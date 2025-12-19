@@ -9,6 +9,19 @@ Write-Host "=== ErwinAddIn Build & Register ===" -ForegroundColor Cyan
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $scriptDir
 
+# Check if erwin is running and using the DLL
+$erwinProcess = Get-Process -Name "erwin" -ErrorAction SilentlyContinue
+if ($erwinProcess) {
+    Write-Host "`nWARNING: erwin is running and may lock the DLL." -ForegroundColor Yellow
+    $response = Read-Host "Close erwin before building? (Y/N)"
+    if ($response -eq "Y" -or $response -eq "y") {
+        Write-Host "Closing erwin..." -ForegroundColor Yellow
+        $erwinProcess | Stop-Process -Force
+        Start-Sleep -Seconds 2
+        Write-Host "erwin closed." -ForegroundColor Green
+    }
+}
+
 # Build
 Write-Host "`n[1/3] Building project..." -ForegroundColor Yellow
 dotnet build -c Release
@@ -36,9 +49,14 @@ if (-not $isAdmin) {
     Write-Host "WARNING: Not running as Administrator. Registration may fail." -ForegroundColor Yellow
 }
 
-# Unregister first (ignore errors)
-Write-Host "`n[2/3] Unregistering old version..." -ForegroundColor Yellow
-& $regasm $dllPath /unregister 2>$null
+# Unregister first (if exists)
+Write-Host "`n[2/3] Unregistering old version (if exists)..." -ForegroundColor Yellow
+& $regasm $dllPath /unregister 2>&1 | Out-Null
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "  Old version unregistered successfully" -ForegroundColor Green
+} else {
+    Write-Host "  No previous registration found (OK)" -ForegroundColor Gray
+}
 
 # Register COM with Type Library
 Write-Host "`n[3/3] Registering COM with Type Library..." -ForegroundColor Yellow
