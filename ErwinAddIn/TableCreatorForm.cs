@@ -435,15 +435,16 @@ namespace ErwinAddIn
                 try
                 {
                     // Try to load and explore EAL assembly
+                    // EAL.dll is copied to the output directory during build
                     var ealAssembly = System.Reflection.Assembly.LoadFrom(
                         System.IO.Path.Combine(System.IO.Path.GetDirectoryName(
                             System.Reflection.Assembly.GetExecutingAssembly().Location),
-                            @"..\Refernces\EAL.dll"));
+                            "EAL.dll"));
 
                     if (ealAssembly == null)
                     {
-                        // Try current directory
-                        ealAssembly = System.Reflection.Assembly.LoadFrom(@"D:\Projects\erwin-addon\Refernces\EAL.dll");
+                        // Try current directory as fallback
+                        ealAssembly = System.Reflection.Assembly.LoadFrom("EAL.dll");
                     }
 
                     if (ealAssembly != null)

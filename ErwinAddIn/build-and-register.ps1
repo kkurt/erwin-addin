@@ -24,6 +24,7 @@ if ($erwinProcess) {
 
 # Build
 Write-Host "`n[1/3] Building project..." -ForegroundColor Yellow
+dotnet clean
 dotnet build -c Release
 
 if ($LASTEXITCODE -ne 0) {

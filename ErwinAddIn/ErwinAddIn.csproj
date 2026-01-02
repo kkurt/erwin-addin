@@ -16,7 +16,8 @@
     <Reference Include="Microsoft.CSharp" />
     <Reference Include="System.Windows.Forms" />
     <Reference Include="EAL">
-      <HintPath>..\Refernces\EAL.dll</HintPath>
+      <HintPath>References\EAL.dll</HintPath>
+      <Private>True</Private>
     </Reference>
   </ItemGroup>
 
@@ -25,5 +26,18 @@
       <DependentUpon>TableCreatorForm.cs</DependentUpon>
     </Compile>
   </ItemGroup>
+
+  <ItemGroup>
+    <None Include="References\EAL.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>EAL.dll</Link>
+    </None>
+  </ItemGroup>
+
+  <!-- Copy EAL.dll directly to output directory (not in References subfolder) -->
+  <Target Name="CopyEALToOutput" AfterTargets="Build">
+    <Copy SourceFiles="$(ProjectDir)References\EAL.dll" DestinationFiles="$(OutputPath)EAL.dll" SkipUnchangedFiles="true" />
+    <Message Text="Copied EAL.dll to $(OutputPath)" Importance="high" />
+  </Target>
 
 </Project>
