@@ -9,7 +9,10 @@
       "Bash(powershell.exe -Command \"where.exe dotnet; Get-Command dotnet -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source\")",
       "Bash(powershell.exe -Command:*)",
       "Bash(cmd.exe /c \"dotnet build:*)",
-      "Bash(dir:*)"
+      "Bash(dir:*)",
+      "Bash(powershell.exe -ExecutionPolicy Bypass -File \".\\\\build.ps1\")",
+      "Bash(where:*)",
+      "Bash(powershell.exe:*)"
     ]
   }
 }

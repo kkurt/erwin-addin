@@ -4,7 +4,7 @@ VisualStudioVersion = 17.5.2.0
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ErwinAddIn", "ErwinAddIn\ErwinAddIn.csproj", "{1B62A3C2-810A-2053-D401-BD98ABD44F8B}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ErwinTableCreator", "ErwinTableCreator\ErwinTableCreator.csproj", "{700D877C-3F6E-980F-5C6C-F819C65B2B87}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ErwinAdmin", "ErwinAdmin\ErwinAdmin.csproj", "{700D877C-3F6E-980F-5C6C-F819C65B2B87}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
