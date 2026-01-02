@@ -1,6 +1,6 @@
-namespace ErwinAddIn
+namespace EliteSoft.Erwin.AddIn
 {
-    partial class TableCreatorForm
+    partial class ModelConfigForm
     {
         private System.ComponentModel.IContainer components = null;
 
@@ -29,8 +29,6 @@ namespace ErwinAddIn
             this.txtSchemaName = new System.Windows.Forms.TextBox();
             this.lblName = new System.Windows.Forms.Label();
             this.txtName = new System.Windows.Forms.TextBox();
-            this.lblCode = new System.Windows.Forms.Label();
-            this.txtCode = new System.Windows.Forms.TextBox();
 
             this.btnApply = new System.Windows.Forms.Button();
             this.btnClose = new System.Windows.Forms.Button();
@@ -89,11 +87,9 @@ namespace ErwinAddIn
             this.grpConfig.Controls.Add(this.txtSchemaName);
             this.grpConfig.Controls.Add(this.lblName);
             this.grpConfig.Controls.Add(this.txtName);
-            this.grpConfig.Controls.Add(this.lblCode);
-            this.grpConfig.Controls.Add(this.txtCode);
             this.grpConfig.Location = new System.Drawing.Point(12, 75);
             this.grpConfig.Name = "grpConfig";
-            this.grpConfig.Size = new System.Drawing.Size(560, 130);
+            this.grpConfig.Size = new System.Drawing.Size(560, 95);
             this.grpConfig.TabIndex = 1;
             this.grpConfig.TabStop = false;
             this.grpConfig.Text = "Configuration";
@@ -148,25 +144,9 @@ namespace ErwinAddIn
             this.txtName.Size = new System.Drawing.Size(460, 23);
             this.txtName.TabIndex = 5;
             //
-            // lblCode
-            //
-            this.lblCode.AutoSize = true;
-            this.lblCode.Location = new System.Drawing.Point(15, 98);
-            this.lblCode.Name = "lblCode";
-            this.lblCode.Size = new System.Drawing.Size(38, 15);
-            this.lblCode.TabIndex = 6;
-            this.lblCode.Text = "Code:";
-            //
-            // txtCode
-            //
-            this.txtCode.Location = new System.Drawing.Point(80, 95);
-            this.txtCode.Name = "txtCode";
-            this.txtCode.Size = new System.Drawing.Size(460, 23);
-            this.txtCode.TabIndex = 7;
-            //
             // btnApply
             //
-            this.btnApply.Location = new System.Drawing.Point(382, 215);
+            this.btnApply.Location = new System.Drawing.Point(382, 180);
             this.btnApply.Name = "btnApply";
             this.btnApply.Size = new System.Drawing.Size(90, 32);
             this.btnApply.TabIndex = 2;
@@ -176,7 +156,7 @@ namespace ErwinAddIn
             //
             // btnClose
             //
-            this.btnClose.Location = new System.Drawing.Point(482, 215);
+            this.btnClose.Location = new System.Drawing.Point(482, 180);
             this.btnClose.Name = "btnClose";
             this.btnClose.Size = new System.Drawing.Size(90, 32);
             this.btnClose.TabIndex = 3;
@@ -186,18 +166,18 @@ namespace ErwinAddIn
             //
             // lblStatus
             //
-            this.lblStatus.Location = new System.Drawing.Point(12, 220);
+            this.lblStatus.Location = new System.Drawing.Point(12, 185);
             this.lblStatus.Name = "lblStatus";
             this.lblStatus.Size = new System.Drawing.Size(360, 25);
             this.lblStatus.TabIndex = 4;
             this.lblStatus.Text = "";
             this.lblStatus.ForeColor = System.Drawing.Color.DarkBlue;
             //
-            // TableCreatorForm
+            // ModelConfigForm
             //
             this.AutoScaleDimensions = new System.Drawing.SizeF(7F, 15F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
-            this.ClientSize = new System.Drawing.Size(584, 261);
+            this.ClientSize = new System.Drawing.Size(584, 226);
             this.Controls.Add(this.grpModel);
             this.Controls.Add(this.grpConfig);
             this.Controls.Add(this.btnApply);
@@ -207,10 +187,10 @@ namespace ErwinAddIn
             this.FormBorderStyle = System.Windows.Forms.FormBorderStyle.FixedDialog;
             this.MaximizeBox = false;
             this.MinimizeBox = false;
-            this.Name = "TableCreatorForm";
+            this.Name = "ModelConfigForm";
             this.StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen;
-            this.Text = "erwin Model Configurator";
-            this.Load += new System.EventHandler(this.TableCreatorForm_Load);
+            this.Text = "Elite Soft Erwin Model Configurator";
+            this.Load += new System.EventHandler(this.ModelConfigForm_Load);
             this.grpModel.ResumeLayout(false);
             this.grpModel.PerformLayout();
             this.grpConfig.ResumeLayout(false);
@@ -232,8 +212,6 @@ namespace ErwinAddIn
         private System.Windows.Forms.TextBox txtSchemaName;
         private System.Windows.Forms.Label lblName;
         private System.Windows.Forms.TextBox txtName;
-        private System.Windows.Forms.Label lblCode;
-        private System.Windows.Forms.TextBox txtCode;
 
         private System.Windows.Forms.Button btnApply;
         private System.Windows.Forms.Button btnClose;

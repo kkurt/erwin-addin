@@ -3,8 +3,10 @@ using System.Drawing;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
-namespace ErwinTest1
+namespace EliteSoft.Erwin.Admin
 {
+    // DEPRECATED: This form is kept for reference only
+    // Use MartConnectionForm instead
     public partial class Form1 : Form
     {
         private dynamic oApplication;

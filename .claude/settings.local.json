@@ -8,7 +8,8 @@
       "Bash(powershell.exe -Command \"& ''C:\\\\Program Files\\\\dotnet\\\\dotnet.exe'' build ''d:\\\\Projects\\\\erwin-addon\\\\ErwinAddIn\\\\ErwinAddIn.csproj'' -c Release\")",
       "Bash(powershell.exe -Command \"where.exe dotnet; Get-Command dotnet -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source\")",
       "Bash(powershell.exe -Command:*)",
-      "Bash(cmd.exe /c \"dotnet build:*)"
+      "Bash(cmd.exe /c \"dotnet build:*)",
+      "Bash(dir:*)"
     ]
   }
 }

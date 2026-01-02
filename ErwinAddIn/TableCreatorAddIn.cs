@@ -2,23 +2,23 @@ using System;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
-namespace ErwinAddIn
+namespace EliteSoft.Erwin.AddIn
 {
     /// <summary>
-    /// erwin Data Modeler Add-In for creating tables
-    /// Register with: regasm ErwinAddIn.dll /codebase
+    /// Elite Soft Erwin Add-In - Model Configuration
+    /// Register with: regasm EliteSoft.Erwin.AddIn.dll /codebase
     /// </summary>
     [ComVisible(true)]
     [Guid("A1B2C3D4-E5F6-7890-ABCD-EF1234567890")]
-    [ProgId("ErwinAddIn.TableCreator")]
+    [ProgId("EliteSoft.Erwin.AddIn")]
     [ClassInterface(ClassInterfaceType.AutoDual)]
-    public class TableCreatorAddIn
+    public class ErwinAddIn
     {
-        public TableCreatorAddIn()
+        public ErwinAddIn()
         {
         }
 
-        private static TableCreatorForm _activeForm = null;
+        private static ModelConfigForm _activeForm = null;
 
         /// <summary>
         /// Called by erwin - parameterless version
@@ -47,7 +47,7 @@ namespace ErwinAddIn
                 dynamic scapi = Activator.CreateInstance(scapiType);
 
                 // Show the form as non-modal (doesn't block other windows)
-                _activeForm = new TableCreatorForm(scapi);
+                _activeForm = new ModelConfigForm(scapi);
                 _activeForm.FormClosed += (s, e) => { _activeForm = null; };
                 _activeForm.Show();
             }
@@ -69,11 +69,11 @@ namespace ErwinAddIn
         /// <summary>
         /// Add-in display name for erwin menu
         /// </summary>
-        public string Name => "Table Creator";
+        public string Name => "Elite Soft Erwin Add-In";
 
         /// <summary>
         /// Add-in description
         /// </summary>
-        public string Description => "Creates new entities/tables in the model";
+        public string Description => "Elite Soft Erwin Model Configuration Add-In";
     }
 }

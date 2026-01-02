@@ -1,9 +1,9 @@
-# ErwinAddIn Build and Register Script
+# Elite Soft Erwin Add-In Build and Register Script
 # Run as Administrator!
-
+attrib -r "C:\Users\Administrator\Documents\PublicationSystemSample_Modified.erwin"
 $ErrorActionPreference = "Stop"
 
-Write-Host "=== ErwinAddIn Build & Register ===" -ForegroundColor Cyan
+Write-Host "=== Elite Soft Erwin Add-In Build & Register ===" -ForegroundColor Cyan
 
 # Get script directory
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -34,8 +34,8 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host "Build successful!" -ForegroundColor Green
 
-$dllPath = Join-Path $scriptDir "bin\Release\net48\ErwinAddIn.dll"
-$tlbPath = Join-Path $scriptDir "bin\Release\net48\ErwinAddIn.tlb"
+$dllPath = Join-Path $scriptDir "bin\Release\net48\EliteSoft.Erwin.AddIn.dll"
+$tlbPath = Join-Path $scriptDir "bin\Release\net48\EliteSoft.Erwin.AddIn.tlb"
 $regasm = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\regasm.exe"
 
 if (-not (Test-Path $dllPath)) {
@@ -68,7 +68,7 @@ if ($LASTEXITCODE -eq 0) {
 
     # Show registry info
     Write-Host "`nRegistry check:" -ForegroundColor Cyan
-    $progId = "ErwinAddIn.TableCreator"
+    $progId = "EliteSoft.Erwin.AddIn"
     $regPath = "Registry::HKEY_CLASSES_ROOT\$progId"
     if (Test-Path $regPath) {
         Write-Host "  ProgID '$progId' registered OK" -ForegroundColor Green
@@ -80,7 +80,7 @@ if ($LASTEXITCODE -eq 0) {
     Write-Host "  DLL: $dllPath"
     Write-Host "  TLB: $tlbPath"
 
-    Write-Host "`nProgID for erwin: ErwinAddIn.TableCreator" -ForegroundColor Yellow
+    Write-Host "`nProgID for erwin: EliteSoft.Erwin.AddIn" -ForegroundColor Yellow
     Write-Host ""
 } else {
     Write-Host "Registration failed!" -ForegroundColor Red

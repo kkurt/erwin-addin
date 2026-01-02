@@ -5,7 +5,7 @@ using System.Text;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
-namespace ErwinAddIn
+namespace EliteSoft.Erwin.AddIn
 {
     /// <summary>
     /// Utility methods for erwin Data Modeler - converted from PowerDesigner VBScript
