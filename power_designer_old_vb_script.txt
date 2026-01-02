@@ -1,0 +1,848 @@
+'******************************************************************************
+'* Purpose:  This VB-Script holds global definitions shared by all the custom-
+'*            checks scripts of the model extension.
+'******************************************************************************
+
+Option Explicit ' This is to ensure all used variables are defined
+
+Dim CurrentSchema
+Dim DB
+Dim modelEnvironment
+
+Dim workspaceTargetModel
+
+Dim ScriptFile, ScriptPath ,gUserName , exName
+
+if not ActiveModel is nothing then
+	modelEnvironment = ActiveModel.ExtractionBranchName
+	if modelEnvironment = "" then
+		modelEnvironment = "6_PROD"
+	end if
+CurrentSchema = trim(ActiveModel.GetExtendedAttributeText("SchCode_" &mid(modelEnvironment,3)))
+DB = trim(ActiveModel.GetExtendedAttributeText("DBName_" &mid(modelEnvironment,3)))
+end if
+
+
+
+Function GetODBCConnection(obj)
+   const HKEY_LOCAL_MACHINE = &H80000002
+   const HKEY_CURRENT_USER = &H80000001
+   dim modelEnviroment
+   modelEnviroment = ActiveModel.ExtractionBranchName
+   
+   dim strComputer, objRegistry, strKeyPath, arrValueNames, arrValueTypes, i, strValue, strValueName, outValue, enviromentMach, result, checkMachine, dbname
+   strComputer = "."
+   set objRegistry = getobject("winmgmts:\\" & strComputer & "\root\default:StdRegProv")
+   strKeyPath = "SOFTWARE\ODBC\ODBC.INI\ODBC Data Sources"
+   objRegistry.EnumValues HKEY_CURRENT_USER, strKeyPath, arrValueNames, arrValueTypes
+   'objRegistry.EnumValues HKEY_LOCAL_MACHINE, StrKeyPath, arrValueNames, arrValueTypes
+   'Enviroment set
+   
+   'to fiz the error when the odbc in HKEY_LOCAL_MACHINE
+   checkMachine = 0
+   dim odbcName
+   for each odbcName in arrValueNames
+      'output odbcName
+      if odbcName = cstr(OracleDB) then
+         checkMachine = checkMachine + 1
+      elseif odbcName = cstr(OracleDB) then
+         checkMachine = checkMachine + 1
+      end if
+   next
+   
+   if checkMachine = 0 then
+      objRegistry.EnumValues HKEY_LOCAL_MACHINE, strKeyPath, arrValueNames, arrValueTypes
+      
+   end if
+   
+   for i = 0 to ubound(arrValueNames)
+      strValueName = arrValueNames(i)
+      'output strValueName
+      'output checkMachine
+      if checkMachine > 0 then
+         objRegistry.GetStringValue HKEY_CURRENT_USER, strKeyPath, strValueName, strValue
+      else
+         objRegistry.GetStringValue HKEY_LOCAL_MACHINE, strKeyPath, strValueName, strValue
+      end if
+      if inStr(strValue, "Oracle in") > 0 then
+         enviromentMach = false
+         'output modelEnviroment
+         if inStr(modelEnviroment, "1_DEV") > 0 and (inStr(strValueName, OracleDB) = 1) then
+            enviromentMach = true
+         elseif inStr(modelEnviroment, "2_INT") > 0 and (inStr(strValueName, OracleDB) = 1) then
+            enviromentMach = true
+         elseif inStr(modelEnviroment, "3_FIX") > 0 and (inStr(strValueName, OracleDB) = 1) then
+            enviromentMach = true
+         elseif inStr(modelEnviroment, "4_BAU") > 0 and (inStr(strValueName, OracleDB) = 1) then
+            enviromentMach = true
+         elseif inStr(modelEnviroment, "5_REG") > 0 and (inStr(strValueName, OracleDB) = 1) then
+            enviromentMach = true
+         elseif inStr(modelEnviroment, "6_PREPROD") > 0 and (inStr(strValueName, OracleDB) = 1) then
+            enviromentMach = true
+         elseif inStr(modelEnviroment, "7_PROD") > 0 and (inStr(strValueName, OracleDB) = 1) then
+            enviromentMach = true
+         end if
+         if enviromentMach = true then
+            outValue = "odbc" & strValueName & ":" & strValue
+            exit for
+         end if
+      end if
+   next
+   
+   GetODBCConnection = outValue
+   
+end Function  
+
+
+Function SetModelName(ByRef obj)
+
+Dim dbmsParts 
+Dim DbName
+Dim SchemaName
+Dim SubModelName
+
+
+DbName = obj.GetExtendedAttributeText("DbName")
+SchemaName = obj.GetExtendedAttributeText("SchemaName")
+SubModelName = obj.GetExtendedAttributeText("SubModelName")
+
+
+'output "DbName=" &  DbName & "SchemaName=" & SchemaName & "CurrentSchema=" & CurrentSchema & " DB=" & DB
+ 
+
+dbmsParts = Split(obj.DBMS.Name, " ")    
+Dim FirstWord    
+FirstWord = ucase(dbmsParts(0))
+
+Dim NameAndCode 
+
+if (DbName<>"") and (SchemaName<>"") Then 
+   'NameAndCode = "PDM." & FirstWord & "." & ucase(DbName) & "." & ucase(SchemaName)
+   NameAndCode = ucase(DbName) & "." & ucase(SchemaName)
+   obj.SetNameAndCode NameAndCode, NameAndCode        
+end if
+
+if (SubModelName<>"") Then
+   output "Checking SubModelName..."
+   NameAndCode = NameAndCode & "." & SubModelName
+   obj.SetNameAndCode NameAndCode, NameAndCode       
+end if 
+
+end function
+
+'********************    RULES  ***************************
+Function Rule_ValCannotBeEmpty(Val, ValName) 
+if Val = "" then
+   msgbox ValName & " alani bos geçilemez!"
+end if
+end function
+
+
+
+'********************************************************
+
+Function CreateUser(SchemaName, ByVal obj)
+
+   Dim DefaultOwner,DefaultOwnerFlag, user, newOwner
+   
+   DefaultOwner = SchemaName   
+   DefaultOwnerFlag = False
+
+   for each user in obj.users
+      if user.Code = DefaultOwner then
+         DefaultOwnerFlag = True
+         set newOwner = user
+      end if
+   next
+   if DefaultOwnerFlag = False then
+      set newOwner = obj.Users.CreateNew(0)
+      newOwner.Name = DefaultOwner
+      newOwner.Code = DefaultOwner
+   end if
+   obj.SetExtendedAttribute "DefaultOwner",newOwner
+
+end function
+
+
+Function GenerateDDL(obj)
+   ' Implement your method on <obj> here
+   output "obj===========>" &obj
+   dim owner, dlg, alterInd, selectedInd, customizeInd, pathname, scriptname, result, fileText
+   dim checkModel
+   
+   set dlg = obj.CreateCustomDialog("%CurrentTargetCode%.GenerateDDLOptions")
+   dlg.CloseButtonLabel = "Generate"
+   dlg.SetValue "NumOfSelected",ActiveSelection.count
+   dlg.EnforceCancelButton = true
+      
+   dim genobjects, sel
+   set genobjects = ActiveModel.CreateSelection()      
+   
+   output "genobjects===========>" &genobjects
+   
+   if dlg.ShowDialog() then 
+      alterInd = obj.GetExtendedAttribute("GenerateAlterScriptFlag")
+      selectedInd = "Yes"
+      customizeInd = "No"
+      pathname = EvaluateNamedPath("%_SHARED%\")
+      scriptname = "DB_DDL_" & CurrentSchema & "_" & year(Now) & right("0" & month(now),2) & right("0" & day(now),2) & right("0" & hour(now),2) & right("0" & minute(now),2) & right("0" & second(now),2) & ".sql"
+      
+      if(checkModelRun(obj)) then      
+         output "checkModel true"                
+         if GenerateScript(obj.Model,pathname,scriptname,alterInd,selectedInd,customizeInd) then
+            obj.SetExtendedAttribute "ScriptPath",pathname
+            obj.SetExtendedAttribute "ScriptFile",scriptname 
+            set dlg = obj.CreateCustomDialog("%CurrentTargetCode%.ScriptPreview")
+            dlg.EnforceCancelButton = false
+            fileText = ReadFile(pathname + scriptname)
+            dlg.SetValue "ScriptText",fileText            
+            result = dlg.ShowDialog()
+         else
+            msgbox "Error in script generation"
+         end if
+         
+      end if
+   end if        
+   
+End Function
+
+Function checkModelRun(aModel)
+   checkModelRun = -1
+   Dim modl
+   set modl = aModel
+   Dim opts, ctrl, catg, chck
+   set opts = modl.GetPackageOptions()
+   set ctrl = opts.GetCheckModelControler()
+
+Dim CheckModelTbl
+dim SelectedTable
+
+for each SelectedTable in ActiveSelection   
+   SelectedTable.SetExtendedAttribute "_CheckModelEnable", true
+next
+
+
+   for each catg in ctrl.categories
+      for each chck in catg.checks
+
+         if INSTR(chck.Name,"CheckModelEnable") > 0  then                   
+            chck.Execution = 1           
+         else
+            chck.Execution = 0
+         end if
+      next
+   next
+   
+   opts.Save
+  
+   Dim errCount, wrnCount
+   ctrl.Execute errCount, wrnCount
+   
+  
+
+   if errCount > 0 then
+      MsgBox("Model ""Error""'ler bulunmaktadir. Düzeltip devam ediniz.")
+      checkModelRun = false
+   elseif wrnCount > 0 then
+      dim objShell, answer
+   
+      Set objShell = CreateObject("Wscript.Shell")
+
+      answer = MsgBox("Model ""Warning""'ler bulunmaktadir. Devam Etmek ister misiniz?", vbYesNo, "Check Model Sonucu")
+
+      If answer = vbYes Then
+         checkModelRun = true
+      else
+         checkModelRun = false
+      End if   
+   else
+      checkModelRun = true
+   end if
+
+for each SelectedTable in ActiveSelection   
+   SelectedTable.SetExtendedAttribute "_CheckModelEnable", false
+next   
+   
+End Function
+
+
+sub DefaultGenOptions(ByRef opt)
+   'output "DefaultGenOptions"
+   'opt.GenerationCreateTablespace = true
+   'opt.GenerationDropTablespace = false
+   'opt.GenerationCreateTablespaceBeginScript = true
+   'opt.GenerationCreateTablespaceEndScript = true
+   opt.GenerationCreateTable = true
+   opt.GenerationCreateTableCheck = false
+   opt.GenerationCreateTablePhysicalOptions = true
+   opt.GenerationCreateTableBeginScript = true
+   opt.GenerationCreateTableEndScript = true
+   opt.GenerationCreateTableComment = true
+   opt.GenerationDropTable = false
+   opt.GenerationColumnUserDefaultValue = true
+   opt.GenerationColumnCheck = false
+   'opt.GenerationColumnUserPhysicalOptions = true
+   opt.GenerationColumnComment = true
+   opt.GenerationCreatePrimaryKey = true
+   opt.GenerationCreatePrimaryKeyOutside = true
+   opt.GenerationDropPrimaryKey = false
+   opt.GenerationCreateAlternateKey = false
+   'opt.GenerationCreateAlternateKeyOutside = false
+   opt.GenerationDropAlternateKey = false
+   'opt.GenerationCreateForeignKey = false
+   'opt.GenerationCreateForeignKeyOutside = false
+   'opt.GenerationDropForeignKey = false
+   opt.GenerationCreateIndex = true
+   opt.GenerationCreateIndexOutside = true
+   opt.GenerationCreateIndexPrimaryKey = true
+   opt.GenerationCreateIndexForeignKey = false
+   opt.GenerationCreateIndexAlternateKey = false
+   opt.GenerationCreateIndexClustered = false
+   opt.GenerationCreateIndexOthers = false
+   opt.GenerationCreateIndexPhysicalOptions = true
+   opt.GenerationCreateIndexComment = true
+   opt.GenerationCreateDatabase = false
+   opt.GenerationDropIndex = false
+   opt.GenerationCreateView = true
+   opt.GenerationCreateViewBeginScript = true
+   opt.GenerationCreateViewEndScript = true
+   opt.GenerationCreateViewComment = true
+   opt.GenerationDropView = false
+   'opt.GenerationCreateViewPhysicalOptions = true
+   opt.GenerationDropForceColumnList = false
+   opt.GenerationViewCreateTrigger = false
+   opt.GenerationViewDropTrigger = false
+   opt.GenerationViewCreateTriggerComment = true
+   opt.GenerationViewCreateIndex = true
+   opt.GenerationViewCreateIndexClustered = true
+   opt.GenerationViewCreateIndexOthers = true
+   opt.GenerationViewCreateIndexPhysicalOptions = true
+   opt.GenerationViewDropIndex = false
+   opt.GenerationTablCreateTrigger = false
+   opt.GenerationTablDropTrigger = false
+   opt.GenerationTablCreateTriggerComment = false
+   opt.GenerationTablCreateIndex = true
+   opt.GenerationTablCreateIndexPrimaryKey = true
+   opt.GenerationTablCreateIndexForeignKey = false
+   opt.GenerationTablCreateIndexAlternateKey = false
+   opt.GenerationTablCreateIndexClustered = true
+   opt.GenerationTablCreateIndexOthers = true
+   opt.GenerationTablCreateIndexPhysicalOptions = true
+   opt.GenerationTablDropIndex = false
+   opt.GenerationCreateTrigger = false
+   opt.GenerationDropTrigger = false
+   opt.GenerationCreateProcedure = true
+   opt.GenerationDropProcedure = false
+   opt.GenerationCreateProcedureBeginScript = true
+   opt.GenerationCreateProcedureEndScript = true
+   opt.GenerationUsageTitle = true
+   opt.GenerationUsageOwnerPrefix = true
+   opt.GenerationUsagePutNameInEmptyLabel = true
+   opt.GenerationCharacterNoAccent = true
+   opt.GenerationTablePermission = true
+   opt.GenerationViewPermission = true
+   opt.GenerationProcedurePermission = true
+   'opt.GenerationSequencePermission = true
+   'opt.GenerationDropJoinIndex = false
+   opt.RebuildIndexPrimaryKey = true
+   opt.RebuildIndexPrimaryKeyNameTemplate = "IDX_%TABLE%_PK"
+   opt.RebuildIndexForeignKey = false
+   opt.RebuildIndexAlternateKey = false
+end sub
+
+sub DefaultRevOptions(ByRef opt)
+    opt.ReversedDBA = true
+    opt.ReversedScript = false
+    opt.ReversePhysicalOptions = true
+    opt.ReverseAllTables = true
+    opt.ReverseAllDatabases = true
+    opt.ReverseAllViews = false
+    opt.ReverseAllStorage = false
+    opt.ReverseAllTablespace = true
+    opt.ReverseAllDomain = false
+    opt.ReverseAllUser = false
+    opt.ReverseAllProcedures = false
+    opt.ReverseAllTriggers = false
+    opt.ReverseAllSystemTables = false
+    opt.ReverseAllSynonyms = false
+    opt.ReverseCodeToNameConvert = true
+end sub
+
+function GenerateScript(ByRef model, pathname, scriptname, alterInd, selectedInd,customizeInd)
+   GenerateScript = false
+   dim dlg, opt, genobjects, sel
+   gUserName = UserName
+   
+   output "Script Generation has started. " & now()
+   output "Schema : " & CurrentSchema
+   output "Model : " & model
+   output "File path : " & pathname
+   output "File name : " & scriptname
+   selectedInd = "Yes"
+   
+   set genobjects = model.CreateSelection()
+   
+   if selectedInd = "Yes" then
+      for each sel in ActiveSelection
+         genobjects.Objects.Add sel
+      next
+      genobjects.AddObjects model, cls_Group, false, true
+   else
+      genobjects.AddObjects model, cls_Table, false, true
+     'genobjects.AddObjects model, cls_Tablespace, false, true
+      genobjects.AddObjects model, cls_View, false, true
+      genobjects.AddObjects model, cls_Sequence, false, true
+      genobjects.AddObjects model, cls_Procedure, false, true
+      genobjects.AddObjects model, cls_ExtendedObject, false, true
+   end if
+   'if customizeInd = "Yes" then
+    '  dim allobjects
+     ' set allobjects = model.CreateSelection()
+      'allobjects.AddObjects model, cls_Table, false, true
+     'allobjects.AddObjects model, cls_Tablespace, false, true
+ '     allobjects.AddObjects model, cls_View, false, true
+  '    allobjects.AddObjects model, cls_Sequence, false, true
+   '   allobjects.AddObjects model, cls_Procedure, false, true
+    '  genobjects.AddObjects model, cls_ExtendedObject, false, true
+     ' genobjects.ShowObjMultiSelection allobjects, "Objects"
+   'end if
+   genobjects.CreatePersistentSelectionManager("GenerateScriptSel")
+
+   set opt = model.GetPackageOptions()
+   call DefaultGenOptions(opt)
+
+   opt.GenerationPathName = pathname
+   opt.GenerationScriptName = scriptname
+   opt.GenerateODBC = false
+   opt.GenerationBeforeCheckModel = false
+   
+   if alterInd then
+      InteractiveMode = im_Dialog
+      model.ConnectToDatabase "","",""
+     
+      if model.IsConnectedToDatabase then
+         output "Connected"
+         call DefaultRevOptions(opt)
+         model.RemoveOdbcSelection "ReverseSelection"
+         output "Selection Object Count: " & genobjects.objects.count
+         output "Selection List:" 
+         for each sel in genobjects.Objects
+            output sel.ClassName & "," & sel.Code& "," & CurrentSchema
+            model.AddToOdbcSelection "ReverseSelection", sel.ClassKind, "", sel.Code,CurrentSchema
+         next
+         model.AddToOdbcSelection "ReverseSelection", cls_User , "Schema", CurrentSchema
+         model.AddToOdbcSelection "ReverseSelection", cls_User , "User", CurrentSchema
+        
+
+         
+         opt.DatabaseSynchronizationUsage = true
+         opt.DatabaseSynchronizationChoice = 1
+         opt.DatabaseSynchronizationBackupTables = 0 '---------------------------------1
+         opt.DatabaseSynchronizationKeepBackupTables = 1
+         opt.DatabaseSynchronizationDropTemporaryTable = false
+         opt.DatabaseSynchronizationTemporaryPhisicalOptions = true
+         
+         opt.ReversedScript = False
+         opt.ReversedDSN = cnxDSN
+         opt.ReverseSchema = model.GetExtendedAttribute("DefaultOwner")
+         
+         dim temp_user
+         
+         for each temp_user in model.users
+            if temp_user.Code = CurrentSchema then
+               set opt.ReverseSchema = temp_user
+            end if
+         next
+         
+         output "Selection List - END -" 
+         opt.ODBCSelectedSelection = "ReverseSelection"
+         output "ReverseSchema " & opt.ReverseSchema
+
+         opt.Save
+         
+
+         InteractiveMode = im_Batch
+
+         model.UseSelection fct_DatabaseModification, "GenerateScriptSel"
+
+         model.ModifyDatabase genobjects
+         
+         if model.IsConnectedToDatabase then 
+            model.DisconnectFromDatabase
+         end if
+         output "Script Generation has completed(Alter Mode). " & now()
+         GenerateScript = true
+      end if
+   else
+      model.UseSelection fct_DatabaseGeneration, "GenerateScriptSel"
+      'model.UseSettings  fct_DatabaseGeneration, gTTKOMSet    
+      model.GenerateDatabase genobjects
+      output "Script Generation has completed(Create Mode). " & now()
+      GenerateScript = true
+   end if
+   dim dlg1,err_count,check_result
+   if GenerateScript = true then 
+      dim fileText
+      fileText = ReadFile(pathname + scriptname)
+      Dim fso
+      Set fso = CreateObject("Scripting.FileSystemObject")
+      Dim workspace
+      Set workspace = fso.OpenTextFile (pathname + scriptname, 2, True)
+      If not workspace is Nothing then
+         workspace.WriteLine("--Generated by PowerDesigner Version:" & Version)
+         workspace.WriteLine("--Generated by User: " & UserName)
+         workspace.WriteLine("--Generated for Environment: " & model.GetExtendedAttribute("Repository"))
+         workspace.WriteLine(fileText)
+         workspace.Close
+      end if
+      Set fso = Nothing
+   end if
+end function
+
+function ReadFile(ByRef filename)
+    dim fso, f
+    set fso = CreateObject("Scripting.FileSystemObject")
+    if fso.FileExists(filename) then
+      set f = fso.OpenTextFile(filename, 1)
+      ReadFile = f.ReadAll
+      f.Close
+    else 
+      ReadFile = "--EMPTY FILE"
+    end if
+    Set fso = Nothing
+end function
+
+
+
+
+' *************************** Integrate Functions *************************************
+Function FindTargetBranch(model, currentBranch)
+    Dim targetBranch
+
+    If currentBranch = "1_DEV" Then
+        If Trim(model.GetExtendedAttributeText("SchCode_INT")) <> "" Then
+            targetBranch = "2_INT"
+        ElseIf Trim(model.GetExtendedAttributeText("SchCode_FIX")) <> "" Then
+            targetBranch = "3_FIX"
+        ElseIf Trim(model.GetExtendedAttributeText("SchCode_BAU")) <> "" Then
+            targetBranch = "4_BAU"
+        ElseIf Trim(model.GetExtendedAttributeText("SchCode_REG")) <> "" Then
+            targetBranch = "5_REG"
+        ElseIf Trim(model.GetExtendedAttributeText("SchCode_PREPROD")) <> "" Then
+            targetBranch = "6_PREPROD"
+        ElseIf Trim(model.GetExtendedAttributeText("SchCode_PROD")) <> "" Then
+            targetBranch = "7_PROD"
+        End If
+    ElseIf currentBranch = "2_INT" Then
+        If Trim(model.GetExtendedAttributeText("SchCode_FIX")) <> "" Then
+            targetBranch = "3_FIX"
+        ElseIf Trim(model.GetExtendedAttributeText("SchCode_BAU")) <> "" Then
+            targetBranch = "4_BAU"
+        ElseIf Trim(model.GetExtendedAttributeText("SchCode_REG")) <> "" Then
+            targetBranch = "5_REG"
+        ElseIf Trim(model.GetExtendedAttributeText("SchCode_PREPROD")) <> "" Then
+            targetBranch = "6_PREPROD"
+        ElseIf Trim(model.GetExtendedAttributeText("SchCode_PROD")) <> "" Then
+            targetBranch = "7_PROD"
+        End If
+        ElseIf currentBranch = "3_FIX" Then
+        If Trim(model.GetExtendedAttributeText("SchCode_BAU")) <> "" Then
+            targetBranch = "4_BAU"
+        ElseIf Trim(model.GetExtendedAttributeText("SchCode_REG")) <> "" Then
+            targetBranch = "5_REG"
+        ElseIf Trim(model.GetExtendedAttributeText("SchCode_PREPROD")) <> "" Then
+            targetBranch = "6_PREPROD"
+        ElseIf Trim(model.GetExtendedAttributeText("SchCode_PROD")) <> "" Then
+            targetBranch = "7_PROD"
+        End If
+    ElseIf currentBranch = "4_BAU" Then
+        If Trim(model.GetExtendedAttributeText("SchCode_REG")) <> "" Then
+            targetBranch = "5_REG"
+        ElseIf Trim(model.GetExtendedAttributeText("SchCode_PREPROD")) <> "" Then
+            targetBranch = "6_PREPROD"
+        ElseIf Trim(model.GetExtendedAttributeText("SchCode_PROD")) <> "" Then
+            targetBranch = "7_PROD"
+        End If
+    ElseIf currentBranch = "5_REG" Then
+        If Trim(model.GetExtendedAttributeText("SchCode_PREPROD")) <> "" Then
+            targetBranch = "6_PREPROD"
+        ElseIf Trim(model.GetExtendedAttributeText("SchCode_PROD")) <> "" Then
+            targetBranch = "7_PROD"
+        End If
+    ElseIf currentBranch = "6_PREPROD" Then
+        If Trim(model.GetExtendedAttributeText("SchCode_PROD")) <> "" Then
+            targetBranch = "7_PROD"
+        End If
+    End If
+
+    If targetBranch = "" Then
+        MsgBox "Hedef ortam bulunamadi, lütfen Model>Model Properties>TTKom Utilities tab'?ndan ortamlara göre sema isimlerini giriniz"
+        else FindTargetBranch = targetBranch
+    End If
+    
+End Function
+
+Function ScanRepositoryAndCheckoutModel(folder, targetFolder, targetModel, targetBranch)
+    Dim subFolder, SysFolder, repDB, subBranch, subModel, TargetFolderRepo, DB, ActModel
+    Dim pdRepository, repoBrowser
+    Set pdRepository = RepositoryConnection
+    'set repoBrowser = pdrepository.RepositoryBrowser
+    
+    'modelName = targetModel
+   ' Set TargetFolderRepo = pdRepository.FindChildByPath("MODEL\ORACLE\TEST1", PdRMG.Cls_RepositoryFolder)
+   ' output TargetFolderRepo
+   ' Loop through all repository objects
+   ' Set repoObjects = repoBrowser.Children
+   ' For Each repoObject In repoObjects
+   '    If repoObject.ObjectType = "Model" And repoObject.Name = modelName Then
+   '        output "Repository Path: " & repoObject.Path, vbInformation, "Repository Folder Path"
+   '        Exit For
+   '    End If
+   ' Next
+    
+    If folder Is Nothing Then
+        Exit Function
+    End If
+
+   'output "folder=" &folder &" targetFolder="&targetFolder&" targetModel= "&targetModel&" targetBranch= "&targetBranch
+   
+   set ActModel = ActiveModel
+   
+   
+   dim targetDBModel, targetDB, ModelDBType
+   targetDBModel = split(targetModel,".",-1,1)
+   'output "targetDBModel(0):" & targetDBModel(0)
+   'output "targetDBModel(1):" & targetDBModel(1)
+   targetDB = targetDBModel(0)
+   
+
+    
+   if InStr(ActModel.DBMS,"ORACLE") > 0 then  
+      if ActModel.GetExtendedAttributeText("DWH")  then
+         ModelDBType = "DWH"
+         targetDB = ActModel.GetExtendedAttributeText("ModelDWHtype")
+         'output "1"
+       else
+         ModelDBType ="ORACLE"
+       end if  
+   elseif InStr(ActModel.DBMS,"POSGRESQL") > 0 Then
+      ModelDBType ="POSGRESQL"
+   elseif InStr(ActModel.DBMS,"MSSQL") > 0 Then
+      ModelDBType ="MSSQL"      
+   end if
+   'output "modelDBType: " & ModelDBType & " targetDB: " & targetDB & " AttrIsDWH: " & ActModel.GetExtendedAttributeText("DWH") & " DWHType: " & ActModel.GetExtendedAttributeText("ModelDWHtype") 
+    For Each subFolder In folder.ChildObjects
+        'output "subFolder:" & subFolder 
+        If subFolder.IsKindOf(PdRMG.Cls_RepositoryFolder) And subFolder.Name = "MODEL" Then        
+            For Each SysFolder In subFolder.ChildObjects 
+                'output "SysFolder:" & SysFolder   
+                'If SysFolder.IsKindOf(PdRMG.Cls_RepositoryFolder) And SysFolder.Name = "ORACLE" Then ' ActModel.GetExtendedAttributeText("ModelDBType")    
+                If SysFolder.IsKindOf(PdRMG.Cls_RepositoryFolder) And SysFolder.Name = ModelDBType  Then                
+                    For Each repDB In SysFolder.ChildObjects 
+                        'output "repDB: " & repDB.Name & " SysFolder: " & SysFolder.Name & " Target DB:"  & targetDB & " modelDBType: " & ModelDBType                     
+                        If SysFolder.IsKindOf(PdRMG.Cls_RepositoryFolder)  and repDB.Name=targetDB  Then              
+                            For Each DB In SysFolder.ChildObjects      
+                 '               output "DB:" & DB              
+                                 'If DB.IsKindOf(PdRMG.Cls_RepositoryFolder) And DB.Name = targetFolder Then                        
+                                     For Each subBranch In DB.ChildObjects      
+                                          ' output "subBranch: " & subBranch.Name & " targetBranch: " &targetBranch
+                                           If subBranch.IsKindOf(PdRMG.Cls_RepositoryBranchFolder) And targetBranch = subBranch.Name Then                                
+                                               For Each subModel In subBranch.ChildObjects   
+                   '                                output "subModel.Name: " & subModel.Name                                  
+                                                   If subModel.IsKindOf(PdRMG.Cls_RepositoryModel) And targetModel = subModel.Name Then 
+                                                      output "Checkout process..!!!!!"                                       
+                                                      subModel.Checkout() 
+                                                   End If
+                                               Next
+                                           End If
+                                     Next
+                                 'End If
+                            Next
+                        End If
+                    Next                            
+                End If
+            Next
+        End If
+    Next
+End Function
+
+Function ScanRepositoryAndCheckoutModelOrj(folder, targetFolder, targetModel, targetBranch)
+    Dim subFolder, SysFolder, repDB, subBranch, subModel
+
+    If folder Is Nothing Then
+        Exit Function
+    End If
+
+   'output "folder=" &folder &" targetFolder="&targetFolder&" targetModel="&targetModel&" targetBranch="&targetBranch
+   
+    For Each subFolder In folder.ChildObjects
+        If subFolder.IsKindOf(PdRMG.Cls_RepositoryFolder) And subFolder.Name = "MODEL" Then        
+            For Each SysFolder In subFolder.ChildObjects            
+                If SysFolder.IsKindOf(PdRMG.Cls_RepositoryFolder) And SysFolder.Name = "TEST1" Then                
+                    For Each repDB In SysFolder.ChildObjects                    
+                        If repDB.IsKindOf(PdRMG.Cls_RepositoryFolder) And repDB.Name = targetFolder Then                        
+                            For Each subBranch In repDB.ChildObjects                            
+                                If subBranch.IsKindOf(PdRMG.Cls_RepositoryBranchFolder) And targetBranch = subBranch.Name Then                                
+                                    For Each subModel In subBranch.ChildObjects                                    
+                                        If subModel.IsKindOf(PdRMG.Cls_RepositoryModel) And targetModel = subModel.Name Then                                        
+                                            subModel.Checkout()
+                                        End If
+                                    Next
+                                End If
+                            Next
+                        End If
+                    Next
+                End If
+            Next
+        End If
+    Next
+End Function
+
+
+Function IsBranch(aobj) 
+Dim folderLoc, sonuc
+
+folderLoc = aobj.FindInRepository.Parent.Location
+folderLoc = Right(folderLoc,Len(folderLoc) -1)
+if not RepositoryConnection.FindChildByPath(folderLoc&"/1_DEV/"&aobj.Name, Cls_RepositoryModel) is nothing Then
+   isBranch = "1_DEV"
+elseif not RepositoryConnection.FindChildByPath(folderLoc&"/2_INT/"&aobj.Name, Cls_RepositoryModel) is nothing Then
+   isBranch = "2_INT"
+elseif not RepositoryConnection.FindChildByPath(folderLoc&"/3_FIX/"&aobj.Name, Cls_RepositoryModel) is nothing Then
+   isBranch = "3_FIX"
+elseif not RepositoryConnection.FindChildByPath(folderLoc&"/4_BAU/"&aobj.Name, Cls_RepositoryModel) is nothing Then
+    isBranch = "4_BAU"
+elseif not RepositoryConnection.FindChildByPath(folderLoc&"/5_REG/"&aobj.Name, Cls_RepositoryModel) is nothing Then
+    isBranch = "5_REG"
+elseif not RepositoryConnection.FindChildByPath(folderLoc&"/6_PREPROD/"&aobj.Name, Cls_RepositoryModel) is nothing Then
+    isBranch = "6_PREPROD"
+elseif not RepositoryConnection.FindChildByPath(folderLoc&"/7_PROD/"&aobj.Name, Cls_RepositoryModel) is nothing Then
+    isBranch = "7_PROD"
+end if           
+
+End Function
+
+
+Function ScanWorkspaceAndFindModel(folder, modelName , Environment)
+
+Dim workspaceModel, obj, subFolder
+
+set workspaceModel= folder
+
+set workspaceTargetModel= nothing
+
+'output "ILK workspaceModel.ModelObject.Name: " 
+
+'output "TEST DEBUG," & "folder: " & folder & " modelName:" & modelName& " Environment: " & Environment
+ 
+'if  workspaceModel.IsKindOf(cls_WorkspaceModel)   then 
+'output "workspaceModel.ModelObject.Name: " & workspaceModel.ModelObject.Name & " modelName:" &modelName & " GetExtendedAttributeText(Repository): " & workspaceModel.ModelObject.GetExtendedAttributeText("Repository") & " Environment:" & Environment
+'end if
+
+if workspaceModel.IsKindOf(cls_WorkspaceFolder) then
+   for each subFolder in workspaceModel.Children
+      output "In for each, subFolder=" & subFolder
+      ScanWorkspaceAndFindModel subFolder, modelName, Environment
+   next
+
+' TEST DEBUG!!!!
+
+'output "GetExtendedAttributeText(Repository): " & workspaceModel.ModelObject.GetExtendedAttributeText("Repository") & " Environment:Environment" & Environment
+
+elseif  workspaceModel.IsKindOf(cls_WorkspaceModel)  and workspaceModel.ModelObject.Name = modelName and   workspaceModel.ModelObject.GetExtendedAttributeText("Repository") = Environment then 
+   output "Setting workspaceTargetModel..."
+   set workspaceTargetModel= workspaceModel.ModelObject
+   Exit Function
+end if
+
+End Function
+
+Function TTIntegrate (obj)
+  Dim currentBranch , currentFolder , targetModel , targetBranch , targetmodelobject, targetEnvPCode, sourceEnvPcode
+  Dim devmodelstatus
+  devmodelstatus = true
+  
+  if RepositoryConnection.Connected then
+   modelEnvironment = obj.ExtractionBranchName
+      if modelEnvironment = "" then
+         modelEnvironment = "7_PROD"
+      end if
+   CurrentSchema = trim(obj.GetExtendedAttributeText("SchCode_"&mid(modelEnvironment,3)))
+   DB = trim(obj.GetExtendedAttributeText("DbName_"&mid(modelEnvironment,3)))
+   'output "object name:" & obj.name    
+   currentBranch = obj.FindInRepository.Parent.Name    
+   currentFolder = obj.FindInRepository.Parent.Parent.Name
+   targetBranch = FindTargetBranch(obj, currentBranch)   
+   targetModel = obj.Code
+   
+   'output "currentBranch:" & currentBranch & " currentFolder: " & currentFolder & " sourceEnvPcode:" & sourceEnvPcode  & " targetBranch: "& targetBranch
+   if obj.UpToDateStatus <> 0 and currentBranch = IsBranch(obj) then
+      devModelStatus = false
+   end if
+   
+   if not devModelStatus then
+      output "Modelde degisiklikler mevcut, DEV Modeli Check-in yapiliyor."
+      obj.CheckIn()
+      output "Güncel ortam check-in yapildi."
+   end if
+   'output  "targetModel:" & targetModel & " targetBranch:" & targetBranch
+   InteractiveMode = im_Dialog
+   ScanRepositoryAndCheckoutModel RepositoryConnection, currentFolder,  targetModel,targetBranch
+   ScanWorkspaceAndFindModel activeWorkspace, targetmodel , targetBranch
+   
+   'output "Hedef Ortami " &TargetEnvPcode
+'   if TargetEnvPcode <> SourceEnvPcode   then
+'      ConvertNameSource obj, targetBranch, TargetEnvPcode, sourceEnvPcode
+'   end if
+   
+   workspaceTargetModel.Merge obj, mrg_allchanges
+   InteractiveMode = im_Batch
+   Call obj.Close()
+   workspaceTargetModel.CheckIn()
+   output "Checkin done!"
+   
+   end if  
+   
+   
+end function
+
+
+Function ReverseFromDB(obj)  
+   
+   Dim projeKodu,cnx,sch,cnxDSN,cnxUSR,cnxPWD
+
+   if not obj.IsConnectedToDatabase then
+      InteractiveMode = im_Dialog
+      obj.ConnectToDatabase "","",""
+   End if
+   
+   if obj.IsConnectedToDatabase then
+      Dim pOpt
+      Set pOpt = obj.GetPackageOptions()
+      pOpt.ReversedDBA = true
+      pOpt.ReversedScript = False
+      pOpt.ReversePhysicalOptions = true   
+      pOpt.ReverseAllTables = true
+      pOpt.ReverseAllDatabases = true
+      pOpt.ReverseAllViews = true
+      pOpt.ReverseAllStorage = False      
+      pOpt.ReverseAllDomain = False
+      pOpt.ReverseAllUser = true
+      pOpt.ReverseAllProcedures = false
+      pOpt.ReverseAllTriggers = False
+      pOpt.ReverseAllSystemTables = False
+      pOpt.ReverseAllSynonyms = False
+      pOpt.ReverseCodeToNameConvert = True
+      pOpt.ReverseProcedurePermissions = True
+      
+      pOpt.ReverseSchema = obj.Model.GetExtendedAttribute("DefaultOwner")
+      pOpt.ReverseCatalog = obj.Model.GetExtendedAttribute("SchemaName")
+      pOpt.Save
+      
+      ValidationMode = False
+      InteractiveMode = im_Dialog      
+      obj.ReverseDatabase
+      InteractiveMode = im_Batch
+      obj.DisconnectFromDatabase()      
+   end if
+End Function

@@ -15,6 +15,9 @@
   <ItemGroup>
     <Reference Include="Microsoft.CSharp" />
     <Reference Include="System.Windows.Forms" />
+    <Reference Include="EAL">
+      <HintPath>..\Refernces\EAL.dll</HintPath>
+    </Reference>
   </ItemGroup>
 
   <ItemGroup>

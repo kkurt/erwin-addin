@@ -26,7 +26,7 @@ namespace ErwinTest1
 
         private void SetupCustomControls()
         {
-            this.Text = "erwin Table Creator";
+            this.Text = "Elite Softe - Erwin Addon";
             this.Size = new Size(420, 250);
             this.StartPosition = FormStartPosition.CenterScreen;
             this.FormBorderStyle = FormBorderStyle.FixedDialog;

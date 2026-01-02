@@ -18,6 +18,8 @@ namespace ErwinAddIn
         {
         }
 
+        private static TableCreatorForm _activeForm = null;
+
         /// <summary>
         /// Called by erwin - parameterless version
         /// </summary>
@@ -25,6 +27,14 @@ namespace ErwinAddIn
         {
             try
             {
+                // If form is already open, bring it to front
+                if (_activeForm != null && !_activeForm.IsDisposed)
+                {
+                    _activeForm.BringToFront();
+                    _activeForm.Activate();
+                    return;
+                }
+
                 // Create SCAPI connection
                 Type scapiType = Type.GetTypeFromProgID("erwin9.SCAPI");
                 if (scapiType == null)
@@ -36,11 +46,10 @@ namespace ErwinAddIn
 
                 dynamic scapi = Activator.CreateInstance(scapiType);
 
-                // Show the table creator form
-                using (var form = new TableCreatorForm(scapi))
-                {
-                    form.ShowDialog();
-                }
+                // Show the form as non-modal (doesn't block other windows)
+                _activeForm = new TableCreatorForm(scapi);
+                _activeForm.FormClosed += (s, e) => { _activeForm = null; };
+                _activeForm.Show();
             }
             catch (Exception ex)
             {

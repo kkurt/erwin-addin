@@ -1,4 +1,4 @@
-# erwin Table Creator Addon
+# Elite Soft erwin Addon
 
 erwin Data Modeler icin basit bir tablo olusturma addon'u (C#).
 
