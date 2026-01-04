@@ -1,6 +1,11 @@
 using System;
 using System.Drawing;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Text;
+using System.Threading.Tasks;
 using System.Windows.Forms;
+using System.Xml.Linq;
 
 namespace EliteSoft.Erwin.Admin
 {
@@ -36,10 +41,16 @@ namespace EliteSoft.Erwin.Admin
         private dynamic _martConnection;
         private bool _isMartConnected = false;
 
+        private HttpClient _httpClient;
+        private string _bearerToken;
+        private string _martApiBaseUrl;
+
         public MartConnectionForm()
         {
             InitializeComponent();
             InitializeSCAPI();
+            _httpClient = new HttpClient();
+            _httpClient.Timeout = TimeSpan.FromSeconds(30);
         }
 
         private void InitializeComponent()
@@ -155,40 +166,83 @@ namespace EliteSoft.Erwin.Admin
             grpMartConnection.Controls.Add(btnMartConnect);
         }
 
+        private TextBox txtModelPath;
+
         private void InitializeLoadModelTab()
         {
             // Model Selection Group
             grpModelSelection = new GroupBox();
-            grpModelSelection.Text = "Mart Catalog";
+            grpModelSelection.Text = "Load Model from Mart";
             grpModelSelection.Location = new Point(15, 15);
-            grpModelSelection.Size = new Size(520, 270);
+            grpModelSelection.Size = new Size(520, 150);
             tabLoadModel.Controls.Add(grpModelSelection);
 
-            // Model TreeView
-            treeModels = new TreeView();
-            treeModels.Location = new Point(15, 25);
-            treeModels.Size = new Size(490, 190);
-            treeModels.HideSelection = false;
-            treeModels.ShowLines = true;
-            treeModels.ShowRootLines = true;
-            treeModels.ShowPlusMinus = true;
-            grpModelSelection.Controls.Add(treeModels);
+            // Label
+            Label lblModelPath = new Label();
+            lblModelPath.Text = "Model Path (Library/ModelName):";
+            lblModelPath.Location = new Point(15, 30);
+            lblModelPath.Size = new Size(200, 20);
+            grpModelSelection.Controls.Add(lblModelPath);
+
+            // TextBox for model path
+            txtModelPath = new TextBox();
+            txtModelPath.Location = new Point(15, 55);
+            txtModelPath.Size = new Size(490, 23);
+            txtModelPath.Text = "Kursat/PublicationSystemSample_Modified";
+            txtModelPath.Font = new Font("Consolas", 10F);
+            grpModelSelection.Controls.Add(txtModelPath);
+
+            // Example label
+            Label lblExample = new Label();
+            lblExample.Text = "Example: Kursat/ModelName or Library/Folder/ModelName";
+            lblExample.Location = new Point(15, 85);
+            lblExample.Size = new Size(490, 20);
+            lblExample.ForeColor = Color.Gray;
+            grpModelSelection.Controls.Add(lblExample);
 
             // Load from Mart Button
             btnLoadModel = new Button();
-            btnLoadModel.Text = "Load Selected Model";
-            btnLoadModel.Location = new Point(15, 225);
+            btnLoadModel.Text = "Load from Mart";
+            btnLoadModel.Location = new Point(15, 110);
             btnLoadModel.Size = new Size(235, 30);
             btnLoadModel.Click += BtnLoadModel_Click;
             grpModelSelection.Controls.Add(btnLoadModel);
 
+            // Load from File Group
+            GroupBox grpFileLoad = new GroupBox();
+            grpFileLoad.Text = "Or Load Model from File";
+            grpFileLoad.Location = new Point(15, 180);
+            grpFileLoad.Size = new Size(520, 80);
+            tabLoadModel.Controls.Add(grpFileLoad);
+
             // Load from File Button
             Button btnLoadFromFile = new Button();
-            btnLoadFromFile.Text = "Load from File...";
-            btnLoadFromFile.Location = new Point(270, 225);
-            btnLoadFromFile.Size = new Size(235, 30);
+            btnLoadFromFile.Text = "Browse and Load from File...";
+            btnLoadFromFile.Location = new Point(15, 30);
+            btnLoadFromFile.Size = new Size(490, 35);
             btnLoadFromFile.Click += BtnLoadFromFile_Click;
-            grpModelSelection.Controls.Add(btnLoadFromFile);
+            grpFileLoad.Controls.Add(btnLoadFromFile);
+
+            // Info TreeView (shows connection info and catalog browsing limitation)
+            treeModels = new TreeView();
+            treeModels.Location = new Point(15, 275);
+            treeModels.Size = new Size(520, 180);
+            treeModels.Font = new Font("Consolas", 9F);
+            treeModels.AfterSelect += TreeModels_AfterSelect;
+            tabLoadModel.Controls.Add(treeModels);
+        }
+
+        private void TreeModels_AfterSelect(object sender, TreeViewEventArgs e)
+        {
+            if (e.Node != null && e.Node.Tag != null)
+            {
+                string nodeTag = e.Node.Tag.ToString();
+                if (nodeTag.StartsWith("MODEL:"))
+                {
+                    string modelPath = nodeTag.Substring("MODEL:".Length);
+                    txtModelPath.Text = modelPath;
+                }
+            }
         }
 
         private void InitializeCheckNamingTab()
@@ -197,119 +251,325 @@ namespace EliteSoft.Erwin.Admin
             // Will be implemented in next step
         }
 
-        private void LoadMartCatalog()
+        private void TreeModels_BeforeExpand(object sender, TreeViewCancelEventArgs e)
         {
             try
             {
-                System.Diagnostics.Debug.WriteLine("=== LoadMartCatalog START ===");
+                TreeNode expandingNode = e.Node;
+                string nodeTag = expandingNode.Tag?.ToString() ?? "";
 
-                treeModels.Nodes.Clear();
-
-                // Create root node for Mart
-                TreeNode martRoot = new TreeNode("Mart")
+                // Check if this is a LIBRARY or CATEGORY node with placeholder children
+                if (nodeTag.StartsWith("LIBRARY:") || nodeTag.StartsWith("CATEGORY:"))
                 {
-                    Tag = "ROOT"
+                    if (expandingNode.Nodes.Count == 1 &&
+                        expandingNode.Nodes[0].Tag?.ToString() == "PLACEHOLDER")
+                    {
+                        string path = "";
+                        if (nodeTag.StartsWith("LIBRARY:"))
+                        {
+                            path = nodeTag.Substring("LIBRARY:".Length);
+                        }
+                        else if (nodeTag.StartsWith("CATEGORY:"))
+                        {
+                            path = nodeTag.Substring("CATEGORY:".Length);
+                        }
+
+                        // Remove placeholder
+                        expandingNode.Nodes.Clear();
+
+                        // Try to load models from Mart via SCAPI
+                        bool loaded = TryLoadModelsFromPath(path, expandingNode);
+
+                        if (!loaded)
+                        {
+                            TreeNode noModelsNode = new TreeNode("(No models found)")
+                            {
+                                Tag = "INFO",
+                                ForeColor = Color.Gray
+                            };
+                            expandingNode.Nodes.Add(noModelsNode);
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private bool TryLoadModelsFromPath(string path, TreeNode parentNode)
+        {
+            try
+            {
+                // Try to enumerate models from SCAPI MartConnection
+                if (_scapi.MartConnection != null && _scapi.MartConnection.Libraries != null)
+                {
+                    // Split path to get library name and category/folder
+                    string[] pathParts = path.Split('/');
+                    string libraryName = pathParts[0];
+                    string category = pathParts.Length > 1 ? pathParts[1] : null;
+
+                    for (int i = 1; i <= _scapi.MartConnection.Libraries.Count; i++)
+                    {
+                        dynamic lib = _scapi.MartConnection.Libraries.Item(i);
+                        if (lib.Name == libraryName && lib.Models != null)
+                        {
+                            int modelCount = lib.Models.Count;
+
+                            for (int j = 1; j <= modelCount; j++)
+                            {
+                                dynamic model = lib.Models.Item(j);
+                                string modelName = model.Name;
+
+                                // If category specified, filter models by category
+                                // Otherwise, add all models
+                                TreeNode modelNode = new TreeNode(modelName)
+                                {
+                                    Tag = $"MODEL:{path}/{modelName}"
+                                };
+                                parentNode.Nodes.Add(modelNode);
+                            }
+
+                            return modelCount > 0;
+                        }
+                    }
+                }
+
+                return false;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private string _lastApiError = "";
+
+        private async Task<string> AuthenticateMartApiAsync()
+        {
+            try
+            {
+                // Try MartServerCloud JWT endpoint first (erwin 10+)
+                var authUrl = $"http://{txtServerName.Text}:{txtPort.Text}/MartServerCloud/jwt/authenticate/login";
+
+                var authData = new
+                {
+                    username = txtUserName.Text,
+                    password = txtPassword.Text,
+                    versionString = "10.1",
+                    startNewSession = "true",
+                    resetPassword = "false",
+                    isWindowsAuthentication = "false",
+                    deviceInfo = "{\"deviceId\":\"erwin-admin-tool\",\"deviceData\":\"Windows|ErwinAdmin\"}"
                 };
-                treeModels.Nodes.Add(martRoot);
 
-                // Try to enumerate libraries from Mart server
-                // Note: SCAPI may not expose catalog browsing API, so we'll create placeholder structure
-                // Real catalog structure is managed by MartServer REST API (as seen in browser console)
+                string jsonBody = System.Text.Json.JsonSerializer.Serialize(authData);
+                var content = new StringContent(jsonBody, Encoding.UTF8, "application/json");
 
-                try
+                var response = await _httpClient.PostAsync(authUrl, content);
+
+                if (response.IsSuccessStatusCode)
                 {
-                    // Attempt to get libraries from SCAPI
-                    if (_scapi.MartConnection != null && _scapi.MartConnection.Libraries != null)
+                    var responseContent = await response.Content.ReadAsStringAsync();
+                    var jsonDoc = System.Text.Json.JsonDocument.Parse(responseContent);
+
+                    // Try different token property names
+                    if (jsonDoc.RootElement.TryGetProperty("id_token", out var idTokenElement))
                     {
-                        System.Diagnostics.Debug.WriteLine("Attempting to enumerate libraries from MartConnection...");
-
-                        int libCount = _scapi.MartConnection.Libraries.Count;
-                        System.Diagnostics.Debug.WriteLine($"Found {libCount} libraries via MartConnection");
-
-                        for (int i = 1; i <= libCount; i++)
-                        {
-                            dynamic library = _scapi.MartConnection.Libraries.Item(i);
-                            string libraryName = library.Name;
-                            System.Diagnostics.Debug.WriteLine($"  Library [{i}]: {libraryName}");
-
-                            TreeNode libraryNode = new TreeNode(libraryName)
-                            {
-                                Tag = $"LIBRARY:{libraryName}"
-                            };
-                            martRoot.Nodes.Add(libraryNode);
-
-                            // Add placeholder for lazy loading
-                            libraryNode.Nodes.Add(new TreeNode("(Expand to load models...)") { Tag = "PLACEHOLDER" });
-                        }
+                        return idTokenElement.GetString();
                     }
-                    else
+                    else if (jsonDoc.RootElement.TryGetProperty("token", out var tokenElement))
                     {
-                        throw new Exception("MartConnection.Libraries not available");
+                        return tokenElement.GetString();
                     }
-                }
-                catch (Exception enumEx)
-                {
-                    System.Diagnostics.Debug.WriteLine($"Could not enumerate libraries from SCAPI: {enumEx.Message}");
-                    System.Diagnostics.Debug.WriteLine("Creating static library structure based on visible Mart Portal libraries...");
-
-                    // Create static library nodes based on what we see in Mart Portal screenshot
-                    // Libraries: Demo, Kursat, Sample
-                    string[] knownLibraries = { "Kursat", "Demo", "Sample" };
-
-                    foreach (string libName in knownLibraries)
+                    else if (jsonDoc.RootElement.TryGetProperty("jwtToken", out var jwtElement))
                     {
-                        TreeNode libraryNode = new TreeNode(libName)
-                        {
-                            Tag = $"LIBRARY:{libName}"
-                        };
-                        martRoot.Nodes.Add(libraryNode);
-
-                        // Add some known models for Kursat library (from screenshot)
-                        if (libName == "Kursat")
-                        {
-                            TreeNode modelNode = new TreeNode("PublicationSystemSample_Modified")
-                            {
-                                Tag = "MODEL:Kursat/PublicationSystemSample_Modified"
-                            };
-                            libraryNode.Nodes.Add(modelNode);
-                        }
-                        else
-                        {
-                            // Add placeholder for other libraries
-                            libraryNode.Nodes.Add(new TreeNode("(Double-click to refresh)") { Tag = "PLACEHOLDER" });
-                        }
+                        return jwtElement.GetString();
                     }
+                    else if (jsonDoc.RootElement.TryGetProperty("bearerToken", out var bearerElement))
+                    {
+                        return bearerElement.GetString();
+                    }
+
+                    // If no token found, return whole response for debugging
+                    _lastApiError = $"Auth response OK but no token found. Response: {responseContent.Substring(0, Math.Min(200, responseContent.Length))}";
+                    return null;
                 }
 
-                // Expand root node
-                martRoot.Expand();
-                System.Diagnostics.Debug.WriteLine("=== LoadMartCatalog END ===");
+                _lastApiError = $"Auth failed: HTTP {(int)response.StatusCode} - {response.ReasonPhrase}";
+                return null;
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine($"ERROR in LoadMartCatalog: {ex.Message}");
+                _lastApiError = $"Auth exception: {ex.Message}";
+                return null;
+            }
+        }
 
-                // Create simple fallback structure
-                treeModels.Nodes.Clear();
-                TreeNode martRoot = new TreeNode("Mart (Manual Entry Required)")
+        private async Task<System.Text.Json.JsonDocument> GetMartCatalogJsonAsync()
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(_bearerToken))
                 {
-                    Tag = "ROOT"
-                };
-                treeModels.Nodes.Add(martRoot);
+                    _bearerToken = await AuthenticateMartApiAsync();
+                    if (string.IsNullOrEmpty(_bearerToken))
+                        return null;
+                }
 
-                TreeNode infoNode = new TreeNode("Could not load catalog automatically")
-                {
-                    Tag = "INFO"
-                };
-                martRoot.Nodes.Add(infoNode);
+                var catalogUrl = $"http://{txtServerName.Text}:{txtPort.Text}/MartServer/service/catalog/getCatalogChildren";
 
-                TreeNode helpNode = new TreeNode("Please enter model path manually: library/modelName")
+                var catalogData = new
                 {
-                    Tag = "HELP"
+                    d = "0",  // Root level
+                    state = "false",  // No encryption for now
+                    getHiddenVersions = "N",
+                    connector = "false"
                 };
-                martRoot.Nodes.Add(helpNode);
+
+                string jsonBody = System.Text.Json.JsonSerializer.Serialize(catalogData);
+                var content = new StringContent(jsonBody, Encoding.UTF8, "application/json");
+
+                // Add JWT token as bearer
+                _httpClient.DefaultRequestHeaders.Authorization =
+                    new AuthenticationHeaderValue("Bearer", _bearerToken);
+
+                var response = await _httpClient.PostAsync(catalogUrl, content);
+
+                if (response.IsSuccessStatusCode)
+                {
+                    var responseContent = await response.Content.ReadAsStringAsync();
+
+                    // Response might start with "0|" prefix
+                    if (responseContent.StartsWith("0|"))
+                    {
+                        responseContent = responseContent.Substring(2);
+                    }
+
+                    return System.Text.Json.JsonDocument.Parse(responseContent);
+                }
+
+                _lastApiError = $"Catalog failed: HTTP {(int)response.StatusCode}";
+                return null;
+            }
+            catch (Exception ex)
+            {
+                _lastApiError = $"Catalog exception: {ex.Message}";
+                return null;
+            }
+        }
+
+        private async void LoadMartCatalog()
+        {
+            treeModels.Nodes.Clear();
+            TreeNode martRoot = new TreeNode("Mart - Loading...") { Tag = "ROOT" };
+            treeModels.Nodes.Add(martRoot);
+            martRoot.Expand();
+
+            try
+            {
+                Cursor.Current = Cursors.WaitCursor;
+                Application.DoEvents();
+
+                var catalogJson = await GetMartCatalogJsonAsync();
+
+                if (catalogJson == null)
+                {
+                    martRoot.Text = "Mart Connected (Catalog API unavailable)";
+
+                    if (!string.IsNullOrEmpty(_lastApiError))
+                    {
+                        TreeNode errorDetailNode = new TreeNode(_lastApiError)
+                        {
+                            Tag = "ERROR",
+                            ForeColor = Color.Red
+                        };
+                        martRoot.Nodes.Add(errorDetailNode);
+                    }
+
+                    TreeNode infoNode = new TreeNode("REST API authentication failed or not available")
+                    {
+                        Tag = "INFO",
+                        ForeColor = Color.Red
+                    };
+                    martRoot.Nodes.Add(infoNode);
+
+                    TreeNode instructionNode = new TreeNode("Enter model path manually: Library/ModelName")
+                    {
+                        Tag = "INFO",
+                        ForeColor = Color.DarkGreen
+                    };
+                    martRoot.Nodes.Add(instructionNode);
+
+                    TreeNode exampleNode = new TreeNode("Example: Kursat/PublicationSystemSample_Modified")
+                    {
+                        Tag = "INFO",
+                        ForeColor = Color.Gray
+                    };
+                    martRoot.Nodes.Add(exampleNode);
+
+                    martRoot.Expand();
+                    return;
+                }
+
+                martRoot.Text = "Mart Catalog";
+                martRoot.Nodes.Clear();
+
+                // Parse catalog JSON
+                if (catalogJson.RootElement.TryGetProperty("getChildCatalogs", out var catalogs))
+                {
+                    foreach (var catalog in catalogs.EnumerateArray())
+                    {
+                        string entryName = catalog.GetProperty("entryname").GetString();
+                        string entryType = catalog.GetProperty("entrytype").GetString();
+                        string entryId = catalog.GetProperty("entryid").GetString();
+
+                        // For now, just show libraries (will need recursive loading for full catalog)
+                        var catalogNode = new TreeNode(entryName)
+                        {
+                            Tag = $"CATALOG:{entryId}:{entryName}",
+                            ForeColor = Color.DarkBlue
+                        };
+                        martRoot.Nodes.Add(catalogNode);
+
+                        // Add placeholder for children (will implement lazy loading later)
+                        catalogNode.Nodes.Add(new TreeNode("Loading...") { Tag = "PLACEHOLDER" });
+                    }
+                }
+
+                if (martRoot.Nodes.Count == 0)
+                {
+                    TreeNode emptyNode = new TreeNode("No catalogs found")
+                    {
+                        Tag = "INFO",
+                        ForeColor = Color.Gray
+                    };
+                    martRoot.Nodes.Add(emptyNode);
+                }
 
                 martRoot.Expand();
+            }
+            catch (Exception ex)
+            {
+                martRoot.Text = "Mart Connected (Error loading catalog)";
+
+                TreeNode errorNode = new TreeNode($"Error: {ex.Message}")
+                {
+                    Tag = "ERROR",
+                    ForeColor = Color.Red
+                };
+                martRoot.Nodes.Add(errorNode);
+
+                TreeNode instructionNode = new TreeNode("Enter model path manually: Library/ModelName")
+                {
+                    Tag = "INFO",
+                    ForeColor = Color.DarkGreen
+                };
+                martRoot.Nodes.Add(instructionNode);
+
+                martRoot.Expand();
+            }
+            finally
+            {
+                Cursor.Current = Cursors.Default;
             }
         }
 
@@ -433,6 +693,9 @@ namespace EliteSoft.Erwin.Admin
                 // Store Mart connection settings (actual connection happens during model load)
                 string martServer = $"{txtServerName.Text}:{txtPort.Text}";
 
+                // Set Mart REST API base URL
+                _martApiBaseUrl = $"http://{txtServerName.Text}:{txtPort.Text}/MartServer/api";
+
                 Cursor.Current = Cursors.WaitCursor;
                 Application.DoEvents();
 
@@ -451,9 +714,9 @@ namespace EliteSoft.Erwin.Admin
                     $"Mart connection configured!\n\n" +
                     $"Server: {martServer}\n" +
                     $"User: {txtUserName.Text}\n\n" +
-                    $"Mart catalog loaded.\n" +
                     $"'Load Model' tab is now enabled.\n\n" +
-                    $"Select a model from the tree and click 'Load Selected Model'.",
+                    $"Loading catalog via REST API...\n" +
+                    $"You can select a model from the tree or enter path manually.",
                     "Configuration Successful",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Information
@@ -488,8 +751,6 @@ namespace EliteSoft.Erwin.Admin
 
         private void BtnLoadFromFile_Click(object sender, EventArgs e)
         {
-            System.Diagnostics.Debug.WriteLine("=== BtnLoadFromFile_Click START ===");
-
             try
             {
                 using (OpenFileDialog openFileDialog = new OpenFileDialog())
@@ -499,14 +760,9 @@ namespace EliteSoft.Erwin.Admin
                     openFileDialog.FilterIndex = 1;
                     openFileDialog.RestoreDirectory = true;
 
-                    if (openFileDialog.ShowDialog() != DialogResult.OK)
-                    {
-                        System.Diagnostics.Debug.WriteLine("User cancelled file selection");
-                        return;
-                    }
+                    if (openFileDialog.ShowDialog() != DialogResult.OK) return;
 
                     string filePath = openFileDialog.FileName;
-                    System.Diagnostics.Debug.WriteLine($"File selected: {filePath}");
 
                     if (!System.IO.File.Exists(filePath))
                     {
@@ -515,37 +771,21 @@ namespace EliteSoft.Erwin.Admin
                         return;
                     }
 
-                    // Show progress
                     Cursor.Current = Cursors.WaitCursor;
                     Application.DoEvents();
-
-                    System.Diagnostics.Debug.WriteLine("About to load model from file using SCAPI");
 
                     try
                     {
                         if (_scapi == null)
-                        {
                             throw new InvalidOperationException("SCAPI object is null. Please restart the application.");
-                        }
 
-                        System.Diagnostics.Debug.WriteLine("Calling PersistenceUnits.Add() with file path");
-
-                        // Load model from file - MUCH SAFER than Mart loading
                         dynamic loadedModel = _scapi.PersistenceUnits.Add(filePath, "RDO=Yes");
 
-                        System.Diagnostics.Debug.WriteLine("Model loaded successfully from file!");
-
                         if (loadedModel == null)
-                        {
                             throw new InvalidOperationException("Model loaded but returned null object");
-                        }
 
-                        // Success!
                         _currentModel = loadedModel;
-
-                        // Enable Check Naming tab
                         tabCheckNaming.Enabled = true;
-
                         Cursor.Current = Cursors.Default;
 
                         MessageBox.Show(
@@ -557,14 +797,10 @@ namespace EliteSoft.Erwin.Admin
                             MessageBoxButtons.OK,
                             MessageBoxIcon.Information
                         );
-
-                        System.Diagnostics.Debug.WriteLine("Success message shown");
                     }
                     catch (System.Runtime.InteropServices.COMException comEx)
                     {
                         Cursor.Current = Cursors.Default;
-                        System.Diagnostics.Debug.WriteLine($"COM Exception: {comEx.Message}");
-
                         MessageBox.Show(
                             $"COM Error loading model from file!\n\n" +
                             $"HRESULT: 0x{comEx.HResult:X8}\n" +
@@ -582,8 +818,6 @@ namespace EliteSoft.Erwin.Admin
                     catch (Exception ex)
                     {
                         Cursor.Current = Cursors.Default;
-                        System.Diagnostics.Debug.WriteLine($"Exception: {ex.GetType().Name} - {ex.Message}");
-
                         MessageBox.Show(
                             $"Error loading model from file!\n\n" +
                             $"Error: {ex.GetType().Name}\n" +
@@ -599,8 +833,6 @@ namespace EliteSoft.Erwin.Admin
             catch (Exception ex)
             {
                 Cursor.Current = Cursors.Default;
-                System.Diagnostics.Debug.WriteLine($"Outer exception: {ex.GetType().Name} - {ex.Message}");
-
                 MessageBox.Show(
                     $"Unexpected error!\n\n{ex.Message}",
                     "Error",
@@ -608,277 +840,146 @@ namespace EliteSoft.Erwin.Admin
                     MessageBoxIcon.Error
                 );
             }
-
-            System.Diagnostics.Debug.WriteLine("=== BtnLoadFromFile_Click END ===");
         }
 
         private void BtnLoadModel_Click(object sender, EventArgs e)
         {
-            // EXTENSIVE DEBUG LOGGING TO IDENTIFY CRASH POINT
-            System.Diagnostics.Debug.WriteLine("=== BtnLoadModel_Click START ===");
-            System.Diagnostics.Debug.WriteLine($"Timestamp: {DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}");
-
             string selectedModel = "";
             string martServer = "";
             string martUrl = "";
 
             try
             {
-                System.Diagnostics.Debug.WriteLine("STEP 1: Starting validation checks");
-
                 if (!_isMartConnected)
                 {
-                    System.Diagnostics.Debug.WriteLine("STEP 1a: Not connected - showing message");
                     MessageBox.Show("Please connect to Mart first.", "Not Connected",
                         MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                    System.Diagnostics.Debug.WriteLine("STEP 1b: Message shown - returning");
                     return;
                 }
 
-                System.Diagnostics.Debug.WriteLine("STEP 2: Extracting selected model from TreeView");
-
+                // First, check if a model is selected in TreeView
                 TreeNode selectedNode = treeModels.SelectedNode;
-                if (selectedNode == null)
+                string modelPath = "";
+
+                if (selectedNode != null && selectedNode.Tag != null)
                 {
-                    System.Diagnostics.Debug.WriteLine("STEP 2a: No node selected - showing message");
-                    MessageBox.Show("Please select a model from the tree.", "No Selection",
-                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                    treeModels.Focus();
-                    System.Diagnostics.Debug.WriteLine("STEP 2b: Message shown - returning");
-                    return;
+                    string nodeTag = selectedNode.Tag.ToString();
+                    if (nodeTag.StartsWith("MODEL:"))
+                    {
+                        modelPath = nodeTag.Substring("MODEL:".Length);
+                    }
+                    else if (!nodeTag.StartsWith("LIBRARY:") && !nodeTag.StartsWith("INFO") && !nodeTag.StartsWith("ERROR") && !nodeTag.StartsWith("ROOT"))
+                    {
+                        MessageBox.Show(
+                            "Please select a model from the tree (not a library or folder).\n\n" +
+                            "Expand the library nodes to see available models.",
+                            "Invalid Selection",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Warning);
+                        return;
+                    }
                 }
 
-                System.Diagnostics.Debug.WriteLine($"STEP 2c: Selected node: {selectedNode.Text}, Tag: {selectedNode.Tag}");
-
-                // Verify that a MODEL node is selected (not ROOT, CATALOG, or LIBRARY)
-                string nodeTag = selectedNode.Tag?.ToString() ?? "";
-                if (!nodeTag.StartsWith("MODEL:"))
+                // If no model selected from tree, use manual TextBox input
+                if (string.IsNullOrWhiteSpace(modelPath))
                 {
-                    System.Diagnostics.Debug.WriteLine("STEP 2d: Selected node is not a model - showing message");
-                    MessageBox.Show(
-                        "Please select a model (not a folder or catalog).\n\n" +
-                        "Expand the tree to find a model and select it.",
-                        "Invalid Selection",
-                        MessageBoxButtons.OK,
-                        MessageBoxIcon.Warning);
-                    System.Diagnostics.Debug.WriteLine("STEP 2e: Message shown - returning");
-                    return;
+                    modelPath = txtModelPath.Text.Trim();
+                    if (string.IsNullOrWhiteSpace(modelPath))
+                    {
+                        MessageBox.Show(
+                            "Please select a model from the tree or enter a model path.\n\n" +
+                            "Format: Library/ModelName\n" +
+                            "Example: Kursat/PublicationSystemSample_Modified",
+                            "No Model Selected",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Warning);
+                        txtModelPath.Focus();
+                        return;
+                    }
                 }
 
-                // Extract model path from tag (format: "MODEL:library/modelName")
-                selectedModel = nodeTag.Substring("MODEL:".Length);
-                System.Diagnostics.Debug.WriteLine($"STEP 2f: Model path extracted: {selectedModel}");
-
-                System.Diagnostics.Debug.WriteLine("STEP 3: Building connection parameters");
-
-                // Build Mart URL with PSW (not PWD!) - erwin documentation specifies PSW
+                selectedModel = modelPath;
                 martServer = $"{txtServerName.Text}:{txtPort.Text}";
-                System.Diagnostics.Debug.WriteLine($"STEP 3a: Mart Server: {martServer}");
-
-                // CORRECTED: Use PSW instead of PWD (from erwin documentation)
-                // Format: mart://Mart/library/ModelName?SRV=localhost;PRT=8082;UID=sa;PSW=password
                 string connectionParams = $"SRV={txtServerName.Text};PRT={txtPort.Text};UID={txtUserName.Text};PSW={txtPassword.Text}";
                 martUrl = $"mart://Mart/{selectedModel}?{connectionParams}";
-                System.Diagnostics.Debug.WriteLine($"STEP 3b: Mart URL (with PSW embedded): {martUrl.Replace(txtPassword.Text, "******")}");
 
-                // Use RDO=Yes for read-only access
-                string options = "RDO=Yes";
-                System.Diagnostics.Debug.WriteLine($"STEP 3c: Options parameter: {options}");
-
-                System.Diagnostics.Debug.WriteLine("STEP 4: Setting cursor to wait");
                 Cursor.Current = Cursors.WaitCursor;
                 Application.DoEvents();
-                System.Diagnostics.Debug.WriteLine("STEP 4a: Cursor set, DoEvents completed");
 
-                System.Diagnostics.Debug.WriteLine("STEP 5: Initializing load variables");
                 dynamic loadedModel = null;
-                bool loadSuccess = false;
                 string loadErrorMessage = "";
-                System.Diagnostics.Debug.WriteLine("STEP 5a: Variables initialized");
 
                 try
                 {
-                    System.Diagnostics.Debug.WriteLine("STEP 6: Entering inner try block for SCAPI call");
+                    if (_scapi?.PersistenceUnits == null)
+                        throw new InvalidOperationException("SCAPI not initialized. Please restart the application.");
 
-                    System.Diagnostics.Debug.WriteLine("STEP 6a: Checking if _scapi is null");
-                    if (_scapi == null)
-                    {
-                        System.Diagnostics.Debug.WriteLine("STEP 6a-ERROR: _scapi is NULL!");
-                        throw new InvalidOperationException("SCAPI object is null. Please restart the application.");
-                    }
-                    System.Diagnostics.Debug.WriteLine("STEP 6a-OK: _scapi is not null");
-
-                    System.Diagnostics.Debug.WriteLine("STEP 6b: Checking if _scapi.PersistenceUnits is null");
-                    if (_scapi.PersistenceUnits == null)
-                    {
-                        System.Diagnostics.Debug.WriteLine("STEP 6b-ERROR: PersistenceUnits is NULL!");
-                        throw new InvalidOperationException("SCAPI PersistenceUnits is null. SCAPI may not be initialized properly.");
-                    }
-                    System.Diagnostics.Debug.WriteLine("STEP 6b-OK: PersistenceUnits is not null");
-
-                    // Mart connection already established in Connect button via OpenMart()
-                    System.Diagnostics.Debug.WriteLine("STEP 6c: Loading model from connected Mart (OpenMart already called)");
-                    System.Diagnostics.Debug.WriteLine($"  URL: {martUrl}");
-                    System.Diagnostics.Debug.WriteLine($"  Options: {options}");
-                    System.Diagnostics.Debug.WriteLine($"  Mart Connected: {_isMartConnected}");
-
-                    // Now that Mart connection is established via OpenMart(), load model
-                    // URL format: mart://Mart/library/ModelName?SRV=server;PRT=port;UID=user;PSW=password
-                    System.Diagnostics.Debug.WriteLine("STEP 6c-1: Calling PersistenceUnits.Add");
-                    loadedModel = _scapi.PersistenceUnits.Add(martUrl, options);
-                    System.Diagnostics.Debug.WriteLine("STEP 6c-2: PersistenceUnits.Add completed");
+                    loadedModel = _scapi.PersistenceUnits.Add(martUrl, "RDO=Yes");
 
                     if (loadedModel == null)
-                    {
                         throw new InvalidOperationException("Model loaded but returned null object");
-                    }
 
-                    System.Diagnostics.Debug.WriteLine("STEP 6d: PersistenceUnits.Add() COMPLETED SUCCESSFULLY!");
-                    System.Diagnostics.Debug.WriteLine($"  Loaded model object: {(loadedModel != null ? "NOT NULL" : "NULL")}");
+                    _currentModel = loadedModel;
+                    tabCheckNaming.Enabled = true;
+                    Cursor.Current = Cursors.Default;
 
-                    loadSuccess = true;
-                    System.Diagnostics.Debug.WriteLine("STEP 6e: loadSuccess set to true");
+                    MessageBox.Show(
+                        $"Model successfully loaded from Mart!\n\n" +
+                        $"Model: {selectedModel}\n" +
+                        $"Server: {martServer}\n" +
+                        $"User: {txtUserName.Text}\n\n" +
+                        $"'Check Naming Conventions' tab is now enabled.",
+                        "Success",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information
+                    );
                 }
                 catch (System.Runtime.InteropServices.COMException comEx)
                 {
-                    System.Diagnostics.Debug.WriteLine("STEP 6-CATCH-COM: COM Exception caught!");
-                    System.Diagnostics.Debug.WriteLine($"  HRESULT: 0x{comEx.HResult:X8}");
-                    System.Diagnostics.Debug.WriteLine($"  Message: {comEx.Message}");
-
-                    loadErrorMessage = $"COM Error occurred while connecting to Mart.\n\n" +
-                                      $"HRESULT: 0x{comEx.HResult:X8}\n" +
-                                      $"Message: {comEx.Message}\n\n" +
-                                      $"This usually means:\n" +
-                                      $"- Invalid username or password\n" +
-                                      $"- Mart server is not accessible\n" +
-                                      $"- Model does not exist in the specified library/path\n" +
-                                      $"- Network connection issue\n" +
-                                      $"- Incorrect model path format (should be: library/ModelName)";
-                }
-                catch (InvalidOperationException ioEx)
-                {
-                    System.Diagnostics.Debug.WriteLine("STEP 6-CATCH-IO: InvalidOperationException caught!");
-                    System.Diagnostics.Debug.WriteLine($"  Message: {ioEx.Message}");
-
-                    loadErrorMessage = $"Invalid Operation:\n\n{ioEx.Message}";
-                }
-                catch (Exception loadEx)
-                {
-                    System.Diagnostics.Debug.WriteLine("STEP 6-CATCH-GENERAL: General Exception caught!");
-                    System.Diagnostics.Debug.WriteLine($"  Type: {loadEx.GetType().Name}");
-                    System.Diagnostics.Debug.WriteLine($"  Message: {loadEx.Message}");
-
-                    loadErrorMessage = $"Error Type: {loadEx.GetType().Name}\n" +
-                                      $"Message: {loadEx.Message}";
-
-                    if (loadEx.InnerException != null)
-                    {
-                        System.Diagnostics.Debug.WriteLine($"  Inner Exception: {loadEx.InnerException.Message}");
-                        loadErrorMessage += $"\n\nInner Exception:\n{loadEx.InnerException.Message}";
-                    }
-                }
-                finally
-                {
-                    System.Diagnostics.Debug.WriteLine("STEP 7: In finally block - resetting cursor");
                     Cursor.Current = Cursors.Default;
-                    System.Diagnostics.Debug.WriteLine("STEP 7a: Cursor reset complete");
-                }
-
-                System.Diagnostics.Debug.WriteLine("STEP 8: Checking load success");
-                System.Diagnostics.Debug.WriteLine($"  loadSuccess: {loadSuccess}");
-                System.Diagnostics.Debug.WriteLine($"  loadedModel != null: {loadedModel != null}");
-
-                if (!loadSuccess || loadedModel == null)
-                {
-                    System.Diagnostics.Debug.WriteLine("STEP 8a: Load FAILED - showing error message");
-
-                    string fullError = $"Failed to load model from Mart!\n\n" +
-                                      $"Mart URL: {martUrl}\n" +
-                                      $"Server: {martServer}\n" +
-                                      $"User: {txtUserName.Text}\n" +
-                                      $"Model: {selectedModel}\n\n" +
-                                      $"{loadErrorMessage}";
-
-                    System.Diagnostics.Debug.WriteLine($"STEP 8b: Error message prepared, showing MessageBox");
                     MessageBox.Show(
-                        fullError,
+                        $"Failed to load model from Mart!\n\n" +
+                        $"Mart URL: {martUrl}\n" +
+                        $"Server: {martServer}\n" +
+                        $"User: {txtUserName.Text}\n" +
+                        $"Model: {selectedModel}\n\n" +
+                        $"HRESULT: 0x{comEx.HResult:X8}\n" +
+                        $"Message: {comEx.Message}\n\n" +
+                        $"This usually means:\n" +
+                        $"- Invalid username or password\n" +
+                        $"- Mart server is not accessible\n" +
+                        $"- Model does not exist in the specified library/path\n" +
+                        $"- Network connection issue",
                         "Model Load Failed",
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Error
                     );
-                    System.Diagnostics.Debug.WriteLine("STEP 8c: MessageBox shown, returning");
-                    return;
                 }
-
-                System.Diagnostics.Debug.WriteLine("STEP 9: Load SUCCESS - processing result");
-                _currentModel = loadedModel;
-                System.Diagnostics.Debug.WriteLine("STEP 9a: _currentModel assigned");
-
-                System.Diagnostics.Debug.WriteLine("STEP 10: Enabling Check Naming tab");
-                tabCheckNaming.Enabled = true;
-                System.Diagnostics.Debug.WriteLine("STEP 10a: Tab enabled");
-
-                System.Diagnostics.Debug.WriteLine("STEP 11: Showing success message");
-                MessageBox.Show(
-                    $"Model successfully loaded from Mart!\n\n" +
-                    $"Model: {selectedModel}\n" +
-                    $"Server: {martServer}\n" +
-                    $"User: {txtUserName.Text}\n\n" +
-                    $"'Check Naming Conventions' tab is now enabled.\n" +
-                    $"You can now work with this model.",
-                    "Success",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Information
-                );
-                System.Diagnostics.Debug.WriteLine("STEP 11a: Success message shown");
-            }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine("=== OUTER CATCH BLOCK ENTERED ===");
-                System.Diagnostics.Debug.WriteLine($"Exception Type: {ex.GetType().FullName}");
-                System.Diagnostics.Debug.WriteLine($"Exception Message: {ex.Message}");
-
-                Cursor.Current = Cursors.Default;
-
-                string errorDetails = $"CRITICAL ERROR in Load Model!\n\n" +
-                                    $"Error Type: {ex.GetType().FullName}\n" +
-                                    $"Message: {ex.Message}\n" +
-                                    $"Source: {ex.Source}\n\n" +
-                                    $"Context:\n" +
-                                    $"Model: {selectedModel}\n" +
-                                    $"Server: {martServer}\n" +
-                                    $"Mart URL: {martUrl}\n\n" +
-                                    $"Stack Trace:\n{ex.StackTrace}";
-
-                if (ex.InnerException != null)
+                catch (Exception loadEx)
                 {
-                    errorDetails += $"\n\n=== Inner Exception ===\n" +
-                                  $"Type: {ex.InnerException.GetType().FullName}\n" +
-                                  $"Message: {ex.InnerException.Message}\n" +
-                                  $"Stack Trace:\n{ex.InnerException.StackTrace}";
-                }
-
-                System.Diagnostics.Debug.WriteLine(errorDetails);
-
-                try
-                {
-                    System.Diagnostics.Debug.WriteLine("Attempting to show MessageBox with error");
+                    Cursor.Current = Cursors.Default;
                     MessageBox.Show(
-                        errorDetails,
-                        "Critical Error - Application Continuing",
+                        $"Failed to load model from Mart!\n\n" +
+                        $"Model: {selectedModel}\n" +
+                        $"Server: {martServer}\n\n" +
+                        $"Error: {loadEx.Message}",
+                        "Model Load Failed",
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Error
                     );
-                    System.Diagnostics.Debug.WriteLine("MessageBox shown successfully");
-                }
-                catch (Exception msgBoxEx)
-                {
-                    System.Diagnostics.Debug.WriteLine($"FAILED TO SHOW MESSAGEBOX: {msgBoxEx.Message}");
                 }
             }
-
-            System.Diagnostics.Debug.WriteLine("=== BtnLoadModel_Click END ===");
-            System.Diagnostics.Debug.WriteLine("");
+            catch (Exception ex)
+            {
+                Cursor.Current = Cursors.Default;
+                MessageBox.Show(
+                    $"Unexpected error!\n\n" +
+                    $"Error: {ex.Message}",
+                    "Error",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error
+                );
+            }
         }
 
         protected override void OnFormClosed(FormClosedEventArgs e)
@@ -890,14 +991,11 @@ namespace EliteSoft.Erwin.Admin
                 try
                 {
                     _scapi.PersistenceUnits.Remove(_currentModel);
-                    System.Diagnostics.Debug.WriteLine("Current model removed from PersistenceUnits");
                 }
-                catch (Exception ex)
-                {
-                    System.Diagnostics.Debug.WriteLine($"Failed to remove model: {ex.Message}");
-                }
+                catch { }
             }
 
+            _httpClient?.Dispose();
             _scapi = null;
             _martConnection = null;
         }

@@ -12,7 +12,8 @@
       "Bash(dir:*)",
       "Bash(powershell.exe -ExecutionPolicy Bypass -File \".\\\\build.ps1\")",
       "Bash(where:*)",
-      "Bash(powershell.exe:*)"
+      "Bash(powershell.exe:*)",
+      "Bash(dotnet restore:*)"
     ]
   }
 }

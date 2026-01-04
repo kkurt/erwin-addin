@@ -11,12 +11,20 @@
 
   <ItemGroup>
     <Reference Include="Microsoft.CSharp" />
+    <Reference Include="Microsoft.VisualBasic" />
+    <Reference Include="System.Net.Http" />
   </ItemGroup>
 
   <ItemGroup>
-    <!-- Exclude deprecated Form1.cs from compilation -->
+    <PackageReference Include="System.Text.Json" Version="8.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Exclude deprecated files from compilation -->
     <Compile Remove="Form1.cs" />
     <None Include="Form1.cs" />
+    <Compile Remove="MartCatalogBrowser.cs" />
+    <None Include="MartCatalogBrowser.cs" />
   </ItemGroup>
 
 </Project>
