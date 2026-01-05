@@ -47,7 +47,9 @@
       "Bash(git reset:*)",
       "Bash(git add:*)",
       "Bash(git restore:*)",
-      "Bash(dir:*)"
+      "Bash(dir:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nAdd Mart Server REST API integration with dynamic catalog loading\n\n- Implement MartApiClient for REST API authentication and catalog operations\n- Add ErwinScapiService with Session support for UDP value access\n- Create MartConnectionForm with 3-panel wizard UI \\(Connect, Load Model, Model Properties\\)\n- Add loading overlay animation during model loading\n- Implement tree view for Mart catalog navigation\n- Add Model Properties tab with General, UDP, and Naming Conventions tabs\n- Clean up test files and temporary artifacts\n\n🤖 Generated with [Claude Code]\\(https://claude.com/claude-code\\)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git push)"
     ]
   }
 }
