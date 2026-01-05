@@ -3,6 +3,7 @@
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
     <RootNamespace>EliteSoft.Erwin.Admin</RootNamespace>
     <AssemblyName>EliteSoft.Erwin.Admin</AssemblyName>
     <UseWindowsForms>true</UseWindowsForms>
@@ -16,7 +17,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="System.Text.Json" Version="8.0.0" />
+    <PackageReference Include="System.Text.Json" Version="9.0.0" />
   </ItemGroup>
 
   <ItemGroup>

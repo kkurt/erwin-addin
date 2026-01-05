@@ -1,0 +1,15 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": ".NET Framework Launch",
+            "type": "clr",
+            "request": "launch",
+            "preLaunchTask": "build",
+            "program": "${workspaceFolder}/ErwinAdmin/bin/Debug/net48/EliteSoft.Erwin.Admin.exe",
+            "cwd": "${workspaceFolder}/ErwinAdmin/bin/Debug/net48",
+            "stopAtEntry": false,
+            "console": "internalConsole"
+        }
+    ]
+}

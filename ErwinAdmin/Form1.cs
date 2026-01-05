@@ -7,7 +7,9 @@ namespace EliteSoft.Erwin.Admin
 {
     // DEPRECATED: This form is kept for reference only
     // Use MartConnectionForm instead
-    public partial class Form1 : Form
+ 
+ 
+     public partial class Form1 : Form
     {
         private dynamic oApplication;
         private dynamic oCurrentModel;
