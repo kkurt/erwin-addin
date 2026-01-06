@@ -53,7 +53,8 @@
       "Bash(git config:*)",
       "Bash(ls:*)",
       "Bash(C:WindowsMicrosoft.NETFramework64v4.0.30319regasm.exe \"c:\\\\Users\\\\Administrator\\\\source\\\\repos\\\\erwin-addin\\\\ErwinAddIn\\\\bin\\\\Release\\\\net48\\\\EliteSoft.Erwin.AddIn.dll\" /codebase /tlb)",
-      "Bash(start EliteSoft.Erwin.Admin.exe)"
+      "Bash(start EliteSoft.Erwin.Admin.exe)",
+      "Bash(del \"c:\\\\Users\\\\Administrator\\\\source\\\\repos\\\\erwin-addin\\\\ErwinAddIn\\\\ModelConfigForm.cs\")"
     ]
   }
 }
