@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using EliteSoft.Erwin.Admin.Models;
 
 namespace EliteSoft.Erwin.Admin.Services
@@ -58,6 +59,21 @@ namespace EliteSoft.Erwin.Admin.Services
         /// Gets UDP values with debug logging
         /// </summary>
         List<UdpValue> GetModelUdpValues(Action<string> log);
+
+        /// <summary>
+        /// Gets naming standards from the model
+        /// </summary>
+        List<NamingStandard> GetNamingStandards(Action<string> log = null);
+    }
+
+    /// <summary>
+    /// Represents a Naming Standard in the model
+    /// </summary>
+    public class NamingStandard
+    {
+        public string Name { get; set; }
+        public string ObjectType { get; set; }
+        public string Description { get; set; }
     }
 
     /// <summary>
@@ -365,96 +381,129 @@ namespace EliteSoft.Erwin.Admin.Services
             {
                 log("[UDP] Getting Model UDP values via Session...");
 
-                // Get the Subject_Area object - UDP values are stored on Subject_Area, not Model
-                // Use _session.ModelObjects (not _currentModel.ModelObjects)
+                dynamic modelObjects = null;
+                try
+                {
+                    modelObjects = _session.ModelObjects;
+                    log($"[UDP] Got ModelObjects from Session, Count: {modelObjects.Count}");
+                }
+                catch (Exception ex)
+                {
+                    log($"[UDP] Failed to get ModelObjects: {ex.Message}");
+                    return result;
+                }
+
+                // Get the root/model object first
+                dynamic modelRoot = null;
+                try
+                {
+                    modelRoot = modelObjects.Root;
+                    string rootClassName = "unknown";
+                    try { rootClassName = modelRoot.ClassName; } catch { }
+                    log($"[UDP] Root object: {modelRoot?.Name ?? "(no name)"}, ClassName: {rootClassName}");
+                }
+                catch (Exception ex)
+                {
+                    log($"[UDP] Failed to get Root: {ex.Message}");
+                }
+
+                // Known UDP names we're looking for
+                var udpNames = new[] { "ES_DatabaseName", "ES_SchemaName", "ES_FullName", "ES_Code" };
+
+                // First, let's check both Logical and Physical values explicitly
+                log("[UDP] === Checking Logical vs Physical UDP values ===");
+                foreach (var udpName in udpNames)
+                {
+                    string logicalValue = null;
+                    string physicalValue = null;
+
+                    // Try Model.Logical
+                    try { logicalValue = modelRoot?.Properties($"Model.Logical.{udpName}").Value?.ToString(); } catch { }
+                    // Try Model.Physical
+                    try { physicalValue = modelRoot?.Properties($"Model.Physical.{udpName}").Value?.ToString(); } catch { }
+
+                    log($"[UDP]   {udpName}: Logical='{logicalValue ?? "(null)"}', Physical='{physicalValue ?? "(null)"}'");
+                }
+                log("[UDP] ===================================");
+
+                // Try multiple strategies to find UDP values
+
+                // Strategy 1: Try to get Subject_Area if it exists
                 dynamic subjectArea = null;
                 try
                 {
-                    var modelObjects = _session.ModelObjects;
-                    log($"[UDP] Got ModelObjects from Session");
                     var saCollection = modelObjects.Collect("Subject_Area");
-                    log($"[UDP] Subject_Area count: {saCollection?.Count ?? 0}");
-                    if (saCollection != null && saCollection.Count > 0)
+                    int count = saCollection?.Count ?? 0;
+                    log($"[UDP] Subject_Area collection count: {count}");
+                    if (count > 0)
                     {
-                        subjectArea = saCollection.Item(0);
-                        log($"[UDP] Got Subject_Area: {subjectArea?.Name ?? "(no name)"}");
+                        try { subjectArea = saCollection.Item(1); }
+                        catch { try { subjectArea = saCollection.Item(0); } catch { } }
+
+                        if (subjectArea != null)
+                            log($"[UDP] Got Subject_Area: {subjectArea?.Name ?? "(no name)"}");
                     }
                 }
                 catch (Exception ex)
                 {
-                    log($"[UDP] Failed to get Subject_Area collection: {ex.Message}");
+                    log($"[UDP] Subject_Area not available: {ex.Message}");
                 }
 
-                // Fallback to Root if Subject_Area not found
-                if (subjectArea == null)
+                // Strategy 2: Try Default_Subject_Area property on model
+                if (subjectArea == null && modelRoot != null)
                 {
                     try
                     {
-                        subjectArea = _session.ModelObjects.Root;
-                        log($"[UDP] Using Root object: {subjectArea?.Name ?? "(no name)"}");
+                        subjectArea = modelRoot.Default_Subject_Area;
+                        log($"[UDP] Got Default_Subject_Area: {subjectArea?.Name ?? "(no name)"}");
                     }
                     catch (Exception ex)
                     {
-                        log($"[UDP] Failed to get Root: {ex.Message}");
+                        log($"[UDP] Default_Subject_Area not available: {ex.Message}");
                     }
                 }
 
-                if (subjectArea == null)
-                {
-                    log("[UDP] No Subject_Area or Root object found");
-                    return result;
-                }
+                // Create a list of objects to try for UDP values
+                var objectsToTry = new List<(dynamic obj, string name)>();
+                if (subjectArea != null) objectsToTry.Add((subjectArea, "Subject_Area"));
+                if (modelRoot != null) objectsToTry.Add((modelRoot, "Model"));
 
-                // Known UDP names that apply to Subject_Area
-                var udpNames = new[] { "ES_DatabaseName", "ES_SchemaName", "ES_FullName", "ES_Code" };
+                // Property path patterns to try for each object
+                // Try Physical first (most common for database generation), then Logical
+                var pathPatterns = new[]
+                {
+                    "{0}",                              // Direct: ES_DatabaseName
+                    "Subject_Area.Physical.{0}",        // Subject_Area.Physical.ES_DatabaseName
+                    "Model.Physical.{0}",               // Model.Physical.ES_DatabaseName
+                    "Physical.{0}",                     // Physical.ES_DatabaseName
+                    "Subject_Area.Logical.{0}",         // Subject_Area.Logical.ES_DatabaseName
+                    "Model.Logical.{0}",                // Model.Logical.ES_DatabaseName
+                    "Logical.{0}",                      // Logical.ES_DatabaseName
+                };
 
                 foreach (var udpName in udpNames)
                 {
                     string value = null;
 
-                    // Method 1: Try direct property name (simple UDP)
-                    if (string.IsNullOrEmpty(value))
+                    foreach (var (obj, objName) in objectsToTry)
                     {
-                        try
-                        {
-                            value = subjectArea.Properties(udpName).Value?.ToString();
-                            if (!string.IsNullOrEmpty(value))
-                            {
-                                log($"[UDP] Found via direct: {udpName} = {value}");
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            log($"[UDP] Direct {udpName} failed: {ex.Message}");
-                        }
-                    }
+                        if (!string.IsNullOrEmpty(value)) break;
 
-                    // Method 2: Try Logical format (Subject_Area.Logical.ES_DatabaseName)
-                    if (string.IsNullOrEmpty(value))
-                    {
-                        try
+                        foreach (var pattern in pathPatterns)
                         {
-                            value = subjectArea.Properties($"Subject_Area.Logical.{udpName}").Value?.ToString();
-                            if (!string.IsNullOrEmpty(value))
-                            {
-                                log($"[UDP] Found via Logical: {udpName} = {value}");
-                            }
-                        }
-                        catch { }
-                    }
+                            if (!string.IsNullOrEmpty(value)) break;
 
-                    // Method 3: Try Physical format (Subject_Area.Physical.ES_DatabaseName)
-                    if (string.IsNullOrEmpty(value))
-                    {
-                        try
-                        {
-                            value = subjectArea.Properties($"Subject_Area.Physical.{udpName}").Value?.ToString();
-                            if (!string.IsNullOrEmpty(value))
+                            string propPath = string.Format(pattern, udpName);
+                            try
                             {
-                                log($"[UDP] Found via Physical: {udpName} = {value}");
+                                value = obj.Properties(propPath).Value?.ToString();
+                                if (!string.IsNullOrEmpty(value))
+                                {
+                                    log($"[UDP] Found {udpName} on {objName} via '{propPath}': {value}");
+                                }
                             }
+                            catch { }
                         }
-                        catch { }
                     }
 
                     if (!string.IsNullOrEmpty(value))
@@ -463,36 +512,45 @@ namespace EliteSoft.Erwin.Admin.Services
                     }
                 }
 
-                // Also try to get any other UDPs from UDP_Definitions that apply to Subject_Area
+                // Strategy 3: Try to get UDP values from UDP_Definitions
                 try
                 {
                     var udpDefs = _currentModel.UDP_Definitions;
-                    if (udpDefs != null)
+                    if (udpDefs != null && udpDefs.Count > 0)
                     {
-                        log($"[UDP] Checking {udpDefs.Count} UDP definitions for additional UDPs...");
+                        log($"[UDP] Checking {udpDefs.Count} UDP definitions...");
                         foreach (var udpDef in udpDefs)
                         {
                             try
                             {
                                 string defName = udpDef.Name;
-                                // Skip if already found
                                 if (result.Exists(u => u.Name == defName)) continue;
 
                                 string value = null;
-                                try { value = subjectArea.Properties(defName).Value?.ToString(); } catch { }
-                                if (string.IsNullOrEmpty(value))
+                                foreach (var (obj, objName) in objectsToTry)
                                 {
-                                    try { value = subjectArea.Properties($"Subject_Area.Logical.{defName}").Value?.ToString(); } catch { }
-                                }
-                                if (string.IsNullOrEmpty(value))
-                                {
-                                    try { value = subjectArea.Properties($"Subject_Area.Physical.{defName}").Value?.ToString(); } catch { }
+                                    if (!string.IsNullOrEmpty(value)) break;
+
+                                    foreach (var pattern in pathPatterns)
+                                    {
+                                        if (!string.IsNullOrEmpty(value)) break;
+
+                                        string propPath = string.Format(pattern, defName);
+                                        try
+                                        {
+                                            value = obj.Properties(propPath).Value?.ToString();
+                                            if (!string.IsNullOrEmpty(value))
+                                            {
+                                                log($"[UDP] Found {defName} on {objName} via '{propPath}': {value}");
+                                            }
+                                        }
+                                        catch { }
+                                    }
                                 }
 
                                 if (!string.IsNullOrEmpty(value))
                                 {
                                     result.Add(new UdpValue { Name = defName, Value = value });
-                                    log($"[UDP] Found additional UDP: {defName} = {value}");
                                 }
                             }
                             catch { }
@@ -502,6 +560,52 @@ namespace EliteSoft.Erwin.Admin.Services
                 catch (Exception ex)
                 {
                     log($"[UDP] UDP_Definitions scan error: {ex.Message}");
+                }
+
+                // Strategy 4: If still no results, enumerate all properties on available objects
+                if (result.Count == 0)
+                {
+                    log("[UDP] No UDPs found with standard methods, enumerating properties...");
+                    foreach (var (obj, objName) in objectsToTry)
+                    {
+                        try
+                        {
+                            // Try to enumerate Properties collection
+                            var props = obj.Properties;
+                            if (props != null)
+                            {
+                                int propCount = 0;
+                                try { propCount = props.Count; } catch { }
+                                log($"[UDP] {objName} has {propCount} properties");
+
+                                int shown = 0;
+                                foreach (var prop in props)
+                                {
+                                    if (shown >= 10) { log($"[UDP]   ... (stopping at 10)"); break; }
+                                    try
+                                    {
+                                        string propName = prop.Name;
+                                        string propValue = prop.Value?.ToString() ?? "(null)";
+                                        // Only show ES_ prefixed properties
+                                        if (propName.StartsWith("ES_"))
+                                        {
+                                            log($"[UDP]   {propName} = {propValue}");
+                                            if (!string.IsNullOrEmpty(propValue) && propValue != "(null)")
+                                            {
+                                                result.Add(new UdpValue { Name = propName, Value = propValue });
+                                            }
+                                        }
+                                        shown++;
+                                    }
+                                    catch { }
+                                }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            log($"[UDP] Properties enumeration on {objName} failed: {ex.Message}");
+                        }
+                    }
                 }
 
                 log($"[UDP] Total Model UDP values found: {result.Count}");
@@ -546,6 +650,149 @@ namespace EliteSoft.Erwin.Admin.Services
             if ((appliesTo & 128) != 0) types.Add("Default");
 
             return types.Count > 0 ? string.Join(", ", types) : $"Type({appliesTo})";
+        }
+
+        public List<NamingStandard> GetNamingStandards(Action<string> log = null)
+        {
+            var result = new List<NamingStandard>();
+            log ??= s => System.Diagnostics.Debug.WriteLine(s);
+
+            if (_session == null)
+            {
+                log("[NamingStd] _session is null");
+                return result;
+            }
+
+            try
+            {
+                log("[NamingStd] Getting Naming Standards from model...");
+
+                dynamic modelObjects = _session.ModelObjects;
+                log($"[NamingStd] ModelObjects count: {modelObjects.Count}");
+
+                // Try multiple class names for Naming Standards
+                // Documentation says it's "NSM_Option" (Naming Standard Module Option)
+                string[] classNames = {
+                    "NSM_Option",           // Correct class name from erwin metamodel
+                    "Naming_Standard",
+                    "Naming Standard",
+                    "NamingStandard"
+                };
+
+                bool foundViaCollect = false;
+
+                foreach (var className in classNames)
+                {
+                    if (foundViaCollect) break;
+
+                    try
+                    {
+                        var nsCollection = modelObjects.Collect(className);
+                        int count = nsCollection?.Count ?? 0;
+
+                        if (count > 0)
+                        {
+                            log($"[NamingStd] Found {count} objects via Collect('{className}')");
+                            foundViaCollect = true;
+
+                            for (int i = 0; i < count; i++)
+                            {
+                                try
+                                {
+                                    dynamic ns = null;
+                                    try { ns = nsCollection.Item(i); }
+                                    catch { try { ns = nsCollection.Item(i + 1); } catch { } }
+
+                                    if (ns != null)
+                                    {
+                                        string name = "";
+                                        string objType = "";
+                                        string desc = "";
+
+                                        try { name = ns.Name ?? ""; } catch { }
+                                        try { objType = ns.Object_Type?.ToString() ?? ""; } catch { }
+                                        try { desc = ns.Definition ?? ""; } catch { }
+
+                                        if (string.IsNullOrEmpty(objType))
+                                        {
+                                            try { objType = ns.Properties("Object_Type").Value?.ToString() ?? ""; } catch { }
+                                        }
+
+                                        result.Add(new NamingStandard
+                                        {
+                                            Name = name,
+                                            ObjectType = objType,
+                                            Description = desc
+                                        });
+
+                                        log($"[NamingStd]   [{i}] {name} ({objType})");
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    log($"[NamingStd]   Error reading item {i}: {ex.Message}");
+                                }
+                            }
+                        }
+                    }
+                    catch { }
+                }
+
+                // If Collect didn't work, iterate through all objects and log unique class names
+                if (!foundViaCollect)
+                {
+                    log("[NamingStd] Collect failed, scanning all ModelObjects...");
+
+                    // Collect unique class names to help debugging
+                    var uniqueClasses = new HashSet<string>();
+                    int namingRelatedCount = 0;
+
+                    foreach (var obj in modelObjects)
+                    {
+                        try
+                        {
+                            string objClassName = obj.ClassName;
+                            uniqueClasses.Add(objClassName);
+
+                            // Check if class name contains "naming" or "standard"
+                            string lowerClassName = objClassName.ToLower();
+                            if (lowerClassName.Contains("naming") || lowerClassName.Contains("standard") || lowerClassName.Contains("name_map"))
+                            {
+                                string name = "";
+                                string objType = "";
+                                string desc = "";
+
+                                try { name = obj.Name ?? ""; } catch { }
+                                try { objType = obj.Object_Type?.ToString() ?? ""; } catch { }
+                                try { desc = obj.Definition ?? ""; } catch { }
+
+                                result.Add(new NamingStandard
+                                {
+                                    Name = name,
+                                    ObjectType = objType,
+                                    Description = desc
+                                });
+
+                                namingRelatedCount++;
+                                log($"[NamingStd]   Found ({objClassName}): {name}");
+                            }
+                        }
+                        catch { }
+                    }
+
+                    // Log some unique class names to help identify the correct one
+                    log($"[NamingStd] Unique class names in model (sample): {string.Join(", ", uniqueClasses.Take(20))}");
+                    log($"[NamingStd] Found {namingRelatedCount} naming-related objects");
+                }
+
+                log($"[NamingStd] Total Naming Standards found: {result.Count}");
+            }
+            catch (Exception ex)
+            {
+                log($"[NamingStd] GetNamingStandards error: {ex.Message}");
+            }
+
+            return result;
         }
 
         public void Dispose()

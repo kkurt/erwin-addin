@@ -51,6 +51,9 @@ namespace EliteSoft.Erwin.Admin
         private TabControl _tabModelProps = null!;
         private TextBox _txtModelName = null!;
         private ListView _listUdps = null!;
+        private ListView _listNamingStandards = null!;
+        private Label _lblModelSubtitle = null!;
+        private string _currentModelPath = "";
 
         // Loading overlay
         private Panel _panelLoading = null!;
@@ -244,11 +247,22 @@ namespace EliteSoft.Erwin.Admin
 
             _panelNaming.Controls.Add(ControlFactory.CreateTitle("Model Properties", 40, 25));
 
+            // Model name subtitle
+            _lblModelSubtitle = new Label
+            {
+                Location = new Point(42, 55),
+                Size = new Size(700, 20),
+                Font = new Font(AppTheme.DefaultFont.FontFamily, 10f, FontStyle.Italic),
+                ForeColor = AppTheme.TextSecondary,
+                Text = ""
+            };
+            _panelNaming.Controls.Add(_lblModelSubtitle);
+
             // Create TabControl with classic style
             _tabModelProps = new TabControl
             {
-                Location = new Point(40, 70),
-                Size = new Size(760, 540),
+                Location = new Point(40, 80),
+                Size = new Size(760, 530),
                 Font = AppTheme.DefaultFont
             };
 
@@ -276,10 +290,7 @@ namespace EliteSoft.Erwin.Admin
                 BackColor = AppTheme.Primary,
                 Padding = new Padding(15)
             };
-            var lblNamingPlaceholder = ControlFactory.CreateLabel(
-                "Naming conventions check will be implemented here.",
-                20, 20, AppTheme.DefaultFont, AppTheme.TextSecondary);
-            tabNaming.Controls.Add(lblNamingPlaceholder);
+            InitializeNamingConventionsTab(tabNaming);
             _tabModelProps.TabPages.Add(tabNaming);
 
             _panelNaming.Controls.Add(_tabModelProps);
@@ -319,6 +330,31 @@ namespace EliteSoft.Erwin.Admin
             _listUdps.Columns.Add("Value", 440);
 
             tab.Controls.Add(_listUdps);
+        }
+
+        private void InitializeNamingConventionsTab(TabPage tab)
+        {
+            var lblTitle = ControlFactory.CreateLabel("Naming Standards:", 20, 15);
+            tab.Controls.Add(lblTitle);
+
+            _listNamingStandards = new ListView
+            {
+                Location = new Point(20, 45),
+                Size = new Size(700, 420),
+                View = View.Details,
+                FullRowSelect = true,
+                GridLines = true,
+                BackColor = AppTheme.InputBackground,
+                ForeColor = AppTheme.TextPrimary,
+                Font = AppTheme.DefaultFont,
+                BorderStyle = BorderStyle.FixedSingle
+            };
+
+            _listNamingStandards.Columns.Add("Name", 250);
+            _listNamingStandards.Columns.Add("Type", 150);
+            _listNamingStandards.Columns.Add("Description", 290);
+
+            tab.Controls.Add(_listNamingStandards);
         }
 
         private void InitializeLoadingOverlay()
@@ -434,11 +470,26 @@ namespace EliteSoft.Erwin.Admin
             _txtModelName.Text = modelName ?? "(Unknown)";
             Log($"[Info] Model name: {modelName ?? "(null)"}");
 
+            // Update subtitle with path and model name
+            if (!string.IsNullOrEmpty(_currentModelPath) && !string.IsNullOrEmpty(modelName))
+            {
+                _lblModelSubtitle.Text = $"{_currentModelPath}  →  {modelName}";
+            }
+            else if (!string.IsNullOrEmpty(modelName))
+            {
+                _lblModelSubtitle.Text = modelName;
+            }
+            else
+            {
+                _lblModelSubtitle.Text = _currentModelPath;
+            }
+
             // Check if model is loaded
             if (_scapiService.CurrentModel == null)
             {
                 Log("[Warning] CurrentModel is null!");
                 SetStatus("No model loaded");
+                _lblModelSubtitle.Text = "";
                 return;
             }
 
@@ -456,7 +507,21 @@ namespace EliteSoft.Erwin.Admin
                 Log($"[Debug] UDP: {udp.Name} = {udp.Value}");
             }
 
-            SetStatus($"Model properties loaded - {udpValues.Count} UDPs found");
+            // Load Naming Standards
+            _listNamingStandards.Items.Clear();
+            Log("[Info] Getting Naming Standards...");
+            var namingStandards = _scapiService.GetNamingStandards(Log);
+            Log($"[Info] Got {namingStandards.Count} Naming Standards");
+
+            foreach (var ns in namingStandards)
+            {
+                var item = new ListViewItem(ns.Name);
+                item.SubItems.Add(ns.ObjectType);
+                item.SubItems.Add(ns.Description);
+                _listNamingStandards.Items.Add(item);
+            }
+
+            SetStatus($"Model properties loaded - {udpValues.Count} UDPs, {namingStandards.Count} Naming Standards");
         }
 
         private void UpdateNavButtons(int activeIndex)
@@ -697,6 +762,7 @@ namespace EliteSoft.Erwin.Admin
 
                 if (result.Success)
                 {
+                    _currentModelPath = modelPath;
                     _btnNavNaming.Enabled = true;
                     SetStatus($"Model loaded: {modelPath}");
                     MessageBox.Show($"Model '{modelPath}' loaded successfully!", "Success",
