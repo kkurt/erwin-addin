@@ -34,8 +34,15 @@ namespace EliteSoft.Erwin.AddIn
             this.btnClose = new System.Windows.Forms.Button();
             this.lblStatus = new System.Windows.Forms.Label();
 
+            this.grpValidation = new System.Windows.Forms.GroupBox();
+            this.chkMonitoring = new System.Windows.Forms.CheckBox();
+            this.btnValidateAll = new System.Windows.Forms.Button();
+            this.listValidationIssues = new System.Windows.Forms.ListView();
+            this.lblValidationStatus = new System.Windows.Forms.Label();
+
             this.grpModel.SuspendLayout();
             this.grpConfig.SuspendLayout();
+            this.grpValidation.SuspendLayout();
             this.SuspendLayout();
 
             //
@@ -144,9 +151,63 @@ namespace EliteSoft.Erwin.AddIn
             this.txtName.Size = new System.Drawing.Size(460, 23);
             this.txtName.TabIndex = 5;
             //
+            // grpValidation
+            //
+            this.grpValidation.Controls.Add(this.chkMonitoring);
+            this.grpValidation.Controls.Add(this.btnValidateAll);
+            this.grpValidation.Controls.Add(this.listValidationIssues);
+            this.grpValidation.Controls.Add(this.lblValidationStatus);
+            this.grpValidation.Location = new System.Drawing.Point(12, 178);
+            this.grpValidation.Name = "grpValidation";
+            this.grpValidation.Size = new System.Drawing.Size(560, 200);
+            this.grpValidation.TabIndex = 5;
+            this.grpValidation.TabStop = false;
+            this.grpValidation.Text = "Column Name Validation (col_ prefix required)";
+            //
+            // chkMonitoring
+            //
+            this.chkMonitoring.AutoSize = true;
+            this.chkMonitoring.Location = new System.Drawing.Point(15, 25);
+            this.chkMonitoring.Name = "chkMonitoring";
+            this.chkMonitoring.Size = new System.Drawing.Size(180, 19);
+            this.chkMonitoring.TabIndex = 0;
+            this.chkMonitoring.Text = "Enable Real-time Monitoring";
+            this.chkMonitoring.UseVisualStyleBackColor = true;
+            this.chkMonitoring.CheckedChanged += new System.EventHandler(this.ChkMonitoring_CheckedChanged);
+            //
+            // btnValidateAll
+            //
+            this.btnValidateAll.Location = new System.Drawing.Point(440, 20);
+            this.btnValidateAll.Name = "btnValidateAll";
+            this.btnValidateAll.Size = new System.Drawing.Size(100, 28);
+            this.btnValidateAll.TabIndex = 1;
+            this.btnValidateAll.Text = "Validate All";
+            this.btnValidateAll.UseVisualStyleBackColor = true;
+            this.btnValidateAll.Click += new System.EventHandler(this.BtnValidateAll_Click);
+            //
+            // listValidationIssues
+            //
+            this.listValidationIssues.FullRowSelect = true;
+            this.listValidationIssues.GridLines = true;
+            this.listValidationIssues.Location = new System.Drawing.Point(15, 55);
+            this.listValidationIssues.Name = "listValidationIssues";
+            this.listValidationIssues.Size = new System.Drawing.Size(525, 115);
+            this.listValidationIssues.TabIndex = 2;
+            this.listValidationIssues.UseCompatibleStateImageBehavior = false;
+            this.listValidationIssues.View = System.Windows.Forms.View.Details;
+            //
+            // lblValidationStatus
+            //
+            this.lblValidationStatus.Location = new System.Drawing.Point(15, 175);
+            this.lblValidationStatus.Name = "lblValidationStatus";
+            this.lblValidationStatus.Size = new System.Drawing.Size(525, 20);
+            this.lblValidationStatus.TabIndex = 3;
+            this.lblValidationStatus.Text = "Monitoring: Off";
+            this.lblValidationStatus.ForeColor = System.Drawing.Color.Gray;
+            //
             // btnApply
             //
-            this.btnApply.Location = new System.Drawing.Point(382, 180);
+            this.btnApply.Location = new System.Drawing.Point(382, 390);
             this.btnApply.Name = "btnApply";
             this.btnApply.Size = new System.Drawing.Size(90, 32);
             this.btnApply.TabIndex = 2;
@@ -156,7 +217,7 @@ namespace EliteSoft.Erwin.AddIn
             //
             // btnClose
             //
-            this.btnClose.Location = new System.Drawing.Point(482, 180);
+            this.btnClose.Location = new System.Drawing.Point(482, 390);
             this.btnClose.Name = "btnClose";
             this.btnClose.Size = new System.Drawing.Size(90, 32);
             this.btnClose.TabIndex = 3;
@@ -166,7 +227,7 @@ namespace EliteSoft.Erwin.AddIn
             //
             // lblStatus
             //
-            this.lblStatus.Location = new System.Drawing.Point(12, 185);
+            this.lblStatus.Location = new System.Drawing.Point(12, 395);
             this.lblStatus.Name = "lblStatus";
             this.lblStatus.Size = new System.Drawing.Size(360, 25);
             this.lblStatus.TabIndex = 4;
@@ -177,9 +238,10 @@ namespace EliteSoft.Erwin.AddIn
             //
             this.AutoScaleDimensions = new System.Drawing.SizeF(7F, 15F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
-            this.ClientSize = new System.Drawing.Size(584, 226);
+            this.ClientSize = new System.Drawing.Size(584, 436);
             this.Controls.Add(this.grpModel);
             this.Controls.Add(this.grpConfig);
+            this.Controls.Add(this.grpValidation);
             this.Controls.Add(this.btnApply);
             this.Controls.Add(this.btnClose);
             this.Controls.Add(this.lblStatus);
@@ -195,6 +257,8 @@ namespace EliteSoft.Erwin.AddIn
             this.grpModel.PerformLayout();
             this.grpConfig.ResumeLayout(false);
             this.grpConfig.PerformLayout();
+            this.grpValidation.ResumeLayout(false);
+            this.grpValidation.PerformLayout();
             this.ResumeLayout(false);
         }
 
@@ -216,5 +280,11 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.Button btnApply;
         private System.Windows.Forms.Button btnClose;
         private System.Windows.Forms.Label lblStatus;
+
+        private System.Windows.Forms.GroupBox grpValidation;
+        private System.Windows.Forms.CheckBox chkMonitoring;
+        private System.Windows.Forms.Button btnValidateAll;
+        private System.Windows.Forms.ListView listValidationIssues;
+        private System.Windows.Forms.Label lblValidationStatus;
     }
 }

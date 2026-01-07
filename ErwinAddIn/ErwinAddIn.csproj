@@ -22,8 +22,8 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Compile Update="TableCreatorForm.Designer.cs">
-      <DependentUpon>TableCreatorForm.cs</DependentUpon>
+    <Compile Update="ModelConfigForm.Designer.cs">
+      <DependentUpon>ModelConfigForm.cs</DependentUpon>
     </Compile>
   </ItemGroup>
 
