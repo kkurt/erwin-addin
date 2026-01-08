@@ -1,26 +1,46 @@
 using System;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
 using System.Windows.Forms;
 
 namespace EliteSoft.Erwin.AddIn.Services
 {
     /// <summary>
-    /// Column validation service - monitors and validates physical column names
-    /// Uses lightweight polling with change detection
+    /// Column validation service - monitors and validates physical column names against glossary
     /// </summary>
     public class ColumnValidationService : IDisposable
     {
         private readonly dynamic _session;
         private readonly Timer _monitorTimer;
+        private readonly Timer _windowMonitorTimer;
         private readonly Dictionary<string, ColumnSnapshot> _columnSnapshots;
         private readonly List<IColumnNameRule> _validationRules;
         private bool _isMonitoring;
         private bool _disposed;
+        private bool _columnEditorWasOpen;
+
+        // Win32 API for window enumeration
+        [DllImport("user32.dll")]
+        private static extern bool EnumWindows(EnumWindowsProc enumProc, IntPtr lParam);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsWindowVisible(IntPtr hWnd);
+
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
         /// <summary>
         /// Fired when a column name changes and fails validation
         /// </summary>
         public event EventHandler<ColumnValidationEventArgs> OnValidationFailed;
+
+        /// <summary>
+        /// Fired when a column name is valid and found in glossary
+        /// </summary>
+        public event EventHandler<ColumnValidationEventArgs> OnValidationPassed;
 
         /// <summary>
         /// Fired when monitoring detects any column change
@@ -32,17 +52,23 @@ namespace EliteSoft.Erwin.AddIn.Services
             _session = session;
             _columnSnapshots = new Dictionary<string, ColumnSnapshot>();
             _isMonitoring = false;
+            _columnEditorWasOpen = false;
 
-            // Initialize validation rules
+            // Initialize validation rules - now using Glossary validation
             _validationRules = new List<IColumnNameRule>
             {
-                new PrefixRule("col_", caseSensitive: false)  // col_ prefix required
+                new GlossaryRule()  // Validate against GLOSSARY table
             };
 
             // Setup timer for monitoring (lightweight polling)
             _monitorTimer = new Timer();
             _monitorTimer.Interval = 2000; // 2 seconds
             _monitorTimer.Tick += OnMonitorTick;
+
+            // Setup timer for window monitoring (check if Column Editor closed)
+            _windowMonitorTimer = new Timer();
+            _windowMonitorTimer.Interval = 500; // 500ms - check frequently
+            _windowMonitorTimer.Tick += OnWindowMonitorTick;
         }
 
         /// <summary>
@@ -58,7 +84,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                 dynamic root = modelObjects.Root;
                 if (root == null) return;
 
-                // Collect all Entities
                 dynamic allEntities = modelObjects.Collect(root, "Entity");
                 if (allEntities == null) return;
 
@@ -77,7 +102,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                     }
                     catch { tableName = entityName; }
 
-                    // Get attributes of this entity
                     dynamic entityAttrs = null;
                     try { entityAttrs = modelObjects.Collect(entity, "Attribute"); } catch { continue; }
                     if (entityAttrs == null) continue;
@@ -125,7 +149,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             TakeSnapshot();
             _isMonitoring = true;
             _monitorTimer.Start();
-            System.Diagnostics.Debug.WriteLine("Monitoring started");
+            _windowMonitorTimer.Start();
         }
 
         /// <summary>
@@ -136,16 +160,139 @@ namespace EliteSoft.Erwin.AddIn.Services
             if (!_isMonitoring) return;
 
             _monitorTimer.Stop();
+            _windowMonitorTimer.Stop();
             _isMonitoring = false;
-            System.Diagnostics.Debug.WriteLine("Monitoring stopped");
         }
 
-        /// <summary>
-        /// Timer tick - check for changes
-        /// </summary>
         private void OnMonitorTick(object sender, EventArgs e)
         {
             CheckForChanges();
+        }
+
+        /// <summary>
+        /// Monitors for Column Editor window close event
+        /// </summary>
+        private void OnWindowMonitorTick(object sender, EventArgs e)
+        {
+            bool editorIsOpen = IsColumnEditorOpen();
+
+            // If editor was open and now closed, delete "PLEASE CHANGE IT" columns
+            if (_columnEditorWasOpen && !editorIsOpen)
+            {
+                System.Diagnostics.Debug.WriteLine("Column Editor closed - checking for PLEASE CHANGE IT columns");
+                DeletePleaseChangeItColumns();
+                TakeSnapshot(); // Refresh snapshot after deletion
+            }
+
+            _columnEditorWasOpen = editorIsOpen;
+        }
+
+        /// <summary>
+        /// Checks if erwin Column Editor window is open
+        /// </summary>
+        private bool IsColumnEditorOpen()
+        {
+            bool found = false;
+
+            EnumWindows((hWnd, lParam) =>
+            {
+                if (!IsWindowVisible(hWnd)) return true;
+
+                StringBuilder title = new StringBuilder(256);
+                GetWindowText(hWnd, title, 256);
+                string windowTitle = title.ToString();
+
+                // Check for Column Editor window pattern: "Oracle Table 'X' Column 'Y' Editor"
+                // or similar patterns with "Column" and "Editor"
+                if (windowTitle.Contains("Column") && windowTitle.Contains("Editor"))
+                {
+                    found = true;
+                    return false; // Stop enumeration
+                }
+
+                return true; // Continue enumeration
+            }, IntPtr.Zero);
+
+            return found;
+        }
+
+        /// <summary>
+        /// Deletes all columns named "PLEASE CHANGE IT" from the model
+        /// </summary>
+        public void DeletePleaseChangeItColumns()
+        {
+            try
+            {
+                dynamic modelObjects = _session.ModelObjects;
+                dynamic root = modelObjects.Root;
+                if (root == null) return;
+
+                dynamic allEntities = modelObjects.Collect(root, "Entity");
+                if (allEntities == null) return;
+
+                var columnsToDelete = new List<dynamic>();
+
+                foreach (dynamic entity in allEntities)
+                {
+                    if (entity == null) continue;
+
+                    dynamic entityAttrs = null;
+                    try { entityAttrs = modelObjects.Collect(entity, "Attribute"); } catch { continue; }
+                    if (entityAttrs == null) continue;
+
+                    foreach (dynamic attr in entityAttrs)
+                    {
+                        if (attr == null) continue;
+
+                        string physicalName = "";
+                        try
+                        {
+                            string physCol = attr.Properties("Physical_Name").Value?.ToString() ?? "";
+                            string attrName = attr.Name ?? "";
+                            physicalName = (!string.IsNullOrEmpty(physCol) && !physCol.StartsWith("%")) ? physCol : attrName;
+                        }
+                        catch { continue; }
+
+                        if (physicalName.Equals("PLEASE CHANGE IT", StringComparison.OrdinalIgnoreCase))
+                        {
+                            columnsToDelete.Add(attr);
+                        }
+                    }
+                }
+
+                // Delete the columns
+                if (columnsToDelete.Count > 0)
+                {
+                    int transId = _session.BeginNamedTransaction("DeleteInvalidColumns");
+                    try
+                    {
+                        foreach (var attr in columnsToDelete)
+                        {
+                            try
+                            {
+                                string attrName = attr.Name ?? "unknown";
+                                modelObjects.Remove(attr);
+                                System.Diagnostics.Debug.WriteLine($"Deleted column: {attrName}");
+                            }
+                            catch (Exception ex)
+                            {
+                                System.Diagnostics.Debug.WriteLine($"Failed to delete column: {ex.Message}");
+                            }
+                        }
+                        _session.CommitTransaction(transId);
+                        System.Diagnostics.Debug.WriteLine($"Deleted {columnsToDelete.Count} 'PLEASE CHANGE IT' column(s)");
+                    }
+                    catch
+                    {
+                        try { _session.RollbackTransaction(transId); } catch { }
+                        throw;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"DeletePleaseChangeItColumns error: {ex.Message}");
+            }
         }
 
         /// <summary>
@@ -159,7 +306,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                 dynamic root = modelObjects.Root;
                 if (root == null) return;
 
-                // Collect all Entities
                 dynamic allEntities = modelObjects.Collect(root, "Entity");
                 if (allEntities == null) return;
 
@@ -178,7 +324,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                     }
                     catch { tableName = entityName; }
 
-                    // Get attributes of this entity
                     dynamic entityAttrs = null;
                     try { entityAttrs = modelObjects.Collect(entity, "Attribute"); } catch { continue; }
                     if (entityAttrs == null) continue;
@@ -200,7 +345,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                         }
                         catch { physicalName = attrName; }
 
-                        // Check if this is a new or changed column
                         bool isNew = !_columnSnapshots.ContainsKey(objectId);
                         bool isChanged = !isNew && _columnSnapshots[objectId].PhysicalName != physicalName;
 
@@ -208,7 +352,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                         {
                             string previousName = isNew ? null : _columnSnapshots[objectId].PhysicalName;
 
-                            // Fire change event
                             OnColumnChanged?.Invoke(this, new ColumnChangeEventArgs
                             {
                                 ObjectId = objectId,
@@ -219,7 +362,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 IsNew = isNew
                             });
 
-                            // Validate the new name
                             var validationResult = ValidateColumnName(physicalName);
                             if (!validationResult.IsValid)
                             {
@@ -231,11 +373,26 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     PhysicalName = physicalName,
                                     PreviousName = previousName,
                                     ValidationMessage = validationResult.Message,
-                                    RuleName = validationResult.RuleName
+                                    RuleName = validationResult.RuleName,
+                                    GlossaryEntry = null
+                                });
+                            }
+                            else if (validationResult.GlossaryEntry != null)
+                            {
+                                // Valid and found in glossary - trigger action to set DataType and Owner
+                                OnValidationPassed?.Invoke(this, new ColumnValidationEventArgs
+                                {
+                                    ObjectId = objectId,
+                                    TableName = tableName,
+                                    AttributeName = attrName,
+                                    PhysicalName = physicalName,
+                                    PreviousName = previousName,
+                                    ValidationMessage = "Found in glossary",
+                                    RuleName = "GlossaryRule",
+                                    GlossaryEntry = validationResult.GlossaryEntry
                                 });
                             }
 
-                            // Update snapshot
                             _columnSnapshots[objectId] = new ColumnSnapshot
                             {
                                 ObjectId = objectId,
@@ -254,7 +411,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// Validates a single column name against all rules
+        /// Validates a single column name against glossary
         /// </summary>
         public ValidationResult ValidateColumnName(string physicalName)
         {
@@ -263,23 +420,28 @@ namespace EliteSoft.Erwin.AddIn.Services
                 return ValidationResult.Invalid("Column name is empty", "EmptyName");
             }
 
-            // Skip validation for default column names (newly created columns in erwin)
+            // Skip validation for default column names
             if (physicalName.Equals("<default>", StringComparison.OrdinalIgnoreCase) ||
                 physicalName.StartsWith("<default>", StringComparison.OrdinalIgnoreCase))
             {
-                return ValidationResult.Valid(); // Skip - user hasn't named it yet
+                return ValidationResult.Valid();
             }
 
-            // Skip validation for "PLEASE CHANGE IT" (already marked as invalid)
+            // Skip validation for "PLEASE CHANGE IT"
             if (physicalName.Equals("PLEASE CHANGE IT", StringComparison.OrdinalIgnoreCase))
             {
-                return ValidationResult.Valid(); // Skip - already marked for change
+                return ValidationResult.Valid();
             }
 
             foreach (var rule in _validationRules)
             {
                 var result = rule.Validate(physicalName);
                 if (!result.IsValid)
+                {
+                    return result;
+                }
+                // If valid and has glossary entry, return it
+                if (result.GlossaryEntry != null)
                 {
                     return result;
                 }
@@ -369,6 +531,7 @@ namespace EliteSoft.Erwin.AddIn.Services
 
             StopMonitoring();
             _monitorTimer?.Dispose();
+            _windowMonitorTimer?.Dispose();
         }
     }
 
@@ -401,6 +564,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         public string PreviousName { get; set; }
         public string ValidationMessage { get; set; }
         public string RuleName { get; set; }
+        public GlossaryEntry GlossaryEntry { get; set; }
     }
 
     public class ColumnValidationIssue
@@ -417,8 +581,10 @@ namespace EliteSoft.Erwin.AddIn.Services
         public bool IsValid { get; set; }
         public string Message { get; set; }
         public string RuleName { get; set; }
+        public GlossaryEntry GlossaryEntry { get; set; }
 
         public static ValidationResult Valid() => new ValidationResult { IsValid = true };
+        public static ValidationResult ValidWithEntry(GlossaryEntry entry) => new ValidationResult { IsValid = true, GlossaryEntry = entry };
         public static ValidationResult Invalid(string message, string ruleName) =>
             new ValidationResult { IsValid = false, Message = message, RuleName = ruleName };
     }
@@ -434,38 +600,43 @@ namespace EliteSoft.Erwin.AddIn.Services
     }
 
     /// <summary>
-    /// Requires columns to start with a specific prefix (e.g., "col_")
+    /// Validates column names against GLOSSARY table
     /// </summary>
-    public class PrefixRule : IColumnNameRule
+    public class GlossaryRule : IColumnNameRule
     {
-        private readonly string _prefix;
-        private readonly bool _caseSensitive;
-
-        public string RuleName => "PrefixRule";
-
-        public PrefixRule(string prefix, bool caseSensitive = false)
-        {
-            _prefix = prefix;
-            _caseSensitive = caseSensitive;
-        }
+        public string RuleName => "GlossaryRule";
 
         public ValidationResult Validate(string columnName)
         {
             if (string.IsNullOrEmpty(columnName))
                 return ValidationResult.Valid();
 
-            bool hasPrefix = _caseSensitive
-                ? columnName.StartsWith(_prefix)
-                : columnName.StartsWith(_prefix, StringComparison.OrdinalIgnoreCase);
+            var glossary = GlossaryService.Instance;
 
-            if (!hasPrefix)
+            // Check if glossary is loaded
+            if (!glossary.IsLoaded)
+            {
+                // Try to load
+                glossary.LoadGlossary();
+            }
+
+            if (!glossary.IsLoaded)
+            {
+                // Could not load glossary - allow the column (fail open)
+                return ValidationResult.Valid();
+            }
+
+            // Check if column name exists in glossary
+            var entry = glossary.GetEntry(columnName);
+            if (entry == null)
             {
                 return ValidationResult.Invalid(
-                    $"Column name must start with '{_prefix}' prefix",
+                    $"'{columnName}' not found in glossary. This column name is not allowed.",
                     RuleName);
             }
 
-            return ValidationResult.Valid();
+            // Valid - return with glossary entry for further processing
+            return ValidationResult.ValidWithEntry(entry);
         }
     }
 

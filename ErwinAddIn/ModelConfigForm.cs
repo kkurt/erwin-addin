@@ -170,10 +170,14 @@ namespace EliteSoft.Erwin.AddIn
             // Dispose previous service if exists
             _validationService?.Dispose();
 
+            // Load glossary from database
+            LoadGlossary();
+
             _validationService = new ColumnValidationService(_session);
 
             // Subscribe to validation events
             _validationService.OnValidationFailed += OnValidationFailed;
+            _validationService.OnValidationPassed += OnValidationPassed;
             _validationService.OnColumnChanged += OnColumnChanged;
 
             // Enable validation controls
@@ -183,8 +187,36 @@ namespace EliteSoft.Erwin.AddIn
             // Take initial snapshot
             _validationService.TakeSnapshot();
 
-            lblValidationStatus.Text = "Ready - Click 'Validate All' or enable monitoring";
-            lblValidationStatus.ForeColor = Color.DarkBlue;
+            var glossary = GlossaryService.Instance;
+            if (glossary.IsLoaded)
+            {
+                lblValidationStatus.Text = $"Ready - Glossary loaded ({glossary.Count} entries)";
+                lblValidationStatus.ForeColor = Color.DarkBlue;
+            }
+            else
+            {
+                lblValidationStatus.Text = $"Warning: Glossary not loaded - {glossary.LastError}";
+                lblValidationStatus.ForeColor = Color.Orange;
+            }
+        }
+
+        /// <summary>
+        /// Load glossary from database
+        /// </summary>
+        private void LoadGlossary()
+        {
+            try
+            {
+                var glossary = GlossaryService.Instance;
+                if (!glossary.IsLoaded)
+                {
+                    glossary.LoadGlossary();
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"LoadGlossary error: {ex.Message}");
+            }
         }
 
         /// <summary>
@@ -231,6 +263,143 @@ namespace EliteSoft.Erwin.AddIn
             // Update status
             lblValidationStatus.Text = $"Last issue: {e.PhysicalName} - {e.ValidationMessage}";
             lblValidationStatus.ForeColor = Color.Red;
+        }
+
+        /// <summary>
+        /// Called when a column name is valid and found in glossary
+        /// Sets the Data Type and OWNER UDP from glossary
+        /// </summary>
+        private void OnValidationPassed(object sender, ColumnValidationEventArgs e)
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action(() => OnValidationPassed(sender, e)));
+                return;
+            }
+
+            if (e.GlossaryEntry == null) return;
+
+            // Apply glossary entry - set Data Type and OWNER UDP
+            ApplyGlossaryEntry(e.TableName, e.AttributeName, e.GlossaryEntry);
+
+            // Update status
+            lblValidationStatus.Text = $"[{DateTime.Now:HH:mm:ss}] {e.PhysicalName} - DataType: {e.GlossaryEntry.DataType}, Owner: {e.GlossaryEntry.Owner}";
+            lblValidationStatus.ForeColor = Color.DarkGreen;
+        }
+
+        /// <summary>
+        /// Applies glossary entry to a column - sets Data Type and OWNER UDP
+        /// </summary>
+        private void ApplyGlossaryEntry(string tableName, string attributeName, GlossaryEntry entry)
+        {
+            try
+            {
+                dynamic modelObjects = _session.ModelObjects;
+                dynamic root = modelObjects.Root;
+                if (root == null) return;
+
+                dynamic allEntities = modelObjects.Collect(root, "Entity");
+                if (allEntities == null) return;
+
+                foreach (dynamic entity in allEntities)
+                {
+                    if (entity == null) continue;
+
+                    string entityName = "";
+                    string entityPhysName = "";
+                    try { entityName = entity.Name ?? ""; } catch { }
+                    try { entityPhysName = entity.Properties("Physical_Name").Value?.ToString() ?? ""; } catch { }
+
+                    bool entityMatch = entityPhysName.Equals(tableName, StringComparison.OrdinalIgnoreCase) ||
+                                      entityName.Equals(tableName, StringComparison.OrdinalIgnoreCase);
+                    if (!entityMatch) continue;
+
+                    dynamic entityAttrs = null;
+                    try { entityAttrs = modelObjects.Collect(entity, "Attribute"); } catch { continue; }
+                    if (entityAttrs == null) continue;
+
+                    foreach (dynamic attr in entityAttrs)
+                    {
+                        if (attr == null) continue;
+
+                        string attrName = "";
+                        try { attrName = attr.Name ?? ""; } catch { }
+
+                        if (attrName.Equals(attributeName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            int transId = _session.BeginNamedTransaction("ApplyGlossary");
+
+                            try
+                            {
+                                // Set Physical Data Type from glossary
+                                if (!string.IsNullOrEmpty(entry.DataType))
+                                {
+                                    try
+                                    {
+                                        attr.Properties("Physical_Data_Type").Value = entry.DataType;
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        System.Diagnostics.Debug.WriteLine($"Set Physical_Data_Type error: {ex.Message}");
+                                    }
+                                }
+
+                                // Set OWNER UDP from glossary
+                                if (!string.IsNullOrEmpty(entry.Owner))
+                                {
+                                    try
+                                    {
+                                        // Try to set UDP named "OWNER"
+                                        dynamic udpCollection = attr.Properties("UDP_Values");
+                                        if (udpCollection != null)
+                                        {
+                                            // Try to find/set OWNER UDP
+                                            bool found = false;
+                                            try
+                                            {
+                                                dynamic ownerUdp = udpCollection.Item("OWNER");
+                                                if (ownerUdp != null)
+                                                {
+                                                    ownerUdp.Value = entry.Owner;
+                                                    found = true;
+                                                }
+                                            }
+                                            catch { }
+
+                                            if (!found)
+                                            {
+                                                // UDP might need to be accessed differently
+                                                // Try setting via UDP property directly
+                                                try
+                                                {
+                                                    attr.Properties("UDP_OWNER").Value = entry.Owner;
+                                                }
+                                                catch { }
+                                            }
+                                        }
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        System.Diagnostics.Debug.WriteLine($"Set OWNER UDP error: {ex.Message}");
+                                    }
+                                }
+
+                                _session.CommitTransaction(transId);
+                                return;
+                            }
+                            catch
+                            {
+                                try { _session.RollbackTransaction(transId); } catch { }
+                                throw;
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"ApplyGlossaryEntry error: {ex.Message}");
+            }
         }
 
         /// <summary>
