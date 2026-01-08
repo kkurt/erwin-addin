@@ -19,11 +19,54 @@ namespace EliteSoft.Erwin.AddIn
         // Validation service
         private ColumnValidationService _validationService;
 
+        // Flag to track if OWNER UDP exists in model
+        private bool _ownerUdpExists = false;
+
         public ModelConfigForm(dynamic scapi)
         {
             _scapi = scapi;
             InitializeComponent();
             InitializeValidationUI();
+        }
+
+        /// <summary>
+        /// Logs a message to the debug log panel
+        /// </summary>
+        private void Log(string message)
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action(() => Log(message)));
+                return;
+            }
+
+            string timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
+            string logLine = $"[{timestamp}] {message}\r\n";
+            txtDebugLog.AppendText(logLine);
+            txtDebugLog.SelectionStart = txtDebugLog.Text.Length;
+            txtDebugLog.ScrollToCaret();
+            Application.DoEvents();
+        }
+
+        /// <summary>
+        /// Clear debug log button click
+        /// </summary>
+        private void BtnClearLog_Click(object sender, EventArgs e)
+        {
+            txtDebugLog.Clear();
+        }
+
+        /// <summary>
+        /// Copy debug log button click - copies all log text to clipboard
+        /// </summary>
+        private void BtnCopyLog_Click(object sender, EventArgs e)
+        {
+            if (!string.IsNullOrEmpty(txtDebugLog.Text))
+            {
+                Clipboard.SetText(txtDebugLog.Text);
+                lblStatus.Text = "Log copied to clipboard!";
+                lblStatus.ForeColor = Color.DarkGreen;
+            }
         }
 
         /// <summary>
@@ -167,11 +210,17 @@ namespace EliteSoft.Erwin.AddIn
         /// </summary>
         private void InitializeValidationService()
         {
+            Log("InitializeValidationService - Step 1: Starting");
+
             // Dispose previous service if exists
             _validationService?.Dispose();
 
+            Log("InitializeValidationService - Step 2: Before LoadGlossary");
+
             // Load glossary from database
             LoadGlossary();
+
+            Log("InitializeValidationService - Step 3: Glossary loaded");
 
             _validationService = new ColumnValidationService(_session);
 
@@ -197,6 +246,266 @@ namespace EliteSoft.Erwin.AddIn
             {
                 lblValidationStatus.Text = $"Warning: Glossary not loaded - {glossary.LastError}";
                 lblValidationStatus.ForeColor = Color.Orange;
+            }
+        }
+
+        /// <summary>
+        /// Check and create OWNER UDP at startup if needed
+        /// </summary>
+        private void EnsureOwnerUdpExistsOnStartup()
+        {
+            Log("EnsureOwnerUdpExistsOnStartup called");
+
+            try
+            {
+                dynamic modelObjects = _session.ModelObjects;
+                Log("Got ModelObjects");
+
+                dynamic root = modelObjects.Root;
+                Log($"Got Root: {root?.Name ?? "(null)"}");
+
+                // Check if OWNER UDP definition exists by looking at Property_Type objects
+                Log("Checking if OWNER UDP definition exists via Property_Type...");
+
+                bool udpExists = false;
+
+                try
+                {
+                    // Try to collect Property_Type objects from root
+                    Log("Trying modelObjects.Collect(root, \"Property_Type\")...");
+                    dynamic propertyTypes = modelObjects.Collect(root, "Property_Type");
+
+                    int ptCount = 0;
+                    try { ptCount = propertyTypes?.Count ?? 0; } catch { }
+                    Log($"Property_Type count: {ptCount}");
+
+                    foreach (dynamic pt in propertyTypes)
+                    {
+                        if (pt == null) continue;
+
+                        string ptName = "";
+                        try { ptName = pt.Name ?? ""; } catch { continue; }
+
+                        Log($"Found Property_Type: {ptName}");
+
+                        // Check for OWNER UDP - erwin stores it as "Attribute.Physical.OWNER"
+                        if (ptName.Equals("Attribute.Physical.OWNER", StringComparison.OrdinalIgnoreCase))
+                        {
+                            udpExists = true;
+                            Log("OWNER UDP DEFINITION EXISTS!");
+                            break;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log($"Error checking Property_Type: {ex.Message}");
+                }
+
+                // Alternative: Scan all attributes for UDP value
+                Log("Scanning all attributes for OWNER UDP value...");
+                try
+                {
+                    dynamic allEntities = modelObjects.Collect(root, "Entity");
+                    int checkedCount = 0;
+
+                    foreach (dynamic entity in allEntities)
+                    {
+                        if (entity == null) continue;
+                        if (udpExists) break;
+
+                        dynamic entityAttrs = null;
+                        try { entityAttrs = modelObjects.Collect(entity, "Attribute"); } catch { continue; }
+                        if (entityAttrs == null) continue;
+
+                        foreach (dynamic attr in entityAttrs)
+                        {
+                            if (attr == null) continue;
+                            checkedCount++;
+
+                            try
+                            {
+                                // Try to READ the UDP value
+                                var ownerValue = attr.Properties("Attribute.Physical.OWNER").Value;
+                                string ownerStr = ownerValue?.ToString() ?? "";
+
+                                if (!string.IsNullOrEmpty(ownerStr))
+                                {
+                                    udpExists = true;
+                                    string attrName = "";
+                                    try { attrName = attr.Name ?? ""; } catch { }
+                                    Log($"OWNER UDP FOUND! Attribute '{attrName}' has OWNER='{ownerStr}'");
+                                    break;
+                                }
+                            }
+                            catch
+                            {
+                                // Property not accessible on this attribute - continue checking
+                            }
+                        }
+                    }
+
+                    Log($"Checked {checkedCount} attributes");
+                }
+                catch (Exception ex2)
+                {
+                    Log($"Error scanning attributes: {ex2.Message}");
+                }
+
+                Log($"UDP exists: {udpExists}");
+                _ownerUdpExists = udpExists;
+
+                if (udpExists)
+                {
+                    Log("OWNER UDP already exists - ready to use");
+                }
+                else
+                {
+                    // UDP not found - try to create it via metamodel session
+                    Log("OWNER UDP not found - attempting to create...");
+                    bool created = CreateOwnerUdpViaMetamodel(modelObjects);
+                    if (created)
+                    {
+                        _ownerUdpExists = true;
+                        Log("OWNER UDP created successfully!");
+                    }
+                    else
+                    {
+                        Log("Could not create UDP automatically.");
+                        Log("Please create manually: Model > UDPs > Add > Class: Column, Name: OWNER, Type: Text");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"OUTER ERROR: {ex.Message}");
+                Log($"Stack: {ex.StackTrace}");
+            }
+        }
+
+        /// <summary>
+        /// Tries to set OWNER UDP value on an attribute
+        /// </summary>
+        private bool TrySetOwnerUdp(dynamic attr, string ownerValue, string attributeName)
+        {
+            // Try to set OWNER UDP value directly
+            try
+            {
+                attr.Properties("Attribute.Physical.OWNER").Value = ownerValue;
+                _ownerUdpExists = true; // Mark as exists since it worked
+                Log($"Set OWNER UDP = '{ownerValue}' for {attributeName}");
+                return true;
+            }
+            catch
+            {
+                // Direct property access failed
+            }
+
+            // Try CollectProperties approach
+            try
+            {
+                var props = attr.CollectProperties("Attribute.Physical.OWNER");
+                if (props != null && props.Count > 0)
+                {
+                    props.Item(0).Value = ownerValue;
+                    _ownerUdpExists = true;
+                    Log($"Set OWNER via CollectProperties = '{ownerValue}' for {attributeName}");
+                    return true;
+                }
+            }
+            catch
+            {
+                // CollectProperties also failed
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Creates the OWNER UDP via metamodel-level session
+        /// </summary>
+        private bool CreateOwnerUdpViaMetamodel(dynamic modelObjects)
+        {
+            dynamic metamodelSession = null;
+            try
+            {
+                Log("Opening metamodel session (SCD_SL_M1)...");
+
+                // Create a new session with metamodel access level (SCD_SL_M1 = 1)
+                metamodelSession = _scapi.Sessions.Add();
+                metamodelSession.Open(_currentModel, 1); // 1 = SCD_SL_M1 (Metamodel level)
+
+                Log("Metamodel session opened");
+
+                // Begin transaction
+                int transId = metamodelSession.BeginNamedTransaction("CreateOwnerUDP");
+                Log("Transaction started");
+
+                try
+                {
+                    // Create Property_Type for the UDP
+                    dynamic mmObjects = metamodelSession.ModelObjects;
+                    dynamic udpType = mmObjects.Add("Property_Type");
+
+                    Log("Property_Type object created");
+
+                    // Set UDP properties
+                    // Name format: <ObjectClassName>.<Logical/Physical>.<Name>
+                    udpType.Properties("Name").Value = "Attribute.Physical.OWNER";
+                    Log("Set Name = Attribute.Physical.OWNER");
+
+                    // tag_Udp_Owner_Type - the class this UDP applies to
+                    // Attribute class ID in erwin
+                    try { udpType.Properties("tag_Udp_Owner_Type").Value = "Attribute"; }
+                    catch { Log("Could not set tag_Udp_Owner_Type"); }
+
+                    // Physical only
+                    try { udpType.Properties("tag_Is_Physical").Value = true; }
+                    catch { Log("Could not set tag_Is_Physical"); }
+
+                    try { udpType.Properties("tag_Is_Logical").Value = false; }
+                    catch { Log("Could not set tag_Is_Logical"); }
+
+                    // Data type: 2 = Text
+                    try { udpType.Properties("tag_Udp_Data_Type").Value = 2; }
+                    catch { Log("Could not set tag_Udp_Data_Type"); }
+
+                    try { udpType.Properties("Data_Type").Value = 2; }
+                    catch { Log("Could not set Data_Type"); }
+
+                    // Order
+                    try { udpType.Properties("tag_Order").Value = "1"; }
+                    catch { Log("Could not set tag_Order"); }
+
+                    // Locally defined
+                    try { udpType.Properties("tag_Is_Locally_Defined").Value = true; }
+                    catch { Log("Could not set tag_Is_Locally_Defined"); }
+
+                    // Commit transaction
+                    metamodelSession.CommitTransaction(transId);
+                    Log("Transaction committed");
+
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    Log($"Error creating UDP: {ex.Message}");
+                    try { metamodelSession.RollbackTransaction(transId); } catch { }
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"Metamodel session error: {ex.Message}");
+                return false;
+            }
+            finally
+            {
+                // Close metamodel session
+                if (metamodelSession != null)
+                {
+                    try { metamodelSession.Close(); } catch { }
+                }
             }
         }
 
@@ -279,6 +588,8 @@ namespace EliteSoft.Erwin.AddIn
 
             if (e.GlossaryEntry == null) return;
 
+            System.Diagnostics.Debug.WriteLine($"OnValidationPassed: Table={e.TableName}, Attr={e.AttributeName}, DataType={e.GlossaryEntry.DataType}, Owner={e.GlossaryEntry.Owner}");
+
             // Apply glossary entry - set Data Type and OWNER UDP
             ApplyGlossaryEntry(e.TableName, e.AttributeName, e.GlossaryEntry);
 
@@ -347,40 +658,38 @@ namespace EliteSoft.Erwin.AddIn
                                 // Set OWNER UDP from glossary
                                 if (!string.IsNullOrEmpty(entry.Owner))
                                 {
-                                    try
-                                    {
-                                        // Try to set UDP named "OWNER"
-                                        dynamic udpCollection = attr.Properties("UDP_Values");
-                                        if (udpCollection != null)
-                                        {
-                                            // Try to find/set OWNER UDP
-                                            bool found = false;
-                                            try
-                                            {
-                                                dynamic ownerUdp = udpCollection.Item("OWNER");
-                                                if (ownerUdp != null)
-                                                {
-                                                    ownerUdp.Value = entry.Owner;
-                                                    found = true;
-                                                }
-                                            }
-                                            catch { }
+                                    bool ownerSet = TrySetOwnerUdp(attr, entry.Owner, attributeName);
 
-                                            if (!found)
-                                            {
-                                                // UDP might need to be accessed differently
-                                                // Try setting via UDP property directly
-                                                try
-                                                {
-                                                    attr.Properties("UDP_OWNER").Value = entry.Owner;
-                                                }
-                                                catch { }
-                                            }
+                                    // If setting failed and UDP doesn't exist, create it and retry
+                                    if (!ownerSet && !_ownerUdpExists)
+                                    {
+                                        Log($"OWNER UDP not set - attempting to create UDP for {attributeName}...");
+
+                                        // Commit current transaction first
+                                        _session.CommitTransaction(transId);
+
+                                        // Create UDP via metamodel
+                                        bool created = CreateOwnerUdpViaMetamodel(modelObjects);
+                                        if (created)
+                                        {
+                                            _ownerUdpExists = true;
+                                            Log("OWNER UDP created successfully! Retrying set...");
+
+                                            // Start a new transaction to set the value
+                                            transId = _session.BeginNamedTransaction("ApplyGlossaryRetry");
+                                            ownerSet = TrySetOwnerUdp(attr, entry.Owner, attributeName);
+                                        }
+                                        else
+                                        {
+                                            Log("Could not create OWNER UDP automatically.");
+                                            // Start a new transaction to continue
+                                            transId = _session.BeginNamedTransaction("ApplyGlossaryContinue");
                                         }
                                     }
-                                    catch (Exception ex)
+
+                                    if (!ownerSet)
                                     {
-                                        System.Diagnostics.Debug.WriteLine($"Set OWNER UDP error: {ex.Message}");
+                                        System.Diagnostics.Debug.WriteLine($"OWNER UDP not set for {attributeName}");
                                     }
                                 }
 
@@ -399,6 +708,92 @@ namespace EliteSoft.Erwin.AddIn
             catch (Exception ex)
             {
                 System.Diagnostics.Debug.WriteLine($"ApplyGlossaryEntry error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Ensures the OWNER UDP exists in the model, creates it if not
+        /// Creates Property_Type and required Association_Type objects
+        /// </summary>
+        private void EnsureOwnerUdpExists(dynamic modelObjects)
+        {
+            try
+            {
+                // Check if UDP already exists by looking for Property_Type with name "Column.Physical.OWNER"
+                dynamic root = modelObjects.Root;
+                dynamic propertyTypes = modelObjects.Collect(root, "Property_Type");
+
+                if (propertyTypes != null)
+                {
+                    foreach (dynamic pt in propertyTypes)
+                    {
+                        if (pt == null) continue;
+                        try
+                        {
+                            string name = pt.Name ?? "";
+                            if (name.Equals("Column.Physical.OWNER", StringComparison.OrdinalIgnoreCase))
+                            {
+                                // UDP already exists
+                                return;
+                            }
+                        }
+                        catch { }
+                    }
+                }
+
+                // Step 1: Create the Property_Type (UDP definition)
+                dynamic newUdp = modelObjects.Add("Property_Type");
+
+                // Get the numeric ID (not GUID ObjectId)
+                string udpId = "";
+                try { udpId = newUdp.Properties("Id").Value?.ToString() ?? ""; } catch { }
+                if (string.IsNullOrEmpty(udpId))
+                {
+                    try { udpId = newUdp.Id?.ToString() ?? ""; } catch { }
+                }
+                if (string.IsNullOrEmpty(udpId))
+                {
+                    // Use ObjectId as fallback
+                    udpId = newUdp.ObjectId?.ToString() ?? "";
+                }
+
+                newUdp.Properties("Name").Value = "Column.Physical.OWNER";
+                newUdp.Properties("tag_Is_Physical").Value = true;
+                newUdp.Properties("tag_Order").Value = "1";
+                newUdp.Properties("tag_Udp_Owner_Type").Value = "1075838981";  // Attribute class ID
+                newUdp.Properties("tag_Column_Width").Value = "-3";
+                newUdp.Properties("tag_Udp_Data_Type").Value = "2";  // Text type
+                newUdp.Properties("Data_Type").Value = "2";
+                newUdp.Properties("tag_Is_Locally_Defined").Value = true;
+
+                System.Diagnostics.Debug.WriteLine($"Created Property_Type: Column.Physical.OWNER (id={udpId})");
+
+                // Step 2: Create Association_Type for Column_has_Physical_OWNER
+                dynamic attrAssoc = modelObjects.Add("Association_Type");
+                attrAssoc.Properties("Name").Value = "Column_has_Physical_OWNER";
+                attrAssoc.Properties("tag_Is_Physical").Value = true;
+                attrAssoc.Properties("tag_Is_Prefetch").Value = true;
+                attrAssoc.Properties("Participating_Property_Ref").Value = udpId;
+                attrAssoc.Properties("Participating_Object_Ref").Value = "1075838981";  // Attribute class ID
+                attrAssoc.Properties("tag_Is_Locally_Defined").Value = true;
+
+                System.Diagnostics.Debug.WriteLine("Created Association_Type: Column_has_Physical_OWNER");
+
+                // Step 3: Create Association_Type for Domain_has_Physical_OWNER
+                dynamic domainAssoc = modelObjects.Add("Association_Type");
+                domainAssoc.Properties("Name").Value = "Domain_has_Physical_OWNER";
+                domainAssoc.Properties("tag_Is_Physical").Value = true;
+                domainAssoc.Properties("tag_Is_Prefetch").Value = true;
+                domainAssoc.Properties("Participating_Property_Ref").Value = udpId;
+                domainAssoc.Properties("Participating_Object_Ref").Value = "1075838983";  // Domain class ID
+                domainAssoc.Properties("tag_Is_Locally_Defined").Value = true;
+
+                System.Diagnostics.Debug.WriteLine("Created Association_Type: Domain_has_Physical_OWNER");
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"EnsureOwnerUdpExists error: {ex.Message}");
+                throw;
             }
         }
 
@@ -518,31 +913,48 @@ namespace EliteSoft.Erwin.AddIn
 
             listValidationIssues.Items.Clear();
 
-            var issues = _validationService.ValidateAllColumns();
+            var allResults = _validationService.ValidateAllColumns();
 
-            foreach (var issue in issues)
+            // Separate valid and invalid
+            var validColumns = allResults.Where(r => r.IsValid).ToList();
+            var invalidColumns = allResults.Where(r => !r.IsValid).ToList();
+
+            // First add valid columns (green)
+            foreach (var col in validColumns)
             {
-                var item = new ListViewItem(issue.TableName);
-                item.SubItems.Add(issue.AttributeName);
-                item.SubItems.Add(issue.PhysicalName);
-                item.SubItems.Add(issue.Issue);
+                var item = new ListViewItem(col.TableName);
+                item.SubItems.Add(col.AttributeName);
+                item.SubItems.Add(col.PhysicalName);
+                item.SubItems.Add("OK - Glossary'de bulundu");
+                item.ForeColor = Color.DarkGreen;
+                listValidationIssues.Items.Add(item);
+            }
+
+            // Then add invalid columns (red)
+            foreach (var col in invalidColumns)
+            {
+                var item = new ListViewItem(col.TableName);
+                item.SubItems.Add(col.AttributeName);
+                item.SubItems.Add(col.PhysicalName);
+                item.SubItems.Add(col.Issue);
                 item.ForeColor = Color.Red;
                 listValidationIssues.Items.Add(item);
             }
 
-            if (issues.Count == 0)
+            // Update status
+            if (invalidColumns.Count == 0)
             {
-                lblValidationStatus.Text = "Validation passed - All columns have 'col_' prefix";
+                lblValidationStatus.Text = $"Validation passed - All {validColumns.Count} columns exist in glossary";
                 lblValidationStatus.ForeColor = Color.DarkGreen;
-                MessageBox.Show("All column names are valid!\nAll columns have the required 'col_' prefix.",
+                MessageBox.Show($"All column names are valid!\n{validColumns.Count} column(s) found in glossary.",
                     "Validation Passed", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
             else
             {
-                lblValidationStatus.Text = $"Validation failed - {issues.Count} issue(s) found";
+                lblValidationStatus.Text = $"Validation: {validColumns.Count} OK, {invalidColumns.Count} failed";
                 lblValidationStatus.ForeColor = Color.Red;
-                MessageBox.Show($"Found {issues.Count} column(s) without 'col_' prefix.\nSee the list for details.",
-                    "Validation Failed", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show($"Valid: {validColumns.Count} column(s)\nInvalid: {invalidColumns.Count} column(s) not in glossary.\n\nSee the list for details.",
+                    "Validation Result", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
 

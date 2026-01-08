@@ -40,9 +40,15 @@ namespace EliteSoft.Erwin.AddIn
             this.listValidationIssues = new System.Windows.Forms.ListView();
             this.lblValidationStatus = new System.Windows.Forms.Label();
 
+            this.grpDebugLog = new System.Windows.Forms.GroupBox();
+            this.txtDebugLog = new System.Windows.Forms.TextBox();
+            this.btnCopyLog = new System.Windows.Forms.Button();
+            this.btnClearLog = new System.Windows.Forms.Button();
+
             this.grpModel.SuspendLayout();
             this.grpConfig.SuspendLayout();
             this.grpValidation.SuspendLayout();
+            this.grpDebugLog.SuspendLayout();
             this.SuspendLayout();
 
             //
@@ -162,7 +168,7 @@ namespace EliteSoft.Erwin.AddIn
             this.grpValidation.Size = new System.Drawing.Size(560, 200);
             this.grpValidation.TabIndex = 5;
             this.grpValidation.TabStop = false;
-            this.grpValidation.Text = "Column Name Validation (col_ prefix required)";
+            this.grpValidation.Text = "Column Name Validation (Glossary Check)";
             //
             // chkMonitoring
             //
@@ -205,9 +211,53 @@ namespace EliteSoft.Erwin.AddIn
             this.lblValidationStatus.Text = "Monitoring: Off";
             this.lblValidationStatus.ForeColor = System.Drawing.Color.Gray;
             //
+            // grpDebugLog
+            //
+            this.grpDebugLog.Controls.Add(this.txtDebugLog);
+            this.grpDebugLog.Controls.Add(this.btnCopyLog);
+            this.grpDebugLog.Controls.Add(this.btnClearLog);
+            this.grpDebugLog.Location = new System.Drawing.Point(12, 385);
+            this.grpDebugLog.Name = "grpDebugLog";
+            this.grpDebugLog.Size = new System.Drawing.Size(560, 150);
+            this.grpDebugLog.TabIndex = 6;
+            this.grpDebugLog.TabStop = false;
+            this.grpDebugLog.Text = "Debug Log (copy-paste available)";
+            //
+            // txtDebugLog
+            //
+            this.txtDebugLog.Location = new System.Drawing.Point(15, 22);
+            this.txtDebugLog.Multiline = true;
+            this.txtDebugLog.Name = "txtDebugLog";
+            this.txtDebugLog.ReadOnly = true;
+            this.txtDebugLog.ScrollBars = System.Windows.Forms.ScrollBars.Both;
+            this.txtDebugLog.Size = new System.Drawing.Size(445, 115);
+            this.txtDebugLog.TabIndex = 0;
+            this.txtDebugLog.Font = new System.Drawing.Font("Consolas", 8F);
+            this.txtDebugLog.BackColor = System.Drawing.Color.White;
+            //
+            // btnCopyLog
+            //
+            this.btnCopyLog.Location = new System.Drawing.Point(470, 22);
+            this.btnCopyLog.Name = "btnCopyLog";
+            this.btnCopyLog.Size = new System.Drawing.Size(75, 28);
+            this.btnCopyLog.TabIndex = 1;
+            this.btnCopyLog.Text = "Copy";
+            this.btnCopyLog.UseVisualStyleBackColor = true;
+            this.btnCopyLog.Click += new System.EventHandler(this.BtnCopyLog_Click);
+            //
+            // btnClearLog
+            //
+            this.btnClearLog.Location = new System.Drawing.Point(470, 56);
+            this.btnClearLog.Name = "btnClearLog";
+            this.btnClearLog.Size = new System.Drawing.Size(75, 28);
+            this.btnClearLog.TabIndex = 2;
+            this.btnClearLog.Text = "Clear";
+            this.btnClearLog.UseVisualStyleBackColor = true;
+            this.btnClearLog.Click += new System.EventHandler(this.BtnClearLog_Click);
+            //
             // btnApply
             //
-            this.btnApply.Location = new System.Drawing.Point(382, 390);
+            this.btnApply.Location = new System.Drawing.Point(382, 545);
             this.btnApply.Name = "btnApply";
             this.btnApply.Size = new System.Drawing.Size(90, 32);
             this.btnApply.TabIndex = 2;
@@ -217,7 +267,7 @@ namespace EliteSoft.Erwin.AddIn
             //
             // btnClose
             //
-            this.btnClose.Location = new System.Drawing.Point(482, 390);
+            this.btnClose.Location = new System.Drawing.Point(482, 545);
             this.btnClose.Name = "btnClose";
             this.btnClose.Size = new System.Drawing.Size(90, 32);
             this.btnClose.TabIndex = 3;
@@ -227,7 +277,7 @@ namespace EliteSoft.Erwin.AddIn
             //
             // lblStatus
             //
-            this.lblStatus.Location = new System.Drawing.Point(12, 395);
+            this.lblStatus.Location = new System.Drawing.Point(12, 550);
             this.lblStatus.Name = "lblStatus";
             this.lblStatus.Size = new System.Drawing.Size(360, 25);
             this.lblStatus.TabIndex = 4;
@@ -238,10 +288,11 @@ namespace EliteSoft.Erwin.AddIn
             //
             this.AutoScaleDimensions = new System.Drawing.SizeF(7F, 15F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
-            this.ClientSize = new System.Drawing.Size(584, 436);
+            this.ClientSize = new System.Drawing.Size(584, 590);
             this.Controls.Add(this.grpModel);
             this.Controls.Add(this.grpConfig);
             this.Controls.Add(this.grpValidation);
+            this.Controls.Add(this.grpDebugLog);
             this.Controls.Add(this.btnApply);
             this.Controls.Add(this.btnClose);
             this.Controls.Add(this.lblStatus);
@@ -259,6 +310,8 @@ namespace EliteSoft.Erwin.AddIn
             this.grpConfig.PerformLayout();
             this.grpValidation.ResumeLayout(false);
             this.grpValidation.PerformLayout();
+            this.grpDebugLog.ResumeLayout(false);
+            this.grpDebugLog.PerformLayout();
             this.ResumeLayout(false);
         }
 
@@ -286,5 +339,10 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.Button btnValidateAll;
         private System.Windows.Forms.ListView listValidationIssues;
         private System.Windows.Forms.Label lblValidationStatus;
+
+        private System.Windows.Forms.GroupBox grpDebugLog;
+        private System.Windows.Forms.TextBox txtDebugLog;
+        private System.Windows.Forms.Button btnCopyLog;
+        private System.Windows.Forms.Button btnClearLog;
     }
 }

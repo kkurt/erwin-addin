@@ -451,11 +451,11 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// Validates all columns and returns list of issues
+        /// Validates all columns and returns list of all results (valid and invalid)
         /// </summary>
         public List<ColumnValidationIssue> ValidateAllColumns()
         {
-            var issues = new List<ColumnValidationIssue>();
+            var results = new List<ColumnValidationIssue>();
 
             try
             {
@@ -463,7 +463,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 dynamic root = modelObjects.Root;
 
                 dynamic allEntities = modelObjects.Collect(root, "Entity");
-                if (allEntities == null) return issues;
+                if (allEntities == null) return results;
 
                 foreach (dynamic entity in allEntities)
                 {
@@ -499,18 +499,27 @@ namespace EliteSoft.Erwin.AddIn.Services
                         }
                         catch { physicalName = attrName; }
 
-                        var result = ValidateColumnName(physicalName);
-                        if (!result.IsValid)
+                        // Skip special names
+                        if (string.IsNullOrEmpty(physicalName) ||
+                            physicalName.Equals("<default>", StringComparison.OrdinalIgnoreCase) ||
+                            physicalName.StartsWith("<default>", StringComparison.OrdinalIgnoreCase) ||
+                            physicalName.Equals("PLEASE CHANGE IT", StringComparison.OrdinalIgnoreCase))
                         {
-                            issues.Add(new ColumnValidationIssue
-                            {
-                                TableName = tableName,
-                                AttributeName = attrName,
-                                PhysicalName = physicalName,
-                                Issue = result.Message,
-                                RuleName = result.RuleName
-                            });
+                            continue;
                         }
+
+                        var result = ValidateColumnName(physicalName);
+
+                        results.Add(new ColumnValidationIssue
+                        {
+                            TableName = tableName,
+                            AttributeName = attrName,
+                            PhysicalName = physicalName,
+                            Issue = result.IsValid ? "Found in glossary" : result.Message,
+                            RuleName = result.RuleName ?? "GlossaryRule",
+                            IsValid = result.IsValid,
+                            GlossaryEntry = result.GlossaryEntry
+                        });
                     }
                 }
             }
@@ -519,7 +528,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 System.Diagnostics.Debug.WriteLine($"ValidateAllColumns error: {ex.Message}");
             }
 
-            return issues;
+            return results;
         }
 
         public bool IsMonitoring => _isMonitoring;
@@ -574,6 +583,8 @@ namespace EliteSoft.Erwin.AddIn.Services
         public string PhysicalName { get; set; }
         public string Issue { get; set; }
         public string RuleName { get; set; }
+        public bool IsValid { get; set; }
+        public GlossaryEntry GlossaryEntry { get; set; }
     }
 
     public class ValidationResult
