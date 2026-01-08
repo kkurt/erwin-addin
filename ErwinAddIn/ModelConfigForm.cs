@@ -82,14 +82,14 @@ namespace EliteSoft.Erwin.AddIn
         private void InitializeValidationUI()
         {
             // Column validation ListView columns
-            listColumnValidation.Columns.Add("Table", 120);
-            listColumnValidation.Columns.Add("Column", 120);
-            listColumnValidation.Columns.Add("Physical Name", 140);
-            listColumnValidation.Columns.Add("Status", 140);
+            listColumnValidation.Columns.Add("Table", 150);
+            listColumnValidation.Columns.Add("Column", 150);
+            listColumnValidation.Columns.Add("Physical Name", 200);
+            listColumnValidation.Columns.Add("In Glossary", 100);
 
             // Table validation ListView columns
-            listTableValidation.Columns.Add("Table", 180);
-            listTableValidation.Columns.Add("Issue", 280);
+            listTableValidation.Columns.Add("Table", 250);
+            listTableValidation.Columns.Add("Type Selected", 120);
 
             btnValidateAll.Enabled = false;
         }
@@ -878,11 +878,11 @@ namespace EliteSoft.Erwin.AddIn
                 return;
             }
 
-            // Add to column validation list (always, even during suppression)
+            // Add to column validation list (always, even during suppression) with cross symbol
             var item = new ListViewItem(e.TableName);
             item.SubItems.Add(e.AttributeName);
             item.SubItems.Add(e.PhysicalName);
-            item.SubItems.Add(e.ValidationMessage);
+            item.SubItems.Add("✗");
             item.ForeColor = Color.Red;
             listColumnValidation.Items.Insert(0, item);
 
@@ -1247,24 +1247,24 @@ namespace EliteSoft.Erwin.AddIn
             var validColumns = columnResults.Where(r => r.IsValid).ToList();
             var invalidColumns = columnResults.Where(r => !r.IsValid).ToList();
 
-            // First add valid columns (green)
+            // First add valid columns (green) with checkmark
             foreach (var col in validColumns)
             {
                 var item = new ListViewItem(col.TableName);
                 item.SubItems.Add(col.AttributeName);
                 item.SubItems.Add(col.PhysicalName);
-                item.SubItems.Add("OK - Found in glossary");
+                item.SubItems.Add("✓");
                 item.ForeColor = Color.DarkGreen;
                 listColumnValidation.Items.Add(item);
             }
 
-            // Then add invalid columns (red)
+            // Then add invalid columns (red) with cross
             foreach (var col in invalidColumns)
             {
                 var item = new ListViewItem(col.TableName);
                 item.SubItems.Add(col.AttributeName);
                 item.SubItems.Add(col.PhysicalName);
-                item.SubItems.Add(col.Issue);
+                item.SubItems.Add("✗");
                 item.ForeColor = Color.Red;
                 listColumnValidation.Items.Add(item);
             }
@@ -1273,20 +1273,20 @@ namespace EliteSoft.Erwin.AddIn
             var validTables = tableResults.Where(r => r.IsValid).ToList();
             var invalidTables = tableResults.Where(r => !r.IsValid).ToList();
 
-            // Add valid tables (green) - TABLE_TYPE selected
+            // Add valid tables (green) with checkmark - TABLE_TYPE selected
             foreach (var tbl in validTables)
             {
                 var item = new ListViewItem(tbl.TableName);
-                item.SubItems.Add(tbl.Issue);
+                item.SubItems.Add("✓");
                 item.ForeColor = Color.DarkGreen;
                 listTableValidation.Items.Add(item);
             }
 
-            // Add invalid tables (red) - TABLE_TYPE not selected
+            // Add invalid tables (red) with cross - TABLE_TYPE not selected
             foreach (var tbl in invalidTables)
             {
                 var item = new ListViewItem(tbl.TableName);
-                item.SubItems.Add(tbl.Issue);
+                item.SubItems.Add("✗");
                 item.ForeColor = Color.Red;
                 listTableValidation.Items.Add(item);
             }

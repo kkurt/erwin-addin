@@ -103,7 +103,7 @@ namespace EliteSoft.Erwin.AddIn
             this.tabControl.Location = new System.Drawing.Point(12, 12);
             this.tabControl.Name = "tabControl";
             this.tabControl.SelectedIndex = 0;
-            this.tabControl.Size = new System.Drawing.Size(560, 480);
+            this.tabControl.Size = new System.Drawing.Size(852, 480);
             this.tabControl.TabIndex = 0;
 
             //
@@ -113,7 +113,7 @@ namespace EliteSoft.Erwin.AddIn
             this.tabModel.Location = new System.Drawing.Point(4, 24);
             this.tabModel.Name = "tabModel";
             this.tabModel.Padding = new System.Windows.Forms.Padding(10);
-            this.tabModel.Size = new System.Drawing.Size(552, 452);
+            this.tabModel.Size = new System.Drawing.Size(844, 452);
             this.tabModel.TabIndex = 0;
             this.tabModel.Text = "Model";
             this.tabModel.UseVisualStyleBackColor = true;
@@ -127,7 +127,7 @@ namespace EliteSoft.Erwin.AddIn
             this.grpModel.Controls.Add(this.lblModelName);
             this.grpModel.Location = new System.Drawing.Point(10, 10);
             this.grpModel.Name = "grpModel";
-            this.grpModel.Size = new System.Drawing.Size(525, 70);
+            this.grpModel.Size = new System.Drawing.Size(817, 70);
             this.grpModel.TabIndex = 0;
             this.grpModel.TabStop = false;
             this.grpModel.Text = "Select Model";
@@ -171,7 +171,7 @@ namespace EliteSoft.Erwin.AddIn
             this.tabConfiguration.Location = new System.Drawing.Point(4, 24);
             this.tabConfiguration.Name = "tabConfiguration";
             this.tabConfiguration.Padding = new System.Windows.Forms.Padding(10);
-            this.tabConfiguration.Size = new System.Drawing.Size(552, 452);
+            this.tabConfiguration.Size = new System.Drawing.Size(844, 452);
             this.tabConfiguration.TabIndex = 1;
             this.tabConfiguration.Text = "Configuration";
             this.tabConfiguration.UseVisualStyleBackColor = true;
@@ -189,7 +189,7 @@ namespace EliteSoft.Erwin.AddIn
             this.grpConfig.Controls.Add(this.btnApply);
             this.grpConfig.Location = new System.Drawing.Point(10, 10);
             this.grpConfig.Name = "grpConfig";
-            this.grpConfig.Size = new System.Drawing.Size(525, 170);
+            this.grpConfig.Size = new System.Drawing.Size(817, 170);
             this.grpConfig.TabIndex = 0;
             this.grpConfig.TabStop = false;
             this.grpConfig.Text = "Model Configuration";
@@ -273,7 +273,7 @@ namespace EliteSoft.Erwin.AddIn
             this.tabGlossary.Location = new System.Drawing.Point(4, 24);
             this.tabGlossary.Name = "tabGlossary";
             this.tabGlossary.Padding = new System.Windows.Forms.Padding(10);
-            this.tabGlossary.Size = new System.Drawing.Size(552, 452);
+            this.tabGlossary.Size = new System.Drawing.Size(844, 452);
             this.tabGlossary.TabIndex = 2;
             this.tabGlossary.Text = "Glossary";
             this.tabGlossary.UseVisualStyleBackColor = true;
@@ -297,7 +297,7 @@ namespace EliteSoft.Erwin.AddIn
             this.grpGlossary.Controls.Add(this.lblGlossaryStatus);
             this.grpGlossary.Location = new System.Drawing.Point(10, 10);
             this.grpGlossary.Name = "grpGlossary";
-            this.grpGlossary.Size = new System.Drawing.Size(525, 250);
+            this.grpGlossary.Size = new System.Drawing.Size(817, 250);
             this.grpGlossary.TabIndex = 0;
             this.grpGlossary.TabStop = false;
             this.grpGlossary.Text = "Glossary Database Connection";
@@ -443,7 +443,7 @@ namespace EliteSoft.Erwin.AddIn
             this.tabValidation.Location = new System.Drawing.Point(4, 24);
             this.tabValidation.Name = "tabValidation";
             this.tabValidation.Padding = new System.Windows.Forms.Padding(10);
-            this.tabValidation.Size = new System.Drawing.Size(552, 452);
+            this.tabValidation.Size = new System.Drawing.Size(844, 452);
             this.tabValidation.TabIndex = 3;
             this.tabValidation.Text = "Validation";
             this.tabValidation.UseVisualStyleBackColor = true;
@@ -468,7 +468,7 @@ namespace EliteSoft.Erwin.AddIn
             this.tabControlValidation.Location = new System.Drawing.Point(13, 47);
             this.tabControlValidation.Name = "tabControlValidation";
             this.tabControlValidation.SelectedIndex = 0;
-            this.tabControlValidation.Size = new System.Drawing.Size(520, 370);
+            this.tabControlValidation.Size = new System.Drawing.Size(812, 370);
             this.tabControlValidation.TabIndex = 1;
 
             //
@@ -478,7 +478,7 @@ namespace EliteSoft.Erwin.AddIn
             this.tabColumnValidation.Location = new System.Drawing.Point(4, 24);
             this.tabColumnValidation.Name = "tabColumnValidation";
             this.tabColumnValidation.Padding = new System.Windows.Forms.Padding(5);
-            this.tabColumnValidation.Size = new System.Drawing.Size(512, 342);
+            this.tabColumnValidation.Size = new System.Drawing.Size(804, 342);
             this.tabColumnValidation.TabIndex = 0;
             this.tabColumnValidation.Text = "Column Validation";
             this.tabColumnValidation.UseVisualStyleBackColor = true;
@@ -491,7 +491,7 @@ namespace EliteSoft.Erwin.AddIn
             this.listColumnValidation.GridLines = true;
             this.listColumnValidation.Location = new System.Drawing.Point(5, 5);
             this.listColumnValidation.Name = "listColumnValidation";
-            this.listColumnValidation.Size = new System.Drawing.Size(502, 332);
+            this.listColumnValidation.Size = new System.Drawing.Size(794, 332);
             this.listColumnValidation.TabIndex = 0;
             this.listColumnValidation.UseCompatibleStateImageBehavior = false;
             this.listColumnValidation.View = System.Windows.Forms.View.Details;
@@ -503,7 +503,7 @@ namespace EliteSoft.Erwin.AddIn
             this.tabTableValidation.Location = new System.Drawing.Point(4, 24);
             this.tabTableValidation.Name = "tabTableValidation";
             this.tabTableValidation.Padding = new System.Windows.Forms.Padding(5);
-            this.tabTableValidation.Size = new System.Drawing.Size(512, 342);
+            this.tabTableValidation.Size = new System.Drawing.Size(804, 342);
             this.tabTableValidation.TabIndex = 1;
             this.tabTableValidation.Text = "Table Validation";
             this.tabTableValidation.UseVisualStyleBackColor = true;
@@ -516,7 +516,7 @@ namespace EliteSoft.Erwin.AddIn
             this.listTableValidation.GridLines = true;
             this.listTableValidation.Location = new System.Drawing.Point(5, 5);
             this.listTableValidation.Name = "listTableValidation";
-            this.listTableValidation.Size = new System.Drawing.Size(502, 332);
+            this.listTableValidation.Size = new System.Drawing.Size(794, 332);
             this.listTableValidation.TabIndex = 0;
             this.listTableValidation.UseCompatibleStateImageBehavior = false;
             this.listTableValidation.View = System.Windows.Forms.View.Details;
@@ -527,7 +527,7 @@ namespace EliteSoft.Erwin.AddIn
             this.lblValidationStatus.Anchor = System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right | System.Windows.Forms.AnchorStyles.Bottom;
             this.lblValidationStatus.Location = new System.Drawing.Point(13, 422);
             this.lblValidationStatus.Name = "lblValidationStatus";
-            this.lblValidationStatus.Size = new System.Drawing.Size(520, 20);
+            this.lblValidationStatus.Size = new System.Drawing.Size(812, 20);
             this.lblValidationStatus.TabIndex = 2;
             this.lblValidationStatus.Text = "Real-time monitoring active";
             this.lblValidationStatus.ForeColor = System.Drawing.Color.DarkGreen;
@@ -539,7 +539,7 @@ namespace EliteSoft.Erwin.AddIn
             this.tabDebug.Location = new System.Drawing.Point(4, 24);
             this.tabDebug.Name = "tabDebug";
             this.tabDebug.Padding = new System.Windows.Forms.Padding(10);
-            this.tabDebug.Size = new System.Drawing.Size(552, 452);
+            this.tabDebug.Size = new System.Drawing.Size(844, 452);
             this.tabDebug.TabIndex = 4;
             this.tabDebug.Text = "Debug Log";
             this.tabDebug.UseVisualStyleBackColor = true;
@@ -553,7 +553,7 @@ namespace EliteSoft.Erwin.AddIn
             this.grpDebugLog.Controls.Add(this.btnClearLog);
             this.grpDebugLog.Location = new System.Drawing.Point(10, 10);
             this.grpDebugLog.Name = "grpDebugLog";
-            this.grpDebugLog.Size = new System.Drawing.Size(525, 425);
+            this.grpDebugLog.Size = new System.Drawing.Size(817, 425);
             this.grpDebugLog.TabIndex = 0;
             this.grpDebugLog.TabStop = false;
             this.grpDebugLog.Text = "Debug Output";
@@ -600,7 +600,7 @@ namespace EliteSoft.Erwin.AddIn
             // btnClose
             //
             this.btnClose.Anchor = System.Windows.Forms.AnchorStyles.Bottom | System.Windows.Forms.AnchorStyles.Right;
-            this.btnClose.Location = new System.Drawing.Point(482, 505);
+            this.btnClose.Location = new System.Drawing.Point(774, 505);
             this.btnClose.Name = "btnClose";
             this.btnClose.Size = new System.Drawing.Size(90, 32);
             this.btnClose.TabIndex = 1;
@@ -614,7 +614,7 @@ namespace EliteSoft.Erwin.AddIn
             this.lblStatus.Anchor = System.Windows.Forms.AnchorStyles.Bottom | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
             this.lblStatus.Location = new System.Drawing.Point(12, 510);
             this.lblStatus.Name = "lblStatus";
-            this.lblStatus.Size = new System.Drawing.Size(460, 25);
+            this.lblStatus.Size = new System.Drawing.Size(752, 25);
             this.lblStatus.TabIndex = 2;
             this.lblStatus.Text = "";
             this.lblStatus.ForeColor = System.Drawing.Color.DarkBlue;
@@ -624,7 +624,7 @@ namespace EliteSoft.Erwin.AddIn
             //
             this.AutoScaleDimensions = new System.Drawing.SizeF(7F, 15F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
-            this.ClientSize = new System.Drawing.Size(584, 551);
+            this.ClientSize = new System.Drawing.Size(876, 551);
             this.Controls.Add(this.tabControl);
             this.Controls.Add(this.btnClose);
             this.Controls.Add(this.lblStatus);

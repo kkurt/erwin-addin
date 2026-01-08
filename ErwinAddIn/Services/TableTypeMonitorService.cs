@@ -186,6 +186,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                         !string.IsNullOrEmpty(tableTypeValue) &&
                         _entitySnapshots[objectId].TableTypeValue != tableTypeValue;
 
+                    // Check if physical name changed (user manually edited the table name)
+                    bool physicalNameChanged = !isNew &&
+                        _entitySnapshots[objectId].PhysicalName != physicalName;
+
                     if (tableTypeChanged)
                     {
                         string oldTableType = _entitySnapshots[objectId].TableTypeValue;
@@ -207,6 +211,26 @@ namespace EliteSoft.Erwin.AddIn.Services
                             PhysicalName = physicalName,
                             TableTypeValue = tableTypeValue
                         };
+                    }
+                    else if (physicalNameChanged)
+                    {
+                        // Physical name changed (user manually edited table name)
+                        string oldPhysicalName = _entitySnapshots[objectId].PhysicalName;
+                        Log($"Physical name changed for entity: '{oldPhysicalName}' -> '{physicalName}'");
+
+                        // If TABLE_TYPE is set, check if affix needs to be reapplied
+                        if (!string.IsNullOrEmpty(tableTypeValue))
+                        {
+                            var tableTypeEntry = TableTypeService.Instance.GetByName(tableTypeValue);
+                            if (tableTypeEntry != null && !tableTypeEntry.HasAffixApplied(physicalName))
+                            {
+                                Log($"Affix missing after name change, reapplying for TABLE_TYPE '{tableTypeValue}'");
+                                ApplyTableTypeAffix(entity, physicalName, tableTypeEntry);
+                            }
+                        }
+
+                        // Update snapshot with new name
+                        _entitySnapshots[objectId].PhysicalName = physicalName;
                     }
                     else if (isNew)
                     {
