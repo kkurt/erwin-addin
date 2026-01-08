@@ -16,8 +16,8 @@ namespace EliteSoft.Erwin.AddIn.Services
         private bool _isLoaded;
         private string _lastError;
 
-        // Connection string
-        private const string ConnectionString = "Server=localhost,1433;Database=Fiba;User Id=sa;Password=Elite12345;Connection Timeout=5;";
+        // Connection string - can be changed via SetConnectionString
+        private string _connectionString = "Server=localhost,1433;Database=Fiba;User Id=sa;Password=Elite12345;Connection Timeout=5;";
 
         /// <summary>
         /// Singleton instance
@@ -56,7 +56,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 _glossary.Clear();
                 _lastError = null;
 
-                using (var connection = new SqlConnection(ConnectionString))
+                using (var connection = new SqlConnection(_connectionString))
                 {
                     connection.Open();
 
@@ -137,6 +137,22 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             LoadGlossary();
         }
+
+        /// <summary>
+        /// Set connection string for glossary database
+        /// </summary>
+        public void SetConnectionString(string connectionString)
+        {
+            if (!string.IsNullOrEmpty(connectionString))
+            {
+                _connectionString = connectionString;
+            }
+        }
+
+        /// <summary>
+        /// Get current connection string
+        /// </summary>
+        public string ConnectionString => _connectionString;
     }
 
     /// <summary>

@@ -22,6 +22,10 @@ namespace EliteSoft.Erwin.AddIn
         // Flag to track if OWNER UDP exists in model
         private bool _ownerUdpExists = false;
 
+        // Suppress validation popups during startup (first 5 seconds)
+        private bool _suppressValidationPopups = true;
+        private Timer _suppressionTimer;
+
         public ModelConfigForm(dynamic scapi)
         {
             _scapi = scapi;
@@ -79,7 +83,6 @@ namespace EliteSoft.Erwin.AddIn
             listValidationIssues.Columns.Add("Physical Name", 140);
             listValidationIssues.Columns.Add("Issue", 140);
 
-            chkMonitoring.Enabled = false;
             btnValidateAll.Enabled = false;
         }
 
@@ -230,21 +233,36 @@ namespace EliteSoft.Erwin.AddIn
             _validationService.OnColumnChanged += OnColumnChanged;
 
             // Enable validation controls
-            chkMonitoring.Enabled = true;
             btnValidateAll.Enabled = true;
 
-            // Take initial snapshot
+            // Take initial snapshot and auto-start monitoring
             _validationService.TakeSnapshot();
+            _validationService.StartMonitoring();
+
+            // Suppress popups for first 5 seconds to avoid flood on startup
+            _suppressValidationPopups = true;
+            _suppressionTimer = new Timer();
+            _suppressionTimer.Interval = 5000;  // 5 seconds
+            _suppressionTimer.Tick += (s, ev) =>
+            {
+                _suppressValidationPopups = false;
+                _suppressionTimer.Stop();
+                _suppressionTimer.Dispose();
+                _suppressionTimer = null;
+                Log("Validation popup suppression ended - popups now active");
+            };
+            _suppressionTimer.Start();
+            Log("Validation popup suppression started (5 seconds)");
 
             var glossary = GlossaryService.Instance;
             if (glossary.IsLoaded)
             {
-                lblValidationStatus.Text = $"Ready - Glossary loaded ({glossary.Count} entries)";
-                lblValidationStatus.ForeColor = Color.DarkBlue;
+                lblValidationStatus.Text = $"Monitoring active - Glossary: {glossary.Count} entries";
+                lblValidationStatus.ForeColor = Color.DarkGreen;
             }
             else
             {
-                lblValidationStatus.Text = $"Warning: Glossary not loaded - {glossary.LastError}";
+                lblValidationStatus.Text = $"Monitoring active - Warning: Glossary not loaded";
                 lblValidationStatus.ForeColor = Color.Orange;
             }
         }
@@ -510,21 +528,127 @@ namespace EliteSoft.Erwin.AddIn
         }
 
         /// <summary>
+        /// Test database connection button click
+        /// </summary>
+        private void BtnTestConnection_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                lblGlossaryStatus.Text = "Testing connection...";
+                lblGlossaryStatus.ForeColor = Color.DarkBlue;
+                Application.DoEvents();
+
+                string connStr = BuildConnectionString();
+                using (var connection = new System.Data.SqlClient.SqlConnection(connStr))
+                {
+                    connection.Open();
+                    lblGlossaryStatus.Text = "Connection successful!";
+                    lblGlossaryStatus.ForeColor = Color.DarkGreen;
+                }
+            }
+            catch (Exception ex)
+            {
+                lblGlossaryStatus.Text = $"Connection failed: {ex.Message}";
+                lblGlossaryStatus.ForeColor = Color.Red;
+            }
+        }
+
+        /// <summary>
+        /// Reload glossary button click
+        /// </summary>
+        private void BtnReloadGlossary_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                lblGlossaryStatus.Text = "Reloading glossary...";
+                lblGlossaryStatus.ForeColor = Color.DarkBlue;
+                Application.DoEvents();
+
+                // Update GlossaryService connection string
+                string connStr = BuildConnectionString();
+                GlossaryService.Instance.SetConnectionString(connStr);
+                GlossaryService.Instance.Reload();
+
+                if (GlossaryService.Instance.IsLoaded)
+                {
+                    lblGlossaryStatus.Text = $"Glossary loaded: {GlossaryService.Instance.Count} entries";
+                    lblGlossaryStatus.ForeColor = Color.DarkGreen;
+
+                    // Update validation status if available
+                    if (lblValidationStatus != null)
+                    {
+                        lblValidationStatus.Text = $"Monitoring active - Glossary: {GlossaryService.Instance.Count} entries";
+                        lblValidationStatus.ForeColor = Color.DarkGreen;
+                    }
+                }
+                else
+                {
+                    lblGlossaryStatus.Text = $"Failed to load glossary: {GlossaryService.Instance.LastError}";
+                    lblGlossaryStatus.ForeColor = Color.Red;
+                }
+            }
+            catch (Exception ex)
+            {
+                lblGlossaryStatus.Text = $"Error: {ex.Message}";
+                lblGlossaryStatus.ForeColor = Color.Red;
+            }
+        }
+
+        /// <summary>
+        /// Build connection string from form fields
+        /// </summary>
+        private string BuildConnectionString()
+        {
+            string server = txtHost.Text.Trim();
+            string port = txtPort.Text.Trim();
+
+            // Combine host and port
+            if (!string.IsNullOrEmpty(port) && port != "1433")
+            {
+                server = $"{server},{port}";
+            }
+            else if (!string.IsNullOrEmpty(port))
+            {
+                server = $"{server},{port}";
+            }
+
+            return $"Server={server};Database={txtGlossaryDatabase.Text};User Id={txtUserId.Text};Password={txtPassword.Text};Connection Timeout=5;";
+        }
+
+        /// <summary>
         /// Load glossary from database
         /// </summary>
         private void LoadGlossary()
         {
             try
             {
+                // Update connection string from form fields
+                string connStr = BuildConnectionString();
+                GlossaryService.Instance.SetConnectionString(connStr);
+
                 var glossary = GlossaryService.Instance;
                 if (!glossary.IsLoaded)
                 {
                     glossary.LoadGlossary();
                 }
+
+                // Update glossary status label
+                if (glossary.IsLoaded)
+                {
+                    lblGlossaryStatus.Text = $"Glossary loaded: {glossary.Count} entries";
+                    lblGlossaryStatus.ForeColor = Color.DarkGreen;
+                }
+                else
+                {
+                    lblGlossaryStatus.Text = $"Glossary not loaded: {glossary.LastError}";
+                    lblGlossaryStatus.ForeColor = Color.Red;
+                }
             }
             catch (Exception ex)
             {
                 System.Diagnostics.Debug.WriteLine($"LoadGlossary error: {ex.Message}");
+                lblGlossaryStatus.Text = $"Error: {ex.Message}";
+                lblGlossaryStatus.ForeColor = Color.Red;
             }
         }
 
@@ -539,13 +663,20 @@ namespace EliteSoft.Erwin.AddIn
                 return;
             }
 
-            // Add to issues list
+            // Add to issues list (always, even during suppression)
             var item = new ListViewItem(e.TableName);
             item.SubItems.Add(e.AttributeName);
             item.SubItems.Add(e.PhysicalName);
             item.SubItems.Add(e.ValidationMessage);
             item.ForeColor = Color.Red;
             listValidationIssues.Items.Insert(0, item);
+
+            // During startup suppression period, don't show popup
+            if (_suppressValidationPopups)
+            {
+                Log($"Popup suppressed for: {e.TableName}.{e.AttributeName}");
+                return;
+            }
 
             // Pause monitoring while showing popup
             _validationService?.StopMonitoring();
@@ -564,10 +695,7 @@ namespace EliteSoft.Erwin.AddIn
             ChangeColumnPhysicalName(e.TableName, e.AttributeName, "PLEASE CHANGE IT");
 
             // Resume monitoring after popup is closed
-            if (chkMonitoring.Checked)
-            {
-                _validationService?.StartMonitoring();
-            }
+            _validationService?.StartMonitoring();
 
             // Update status
             lblValidationStatus.Text = $"Last issue: {e.PhysicalName} - {e.ValidationMessage}";
@@ -881,27 +1009,6 @@ namespace EliteSoft.Erwin.AddIn
 
             string changeType = e.IsNew ? "New" : "Changed";
             lblValidationStatus.Text = $"[{DateTime.Now:HH:mm:ss}] {changeType}: {e.TableName}.{e.NewPhysicalName}";
-        }
-
-        /// <summary>
-        /// Toggle real-time monitoring
-        /// </summary>
-        private void ChkMonitoring_CheckedChanged(object sender, EventArgs e)
-        {
-            if (_validationService == null) return;
-
-            if (chkMonitoring.Checked)
-            {
-                _validationService.StartMonitoring();
-                lblValidationStatus.Text = "Monitoring: Active (checking every 2 seconds)";
-                lblValidationStatus.ForeColor = Color.DarkGreen;
-            }
-            else
-            {
-                _validationService.StopMonitoring();
-                lblValidationStatus.Text = "Monitoring: Off";
-                lblValidationStatus.ForeColor = Color.Gray;
-            }
         }
 
         /// <summary>

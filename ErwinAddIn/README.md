@@ -199,3 +199,6 @@ https://bookshelf.erwin.com/bookshelf/public_html/Content/PDFs/API%20Reference.p
   - UDP yaklasimlari SCAPI late binding ile calismadigi icin kaldirildi
   - Definition alani guvenilir depolama olarak kullaniliyor
   - Kod temizlendi ve sadelelestirildi
+
+
+README.md'yi incele ve güncelle, güncellerken türkçe karakterleri kullan gerekirse. Kullanılmayan kelimeleri de düaelt!
