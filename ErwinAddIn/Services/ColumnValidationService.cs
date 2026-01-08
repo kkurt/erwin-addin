@@ -451,7 +451,8 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// Validates all columns and returns list of all results (valid and invalid)
+        /// Validates all columns and tables, returns list of all results (valid and invalid)
+        /// Also checks TABLE_TYPE UDP for tables
         /// </summary>
         public List<ColumnValidationIssue> ValidateAllColumns()
         {
@@ -479,6 +480,46 @@ namespace EliteSoft.Erwin.AddIn.Services
                         tableName = (!string.IsNullOrEmpty(physTable) && !physTable.StartsWith("%")) ? physTable : entityName;
                     }
                     catch { tableName = entityName; }
+
+                    // Check TABLE_TYPE UDP for this table
+                    // Always add a table validation result
+                    string tableTypeValue = "";
+                    bool tableTypeUdpExists = false;
+                    try
+                    {
+                        var prop = entity.Properties("Entity.Physical.TABLE_TYPE");
+                        if (prop != null)
+                        {
+                            tableTypeValue = prop.Value?.ToString() ?? "";
+                            tableTypeUdpExists = true;
+                        }
+                    }
+                    catch
+                    {
+                        // UDP doesn't exist or can't be read
+                        tableTypeUdpExists = false;
+                    }
+
+                    // If TABLE_TYPE UDP doesn't exist, is empty, or is not a valid table type, add validation error
+                    // A valid table type must exist in TableTypeService (from database)
+                    var tableTypeEntry = TableTypeService.Instance.GetByName(tableTypeValue);
+                    bool isValidTableType = tableTypeEntry != null;
+
+                    bool tableTypeNotSelected = !tableTypeUdpExists ||
+                                                string.IsNullOrEmpty(tableTypeValue) ||
+                                                !isValidTableType;
+
+                    // Always add table validation result
+                    results.Add(new ColumnValidationIssue
+                    {
+                        TableName = tableName,
+                        AttributeName = "(Table)",
+                        PhysicalName = tableName,
+                        Issue = tableTypeNotSelected ? "Table type not selected" : $"Table type: {tableTypeValue}",
+                        RuleName = "TableTypeRule",
+                        IsValid = !tableTypeNotSelected,
+                        GlossaryEntry = null
+                    });
 
                     dynamic entityAttrs = null;
                     try { entityAttrs = modelObjects.Collect(entity, "Attribute"); } catch { continue; }

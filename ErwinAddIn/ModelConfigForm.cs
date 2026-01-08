@@ -19,6 +19,9 @@ namespace EliteSoft.Erwin.AddIn
         // Validation service
         private ColumnValidationService _validationService;
 
+        // TABLE_TYPE monitor service
+        private TableTypeMonitorService _tableTypeMonitorService;
+
         // Flag to track if OWNER UDP exists in model
         private bool _ownerUdpExists = false;
 
@@ -78,10 +81,15 @@ namespace EliteSoft.Erwin.AddIn
         /// </summary>
         private void InitializeValidationUI()
         {
-            listValidationIssues.Columns.Add("Table", 120);
-            listValidationIssues.Columns.Add("Column", 120);
-            listValidationIssues.Columns.Add("Physical Name", 140);
-            listValidationIssues.Columns.Add("Issue", 140);
+            // Column validation ListView columns
+            listColumnValidation.Columns.Add("Table", 120);
+            listColumnValidation.Columns.Add("Column", 120);
+            listColumnValidation.Columns.Add("Physical Name", 140);
+            listColumnValidation.Columns.Add("Status", 140);
+
+            // Table validation ListView columns
+            listTableValidation.Columns.Add("Table", 180);
+            listTableValidation.Columns.Add("Issue", 280);
 
             btnValidateAll.Enabled = false;
         }
@@ -215,8 +223,9 @@ namespace EliteSoft.Erwin.AddIn
         {
             Log("InitializeValidationService - Step 1: Starting");
 
-            // Dispose previous service if exists
+            // Dispose previous services if exist
             _validationService?.Dispose();
+            _tableTypeMonitorService?.Dispose();
 
             Log("InitializeValidationService - Step 2: Before LoadGlossary");
 
@@ -224,6 +233,12 @@ namespace EliteSoft.Erwin.AddIn
             LoadGlossary();
 
             Log("InitializeValidationService - Step 3: Glossary loaded");
+
+            // Load TABLE_TYPE from database and ensure UDP exists
+            LoadTableTypes();
+            EnsureTableTypeUdpExists();
+
+            Log("InitializeValidationService - Step 4: TABLE_TYPE loaded and UDP checked");
 
             _validationService = new ColumnValidationService(_session);
 
@@ -238,6 +253,13 @@ namespace EliteSoft.Erwin.AddIn
             // Take initial snapshot and auto-start monitoring
             _validationService.TakeSnapshot();
             _validationService.StartMonitoring();
+
+            // Initialize TABLE_TYPE monitor service
+            _tableTypeMonitorService = new TableTypeMonitorService(_session);
+            _tableTypeMonitorService.OnLog += (msg) => Log(msg);
+            _tableTypeMonitorService.TakeSnapshot();
+            _tableTypeMonitorService.StartMonitoring();
+            Log("TableTypeMonitorService initialized and monitoring");
 
             // Suppress popups for first 5 seconds to avoid flood on startup
             _suppressValidationPopups = true;
@@ -653,6 +675,199 @@ namespace EliteSoft.Erwin.AddIn
         }
 
         /// <summary>
+        /// Load TABLE_TYPE entries from database
+        /// </summary>
+        private void LoadTableTypes()
+        {
+            try
+            {
+                var tableTypeService = TableTypeService.Instance;
+                tableTypeService.Reload();
+
+                if (tableTypeService.IsLoaded)
+                {
+                    Log($"TABLE_TYPE loaded: {tableTypeService.Count} entries");
+                    Log($"TABLE_TYPE values: {tableTypeService.GetNamesAsCommaSeparated()}");
+                }
+                else
+                {
+                    Log($"TABLE_TYPE not loaded: {tableTypeService.LastError}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"LoadTableTypes error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Ensures the TABLE_TYPE UDP exists in the model as a List type
+        /// Creates it with values from TABLE_TYPE table if it doesn't exist
+        /// </summary>
+        private void EnsureTableTypeUdpExists()
+        {
+            try
+            {
+                var tableTypeService = TableTypeService.Instance;
+                if (!tableTypeService.IsLoaded || tableTypeService.Count == 0)
+                {
+                    Log("TABLE_TYPE service not loaded - skipping UDP creation");
+                    return;
+                }
+
+                dynamic modelObjects = _session.ModelObjects;
+                dynamic root = modelObjects.Root;
+
+                // Check if TABLE_TYPE UDP already exists
+                bool udpExists = false;
+                try
+                {
+                    dynamic propertyTypes = modelObjects.Collect(root, "Property_Type");
+                    foreach (dynamic pt in propertyTypes)
+                    {
+                        if (pt == null) continue;
+                        string ptName = "";
+                        try { ptName = pt.Name ?? ""; } catch { continue; }
+
+                        // Check for Entity.Physical.TABLE_TYPE (Table-level UDP)
+                        if (ptName.Equals("Entity.Physical.TABLE_TYPE", StringComparison.OrdinalIgnoreCase))
+                        {
+                            udpExists = true;
+                            Log("TABLE_TYPE UDP already exists");
+                            break;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log($"Error checking for TABLE_TYPE UDP: {ex.Message}");
+                }
+
+                if (!udpExists)
+                {
+                    // Create TABLE_TYPE UDP via metamodel session
+                    Log("TABLE_TYPE UDP not found - creating...");
+                    bool created = CreateTableTypeUdp(tableTypeService.GetNamesAsCommaSeparated());
+                    if (created)
+                    {
+                        Log("TABLE_TYPE UDP created successfully!");
+                    }
+                    else
+                    {
+                        Log("Failed to create TABLE_TYPE UDP");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"EnsureTableTypeUdpExists error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Creates the TABLE_TYPE UDP as a List type with values from database
+        /// </summary>
+        private bool CreateTableTypeUdp(string listValues)
+        {
+            dynamic metamodelSession = null;
+            try
+            {
+                Log($"Creating TABLE_TYPE UDP with values: {listValues}");
+
+                // Create a new session with metamodel access level (SCD_SL_M1 = 1)
+                metamodelSession = _scapi.Sessions.Add();
+                metamodelSession.Open(_currentModel, 1); // 1 = SCD_SL_M1 (Metamodel level)
+
+                Log("Metamodel session opened for TABLE_TYPE UDP");
+
+                // Begin transaction
+                int transId = metamodelSession.BeginNamedTransaction("CreateTableTypeUDP");
+                Log("Transaction started");
+
+                try
+                {
+                    // Create Property_Type for the UDP
+                    dynamic mmObjects = metamodelSession.ModelObjects;
+                    dynamic udpType = mmObjects.Add("Property_Type");
+
+                    Log("Property_Type object created for TABLE_TYPE");
+
+                    // Set UDP properties
+                    // Name format: <ObjectClassName>.<Logical/Physical>.<Name>
+                    // Entity = Table in erwin terminology
+                    udpType.Properties("Name").Value = "Entity.Physical.TABLE_TYPE";
+                    Log("Set Name = Entity.Physical.TABLE_TYPE");
+
+                    // tag_Udp_Owner_Type - the class this UDP applies to (Entity for tables)
+                    try { udpType.Properties("tag_Udp_Owner_Type").Value = "Entity"; }
+                    catch { Log("Could not set tag_Udp_Owner_Type"); }
+
+                    // Physical only
+                    try { udpType.Properties("tag_Is_Physical").Value = true; }
+                    catch { Log("Could not set tag_Is_Physical"); }
+
+                    try { udpType.Properties("tag_Is_Logical").Value = false; }
+                    catch { Log("Could not set tag_Is_Logical"); }
+
+                    // Data type: 6 = List (enumeration type)
+                    // erwin UDP data types: 1=Integer, 2=Text, 3=Date, 4=Command, 5=Real, 6=List
+                    try { udpType.Properties("tag_Udp_Data_Type").Value = 6; }
+                    catch { Log("Could not set tag_Udp_Data_Type"); }
+
+                    // Set the list values using tag_Udp_Values_List (comma-separated)
+                    // This is the correct property name for List type UDP values
+                    try
+                    {
+                        udpType.Properties("tag_Udp_Values_List").Value = listValues;
+                        Log($"Set tag_Udp_Values_List = {listValues}");
+                    }
+                    catch (Exception ex) { Log($"Could not set tag_Udp_Values_List: {ex.Message}"); }
+
+                    // Set default value (first item in list)
+                    string defaultValue = listValues.Split(',').FirstOrDefault()?.Trim() ?? "";
+                    if (!string.IsNullOrEmpty(defaultValue))
+                    {
+                        try { udpType.Properties("tag_Udp_Default_Value").Value = defaultValue; }
+                        catch { Log("Could not set tag_Udp_Default_Value"); }
+                    }
+
+                    // Order
+                    try { udpType.Properties("tag_Order").Value = "1"; }
+                    catch { Log("Could not set tag_Order"); }
+
+                    // Locally defined
+                    try { udpType.Properties("tag_Is_Locally_Defined").Value = true; }
+                    catch { Log("Could not set tag_Is_Locally_Defined"); }
+
+                    // Commit transaction
+                    metamodelSession.CommitTransaction(transId);
+                    Log("Transaction committed for TABLE_TYPE UDP");
+
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    Log($"Error creating TABLE_TYPE UDP: {ex.Message}");
+                    try { metamodelSession.RollbackTransaction(transId); } catch { }
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"Metamodel session error for TABLE_TYPE: {ex.Message}");
+                return false;
+            }
+            finally
+            {
+                // Close metamodel session
+                if (metamodelSession != null)
+                {
+                    try { metamodelSession.Close(); } catch { }
+                }
+            }
+        }
+
+        /// <summary>
         /// Called when a column name fails validation (real-time alert)
         /// </summary>
         private void OnValidationFailed(object sender, ColumnValidationEventArgs e)
@@ -663,13 +878,13 @@ namespace EliteSoft.Erwin.AddIn
                 return;
             }
 
-            // Add to issues list (always, even during suppression)
+            // Add to column validation list (always, even during suppression)
             var item = new ListViewItem(e.TableName);
             item.SubItems.Add(e.AttributeName);
             item.SubItems.Add(e.PhysicalName);
             item.SubItems.Add(e.ValidationMessage);
             item.ForeColor = Color.Red;
-            listValidationIssues.Items.Insert(0, item);
+            listColumnValidation.Items.Insert(0, item);
 
             // During startup suppression period, don't show popup
             if (_suppressValidationPopups)
@@ -1012,19 +1227,25 @@ namespace EliteSoft.Erwin.AddIn
         }
 
         /// <summary>
-        /// Validate all columns on-demand
+        /// Validate all columns and tables on-demand
         /// </summary>
         private void BtnValidateAll_Click(object sender, EventArgs e)
         {
             if (_validationService == null) return;
 
-            listValidationIssues.Items.Clear();
+            // Clear both lists
+            listColumnValidation.Items.Clear();
+            listTableValidation.Items.Clear();
 
             var allResults = _validationService.ValidateAllColumns();
 
-            // Separate valid and invalid
-            var validColumns = allResults.Where(r => r.IsValid).ToList();
-            var invalidColumns = allResults.Where(r => !r.IsValid).ToList();
+            // Separate column issues from table issues
+            var columnResults = allResults.Where(r => r.RuleName != "TableTypeRule").ToList();
+            var tableResults = allResults.Where(r => r.RuleName == "TableTypeRule").ToList();
+
+            // Process column validations
+            var validColumns = columnResults.Where(r => r.IsValid).ToList();
+            var invalidColumns = columnResults.Where(r => !r.IsValid).ToList();
 
             // First add valid columns (green)
             foreach (var col in validColumns)
@@ -1032,9 +1253,9 @@ namespace EliteSoft.Erwin.AddIn
                 var item = new ListViewItem(col.TableName);
                 item.SubItems.Add(col.AttributeName);
                 item.SubItems.Add(col.PhysicalName);
-                item.SubItems.Add("OK - Glossary'de bulundu");
+                item.SubItems.Add("OK - Found in glossary");
                 item.ForeColor = Color.DarkGreen;
-                listValidationIssues.Items.Add(item);
+                listColumnValidation.Items.Add(item);
             }
 
             // Then add invalid columns (red)
@@ -1045,23 +1266,53 @@ namespace EliteSoft.Erwin.AddIn
                 item.SubItems.Add(col.PhysicalName);
                 item.SubItems.Add(col.Issue);
                 item.ForeColor = Color.Red;
-                listValidationIssues.Items.Add(item);
+                listColumnValidation.Items.Add(item);
+            }
+
+            // Process table validations
+            var validTables = tableResults.Where(r => r.IsValid).ToList();
+            var invalidTables = tableResults.Where(r => !r.IsValid).ToList();
+
+            // Add valid tables (green) - TABLE_TYPE selected
+            foreach (var tbl in validTables)
+            {
+                var item = new ListViewItem(tbl.TableName);
+                item.SubItems.Add(tbl.Issue);
+                item.ForeColor = Color.DarkGreen;
+                listTableValidation.Items.Add(item);
+            }
+
+            // Add invalid tables (red) - TABLE_TYPE not selected
+            foreach (var tbl in invalidTables)
+            {
+                var item = new ListViewItem(tbl.TableName);
+                item.SubItems.Add(tbl.Issue);
+                item.ForeColor = Color.Red;
+                listTableValidation.Items.Add(item);
             }
 
             // Update status
-            if (invalidColumns.Count == 0)
+            int totalIssues = invalidColumns.Count + invalidTables.Count;
+            if (totalIssues == 0)
             {
-                lblValidationStatus.Text = $"Validation passed - All {validColumns.Count} columns exist in glossary";
+                lblValidationStatus.Text = $"All validations passed - {validColumns.Count} columns, {validTables.Count} tables OK";
                 lblValidationStatus.ForeColor = Color.DarkGreen;
-                MessageBox.Show($"All column names are valid!\n{validColumns.Count} column(s) found in glossary.",
+                MessageBox.Show($"All validations passed!\n\nColumns: {validColumns.Count} found in glossary\nTables: All tables have type selected",
                     "Validation Passed", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
             else
             {
-                lblValidationStatus.Text = $"Validation: {validColumns.Count} OK, {invalidColumns.Count} failed";
+                lblValidationStatus.Text = $"Validation: {invalidColumns.Count} column errors, {invalidTables.Count} table errors";
                 lblValidationStatus.ForeColor = Color.Red;
-                MessageBox.Show($"Valid: {validColumns.Count} column(s)\nInvalid: {invalidColumns.Count} column(s) not in glossary.\n\nSee the list for details.",
-                    "Validation Result", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+
+                string message = "";
+                if (invalidColumns.Count > 0)
+                    message += $"Column Errors: {invalidColumns.Count} not found in glossary\n";
+                if (invalidTables.Count > 0)
+                    message += $"Table Errors: {invalidTables.Count} tables without type selected\n";
+                message += "\nSee the tabs for details.";
+
+                MessageBox.Show(message, "Validation Result", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
 
@@ -1341,6 +1592,10 @@ namespace EliteSoft.Erwin.AddIn
                 // Dispose validation service
                 _validationService?.Dispose();
                 _validationService = null;
+
+                // Dispose TABLE_TYPE monitor service
+                _tableTypeMonitorService?.Dispose();
+                _tableTypeMonitorService = null;
 
                 _session?.Close();
                 _scapi?.Sessions?.Clear();
