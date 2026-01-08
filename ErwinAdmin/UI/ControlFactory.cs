@@ -52,7 +52,7 @@ namespace EliteSoft.Erwin.Admin.UI
         }
 
         /// <summary>
-        /// Creates a styled button
+        /// Creates a styled button - Windows standard visual style
         /// </summary>
         public static Button CreateButton(
             string text,
@@ -63,50 +63,15 @@ namespace EliteSoft.Erwin.Admin.UI
             ButtonStyle style = ButtonStyle.Primary,
             EventHandler onClick = null)
         {
-            Color backColor;
-            Color foreColor;
-
-            switch (style)
-            {
-                case ButtonStyle.Primary:
-                    backColor = AppTheme.Accent;
-                    foreColor = Color.White;
-                    break;
-                case ButtonStyle.Success:
-                    backColor = AppTheme.Success;
-                    foreColor = Color.White;
-                    break;
-                case ButtonStyle.Danger:
-                    backColor = AppTheme.Error;
-                    foreColor = Color.White;
-                    break;
-                case ButtonStyle.Secondary:
-                    backColor = AppTheme.Secondary;
-                    foreColor = AppTheme.TextPrimary;
-                    break;
-                default:
-                    backColor = AppTheme.Accent;
-                    foreColor = Color.White;
-                    break;
-            }
-
             var btn = new Button
             {
                 Text = text,
                 Location = new Point(x, y),
                 Size = new Size(width, height),
-                FlatStyle = FlatStyle.Flat,
-                BackColor = backColor,
-                ForeColor = foreColor,
+                UseVisualStyleBackColor = true,
                 Font = AppTheme.ButtonFont,
                 Cursor = Cursors.Hand
             };
-
-            btn.FlatAppearance.BorderSize = style == ButtonStyle.Secondary ? 1 : 0;
-            btn.FlatAppearance.BorderColor = AppTheme.InputBorder;
-            btn.FlatAppearance.MouseOverBackColor = style == ButtonStyle.Secondary
-                ? AppTheme.Accent
-                : ControlPaint.Light(backColor, 0.2f);
 
             if (onClick != null)
                 btn.Click += onClick;
@@ -115,7 +80,7 @@ namespace EliteSoft.Erwin.Admin.UI
         }
 
         /// <summary>
-        /// Creates a navigation button
+        /// Creates a navigation button - Windows standard visual style
         /// </summary>
         public static Button CreateNavButton(string text, int panelIndex, bool isActive, Action<int> onClick)
         {
@@ -123,17 +88,22 @@ namespace EliteSoft.Erwin.Admin.UI
             {
                 Text = text,
                 Size = new Size(160, 35),
-                FlatStyle = FlatStyle.Flat,
-                ForeColor = AppTheme.TextPrimary,
-                BackColor = isActive ? AppTheme.Accent : AppTheme.Secondary,
+                UseVisualStyleBackColor = true,
                 Font = AppTheme.DefaultFont,
                 TextAlign = ContentAlignment.MiddleLeft,
                 Padding = new Padding(8, 0, 0, 0),
                 Cursor = Cursors.Hand,
                 Tag = panelIndex
             };
-            btn.FlatAppearance.BorderSize = 0;
-            btn.FlatAppearance.MouseOverBackColor = AppTheme.Accent;
+
+            if (isActive)
+            {
+                btn.BackColor = AppTheme.Accent;
+                btn.ForeColor = Color.White;
+                btn.FlatStyle = FlatStyle.Flat;
+                btn.FlatAppearance.BorderSize = 0;
+            }
+
             btn.Click += (s, e) => onClick?.Invoke(panelIndex);
             return btn;
         }
@@ -182,7 +152,7 @@ namespace EliteSoft.Erwin.Admin.UI
             {
                 Location = new Point(x, y),
                 Size = new Size(width, height),
-                BackColor = backColor ?? AppTheme.Primary
+                BackColor = backColor ?? AppTheme.PanelBackground
             };
         }
 

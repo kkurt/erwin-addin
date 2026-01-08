@@ -22,9 +22,29 @@ namespace EliteSoft.Erwin.Admin
 
         #region UI Controls
 
+        // Main TabControl
+        private TabControl _mainTabControl = null!;
+        private TabPage _tabMartProcesses = null!;
+        private TabPage _tabExtensionProps = null!;
+
+        // Extension Properties tab content
+        private TabControl _tabExtPropsInner = null!;
+        private TabPage _tabConnections = null!;
+
+        // Connections tab controls
+        private TextBox _txtConnDbType = null!;
+        private TextBox _txtConnHost = null!;
+        private TextBox _txtConnPort = null!;
+        private TextBox _txtConnDbSchema = null!;
+        private TextBox _txtConnUsername = null!;
+        private TextBox _txtConnPassword = null!;
+        private Button _btnConnTest = null!;
+        private Button _btnConnSave = null!;
+        private Label _lblConnStatus = null!;
+
+        // Mart Processes tab content
         private Panel _panelSidebar = null!;
         private Panel _panelContent = null!;
-        private Panel _panelStatus = null!;
         private Panel _panelConnect = null!;
         private Panel _panelModels = null!;
         private Panel _panelNaming = null!;
@@ -32,6 +52,9 @@ namespace EliteSoft.Erwin.Admin
         private Button _btnNavConnect = null!;
         private Button _btnNavModels = null!;
         private Button _btnNavNaming = null!;
+
+        // Status bar (bottom of form)
+        private Panel _panelStatus = null!;
 
         private TextBox _txtServerName = null!;
         private TextBox _txtPort = null!;
@@ -85,32 +108,170 @@ namespace EliteSoft.Erwin.Admin
 
         private void InitializeUI()
         {
-            Text = "Elite Soft erwin Mart Admin";
+            Text = "Elite Soft erwin Admin";
             Size = new Size(1050, 720);
             MinimumSize = new Size(1050, 720);
             StartPosition = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
-            BackColor = AppTheme.Primary;
+            BackColor = AppTheme.FormBackground;
             Font = AppTheme.DefaultFont;
 
-            InitializeSidebar();
+            InitializeMainTabControl();
             InitializeStatusBar();
-            InitializeContentPanels();
             InitializeLoadingOverlay();
             ShowPanel(0);
         }
 
-        private void InitializeSidebar()
+        private void InitializeMainTabControl()
         {
-            _panelSidebar = new Panel
+            // Create main TabControl that spans the form (except status bar)
+            _mainTabControl = new TabControl
             {
                 Location = new Point(0, 0),
-                Size = new Size(200, ClientSize.Height - 35),
-                BackColor = AppTheme.Secondary
+                Size = new Size(ClientSize.Width, ClientSize.Height - 35),
+                Font = AppTheme.DefaultFont,
+                Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom
             };
 
-            var lblAppTitle = ControlFactory.CreateLabel("erwin Mart Admin", 15, 20, AppTheme.SubtitleFont);
+            // Mart Processes tab
+            _tabMartProcesses = new TabPage("Mart Processes")
+            {
+                UseVisualStyleBackColor = true,
+                Padding = new Padding(0)
+            };
+            InitializeMartProcessesTab();
+            _mainTabControl.TabPages.Add(_tabMartProcesses);
+
+            // Extension Properties tab
+            _tabExtensionProps = new TabPage("Elite Soft Erwin Extension Properties")
+            {
+                UseVisualStyleBackColor = true,
+                Padding = new Padding(10)
+            };
+            InitializeExtensionPropsTab();
+            _mainTabControl.TabPages.Add(_tabExtensionProps);
+
+            Controls.Add(_mainTabControl);
+        }
+
+        private void InitializeExtensionPropsTab()
+        {
+            // Inner TabControl for Connections tab
+            _tabExtPropsInner = new TabControl
+            {
+                Dock = DockStyle.Fill,
+                Font = AppTheme.DefaultFont
+            };
+
+            // Glossary Connection Definition tab
+            _tabConnections = new TabPage("Glossary Connection Definition")
+            {
+                UseVisualStyleBackColor = true,
+                Padding = new Padding(15)
+            };
+            InitializeConnectionsTab();
+            _tabExtPropsInner.TabPages.Add(_tabConnections);
+
+            _tabExtensionProps.Controls.Add(_tabExtPropsInner);
+        }
+
+        private void InitializeConnectionsTab()
+        {
+            var panel = new Panel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = AppTheme.PanelBackground
+            };
+
+            panel.Controls.Add(ControlFactory.CreateTitle("Glossary Database Connection", 20, 15));
+
+            // DB_TYPE
+            panel.Controls.Add(ControlFactory.CreateLabel("DB_TYPE:", 20, 70));
+            _txtConnDbType = ControlFactory.CreateTextBox(150, 67, 250, "MSSQL");
+            panel.Controls.Add(_txtConnDbType);
+
+            // HOST
+            panel.Controls.Add(ControlFactory.CreateLabel("HOST:", 20, 115));
+            _txtConnHost = ControlFactory.CreateTextBox(150, 112, 250, "localhost");
+            panel.Controls.Add(_txtConnHost);
+
+            // PORT
+            panel.Controls.Add(ControlFactory.CreateLabel("PORT:", 20, 160));
+            _txtConnPort = ControlFactory.CreateTextBox(150, 157, 250, "1433");
+            panel.Controls.Add(_txtConnPort);
+
+            // DB_SCHEMA
+            panel.Controls.Add(ControlFactory.CreateLabel("DB_SCHEMA:", 20, 205));
+            _txtConnDbSchema = ControlFactory.CreateTextBox(150, 202, 250, "dbo");
+            panel.Controls.Add(_txtConnDbSchema);
+
+            // USERNAME
+            panel.Controls.Add(ControlFactory.CreateLabel("USERNAME:", 20, 250));
+            _txtConnUsername = ControlFactory.CreateTextBox(150, 247, 250, "sa");
+            panel.Controls.Add(_txtConnUsername);
+
+            // PASSWORD
+            panel.Controls.Add(ControlFactory.CreateLabel("PASSWORD:", 20, 295));
+            _txtConnPassword = ControlFactory.CreateTextBox(150, 292, 250, "", isPassword: true);
+            panel.Controls.Add(_txtConnPassword);
+
+            // Buttons
+            _btnConnTest = ControlFactory.CreateButton("Test Connection", 150, 350, 140, 35, onClick: OnConnTestClick);
+            panel.Controls.Add(_btnConnTest);
+
+            _btnConnSave = ControlFactory.CreateButton("Save", 300, 350, 100, 35, onClick: OnConnSaveClick);
+            panel.Controls.Add(_btnConnSave);
+
+            // Status label
+            _lblConnStatus = ControlFactory.CreateLabel("", 150, 400, foreColor: AppTheme.TextSecondary);
+            panel.Controls.Add(_lblConnStatus);
+
+            _tabConnections.Controls.Add(panel);
+        }
+
+        private void OnConnTestClick(object sender, EventArgs e)
+        {
+            _lblConnStatus.Text = "Testing connection...";
+            _lblConnStatus.ForeColor = AppTheme.Info;
+
+            try
+            {
+                string connectionString = $"Server={_txtConnHost.Text},{_txtConnPort.Text};Database={_txtConnDbSchema.Text};User Id={_txtConnUsername.Text};Password={_txtConnPassword.Text};TrustServerCertificate=True;";
+
+                using (var connection = new System.Data.SqlClient.SqlConnection(connectionString))
+                {
+                    connection.Open();
+                    _lblConnStatus.Text = "Connection successful!";
+                    _lblConnStatus.ForeColor = AppTheme.Success;
+                }
+            }
+            catch (Exception ex)
+            {
+                _lblConnStatus.Text = $"Connection failed: {ex.Message}";
+                _lblConnStatus.ForeColor = AppTheme.Error;
+            }
+        }
+
+        private void OnConnSaveClick(object sender, EventArgs e)
+        {
+            // TODO: Save glossary connection settings
+            _lblConnStatus.Text = "Glossary connection settings saved.";
+            _lblConnStatus.ForeColor = AppTheme.Success;
+        }
+
+        private void InitializeMartProcessesTab()
+        {
+            // Sidebar - dock to left
+            _panelSidebar = new Panel
+            {
+                Dock = DockStyle.Left,
+                Width = 200,
+                BackColor = Color.FromArgb(230, 230, 230),
+                BorderStyle = BorderStyle.FixedSingle
+            };
+
+            var lblAppTitle = ControlFactory.CreateLabel("Mart Connection", 15, 20, AppTheme.SubtitleFont);
             _panelSidebar.Controls.Add(lblAppTitle);
 
             _btnNavConnect = ControlFactory.CreateNavButton("1. Connect", 0, true, ShowPanel);
@@ -130,7 +291,20 @@ namespace EliteSoft.Erwin.Admin
             _btnNavNaming.Enabled = false;
             _panelSidebar.Controls.Add(_btnNavNaming);
 
-            Controls.Add(_panelSidebar);
+            // Content panel - fill remaining space
+            _panelContent = new Panel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = AppTheme.PanelBackground
+            };
+
+            InitializeConnectPanel();
+            InitializeModelsPanel();
+            InitializeNamingPanel();
+
+            // Add content first, then sidebar (dock order matters)
+            _tabMartProcesses.Controls.Add(_panelContent);
+            _tabMartProcesses.Controls.Add(_panelSidebar);
         }
 
         private void InitializeStatusBar()
@@ -139,10 +313,12 @@ namespace EliteSoft.Erwin.Admin
             {
                 Location = new Point(0, ClientSize.Height - 35),
                 Size = new Size(ClientSize.Width, 35),
-                BackColor = AppTheme.Secondary
+                BackColor = Color.FromArgb(230, 230, 230),
+                BorderStyle = BorderStyle.FixedSingle,
+                Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom
             };
 
-            _lblStatus = ControlFactory.CreateLabel("Ready", 210, 8, foreColor: AppTheme.TextSecondary);
+            _lblStatus = ControlFactory.CreateLabel("Ready", 10, 8, foreColor: AppTheme.TextSecondary);
             _panelStatus.Controls.Add(_lblStatus);
 
             _progressBar = ControlFactory.CreateProgressBar(ClientSize.Width - 150, 8, 130, 18);
@@ -151,24 +327,13 @@ namespace EliteSoft.Erwin.Admin
             Controls.Add(_panelStatus);
         }
 
-        private void InitializeContentPanels()
-        {
-            _panelContent = new Panel
-            {
-                Location = new Point(200, 0),
-                Size = new Size(ClientSize.Width - 200, ClientSize.Height - 35),
-                BackColor = AppTheme.Primary
-            };
-            Controls.Add(_panelContent);
-
-            InitializeConnectPanel();
-            InitializeModelsPanel();
-            InitializeNamingPanel();
-        }
-
         private void InitializeConnectPanel()
         {
-            _panelConnect = ControlFactory.CreatePanel(0, 0, _panelContent.Width, _panelContent.Height);
+            _panelConnect = new Panel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = AppTheme.PanelBackground
+            };
 
             _panelConnect.Controls.Add(ControlFactory.CreateTitle("Connect to Mart Server", 40, 25));
             _panelConnect.Controls.Add(ControlFactory.CreateLabel("Server:", 40, 80));
@@ -212,8 +377,12 @@ namespace EliteSoft.Erwin.Admin
 
         private void InitializeModelsPanel()
         {
-            _panelModels = ControlFactory.CreatePanel(0, 0, _panelContent.Width, _panelContent.Height);
-            _panelModels.Visible = false;
+            _panelModels = new Panel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = AppTheme.PanelBackground,
+                Visible = false
+            };
 
             _panelModels.Controls.Add(ControlFactory.CreateTitle("Load Model", 40, 25));
 
@@ -242,8 +411,12 @@ namespace EliteSoft.Erwin.Admin
 
         private void InitializeNamingPanel()
         {
-            _panelNaming = ControlFactory.CreatePanel(0, 0, _panelContent.Width, _panelContent.Height);
-            _panelNaming.Visible = false;
+            _panelNaming = new Panel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = AppTheme.PanelBackground,
+                Visible = false
+            };
 
             _panelNaming.Controls.Add(ControlFactory.CreateTitle("Model Properties", 40, 25));
 
@@ -269,8 +442,9 @@ namespace EliteSoft.Erwin.Admin
             // General Tab
             var tabGeneral = new TabPage("General")
             {
-                BackColor = AppTheme.Primary,
-                Padding = new Padding(15)
+                BackColor = AppTheme.PanelBackground,
+                Padding = new Padding(15),
+                UseVisualStyleBackColor = true
             };
             InitializeGeneralTab(tabGeneral);
             _tabModelProps.TabPages.Add(tabGeneral);
@@ -278,8 +452,9 @@ namespace EliteSoft.Erwin.Admin
             // UDP Tab
             var tabUdp = new TabPage("UDP")
             {
-                BackColor = AppTheme.Primary,
-                Padding = new Padding(15)
+                BackColor = AppTheme.PanelBackground,
+                Padding = new Padding(15),
+                UseVisualStyleBackColor = true
             };
             InitializeUdpTab(tabUdp);
             _tabModelProps.TabPages.Add(tabUdp);
@@ -287,8 +462,9 @@ namespace EliteSoft.Erwin.Admin
             // Naming Conventions Tab
             var tabNaming = new TabPage("Naming Conventions")
             {
-                BackColor = AppTheme.Primary,
-                Padding = new Padding(15)
+                BackColor = AppTheme.PanelBackground,
+                Padding = new Padding(15),
+                UseVisualStyleBackColor = true
             };
             InitializeNamingConventionsTab(tabNaming);
             _tabModelProps.TabPages.Add(tabNaming);
@@ -362,7 +538,7 @@ namespace EliteSoft.Erwin.Admin
             _panelLoading = new Panel
             {
                 Size = new Size(300, 120),
-                BackColor = Color.FromArgb(230, 45, 45, 48),
+                BackColor = Color.FromArgb(240, 250, 250, 250),
                 BorderStyle = BorderStyle.FixedSingle,
                 Visible = false
             };
@@ -526,9 +702,28 @@ namespace EliteSoft.Erwin.Admin
 
         private void UpdateNavButtons(int activeIndex)
         {
-            _btnNavConnect.BackColor = activeIndex == 0 ? AppTheme.Accent : AppTheme.Secondary;
-            _btnNavModels.BackColor = activeIndex == 1 ? AppTheme.Accent : AppTheme.Secondary;
-            _btnNavNaming.BackColor = activeIndex == 2 ? AppTheme.Accent : AppTheme.Secondary;
+            // Update button colors for active/inactive state
+            UpdateNavButtonStyle(_btnNavConnect, activeIndex == 0);
+            UpdateNavButtonStyle(_btnNavModels, activeIndex == 1);
+            UpdateNavButtonStyle(_btnNavNaming, activeIndex == 2);
+        }
+
+        private void UpdateNavButtonStyle(Button btn, bool isActive)
+        {
+            if (isActive)
+            {
+                btn.BackColor = AppTheme.Accent;
+                btn.ForeColor = Color.White;
+                btn.FlatStyle = FlatStyle.Flat;
+                btn.FlatAppearance.BorderSize = 0;
+            }
+            else
+            {
+                btn.BackColor = Color.FromArgb(230, 230, 230);
+                btn.ForeColor = AppTheme.TextPrimary;
+                btn.FlatStyle = FlatStyle.Standard;
+                btn.UseVisualStyleBackColor = true;
+            }
         }
 
         #endregion
