@@ -28,6 +28,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\ErwinShared\ErwinShared.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
     <None Include="References\EAL.dll">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <Link>EAL.dll</Link>

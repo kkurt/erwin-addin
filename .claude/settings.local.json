@@ -57,7 +57,8 @@
       "Bash(del \"c:\\\\Users\\\\Administrator\\\\source\\\\repos\\\\erwin-addin\\\\ErwinAddIn\\\\ModelConfigForm.cs\")",
       "Bash(sqlcmd:*)",
       "Bash(git checkout:*)",
-      "Bash(\"C:\\\\Windows\\\\Microsoft.NET\\\\Framework64\\\\v4.0.30319\\\\regasm.exe\" \"c:\\\\Users\\\\Administrator\\\\source\\\\repos\\\\erwin-addin\\\\ErwinAddIn\\\\bin\\\\Release\\\\net48\\\\EliteSoft.Erwin.AddIn.dll\" /codebase /tlb)"
+      "Bash(\"C:\\\\Windows\\\\Microsoft.NET\\\\Framework64\\\\v4.0.30319\\\\regasm.exe\" \"c:\\\\Users\\\\Administrator\\\\source\\\\repos\\\\erwin-addin\\\\ErwinAddIn\\\\bin\\\\Release\\\\net48\\\\EliteSoft.Erwin.AddIn.dll\" /codebase /tlb)",
+      "Bash(dotnet new:*)"
     ]
   }
 }

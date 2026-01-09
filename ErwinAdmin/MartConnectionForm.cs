@@ -2,11 +2,17 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
+using System.Linq;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using EliteSoft.Erwin.Admin.Models;
 using EliteSoft.Erwin.Admin.Services;
 using EliteSoft.Erwin.Admin.UI;
+using EliteSoft.Erwin.Shared.Models;
+using EliteSoft.Erwin.Shared.Services;
+using EliteSoft.Erwin.Shared.Data;
+using EliteSoft.Erwin.Shared.Data.Entities;
+using EliteSoft.Erwin.Shared.Data.Repositories;
 
 namespace EliteSoft.Erwin.Admin
 {
@@ -17,6 +23,7 @@ namespace EliteSoft.Erwin.Admin
         private readonly IMartApiClient _martApi;
         private readonly IErwinScapiService _scapiService;
         private readonly IMartCatalogService _catalogService;
+        private readonly BootstrapService _bootstrapService;
 
         #endregion
 
@@ -29,18 +36,28 @@ namespace EliteSoft.Erwin.Admin
 
         // Extension Properties tab content
         private TabControl _tabExtPropsInner = null!;
-        private TabPage _tabConnections = null!;
+        private TabPage _tabRepoProperties = null!;
+        private TabPage _tabRepoConnection = null!;
 
-        // Connections tab controls
-        private TextBox _txtConnDbType = null!;
-        private TextBox _txtConnHost = null!;
-        private TextBox _txtConnPort = null!;
-        private TextBox _txtConnDbSchema = null!;
-        private TextBox _txtConnUsername = null!;
-        private TextBox _txtConnPassword = null!;
-        private Button _btnConnTest = null!;
-        private Button _btnConnSave = null!;
+        // Repository Database Properties tab controls
+        private CheckBox _chkUseTableTypes = null!;
+        private DataGridView _gridTableTypes = null!;
+        private Button _btnClearTableTypes = null!;
+
+        // Repository DB Connection tab controls
+        private ComboBox _cmbRepoDbType = null!;
+        private TextBox _txtRepoHost = null!;
+        private TextBox _txtRepoPort = null!;
+        private TextBox _txtRepoDatabase = null!;
+        private TextBox _txtRepoUsername = null!;
+        private TextBox _txtRepoPassword = null!;
+        private Button _btnRepoTest = null!;
+        private Button _btnRepoSave = null!;
         private Label _lblConnStatus = null!;
+
+        // DB Init tab controls
+        private Button _btnRepoInitDb = null!;
+        private Label _lblRepoStatus = null!;
 
         // Mart Processes tab content
         private Panel _panelSidebar = null!;
@@ -95,6 +112,7 @@ namespace EliteSoft.Erwin.Admin
             _martApi = new MartApiClient();
             _scapiService = new ErwinScapiService();
             _catalogService = new MartCatalogService();
+            _bootstrapService = new BootstrapService();
 
             _martApi.LogMessage += OnApiLogMessage;
             _martApi.AuthenticationStateChanged += OnAuthenticationStateChanged;
@@ -134,16 +152,7 @@ namespace EliteSoft.Erwin.Admin
                 Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom
             };
 
-            // Mart Processes tab
-            _tabMartProcesses = new TabPage("Mart Processes")
-            {
-                UseVisualStyleBackColor = true,
-                Padding = new Padding(0)
-            };
-            InitializeMartProcessesTab();
-            _mainTabControl.TabPages.Add(_tabMartProcesses);
-
-            // Extension Properties tab
+            // Extension Properties tab (FIRST)
             _tabExtensionProps = new TabPage("Elite Soft Erwin Extension Properties")
             {
                 UseVisualStyleBackColor = true,
@@ -152,31 +161,49 @@ namespace EliteSoft.Erwin.Admin
             InitializeExtensionPropsTab();
             _mainTabControl.TabPages.Add(_tabExtensionProps);
 
+            // Mart Processes tab (SECOND)
+            _tabMartProcesses = new TabPage("Mart Processes")
+            {
+                UseVisualStyleBackColor = true,
+                Padding = new Padding(0)
+            };
+            InitializeMartProcessesTab();
+            _mainTabControl.TabPages.Add(_tabMartProcesses);
+
             Controls.Add(_mainTabControl);
         }
 
         private void InitializeExtensionPropsTab()
         {
-            // Inner TabControl for Connections tab
+            // Inner TabControl for Repository tabs
             _tabExtPropsInner = new TabControl
             {
                 Dock = DockStyle.Fill,
                 Font = AppTheme.DefaultFont
             };
 
-            // Glossary Connection Definition tab
-            _tabConnections = new TabPage("Glossary Connection Definition")
+            // Repository DB Connection tab (FIRST)
+            _tabRepoConnection = new TabPage("Repository Database Connection")
             {
                 UseVisualStyleBackColor = true,
                 Padding = new Padding(15)
             };
-            InitializeConnectionsTab();
-            _tabExtPropsInner.TabPages.Add(_tabConnections);
+            InitializeRepoConnectionTab();
+            _tabExtPropsInner.TabPages.Add(_tabRepoConnection);
+
+            // DB Init tab (SECOND)
+            _tabRepoProperties = new TabPage("DB Init")
+            {
+                UseVisualStyleBackColor = true,
+                Padding = new Padding(15)
+            };
+            InitializeDbInitTab();
+            _tabExtPropsInner.TabPages.Add(_tabRepoProperties);
 
             _tabExtensionProps.Controls.Add(_tabExtPropsInner);
         }
 
-        private void InitializeConnectionsTab()
+        private void InitializeDbInitTab()
         {
             var panel = new Panel
             {
@@ -184,80 +211,324 @@ namespace EliteSoft.Erwin.Admin
                 BackColor = AppTheme.PanelBackground
             };
 
-            panel.Controls.Add(ControlFactory.CreateTitle("Glossary Database Connection", 20, 15));
+            // Use Table Types checkbox
+            _chkUseTableTypes = new CheckBox
+            {
+                Location = new Point(20, 20),
+                Size = new Size(300, 24),
+                Text = "Use Table Types",
+                Font = AppTheme.DefaultFont,
+                Checked = true
+            };
+            _chkUseTableTypes.CheckedChanged += OnUseTableTypesChanged;
+            panel.Controls.Add(_chkUseTableTypes);
 
-            // DB_TYPE
-            panel.Controls.Add(ControlFactory.CreateLabel("DB_TYPE:", 20, 70));
-            _txtConnDbType = ControlFactory.CreateTextBox(150, 67, 250, "MSSQL");
-            panel.Controls.Add(_txtConnDbType);
+            // Table Types DataGridView
+            _gridTableTypes = new DataGridView
+            {
+                Location = new Point(20, 55),
+                Size = new Size(500, 200),
+                Font = AppTheme.DefaultFont,
+                BackgroundColor = Color.White,
+                BorderStyle = BorderStyle.FixedSingle,
+                RowHeadersVisible = false,
+                AllowUserToResizeRows = false,
+                AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
+                SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+                EditMode = DataGridViewEditMode.EditOnEnter
+            };
 
-            // HOST
-            panel.Controls.Add(ControlFactory.CreateLabel("HOST:", 20, 115));
-            _txtConnHost = ControlFactory.CreateTextBox(150, 112, 250, "localhost");
-            panel.Controls.Add(_txtConnHost);
+            // Add columns
+            _gridTableTypes.Columns.Add("NAME", "NAME");
+            _gridTableTypes.Columns.Add("AFFIX", "AFFIX");
 
-            // PORT
-            panel.Controls.Add(ControlFactory.CreateLabel("PORT:", 20, 160));
-            _txtConnPort = ControlFactory.CreateTextBox(150, 157, 250, "1433");
-            panel.Controls.Add(_txtConnPort);
+            var locationColumn = new DataGridViewComboBoxColumn
+            {
+                Name = "NAME_EXTENSION_LOCATION",
+                HeaderText = "NAME_EXTENSION_LOCATION",
+                Items = { "PREFIX", "SUFFIX" },
+                FlatStyle = FlatStyle.Flat
+            };
+            _gridTableTypes.Columns.Add(locationColumn);
 
-            // DB_SCHEMA
-            panel.Controls.Add(ControlFactory.CreateLabel("DB_SCHEMA:", 20, 205));
-            _txtConnDbSchema = ControlFactory.CreateTextBox(150, 202, 250, "dbo");
-            panel.Controls.Add(_txtConnDbSchema);
+            // Set column widths
+            _gridTableTypes.Columns["NAME"].FillWeight = 40;
+            _gridTableTypes.Columns["AFFIX"].FillWeight = 25;
+            _gridTableTypes.Columns["NAME_EXTENSION_LOCATION"].FillWeight = 35;
 
-            // USERNAME
-            panel.Controls.Add(ControlFactory.CreateLabel("USERNAME:", 20, 250));
-            _txtConnUsername = ControlFactory.CreateTextBox(150, 247, 250, "sa");
-            panel.Controls.Add(_txtConnUsername);
+            // Load default values
+            LoadDefaultTableTypes();
 
-            // PASSWORD
-            panel.Controls.Add(ControlFactory.CreateLabel("PASSWORD:", 20, 295));
-            _txtConnPassword = ControlFactory.CreateTextBox(150, 292, 250, "", isPassword: true);
-            panel.Controls.Add(_txtConnPassword);
+            panel.Controls.Add(_gridTableTypes);
 
-            // Buttons
-            _btnConnTest = ControlFactory.CreateButton("Test Connection", 150, 350, 140, 35, onClick: OnConnTestClick);
-            panel.Controls.Add(_btnConnTest);
+            // Clear button
+            _btnClearTableTypes = ControlFactory.CreateButton("Clear All", 420, 265, 100, 30, ButtonStyle.Secondary, OnClearTableTypesClick);
+            panel.Controls.Add(_btnClearTableTypes);
 
-            _btnConnSave = ControlFactory.CreateButton("Save", 300, 350, 100, 35, onClick: OnConnSaveClick);
-            panel.Controls.Add(_btnConnSave);
+            // Initialize button
+            _btnRepoInitDb = ControlFactory.CreateButton("Initialize", 420, 305, 100, 30, onClick: OnDbInitClick);
+            panel.Controls.Add(_btnRepoInitDb);
 
-            // Status label
-            _lblConnStatus = ControlFactory.CreateLabel("", 150, 400, foreColor: AppTheme.TextSecondary);
-            panel.Controls.Add(_lblConnStatus);
+            // Status label for DB Init
+            _lblRepoStatus = ControlFactory.CreateLabel("", 20, 350, foreColor: AppTheme.TextSecondary);
+            _lblRepoStatus.AutoSize = false;
+            _lblRepoStatus.Size = new Size(500, 40);
+            panel.Controls.Add(_lblRepoStatus);
 
-            _tabConnections.Controls.Add(panel);
+            _tabRepoProperties.Controls.Add(panel);
         }
 
-        private void OnConnTestClick(object sender, EventArgs e)
+        private void OnDbInitClick(object sender, EventArgs e)
         {
-            _lblConnStatus.Text = "Testing connection...";
-            _lblConnStatus.ForeColor = AppTheme.Info;
+            _lblRepoStatus.Text = "Initializing database...";
+            _lblRepoStatus.ForeColor = AppTheme.Info;
+            Application.DoEvents();
 
             try
             {
-                string connectionString = $"Server={_txtConnHost.Text},{_txtConnPort.Text};Database={_txtConnDbSchema.Text};User Id={_txtConnUsername.Text};Password={_txtConnPassword.Text};TrustServerCertificate=True;";
-
-                using (var connection = new System.Data.SqlClient.SqlConnection(connectionString))
+                var config = _bootstrapService.GetConfig();
+                if (config == null || !config.IsConfigured)
                 {
-                    connection.Open();
-                    _lblConnStatus.Text = "Connection successful!";
-                    _lblConnStatus.ForeColor = AppTheme.Success;
+                    _lblRepoStatus.Text = "Please configure and save Repository DB Connection first.";
+                    _lblRepoStatus.ForeColor = AppTheme.Error;
+                    return;
+                }
+
+                using (var context = new RepoDbContext(config))
+                {
+                    // Ensure tables are created
+                    context.EnsureTablesCreated();
+
+                    // Insert TABLE_TYPE values if they don't exist
+                    if (_chkUseTableTypes.Checked)
+                    {
+                        int insertedCount = 0;
+                        foreach (DataGridViewRow row in _gridTableTypes.Rows)
+                        {
+                            if (row.IsNewRow) continue;
+
+                            var name = row.Cells["NAME"].Value?.ToString();
+                            var affix = row.Cells["AFFIX"].Value?.ToString();
+                            var location = row.Cells["NAME_EXTENSION_LOCATION"].Value?.ToString();
+
+                            if (!string.IsNullOrWhiteSpace(name) && !string.IsNullOrWhiteSpace(affix) && !string.IsNullOrWhiteSpace(location))
+                            {
+                                // Check if already exists
+                                var exists = context.TableTypes.Any(t => t.Name == name);
+                                if (!exists)
+                                {
+                                    context.TableTypes.Add(new TableType
+                                    {
+                                        Name = name,
+                                        Affix = affix,
+                                        NameExtensionLocation = location
+                                    });
+                                    insertedCount++;
+                                }
+                            }
+                        }
+                        context.SaveChanges();
+
+                        _lblRepoStatus.Text = $"Database initialized. {insertedCount} table type(s) inserted.";
+                    }
+                    else
+                    {
+                        _lblRepoStatus.Text = "Database tables created successfully.";
+                    }
+                    _lblRepoStatus.ForeColor = AppTheme.Success;
                 }
             }
             catch (Exception ex)
             {
-                _lblConnStatus.Text = $"Connection failed: {ex.Message}";
+                _lblRepoStatus.Text = $"Initialization failed: {ex.Message}";
+                _lblRepoStatus.ForeColor = AppTheme.Error;
+            }
+        }
+
+        private void LoadDefaultTableTypes()
+        {
+            _gridTableTypes.Rows.Clear();
+            var defaults = TableTypeDefaults.GetDefaults();
+            foreach (var tt in defaults)
+            {
+                _gridTableTypes.Rows.Add(tt.Name, tt.Affix, tt.NameExtensionLocation);
+            }
+        }
+
+        private void OnUseTableTypesChanged(object sender, EventArgs e)
+        {
+            _gridTableTypes.Enabled = _chkUseTableTypes.Checked;
+            _btnClearTableTypes.Enabled = _chkUseTableTypes.Checked;
+        }
+
+        private void OnClearTableTypesClick(object sender, EventArgs e)
+        {
+            _gridTableTypes.Rows.Clear();
+        }
+
+        private void InitializeRepoConnectionTab()
+        {
+            var panel = new Panel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = AppTheme.PanelBackground
+            };
+
+            panel.Controls.Add(ControlFactory.CreateTitle("Repository Database Connection", 20, 15));
+            panel.Controls.Add(ControlFactory.CreateLabel("This is the central database for storing Extension configuration.", 20, 50, AppTheme.SmallFont, AppTheme.TextSecondary));
+
+            // DB_TYPE (ComboBox)
+            panel.Controls.Add(ControlFactory.CreateLabel("DB_TYPE:", 20, 90));
+            _cmbRepoDbType = new ComboBox
+            {
+                Location = new Point(150, 87),
+                Size = new Size(250, 26),
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                Font = AppTheme.DefaultFont
+            };
+            _cmbRepoDbType.Items.AddRange(DbTypes.All);
+            _cmbRepoDbType.SelectedIndex = 0;
+            _cmbRepoDbType.SelectedIndexChanged += OnRepoDbTypeChanged;
+            panel.Controls.Add(_cmbRepoDbType);
+
+            // HOST
+            panel.Controls.Add(ControlFactory.CreateLabel("HOST:", 20, 135));
+            _txtRepoHost = ControlFactory.CreateTextBox(150, 132, 250, "");
+            panel.Controls.Add(_txtRepoHost);
+
+            // PORT
+            panel.Controls.Add(ControlFactory.CreateLabel("PORT:", 20, 180));
+            _txtRepoPort = ControlFactory.CreateTextBox(150, 177, 250, "");
+            panel.Controls.Add(_txtRepoPort);
+
+            // DATABASE
+            panel.Controls.Add(ControlFactory.CreateLabel("DATABASE:", 20, 225));
+            _txtRepoDatabase = ControlFactory.CreateTextBox(150, 222, 250, "");
+            panel.Controls.Add(_txtRepoDatabase);
+
+            // USERNAME
+            panel.Controls.Add(ControlFactory.CreateLabel("USERNAME:", 20, 270));
+            _txtRepoUsername = ControlFactory.CreateTextBox(150, 267, 250, "");
+            panel.Controls.Add(_txtRepoUsername);
+
+            // PASSWORD
+            panel.Controls.Add(ControlFactory.CreateLabel("PASSWORD:", 20, 315));
+            _txtRepoPassword = ControlFactory.CreateTextBox(150, 312, 250, "", isPassword: true);
+            panel.Controls.Add(_txtRepoPassword);
+
+            // Buttons
+            _btnRepoTest = ControlFactory.CreateButton("Test Connection", 150, 370, 140, 35, onClick: OnRepoTestClick);
+            panel.Controls.Add(_btnRepoTest);
+
+            _btnRepoSave = ControlFactory.CreateButton("Save", 300, 370, 100, 35, onClick: OnRepoSaveClick);
+            panel.Controls.Add(_btnRepoSave);
+
+            // Status label
+            _lblConnStatus = ControlFactory.CreateLabel("", 150, 420, foreColor: AppTheme.TextSecondary);
+            _lblConnStatus.AutoSize = false;
+            _lblConnStatus.Size = new Size(500, 40);
+            panel.Controls.Add(_lblConnStatus);
+
+            _tabRepoConnection.Controls.Add(panel);
+
+            // Load existing config if available
+            LoadRepoConfig();
+        }
+
+        private void OnRepoDbTypeChanged(object sender, EventArgs e)
+        {
+            // Update default port based on DB type
+            string dbType = _cmbRepoDbType.SelectedItem?.ToString() ?? DbTypes.MSSQL;
+            _txtRepoPort.Text = DbTypes.GetDefaultPort(dbType);
+        }
+
+        private void LoadRepoConfig()
+        {
+            var config = _bootstrapService.GetConfig();
+            if (config != null && config.IsConfigured)
+            {
+                // Set combo box selection
+                for (int i = 0; i < _cmbRepoDbType.Items.Count; i++)
+                {
+                    if (_cmbRepoDbType.Items[i].ToString().Equals(config.DbType, StringComparison.OrdinalIgnoreCase))
+                    {
+                        _cmbRepoDbType.SelectedIndex = i;
+                        break;
+                    }
+                }
+
+                _txtRepoHost.Text = config.Host;
+                _txtRepoPort.Text = config.Port;
+                _txtRepoDatabase.Text = config.Database;
+                _txtRepoUsername.Text = config.Username;
+                _txtRepoPassword.Text = config.Password;
+
+                _lblConnStatus.Text = "Configuration loaded from local storage.";
+                _lblConnStatus.ForeColor = AppTheme.Info;
+            }
+        }
+
+        private BootstrapConfig GetRepoConfigFromUI()
+        {
+            return new BootstrapConfig
+            {
+                DbType = _cmbRepoDbType.SelectedItem?.ToString() ?? DbTypes.MSSQL,
+                Host = _txtRepoHost.Text,
+                Port = _txtRepoPort.Text,
+                Database = _txtRepoDatabase.Text,
+                Username = _txtRepoUsername.Text,
+                Password = _txtRepoPassword.Text
+            };
+        }
+
+        private void OnRepoTestClick(object sender, EventArgs e)
+        {
+            _lblConnStatus.Text = "Testing connection...";
+            _lblConnStatus.ForeColor = AppTheme.Info;
+            Application.DoEvents();
+
+            try
+            {
+                var config = GetRepoConfigFromUI();
+                var factory = new RepoDbContextFactory();
+
+                if (factory.TestConnection(config, out string errorMessage))
+                {
+                    _lblConnStatus.Text = "Connection successful!";
+                    _lblConnStatus.ForeColor = AppTheme.Success;
+                }
+                else
+                {
+                    _lblConnStatus.Text = $"Connection failed: {errorMessage}";
+                    _lblConnStatus.ForeColor = AppTheme.Error;
+                }
+            }
+            catch (Exception ex)
+            {
+                _lblConnStatus.Text = $"Error: {ex.Message}";
                 _lblConnStatus.ForeColor = AppTheme.Error;
             }
         }
 
-        private void OnConnSaveClick(object sender, EventArgs e)
+        private void OnRepoSaveClick(object sender, EventArgs e)
         {
-            // TODO: Save glossary connection settings
-            _lblConnStatus.Text = "Glossary connection settings saved.";
-            _lblConnStatus.ForeColor = AppTheme.Success;
+            _lblConnStatus.Text = "Saving configuration...";
+            _lblConnStatus.ForeColor = AppTheme.Info;
+            Application.DoEvents();
+
+            try
+            {
+                var config = GetRepoConfigFromUI();
+                _bootstrapService.SaveConfig(config);
+
+                _lblConnStatus.Text = "Configuration saved successfully!";
+                _lblConnStatus.ForeColor = AppTheme.Success;
+            }
+            catch (Exception ex)
+            {
+                _lblConnStatus.Text = $"Save failed: {ex.Message}";
+                _lblConnStatus.ForeColor = AppTheme.Error;
+            }
         }
 
         private void InitializeMartProcessesTab()
