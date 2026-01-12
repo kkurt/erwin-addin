@@ -17,6 +17,8 @@ namespace EliteSoft.Erwin.Shared.Data
         public DbSet<AppConfig> AppConfigs { get; set; }
         public DbSet<TableType> TableTypes { get; set; }
         public DbSet<GlossaryConnectionDef> GlossaryConnectionDefs { get; set; }
+        public DbSet<ProjectProperty> ProjectProperties { get; set; }
+        public DbSet<ApprovementDef> ApprovementDefs { get; set; }
 
         /// <summary>
         /// Creates a new RepoDbContext with the specified connection settings
@@ -86,6 +88,12 @@ namespace EliteSoft.Erwin.Shared.Data
             modelBuilder.Entity<TableType>(entity =>
             {
                 entity.HasIndex(e => e.Name).IsUnique();
+            });
+
+            // ProjectProperty configuration
+            modelBuilder.Entity<ProjectProperty>(entity =>
+            {
+                entity.HasIndex(e => e.Key).IsUnique();
             });
         }
 

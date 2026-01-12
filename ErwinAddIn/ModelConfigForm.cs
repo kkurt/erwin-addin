@@ -83,8 +83,7 @@ namespace EliteSoft.Erwin.AddIn
         {
             // Column validation ListView columns
             listColumnValidation.Columns.Add("Table", 150);
-            listColumnValidation.Columns.Add("Column", 150);
-            listColumnValidation.Columns.Add("Physical Name", 200);
+            listColumnValidation.Columns.Add("Physical Name", 250);
             listColumnValidation.Columns.Add("In Glossary", 100);
 
             // Table validation ListView columns
@@ -715,11 +714,46 @@ namespace EliteSoft.Erwin.AddIn
                     return;
                 }
 
+                // First, try to access the UDP directly to check if it exists
+                // This is more reliable than enumerating all Property_Type objects
+                bool udpExists = CheckTableTypeUdpExists();
+
+                if (udpExists)
+                {
+                    Log("TABLE_TYPE UDP already exists - skipping creation");
+                    return;
+                }
+
+                // Create TABLE_TYPE UDP via metamodel session
+                Log("TABLE_TYPE UDP not found - creating...");
+                bool created = CreateTableTypeUdp(tableTypeService.GetNamesAsCommaSeparated());
+                if (created)
+                {
+                    Log("TABLE_TYPE UDP created successfully!");
+                }
+                else
+                {
+                    Log("Failed to create TABLE_TYPE UDP (may already exist)");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"EnsureTableTypeUdpExists error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Checks if the TABLE_TYPE UDP already exists in the model
+        /// Uses multiple methods for reliable detection
+        /// </summary>
+        private bool CheckTableTypeUdpExists()
+        {
+            try
+            {
                 dynamic modelObjects = _session.ModelObjects;
                 dynamic root = modelObjects.Root;
 
-                // Check if TABLE_TYPE UDP already exists
-                bool udpExists = false;
+                // Method 1: Try to collect Property_Type objects and find TABLE_TYPE
                 try
                 {
                     dynamic propertyTypes = modelObjects.Collect(root, "Property_Type");
@@ -729,38 +763,51 @@ namespace EliteSoft.Erwin.AddIn
                         string ptName = "";
                         try { ptName = pt.Name ?? ""; } catch { continue; }
 
-                        // Check for Entity.Physical.TABLE_TYPE (Table-level UDP)
                         if (ptName.Equals("Entity.Physical.TABLE_TYPE", StringComparison.OrdinalIgnoreCase))
                         {
-                            udpExists = true;
-                            Log("TABLE_TYPE UDP already exists");
-                            break;
+                            return true;
                         }
                     }
                 }
                 catch (Exception ex)
                 {
-                    Log($"Error checking for TABLE_TYPE UDP: {ex.Message}");
+                    Log($"Property_Type enumeration failed: {ex.Message}");
                 }
 
-                if (!udpExists)
+                // Method 2: Try to access the UDP on any existing Entity
+                try
                 {
-                    // Create TABLE_TYPE UDP via metamodel session
-                    Log("TABLE_TYPE UDP not found - creating...");
-                    bool created = CreateTableTypeUdp(tableTypeService.GetNamesAsCommaSeparated());
-                    if (created)
+                    dynamic entities = modelObjects.Collect(root, "Entity");
+                    foreach (dynamic entity in entities)
                     {
-                        Log("TABLE_TYPE UDP created successfully!");
-                    }
-                    else
-                    {
-                        Log("Failed to create TABLE_TYPE UDP");
+                        if (entity == null) continue;
+                        try
+                        {
+                            // Try to access the UDP - if it exists, this won't throw
+                            var udpValue = entity.Properties("Entity.Physical.TABLE_TYPE");
+                            if (udpValue != null)
+                            {
+                                return true;
+                            }
+                        }
+                        catch
+                        {
+                            // UDP doesn't exist on this entity, continue checking
+                        }
+                        break; // Only need to check one entity
                     }
                 }
+                catch
+                {
+                    // No entities or can't check
+                }
+
+                return false;
             }
             catch (Exception ex)
             {
-                Log($"EnsureTableTypeUdpExists error: {ex.Message}");
+                Log($"CheckTableTypeUdpExists error: {ex.Message}");
+                return false;
             }
         }
 
@@ -847,6 +894,14 @@ namespace EliteSoft.Erwin.AddIn
                 }
                 catch (Exception ex)
                 {
+                    // Check if error is "must be unique" - means UDP already exists
+                    if (ex.Message.Contains("must be unique") || ex.Message.Contains("EBS-1057"))
+                    {
+                        Log("TABLE_TYPE UDP already exists (detected via unique constraint)");
+                        try { metamodelSession.RollbackTransaction(transId); } catch { }
+                        return true; // UDP exists, consider it success
+                    }
+
                     Log($"Error creating TABLE_TYPE UDP: {ex.Message}");
                     try { metamodelSession.RollbackTransaction(transId); } catch { }
                     return false;
@@ -854,6 +909,13 @@ namespace EliteSoft.Erwin.AddIn
             }
             catch (Exception ex)
             {
+                // Check if error is "must be unique" - means UDP already exists
+                if (ex.Message.Contains("must be unique") || ex.Message.Contains("EBS-1057"))
+                {
+                    Log("TABLE_TYPE UDP already exists (detected via unique constraint)");
+                    return true; // UDP exists, consider it success
+                }
+
                 Log($"Metamodel session error for TABLE_TYPE: {ex.Message}");
                 return false;
             }
@@ -880,7 +942,6 @@ namespace EliteSoft.Erwin.AddIn
 
             // Add to column validation list (always, even during suppression) with cross symbol
             var item = new ListViewItem(e.TableName);
-            item.SubItems.Add(e.AttributeName);
             item.SubItems.Add(e.PhysicalName);
             item.SubItems.Add("✗");
             item.ForeColor = Color.Red;
@@ -1251,7 +1312,6 @@ namespace EliteSoft.Erwin.AddIn
             foreach (var col in validColumns)
             {
                 var item = new ListViewItem(col.TableName);
-                item.SubItems.Add(col.AttributeName);
                 item.SubItems.Add(col.PhysicalName);
                 item.SubItems.Add("✓");
                 item.ForeColor = Color.DarkGreen;
@@ -1262,7 +1322,6 @@ namespace EliteSoft.Erwin.AddIn
             foreach (var col in invalidColumns)
             {
                 var item = new ListViewItem(col.TableName);
-                item.SubItems.Add(col.AttributeName);
                 item.SubItems.Add(col.PhysicalName);
                 item.SubItems.Add("✗");
                 item.ForeColor = Color.Red;
@@ -1557,7 +1616,7 @@ namespace EliteSoft.Erwin.AddIn
                         MessageBox.Show(msg, "Uyarı", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     }
                 }
-                catch (Exception ex)
+                catch
                 {
                     try { _session.RollbackTransaction(transId); } catch { }
                     throw;

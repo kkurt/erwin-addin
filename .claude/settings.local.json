@@ -58,7 +58,23 @@
       "Bash(sqlcmd:*)",
       "Bash(git checkout:*)",
       "Bash(\"C:\\\\Windows\\\\Microsoft.NET\\\\Framework64\\\\v4.0.30319\\\\regasm.exe\" \"c:\\\\Users\\\\Administrator\\\\source\\\\repos\\\\erwin-addin\\\\ErwinAddIn\\\\bin\\\\Release\\\\net48\\\\EliteSoft.Erwin.AddIn.dll\" /codebase /tlb)",
-      "Bash(dotnet new:*)"
+      "Bash(dotnet new:*)",
+      "Bash(mkdir:*)",
+      "Bash(npm install:*)",
+      "Bash(where npm:*)",
+      "Bash(del \"c:\\\\Users\\\\Administrator\\\\source\\\\repos\\\\erwin-addin\\\\AdminWeb\\\\middleware.ts\")",
+      "Bash(rm:*)",
+      "Bash(dotnet clean:*)",
+      "Bash(Remove-Item -Recurse -Force \"c:\\\\Users\\\\Administrator\\\\source\\\\repos\\\\erwin-addin\\\\ErwinAdmin\\\\bin\", \"c:\\\\Users\\\\Administrator\\\\source\\\\repos\\\\erwin-addin\\\\ErwinAdmin\\\\obj\" -ErrorAction SilentlyContinue)",
+      "Bash(Start-Sleep -Seconds 2)",
+      "Bash(start binDebugnet48ErwinForge.exe)",
+      "Bash(start \"ErwinForge\" \"bin/Debug/net48/ErwinForge.exe\")",
+      "Bash(Start-Process \"c:\\\\Users\\\\Administrator\\\\source\\\\repos\\\\erwin-addin\\\\ErwinAdmin\\\\bin\\\\Debug\\\\net48\\\\ErwinForge.exe\")",
+      "Read(//c/Program Files/erwin/Data Modeler r10/erwin Bookshelf/Content/References/API Reference/**)",
+      "Read(//c/Users/Administrator/AppData/Local/EliteSoft/ErwinExtension/**)",
+      "Bash(tree:*)",
+      "Bash(del \"c:\\\\Users\\\\Administrator\\\\source\\\\repos\\\\erwin-addin\\\\ErwinAdmin\\\\Form1.cs\")",
+      "Bash(del \"c:\\\\Users\\\\Administrator\\\\source\\\\repos\\\\erwin-addin\\\\ErwinAdmin\\\\MartCatalogBrowser.cs\")"
     ]
   }
 }

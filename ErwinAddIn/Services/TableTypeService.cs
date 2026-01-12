@@ -103,14 +103,14 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         /// <summary>
         /// Get all table type names as comma-separated string (for UDP List values)
-        /// First item is "LÜTFEN SEÇİNİZ" to force user selection
+        /// First item is placeholder to force user selection
         /// </summary>
         public string GetNamesAsCommaSeparated()
         {
             if (!_isLoaded || _tableTypes.Count == 0)
-                return "LÜTFEN SEÇİNİZ";
+                return "(SELECT)";
 
-            var names = new List<string> { "LÜTFEN SEÇİNİZ" };
+            var names = new List<string> { "(SELECT)" };
             names.AddRange(_tableTypes.Select(t => t.Name));
             return string.Join(",", names);
         }

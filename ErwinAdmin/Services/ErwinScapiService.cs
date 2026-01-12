@@ -61,6 +61,11 @@ namespace EliteSoft.Erwin.Admin.Services
         List<UdpValue> GetModelUdpValues(Action<string> log);
 
         /// <summary>
+        /// Gets UDP values separated by Logical and Physical layers
+        /// </summary>
+        ModelUdpResult GetModelUdpValuesByLayer(Action<string> log = null);
+
+        /// <summary>
         /// Gets naming standards from the model
         /// </summary>
         List<NamingStandard> GetNamingStandards(Action<string> log = null);
@@ -94,6 +99,15 @@ namespace EliteSoft.Erwin.Admin.Services
     {
         public string Name { get; set; }
         public string Value { get; set; }
+    }
+
+    /// <summary>
+    /// Represents UDP values separated by Logical/Physical layer
+    /// </summary>
+    public class ModelUdpResult
+    {
+        public List<UdpValue> LogicalUdps { get; set; } = new List<UdpValue>();
+        public List<UdpValue> PhysicalUdps { get; set; } = new List<UdpValue>();
     }
 
     public class ModelLoadResult
@@ -162,6 +176,8 @@ namespace EliteSoft.Erwin.Admin.Services
                 CloseCurrentModel();
 
                 var martUrl = connection.GetMartUrl(modelPath);
+                System.Diagnostics.Debug.WriteLine($"[SCAPI] Loading model from: {martUrl}");
+
                 _currentModel = _scapi.PersistenceUnits.Add(martUrl, "RDO=Yes");
 
                 if (_currentModel == null)
@@ -169,9 +185,33 @@ namespace EliteSoft.Erwin.Admin.Services
                     return ModelLoadResult.Failed("Model returned null");
                 }
 
+                // Log persistence unit info
+                try
+                {
+                    string puName = _currentModel.Name?.ToString() ?? "(null)";
+                    string puLocation = _currentModel.Location?.ToString() ?? "(null)";
+                    System.Diagnostics.Debug.WriteLine($"[SCAPI] PU Name: {puName}, Location: {puLocation}");
+                }
+                catch { }
+
                 // Create session for model access
                 _session = _scapi.Sessions.Add();
                 _session.Open(_currentModel);
+
+                // Log model root info after session opens
+                try
+                {
+                    dynamic modelObjects = _session.ModelObjects;
+                    dynamic modelRoot = modelObjects.Root;
+                    string modelName = modelRoot?.Name?.ToString() ?? "(null)";
+
+                    // Try to get version info
+                    string version = "";
+                    try { version = modelRoot.Properties("Version")?.Value?.ToString() ?? ""; } catch { }
+
+                    System.Diagnostics.Debug.WriteLine($"[SCAPI] Model loaded: {modelName}, Version: {version}");
+                }
+                catch { }
 
                 return ModelLoadResult.Successful();
             }
@@ -613,6 +653,193 @@ namespace EliteSoft.Erwin.Admin.Services
             catch (Exception ex)
             {
                 log($"[UDP] GetModelUdpValues error: {ex.Message}");
+            }
+
+            return result;
+        }
+
+        public ModelUdpResult GetModelUdpValuesByLayer(Action<string> log = null)
+        {
+            var result = new ModelUdpResult();
+            log ??= s => System.Diagnostics.Debug.WriteLine(s);
+
+            if (_currentModel == null || _session == null)
+            {
+                log("[UDP-Layer] Model or session is null");
+                return result;
+            }
+
+            try
+            {
+                log("[UDP-Layer] Getting UDP values by Logical/Physical layer (erwinSpy approach)...");
+
+                dynamic modelObjects = _session.ModelObjects;
+                dynamic modelRoot = modelObjects.Root;
+
+                log($"[UDP-Layer] ModelRoot Name: {modelRoot?.Name ?? "(null)"}");
+                log($"[UDP-Layer] ModelRoot ClassName: {modelRoot?.ClassName ?? "(null)"}");
+
+                // erwinSpy approach: Enumerate modelRoot.Properties and check SCD_MPF_USER_DEFINED flag
+                // Flag value: SCD_MPF_USER_DEFINED = 2 (bit 1)
+                const int SCD_MPF_USER_DEFINED = 2;
+
+                log("[UDP-Layer] === Enumerating modelRoot.Properties for USER_DEFINED properties ===");
+
+                try
+                {
+                    dynamic props = modelRoot.Properties;
+                    int propCount = 0;
+                    int udpCount = 0;
+
+                    // Enumerate all properties
+                    foreach (dynamic prop in props)
+                    {
+                        propCount++;
+                        try
+                        {
+                            // Get property class name (this is the full property path like "Model.Physical.TEST")
+                            string propClassName = "";
+                            try { propClassName = prop.ClassName?.ToString() ?? ""; } catch { }
+
+                            // Get property flags
+                            int flags = 0;
+                            try { flags = (int)prop.Flags; } catch { }
+
+                            // Check if USER_DEFINED flag is set
+                            bool isUserDefined = (flags & SCD_MPF_USER_DEFINED) != 0;
+
+                            // Log first 20 properties for debugging
+                            if (propCount <= 20)
+                            {
+                                string flagStr = isUserDefined ? " [UDP]" : "";
+                                log($"[UDP-Layer]   [{propCount}] {propClassName}, Flags={flags}{flagStr}");
+                            }
+
+                            // Only process user-defined properties (UDPs)
+                            if (isUserDefined)
+                            {
+                                udpCount++;
+
+                                // Get the value
+                                string value = "";
+                                try { value = prop.Value?.ToString() ?? ""; } catch { }
+
+                                // Determine if Physical or Logical based on property class name
+                                if (propClassName.StartsWith("Model.Physical."))
+                                {
+                                    string udpName = propClassName.Substring("Model.Physical.".Length);
+                                    log($"[UDP-Layer]   Physical UDP: {udpName} = '{value}'");
+                                    result.PhysicalUdps.Add(new UdpValue { Name = udpName, Value = value });
+                                }
+                                else if (propClassName.StartsWith("Model.Logical."))
+                                {
+                                    string udpName = propClassName.Substring("Model.Logical.".Length);
+                                    log($"[UDP-Layer]   Logical UDP: {udpName} = '{value}'");
+                                    result.LogicalUdps.Add(new UdpValue { Name = udpName, Value = value });
+                                }
+                                else
+                                {
+                                    // Other UDP (not Model-level, maybe Entity, Attribute etc.)
+                                    log($"[UDP-Layer]   Other UDP: {propClassName} = '{value}'");
+                                }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            if (propCount <= 20)
+                                log($"[UDP-Layer]   [{propCount}] Error: {ex.Message}");
+                        }
+                    }
+
+                    log($"[UDP-Layer] Scanned {propCount} properties, found {udpCount} UDPs");
+                }
+                catch (Exception ex)
+                {
+                    log($"[UDP-Layer] Properties enumeration failed: {ex.Message}");
+                }
+
+                // If no UDPs found, try alternative: scan all ModelObjects for Property_Type in metamodel
+                if (result.LogicalUdps.Count == 0 && result.PhysicalUdps.Count == 0)
+                {
+                    log("[UDP-Layer] === No UDPs found, trying metamodel approach ===");
+
+                    try
+                    {
+                        // Open metamodel session (SCD_SL_M1 = 1)
+                        dynamic metaSession = _scapi.Sessions.Add();
+                        metaSession.Open(_currentModel, 1);
+
+                        dynamic metaObjects = metaSession.ModelObjects;
+                        int metaCount = metaObjects.Count;
+                        log($"[UDP-Layer] Metamodel session opened, objects count: {metaCount}");
+
+                        // Find Property_Type objects with Model.Physical.* or Model.Logical.* names
+                        var udpPaths = new List<string>();
+
+                        foreach (dynamic obj in metaObjects)
+                        {
+                            try
+                            {
+                                string className = "";
+                                string objName = "";
+                                try { className = obj.ClassName?.ToString() ?? ""; } catch { }
+                                try { objName = obj.Name?.ToString() ?? ""; } catch { }
+
+                                // Property_Type objects define UDPs
+                                if (className == "Property_Type")
+                                {
+                                    if (objName.StartsWith("Model.Physical.") || objName.StartsWith("Model.Logical."))
+                                    {
+                                        udpPaths.Add(objName);
+                                        log($"[UDP-Layer]   Found UDP definition: {objName}");
+                                    }
+                                }
+                            }
+                            catch { }
+                        }
+
+                        // Close metamodel session
+                        try { metaSession.Close(); } catch { }
+
+                        // Now read values from the data session
+                        log($"[UDP-Layer] Reading {udpPaths.Count} UDP values from data session...");
+                        foreach (var udpPath in udpPaths)
+                        {
+                            try
+                            {
+                                var val = modelRoot.Properties(udpPath).Value;
+                                string strVal = val?.ToString() ?? "";
+
+                                if (udpPath.StartsWith("Model.Physical."))
+                                {
+                                    string name = udpPath.Substring("Model.Physical.".Length);
+                                    log($"[UDP-Layer]   Physical: {name} = '{strVal}'");
+                                    result.PhysicalUdps.Add(new UdpValue { Name = name, Value = strVal });
+                                }
+                                else if (udpPath.StartsWith("Model.Logical."))
+                                {
+                                    string name = udpPath.Substring("Model.Logical.".Length);
+                                    log($"[UDP-Layer]   Logical: {name} = '{strVal}'");
+                                    result.LogicalUdps.Add(new UdpValue { Name = name, Value = strVal });
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                log($"[UDP-Layer]   {udpPath} = ERROR: {ex.Message}");
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        log($"[UDP-Layer] Metamodel approach failed: {ex.Message}");
+                    }
+                }
+
+                log($"[UDP-Layer] Result: {result.LogicalUdps.Count} Logical, {result.PhysicalUdps.Count} Physical UDP values");
+            }
+            catch (Exception ex)
+            {
+                log($"[UDP-Layer] Error: {ex.Message}");
             }
 
             return result;
