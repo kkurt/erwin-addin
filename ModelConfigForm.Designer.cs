@@ -61,6 +61,8 @@ namespace EliteSoft.Erwin.AddIn
             this.btnTestConnection = new System.Windows.Forms.Button();
             this.btnReloadGlossary = new System.Windows.Forms.Button();
             this.lblGlossaryStatus = new System.Windows.Forms.Label();
+            this.lblLastRefresh = new System.Windows.Forms.Label();
+            this.lblLastRefreshValue = new System.Windows.Forms.Label();
 
             // Debug tab controls
             this.grpDebugLog = new System.Windows.Forms.GroupBox();
@@ -157,7 +159,7 @@ namespace EliteSoft.Erwin.AddIn
             this.lblConnectionStatus.Name = "lblConnectionStatus";
             this.lblConnectionStatus.Size = new System.Drawing.Size(85, 15);
             this.lblConnectionStatus.TabIndex = 2;
-            this.lblConnectionStatus.Text = "(Yükleniyor...)";
+            this.lblConnectionStatus.Text = "(Loading...)";
             this.lblConnectionStatus.ForeColor = System.Drawing.Color.Gray;
 
             //
@@ -287,12 +289,14 @@ namespace EliteSoft.Erwin.AddIn
             this.grpGlossary.Controls.Add(this.btnTestConnection);
             this.grpGlossary.Controls.Add(this.btnReloadGlossary);
             this.grpGlossary.Controls.Add(this.lblGlossaryStatus);
+            this.grpGlossary.Controls.Add(this.lblLastRefresh);
+            this.grpGlossary.Controls.Add(this.lblLastRefreshValue);
             this.grpGlossary.Location = new System.Drawing.Point(10, 10);
             this.grpGlossary.Name = "grpGlossary";
-            this.grpGlossary.Size = new System.Drawing.Size(817, 160);
+            this.grpGlossary.Size = new System.Drawing.Size(817, 190);
             this.grpGlossary.TabIndex = 0;
             this.grpGlossary.TabStop = false;
-            this.grpGlossary.Text = "Glossary Database Connection";
+            this.grpGlossary.Text = "Glossary Database Connection (Auto-refresh every minute)";
 
             //
             // lblHost
@@ -390,6 +394,28 @@ namespace EliteSoft.Erwin.AddIn
             this.lblGlossaryStatus.Text = "";
 
             //
+            // lblLastRefresh
+            //
+            this.lblLastRefresh.AutoSize = true;
+            this.lblLastRefresh.Location = new System.Drawing.Point(15, 135);
+            this.lblLastRefresh.Name = "lblLastRefresh";
+            this.lblLastRefresh.Size = new System.Drawing.Size(75, 15);
+            this.lblLastRefresh.TabIndex = 9;
+            this.lblLastRefresh.Text = "Last Refresh:";
+
+            //
+            // lblLastRefreshValue
+            //
+            this.lblLastRefreshValue.AutoSize = true;
+            this.lblLastRefreshValue.Font = new System.Drawing.Font("Segoe UI", 9F, System.Drawing.FontStyle.Bold);
+            this.lblLastRefreshValue.Location = new System.Drawing.Point(100, 135);
+            this.lblLastRefreshValue.Name = "lblLastRefreshValue";
+            this.lblLastRefreshValue.Size = new System.Drawing.Size(100, 15);
+            this.lblLastRefreshValue.TabIndex = 10;
+            this.lblLastRefreshValue.Text = "(not yet)";
+            this.lblLastRefreshValue.ForeColor = System.Drawing.Color.Gray;
+
+            //
             // tabValidation
             //
             this.tabValidation.Controls.Add(this.btnValidateAll);
@@ -484,7 +510,7 @@ namespace EliteSoft.Erwin.AddIn
             this.lblValidationStatus.Name = "lblValidationStatus";
             this.lblValidationStatus.Size = new System.Drawing.Size(812, 20);
             this.lblValidationStatus.TabIndex = 2;
-            this.lblValidationStatus.Text = "Real-time monitoring active";
+            this.lblValidationStatus.Text = "Click 'Validate All' to check columns and tables";
             this.lblValidationStatus.ForeColor = System.Drawing.Color.DarkGreen;
 
             //
@@ -645,6 +671,8 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.Button btnTestConnection;
         private System.Windows.Forms.Button btnReloadGlossary;
         private System.Windows.Forms.Label lblGlossaryStatus;
+        private System.Windows.Forms.Label lblLastRefresh;
+        private System.Windows.Forms.Label lblLastRefreshValue;
 
         private System.Windows.Forms.TabControl tabControlValidation;
         private System.Windows.Forms.TabPage tabColumnValidation;

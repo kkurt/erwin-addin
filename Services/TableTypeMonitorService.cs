@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Windows.Forms;
 
 namespace EliteSoft.Erwin.AddIn.Services
@@ -27,6 +28,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         private Timer _monitorTimer;
         private bool _isMonitoring;
         private bool _disposed;
+        private bool _isProcessingChange; // Flag to prevent re-entrancy during popup
 
         // Snapshot of entity TABLE_TYPE values: ObjectId -> (PhysicalName, TableTypeValue)
         private Dictionary<string, EntitySnapshot> _entitySnapshots;
@@ -129,7 +131,8 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// </summary>
         private void MonitorTimer_Tick(object sender, EventArgs e)
         {
-            if (!_isMonitoring || _disposed) return;
+            // Skip if already processing a change (prevents popup showing multiple times)
+            if (!_isMonitoring || _disposed || _isProcessingChange) return;
 
             try
             {
@@ -195,22 +198,41 @@ namespace EliteSoft.Erwin.AddIn.Services
                         string oldTableType = _entitySnapshots[objectId].TableTypeValue;
                         Log($"TABLE_TYPE changed for '{physicalName}': '{oldTableType}' -> '{tableTypeValue}'");
 
-                        // Get the TableTypeEntry for the new value
-                        var tableTypeEntry = TableTypeService.Instance.GetByName(tableTypeValue);
-                        if (tableTypeEntry != null)
+                        // Set flag to prevent re-entrancy during popup
+                        _isProcessingChange = true;
+                        try
                         {
-                            // Apply affix based on NAME_EXTENSION_LOCATION
-                            ApplyTableTypeAffix(entity, physicalName, tableTypeEntry);
-                        }
+                            // Update snapshot FIRST to prevent duplicate popups
+                            _entitySnapshots[objectId] = new EntitySnapshot
+                            {
+                                ObjectId = objectId,
+                                EntityName = entityName,
+                                PhysicalName = physicalName,
+                                TableTypeValue = tableTypeValue
+                            };
 
-                        // Update snapshot
-                        _entitySnapshots[objectId] = new EntitySnapshot
+                            // If old TABLE_TYPE had predefined columns, ask user if they want to delete them
+                            if (!string.IsNullOrEmpty(oldTableType))
+                            {
+                                var oldTableTypeEntry = TableTypeService.Instance.GetByName(oldTableType);
+                                if (oldTableTypeEntry != null)
+                                {
+                                    RemoveOldPredefinedColumnsWithConfirmation(entity, oldTableTypeEntry, physicalName);
+                                }
+                            }
+
+                            // Get the TableTypeEntry for the new value
+                            var tableTypeEntry = TableTypeService.Instance.GetByName(tableTypeValue);
+                            if (tableTypeEntry != null)
+                            {
+                                // Apply affix based on NAME_EXTENSION_LOCATION
+                                ApplyTableTypeAffix(entity, physicalName, tableTypeEntry);
+                            }
+                        }
+                        finally
                         {
-                            ObjectId = objectId,
-                            EntityName = entityName,
-                            PhysicalName = physicalName,
-                            TableTypeValue = tableTypeValue
-                        };
+                            _isProcessingChange = false;
+                        }
                     }
                     else if (physicalNameChanged)
                     {
@@ -263,64 +285,306 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// Ask user if they want to remove old predefined columns when TABLE_TYPE changes
+        /// </summary>
+        private void RemoveOldPredefinedColumnsWithConfirmation(dynamic entity, TableTypeEntry oldTableTypeEntry, string tableName)
+        {
+            try
+            {
+                // Ensure PredefinedColumnService is loaded
+                if (!PredefinedColumnService.Instance.IsLoaded)
+                {
+                    PredefinedColumnService.Instance.LoadPredefinedColumns();
+                }
+
+                var oldPredefinedColumns = PredefinedColumnService.Instance.GetByTableTypeId(oldTableTypeEntry.Id);
+                if (!oldPredefinedColumns.Any())
+                {
+                    Log($"No predefined columns to remove for old TABLE_TYPE '{oldTableTypeEntry.Name}'");
+                    return;
+                }
+
+                // Get existing attributes (columns) of the entity
+                dynamic modelObjects = _session.ModelObjects;
+                var columnsToRemove = new List<dynamic>();
+                var columnNamesToRemove = new List<string>();
+
+                try
+                {
+                    dynamic attributes = modelObjects.Collect(entity, "Attribute");
+                    if (attributes != null)
+                    {
+                        foreach (dynamic attr in attributes)
+                        {
+                            try
+                            {
+                                string attrName = attr.Name ?? "";
+                                // Check if this column is from the old TABLE_TYPE's predefined columns
+                                if (oldPredefinedColumns.Any(pc => pc.Name.Equals(attrName, StringComparison.OrdinalIgnoreCase)))
+                                {
+                                    columnsToRemove.Add(attr);
+                                    columnNamesToRemove.Add(attrName);
+                                }
+                            }
+                            catch { }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log($"Error checking existing columns: {ex.Message}");
+                    return;
+                }
+
+                if (!columnsToRemove.Any())
+                {
+                    Log($"No matching predefined columns found to remove for old TABLE_TYPE '{oldTableTypeEntry.Name}'");
+                    return;
+                }
+
+                // Show confirmation dialog
+                string columnList = string.Join(", ", columnNamesToRemove);
+                var result = MessageBox.Show(
+                    $"TABLE_TYPE has changed for table '{tableName}'.\n\n" +
+                    $"Do you want to delete the following columns that were added for the old TABLE_TYPE '{oldTableTypeEntry.Name}'?\n\n" +
+                    $"{columnList}",
+                    "Delete Old Predefined Columns?",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Question);
+
+                if (result == DialogResult.Yes)
+                {
+                    int deletedCount = 0;
+                    foreach (dynamic attr in columnsToRemove)
+                    {
+                        try
+                        {
+                            int transId = _session.BeginNamedTransaction("DeleteOldPredefinedColumn");
+                            try
+                            {
+                                string attrName = attr.Name ?? "";
+                                modelObjects.Remove(attr);
+                                _session.CommitTransaction(transId);
+                                deletedCount++;
+                                Log($"Deleted old predefined column '{attrName}'");
+                            }
+                            catch (Exception ex)
+                            {
+                                try { _session.RollbackTransaction(transId); } catch { }
+                                Log($"Error deleting column: {ex.Message}");
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Log($"Error removing attribute: {ex.Message}");
+                        }
+                    }
+
+                    if (deletedCount > 0)
+                    {
+                        Log($"Deleted {deletedCount} old predefined column(s)");
+                    }
+                }
+                else
+                {
+                    Log($"User chose to keep old predefined columns");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"RemoveOldPredefinedColumnsWithConfirmation error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
         /// Apply affix to table physical name based on TABLE_TYPE entry
         /// First removes any existing affix, then applies the new one
+        /// Also adds predefined columns for the TABLE_TYPE
         /// </summary>
         private void ApplyTableTypeAffix(dynamic entity, string currentPhysicalName, TableTypeEntry tableTypeEntry)
         {
             try
             {
                 // Check if the correct affix is already applied
-                if (tableTypeEntry.HasAffixApplied(currentPhysicalName))
+                bool affixAlreadyApplied = tableTypeEntry.HasAffixApplied(currentPhysicalName);
+
+                if (!affixAlreadyApplied)
                 {
-                    Log($"Correct affix already applied to '{currentPhysicalName}'");
-                    return;
-                }
+                    // First, remove any existing affix from other TABLE_TYPEs
+                    string cleanName = TableTypeService.Instance.RemoveAllAffixes(currentPhysicalName);
 
-                // First, remove any existing affix from other TABLE_TYPEs
-                string cleanName = TableTypeService.Instance.RemoveAllAffixes(currentPhysicalName);
-
-                if (cleanName != currentPhysicalName)
-                {
-                    Log($"Removed old affix: '{currentPhysicalName}' -> '{cleanName}'");
-                }
-
-                // Now apply the new affix
-                string newPhysicalName = tableTypeEntry.ApplyAffix(cleanName);
-
-                if (newPhysicalName == currentPhysicalName)
-                {
-                    Log($"No affix change needed for '{currentPhysicalName}'");
-                    return;
-                }
-
-                Log($"Applying affix: '{currentPhysicalName}' -> '{newPhysicalName}'");
-
-                // Update the Physical_Name
-                int transId = _session.BeginNamedTransaction("ApplyTableTypeAffix");
-                try
-                {
-                    entity.Properties("Physical_Name").Value = newPhysicalName;
-                    _session.CommitTransaction(transId);
-
-                    Log($"Successfully renamed table to '{newPhysicalName}'");
-
-                    // Update snapshot with new name
-                    string objectId = entity.ObjectId?.ToString() ?? "";
-                    if (_entitySnapshots.ContainsKey(objectId))
+                    if (cleanName != currentPhysicalName)
                     {
-                        _entitySnapshots[objectId].PhysicalName = newPhysicalName;
+                        Log($"Removed old affix: '{currentPhysicalName}' -> '{cleanName}'");
+                    }
+
+                    // Now apply the new affix
+                    string newPhysicalName = tableTypeEntry.ApplyAffix(cleanName);
+
+                    if (newPhysicalName != currentPhysicalName)
+                    {
+                        Log($"Applying affix: '{currentPhysicalName}' -> '{newPhysicalName}'");
+
+                        // Update the Physical_Name
+                        int transId = _session.BeginNamedTransaction("ApplyTableTypeAffix");
+                        try
+                        {
+                            entity.Properties("Physical_Name").Value = newPhysicalName;
+                            _session.CommitTransaction(transId);
+
+                            Log($"Successfully renamed table to '{newPhysicalName}'");
+
+                            // Update snapshot with new name
+                            string objectId = entity.ObjectId?.ToString() ?? "";
+                            if (_entitySnapshots.ContainsKey(objectId))
+                            {
+                                _entitySnapshots[objectId].PhysicalName = newPhysicalName;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            try { _session.RollbackTransaction(transId); } catch { }
+                            Log($"Error applying affix: {ex.Message}");
+                        }
+                    }
+                    else
+                    {
+                        Log($"No affix change needed for '{currentPhysicalName}'");
                     }
                 }
-                catch (Exception ex)
+                else
                 {
-                    try { _session.RollbackTransaction(transId); } catch { }
-                    Log($"Error applying affix: {ex.Message}");
+                    Log($"Correct affix already applied to '{currentPhysicalName}'");
                 }
+
+                // Add predefined columns for this TABLE_TYPE
+                AddPredefinedColumns(entity, tableTypeEntry);
             }
             catch (Exception ex)
             {
                 Log($"ApplyTableTypeAffix error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Add predefined columns to the entity based on TABLE_TYPE
+        /// </summary>
+        private void AddPredefinedColumns(dynamic entity, TableTypeEntry tableTypeEntry)
+        {
+            try
+            {
+                // Ensure PredefinedColumnService is loaded
+                if (!PredefinedColumnService.Instance.IsLoaded)
+                {
+                    PredefinedColumnService.Instance.LoadPredefinedColumns();
+                }
+
+                var predefinedColumns = PredefinedColumnService.Instance.GetByTableTypeId(tableTypeEntry.Id);
+                if (!predefinedColumns.Any())
+                {
+                    Log($"No predefined columns for TABLE_TYPE '{tableTypeEntry.Name}'");
+                    return;
+                }
+
+                // Get existing attributes (columns) of the entity
+                dynamic modelObjects = _session.ModelObjects;
+                var existingColumnNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                try
+                {
+                    dynamic attributes = modelObjects.Collect(entity, "Attribute");
+                    if (attributes != null)
+                    {
+                        foreach (dynamic attr in attributes)
+                        {
+                            try
+                            {
+                                string attrName = attr.Name ?? "";
+                                if (!string.IsNullOrEmpty(attrName))
+                                {
+                                    existingColumnNames.Add(attrName);
+                                }
+                            }
+                            catch { }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log($"Error getting existing columns: {ex.Message}");
+                }
+
+                int addedCount = 0;
+                foreach (var predefinedCol in predefinedColumns)
+                {
+                    // Skip if column already exists
+                    if (existingColumnNames.Contains(predefinedCol.Name))
+                    {
+                        Log($"Column '{predefinedCol.Name}' already exists, skipping");
+                        continue;
+                    }
+
+                    try
+                    {
+                        // Use ErwinUtilities.CreateAttribute which is already working
+                        dynamic newAttribute = ErwinUtilities.CreateAttribute(_session, entity, predefinedCol.Name);
+
+                        if (newAttribute != null)
+                        {
+                            // Set additional properties in separate transaction
+                            int transId = _session.BeginNamedTransaction("SetAttributeProperties");
+                            try
+                            {
+                                // Set physical name
+                                try
+                                {
+                                    newAttribute.Properties("Physical_Name").Value = predefinedCol.Name;
+                                }
+                                catch { }
+
+                                // Set data type
+                                try
+                                {
+                                    newAttribute.Properties("Physical_Data_Type").Value = predefinedCol.DataType;
+                                }
+                                catch { }
+
+                                // Set nullability
+                                try
+                                {
+                                    newAttribute.Properties("Null_Option_Type").Value = predefinedCol.Nullable ? 0 : 1;
+                                }
+                                catch { }
+
+                                _session.CommitTransaction(transId);
+                            }
+                            catch
+                            {
+                                try { _session.RollbackTransaction(transId); } catch { }
+                            }
+
+                            addedCount++;
+                            Log($"Added predefined column '{predefinedCol.Name}' ({predefinedCol.DataType})");
+                        }
+                        else
+                        {
+                            Log($"Failed to create attribute '{predefinedCol.Name}'");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"Error adding column '{predefinedCol.Name}': {ex.Message}");
+                    }
+                }
+
+                if (addedCount > 0)
+                {
+                    Log($"Added {addedCount} predefined column(s) to entity");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"AddPredefinedColumns error: {ex.Message}");
             }
         }
 

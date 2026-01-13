@@ -2,143 +2,103 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Linq;
-using System.Reflection;
 using System.Windows.Forms;
 using EliteSoft.Erwin.AddIn.Services;
 
 namespace EliteSoft.Erwin.AddIn
 {
+    /// <summary>
+    /// Main configuration form for the Elite Soft Erwin Add-In.
+    /// Provides model selection, configuration, glossary management, and validation features.
+    /// </summary>
     public partial class ModelConfigForm : Form
     {
-        private dynamic _scapi;
+        #region Constants
+
+        private const int GlossaryRefreshIntervalMs = 60000; // 1 minute
+        private const string StatusConnected = "Connected";
+        private const string StatusDisconnected = "Disconnected";
+        private const string StatusConnecting = "Connecting...";
+        private const string StatusLoading = "Loading...";
+
+        #endregion
+
+        #region Fields
+
+        private readonly dynamic _scapi;
         private dynamic _currentModel;
         private dynamic _session;
-        private bool _isConnected = false;
-        private List<dynamic> _openModels = new List<dynamic>();
+        private bool _isConnected;
+        private readonly List<dynamic> _openModels = new List<dynamic>();
 
-        // Validation service
+        // Services
         private ColumnValidationService _validationService;
-
-        // TABLE_TYPE monitor service
         private TableTypeMonitorService _tableTypeMonitorService;
 
-        // Flag to track if OWNER UDP exists in model
-        private bool _ownerUdpExists = false;
+        // State tracking
+        private Timer _glossaryRefreshTimer;
+        private DateTime? _lastGlossaryRefreshTime;
 
-        // Suppress validation popups during startup (first 5 seconds)
-        private bool _suppressValidationPopups = true;
-        private Timer _suppressionTimer;
+        #endregion
+
+        #region Constructor
 
         public ModelConfigForm(dynamic scapi)
         {
-            _scapi = scapi;
+            _scapi = scapi ?? throw new ArgumentNullException(nameof(scapi));
             InitializeComponent();
             InitializeValidationUI();
+            InitializeGlossaryRefreshTimer();
         }
 
-        /// <summary>
-        /// Logs a message to the debug log panel
-        /// </summary>
-        private void Log(string message)
-        {
-            if (InvokeRequired)
-            {
-                Invoke(new Action(() => Log(message)));
-                return;
-            }
+        #endregion
 
-            string timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
-            string logLine = $"[{timestamp}] {message}\r\n";
-            txtDebugLog.AppendText(logLine);
-            txtDebugLog.SelectionStart = txtDebugLog.Text.Length;
-            txtDebugLog.ScrollToCaret();
-            Application.DoEvents();
-        }
-
-        /// <summary>
-        /// Clear debug log button click
-        /// </summary>
-        private void BtnClearLog_Click(object sender, EventArgs e)
-        {
-            txtDebugLog.Clear();
-        }
-
-        /// <summary>
-        /// Copy debug log button click - copies all log text to clipboard
-        /// </summary>
-        private void BtnCopyLog_Click(object sender, EventArgs e)
-        {
-            if (!string.IsNullOrEmpty(txtDebugLog.Text))
-            {
-                Clipboard.SetText(txtDebugLog.Text);
-                lblStatus.Text = "Log copied to clipboard!";
-                lblStatus.ForeColor = Color.DarkGreen;
-            }
-        }
-
-        /// <summary>
-        /// Initialize validation ListView columns
-        /// </summary>
-        private void InitializeValidationUI()
-        {
-            // Column validation ListView columns
-            listColumnValidation.Columns.Add("Table", 150);
-            listColumnValidation.Columns.Add("Physical Name", 250);
-            listColumnValidation.Columns.Add("In Glossary", 100);
-
-            // Table validation ListView columns
-            listTableValidation.Columns.Add("Table", 250);
-            listTableValidation.Columns.Add("Type Selected", 120);
-
-            btnValidateAll.Enabled = false;
-        }
+        #region Form Lifecycle
 
         private void ModelConfigForm_Load(object sender, EventArgs e)
         {
             LoadOpenModels();
         }
 
-        /// <summary>
-        /// Loads all open models into the combo box
-        /// </summary>
+        protected override void OnFormClosed(FormClosedEventArgs e)
+        {
+            base.OnFormClosed(e);
+            CleanupResources();
+        }
+
+        #endregion
+
+        #region Model Management
+
         private void LoadOpenModels()
         {
             try
             {
-                lblConnectionStatus.Text = "(Yükleniyor...)";
-                lblConnectionStatus.ForeColor = Color.Gray;
+                UpdateConnectionStatus(StatusLoading, Color.Gray);
                 cmbModels.Items.Clear();
                 _openModels.Clear();
                 Application.DoEvents();
 
-                // Get persistence units (open models)
                 dynamic persistenceUnits = _scapi.PersistenceUnits;
 
                 if (persistenceUnits.Count == 0)
                 {
-                    cmbModels.Items.Add("(Model bulunamadı)");
+                    cmbModels.Items.Add("(No models found)");
                     cmbModels.SelectedIndex = 0;
                     cmbModels.Enabled = false;
-                    ShowConnectionError("erwin'de açık model bulunamadı.\nLütfen önce bir model açın.");
+                    ShowError("No open models found in erwin.\nPlease open a model first.", "Connection Error");
                     return;
                 }
 
-                // Load all open models
                 for (int i = 0; i < persistenceUnits.Count; i++)
                 {
                     dynamic model = persistenceUnits.Item(i);
                     _openModels.Add(model);
 
-                    string modelName = GetModelNameFromModel(model);
-                    if (string.IsNullOrEmpty(modelName))
-                    {
-                        modelName = $"(Model {i + 1})";
-                    }
-
+                    string modelName = GetModelName(model) ?? $"(Model {i + 1})";
                     cmbModels.Items.Add(modelName);
                 }
 
-                // Select first model
                 if (cmbModels.Items.Count > 0)
                 {
                     cmbModels.SelectedIndex = 0;
@@ -146,411 +106,247 @@ namespace EliteSoft.Erwin.AddIn
             }
             catch (Exception ex)
             {
-                ShowConnectionError($"Modeller yüklenemedi:\n{ex.Message}");
+                ShowError($"Failed to load models:\n{ex.Message}", "Connection Error");
             }
         }
 
-        /// <summary>
-        /// Called when user selects a different model from combo box
-        /// </summary>
         private void CmbModels_SelectedIndexChanged(object sender, EventArgs e)
         {
             if (cmbModels.SelectedIndex < 0 || cmbModels.SelectedIndex >= _openModels.Count)
                 return;
 
-            ConnectToSelectedModel(cmbModels.SelectedIndex);
+            ConnectToModel(cmbModels.SelectedIndex);
         }
 
-        /// <summary>
-        /// Connects to the selected model
-        /// </summary>
-        private void ConnectToSelectedModel(int modelIndex)
+        private void ConnectToModel(int modelIndex)
         {
             try
             {
-                // Close existing session if any
-                if (_session != null)
-                {
-                    try { _session.Close(); } catch { }
-                }
-
+                CloseCurrentSession();
                 _isConnected = false;
-                lblConnectionStatus.Text = "(Bağlanıyor...)";
-                lblConnectionStatus.ForeColor = Color.Gray;
+                UpdateConnectionStatus(StatusConnecting, Color.Gray);
                 EnableControls(false);
                 Application.DoEvents();
 
-                // Get selected model
                 _currentModel = _openModels[modelIndex];
-
-                // Create session
                 _session = _scapi.Sessions.Add();
                 _session.Open(_currentModel);
 
                 _isConnected = true;
-
-                // Update status
-                lblConnectionStatus.Text = "Bağlandı";
-                lblConnectionStatus.ForeColor = Color.DarkGreen;
-
-                // Load existing values from Definition field
+                UpdateConnectionStatus(StatusConnected, Color.DarkGreen);
                 LoadExistingValues();
-
-                // Enable controls
                 EnableControls(true);
-                lblStatus.Text = "Model'e bağlandı.";
-                lblStatus.ForeColor = Color.DarkGreen;
+                UpdateStatus("Connected to model.", Color.DarkGreen);
 
-                // Initialize validation service
                 InitializeValidationService();
             }
             catch (Exception ex)
             {
                 _isConnected = false;
-                lblConnectionStatus.Text = "Bağlanamadı!";
-                lblConnectionStatus.ForeColor = Color.Red;
+                UpdateConnectionStatus(StatusDisconnected, Color.Red);
                 EnableControls(false);
-                lblStatus.Text = $"Hata: {ex.Message}";
-                lblStatus.ForeColor = Color.Red;
+                UpdateStatus($"Error: {ex.Message}", Color.Red);
             }
         }
 
-        /// <summary>
-        /// Initialize validation service for the connected session
-        /// </summary>
+        private string GetModelName(dynamic model)
+        {
+            try
+            {
+                try { return model.Name; } catch { }
+                try { return model.Properties("Name").Value; } catch { }
+                try
+                {
+                    string path = model.FilePath;
+                    if (!string.IsNullOrEmpty(path))
+                        return System.IO.Path.GetFileNameWithoutExtension(path);
+                }
+                catch { }
+                return null;
+            }
+            catch { return null; }
+        }
+
+        #endregion
+
+        #region Validation Service
+
         private void InitializeValidationService()
         {
-            Log("InitializeValidationService - Step 1: Starting");
+            Log("Initializing validation service...");
 
-            // Dispose previous services if exist
-            _validationService?.Dispose();
-            _tableTypeMonitorService?.Dispose();
-
-            Log("InitializeValidationService - Step 2: Before LoadGlossary");
-
-            // Load glossary from database
+            DisposeServices();
             LoadGlossary();
-
-            Log("InitializeValidationService - Step 3: Glossary loaded");
-
-            // Load TABLE_TYPE from database and ensure UDP exists
             LoadTableTypes();
             EnsureTableTypeUdpExists();
 
-            Log("InitializeValidationService - Step 4: TABLE_TYPE loaded and UDP checked");
-
             _validationService = new ColumnValidationService(_session);
-
-            // Subscribe to validation events
-            _validationService.OnValidationFailed += OnValidationFailed;
-            _validationService.OnValidationPassed += OnValidationPassed;
-            _validationService.OnColumnChanged += OnColumnChanged;
-
-            // Enable validation controls
             btnValidateAll.Enabled = true;
-
-            // Take initial snapshot and auto-start monitoring
-            _validationService.TakeSnapshot();
-            _validationService.StartMonitoring();
 
             // Initialize TABLE_TYPE monitor service
             _tableTypeMonitorService = new TableTypeMonitorService(_session);
-            _tableTypeMonitorService.OnLog += (msg) => Log(msg);
+            _tableTypeMonitorService.OnLog += Log;
             _tableTypeMonitorService.TakeSnapshot();
             _tableTypeMonitorService.StartMonitoring();
-            Log("TableTypeMonitorService initialized and monitoring");
 
-            // Suppress popups for first 5 seconds to avoid flood on startup
-            _suppressValidationPopups = true;
-            _suppressionTimer = new Timer();
-            _suppressionTimer.Interval = 5000;  // 5 seconds
-            _suppressionTimer.Tick += (s, ev) =>
+            UpdateValidationStatus();
+            Log("Validation service initialized.");
+        }
+
+        private void InitializeValidationUI()
+        {
+            listColumnValidation.Columns.Add("Table", 150);
+            listColumnValidation.Columns.Add("Physical Name", 250);
+            listColumnValidation.Columns.Add("Status", 80);
+
+            listTableValidation.Columns.Add("Table", 250);
+            listTableValidation.Columns.Add("Type Selected", 100);
+
+            btnValidateAll.Enabled = false;
+        }
+
+        private void BtnValidateAll_Click(object sender, EventArgs e)
+        {
+            if (_validationService == null) return;
+
+            listColumnValidation.Items.Clear();
+            listTableValidation.Items.Clear();
+
+            var allResults = _validationService.ValidateAllColumns();
+            var columnResults = allResults.Where(r => r.RuleName != "TableTypeRule").ToList();
+            var tableResults = allResults.Where(r => r.RuleName == "TableTypeRule").ToList();
+
+            PopulateColumnValidationResults(columnResults);
+            PopulateTableValidationResults(tableResults);
+            ShowValidationSummary(columnResults, tableResults);
+        }
+
+        private void PopulateColumnValidationResults(List<ColumnValidationIssue> results)
+        {
+            // Sort: valid first, then invalid
+            var sortedResults = results.OrderByDescending(r => r.IsValid).ThenBy(r => r.TableName);
+
+            foreach (var col in sortedResults)
             {
-                _suppressValidationPopups = false;
-                _suppressionTimer.Stop();
-                _suppressionTimer.Dispose();
-                _suppressionTimer = null;
-                Log("Validation popup suppression ended - popups now active");
-            };
-            _suppressionTimer.Start();
-            Log("Validation popup suppression started (5 seconds)");
+                var item = new ListViewItem(col.TableName);
+                item.SubItems.Add(col.PhysicalName);
+                item.SubItems.Add(col.IsValid ? "\u2713" : "\u2717");
+                item.ForeColor = col.IsValid ? Color.DarkGreen : Color.Red;
+                listColumnValidation.Items.Add(item);
+            }
+        }
 
+        private void PopulateTableValidationResults(List<ColumnValidationIssue> results)
+        {
+            // Sort: valid first, then invalid
+            var sortedResults = results.OrderByDescending(r => r.IsValid).ThenBy(r => r.TableName);
+
+            foreach (var tbl in sortedResults)
+            {
+                var item = new ListViewItem(tbl.TableName);
+                item.SubItems.Add(tbl.IsValid ? "\u2713" : "\u2717");
+                item.ForeColor = tbl.IsValid ? Color.DarkGreen : Color.Red;
+                listTableValidation.Items.Add(item);
+            }
+        }
+
+        private void ShowValidationSummary(List<ColumnValidationIssue> columnResults, List<ColumnValidationIssue> tableResults)
+        {
+            int invalidColumns = columnResults.Count(r => !r.IsValid);
+            int invalidTables = tableResults.Count(r => !r.IsValid);
+            int validColumns = columnResults.Count(r => r.IsValid);
+            int validTables = tableResults.Count(r => r.IsValid);
+
+            if (invalidColumns == 0 && invalidTables == 0)
+            {
+                lblValidationStatus.Text = $"All validations passed - {validColumns} columns, {validTables} tables OK";
+                lblValidationStatus.ForeColor = Color.DarkGreen;
+                MessageBox.Show(
+                    $"All validations passed!\n\nColumns: {validColumns} found in glossary\nTables: All tables have type selected",
+                    "Validation Passed", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            else
+            {
+                lblValidationStatus.Text = $"Validation: {invalidColumns} column errors, {invalidTables} table errors";
+                lblValidationStatus.ForeColor = Color.Red;
+
+                string message = "";
+                if (invalidColumns > 0) message += $"Column Errors: {invalidColumns} not found in glossary\n";
+                if (invalidTables > 0) message += $"Table Errors: {invalidTables} tables without type selected\n";
+                message += "\nSee the tabs for details.";
+
+                MessageBox.Show(message, "Validation Result", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        private void UpdateValidationStatus()
+        {
             var glossary = GlossaryService.Instance;
             if (glossary.IsLoaded)
             {
-                lblValidationStatus.Text = $"Monitoring active - Glossary: {glossary.Count} entries";
+                lblValidationStatus.Text = $"Ready - Glossary: {glossary.Count} entries. Click 'Validate All' to check.";
                 lblValidationStatus.ForeColor = Color.DarkGreen;
             }
             else
             {
-                lblValidationStatus.Text = $"Monitoring active - Warning: Glossary not loaded";
+                lblValidationStatus.Text = "Warning: Glossary not loaded";
                 lblValidationStatus.ForeColor = Color.Orange;
             }
         }
 
-        /// <summary>
-        /// Check and create OWNER UDP at startup if needed
-        /// </summary>
-        private void EnsureOwnerUdpExistsOnStartup()
-        {
-            Log("EnsureOwnerUdpExistsOnStartup called");
+        #endregion
 
+        #region Glossary Management
+
+        private void InitializeGlossaryRefreshTimer()
+        {
+            _glossaryRefreshTimer = new Timer { Interval = GlossaryRefreshIntervalMs };
+            _glossaryRefreshTimer.Tick += GlossaryRefreshTimer_Tick;
+            _glossaryRefreshTimer.Start();
+            Log("Glossary auto-refresh timer started (every 1 minute)");
+        }
+
+        private void GlossaryRefreshTimer_Tick(object sender, EventArgs e)
+        {
             try
             {
-                dynamic modelObjects = _session.ModelObjects;
-                Log("Got ModelObjects");
-
-                dynamic root = modelObjects.Root;
-                Log($"Got Root: {root?.Name ?? "(null)"}");
-
-                // Check if OWNER UDP definition exists by looking at Property_Type objects
-                Log("Checking if OWNER UDP definition exists via Property_Type...");
-
-                bool udpExists = false;
-
-                try
-                {
-                    // Try to collect Property_Type objects from root
-                    Log("Trying modelObjects.Collect(root, \"Property_Type\")...");
-                    dynamic propertyTypes = modelObjects.Collect(root, "Property_Type");
-
-                    int ptCount = 0;
-                    try { ptCount = propertyTypes?.Count ?? 0; } catch { }
-                    Log($"Property_Type count: {ptCount}");
-
-                    foreach (dynamic pt in propertyTypes)
-                    {
-                        if (pt == null) continue;
-
-                        string ptName = "";
-                        try { ptName = pt.Name ?? ""; } catch { continue; }
-
-                        Log($"Found Property_Type: {ptName}");
-
-                        // Check for OWNER UDP - erwin stores it as "Attribute.Physical.OWNER"
-                        if (ptName.Equals("Attribute.Physical.OWNER", StringComparison.OrdinalIgnoreCase))
-                        {
-                            udpExists = true;
-                            Log("OWNER UDP DEFINITION EXISTS!");
-                            break;
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Log($"Error checking Property_Type: {ex.Message}");
-                }
-
-                // Alternative: Scan all attributes for UDP value
-                Log("Scanning all attributes for OWNER UDP value...");
-                try
-                {
-                    dynamic allEntities = modelObjects.Collect(root, "Entity");
-                    int checkedCount = 0;
-
-                    foreach (dynamic entity in allEntities)
-                    {
-                        if (entity == null) continue;
-                        if (udpExists) break;
-
-                        dynamic entityAttrs = null;
-                        try { entityAttrs = modelObjects.Collect(entity, "Attribute"); } catch { continue; }
-                        if (entityAttrs == null) continue;
-
-                        foreach (dynamic attr in entityAttrs)
-                        {
-                            if (attr == null) continue;
-                            checkedCount++;
-
-                            try
-                            {
-                                // Try to READ the UDP value
-                                var ownerValue = attr.Properties("Attribute.Physical.OWNER").Value;
-                                string ownerStr = ownerValue?.ToString() ?? "";
-
-                                if (!string.IsNullOrEmpty(ownerStr))
-                                {
-                                    udpExists = true;
-                                    string attrName = "";
-                                    try { attrName = attr.Name ?? ""; } catch { }
-                                    Log($"OWNER UDP FOUND! Attribute '{attrName}' has OWNER='{ownerStr}'");
-                                    break;
-                                }
-                            }
-                            catch
-                            {
-                                // Property not accessible on this attribute - continue checking
-                            }
-                        }
-                    }
-
-                    Log($"Checked {checkedCount} attributes");
-                }
-                catch (Exception ex2)
-                {
-                    Log($"Error scanning attributes: {ex2.Message}");
-                }
-
-                Log($"UDP exists: {udpExists}");
-                _ownerUdpExists = udpExists;
-
-                if (udpExists)
-                {
-                    Log("OWNER UDP already exists - ready to use");
-                }
-                else
-                {
-                    // UDP not found - try to create it via metamodel session
-                    Log("OWNER UDP not found - attempting to create...");
-                    bool created = CreateOwnerUdpViaMetamodel(modelObjects);
-                    if (created)
-                    {
-                        _ownerUdpExists = true;
-                        Log("OWNER UDP created successfully!");
-                    }
-                    else
-                    {
-                        Log("Could not create UDP automatically.");
-                        Log("Please create manually: Model > UDPs > Add > Class: Column, Name: OWNER, Type: Text");
-                    }
-                }
+                RefreshGlossarySilently();
             }
             catch (Exception ex)
             {
-                Log($"OUTER ERROR: {ex.Message}");
-                Log($"Stack: {ex.StackTrace}");
+                Log($"Glossary refresh error: {ex.Message}");
             }
         }
 
-        /// <summary>
-        /// Tries to set OWNER UDP value on an attribute
-        /// </summary>
-        private bool TrySetOwnerUdp(dynamic attr, string ownerValue, string attributeName)
+        private void RefreshGlossarySilently()
         {
-            // Try to set OWNER UDP value directly
-            try
-            {
-                attr.Properties("Attribute.Physical.OWNER").Value = ownerValue;
-                _ownerUdpExists = true; // Mark as exists since it worked
-                Log($"Set OWNER UDP = '{ownerValue}' for {attributeName}");
-                return true;
-            }
-            catch
-            {
-                // Direct property access failed
-            }
+            if (!DatabaseService.Instance.IsConfigured) return;
 
-            // Try CollectProperties approach
-            try
-            {
-                var props = attr.CollectProperties("Attribute.Physical.OWNER");
-                if (props != null && props.Count > 0)
-                {
-                    props.Item(0).Value = ownerValue;
-                    _ownerUdpExists = true;
-                    Log($"Set OWNER via CollectProperties = '{ownerValue}' for {attributeName}");
-                    return true;
-                }
-            }
-            catch
-            {
-                // CollectProperties also failed
-            }
+            GlossaryService.Instance.Reload();
+            _lastGlossaryRefreshTime = DateTime.Now;
+            UpdateLastRefreshLabel();
 
-            return false;
+            if (GlossaryService.Instance.IsLoaded)
+            {
+                Log($"Glossary auto-refreshed: {GlossaryService.Instance.Count} entries");
+            }
         }
 
-        /// <summary>
-        /// Creates the OWNER UDP via metamodel-level session
-        /// </summary>
-        private bool CreateOwnerUdpViaMetamodel(dynamic modelObjects)
+        private void UpdateLastRefreshLabel()
         {
-            dynamic metamodelSession = null;
-            try
+            if (InvokeRequired)
             {
-                Log("Opening metamodel session (SCD_SL_M1)...");
-
-                // Create a new session with metamodel access level (SCD_SL_M1 = 1)
-                metamodelSession = _scapi.Sessions.Add();
-                metamodelSession.Open(_currentModel, 1); // 1 = SCD_SL_M1 (Metamodel level)
-
-                Log("Metamodel session opened");
-
-                // Begin transaction
-                int transId = metamodelSession.BeginNamedTransaction("CreateOwnerUDP");
-                Log("Transaction started");
-
-                try
-                {
-                    // Create Property_Type for the UDP
-                    dynamic mmObjects = metamodelSession.ModelObjects;
-                    dynamic udpType = mmObjects.Add("Property_Type");
-
-                    Log("Property_Type object created");
-
-                    // Set UDP properties
-                    // Name format: <ObjectClassName>.<Logical/Physical>.<Name>
-                    udpType.Properties("Name").Value = "Attribute.Physical.OWNER";
-                    Log("Set Name = Attribute.Physical.OWNER");
-
-                    // tag_Udp_Owner_Type - the class this UDP applies to
-                    // Attribute class ID in erwin
-                    try { udpType.Properties("tag_Udp_Owner_Type").Value = "Attribute"; }
-                    catch { Log("Could not set tag_Udp_Owner_Type"); }
-
-                    // Physical only
-                    try { udpType.Properties("tag_Is_Physical").Value = true; }
-                    catch { Log("Could not set tag_Is_Physical"); }
-
-                    try { udpType.Properties("tag_Is_Logical").Value = false; }
-                    catch { Log("Could not set tag_Is_Logical"); }
-
-                    // Data type: 2 = Text
-                    try { udpType.Properties("tag_Udp_Data_Type").Value = 2; }
-                    catch { Log("Could not set tag_Udp_Data_Type"); }
-
-                    try { udpType.Properties("Data_Type").Value = 2; }
-                    catch { Log("Could not set Data_Type"); }
-
-                    // Order
-                    try { udpType.Properties("tag_Order").Value = "1"; }
-                    catch { Log("Could not set tag_Order"); }
-
-                    // Locally defined
-                    try { udpType.Properties("tag_Is_Locally_Defined").Value = true; }
-                    catch { Log("Could not set tag_Is_Locally_Defined"); }
-
-                    // Commit transaction
-                    metamodelSession.CommitTransaction(transId);
-                    Log("Transaction committed");
-
-                    return true;
-                }
-                catch (Exception ex)
-                {
-                    Log($"Error creating UDP: {ex.Message}");
-                    try { metamodelSession.RollbackTransaction(transId); } catch { }
-                    return false;
-                }
+                Invoke(new Action(UpdateLastRefreshLabel));
+                return;
             }
-            catch (Exception ex)
+
+            if (_lastGlossaryRefreshTime.HasValue)
             {
-                Log($"Metamodel session error: {ex.Message}");
-                return false;
-            }
-            finally
-            {
-                // Close metamodel session
-                if (metamodelSession != null)
-                {
-                    try { metamodelSession.Close(); } catch { }
-                }
+                lblLastRefreshValue.Text = _lastGlossaryRefreshTime.Value.ToString("yyyy-MM-dd HH:mm:ss");
+                lblLastRefreshValue.ForeColor = Color.DarkGreen;
             }
         }
 
-        /// <summary>
-        /// Test glossary database connection button click
-        /// </summary>
         private void BtnTestConnection_Click(object sender, EventArgs e)
         {
             try
@@ -559,7 +355,6 @@ namespace EliteSoft.Erwin.AddIn
                 lblGlossaryStatus.ForeColor = Color.DarkBlue;
                 Application.DoEvents();
 
-                // First check repo database
                 if (!DatabaseService.Instance.IsConfigured)
                 {
                     lblGlossaryStatus.Text = "Repository database not configured. Please configure in ErwinAdmin.";
@@ -567,7 +362,6 @@ namespace EliteSoft.Erwin.AddIn
                     return;
                 }
 
-                // Load glossary connection definition
                 var glossaryConnService = GlossaryConnectionService.Instance;
                 glossaryConnService.ClearCache();
                 glossaryConnService.LoadConnectionDef();
@@ -579,10 +373,8 @@ namespace EliteSoft.Erwin.AddIn
                     return;
                 }
 
-                // Update display labels
                 UpdateGlossaryConnectionLabels();
 
-                // Test the glossary connection
                 string connectionString = glossaryConnService.GetGlossaryConnectionString();
                 string dbType = DatabaseService.Instance.GetDbType();
 
@@ -600,9 +392,6 @@ namespace EliteSoft.Erwin.AddIn
             }
         }
 
-        /// <summary>
-        /// Reconnect and reload glossary button click - reads connection info from DB and reloads glossary
-        /// </summary>
         private void BtnReloadGlossary_Click(object sender, EventArgs e)
         {
             try
@@ -611,11 +400,9 @@ namespace EliteSoft.Erwin.AddIn
                 lblGlossaryStatus.ForeColor = Color.DarkBlue;
                 Application.DoEvents();
 
-                // Clear all cached data to force fresh read from database
                 DatabaseService.Instance.ClearCache();
                 GlossaryConnectionService.Instance.ClearCache();
 
-                // Step 1: Check if repo database is configured
                 if (!DatabaseService.Instance.IsConfigured)
                 {
                     lblGlossaryStatus.Text = "Repository database not configured. Please configure in ErwinAdmin.";
@@ -624,7 +411,6 @@ namespace EliteSoft.Erwin.AddIn
                     return;
                 }
 
-                // Step 2: Read GLOSSARY_CONNECTION_DEF from repo database
                 lblGlossaryStatus.Text = "Reading GLOSSARY_CONNECTION_DEF from repository...";
                 Application.DoEvents();
 
@@ -637,10 +423,8 @@ namespace EliteSoft.Erwin.AddIn
                     return;
                 }
 
-                // Update display labels with new connection info
                 UpdateGlossaryConnectionLabels();
 
-                // Step 3: Load glossary from the glossary database
                 lblGlossaryStatus.Text = "Loading glossary entries...";
                 Application.DoEvents();
 
@@ -652,12 +436,9 @@ namespace EliteSoft.Erwin.AddIn
                     lblGlossaryStatus.Text = $"Glossary loaded: {GlossaryService.Instance.Count} entries from {connDef?.Host}/{connDef?.DbSchema}";
                     lblGlossaryStatus.ForeColor = Color.DarkGreen;
 
-                    // Update validation status if available
-                    if (lblValidationStatus != null)
-                    {
-                        lblValidationStatus.Text = $"Monitoring active - Glossary: {GlossaryService.Instance.Count} entries";
-                        lblValidationStatus.ForeColor = Color.DarkGreen;
-                    }
+                    _lastGlossaryRefreshTime = DateTime.Now;
+                    UpdateLastRefreshLabel();
+                    UpdateValidationStatus();
                 }
                 else
                 {
@@ -672,9 +453,45 @@ namespace EliteSoft.Erwin.AddIn
             }
         }
 
-        /// <summary>
-        /// Updates the glossary connection display labels from GLOSSARY_CONNECTION_DEF
-        /// </summary>
+        private void LoadGlossary()
+        {
+            try
+            {
+                if (!DatabaseService.Instance.IsConfigured)
+                {
+                    lblGlossaryStatus.Text = "Repository database not configured. Please configure in ErwinAdmin.";
+                    lblGlossaryStatus.ForeColor = Color.Red;
+                    ClearGlossaryConnectionLabels();
+                    return;
+                }
+
+                var glossary = GlossaryService.Instance;
+                if (!glossary.IsLoaded)
+                {
+                    glossary.LoadGlossary();
+                }
+
+                UpdateGlossaryConnectionLabels();
+
+                if (glossary.IsLoaded)
+                {
+                    lblGlossaryStatus.Text = $"Glossary loaded: {glossary.Count} entries";
+                    lblGlossaryStatus.ForeColor = Color.DarkGreen;
+                }
+                else
+                {
+                    lblGlossaryStatus.Text = $"Glossary not loaded: {glossary.LastError}";
+                    lblGlossaryStatus.ForeColor = Color.Red;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"LoadGlossary error: {ex.Message}");
+                lblGlossaryStatus.Text = $"Error: {ex.Message}";
+                lblGlossaryStatus.ForeColor = Color.Red;
+            }
+        }
+
         private void UpdateGlossaryConnectionLabels()
         {
             var connDef = GlossaryConnectionService.Instance.ConnectionDef;
@@ -690,9 +507,6 @@ namespace EliteSoft.Erwin.AddIn
             }
         }
 
-        /// <summary>
-        /// Clears the glossary connection display labels
-        /// </summary>
         private void ClearGlossaryConnectionLabels()
         {
             lblHostValue.Text = "(not loaded)";
@@ -700,54 +514,10 @@ namespace EliteSoft.Erwin.AddIn
             lblDatabaseValue.Text = "(not loaded)";
         }
 
-        /// <summary>
-        /// Load glossary from database using GLOSSARY_CONNECTION_DEF configuration
-        /// </summary>
-        private void LoadGlossary()
-        {
-            try
-            {
-                // Check if repo database is configured
-                if (!DatabaseService.Instance.IsConfigured)
-                {
-                    lblGlossaryStatus.Text = "Repository database not configured. Please configure in ErwinAdmin.";
-                    lblGlossaryStatus.ForeColor = Color.Red;
-                    ClearGlossaryConnectionLabels();
-                    return;
-                }
+        #endregion
 
-                var glossary = GlossaryService.Instance;
-                if (!glossary.IsLoaded)
-                {
-                    glossary.LoadGlossary();
-                }
+        #region Table Type Management
 
-                // Update connection labels from GLOSSARY_CONNECTION_DEF
-                UpdateGlossaryConnectionLabels();
-
-                // Update glossary status label
-                if (glossary.IsLoaded)
-                {
-                    lblGlossaryStatus.Text = $"Glossary loaded: {glossary.Count} entries";
-                    lblGlossaryStatus.ForeColor = Color.DarkGreen;
-                }
-                else
-                {
-                    lblGlossaryStatus.Text = $"Glossary not loaded: {glossary.LastError}";
-                    lblGlossaryStatus.ForeColor = Color.Red;
-                }
-            }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine($"LoadGlossary error: {ex.Message}");
-                lblGlossaryStatus.Text = $"Error: {ex.Message}";
-                lblGlossaryStatus.ForeColor = Color.Red;
-            }
-        }
-
-        /// <summary>
-        /// Load TABLE_TYPE entries from database
-        /// </summary>
         private void LoadTableTypes()
         {
             try
@@ -759,6 +529,18 @@ namespace EliteSoft.Erwin.AddIn
                 {
                     Log($"TABLE_TYPE loaded: {tableTypeService.Count} entries");
                     Log($"TABLE_TYPE values: {tableTypeService.GetNamesAsCommaSeparated()}");
+
+                    var predefinedColumnService = PredefinedColumnService.Instance;
+                    predefinedColumnService.Reload();
+
+                    if (predefinedColumnService.IsLoaded)
+                    {
+                        Log($"PREDEFINED_COLUMN loaded: {predefinedColumnService.Count} entries");
+                    }
+                    else
+                    {
+                        Log($"PREDEFINED_COLUMN not loaded: {predefinedColumnService.LastError}");
+                    }
                 }
                 else
                 {
@@ -771,10 +553,6 @@ namespace EliteSoft.Erwin.AddIn
             }
         }
 
-        /// <summary>
-        /// Ensures the TABLE_TYPE UDP exists in the model as a List type
-        /// Creates it with values from TABLE_TYPE table if it doesn't exist
-        /// </summary>
         private void EnsureTableTypeUdpExists()
         {
             try
@@ -786,20 +564,14 @@ namespace EliteSoft.Erwin.AddIn
                     return;
                 }
 
-                // First, try to access the UDP directly to check if it exists
-                // This is more reliable than enumerating all Property_Type objects
-                bool udpExists = CheckTableTypeUdpExists();
-
-                if (udpExists)
+                if (CheckTableTypeUdpExists())
                 {
                     Log("TABLE_TYPE UDP already exists - skipping creation");
                     return;
                 }
 
-                // Create TABLE_TYPE UDP via metamodel session
                 Log("TABLE_TYPE UDP not found - creating...");
-                bool created = CreateTableTypeUdp(tableTypeService.GetNamesAsCommaSeparated());
-                if (created)
+                if (CreateTableTypeUdp(tableTypeService.GetNamesAsCommaSeparated()))
                 {
                     Log("TABLE_TYPE UDP created successfully!");
                 }
@@ -814,10 +586,6 @@ namespace EliteSoft.Erwin.AddIn
             }
         }
 
-        /// <summary>
-        /// Checks if the TABLE_TYPE UDP already exists in the model
-        /// Uses multiple methods for reliable detection
-        /// </summary>
         private bool CheckTableTypeUdpExists()
         {
             try
@@ -825,7 +593,7 @@ namespace EliteSoft.Erwin.AddIn
                 dynamic modelObjects = _session.ModelObjects;
                 dynamic root = modelObjects.Root;
 
-                // Method 1: Try to collect Property_Type objects and find TABLE_TYPE
+                // Method 1: Check Property_Type objects
                 try
                 {
                     dynamic propertyTypes = modelObjects.Collect(root, "Property_Type");
@@ -846,7 +614,7 @@ namespace EliteSoft.Erwin.AddIn
                     Log($"Property_Type enumeration failed: {ex.Message}");
                 }
 
-                // Method 2: Try to access the UDP on any existing Entity
+                // Method 2: Try to access UDP on an entity
                 try
                 {
                     dynamic entities = modelObjects.Collect(root, "Entity");
@@ -855,24 +623,14 @@ namespace EliteSoft.Erwin.AddIn
                         if (entity == null) continue;
                         try
                         {
-                            // Try to access the UDP - if it exists, this won't throw
                             var udpValue = entity.Properties("Entity.Physical.TABLE_TYPE");
-                            if (udpValue != null)
-                            {
-                                return true;
-                            }
+                            if (udpValue != null) return true;
                         }
-                        catch
-                        {
-                            // UDP doesn't exist on this entity, continue checking
-                        }
-                        break; // Only need to check one entity
+                        catch { }
+                        break;
                     }
                 }
-                catch
-                {
-                    // No entities or can't check
-                }
+                catch { }
 
                 return false;
             }
@@ -883,9 +641,6 @@ namespace EliteSoft.Erwin.AddIn
             }
         }
 
-        /// <summary>
-        /// Creates the TABLE_TYPE UDP as a List type with values from database
-        /// </summary>
         private bool CreateTableTypeUdp(string listValues)
         {
             dynamic metamodelSession = null;
@@ -893,85 +648,44 @@ namespace EliteSoft.Erwin.AddIn
             {
                 Log($"Creating TABLE_TYPE UDP with values: {listValues}");
 
-                // Create a new session with metamodel access level (SCD_SL_M1 = 1)
                 metamodelSession = _scapi.Sessions.Add();
-                metamodelSession.Open(_currentModel, 1); // 1 = SCD_SL_M1 (Metamodel level)
+                metamodelSession.Open(_currentModel, 1); // SCD_SL_M1 = Metamodel level
 
-                Log("Metamodel session opened for TABLE_TYPE UDP");
-
-                // Begin transaction
                 int transId = metamodelSession.BeginNamedTransaction("CreateTableTypeUDP");
-                Log("Transaction started");
 
                 try
                 {
-                    // Create Property_Type for the UDP
                     dynamic mmObjects = metamodelSession.ModelObjects;
                     dynamic udpType = mmObjects.Add("Property_Type");
 
-                    Log("Property_Type object created for TABLE_TYPE");
-
-                    // Set UDP properties
-                    // Name format: <ObjectClassName>.<Logical/Physical>.<Name>
-                    // Entity = Table in erwin terminology
                     udpType.Properties("Name").Value = "Entity.Physical.TABLE_TYPE";
-                    Log("Set Name = Entity.Physical.TABLE_TYPE");
 
-                    // tag_Udp_Owner_Type - the class this UDP applies to (Entity for tables)
-                    try { udpType.Properties("tag_Udp_Owner_Type").Value = "Entity"; }
-                    catch { Log("Could not set tag_Udp_Owner_Type"); }
+                    TrySetProperty(udpType, "tag_Udp_Owner_Type", "Entity");
+                    TrySetProperty(udpType, "tag_Is_Physical", true);
+                    TrySetProperty(udpType, "tag_Is_Logical", false);
+                    TrySetProperty(udpType, "tag_Udp_Data_Type", 6); // List type
+                    TrySetProperty(udpType, "tag_Udp_Values_List", listValues);
 
-                    // Physical only
-                    try { udpType.Properties("tag_Is_Physical").Value = true; }
-                    catch { Log("Could not set tag_Is_Physical"); }
-
-                    try { udpType.Properties("tag_Is_Logical").Value = false; }
-                    catch { Log("Could not set tag_Is_Logical"); }
-
-                    // Data type: 6 = List (enumeration type)
-                    // erwin UDP data types: 1=Integer, 2=Text, 3=Date, 4=Command, 5=Real, 6=List
-                    try { udpType.Properties("tag_Udp_Data_Type").Value = 6; }
-                    catch { Log("Could not set tag_Udp_Data_Type"); }
-
-                    // Set the list values using tag_Udp_Values_List (comma-separated)
-                    // This is the correct property name for List type UDP values
-                    try
-                    {
-                        udpType.Properties("tag_Udp_Values_List").Value = listValues;
-                        Log($"Set tag_Udp_Values_List = {listValues}");
-                    }
-                    catch (Exception ex) { Log($"Could not set tag_Udp_Values_List: {ex.Message}"); }
-
-                    // Set default value (first item in list)
                     string defaultValue = listValues.Split(',').FirstOrDefault()?.Trim() ?? "";
                     if (!string.IsNullOrEmpty(defaultValue))
                     {
-                        try { udpType.Properties("tag_Udp_Default_Value").Value = defaultValue; }
-                        catch { Log("Could not set tag_Udp_Default_Value"); }
+                        TrySetProperty(udpType, "tag_Udp_Default_Value", defaultValue);
                     }
 
-                    // Order
-                    try { udpType.Properties("tag_Order").Value = "1"; }
-                    catch { Log("Could not set tag_Order"); }
+                    TrySetProperty(udpType, "tag_Order", "1");
+                    TrySetProperty(udpType, "tag_Is_Locally_Defined", true);
 
-                    // Locally defined
-                    try { udpType.Properties("tag_Is_Locally_Defined").Value = true; }
-                    catch { Log("Could not set tag_Is_Locally_Defined"); }
-
-                    // Commit transaction
                     metamodelSession.CommitTransaction(transId);
-                    Log("Transaction committed for TABLE_TYPE UDP");
-
+                    Log("TABLE_TYPE UDP transaction committed");
                     return true;
                 }
                 catch (Exception ex)
                 {
-                    // Check if error is "must be unique" - means UDP already exists
                     if (ex.Message.Contains("must be unique") || ex.Message.Contains("EBS-1057"))
                     {
                         Log("TABLE_TYPE UDP already exists (detected via unique constraint)");
                         try { metamodelSession.RollbackTransaction(transId); } catch { }
-                        return true; // UDP exists, consider it success
+                        return true;
                     }
 
                     Log($"Error creating TABLE_TYPE UDP: {ex.Message}");
@@ -981,19 +695,17 @@ namespace EliteSoft.Erwin.AddIn
             }
             catch (Exception ex)
             {
-                // Check if error is "must be unique" - means UDP already exists
                 if (ex.Message.Contains("must be unique") || ex.Message.Contains("EBS-1057"))
                 {
                     Log("TABLE_TYPE UDP already exists (detected via unique constraint)");
-                    return true; // UDP exists, consider it success
+                    return true;
                 }
 
-                Log($"Metamodel session error for TABLE_TYPE: {ex.Message}");
+                Log($"Metamodel session error: {ex.Message}");
                 return false;
             }
             finally
             {
-                // Close metamodel session
                 if (metamodelSession != null)
                 {
                     try { metamodelSession.Close(); } catch { }
@@ -1001,513 +713,17 @@ namespace EliteSoft.Erwin.AddIn
             }
         }
 
-        /// <summary>
-        /// Called when a column name fails validation (real-time alert)
-        /// </summary>
-        private void OnValidationFailed(object sender, ColumnValidationEventArgs e)
-        {
-            if (InvokeRequired)
-            {
-                Invoke(new Action(() => OnValidationFailed(sender, e)));
-                return;
-            }
+        #endregion
 
-            // Add to column validation list (always, even during suppression) with cross symbol
-            var item = new ListViewItem(e.TableName);
-            item.SubItems.Add(e.PhysicalName);
-            item.SubItems.Add("✗");
-            item.ForeColor = Color.Red;
-            listColumnValidation.Items.Insert(0, item);
+        #region Configuration Tab
 
-            // During startup suppression period, don't show popup
-            if (_suppressValidationPopups)
-            {
-                Log($"Popup suppressed for: {e.TableName}.{e.AttributeName}");
-                return;
-            }
-
-            // Pause monitoring while showing popup
-            _validationService?.StopMonitoring();
-
-            // Show immediate warning
-            string message = $"Column Name Validation Warning!\n\n" +
-                            $"Table: {e.TableName}\n" +
-                            $"Column: {e.AttributeName}\n" +
-                            $"Physical Name: {e.PhysicalName}\n\n" +
-                            $"Issue: {e.ValidationMessage}";
-
-            MessageBox.Show(message, "Column Validation Warning",
-                MessageBoxButtons.OK, MessageBoxIcon.Warning);
-
-            // After popup closed, change the column name to "PLEASE CHANGE IT"
-            ChangeColumnPhysicalName(e.TableName, e.AttributeName, "PLEASE CHANGE IT");
-
-            // Resume monitoring after popup is closed
-            _validationService?.StartMonitoring();
-
-            // Update status
-            lblValidationStatus.Text = $"Last issue: {e.PhysicalName} - {e.ValidationMessage}";
-            lblValidationStatus.ForeColor = Color.Red;
-        }
-
-        /// <summary>
-        /// Called when a column name is valid and found in glossary
-        /// Sets the Data Type and OWNER UDP from glossary
-        /// </summary>
-        private void OnValidationPassed(object sender, ColumnValidationEventArgs e)
-        {
-            if (InvokeRequired)
-            {
-                Invoke(new Action(() => OnValidationPassed(sender, e)));
-                return;
-            }
-
-            if (e.GlossaryEntry == null) return;
-
-            System.Diagnostics.Debug.WriteLine($"OnValidationPassed: Table={e.TableName}, Attr={e.AttributeName}, DataType={e.GlossaryEntry.DataType}, Owner={e.GlossaryEntry.Owner}");
-
-            // Apply glossary entry - set Data Type and OWNER UDP
-            ApplyGlossaryEntry(e.TableName, e.AttributeName, e.GlossaryEntry);
-
-            // Update status
-            lblValidationStatus.Text = $"[{DateTime.Now:HH:mm:ss}] {e.PhysicalName} - DataType: {e.GlossaryEntry.DataType}, Owner: {e.GlossaryEntry.Owner}";
-            lblValidationStatus.ForeColor = Color.DarkGreen;
-        }
-
-        /// <summary>
-        /// Applies glossary entry to a column - sets Data Type and OWNER UDP
-        /// </summary>
-        private void ApplyGlossaryEntry(string tableName, string attributeName, GlossaryEntry entry)
-        {
-            try
-            {
-                dynamic modelObjects = _session.ModelObjects;
-                dynamic root = modelObjects.Root;
-                if (root == null) return;
-
-                dynamic allEntities = modelObjects.Collect(root, "Entity");
-                if (allEntities == null) return;
-
-                foreach (dynamic entity in allEntities)
-                {
-                    if (entity == null) continue;
-
-                    string entityName = "";
-                    string entityPhysName = "";
-                    try { entityName = entity.Name ?? ""; } catch { }
-                    try { entityPhysName = entity.Properties("Physical_Name").Value?.ToString() ?? ""; } catch { }
-
-                    bool entityMatch = entityPhysName.Equals(tableName, StringComparison.OrdinalIgnoreCase) ||
-                                      entityName.Equals(tableName, StringComparison.OrdinalIgnoreCase);
-                    if (!entityMatch) continue;
-
-                    dynamic entityAttrs = null;
-                    try { entityAttrs = modelObjects.Collect(entity, "Attribute"); } catch { continue; }
-                    if (entityAttrs == null) continue;
-
-                    foreach (dynamic attr in entityAttrs)
-                    {
-                        if (attr == null) continue;
-
-                        string attrName = "";
-                        try { attrName = attr.Name ?? ""; } catch { }
-
-                        if (attrName.Equals(attributeName, StringComparison.OrdinalIgnoreCase))
-                        {
-                            int transId = _session.BeginNamedTransaction("ApplyGlossary");
-
-                            try
-                            {
-                                // Set Physical Data Type from glossary
-                                if (!string.IsNullOrEmpty(entry.DataType))
-                                {
-                                    try
-                                    {
-                                        attr.Properties("Physical_Data_Type").Value = entry.DataType;
-                                    }
-                                    catch (Exception ex)
-                                    {
-                                        System.Diagnostics.Debug.WriteLine($"Set Physical_Data_Type error: {ex.Message}");
-                                    }
-                                }
-
-                                // Set OWNER UDP from glossary
-                                if (!string.IsNullOrEmpty(entry.Owner))
-                                {
-                                    bool ownerSet = TrySetOwnerUdp(attr, entry.Owner, attributeName);
-
-                                    // If setting failed and UDP doesn't exist, create it and retry
-                                    if (!ownerSet && !_ownerUdpExists)
-                                    {
-                                        Log($"OWNER UDP not set - attempting to create UDP for {attributeName}...");
-
-                                        // Commit current transaction first
-                                        _session.CommitTransaction(transId);
-
-                                        // Create UDP via metamodel
-                                        bool created = CreateOwnerUdpViaMetamodel(modelObjects);
-                                        if (created)
-                                        {
-                                            _ownerUdpExists = true;
-                                            Log("OWNER UDP created successfully! Retrying set...");
-
-                                            // Start a new transaction to set the value
-                                            transId = _session.BeginNamedTransaction("ApplyGlossaryRetry");
-                                            ownerSet = TrySetOwnerUdp(attr, entry.Owner, attributeName);
-                                        }
-                                        else
-                                        {
-                                            Log("Could not create OWNER UDP automatically.");
-                                            // Start a new transaction to continue
-                                            transId = _session.BeginNamedTransaction("ApplyGlossaryContinue");
-                                        }
-                                    }
-
-                                    if (!ownerSet)
-                                    {
-                                        System.Diagnostics.Debug.WriteLine($"OWNER UDP not set for {attributeName}");
-                                    }
-                                }
-
-                                _session.CommitTransaction(transId);
-                                return;
-                            }
-                            catch
-                            {
-                                try { _session.RollbackTransaction(transId); } catch { }
-                                throw;
-                            }
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine($"ApplyGlossaryEntry error: {ex.Message}");
-            }
-        }
-
-        /// <summary>
-        /// Ensures the OWNER UDP exists in the model, creates it if not
-        /// Creates Property_Type and required Association_Type objects
-        /// </summary>
-        private void EnsureOwnerUdpExists(dynamic modelObjects)
-        {
-            try
-            {
-                // Check if UDP already exists by looking for Property_Type with name "Column.Physical.OWNER"
-                dynamic root = modelObjects.Root;
-                dynamic propertyTypes = modelObjects.Collect(root, "Property_Type");
-
-                if (propertyTypes != null)
-                {
-                    foreach (dynamic pt in propertyTypes)
-                    {
-                        if (pt == null) continue;
-                        try
-                        {
-                            string name = pt.Name ?? "";
-                            if (name.Equals("Column.Physical.OWNER", StringComparison.OrdinalIgnoreCase))
-                            {
-                                // UDP already exists
-                                return;
-                            }
-                        }
-                        catch { }
-                    }
-                }
-
-                // Step 1: Create the Property_Type (UDP definition)
-                dynamic newUdp = modelObjects.Add("Property_Type");
-
-                // Get the numeric ID (not GUID ObjectId)
-                string udpId = "";
-                try { udpId = newUdp.Properties("Id").Value?.ToString() ?? ""; } catch { }
-                if (string.IsNullOrEmpty(udpId))
-                {
-                    try { udpId = newUdp.Id?.ToString() ?? ""; } catch { }
-                }
-                if (string.IsNullOrEmpty(udpId))
-                {
-                    // Use ObjectId as fallback
-                    udpId = newUdp.ObjectId?.ToString() ?? "";
-                }
-
-                newUdp.Properties("Name").Value = "Column.Physical.OWNER";
-                newUdp.Properties("tag_Is_Physical").Value = true;
-                newUdp.Properties("tag_Order").Value = "1";
-                newUdp.Properties("tag_Udp_Owner_Type").Value = "1075838981";  // Attribute class ID
-                newUdp.Properties("tag_Column_Width").Value = "-3";
-                newUdp.Properties("tag_Udp_Data_Type").Value = "2";  // Text type
-                newUdp.Properties("Data_Type").Value = "2";
-                newUdp.Properties("tag_Is_Locally_Defined").Value = true;
-
-                System.Diagnostics.Debug.WriteLine($"Created Property_Type: Column.Physical.OWNER (id={udpId})");
-
-                // Step 2: Create Association_Type for Column_has_Physical_OWNER
-                dynamic attrAssoc = modelObjects.Add("Association_Type");
-                attrAssoc.Properties("Name").Value = "Column_has_Physical_OWNER";
-                attrAssoc.Properties("tag_Is_Physical").Value = true;
-                attrAssoc.Properties("tag_Is_Prefetch").Value = true;
-                attrAssoc.Properties("Participating_Property_Ref").Value = udpId;
-                attrAssoc.Properties("Participating_Object_Ref").Value = "1075838981";  // Attribute class ID
-                attrAssoc.Properties("tag_Is_Locally_Defined").Value = true;
-
-                System.Diagnostics.Debug.WriteLine("Created Association_Type: Column_has_Physical_OWNER");
-
-                // Step 3: Create Association_Type for Domain_has_Physical_OWNER
-                dynamic domainAssoc = modelObjects.Add("Association_Type");
-                domainAssoc.Properties("Name").Value = "Domain_has_Physical_OWNER";
-                domainAssoc.Properties("tag_Is_Physical").Value = true;
-                domainAssoc.Properties("tag_Is_Prefetch").Value = true;
-                domainAssoc.Properties("Participating_Property_Ref").Value = udpId;
-                domainAssoc.Properties("Participating_Object_Ref").Value = "1075838983";  // Domain class ID
-                domainAssoc.Properties("tag_Is_Locally_Defined").Value = true;
-
-                System.Diagnostics.Debug.WriteLine("Created Association_Type: Domain_has_Physical_OWNER");
-            }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine($"EnsureOwnerUdpExists error: {ex.Message}");
-                throw;
-            }
-        }
-
-        /// <summary>
-        /// Changes the Physical_Name of a column by searching Entity/Attribute
-        /// </summary>
-        private void ChangeColumnPhysicalName(string tableName, string attributeName, string newName)
-        {
-            try
-            {
-                dynamic modelObjects = _session.ModelObjects;
-                dynamic root = modelObjects.Root;
-                if (root == null) return;
-
-                // Find the entity
-                dynamic allEntities = modelObjects.Collect(root, "Entity");
-                if (allEntities == null) return;
-
-                foreach (dynamic entity in allEntities)
-                {
-                    if (entity == null) continue;
-
-                    // Check entity name (logical or physical)
-                    string entityName = "";
-                    string entityPhysName = "";
-                    try { entityName = entity.Name ?? ""; } catch { }
-                    try { entityPhysName = entity.Properties("Physical_Name").Value?.ToString() ?? ""; } catch { }
-
-                    // Match by physical name or logical name
-                    bool entityMatch = entityPhysName.Equals(tableName, StringComparison.OrdinalIgnoreCase) ||
-                                      entityName.Equals(tableName, StringComparison.OrdinalIgnoreCase);
-                    if (!entityMatch) continue;
-
-                    // Find the attribute
-                    dynamic entityAttrs = null;
-                    try { entityAttrs = modelObjects.Collect(entity, "Attribute"); } catch { continue; }
-                    if (entityAttrs == null) continue;
-
-                    foreach (dynamic attr in entityAttrs)
-                    {
-                        if (attr == null) continue;
-
-                        string attrName = "";
-                        try { attrName = attr.Name ?? ""; } catch { }
-
-                        if (attrName.Equals(attributeName, StringComparison.OrdinalIgnoreCase))
-                        {
-                            // Found the attribute - change its Physical_Name
-                            int transId = _session.BeginNamedTransaction("ChangeColumnName");
-
-                            try
-                            {
-                                attr.Properties("Physical_Name").Value = newName;
-                                _session.CommitTransaction(transId);
-
-                                lblValidationStatus.Text = $"Column renamed to '{newName}'";
-                                lblValidationStatus.ForeColor = Color.Orange;
-                                return; // Done
-                            }
-                            catch
-                            {
-                                try { _session.RollbackTransaction(transId); } catch { }
-                                throw;
-                            }
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine($"ChangeColumnPhysicalName error: {ex.Message}");
-            }
-        }
-
-        /// <summary>
-        /// Called when any column changes (for logging/status)
-        /// </summary>
-        private void OnColumnChanged(object sender, ColumnChangeEventArgs e)
-        {
-            if (InvokeRequired)
-            {
-                Invoke(new Action(() => OnColumnChanged(sender, e)));
-                return;
-            }
-
-            string changeType = e.IsNew ? "New" : "Changed";
-            lblValidationStatus.Text = $"[{DateTime.Now:HH:mm:ss}] {changeType}: {e.TableName}.{e.NewPhysicalName}";
-        }
-
-        /// <summary>
-        /// Validate all columns and tables on-demand
-        /// </summary>
-        private void BtnValidateAll_Click(object sender, EventArgs e)
-        {
-            if (_validationService == null) return;
-
-            // Clear both lists
-            listColumnValidation.Items.Clear();
-            listTableValidation.Items.Clear();
-
-            var allResults = _validationService.ValidateAllColumns();
-
-            // Separate column issues from table issues
-            var columnResults = allResults.Where(r => r.RuleName != "TableTypeRule").ToList();
-            var tableResults = allResults.Where(r => r.RuleName == "TableTypeRule").ToList();
-
-            // Process column validations
-            var validColumns = columnResults.Where(r => r.IsValid).ToList();
-            var invalidColumns = columnResults.Where(r => !r.IsValid).ToList();
-
-            // First add valid columns (green) with checkmark
-            foreach (var col in validColumns)
-            {
-                var item = new ListViewItem(col.TableName);
-                item.SubItems.Add(col.PhysicalName);
-                item.SubItems.Add("✓");
-                item.ForeColor = Color.DarkGreen;
-                listColumnValidation.Items.Add(item);
-            }
-
-            // Then add invalid columns (red) with cross
-            foreach (var col in invalidColumns)
-            {
-                var item = new ListViewItem(col.TableName);
-                item.SubItems.Add(col.PhysicalName);
-                item.SubItems.Add("✗");
-                item.ForeColor = Color.Red;
-                listColumnValidation.Items.Add(item);
-            }
-
-            // Process table validations
-            var validTables = tableResults.Where(r => r.IsValid).ToList();
-            var invalidTables = tableResults.Where(r => !r.IsValid).ToList();
-
-            // Add valid tables (green) with checkmark - TABLE_TYPE selected
-            foreach (var tbl in validTables)
-            {
-                var item = new ListViewItem(tbl.TableName);
-                item.SubItems.Add("✓");
-                item.ForeColor = Color.DarkGreen;
-                listTableValidation.Items.Add(item);
-            }
-
-            // Add invalid tables (red) with cross - TABLE_TYPE not selected
-            foreach (var tbl in invalidTables)
-            {
-                var item = new ListViewItem(tbl.TableName);
-                item.SubItems.Add("✗");
-                item.ForeColor = Color.Red;
-                listTableValidation.Items.Add(item);
-            }
-
-            // Update status
-            int totalIssues = invalidColumns.Count + invalidTables.Count;
-            if (totalIssues == 0)
-            {
-                lblValidationStatus.Text = $"All validations passed - {validColumns.Count} columns, {validTables.Count} tables OK";
-                lblValidationStatus.ForeColor = Color.DarkGreen;
-                MessageBox.Show($"All validations passed!\n\nColumns: {validColumns.Count} found in glossary\nTables: All tables have type selected",
-                    "Validation Passed", MessageBoxButtons.OK, MessageBoxIcon.Information);
-            }
-            else
-            {
-                lblValidationStatus.Text = $"Validation: {invalidColumns.Count} column errors, {invalidTables.Count} table errors";
-                lblValidationStatus.ForeColor = Color.Red;
-
-                string message = "";
-                if (invalidColumns.Count > 0)
-                    message += $"Column Errors: {invalidColumns.Count} not found in glossary\n";
-                if (invalidTables.Count > 0)
-                    message += $"Table Errors: {invalidTables.Count} tables without type selected\n";
-                message += "\nSee the tabs for details.";
-
-                MessageBox.Show(message, "Validation Result", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            }
-        }
-
-        /// <summary>
-        /// Gets the model name from a specific model (without session)
-        /// </summary>
-        private string GetModelNameFromModel(dynamic model)
-        {
-            try
-            {
-                // Try different ways to get model name
-                try { return model.Name; }
-                catch { }
-
-                try { return model.Properties("Name").Value; }
-                catch { }
-
-                // Try file path as fallback
-                try
-                {
-                    string path = model.FilePath;
-                    if (!string.IsNullOrEmpty(path))
-                    {
-                        return System.IO.Path.GetFileNameWithoutExtension(path);
-                    }
-                }
-                catch { }
-
-                return null;
-            }
-            catch
-            {
-                return null;
-            }
-        }
-
-        /// <summary>
-        /// Loads existing values from the model's Definition field
-        /// </summary>
         private void LoadExistingValues()
         {
             try
             {
                 dynamic modelObjects = _session.ModelObjects;
+                dynamic rootObj = GetRootObject(modelObjects);
 
-                // Find Subject_Area to read Definition from
-                dynamic rootObj = null;
-                try
-                {
-                    dynamic saCollection = modelObjects.Collect("Subject_Area");
-                    if (saCollection.Count > 0)
-                    {
-                        rootObj = saCollection.Item(0);
-                    }
-                }
-                catch { }
-
-                if (rootObj == null)
-                {
-                    try { rootObj = modelObjects.Root; }
-                    catch { }
-                }
-
-                // Load Name property from the model
                 if (rootObj != null)
                 {
                     try
@@ -1523,48 +739,15 @@ namespace EliteSoft.Erwin.AddIn
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine($"LoadExistingValues Error: {ex.Message}");
+                Log($"LoadExistingValues error: {ex.Message}");
             }
         }
 
-        /// <summary>
-        /// Shows connection error and disables controls
-        /// </summary>
-        private void ShowConnectionError(string message)
-        {
-            lblConnectionStatus.Text = "Bağlanamadı!";
-            lblConnectionStatus.ForeColor = Color.Red;
-            _isConnected = false;
-            EnableControls(false);
-
-            lblStatus.Text = "Bağlantı başarısız.";
-            lblStatus.ForeColor = Color.Red;
-
-            MessageBox.Show(message, "Bağlantı Hatası",
-                MessageBoxButtons.OK, MessageBoxIcon.Error);
-        }
-
-        /// <summary>
-        /// Enables or disables input controls
-        /// </summary>
-        private void EnableControls(bool enabled)
-        {
-            txtDatabaseName.Enabled = enabled;
-            txtSchemaName.Enabled = enabled;
-            txtName.Enabled = enabled;
-            btnApply.Enabled = enabled;
-        }
-
-        /// <summary>
-        /// Called when Database Name or Schema Name changes
-        /// Auto-fills Name field
-        /// </summary>
         private void OnConfigChanged(object sender, EventArgs e)
         {
             string dbName = txtDatabaseName.Text.Trim();
             string schemaName = txtSchemaName.Text.Trim();
 
-            // Auto-fill Name: DatabaseName.SchemaName
             if (!string.IsNullOrEmpty(dbName) && !string.IsNullOrEmpty(schemaName))
             {
                 txtName.Text = $"{dbName}.{schemaName}";
@@ -1583,39 +766,31 @@ namespace EliteSoft.Erwin.AddIn
             }
         }
 
-        /// <summary>
-        /// Apply button click - saves configuration to Definition field and model Name
-        /// </summary>
         private void BtnApply_Click(object sender, EventArgs e)
         {
             if (!_isConnected)
             {
-                MessageBox.Show("Model'e bağlı değilsiniz.", "Uyarı",
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show("Not connected to a model.", "Warning", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
-            // Validate inputs
             if (string.IsNullOrWhiteSpace(txtDatabaseName.Text))
             {
-                MessageBox.Show("Database Name boş olamaz.", "Uyarı",
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show("Database Name cannot be empty.", "Validation Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 txtDatabaseName.Focus();
                 return;
             }
 
             if (string.IsNullOrWhiteSpace(txtSchemaName.Text))
             {
-                MessageBox.Show("Schema Name boş olamaz.", "Uyarı",
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show("Schema Name cannot be empty.", "Validation Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 txtSchemaName.Focus();
                 return;
             }
 
             try
             {
-                lblStatus.Text = "Kaydediliyor...";
-                lblStatus.ForeColor = Color.DarkBlue;
+                UpdateStatus("Saving...", Color.DarkBlue);
                 Application.DoEvents();
 
                 int transId = _session.BeginNamedTransaction("SaveConfig");
@@ -1623,28 +798,10 @@ namespace EliteSoft.Erwin.AddIn
                 try
                 {
                     dynamic modelObjects = _session.ModelObjects;
-
-                    // Find Subject_Area or Root to save Definition
-                    dynamic rootObj = null;
-                    try
-                    {
-                        dynamic saCollection = modelObjects.Collect("Subject_Area");
-                        if (saCollection.Count > 0)
-                        {
-                            rootObj = saCollection.Item(0);
-                        }
-                    }
-                    catch { }
-
-                    if (rootObj == null)
-                    {
-                        try { rootObj = modelObjects.Root; }
-                        catch { }
-                    }
+                    dynamic rootObj = GetRootObject(modelObjects);
 
                     bool nameSaved = false;
 
-                    // Set the calculated Name to the Model's Name property (General tab)
                     if (rootObj != null && !string.IsNullOrWhiteSpace(txtName.Text))
                     {
                         try
@@ -1657,7 +814,6 @@ namespace EliteSoft.Erwin.AddIn
 
                     _session.CommitTransaction(transId);
 
-                    // Save the model
                     bool modelSaved = false;
                     try
                     {
@@ -1666,26 +822,20 @@ namespace EliteSoft.Erwin.AddIn
                     }
                     catch { }
 
-                    // Show result
-                    bool success = nameSaved && modelSaved;
-
-                    if (success)
+                    if (nameSaved && modelSaved)
                     {
-                        lblStatus.Text = "Kaydedildi!";
-                        lblStatus.ForeColor = Color.DarkGreen;
-                        MessageBox.Show($"Name başarıyla kaydedildi!\n\nDatabase: {txtDatabaseName.Text}\nSchema: {txtSchemaName.Text}\nName: {txtName.Text}",
-                            "Başarılı", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        UpdateStatus("Saved!", Color.DarkGreen);
+                        MessageBox.Show(
+                            $"Configuration saved successfully!\n\nDatabase: {txtDatabaseName.Text}\nSchema: {txtSchemaName.Text}\nName: {txtName.Text}",
+                            "Success", MessageBoxButtons.OK, MessageBoxIcon.Information);
                     }
                     else
                     {
-                        lblStatus.Text = "Uyarı!";
-                        lblStatus.ForeColor = Color.Orange;
-
-                        string msg = "Değerler kaydedilemedi:\n";
-                        if (!nameSaved) msg += "- Name özelliği kaydedilemedi\n";
-                        if (!modelSaved) msg += "- Model kaydedilemedi\n";
-
-                        MessageBox.Show(msg, "Uyarı", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        UpdateStatus("Warning!", Color.Orange);
+                        string msg = "Values could not be saved:\n";
+                        if (!nameSaved) msg += "- Name property could not be saved\n";
+                        if (!modelSaved) msg += "- Model could not be saved\n";
+                        MessageBox.Show(msg, "Warning", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     }
                 }
                 catch
@@ -1696,36 +846,172 @@ namespace EliteSoft.Erwin.AddIn
             }
             catch (Exception ex)
             {
-                lblStatus.Text = "Hata!";
-                lblStatus.ForeColor = Color.Red;
-                MessageBox.Show($"Hata: {ex.Message}", "Hata",
-                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                UpdateStatus("Error!", Color.Red);
+                MessageBox.Show($"Error: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
 
-        /// <summary>
-        /// Close button click
-        /// </summary>
-        private void BtnClose_Click(object sender, EventArgs e)
+        #endregion
+
+        #region Debug Log
+
+        private void Log(string message)
         {
-            this.Close();
+            if (InvokeRequired)
+            {
+                Invoke(new Action(() => Log(message)));
+                return;
+            }
+
+            string timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
+            txtDebugLog.AppendText($"[{timestamp}] {message}\r\n");
+            txtDebugLog.SelectionStart = txtDebugLog.Text.Length;
+            txtDebugLog.ScrollToCaret();
+            Application.DoEvents();
         }
 
-        /// <summary>
-        /// Clean up on form close
-        /// </summary>
-        protected override void OnFormClosed(FormClosedEventArgs e)
+        private void BtnClearLog_Click(object sender, EventArgs e)
         {
-            base.OnFormClosed(e);
+            txtDebugLog.Clear();
+        }
+
+        private void BtnCopyLog_Click(object sender, EventArgs e)
+        {
+            if (!string.IsNullOrEmpty(txtDebugLog.Text))
+            {
+                Clipboard.SetText(txtDebugLog.Text);
+                UpdateStatus("Log copied to clipboard!", Color.DarkGreen);
+            }
+        }
+
+        #endregion
+
+        #region UI Helpers
+
+        private void BtnClose_Click(object sender, EventArgs e)
+        {
+            Close();
+        }
+
+        private void UpdateConnectionStatus(string status, Color color)
+        {
+            lblConnectionStatus.Text = status;
+            lblConnectionStatus.ForeColor = color;
+        }
+
+        private void UpdateStatus(string message, Color color)
+        {
+            lblStatus.Text = message;
+            lblStatus.ForeColor = color;
+        }
+
+        private void EnableControls(bool enabled)
+        {
+            txtDatabaseName.Enabled = enabled;
+            txtSchemaName.Enabled = enabled;
+            txtName.Enabled = enabled;
+            btnApply.Enabled = enabled;
+        }
+
+        private void ShowError(string message, string title)
+        {
+            UpdateConnectionStatus(StatusDisconnected, Color.Red);
+            _isConnected = false;
+            EnableControls(false);
+            UpdateStatus("Connection failed.", Color.Red);
+            MessageBox.Show(message, title, MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+
+        #endregion
+
+        #region Helper Methods
+
+        private dynamic GetRootObject(dynamic modelObjects)
+        {
+            dynamic rootObj = null;
+            try
+            {
+                dynamic saCollection = modelObjects.Collect("Subject_Area");
+                if (saCollection.Count > 0)
+                {
+                    rootObj = saCollection.Item(0);
+                }
+            }
+            catch { }
+
+            if (rootObj == null)
+            {
+                try { rootObj = modelObjects.Root; } catch { }
+            }
+
+            return rootObj;
+        }
+
+        private void TrySetProperty(dynamic obj, string propertyName, object value)
+        {
+            try
+            {
+                obj.Properties(propertyName).Value = value;
+            }
+            catch (Exception ex)
+            {
+                Log($"Could not set {propertyName}: {ex.Message}");
+            }
+        }
+
+        private bool TrySetOwnerUdp(dynamic attr, string ownerValue, string attributeName)
+        {
+            try
+            {
+                attr.Properties("Attribute.Physical.OWNER").Value = ownerValue;
+                Log($"Set OWNER UDP = '{ownerValue}' for {attributeName}");
+                return true;
+            }
+            catch { }
 
             try
             {
-                // Dispose validation service
-                _validationService?.Dispose();
-                _validationService = null;
+                var props = attr.CollectProperties("Attribute.Physical.OWNER");
+                if (props != null && props.Count > 0)
+                {
+                    props.Item(0).Value = ownerValue;
+                    Log($"Set OWNER via CollectProperties = '{ownerValue}' for {attributeName}");
+                    return true;
+                }
+            }
+            catch { }
 
-                // Dispose TABLE_TYPE monitor service
-                _tableTypeMonitorService?.Dispose();
+            return false;
+        }
+
+        #endregion
+
+        #region Resource Cleanup
+
+        private void CloseCurrentSession()
+        {
+            if (_session != null)
+            {
+                try { _session.Close(); } catch { }
+            }
+        }
+
+        private void DisposeServices()
+        {
+            _validationService?.Dispose();
+            _tableTypeMonitorService?.Dispose();
+        }
+
+        private void CleanupResources()
+        {
+            try
+            {
+                _glossaryRefreshTimer?.Stop();
+                _glossaryRefreshTimer?.Dispose();
+                _glossaryRefreshTimer = null;
+
+                DisposeServices();
+                _validationService = null;
                 _tableTypeMonitorService = null;
 
                 _session?.Close();
@@ -1733,5 +1019,7 @@ namespace EliteSoft.Erwin.AddIn
             }
             catch { }
         }
+
+        #endregion
     }
 }
