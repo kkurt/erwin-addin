@@ -77,7 +77,8 @@
       "Bash(del \"c:\\\\Users\\\\Administrator\\\\source\\\\repos\\\\erwin-addin\\\\ErwinAdmin\\\\MartCatalogBrowser.cs\")",
       "Bash(dotnet restore:*)",
       "Read(//c/Program Files/erwin/Data Modeler r10/BackupFiles/Samples/erwin API/**)",
-      "Bash(C:WindowsMicrosoft.NETFramework64v4.0.30319RegAsm.exe binReleasenet48EliteSoft.Erwin.AddIn.dll /codebase /tlb)"
+      "Bash(C:WindowsMicrosoft.NETFramework64v4.0.30319RegAsm.exe binReleasenet48EliteSoft.Erwin.AddIn.dll /codebase /tlb)",
+      "Bash(del \"c:\\\\Users\\\\Administrator\\\\source\\\\repos\\\\erwin-addin\\\\Services\\\\ValidationResultCollector.cs\")"
     ]
   }
 }

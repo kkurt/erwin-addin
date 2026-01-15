@@ -23,7 +23,17 @@ namespace EliteSoft.Erwin.AddIn
             this.tabConfiguration = new System.Windows.Forms.TabPage();
             this.tabGlossary = new System.Windows.Forms.TabPage();
             this.tabValidation = new System.Windows.Forms.TabPage();
+            this.tabTableProcesses = new System.Windows.Forms.TabPage();
             this.tabDebug = new System.Windows.Forms.TabPage();
+
+            // Table Processes tab controls
+            this.grpTableProcesses = new System.Windows.Forms.GroupBox();
+            this.lblSelectTable = new System.Windows.Forms.Label();
+            this.cmbTables = new System.Windows.Forms.ComboBox();
+            this.chkArchiveTable = new System.Windows.Forms.CheckBox();
+            this.chkIsolatedTable = new System.Windows.Forms.CheckBox();
+            this.btnCreateTables = new System.Windows.Forms.Button();
+            this.lblTableProcessStatus = new System.Windows.Forms.Label();
 
             // Model tab controls
             this.grpModel = new System.Windows.Forms.GroupBox();
@@ -79,7 +89,9 @@ namespace EliteSoft.Erwin.AddIn
             this.tabConfiguration.SuspendLayout();
             this.tabGlossary.SuspendLayout();
             this.tabValidation.SuspendLayout();
+            this.tabTableProcesses.SuspendLayout();
             this.tabDebug.SuspendLayout();
+            this.grpTableProcesses.SuspendLayout();
             this.grpModel.SuspendLayout();
             this.grpConfig.SuspendLayout();
             this.grpGlossary.SuspendLayout();
@@ -97,6 +109,7 @@ namespace EliteSoft.Erwin.AddIn
             this.tabControl.Controls.Add(this.tabConfiguration);
             this.tabControl.Controls.Add(this.tabGlossary);
             this.tabControl.Controls.Add(this.tabValidation);
+            this.tabControl.Controls.Add(this.tabTableProcesses);
             this.tabControl.Controls.Add(this.tabDebug);
             this.tabControl.Location = new System.Drawing.Point(12, 12);
             this.tabControl.Name = "tabControl";
@@ -514,6 +527,99 @@ namespace EliteSoft.Erwin.AddIn
             this.lblValidationStatus.ForeColor = System.Drawing.Color.DarkGreen;
 
             //
+            // tabTableProcesses
+            //
+            this.tabTableProcesses.Controls.Add(this.grpTableProcesses);
+            this.tabTableProcesses.Location = new System.Drawing.Point(4, 24);
+            this.tabTableProcesses.Name = "tabTableProcesses";
+            this.tabTableProcesses.Padding = new System.Windows.Forms.Padding(10);
+            this.tabTableProcesses.Size = new System.Drawing.Size(844, 452);
+            this.tabTableProcesses.TabIndex = 5;
+            this.tabTableProcesses.Text = "Table Processes";
+            this.tabTableProcesses.UseVisualStyleBackColor = true;
+
+            //
+            // grpTableProcesses
+            //
+            this.grpTableProcesses.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
+            this.grpTableProcesses.Controls.Add(this.lblSelectTable);
+            this.grpTableProcesses.Controls.Add(this.cmbTables);
+            this.grpTableProcesses.Controls.Add(this.chkArchiveTable);
+            this.grpTableProcesses.Controls.Add(this.chkIsolatedTable);
+            this.grpTableProcesses.Controls.Add(this.btnCreateTables);
+            this.grpTableProcesses.Controls.Add(this.lblTableProcessStatus);
+            this.grpTableProcesses.Location = new System.Drawing.Point(10, 10);
+            this.grpTableProcesses.Name = "grpTableProcesses";
+            this.grpTableProcesses.Size = new System.Drawing.Size(817, 200);
+            this.grpTableProcesses.TabIndex = 0;
+            this.grpTableProcesses.TabStop = false;
+            this.grpTableProcesses.Text = "Create Table Copies";
+
+            //
+            // lblSelectTable
+            //
+            this.lblSelectTable.AutoSize = true;
+            this.lblSelectTable.Location = new System.Drawing.Point(15, 30);
+            this.lblSelectTable.Name = "lblSelectTable";
+            this.lblSelectTable.Size = new System.Drawing.Size(75, 15);
+            this.lblSelectTable.TabIndex = 0;
+            this.lblSelectTable.Text = "Select Table:";
+
+            //
+            // cmbTables
+            //
+            this.cmbTables.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
+            this.cmbTables.DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList;
+            this.cmbTables.Location = new System.Drawing.Point(100, 27);
+            this.cmbTables.Name = "cmbTables";
+            this.cmbTables.Size = new System.Drawing.Size(400, 23);
+            this.cmbTables.TabIndex = 1;
+
+            //
+            // chkArchiveTable
+            //
+            this.chkArchiveTable.AutoSize = true;
+            this.chkArchiveTable.Location = new System.Drawing.Point(100, 65);
+            this.chkArchiveTable.Name = "chkArchiveTable";
+            this.chkArchiveTable.Size = new System.Drawing.Size(200, 19);
+            this.chkArchiveTable.TabIndex = 2;
+            this.chkArchiveTable.Text = "Create Archive Table (_ARCHIVE)";
+            this.chkArchiveTable.UseVisualStyleBackColor = true;
+
+            //
+            // chkIsolatedTable
+            //
+            this.chkIsolatedTable.AutoSize = true;
+            this.chkIsolatedTable.Location = new System.Drawing.Point(100, 95);
+            this.chkIsolatedTable.Name = "chkIsolatedTable";
+            this.chkIsolatedTable.Size = new System.Drawing.Size(220, 19);
+            this.chkIsolatedTable.TabIndex = 3;
+            this.chkIsolatedTable.Text = "Create Isolated Table (_ISOLATED)";
+            this.chkIsolatedTable.UseVisualStyleBackColor = true;
+
+            //
+            // btnCreateTables
+            //
+            this.btnCreateTables.Location = new System.Drawing.Point(100, 130);
+            this.btnCreateTables.Name = "btnCreateTables";
+            this.btnCreateTables.Size = new System.Drawing.Size(120, 30);
+            this.btnCreateTables.TabIndex = 4;
+            this.btnCreateTables.Text = "Create Tables";
+            this.btnCreateTables.UseVisualStyleBackColor = true;
+            this.btnCreateTables.Click += new System.EventHandler(this.BtnCreateTables_Click);
+
+            //
+            // lblTableProcessStatus
+            //
+            this.lblTableProcessStatus.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
+            this.lblTableProcessStatus.Location = new System.Drawing.Point(100, 170);
+            this.lblTableProcessStatus.Name = "lblTableProcessStatus";
+            this.lblTableProcessStatus.Size = new System.Drawing.Size(700, 20);
+            this.lblTableProcessStatus.TabIndex = 5;
+            this.lblTableProcessStatus.Text = "";
+            this.lblTableProcessStatus.ForeColor = System.Drawing.Color.DarkGreen;
+
+            //
             // tabDebug
             //
             this.tabDebug.Controls.Add(this.grpDebugLog);
@@ -623,7 +729,10 @@ namespace EliteSoft.Erwin.AddIn
             this.tabConfiguration.ResumeLayout(false);
             this.tabGlossary.ResumeLayout(false);
             this.tabValidation.ResumeLayout(false);
+            this.tabTableProcesses.ResumeLayout(false);
             this.tabDebug.ResumeLayout(false);
+            this.grpTableProcesses.ResumeLayout(false);
+            this.grpTableProcesses.PerformLayout();
             this.grpModel.ResumeLayout(false);
             this.grpModel.PerformLayout();
             this.grpConfig.ResumeLayout(false);
@@ -686,6 +795,15 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.TextBox txtDebugLog;
         private System.Windows.Forms.Button btnCopyLog;
         private System.Windows.Forms.Button btnClearLog;
+
+        private System.Windows.Forms.TabPage tabTableProcesses;
+        private System.Windows.Forms.GroupBox grpTableProcesses;
+        private System.Windows.Forms.Label lblSelectTable;
+        private System.Windows.Forms.ComboBox cmbTables;
+        private System.Windows.Forms.CheckBox chkArchiveTable;
+        private System.Windows.Forms.CheckBox chkIsolatedTable;
+        private System.Windows.Forms.Button btnCreateTables;
+        private System.Windows.Forms.Label lblTableProcessStatus;
 
         private System.Windows.Forms.Button btnClose;
         private System.Windows.Forms.Label lblStatus;

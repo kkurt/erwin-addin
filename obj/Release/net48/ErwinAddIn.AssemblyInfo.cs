@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("EliteSoft.Erwin.AddIn")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+80ba73a6a0f9db600810edfbde28006f87121546")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+364ff0ac89ac6c1f5c5f0beb8cd27aa3d6b5b293")]
 [assembly: System.Reflection.AssemblyProductAttribute("EliteSoft.Erwin.AddIn")]
 [assembly: System.Reflection.AssemblyTitleAttribute("EliteSoft.Erwin.AddIn")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

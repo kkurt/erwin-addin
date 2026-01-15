@@ -34,6 +34,7 @@ namespace EliteSoft.Erwin.AddIn
         // Services
         private ColumnValidationService _validationService;
         private TableTypeMonitorService _tableTypeMonitorService;
+        private ValidationCoordinatorService _validationCoordinatorService;
 
         // State tracking
         private Timer _glossaryRefreshTimer;
@@ -178,8 +179,11 @@ namespace EliteSoft.Erwin.AddIn
             DisposeServices();
             LoadGlossary();
             LoadTableTypes();
+            LoadDomainDefs();
             EnsureTableTypeUdpExists();
+            // Note: Domain Parent is erwin's built-in feature, no custom UDP needed
 
+            // ColumnValidationService is kept for ValidateAll button functionality only (no monitoring)
             _validationService = new ColumnValidationService(_session);
             btnValidateAll.Enabled = true;
 
@@ -188,6 +192,14 @@ namespace EliteSoft.Erwin.AddIn
             _tableTypeMonitorService.OnLog += Log;
             _tableTypeMonitorService.TakeSnapshot();
             _tableTypeMonitorService.StartMonitoring();
+
+            // Initialize unified validation coordinator (single timer for glossary + domain validation)
+            _validationCoordinatorService = new ValidationCoordinatorService(_session);
+            _validationCoordinatorService.OnLog += Log;
+            _validationCoordinatorService.StartMonitoring();
+
+            // Load tables for Table Processes tab
+            LoadTablesComboBox();
 
             UpdateValidationStatus();
             Log("Validation service initialized.");
@@ -715,6 +727,531 @@ namespace EliteSoft.Erwin.AddIn
 
         #endregion
 
+        #region Domain Management
+
+        private void LoadDomainDefs()
+        {
+            try
+            {
+                var domainDefService = DomainDefService.Instance;
+                domainDefService.Reload();
+
+                if (domainDefService.IsLoaded)
+                {
+                    Log($"DOMAIN_DEF loaded: {domainDefService.Count} entries");
+                    Log($"Domain values: {domainDefService.GetNamesAsCommaSeparated()}");
+                }
+                else
+                {
+                    Log($"DOMAIN_DEF not loaded: {domainDefService.LastError}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"LoadDomainDefs error: {ex.Message}");
+            }
+        }
+
+        private void EnsureDomainParentUdpExists()
+        {
+            try
+            {
+                var domainDefService = DomainDefService.Instance;
+                if (!domainDefService.IsLoaded || domainDefService.Count == 0)
+                {
+                    Log("DOMAIN_DEF service not loaded - skipping Domain_Parent UDP creation");
+                    return;
+                }
+
+                if (CheckDomainParentUdpExists())
+                {
+                    Log("Domain_Parent UDP already exists - skipping creation");
+                    return;
+                }
+
+                Log("Domain_Parent UDP not found - creating...");
+                if (CreateDomainParentUdp(domainDefService.GetNamesAsCommaSeparated()))
+                {
+                    Log("Domain_Parent UDP created successfully!");
+                }
+                else
+                {
+                    Log("Failed to create Domain_Parent UDP (may already exist)");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"EnsureDomainParentUdpExists error: {ex.Message}");
+            }
+        }
+
+        private bool CheckDomainParentUdpExists()
+        {
+            try
+            {
+                dynamic modelObjects = _session.ModelObjects;
+                dynamic root = modelObjects.Root;
+
+                // Method 1: Check Property_Type objects
+                try
+                {
+                    dynamic propertyTypes = modelObjects.Collect(root, "Property_Type");
+                    foreach (dynamic pt in propertyTypes)
+                    {
+                        if (pt == null) continue;
+                        string ptName = "";
+                        try { ptName = pt.Name ?? ""; } catch { continue; }
+
+                        if (ptName.Equals("Attribute.Physical.Domain_Parent", StringComparison.OrdinalIgnoreCase))
+                        {
+                            return true;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log($"Property_Type enumeration failed: {ex.Message}");
+                }
+
+                // Method 2: Try to access UDP on an attribute
+                try
+                {
+                    dynamic entities = modelObjects.Collect(root, "Entity");
+                    foreach (dynamic entity in entities)
+                    {
+                        if (entity == null) continue;
+
+                        dynamic attrs = null;
+                        try { attrs = modelObjects.Collect(entity, "Attribute"); } catch { continue; }
+                        if (attrs == null) continue;
+
+                        foreach (dynamic attr in attrs)
+                        {
+                            if (attr == null) continue;
+                            try
+                            {
+                                var udpValue = attr.Properties("Attribute.Physical.Domain_Parent");
+                                if (udpValue != null) return true;
+                            }
+                            catch { }
+                            break;
+                        }
+                        break;
+                    }
+                }
+                catch { }
+
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Log($"CheckDomainParentUdpExists error: {ex.Message}");
+                return false;
+            }
+        }
+
+        private bool CreateDomainParentUdp(string listValues)
+        {
+            dynamic metamodelSession = null;
+            try
+            {
+                Log($"Creating Domain_Parent UDP with values: {listValues}");
+
+                metamodelSession = _scapi.Sessions.Add();
+                metamodelSession.Open(_currentModel, 1); // SCD_SL_M1 = Metamodel level
+
+                int transId = metamodelSession.BeginNamedTransaction("CreateDomainParentUDP");
+
+                try
+                {
+                    dynamic mmObjects = metamodelSession.ModelObjects;
+                    dynamic udpType = mmObjects.Add("Property_Type");
+
+                    udpType.Properties("Name").Value = "Attribute.Physical.Domain_Parent";
+
+                    TrySetProperty(udpType, "tag_Udp_Owner_Type", "Attribute");
+                    TrySetProperty(udpType, "tag_Is_Physical", true);
+                    TrySetProperty(udpType, "tag_Is_Logical", false);
+                    TrySetProperty(udpType, "tag_Udp_Data_Type", 6); // List type
+                    TrySetProperty(udpType, "tag_Udp_Values_List", listValues);
+
+                    string defaultValue = listValues.Split(',').FirstOrDefault()?.Trim() ?? "";
+                    if (!string.IsNullOrEmpty(defaultValue))
+                    {
+                        TrySetProperty(udpType, "tag_Udp_Default_Value", defaultValue);
+                    }
+
+                    TrySetProperty(udpType, "tag_Order", "1");
+                    TrySetProperty(udpType, "tag_Is_Locally_Defined", true);
+
+                    metamodelSession.CommitTransaction(transId);
+                    Log("Domain_Parent UDP transaction committed");
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    if (ex.Message.Contains("must be unique") || ex.Message.Contains("EBS-1057"))
+                    {
+                        Log("Domain_Parent UDP already exists (detected via unique constraint)");
+                        try { metamodelSession.RollbackTransaction(transId); } catch { }
+                        return true;
+                    }
+
+                    Log($"Error creating Domain_Parent UDP: {ex.Message}");
+                    try { metamodelSession.RollbackTransaction(transId); } catch { }
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                if (ex.Message.Contains("must be unique") || ex.Message.Contains("EBS-1057"))
+                {
+                    Log("Domain_Parent UDP already exists (detected via unique constraint)");
+                    return true;
+                }
+
+                Log($"Metamodel session error: {ex.Message}");
+                return false;
+            }
+            finally
+            {
+                if (metamodelSession != null)
+                {
+                    try { metamodelSession.Close(); } catch { }
+                }
+            }
+        }
+
+        #endregion
+
+        #region Table Processes
+
+        private void LoadTablesComboBox()
+        {
+            try
+            {
+                cmbTables.Items.Clear();
+
+                if (_session == null) return;
+
+                dynamic modelObjects = _session.ModelObjects;
+                dynamic root = modelObjects.Root;
+                if (root == null) return;
+
+                dynamic allEntities = modelObjects.Collect(root, "Entity");
+                if (allEntities == null) return;
+
+                var tables = new List<string>();
+
+                foreach (dynamic entity in allEntities)
+                {
+                    if (entity == null) continue;
+
+                    string tableName = "";
+                    try
+                    {
+                        string physTable = entity.Properties("Physical_Name").Value?.ToString() ?? "";
+                        string entityName = entity.Name ?? "";
+                        tableName = (!string.IsNullOrEmpty(physTable) && !physTable.StartsWith("%")) ? physTable : entityName;
+                    }
+                    catch
+                    {
+                        try { tableName = entity.Name ?? ""; } catch { continue; }
+                    }
+
+                    if (!string.IsNullOrEmpty(tableName))
+                    {
+                        tables.Add(tableName);
+                    }
+                }
+
+                tables.Sort();
+                foreach (var table in tables)
+                {
+                    cmbTables.Items.Add(table);
+                }
+
+                if (cmbTables.Items.Count > 0)
+                {
+                    cmbTables.SelectedIndex = 0;
+                }
+
+                Log($"Loaded {tables.Count} tables into combo box");
+            }
+            catch (Exception ex)
+            {
+                Log($"LoadTablesComboBox error: {ex.Message}");
+            }
+        }
+
+        private void BtnCreateTables_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                if (cmbTables.SelectedItem == null)
+                {
+                    MessageBox.Show("Please select a table first.", "No Table Selected", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                if (!chkArchiveTable.Checked && !chkIsolatedTable.Checked)
+                {
+                    MessageBox.Show("Please select at least one option (Archive or Isolated).", "No Option Selected", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                string sourceTableName = cmbTables.SelectedItem.ToString();
+                lblTableProcessStatus.Text = "Processing...";
+                lblTableProcessStatus.ForeColor = System.Drawing.Color.DarkBlue;
+                Application.DoEvents();
+
+                // Suspend validation during table copy to avoid validation popups
+                _validationCoordinatorService?.SuspendValidation();
+
+                int tablesCreated = 0;
+
+                try
+                {
+                    if (chkArchiveTable.Checked)
+                    {
+                        string archiveName = sourceTableName + "_ARCHIVE";
+                        if (CreateTableCopy(sourceTableName, archiveName))
+                        {
+                            tablesCreated++;
+                            Log($"Created archive table: {archiveName}");
+                        }
+                    }
+
+                    if (chkIsolatedTable.Checked)
+                    {
+                        string isolatedName = sourceTableName + "_ISOLATED";
+                        if (CreateTableCopy(sourceTableName, isolatedName))
+                        {
+                            tablesCreated++;
+                            Log($"Created isolated table: {isolatedName}");
+                        }
+                    }
+                }
+                finally
+                {
+                    // Resume validation after table copy completes
+                    _validationCoordinatorService?.ResumeValidation();
+                }
+
+                if (tablesCreated > 0)
+                {
+                    lblTableProcessStatus.Text = $"Successfully created {tablesCreated} table(s)!";
+                    lblTableProcessStatus.ForeColor = System.Drawing.Color.DarkGreen;
+                    LoadTablesComboBox(); // Refresh list
+                }
+                else
+                {
+                    lblTableProcessStatus.Text = "No tables created. Check log for details.";
+                    lblTableProcessStatus.ForeColor = System.Drawing.Color.DarkRed;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"BtnCreateTables_Click error: {ex.Message}");
+                lblTableProcessStatus.Text = $"Error: {ex.Message}";
+                lblTableProcessStatus.ForeColor = System.Drawing.Color.DarkRed;
+            }
+        }
+
+        private bool CreateTableCopy(string sourceTableName, string newTableName)
+        {
+            try
+            {
+                dynamic modelObjects = _session.ModelObjects;
+                dynamic root = modelObjects.Root;
+
+                // Find source entity
+                dynamic sourceEntity = null;
+                dynamic allEntities = modelObjects.Collect(root, "Entity");
+
+                foreach (dynamic entity in allEntities)
+                {
+                    if (entity == null) continue;
+
+                    string tableName = "";
+                    try
+                    {
+                        string physTable = entity.Properties("Physical_Name").Value?.ToString() ?? "";
+                        string entityName = entity.Name ?? "";
+                        tableName = (!string.IsNullOrEmpty(physTable) && !physTable.StartsWith("%")) ? physTable : entityName;
+                    }
+                    catch
+                    {
+                        try { tableName = entity.Name ?? ""; } catch { continue; }
+                    }
+
+                    if (tableName == sourceTableName)
+                    {
+                        sourceEntity = entity;
+                        break;
+                    }
+                }
+
+                if (sourceEntity == null)
+                {
+                    Log($"Source table '{sourceTableName}' not found");
+                    return false;
+                }
+
+                // Check if target already exists
+                foreach (dynamic entity in allEntities)
+                {
+                    if (entity == null) continue;
+
+                    string tableName = "";
+                    try
+                    {
+                        string physTable = entity.Properties("Physical_Name").Value?.ToString() ?? "";
+                        string entityName = entity.Name ?? "";
+                        tableName = (!string.IsNullOrEmpty(physTable) && !physTable.StartsWith("%")) ? physTable : entityName;
+                    }
+                    catch
+                    {
+                        try { tableName = entity.Name ?? ""; } catch { continue; }
+                    }
+
+                    if (tableName == newTableName)
+                    {
+                        Log($"Table '{newTableName}' already exists - skipping");
+                        MessageBox.Show($"Table '{newTableName}' already exists.", "Table Exists", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        return false;
+                    }
+                }
+
+                // Create new entity
+                int transId = _session.BeginNamedTransaction($"CreateTableCopy_{newTableName}");
+                try
+                {
+                    // Create new entity
+                    dynamic newEntity = modelObjects.Add("Entity");
+                    newEntity.Properties("Name").Value = newTableName;
+                    newEntity.Properties("Physical_Name").Value = newTableName;
+
+                    // Copy entity-level properties from source
+                    CopyEntityProperties(sourceEntity, newEntity);
+
+                    // Copy all attributes from source entity
+                    dynamic sourceAttrs = modelObjects.Collect(sourceEntity, "Attribute");
+                    if (sourceAttrs != null)
+                    {
+                        int attrCount = 0;
+                        foreach (dynamic sourceAttr in sourceAttrs)
+                        {
+                            if (sourceAttr == null) continue;
+
+                            try
+                            {
+                                // Create new attribute under new entity using Collect().Add() pattern
+                                dynamic newAttr = modelObjects.Collect(newEntity).Add("Attribute");
+
+                                if (newAttr != null)
+                                {
+                                    // Copy attribute properties
+                                    CopyAttributeProperties(sourceAttr, newAttr);
+                                    attrCount++;
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                Log($"Error copying attribute: {ex.Message}");
+                            }
+                        }
+                        Log($"Copied {attrCount} attributes to {newTableName}");
+                    }
+
+                    _session.CommitTransaction(transId);
+                    Log($"Successfully created table copy: {newTableName}");
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    try { _session.RollbackTransaction(transId); } catch { }
+                    Log($"Error creating table copy: {ex.Message}");
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"CreateTableCopy error: {ex.Message}");
+                return false;
+            }
+        }
+
+        private void CopyEntityProperties(dynamic source, dynamic target)
+        {
+            // Copy common entity properties
+            string[] propertiesToCopy = { "Definition", "Note", "Owner" };
+
+            foreach (string propName in propertiesToCopy)
+            {
+                try
+                {
+                    var value = source.Properties(propName).Value;
+                    if (value != null && !string.IsNullOrEmpty(value.ToString()))
+                    {
+                        target.Properties(propName).Value = value;
+                    }
+                }
+                catch { }
+            }
+        }
+
+        private void CopyAttributeProperties(dynamic source, dynamic target)
+        {
+            // Copy attribute name and physical name
+            try
+            {
+                string attrName = source.Name ?? "";
+                target.Properties("Name").Value = attrName;
+            }
+            catch { }
+
+            try
+            {
+                string physName = source.Properties("Physical_Name").Value?.ToString() ?? "";
+                if (!string.IsNullOrEmpty(physName) && !physName.StartsWith("%"))
+                {
+                    target.Properties("Physical_Name").Value = physName;
+                }
+            }
+            catch { }
+
+            // Copy other attribute properties
+            string[] propertiesToCopy = {
+                "Physical_Data_Type",
+                "Logical_Data_Type",
+                "Null_Option",
+                "Definition",
+                "Note",
+                "Default_Value",
+                "Parent_Domain_Ref"
+            };
+
+            foreach (string propName in propertiesToCopy)
+            {
+                try
+                {
+                    var value = source.Properties(propName).Value;
+                    if (value != null)
+                    {
+                        string strValue = value.ToString();
+                        if (!string.IsNullOrEmpty(strValue) && !strValue.StartsWith("%"))
+                        {
+                            target.Properties(propName).Value = value;
+                        }
+                    }
+                }
+                catch { }
+            }
+        }
+
+        #endregion
+
         #region Configuration Tab
 
         private void LoadExistingValues()
@@ -1000,6 +1537,7 @@ namespace EliteSoft.Erwin.AddIn
         {
             _validationService?.Dispose();
             _tableTypeMonitorService?.Dispose();
+            _validationCoordinatorService?.Dispose();
         }
 
         private void CleanupResources()
@@ -1013,6 +1551,7 @@ namespace EliteSoft.Erwin.AddIn
                 DisposeServices();
                 _validationService = null;
                 _tableTypeMonitorService = null;
+                _validationCoordinatorService = null;
 
                 _session?.Close();
                 _scapi?.Sessions?.Clear();

@@ -1,3 +1,6 @@
 .history/
 */bin/
 */obj/
+bin/
+obj/
+tmpclaude-*
