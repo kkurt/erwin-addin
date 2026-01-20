@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.Text.RegularExpressions;
 
 namespace EliteSoft.Erwin.AddIn.Services
-{
+{ 
     /// <summary>
     /// Service for loading and caching DOMAIN_DEF entries from database.
     /// Uses DatabaseService for multi-database support (MSSQL, PostgreSQL, Oracle).
