@@ -3,7 +3,7 @@
 
 $ErrorActionPreference = "Stop"
 
-# Auto-elevate to Administrator if not already
+# Auto-elevate to Administrator if not already...
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
 if (-not $isAdmin) {
