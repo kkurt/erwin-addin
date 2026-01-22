@@ -40,6 +40,8 @@ dotnet build erwin-addin.sln -c Release
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Build failed!" -ForegroundColor Red
+    Write-Host "`nPress any key to exit..." -ForegroundColor Gray
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
     exit 1
 }
 
@@ -51,6 +53,8 @@ $regasm = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\regasm.exe"
 
 if (-not (Test-Path $dllPath)) {
     Write-Host "DLL not found: $dllPath" -ForegroundColor Red
+    Write-Host "`nPress any key to exit..." -ForegroundColor Gray
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
     exit 1
 }
 
@@ -88,5 +92,10 @@ if ($LASTEXITCODE -eq 0) {
     Write-Host ""
 } else {
     Write-Host "Registration failed!" -ForegroundColor Red
+    Write-Host "`nPress any key to exit..." -ForegroundColor Gray
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
     exit 1
 }
+
+Write-Host "`nPress any key to exit..." -ForegroundColor Gray
+$null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")

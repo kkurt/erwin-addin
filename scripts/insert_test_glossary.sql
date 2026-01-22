@@ -1,7 +1,23 @@
 -- Performance Test Data for GLOSSARY table
 -- Inserts 14,000 random records with NAME between 10-15 characters
 
-USE Fiba;
+USE Glossary;
+GO
+
+-- Create GLOSSARY table if not exists
+IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[GLOSSARY]') AND type in (N'U'))
+BEGIN
+    CREATE TABLE [dbo].[GLOSSARY] (
+        [ID] INT IDENTITY(1,1) PRIMARY KEY,
+        [NAME] VARCHAR(50) NOT NULL,
+        [DATA_TYPE] VARCHAR(50) NULL,
+        [OWNER] VARCHAR(50) NULL
+    );
+
+    CREATE INDEX IX_GLOSSARY_NAME ON [dbo].[GLOSSARY]([NAME]);
+
+    PRINT 'GLOSSARY table created with index on NAME';
+END
 GO
 
 -- Clear existing test data (optional - comment out if you want to keep existing data)

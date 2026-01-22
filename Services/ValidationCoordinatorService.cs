@@ -221,8 +221,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // New attribute - validate both glossary and domain if set
                 bool hasValidDomain = IsValidDomain(currentState.DomainParentValue);
 
-                // Glossary validation for new columns
-                ValidateGlossary(currentState);
+                // Glossary validation for new columns (pass attr to apply DataType/Owner)
+                ValidateGlossary(attr, currentState);
 
                 // Domain validation if domain is set
                 if (hasValidDomain)
@@ -253,7 +253,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 if (physicalNameChanged)
                 {
                     Log($"Physical name changed: {previousState.TableName}.{previousState.PhysicalName} -> {currentState.PhysicalName}");
-                    ValidateGlossary(currentState);
+                    ValidateGlossary(attr, currentState);
 
                     // If has valid domain, also re-validate domain pattern
                     if (hasValidDomain)
@@ -280,6 +280,11 @@ namespace EliteSoft.Erwin.AddIn.Services
         #region Validation Methods
 
         private void ValidateGlossary(AttributeValidationSnapshot state)
+        {
+            ValidateGlossary(null, state);
+        }
+
+        private void ValidateGlossary(dynamic attr, AttributeValidationSnapshot state)
         {
             // Skip special names
             if (string.IsNullOrEmpty(state.PhysicalName) ||
@@ -317,6 +322,90 @@ namespace EliteSoft.Erwin.AddIn.Services
             else
             {
                 Log($"Glossary validation passed: {state.TableName}.{state.PhysicalName}");
+
+                // Apply DataType and Owner from glossary entry
+                if (attr != null)
+                {
+                    ApplyGlossaryProperties(attr, entry);
+                }
+            }
+        }
+
+        private void ApplyGlossaryProperties(dynamic attr, GlossaryEntry glossaryEntry)
+        {
+            try
+            {
+                bool hasDataType = !string.IsNullOrEmpty(glossaryEntry.DataType);
+                bool hasOwner = !string.IsNullOrEmpty(glossaryEntry.Owner);
+
+                if (!hasDataType && !hasOwner) return;
+
+                // Ensure OWNER UDP exists BEFORE starting the main transaction
+                if (hasOwner)
+                {
+                    EnsureOwnerUdpExists();
+                }
+
+                int transId = _session.BeginNamedTransaction("ApplyGlossaryProperties");
+                try
+                {
+                    if (hasDataType)
+                    {
+                        try
+                        {
+                            attr.Properties("Physical_Data_Type").Value = glossaryEntry.DataType;
+                            Log($"Set Physical_Data_Type to '{glossaryEntry.DataType}' from glossary");
+                        }
+                        catch (Exception ex)
+                        {
+                            Log($"Error setting Physical_Data_Type: {ex.Message}");
+                        }
+                    }
+
+                    if (hasOwner && _ownerUdpExists)
+                    {
+                        // Try different UDP property name formats
+                        string[] udpFormats = new[]
+                        {
+                            "OWNER",
+                            "Attribute.OWNER",
+                            "Attribute.Physical.OWNER",
+                            "UDP.OWNER"
+                        };
+
+                        bool ownerSet = false;
+                        foreach (var format in udpFormats)
+                        {
+                            try
+                            {
+                                attr.Properties(format).Value = glossaryEntry.Owner;
+                                Log($"Set OWNER to '{glossaryEntry.Owner}' using format '{format}'");
+                                ownerSet = true;
+                                break;
+                            }
+                            catch
+                            {
+                                // Try next format
+                            }
+                        }
+
+                        if (!ownerSet)
+                        {
+                            Log($"Could not set OWNER - no valid property format found");
+                        }
+                    }
+
+                    _session.CommitTransaction(transId);
+                }
+                catch (Exception ex)
+                {
+                    try { _session.RollbackTransaction(transId); } catch { }
+                    Log($"Error applying glossary properties: {ex.Message}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"ApplyGlossaryProperties error: {ex.Message}");
             }
         }
 
@@ -619,6 +708,67 @@ namespace EliteSoft.Erwin.AddIn.Services
                    domainValue != "(SELECT)" &&
                    domainValue != "<default>" &&
                    domainValue != "Blob";
+        }
+
+        private bool _ownerUdpChecked = false;
+        private bool _ownerUdpExists = false;
+
+        /// <summary>
+        /// Called by ModelConfigForm after OWNER UDP is created via metamodel
+        /// </summary>
+        public void SetOwnerUdpExists(bool exists)
+        {
+            _ownerUdpExists = exists;
+            _ownerUdpChecked = true;
+            Log($"OWNER UDP status set to: {exists}");
+        }
+
+        private void EnsureOwnerUdpExists()
+        {
+            if (_ownerUdpChecked) return;
+
+            // Check if UDP exists by trying to access it on an attribute
+            try
+            {
+                dynamic modelObjects = _session.ModelObjects;
+                dynamic root = modelObjects.Root;
+
+                dynamic entities = modelObjects.Collect(root, "Entity");
+                foreach (dynamic entity in entities)
+                {
+                    if (entity == null) continue;
+
+                    dynamic attrs = null;
+                    try { attrs = modelObjects.Collect(entity, "Attribute"); } catch { continue; }
+                    if (attrs == null) continue;
+
+                    foreach (dynamic attr in attrs)
+                    {
+                        if (attr == null) continue;
+                        try
+                        {
+                            var udpValue = attr.Properties("Attribute.Physical.OWNER");
+                            if (udpValue != null)
+                            {
+                                _ownerUdpExists = true;
+                                _ownerUdpChecked = true;
+                                Log("OWNER UDP exists (verified on attribute)");
+                                return;
+                            }
+                        }
+                        catch { }
+                        break; // Only need to check one attribute
+                    }
+                    break; // Only need to check one entity
+                }
+            }
+            catch { }
+
+            _ownerUdpChecked = true;
+            if (!_ownerUdpExists)
+            {
+                Log("OWNER UDP not found - it will be created by ModelConfigForm");
+            }
         }
 
         private void Log(string message)

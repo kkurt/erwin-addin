@@ -181,6 +181,7 @@ namespace EliteSoft.Erwin.AddIn
             LoadTableTypes();
             LoadDomainDefs();
             EnsureTableTypeUdpExists();
+            bool ownerUdpExists = EnsureOwnerUdpExists();
             // Note: Domain Parent is erwin's built-in feature, no custom UDP needed
 
             // ColumnValidationService is kept for ValidateAll button functionality only (no monitoring)
@@ -196,6 +197,7 @@ namespace EliteSoft.Erwin.AddIn
             // Initialize unified validation coordinator (single timer for glossary + domain validation)
             _validationCoordinatorService = new ValidationCoordinatorService(_session);
             _validationCoordinatorService.OnLog += Log;
+            _validationCoordinatorService.SetOwnerUdpExists(ownerUdpExists);
             _validationCoordinatorService.StartMonitoring();
 
             // Load tables for Table Processes tab
@@ -714,6 +716,164 @@ namespace EliteSoft.Erwin.AddIn
                 }
 
                 Log($"Metamodel session error: {ex.Message}");
+                return false;
+            }
+            finally
+            {
+                if (metamodelSession != null)
+                {
+                    try { metamodelSession.Close(); } catch { }
+                }
+            }
+        }
+
+        private bool EnsureOwnerUdpExists()
+        {
+            try
+            {
+                if (CheckOwnerUdpExists())
+                {
+                    Log("OWNER UDP already exists - skipping creation");
+                    return true;
+                }
+
+                Log("OWNER UDP not found - creating...");
+                if (CreateOwnerUdp())
+                {
+                    Log("OWNER UDP created successfully!");
+                    return true;
+                }
+                else
+                {
+                    Log("Failed to create OWNER UDP");
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"EnsureOwnerUdpExists error: {ex.Message}");
+                return false;
+            }
+        }
+
+        private bool CheckOwnerUdpExists()
+        {
+            try
+            {
+                dynamic modelObjects = _session.ModelObjects;
+                dynamic root = modelObjects.Root;
+
+                // Method 1: Check Property_Type objects
+                try
+                {
+                    dynamic propertyTypes = modelObjects.Collect(root, "Property_Type");
+                    foreach (dynamic pt in propertyTypes)
+                    {
+                        if (pt == null) continue;
+                        string ptName = "";
+                        try { ptName = pt.Name ?? ""; } catch { continue; }
+
+                        if (ptName.Equals("Attribute.Physical.OWNER", StringComparison.OrdinalIgnoreCase))
+                        {
+                            return true;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log($"Property_Type enumeration for OWNER failed: {ex.Message}");
+                }
+
+                // Method 2: Try to access UDP on an attribute
+                try
+                {
+                    dynamic entities = modelObjects.Collect(root, "Entity");
+                    foreach (dynamic entity in entities)
+                    {
+                        if (entity == null) continue;
+
+                        dynamic attrs = null;
+                        try { attrs = modelObjects.Collect(entity, "Attribute"); } catch { continue; }
+                        if (attrs == null) continue;
+
+                        foreach (dynamic attr in attrs)
+                        {
+                            if (attr == null) continue;
+                            try
+                            {
+                                var udpValue = attr.Properties("Attribute.Physical.OWNER");
+                                if (udpValue != null) return true;
+                            }
+                            catch { }
+                            break;
+                        }
+                        break;
+                    }
+                }
+                catch { }
+
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Log($"CheckOwnerUdpExists error: {ex.Message}");
+                return false;
+            }
+        }
+
+        private bool CreateOwnerUdp()
+        {
+            dynamic metamodelSession = null;
+            try
+            {
+                Log("Creating OWNER UDP (Text type for Attribute.Physical)...");
+
+                metamodelSession = _scapi.Sessions.Add();
+                metamodelSession.Open(_currentModel, 1); // SCD_SL_M1 = Metamodel level
+
+                int transId = metamodelSession.BeginNamedTransaction("CreateOwnerUDP");
+
+                try
+                {
+                    dynamic mmObjects = metamodelSession.ModelObjects;
+                    dynamic udpType = mmObjects.Add("Property_Type");
+
+                    udpType.Properties("Name").Value = "Attribute.Physical.OWNER";
+
+                    TrySetProperty(udpType, "tag_Udp_Owner_Type", "Attribute");
+                    TrySetProperty(udpType, "tag_Is_Physical", true);
+                    TrySetProperty(udpType, "tag_Is_Logical", false);
+                    TrySetProperty(udpType, "tag_Udp_Data_Type", 1); // Text type (1 = Text, 6 = List)
+                    TrySetProperty(udpType, "tag_Order", "1");
+                    TrySetProperty(udpType, "tag_Is_Locally_Defined", true);
+
+                    metamodelSession.CommitTransaction(transId);
+                    Log("OWNER UDP transaction committed");
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    if (ex.Message.Contains("must be unique") || ex.Message.Contains("EBS-1057"))
+                    {
+                        Log("OWNER UDP already exists (detected via unique constraint)");
+                        try { metamodelSession.RollbackTransaction(transId); } catch { }
+                        return true;
+                    }
+
+                    Log($"Error creating OWNER UDP: {ex.Message}");
+                    try { metamodelSession.RollbackTransaction(transId); } catch { }
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                if (ex.Message.Contains("must be unique") || ex.Message.Contains("EBS-1057"))
+                {
+                    Log("OWNER UDP already exists (detected via unique constraint)");
+                    return true;
+                }
+
+                Log($"Metamodel session error for OWNER UDP: {ex.Message}");
                 return false;
             }
             finally
