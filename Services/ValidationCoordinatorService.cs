@@ -1,5 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.Runtime.ExceptionServices;
+using System.Runtime.InteropServices;
+using System.Security;
 using System.Text;
 using System.Windows.Forms;
 
@@ -16,11 +19,32 @@ namespace EliteSoft.Erwin.AddIn.Services
     {
         private readonly dynamic _session;
         private Timer _monitorTimer;
+        private Timer _windowMonitorTimer;
+        private TableTypeMonitorService _tableTypeMonitor;
         private bool _isMonitoring;
         private bool _disposed;
         private bool _isProcessingChange;
         private bool _validationSuspended;
         private bool _popupVisible;
+        private volatile bool _isCheckingForChanges;
+        private bool _columnEditorWasOpen;
+        private bool _sessionLost;
+
+        // Batch processing state - process entities in small chunks to avoid UI blocking
+        private int _scanEntityIndex;
+        private bool _scanCycleActive;
+
+        // Win32 API for window enumeration
+        [DllImport("user32.dll")]
+        private static extern bool EnumWindows(EnumWindowsProc enumProc, IntPtr lParam);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsWindowVisible(IntPtr hWnd);
+
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
         // Snapshot of all attributes
         private Dictionary<string, AttributeValidationSnapshot> _attributeSnapshots;
@@ -31,11 +55,15 @@ namespace EliteSoft.Erwin.AddIn.Services
         // Pending validation results to show in single popup
         private List<CollectedValidationResult> _pendingResults;
 
-        // Monitor interval
-        private const int MonitorIntervalMs = 1500;
+        // Monitor interval - short interval for smooth batch processing (5 entities per tick)
+        private const int MonitorIntervalMs = 500;
+        private const int MaxEntitiesPerTick = 5;
 
         // Event for logging
         public event Action<string> OnLog;
+
+        // Event fired when session becomes invalid (model closed)
+        public event Action OnSessionLost;
 
         public ValidationCoordinatorService(dynamic session)
         {
@@ -47,9 +75,18 @@ namespace EliteSoft.Erwin.AddIn.Services
             _monitorTimer = new Timer();
             _monitorTimer.Interval = MonitorIntervalMs;
             _monitorTimer.Tick += MonitorTimer_Tick;
+
+            _windowMonitorTimer = new Timer();
+            _windowMonitorTimer.Interval = 2000;
+            _windowMonitorTimer.Tick += WindowMonitorTimer_Tick;
         }
 
         #region Public Methods
+
+        public void SetTableTypeMonitor(TableTypeMonitorService monitor)
+        {
+            _tableTypeMonitor = monitor;
+        }
 
         public void StartMonitoring()
         {
@@ -57,6 +94,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             _isMonitoring = true;
             TakeSnapshot();
             _monitorTimer.Start();
+            _windowMonitorTimer.Start();
             Log("ValidationCoordinatorService: Monitoring started");
         }
 
@@ -64,18 +102,21 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             _isMonitoring = false;
             _monitorTimer.Stop();
+            _windowMonitorTimer.Stop();
             Log("ValidationCoordinatorService: Monitoring stopped");
         }
 
         public void SuspendValidation()
         {
             _validationSuspended = true;
+            _scanCycleActive = false;
             Log("ValidationCoordinatorService: Validation suspended");
         }
 
         public void ResumeValidation()
         {
             _validationSuspended = false;
+            _scanCycleActive = false;
             TakeSnapshot();
             Log("ValidationCoordinatorService: Validation resumed");
         }
@@ -97,29 +138,39 @@ namespace EliteSoft.Erwin.AddIn.Services
                 dynamic allEntities = modelObjects.Collect(root, "Entity");
                 if (allEntities == null) return;
 
-                foreach (dynamic entity in allEntities)
+                try
                 {
-                    if (entity == null) continue;
-
-                    string tableName = GetTableName(entity);
-
-                    dynamic entityAttrs = null;
-                    try { entityAttrs = modelObjects.Collect(entity, "Attribute"); } catch { continue; }
-                    if (entityAttrs == null) continue;
-
-                    foreach (dynamic attr in entityAttrs)
+                    foreach (dynamic entity in allEntities)
                     {
-                        if (attr == null) continue;
+                        if (entity == null) continue;
 
-                        string objectId = "";
-                        try { objectId = attr.ObjectId?.ToString() ?? ""; } catch { continue; }
+                        string tableName = GetTableName(entity);
 
-                        if (string.IsNullOrEmpty(objectId)) continue;
+                        dynamic entityAttrs = null;
+                        try { entityAttrs = modelObjects.Collect(entity, "Attribute"); }
+                        catch (Exception ex) { Log($"TakeSnapshot: Failed to collect attributes for entity: {ex.Message}"); continue; }
+                        if (entityAttrs == null) continue;
 
-                        var snapshot = CreateSnapshot(attr, tableName, modelObjects);
-                        _attributeSnapshots[objectId] = snapshot;
+                        try
+                        {
+                            foreach (dynamic attr in entityAttrs)
+                            {
+                                if (attr == null) continue;
+
+                                string objectId = "";
+                                try { objectId = attr.ObjectId?.ToString() ?? ""; }
+                                catch (Exception ex) { Log($"TakeSnapshot: Failed to get ObjectId: {ex.Message}"); continue; }
+
+                                if (string.IsNullOrEmpty(objectId)) continue;
+
+                                var snapshot = CreateSnapshot(attr, tableName, modelObjects);
+                                _attributeSnapshots[objectId] = snapshot;
+                            }
+                        }
+                        finally { ReleaseCom(entityAttrs); }
                     }
                 }
+                finally { ReleaseCom(allEntities); }
 
                 Log($"ValidationCoordinatorService: Snapshot taken - {_attributeSnapshots.Count} attributes");
             }
@@ -133,25 +184,163 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         #region Timer Event
 
+        private void HandleSessionLost()
+        {
+            if (_sessionLost) return;
+            _sessionLost = true;
+            _isMonitoring = false;
+            // Stop timers directly — don't call any COM methods
+            try { _monitorTimer?.Stop(); } catch { }
+            try { _windowMonitorTimer?.Stop(); } catch { }
+            Log("Session lost - model was closed. Monitoring stopped.");
+            try { OnSessionLost?.Invoke(); } catch { }
+        }
+
+        [HandleProcessCorruptedStateExceptions]
+        [SecurityCritical]
         private void MonitorTimer_Tick(object sender, EventArgs e)
         {
-            if (!_isMonitoring || _disposed || _isProcessingChange || _validationSuspended) return;
+            if (_sessionLost || !_isMonitoring || _disposed || _isProcessingChange || _validationSuspended || _isCheckingForChanges) return;
 
             try
             {
-                CheckForChanges();
+                _isCheckingForChanges = true;
+
+                dynamic modelObjects = _session.ModelObjects;
+                dynamic root = modelObjects.Root;
+                if (root == null) return;
+
+                dynamic allEntities = modelObjects.Collect(root, "Entity");
+                if (allEntities == null) return;
+
+                try
+                {
+                    int entityCount = 0;
+                    try { entityCount = allEntities.Count; }
+                    catch (Exception ex) { Log($"MonitorTimer_Tick: Failed to get entity count: {ex.Message}"); return; }
+
+                    // Start new scan cycle if not in progress
+                    if (!_scanCycleActive)
+                    {
+                        _scanEntityIndex = 0;
+                        _scanCycleActive = true;
+                        _pendingResults.Clear();
+                    }
+
+                    // Process a small batch of entities using foreach with skip/limit
+                    // (SCAPI Collect() collections don't support Item(i) indexed access)
+                    int endIndex = Math.Min(_scanEntityIndex + MaxEntitiesPerTick, entityCount);
+                    int currentIndex = 0;
+
+                    foreach (dynamic entity in allEntities)
+                    {
+                        if (currentIndex >= endIndex) break;
+
+                        if (currentIndex >= _scanEntityIndex)
+                        {
+                            if (entity != null)
+                            {
+                                CheckEntityForChanges(entity, modelObjects);
+                            }
+                        }
+
+                        currentIndex++;
+                    }
+
+                    _scanEntityIndex = endIndex;
+
+                    // Scan cycle complete - show results and run table type check
+                    if (_scanEntityIndex >= entityCount)
+                    {
+                        _scanCycleActive = false;
+
+                        if (_pendingResults.Count > 0)
+                        {
+                            ShowConsolidatedPopup();
+                        }
+
+                        // TABLE_TYPE check runs once per full cycle (entity-only, lightweight)
+                        try { _tableTypeMonitor?.CheckForTableTypeChanges(allEntities); }
+                        catch (Exception ex) { Log($"MonitorTimer_Tick: TableType check error: {ex.Message}"); }
+                    }
+                }
+                finally
+                {
+                    ReleaseCom(allEntities);
+                }
             }
+            catch (COMException) { HandleSessionLost(); }
+            catch (InvalidComObjectException) { HandleSessionLost(); }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine($"ValidationCoordinatorService.MonitorTimer_Tick error: {ex.Message}");
+                // Any COM-related error means session is dead
+                if (ex is System.Runtime.InteropServices.ExternalException ||
+                    ex.Message.Contains("RPC") || ex.Message.Contains("COM") ||
+                    ex.Message.Contains("disconnected") || ex.Message.Contains("0x800"))
+                    HandleSessionLost();
+                else
+                    System.Diagnostics.Debug.WriteLine($"ValidationCoordinatorService.MonitorTimer_Tick error: {ex.Message}");
+            }
+            finally
+            {
+                _isCheckingForChanges = false;
             }
         }
 
-        #endregion
+        [HandleProcessCorruptedStateExceptions]
+        [SecurityCritical]
+        private void WindowMonitorTimer_Tick(object sender, EventArgs e)
+        {
+            if (_sessionLost || !_isMonitoring || _disposed) return;
 
-        #region Change Detection
+            try
+            {
+                bool editorIsOpen = IsColumnEditorOpen();
 
-        private void CheckForChanges()
+                if (_columnEditorWasOpen && !editorIsOpen)
+                {
+                    Log("Column Editor closed - checking for PLEASE CHANGE IT columns");
+                    DeletePleaseChangeItColumns();
+                    TakeSnapshot();
+                }
+
+                _columnEditorWasOpen = editorIsOpen;
+            }
+            catch (COMException) { HandleSessionLost(); }
+            catch (InvalidComObjectException) { HandleSessionLost(); }
+            catch (Exception ex)
+            {
+                if (ex is System.Runtime.InteropServices.ExternalException ||
+                    ex.Message.Contains("RPC") || ex.Message.Contains("0x800"))
+                    HandleSessionLost();
+            }
+        }
+
+        private bool IsColumnEditorOpen()
+        {
+            bool found = false;
+
+            EnumWindows((hWnd, lParam) =>
+            {
+                if (!IsWindowVisible(hWnd)) return true;
+
+                StringBuilder title = new StringBuilder(256);
+                GetWindowText(hWnd, title, 256);
+                string windowTitle = title.ToString();
+
+                if (windowTitle.Contains("Column") && windowTitle.Contains("Editor"))
+                {
+                    found = true;
+                    return false;
+                }
+
+                return true;
+            }, IntPtr.Zero);
+
+            return found;
+        }
+
+        private void DeletePleaseChangeItColumns()
         {
             try
             {
@@ -162,25 +351,108 @@ namespace EliteSoft.Erwin.AddIn.Services
                 dynamic allEntities = modelObjects.Collect(root, "Entity");
                 if (allEntities == null) return;
 
-                // Clear pending results for this check cycle
-                _pendingResults.Clear();
+                var columnsToDelete = new List<dynamic>();
 
-                foreach (dynamic entity in allEntities)
+                try
                 {
-                    if (entity == null) continue;
+                    foreach (dynamic entity in allEntities)
+                    {
+                        if (entity == null) continue;
 
-                    string tableName = GetTableName(entity);
+                        dynamic entityAttrs = null;
+                        try { entityAttrs = modelObjects.Collect(entity, "Attribute"); }
+                        catch (Exception ex) { Log($"DeletePleaseChangeIt: Failed to collect attributes: {ex.Message}"); continue; }
+                        if (entityAttrs == null) continue;
 
-                    dynamic entityAttrs = null;
-                    try { entityAttrs = modelObjects.Collect(entity, "Attribute"); } catch { continue; }
-                    if (entityAttrs == null) continue;
+                        try
+                        {
+                            foreach (dynamic attr in entityAttrs)
+                            {
+                                if (attr == null) continue;
 
+                                string physicalName = "";
+                                try
+                                {
+                                    string physCol = attr.Properties("Physical_Name").Value?.ToString() ?? "";
+                                    string attrName = attr.Name ?? "";
+                                    physicalName = (!string.IsNullOrEmpty(physCol) && !physCol.StartsWith("%")) ? physCol : attrName;
+                                }
+                                catch (Exception ex) { Log($"DeletePleaseChangeIt: Failed to read attr name: {ex.Message}"); continue; }
+
+                                if (physicalName.Equals("PLEASE CHANGE IT", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    columnsToDelete.Add(attr);
+                                }
+                            }
+                        }
+                        finally { ReleaseCom(entityAttrs); }
+                    }
+                }
+                finally { ReleaseCom(allEntities); }
+
+                if (columnsToDelete.Count > 0)
+                {
+                    int transId = _session.BeginNamedTransaction("DeleteInvalidColumns");
+                    try
+                    {
+                        foreach (var attr in columnsToDelete)
+                        {
+                            try
+                            {
+                                string attrName = attr.Name ?? "unknown";
+                                modelObjects.Remove(attr);
+                                Log($"Deleted 'PLEASE CHANGE IT' column: {attrName}");
+                            }
+                            catch (Exception ex)
+                            {
+                                Log($"Failed to delete column: {ex.Message}");
+                            }
+                        }
+                        _session.CommitTransaction(transId);
+                        Log($"Deleted {columnsToDelete.Count} 'PLEASE CHANGE IT' column(s)");
+                    }
+                    catch (Exception ex)
+                    {
+                        try { _session.RollbackTransaction(transId); }
+                        catch (Exception rbEx) { Log($"DeletePleaseChangeIt: Rollback failed: {rbEx.Message}"); }
+                        Log($"DeletePleaseChangeIt: Transaction failed: {ex.Message}");
+                        throw;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"DeletePleaseChangeItColumns error: {ex.Message}");
+            }
+        }
+
+        #endregion
+
+        #region Change Detection
+
+        private void CheckEntityForChanges(dynamic entity, dynamic modelObjects)
+        {
+            try
+            {
+                string tableName = GetTableName(entity);
+
+                // Get predefined column names for this entity's TABLE_TYPE (to skip glossary validation)
+                var predefinedColumnNames = GetPredefinedColumnNames(entity);
+
+                dynamic entityAttrs = null;
+                try { entityAttrs = modelObjects.Collect(entity, "Attribute"); }
+                catch (Exception ex) { Log($"CheckEntityForChanges: Failed to collect attributes: {ex.Message}"); return; }
+                if (entityAttrs == null) return;
+
+                try
+                {
                     foreach (dynamic attr in entityAttrs)
                     {
                         if (attr == null) continue;
 
                         string objectId = "";
-                        try { objectId = attr.ObjectId?.ToString() ?? ""; } catch { continue; }
+                        try { objectId = attr.ObjectId?.ToString() ?? ""; }
+                        catch (Exception ex) { Log($"CheckEntityForChanges: Failed to get ObjectId: {ex.Message}"); continue; }
                         if (string.IsNullOrEmpty(objectId)) continue;
 
                         var currentState = CreateSnapshot(attr, tableName, modelObjects);
@@ -190,30 +462,25 @@ namespace EliteSoft.Erwin.AddIn.Services
                         {
                             // New attribute added
                             _attributeSnapshots[objectId] = currentState;
-                            ProcessNewAttribute(attr, currentState);
+                            ProcessNewAttribute(attr, currentState, predefinedColumnNames);
                         }
                         else
                         {
                             var previousState = _attributeSnapshots[objectId];
-                            ProcessAttributeChanges(attr, previousState, currentState);
+                            ProcessAttributeChanges(attr, previousState, currentState, predefinedColumnNames);
                             _attributeSnapshots[objectId] = currentState;
                         }
                     }
                 }
-
-                // Show collected results if any
-                if (_pendingResults.Count > 0)
-                {
-                    ShowConsolidatedPopup();
-                }
+                finally { ReleaseCom(entityAttrs); }
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine($"CheckForChanges error: {ex.Message}");
+                System.Diagnostics.Debug.WriteLine($"CheckEntityForChanges error: {ex.Message}");
             }
         }
 
-        private void ProcessNewAttribute(dynamic attr, AttributeValidationSnapshot currentState)
+        private void ProcessNewAttribute(dynamic attr, AttributeValidationSnapshot currentState, HashSet<string> predefinedColumnNames)
         {
             _isProcessingChange = true;
             try
@@ -222,7 +489,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 bool hasValidDomain = IsValidDomain(currentState.DomainParentValue);
 
                 // Glossary validation for new columns (pass attr to apply DataType/Owner)
-                ValidateGlossary(attr, currentState);
+                ValidateGlossary(attr, currentState, predefinedColumnNames);
 
                 // Domain validation if domain is set
                 if (hasValidDomain)
@@ -236,7 +503,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
         }
 
-        private void ProcessAttributeChanges(dynamic attr, AttributeValidationSnapshot previousState, AttributeValidationSnapshot currentState)
+        private void ProcessAttributeChanges(dynamic attr, AttributeValidationSnapshot previousState, AttributeValidationSnapshot currentState, HashSet<string> predefinedColumnNames)
         {
             bool physicalNameChanged = previousState.PhysicalName != currentState.PhysicalName;
             bool domainChanged = previousState.DomainParentValue != currentState.DomainParentValue;
@@ -253,7 +520,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 if (physicalNameChanged)
                 {
                     Log($"Physical name changed: {previousState.TableName}.{previousState.PhysicalName} -> {currentState.PhysicalName}");
-                    ValidateGlossary(attr, currentState);
+                    ValidateGlossary(attr, currentState, predefinedColumnNames);
 
                     // If has valid domain, also re-validate domain pattern
                     if (hasValidDomain)
@@ -279,12 +546,7 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         #region Validation Methods
 
-        private void ValidateGlossary(AttributeValidationSnapshot state)
-        {
-            ValidateGlossary(null, state);
-        }
-
-        private void ValidateGlossary(dynamic attr, AttributeValidationSnapshot state)
+        private void ValidateGlossary(dynamic attr, AttributeValidationSnapshot state, HashSet<string> predefinedColumnNames)
         {
             // Skip special names
             if (string.IsNullOrEmpty(state.PhysicalName) ||
@@ -292,6 +554,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                 state.PhysicalName.StartsWith("<default>", StringComparison.OrdinalIgnoreCase) ||
                 state.PhysicalName.Equals("PLEASE CHANGE IT", StringComparison.OrdinalIgnoreCase))
             {
+                return;
+            }
+
+            // Skip predefined columns - they are auto-added by TABLE_TYPE and don't need glossary validation
+            if (predefinedColumnNames != null && predefinedColumnNames.Contains(state.PhysicalName))
+            {
+                Log($"Glossary validation skipped (predefined column): {state.TableName}.{state.PhysicalName}");
                 return;
             }
 
@@ -316,7 +585,9 @@ namespace EliteSoft.Erwin.AddIn.Services
                     ValidationType = CollectedValidationResultType.Glossary,
                     TableName = state.TableName,
                     ColumnName = state.PhysicalName,
-                    Message = "Column name not found in glossary. Please use a column name from the glossary."
+                    Message = "Column name not found in glossary. Please use a column name from the glossary.",
+                    Attribute = attr,
+                    ObjectId = state.ObjectId
                 });
             }
             else
@@ -335,71 +606,27 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             try
             {
-                bool hasDataType = !string.IsNullOrEmpty(glossaryEntry.DataType);
-                bool hasOwner = !string.IsNullOrEmpty(glossaryEntry.Owner);
-
-                if (!hasDataType && !hasOwner) return;
-
-                // Ensure OWNER UDP exists BEFORE starting the main transaction
-                if (hasOwner)
-                {
-                    EnsureOwnerUdpExists();
-                }
-
                 int transId = _session.BeginNamedTransaction("ApplyGlossaryProperties");
                 try
                 {
-                    if (hasDataType)
+                    // Physical_Data_Type
+                    if (!string.IsNullOrEmpty(glossaryEntry.DataType))
                     {
-                        try
-                        {
-                            attr.Properties("Physical_Data_Type").Value = glossaryEntry.DataType;
-                            Log($"Set Physical_Data_Type to '{glossaryEntry.DataType}' from glossary");
-                        }
-                        catch (Exception ex)
-                        {
-                            Log($"Error setting Physical_Data_Type: {ex.Message}");
-                        }
+                        TrySetProperty(attr, "Physical_Data_Type", glossaryEntry.DataType);
                     }
 
-                    if (hasOwner && _ownerUdpExists)
-                    {
-                        // Try different UDP property name formats
-                        string[] udpFormats = new[]
-                        {
-                            "OWNER",
-                            "Attribute.OWNER",
-                            "Attribute.Physical.OWNER",
-                            "UDP.OWNER"
-                        };
-
-                        bool ownerSet = false;
-                        foreach (var format in udpFormats)
-                        {
-                            try
-                            {
-                                attr.Properties(format).Value = glossaryEntry.Owner;
-                                Log($"Set OWNER to '{glossaryEntry.Owner}' using format '{format}'");
-                                ownerSet = true;
-                                break;
-                            }
-                            catch
-                            {
-                                // Try next format
-                            }
-                        }
-
-                        if (!ownerSet)
-                        {
-                            Log($"Could not set OWNER - no valid property format found");
-                        }
-                    }
+                    // UDP'ler: OWNER, KVKK, PCIDSS, CLASSIFICATION (internal erwin property)
+                    TrySetUdp(attr, "OWNER", glossaryEntry.Owner);
+                    TrySetUdp(attr, "KVKK", glossaryEntry.Kvkk ? "True" : "False");
+                    TrySetUdp(attr, "PCIDSS", glossaryEntry.Pcidss ? "True" : "False");
+                    TrySetUdp(attr, "CLASSIFICATION", glossaryEntry.Classification);
 
                     _session.CommitTransaction(transId);
                 }
                 catch (Exception ex)
                 {
-                    try { _session.RollbackTransaction(transId); } catch { }
+                    try { _session.RollbackTransaction(transId); }
+                    catch (Exception rbEx) { Log($"ApplyGlossaryProperties: Rollback failed: {rbEx.Message}"); }
                     Log($"Error applying glossary properties: {ex.Message}");
                 }
             }
@@ -407,6 +634,47 @@ namespace EliteSoft.Erwin.AddIn.Services
             {
                 Log($"ApplyGlossaryProperties error: {ex.Message}");
             }
+        }
+
+        private void TrySetProperty(dynamic attr, string propertyName, string value)
+        {
+            try
+            {
+                attr.Properties(propertyName).Value = value;
+                Log($"Set {propertyName} to '{value}' from glossary");
+            }
+            catch (Exception ex)
+            {
+                Log($"Error setting {propertyName}: {ex.Message}");
+            }
+        }
+
+        private void TrySetUdp(dynamic attr, string udpName, string value)
+        {
+            if (string.IsNullOrEmpty(value)) return;
+
+            string[] formats = {
+                $"Attribute.Physical.{udpName}",
+                udpName,
+                $"Attribute.{udpName}",
+                $"UDP.{udpName}"
+            };
+
+            foreach (var format in formats)
+            {
+                try
+                {
+                    attr.Properties(format).Value = value;
+                    Log($"Set {udpName} to '{value}' using '{format}'");
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"TrySetUdp: Format '{format}' failed: {ex.Message}");
+                }
+            }
+
+            Log($"Could not set {udpName} - no valid property format found");
         }
 
         private void ValidateDomain(dynamic attr, AttributeValidationSnapshot state, string oldDomainValue)
@@ -505,7 +773,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
                 catch (Exception ex)
                 {
-                    try { _session.RollbackTransaction(transId); } catch { }
+                    try { _session.RollbackTransaction(transId); }
+                    catch (Exception rbEx) { Log($"ApplyDomainProperties: Rollback failed: {rbEx.Message}"); }
                     Log($"Error applying domain properties: {ex.Message}");
                 }
             }
@@ -588,11 +857,64 @@ namespace EliteSoft.Erwin.AddIn.Services
                     title,
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Warning);
+
+                // After user clicks OK, rename glossary-failed columns to "PLEASE CHANGE IT"
+                RenameInvalidGlossaryColumns(glossaryResults);
             }
             finally
             {
                 _popupVisible = false;
                 _pendingResults.Clear();
+            }
+        }
+
+        private void RenameInvalidGlossaryColumns(List<CollectedValidationResult> glossaryResults)
+        {
+            if (glossaryResults.Count == 0) return;
+
+            try
+            {
+                int transId = _session.BeginNamedTransaction("RenameInvalidColumns");
+                try
+                {
+                    foreach (var result in glossaryResults)
+                    {
+                        if (result.Attribute == null) continue;
+
+                        try
+                        {
+                            // Both logical and physical name must be set,
+                            // otherwise CheckForChanges reads stale Physical_Name and loops
+                            result.Attribute.Properties("Name").Value = "PLEASE CHANGE IT";
+                            try { result.Attribute.Properties("Physical_Name").Value = "PLEASE CHANGE IT"; }
+                            catch (Exception phEx) { Log($"RenameInvalidGlossary: Failed to set Physical_Name: {phEx.Message}"); }
+                            Log($"Renamed column {result.TableName}.{result.ColumnName} to 'PLEASE CHANGE IT'");
+
+                            // Update snapshot so next cycle doesn't re-trigger validation
+                            if (!string.IsNullOrEmpty(result.ObjectId) && _attributeSnapshots.ContainsKey(result.ObjectId))
+                            {
+                                _attributeSnapshots[result.ObjectId].PhysicalName = "PLEASE CHANGE IT";
+                                _attributeSnapshots[result.ObjectId].AttributeName = "PLEASE CHANGE IT";
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Log($"Error renaming column {result.ColumnName}: {ex.Message}");
+                        }
+                    }
+
+                    _session.CommitTransaction(transId);
+                }
+                catch (Exception ex)
+                {
+                    try { _session.RollbackTransaction(transId); }
+                    catch (Exception rbEx) { Log($"RenameInvalidGlossary: Rollback failed: {rbEx.Message}"); }
+                    Log($"RenameInvalidGlossaryColumns transaction error: {ex.Message}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"RenameInvalidGlossaryColumns error: {ex.Message}");
             }
         }
 
@@ -607,14 +929,16 @@ namespace EliteSoft.Erwin.AddIn.Services
             string physicalName = "";
             string domainParentValue = "";
 
-            try { objectId = attr.ObjectId?.ToString() ?? ""; } catch { }
-            try { attrName = attr.Name ?? ""; } catch { }
+            try { objectId = attr.ObjectId?.ToString() ?? ""; }
+            catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"CreateSnapshot: ObjectId error: {ex.Message}"); }
+            try { attrName = attr.Name ?? ""; }
+            catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"CreateSnapshot: Name error: {ex.Message}"); }
             try
             {
                 string physCol = attr.Properties("Physical_Name").Value?.ToString() ?? "";
                 physicalName = (!string.IsNullOrEmpty(physCol) && !physCol.StartsWith("%")) ? physCol : attrName;
             }
-            catch { physicalName = attrName; }
+            catch (Exception ex) { physicalName = attrName; System.Diagnostics.Debug.WriteLine($"CreateSnapshot: Physical_Name error: {ex.Message}"); }
 
             domainParentValue = GetDomainParentValue(attr, modelObjects);
 
@@ -633,13 +957,14 @@ namespace EliteSoft.Erwin.AddIn.Services
             string tableName = "";
             string entityName = "";
 
-            try { entityName = entity.Name ?? ""; } catch { }
+            try { entityName = entity.Name ?? ""; }
+            catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"GetTableName: Name error: {ex.Message}"); }
             try
             {
                 string physTable = entity.Properties("Physical_Name").Value?.ToString() ?? "";
                 tableName = (!string.IsNullOrEmpty(physTable) && !physTable.StartsWith("%")) ? physTable : entityName;
             }
-            catch { tableName = entityName; }
+            catch (Exception ex) { tableName = entityName; System.Diagnostics.Debug.WriteLine($"GetTableName: Physical_Name error: {ex.Message}"); }
 
             return tableName;
         }
@@ -670,7 +995,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     }
                 }
             }
-            catch { }
+            catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"GetDomainParentValue error: {ex.Message}"); }
 
             return "";
         }
@@ -696,10 +1021,48 @@ namespace EliteSoft.Erwin.AddIn.Services
                             _domainCache[objectId] = name;
                         }
                     }
-                    catch { }
+                    catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"BuildDomainCache: Domain entry error: {ex.Message}"); }
                 }
             }
-            catch { }
+            catch (Exception ex) { Log($"BuildDomainCache error: {ex.Message}"); }
+        }
+
+        /// <summary>
+        /// Gets predefined column names for the entity's TABLE_TYPE.
+        /// Returns null if entity has no TABLE_TYPE or predefined columns not loaded.
+        /// </summary>
+        private HashSet<string> GetPredefinedColumnNames(dynamic entity)
+        {
+            try
+            {
+                string tableTypeValue = "";
+                try { tableTypeValue = entity.Properties("Entity.Physical.TABLE_TYPE").Value?.ToString() ?? ""; }
+                catch { return null; }
+
+                if (string.IsNullOrEmpty(tableTypeValue) || tableTypeValue == "(SELECT)")
+                    return null;
+
+                var tableTypeEntry = TableTypeService.Instance.GetByName(tableTypeValue);
+                if (tableTypeEntry == null)
+                    return null;
+
+                if (!PredefinedColumnService.Instance.IsLoaded)
+                    PredefinedColumnService.Instance.LoadPredefinedColumns();
+
+                var predefinedColumns = PredefinedColumnService.Instance.GetByTableTypeId(tableTypeEntry.Id);
+                var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var col in predefinedColumns)
+                {
+                    names.Add(col.Name);
+                }
+
+                return names.Count > 0 ? names : null;
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"GetPredefinedColumnNames error: {ex.Message}");
+                return null;
+            }
         }
 
         private bool IsValidDomain(string domainValue)
@@ -710,70 +1073,19 @@ namespace EliteSoft.Erwin.AddIn.Services
                    domainValue != "Blob";
         }
 
-        private bool _ownerUdpChecked = false;
-        private bool _ownerUdpExists = false;
-
-        /// <summary>
-        /// Called by ModelConfigForm after OWNER UDP is created via metamodel
-        /// </summary>
-        public void SetOwnerUdpExists(bool exists)
+        private static void ReleaseCom(object comObject)
         {
-            _ownerUdpExists = exists;
-            _ownerUdpChecked = true;
-            Log($"OWNER UDP status set to: {exists}");
-        }
-
-        private void EnsureOwnerUdpExists()
-        {
-            if (_ownerUdpChecked) return;
-
-            // Check if UDP exists by trying to access it on an attribute
-            try
+            if (comObject != null)
             {
-                dynamic modelObjects = _session.ModelObjects;
-                dynamic root = modelObjects.Root;
-
-                dynamic entities = modelObjects.Collect(root, "Entity");
-                foreach (dynamic entity in entities)
-                {
-                    if (entity == null) continue;
-
-                    dynamic attrs = null;
-                    try { attrs = modelObjects.Collect(entity, "Attribute"); } catch { continue; }
-                    if (attrs == null) continue;
-
-                    foreach (dynamic attr in attrs)
-                    {
-                        if (attr == null) continue;
-                        try
-                        {
-                            var udpValue = attr.Properties("Attribute.Physical.OWNER");
-                            if (udpValue != null)
-                            {
-                                _ownerUdpExists = true;
-                                _ownerUdpChecked = true;
-                                Log("OWNER UDP exists (verified on attribute)");
-                                return;
-                            }
-                        }
-                        catch { }
-                        break; // Only need to check one attribute
-                    }
-                    break; // Only need to check one entity
-                }
-            }
-            catch { }
-
-            _ownerUdpChecked = true;
-            if (!_ownerUdpExists)
-            {
-                Log("OWNER UDP not found - it will be created by ModelConfigForm");
+                try { Marshal.ReleaseComObject(comObject); }
+                catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"ReleaseCom error: {ex.Message}"); }
             }
         }
 
         private void Log(string message)
         {
-            OnLog?.Invoke(message);
+            if (_disposed) return;
+            try { OnLog?.Invoke(message); } catch { }
             System.Diagnostics.Debug.WriteLine(message);
         }
 
@@ -788,6 +1100,7 @@ namespace EliteSoft.Erwin.AddIn.Services
 
             StopMonitoring();
             _monitorTimer?.Dispose();
+            _windowMonitorTimer?.Dispose();
         }
 
         #endregion
@@ -817,6 +1130,8 @@ namespace EliteSoft.Erwin.AddIn.Services
         public string Message { get; set; }
         public string DomainName { get; set; }
         public string Pattern { get; set; }
+        public dynamic Attribute { get; set; }
+        public string ObjectId { get; set; }
     }
 
     /// <summary>

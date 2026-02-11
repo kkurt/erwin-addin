@@ -20,17 +20,13 @@ Write-Host "Running as Administrator" -ForegroundColor Green
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $scriptDir
 
-# Check if erwin is running and using the DLL
+# Check if erwin is running and close it
 $erwinProcess = Get-Process -Name "erwin" -ErrorAction SilentlyContinue
 if ($erwinProcess) {
-    Write-Host "`nWARNING: erwin is running and may lock the DLL." -ForegroundColor Yellow
-    $response = Read-Host "Close erwin before building? (Y/N)"
-    if ($response -eq "Y" -or $response -eq "y") {
-        Write-Host "Closing erwin..." -ForegroundColor Yellow
-        $erwinProcess | Stop-Process -Force
-        Start-Sleep -Seconds 2
-        Write-Host "erwin closed." -ForegroundColor Green
-    }
+    Write-Host "`nClosing erwin..." -ForegroundColor Yellow
+    $erwinProcess | Stop-Process -Force
+    Start-Sleep -Seconds 2
+    Write-Host "erwin closed." -ForegroundColor Green
 }
 
 # Build

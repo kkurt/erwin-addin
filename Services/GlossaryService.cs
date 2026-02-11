@@ -7,6 +7,16 @@ namespace EliteSoft.Erwin.AddIn.Services
     /// <summary>
     /// Service for loading and querying the GLOSSARY table from database.
     /// Uses GlossaryConnectionService to get connection info from GLOSSARY_CONNECTION_DEF table.
+    ///
+    /// GLOSSARY Table Schema:
+    ///   ID            int           (PK)
+    ///   NAME          varchar(50)   - Column name
+    ///   DATA_TYPE     varchar(50)   - Physical data type
+    ///   OWNER         varchar(50)   - Owner
+    ///   DB_TYPE       varchar(50)   - Database type
+    ///   KVKK          bit           - KVKK flag
+    ///   PCIDSS        bit           - PCI-DSS flag
+    ///   CLASSIFICATON varchar(50)   - Classification
     /// </summary>
     public class GlossaryService
     {
@@ -81,11 +91,29 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // Get glossary connection string from GLOSSARY_CONNECTION_DEF
                 string connectionString = glossaryConnService.GetGlossaryConnectionString();
                 string dbType = DatabaseService.Instance.GetDbType();
-                string query = GetGlossaryQuery(dbType);
 
                 using (var connection = DatabaseService.Instance.CreateConnection(dbType, connectionString))
                 {
                     connection.Open();
+
+                    // Try full query first, fall back to basic if extended columns don't exist
+                    bool hasExtendedColumns = true;
+                    string query = GetGlossaryQuery(dbType, true);
+
+                    try
+                    {
+                        using (var testCmd = connection.CreateCommand())
+                        {
+                            testCmd.CommandText = query;
+                            using (testCmd.ExecuteReader()) { }
+                        }
+                    }
+                    catch
+                    {
+                        hasExtendedColumns = false;
+                        query = GetGlossaryQuery(dbType, false);
+                        System.Diagnostics.Debug.WriteLine("GlossaryService: Extended columns not available, using basic query");
+                    }
 
                     using (var command = connection.CreateCommand())
                     {
@@ -98,13 +126,30 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 string dataType = reader["DATA_TYPE"]?.ToString()?.Trim() ?? "";
                                 string owner = reader["OWNER"]?.ToString()?.Trim() ?? "";
 
+                                string dbTypeVal = "";
+                                bool kvkk = false;
+                                bool pcidss = false;
+                                string classification = "";
+
+                                if (hasExtendedColumns)
+                                {
+                                    dbTypeVal = SafeReadString(reader, "DB_TYPE");
+                                    kvkk = SafeReadBool(reader, "KVKK");
+                                    pcidss = SafeReadBool(reader, "PCIDSS");
+                                    classification = SafeReadString(reader, "CLASSIFICATON");
+                                }
+
                                 if (!string.IsNullOrEmpty(name) && !_glossary.ContainsKey(name))
                                 {
                                     _glossary[name] = new GlossaryEntry
                                     {
                                         Name = name,
                                         DataType = dataType,
-                                        Owner = owner
+                                        Owner = owner,
+                                        DbType = dbTypeVal,
+                                        Kvkk = kvkk,
+                                        Pcidss = pcidss,
+                                        Classification = classification
                                     };
                                 }
                             }
@@ -125,22 +170,52 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
         }
 
+        private string SafeReadString(DbDataReader reader, string columnName)
+        {
+            try
+            {
+                var value = reader[columnName];
+                return value == null || value == DBNull.Value ? "" : value.ToString().Trim();
+            }
+            catch { return ""; }
+        }
+
+        private bool SafeReadBool(DbDataReader reader, string columnName)
+        {
+            try
+            {
+                var value = reader[columnName];
+                if (value == null || value == DBNull.Value) return false;
+                if (value is bool b) return b;
+                return Convert.ToBoolean(value);
+            }
+            catch { return false; }
+        }
+
         /// <summary>
         /// Gets the appropriate SQL query for the database type
         /// </summary>
-        private string GetGlossaryQuery(string dbType)
+        private string GetGlossaryQuery(string dbType, bool includeExtended)
         {
+            // Base columns: NAME, DATA_TYPE, OWNER (always exist)
+            // Extended columns: DB_TYPE, KVKK, PCIDSS, CLASSIFICATON
             switch (dbType?.ToUpper())
             {
                 case "POSTGRESQL":
-                    return "SELECT \"NAME\", \"DATA_TYPE\", \"OWNER\" FROM \"GLOSSARY\"";
+                    return includeExtended
+                        ? "SELECT \"NAME\", \"DATA_TYPE\", \"OWNER\", \"DB_TYPE\", \"KVKK\", \"PCIDSS\", \"CLASSIFICATON\" FROM \"GLOSSARY\""
+                        : "SELECT \"NAME\", \"DATA_TYPE\", \"OWNER\" FROM \"GLOSSARY\"";
 
                 case "ORACLE":
-                    return "SELECT NAME, DATA_TYPE, OWNER FROM GLOSSARY";
+                    return includeExtended
+                        ? "SELECT NAME, DATA_TYPE, OWNER, DB_TYPE, KVKK, PCIDSS, CLASSIFICATON FROM GLOSSARY"
+                        : "SELECT NAME, DATA_TYPE, OWNER FROM GLOSSARY";
 
                 case "MSSQL":
                 default:
-                    return "SELECT [NAME], [DATA_TYPE], [OWNER] FROM [dbo].[GLOSSARY]";
+                    return includeExtended
+                        ? "SELECT [NAME], [DATA_TYPE], [OWNER], [DB_TYPE], [KVKK], [PCIDSS], [CLASSIFICATON] FROM [dbo].[GLOSSARY]"
+                        : "SELECT [NAME], [DATA_TYPE], [OWNER] FROM [dbo].[GLOSSARY]";
             }
         }
 
@@ -189,11 +264,6 @@ namespace EliteSoft.Erwin.AddIn.Services
         public string ConnectionString => GlossaryConnectionService.Instance.GetGlossaryConnectionString();
 
         /// <summary>
-        /// Gets the current database type
-        /// </summary>
-        public string DbType => DatabaseService.Instance.GetDbType();
-
-        /// <summary>
         /// Checks if the database is configured
         /// </summary>
         public bool IsConfigured => DatabaseService.Instance.IsConfigured;
@@ -205,12 +275,16 @@ namespace EliteSoft.Erwin.AddIn.Services
     }
 
     /// <summary>
-    /// Represents a glossary entry
+    /// Represents a glossary entry matching the GLOSSARY table schema
     /// </summary>
     public class GlossaryEntry
     {
         public string Name { get; set; }
         public string DataType { get; set; }
         public string Owner { get; set; }
+        public string DbType { get; set; }
+        public bool Kvkk { get; set; }
+        public bool Pcidss { get; set; }
+        public string Classification { get; set; }
     }
 }

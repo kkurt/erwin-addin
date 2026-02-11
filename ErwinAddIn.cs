@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Windows.Forms;
 
 namespace EliteSoft.Erwin.AddIn
@@ -14,11 +15,48 @@ namespace EliteSoft.Erwin.AddIn
     [ClassInterface(ClassInterfaceType.AutoDual)]
     public class ErwinAddIn
     {
+        private static ModelConfigForm _activeForm = null;
+        private static bool _exceptionHandlerInstalled = false;
+
         public ErwinAddIn()
         {
         }
 
-        private static ModelConfigForm _activeForm = null;
+        /// <summary>
+        /// Install global exception handler to prevent erwin crash from COM exceptions.
+        /// </summary>
+        private static void EnsureExceptionHandler()
+        {
+            if (_exceptionHandlerInstalled) return;
+            _exceptionHandlerInstalled = true;
+
+            try
+            {
+                Application.ThreadException += Application_ThreadException;
+            }
+            catch { }
+        }
+
+        private static void Application_ThreadException(object sender, ThreadExceptionEventArgs e)
+        {
+            // Swallow COM exceptions to prevent erwin crash
+            System.Diagnostics.Debug.WriteLine($"ErwinAddIn ThreadException caught: {e.Exception.GetType().Name}: {e.Exception.Message}");
+
+            // If it's a COM-related exception and form is active, trigger session lost cleanup
+            if (_activeForm != null && !_activeForm.IsDisposed)
+            {
+                if (e.Exception is COMException ||
+                    e.Exception is InvalidComObjectException ||
+                    e.Exception is AccessViolationException ||
+                    e.Exception.Message.Contains("COM") ||
+                    e.Exception.Message.Contains("RPC") ||
+                    e.Exception.Message.Contains("0x800"))
+                {
+                    // Form will handle cleanup via HandleSessionLost
+                    System.Diagnostics.Debug.WriteLine("ErwinAddIn: COM exception caught - session may be lost");
+                }
+            }
+        }
 
         /// <summary>
         /// Called by erwin - parameterless version
@@ -27,6 +65,8 @@ namespace EliteSoft.Erwin.AddIn
         {
             try
             {
+                EnsureExceptionHandler();
+
                 // If form is already open, bring it to front
                 if (_activeForm != null && !_activeForm.IsDisposed)
                 {

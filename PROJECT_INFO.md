@@ -7,19 +7,8 @@
 | **Proje Adı** | EliteSoft.Erwin.AddIn |
 | **Platform** | .NET Framework 4.8 (x64) |
 | **Tip** | COM Visible DLL (erwin Add-In) |
+| **COM ProgID** | `EliteSoft.Erwin.AddIn` |
 | **Namespace** | EliteSoft.Erwin.AddIn |
-| **İlk Commit** | 19 Aralık 2025 |
-| **Son Commit** | 15 Ocak 2026 |
-| **Toplam Commit** | 23 |
-
-## Kod İstatistikleri
-
-| Metrik | Değer |
-|--------|-------|
-| **Toplam C# Dosyası** | 17 |
-| **Toplam Kod Satırı** | 6,614 |
-| **Servis Sınıfı** | 9 |
-| **Toplam Sınıf** | 31 |
 
 ## Dosya Bazlı Satır Sayıları
 
@@ -49,7 +38,6 @@
 ### Referanslar
 - **EAL.dll** - erwin API Library (SCAPI)
 - **System.Windows.Forms** - WinForms UI
-- **ErwinShared** - Paylaşılan kütüphane (erwin-admin projesi)
 
 ## Desteklenen Veritabanları
 - Microsoft SQL Server (MSSQL)
@@ -77,7 +65,7 @@ Services/
 
 | Sınıf | Sorumluluk |
 |-------|------------|
-| `ErwinAddIn` | COM Add-In giriş noktası |
+| `ErwinAddIn` | COM Add-In giriş noktası (ProgID: `EliteSoft.Erwin.AddIn`) |
 | `ModelConfigForm` | Ana kullanıcı arayüzü |
 | `ValidationCoordinatorService` | Glossary + Domain validasyonu (tek timer) |
 | `TableTypeMonitorService` | TABLE_TYPE UDP değişiklik izleme |
@@ -94,6 +82,7 @@ Services/
 - Kolon adlarını GLOSSARY tablosuna karşı doğrulama
 - Yeni/değişen kolon adları için otomatik kontrol
 - Bulunamayan kolonlar için uyarı
+- Glossary'den Physical_Data_Type otomatik atama
 
 ### 3. Domain Validasyonu
 - Parent Domain seçildiğinde kolon adı pattern kontrolü
@@ -101,7 +90,7 @@ Services/
 - Otomatik Description ve Data Type atama
 
 ### 4. TABLE_TYPE Yönetimi
-- Tablo tipi UDP otomatik oluşturma
+- Tablo tipi UDP otomatik oluşturma (metamodel seviyesinde)
 - Tablo tipi değişikliklerinde PREDEFINED_COLUMN ekleme
 - LOG, PARAMETER, TRANSACTION, HISTORY tipleri desteği
 
@@ -114,14 +103,6 @@ Services/
 - Glossary ve Domain hatalarını tek pencerede gösterme
 - Tek timer ile senkronize kontrol
 
-## Katkıda Bulunanlar
-
-| Geliştirici | Commit Sayısı |
-|-------------|---------------|
-| Kursat | 15 |
-| kkurt | 7 |
-| unknown | 1 |
-
 ## Teknik Notlar
 
 ### erwin SCAPI Kullanımı
@@ -129,6 +110,12 @@ Services/
 - Transaction: `BeginNamedTransaction`, `CommitTransaction`, `RollbackTransaction`
 - Model nesneleri: `modelObjects.Collect(parent, "ObjectType")`
 - Attribute oluşturma: `modelObjects.Collect(entity).Add("Attribute")`
+- **SCAPI ProgID:** erwin 15.x için bile `erwin9.SCAPI` kullanılır
+
+### UDP Yönetimi
+- TABLE_TYPE UDP metamodel seviyesinde oluşturulur
+- ModelConfigForm add-in başlatılırken metamodel session açarak UDP'leri oluşturur
+- Validasyon servisleri bu UDP'leri kullanarak kolon ve tablo özelliklerini yönetir
 
 ### Validasyon Zamanlama
 - Tek merkezi timer: 1.5 saniye interval
@@ -136,4 +123,4 @@ Services/
 - Batch operasyonlarda suspend/resume mekanizması
 
 ---
-*Son güncelleme: 15 Ocak 2026*
+*Son güncelleme: Şubat 2026*

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Linq;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using EliteSoft.Erwin.AddIn.Services;
 
@@ -39,6 +40,7 @@ namespace EliteSoft.Erwin.AddIn
         // State tracking
         private Timer _glossaryRefreshTimer;
         private DateTime? _lastGlossaryRefreshTime;
+        private volatile bool _isRefreshingGlossary;
 
         #endregion
 
@@ -139,7 +141,17 @@ namespace EliteSoft.Erwin.AddIn
                 EnableControls(true);
                 UpdateStatus("Connected to model.", Color.DarkGreen);
 
-                InitializeValidationService();
+                Form loadingDialog = null;
+                try
+                {
+                    loadingDialog = ShowLoadingDialog("Please Wait...");
+                    InitializeValidationService();
+                }
+                finally
+                {
+                    loadingDialog?.Close();
+                    loadingDialog?.Dispose();
+                }
             }
             catch (Exception ex)
             {
@@ -180,24 +192,23 @@ namespace EliteSoft.Erwin.AddIn
             LoadGlossary();
             LoadTableTypes();
             LoadDomainDefs();
-            EnsureTableTypeUdpExists();
-            bool ownerUdpExists = EnsureOwnerUdpExists();
-            // Note: Domain Parent is erwin's built-in feature, no custom UDP needed
+            EnsureAllUdpsExist();
 
             // ColumnValidationService is kept for ValidateAll button functionality only (no monitoring)
             _validationService = new ColumnValidationService(_session);
             btnValidateAll.Enabled = true;
 
-            // Initialize TABLE_TYPE monitor service
+            // Initialize TABLE_TYPE monitor service (timer managed by coordinator)
             _tableTypeMonitorService = new TableTypeMonitorService(_session);
             _tableTypeMonitorService.OnLog += Log;
             _tableTypeMonitorService.TakeSnapshot();
             _tableTypeMonitorService.StartMonitoring();
 
-            // Initialize unified validation coordinator (single timer for glossary + domain validation)
+            // Initialize unified validation coordinator (single timer for all monitoring)
             _validationCoordinatorService = new ValidationCoordinatorService(_session);
             _validationCoordinatorService.OnLog += Log;
-            _validationCoordinatorService.SetOwnerUdpExists(ownerUdpExists);
+            _validationCoordinatorService.OnSessionLost += HandleSessionLost;
+            _validationCoordinatorService.SetTableTypeMonitor(_tableTypeMonitorService);
             _validationCoordinatorService.StartMonitoring();
 
             // Load tables for Table Processes tab
@@ -322,27 +333,48 @@ namespace EliteSoft.Erwin.AddIn
 
         private void GlossaryRefreshTimer_Tick(object sender, EventArgs e)
         {
-            try
-            {
-                RefreshGlossarySilently();
-            }
-            catch (Exception ex)
-            {
-                Log($"Glossary refresh error: {ex.Message}");
-            }
+            // Prevent re-entrancy - skip if already refreshing
+            if (_isRefreshingGlossary) return;
+
+            // Run on background thread to avoid UI freeze
+            Task.Run(() => RefreshGlossarySilently());
         }
 
         private void RefreshGlossarySilently()
         {
+            if (_isRefreshingGlossary) return;
             if (!DatabaseService.Instance.IsConfigured) return;
 
-            GlossaryService.Instance.Reload();
-            _lastGlossaryRefreshTime = DateTime.Now;
-            UpdateLastRefreshLabel();
-
-            if (GlossaryService.Instance.IsLoaded)
+            try
             {
-                Log($"Glossary auto-refreshed: {GlossaryService.Instance.Count} entries");
+                _isRefreshingGlossary = true;
+
+                GlossaryService.Instance.Reload();
+                _lastGlossaryRefreshTime = DateTime.Now;
+
+                // Update UI on main thread
+                if (!IsDisposed && IsHandleCreated)
+                {
+                    BeginInvoke(new Action(() =>
+                    {
+                        UpdateLastRefreshLabel();
+                        if (GlossaryService.Instance.IsLoaded)
+                        {
+                            Log($"Glossary auto-refreshed: {GlossaryService.Instance.Count} entries");
+                        }
+                    }));
+                }
+            }
+            catch (Exception ex)
+            {
+                if (!IsDisposed && IsHandleCreated)
+                {
+                    BeginInvoke(new Action(() => Log($"Glossary refresh error: {ex.Message}")));
+                }
+            }
+            finally
+            {
+                _isRefreshingGlossary = false;
             }
         }
 
@@ -567,314 +599,119 @@ namespace EliteSoft.Erwin.AddIn
             }
         }
 
-        private void EnsureTableTypeUdpExists()
+        /// <summary>
+        /// Ensures all UDPs exist using a SINGLE metamodel session.
+        /// Creates TABLE_TYPE (Entity, List) and OWNER/KVKK/PCIDSS/CLASSIFICATION (Attribute, Text).
+        /// </summary>
+        private void EnsureAllUdpsExist()
         {
+            dynamic metamodelSession = null;
             try
             {
-                var tableTypeService = TableTypeService.Instance;
-                if (!tableTypeService.IsLoaded || tableTypeService.Count == 0)
-                {
-                    Log("TABLE_TYPE service not loaded - skipping UDP creation");
-                    return;
-                }
+                metamodelSession = _scapi.Sessions.Add();
+                metamodelSession.Open(_currentModel, 1); // SCD_SL_M1 = Metamodel level
 
-                if (CheckTableTypeUdpExists())
-                {
-                    Log("TABLE_TYPE UDP already exists - skipping creation");
-                    return;
-                }
+                dynamic mmObjects = metamodelSession.ModelObjects;
+                dynamic mmRoot = mmObjects.Root;
 
-                Log("TABLE_TYPE UDP not found - creating...");
-                if (CreateTableTypeUdp(tableTypeService.GetNamesAsCommaSeparated()))
-                {
-                    Log("TABLE_TYPE UDP created successfully!");
-                }
-                else
-                {
-                    Log("Failed to create TABLE_TYPE UDP (may already exist)");
-                }
-            }
-            catch (Exception ex)
-            {
-                Log($"EnsureTableTypeUdpExists error: {ex.Message}");
-            }
-        }
-
-        private bool CheckTableTypeUdpExists()
-        {
-            try
-            {
-                dynamic modelObjects = _session.ModelObjects;
-                dynamic root = modelObjects.Root;
-
-                // Method 1: Check Property_Type objects
+                // Collect all existing Property_Type names in one pass
+                var existingUdps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 try
                 {
-                    dynamic propertyTypes = modelObjects.Collect(root, "Property_Type");
+                    dynamic propertyTypes = mmObjects.Collect(mmRoot, "Property_Type");
                     foreach (dynamic pt in propertyTypes)
                     {
                         if (pt == null) continue;
-                        string ptName = "";
-                        try { ptName = pt.Name ?? ""; } catch { continue; }
-
-                        if (ptName.Equals("Entity.Physical.TABLE_TYPE", StringComparison.OrdinalIgnoreCase))
-                        {
-                            return true;
-                        }
+                        try { existingUdps.Add(pt.Name ?? ""); } catch { }
                     }
                 }
                 catch (Exception ex)
                 {
-                    Log($"Property_Type enumeration failed: {ex.Message}");
+                    Log($"Metamodel Property_Type enumeration failed: {ex.Message}");
                 }
 
-                // Method 2: Try to access UDP on an entity
-                try
+                Log($"Found {existingUdps.Count} existing Property_Type entries");
+
+                // TABLE_TYPE UDP (Entity, List type)
+                var tableTypeService = TableTypeService.Instance;
+                if (tableTypeService.IsLoaded && tableTypeService.Count > 0)
                 {
-                    dynamic entities = modelObjects.Collect(root, "Entity");
-                    foreach (dynamic entity in entities)
+                    if (existingUdps.Contains("Entity.Physical.TABLE_TYPE"))
                     {
-                        if (entity == null) continue;
+                        Log("TABLE_TYPE UDP already exists - skipping");
+                    }
+                    else
+                    {
+                        string listValues = tableTypeService.GetNamesAsCommaSeparated();
+                        int transId = metamodelSession.BeginNamedTransaction("CreateTableTypeUDP");
                         try
                         {
-                            var udpValue = entity.Properties("Entity.Physical.TABLE_TYPE");
-                            if (udpValue != null) return true;
+                            dynamic udpType = mmObjects.Add("Property_Type");
+                            udpType.Properties("Name").Value = "Entity.Physical.TABLE_TYPE";
+                            TrySetProperty(udpType, "tag_Udp_Owner_Type", "Entity");
+                            TrySetProperty(udpType, "tag_Is_Physical", true);
+                            TrySetProperty(udpType, "tag_Is_Logical", false);
+                            TrySetProperty(udpType, "tag_Udp_Data_Type", 6); // List type
+                            TrySetProperty(udpType, "tag_Udp_Values_List", listValues);
+                            string defaultValue = listValues.Split(',').FirstOrDefault()?.Trim() ?? "";
+                            if (!string.IsNullOrEmpty(defaultValue))
+                                TrySetProperty(udpType, "tag_Udp_Default_Value", defaultValue);
+                            TrySetProperty(udpType, "tag_Order", "1");
+                            TrySetProperty(udpType, "tag_Is_Locally_Defined", true);
+                            metamodelSession.CommitTransaction(transId);
+                            Log("TABLE_TYPE UDP created");
                         }
-                        catch { }
-                        break;
-                    }
-                }
-                catch { }
-
-                return false;
-            }
-            catch (Exception ex)
-            {
-                Log($"CheckTableTypeUdpExists error: {ex.Message}");
-                return false;
-            }
-        }
-
-        private bool CreateTableTypeUdp(string listValues)
-        {
-            dynamic metamodelSession = null;
-            try
-            {
-                Log($"Creating TABLE_TYPE UDP with values: {listValues}");
-
-                metamodelSession = _scapi.Sessions.Add();
-                metamodelSession.Open(_currentModel, 1); // SCD_SL_M1 = Metamodel level
-
-                int transId = metamodelSession.BeginNamedTransaction("CreateTableTypeUDP");
-
-                try
-                {
-                    dynamic mmObjects = metamodelSession.ModelObjects;
-                    dynamic udpType = mmObjects.Add("Property_Type");
-
-                    udpType.Properties("Name").Value = "Entity.Physical.TABLE_TYPE";
-
-                    TrySetProperty(udpType, "tag_Udp_Owner_Type", "Entity");
-                    TrySetProperty(udpType, "tag_Is_Physical", true);
-                    TrySetProperty(udpType, "tag_Is_Logical", false);
-                    TrySetProperty(udpType, "tag_Udp_Data_Type", 6); // List type
-                    TrySetProperty(udpType, "tag_Udp_Values_List", listValues);
-
-                    string defaultValue = listValues.Split(',').FirstOrDefault()?.Trim() ?? "";
-                    if (!string.IsNullOrEmpty(defaultValue))
-                    {
-                        TrySetProperty(udpType, "tag_Udp_Default_Value", defaultValue);
-                    }
-
-                    TrySetProperty(udpType, "tag_Order", "1");
-                    TrySetProperty(udpType, "tag_Is_Locally_Defined", true);
-
-                    metamodelSession.CommitTransaction(transId);
-                    Log("TABLE_TYPE UDP transaction committed");
-                    return true;
-                }
-                catch (Exception ex)
-                {
-                    if (ex.Message.Contains("must be unique") || ex.Message.Contains("EBS-1057"))
-                    {
-                        Log("TABLE_TYPE UDP already exists (detected via unique constraint)");
-                        try { metamodelSession.RollbackTransaction(transId); } catch { }
-                        return true;
-                    }
-
-                    Log($"Error creating TABLE_TYPE UDP: {ex.Message}");
-                    try { metamodelSession.RollbackTransaction(transId); } catch { }
-                    return false;
-                }
-            }
-            catch (Exception ex)
-            {
-                if (ex.Message.Contains("must be unique") || ex.Message.Contains("EBS-1057"))
-                {
-                    Log("TABLE_TYPE UDP already exists (detected via unique constraint)");
-                    return true;
-                }
-
-                Log($"Metamodel session error: {ex.Message}");
-                return false;
-            }
-            finally
-            {
-                if (metamodelSession != null)
-                {
-                    try { metamodelSession.Close(); } catch { }
-                }
-            }
-        }
-
-        private bool EnsureOwnerUdpExists()
-        {
-            try
-            {
-                if (CheckOwnerUdpExists())
-                {
-                    Log("OWNER UDP already exists - skipping creation");
-                    return true;
-                }
-
-                Log("OWNER UDP not found - creating...");
-                if (CreateOwnerUdp())
-                {
-                    Log("OWNER UDP created successfully!");
-                    return true;
-                }
-                else
-                {
-                    Log("Failed to create OWNER UDP");
-                    return false;
-                }
-            }
-            catch (Exception ex)
-            {
-                Log($"EnsureOwnerUdpExists error: {ex.Message}");
-                return false;
-            }
-        }
-
-        private bool CheckOwnerUdpExists()
-        {
-            try
-            {
-                dynamic modelObjects = _session.ModelObjects;
-                dynamic root = modelObjects.Root;
-
-                // Method 1: Check Property_Type objects
-                try
-                {
-                    dynamic propertyTypes = modelObjects.Collect(root, "Property_Type");
-                    foreach (dynamic pt in propertyTypes)
-                    {
-                        if (pt == null) continue;
-                        string ptName = "";
-                        try { ptName = pt.Name ?? ""; } catch { continue; }
-
-                        if (ptName.Equals("Attribute.Physical.OWNER", StringComparison.OrdinalIgnoreCase))
+                        catch (Exception ex)
                         {
-                            return true;
+                            try { metamodelSession.RollbackTransaction(transId); } catch { }
+                            if (ex.Message.Contains("must be unique") || ex.Message.Contains("EBS-1057"))
+                                Log("TABLE_TYPE UDP already exists (unique constraint)");
+                            else
+                                Log($"Error creating TABLE_TYPE UDP: {ex.Message}");
                         }
                     }
                 }
-                catch (Exception ex)
-                {
-                    Log($"Property_Type enumeration for OWNER failed: {ex.Message}");
-                }
 
-                // Method 2: Try to access UDP on an attribute
-                try
+                // Glossary UDPs (Attribute, Text type): OWNER, KVKK, PCIDSS, CLASSIFICATION
+                string[] glossaryUdps = { "OWNER", "KVKK", "PCIDSS", "CLASSIFICATION" };
+                foreach (var udpName in glossaryUdps)
                 {
-                    dynamic entities = modelObjects.Collect(root, "Entity");
-                    foreach (dynamic entity in entities)
+                    string fullName = $"Attribute.Physical.{udpName}";
+                    if (existingUdps.Contains(fullName))
                     {
-                        if (entity == null) continue;
-
-                        dynamic attrs = null;
-                        try { attrs = modelObjects.Collect(entity, "Attribute"); } catch { continue; }
-                        if (attrs == null) continue;
-
-                        foreach (dynamic attr in attrs)
-                        {
-                            if (attr == null) continue;
-                            try
-                            {
-                                var udpValue = attr.Properties("Attribute.Physical.OWNER");
-                                if (udpValue != null) return true;
-                            }
-                            catch { }
-                            break;
-                        }
-                        break;
+                        Log($"{fullName} UDP already exists - skipping");
+                        continue;
                     }
-                }
-                catch { }
 
-                return false;
-            }
-            catch (Exception ex)
-            {
-                Log($"CheckOwnerUdpExists error: {ex.Message}");
-                return false;
-            }
-        }
-
-        private bool CreateOwnerUdp()
-        {
-            dynamic metamodelSession = null;
-            try
-            {
-                Log("Creating OWNER UDP (Text type for Attribute.Physical)...");
-
-                metamodelSession = _scapi.Sessions.Add();
-                metamodelSession.Open(_currentModel, 1); // SCD_SL_M1 = Metamodel level
-
-                int transId = metamodelSession.BeginNamedTransaction("CreateOwnerUDP");
-
-                try
-                {
-                    dynamic mmObjects = metamodelSession.ModelObjects;
-                    dynamic udpType = mmObjects.Add("Property_Type");
-
-                    udpType.Properties("Name").Value = "Attribute.Physical.OWNER";
-
-                    TrySetProperty(udpType, "tag_Udp_Owner_Type", "Attribute");
-                    TrySetProperty(udpType, "tag_Is_Physical", true);
-                    TrySetProperty(udpType, "tag_Is_Logical", false);
-                    TrySetProperty(udpType, "tag_Udp_Data_Type", 1); // Text type (1 = Text, 6 = List)
-                    TrySetProperty(udpType, "tag_Order", "1");
-                    TrySetProperty(udpType, "tag_Is_Locally_Defined", true);
-
-                    metamodelSession.CommitTransaction(transId);
-                    Log("OWNER UDP transaction committed");
-                    return true;
-                }
-                catch (Exception ex)
-                {
-                    if (ex.Message.Contains("must be unique") || ex.Message.Contains("EBS-1057"))
+                    int transId = metamodelSession.BeginNamedTransaction($"Create_{udpName}");
+                    try
                     {
-                        Log("OWNER UDP already exists (detected via unique constraint)");
+                        dynamic udpType = mmObjects.Add("Property_Type");
+                        udpType.Properties("Name").Value = fullName;
+                        TrySetProperty(udpType, "tag_Udp_Owner_Type", "Attribute");
+                        TrySetProperty(udpType, "tag_Is_Physical", true);
+                        TrySetProperty(udpType, "tag_Is_Logical", false);
+                        TrySetProperty(udpType, "tag_Udp_Data_Type", 1); // Text type
+                        TrySetProperty(udpType, "tag_Order", "1");
+                        TrySetProperty(udpType, "tag_Is_Locally_Defined", true);
+                        metamodelSession.CommitTransaction(transId);
+                        Log($"{fullName} UDP created");
+                    }
+                    catch (Exception ex)
+                    {
                         try { metamodelSession.RollbackTransaction(transId); } catch { }
-                        return true;
+                        if (ex.Message.Contains("must be unique") || ex.Message.Contains("EBS-1057"))
+                            Log($"{fullName} UDP already exists (unique constraint)");
+                        else
+                            Log($"Error creating {fullName} UDP: {ex.Message}");
                     }
-
-                    Log($"Error creating OWNER UDP: {ex.Message}");
-                    try { metamodelSession.RollbackTransaction(transId); } catch { }
-                    return false;
                 }
+
+                Log("All UDPs ensured");
             }
             catch (Exception ex)
             {
-                if (ex.Message.Contains("must be unique") || ex.Message.Contains("EBS-1057"))
-                {
-                    Log("OWNER UDP already exists (detected via unique constraint)");
-                    return true;
-                }
-
-                Log($"Metamodel session error for OWNER UDP: {ex.Message}");
-                return false;
+                Log($"EnsureAllUdpsExist error: {ex.Message}");
             }
             finally
             {
@@ -1554,9 +1391,11 @@ namespace EliteSoft.Erwin.AddIn
 
         private void Log(string message)
         {
+            if (IsDisposed || txtDebugLog == null || txtDebugLog.IsDisposed) return;
+
             if (InvokeRequired)
             {
-                Invoke(new Action(() => Log(message)));
+                try { Invoke(new Action(() => Log(message))); } catch { }
                 return;
             }
 
@@ -1564,7 +1403,6 @@ namespace EliteSoft.Erwin.AddIn
             txtDebugLog.AppendText($"[{timestamp}] {message}\r\n");
             txtDebugLog.SelectionStart = txtDebugLog.Text.Length;
             txtDebugLog.ScrollToCaret();
-            Application.DoEvents();
         }
 
         private void BtnClearLog_Click(object sender, EventArgs e)
@@ -1588,6 +1426,35 @@ namespace EliteSoft.Erwin.AddIn
         private void BtnClose_Click(object sender, EventArgs e)
         {
             Close();
+        }
+
+        private Form ShowLoadingDialog(string message)
+        {
+            var loadingForm = new Form
+            {
+                Text = "Elite Soft Erwin Add-In",
+                Size = new Size(350, 130),
+                StartPosition = FormStartPosition.CenterParent,
+                FormBorderStyle = FormBorderStyle.FixedDialog,
+                MaximizeBox = false,
+                MinimizeBox = false,
+                ControlBox = false,
+                ShowInTaskbar = false
+            };
+
+            var label = new Label
+            {
+                Text = message,
+                Font = new Font("Segoe UI", 12, FontStyle.Regular),
+                AutoSize = false,
+                TextAlign = ContentAlignment.MiddleCenter,
+                Dock = DockStyle.Fill
+            };
+
+            loadingForm.Controls.Add(label);
+            loadingForm.Show(this);
+            Application.DoEvents();
+            return loadingForm;
         }
 
         private void UpdateConnectionStatus(string status, Color color)
@@ -1656,31 +1523,6 @@ namespace EliteSoft.Erwin.AddIn
             }
         }
 
-        private bool TrySetOwnerUdp(dynamic attr, string ownerValue, string attributeName)
-        {
-            try
-            {
-                attr.Properties("Attribute.Physical.OWNER").Value = ownerValue;
-                Log($"Set OWNER UDP = '{ownerValue}' for {attributeName}");
-                return true;
-            }
-            catch { }
-
-            try
-            {
-                var props = attr.CollectProperties("Attribute.Physical.OWNER");
-                if (props != null && props.Count > 0)
-                {
-                    props.Item(0).Value = ownerValue;
-                    Log($"Set OWNER via CollectProperties = '{ownerValue}' for {attributeName}");
-                    return true;
-                }
-            }
-            catch { }
-
-            return false;
-        }
-
         #endregion
 
         #region Resource Cleanup
@@ -1700,6 +1542,37 @@ namespace EliteSoft.Erwin.AddIn
             _validationCoordinatorService?.Dispose();
         }
 
+        /// <summary>
+        /// Called when the SCAPI session becomes invalid (model closed from erwin).
+        /// Safely stops all services without trying to access the dead session.
+        /// </summary>
+        private void HandleSessionLost()
+        {
+            if (InvokeRequired)
+            {
+                try { BeginInvoke(new Action(HandleSessionLost)); } catch { }
+                return;
+            }
+
+            Log("Model closed - session lost. Cleaning up services.");
+
+            try
+            {
+                _glossaryRefreshTimer?.Stop();
+                _glossaryRefreshTimer?.Dispose();
+                _glossaryRefreshTimer = null;
+
+                DisposeServices();
+                _validationService = null;
+                _tableTypeMonitorService = null;
+                _validationCoordinatorService = null;
+
+                // Don't try _session.Close() — session is already dead
+                _session = null;
+            }
+            catch { }
+        }
+
         private void CleanupResources()
         {
             try
@@ -1713,8 +1586,8 @@ namespace EliteSoft.Erwin.AddIn
                 _tableTypeMonitorService = null;
                 _validationCoordinatorService = null;
 
-                _session?.Close();
-                _scapi?.Sessions?.Clear();
+                try { _session?.Close(); } catch { }
+                try { _scapi?.Sessions?.Clear(); } catch { }
             }
             catch { }
         }
