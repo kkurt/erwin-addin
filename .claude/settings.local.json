@@ -80,7 +80,8 @@
       "Bash(C:WindowsMicrosoft.NETFramework64v4.0.30319RegAsm.exe binReleasenet48EliteSoft.Erwin.AddIn.dll /codebase /tlb)",
       "Bash(del \"c:\\\\Users\\\\Administrator\\\\source\\\\repos\\\\erwin-addin\\\\Services\\\\ValidationResultCollector.cs\")",
       "Bash(git remote add:*)",
-      "Bash(git push:*)"
+      "Bash(git push:*)",
+      "Bash(Select-Object -First 20)"
     ]
   }
 }
