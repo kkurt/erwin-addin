@@ -39,6 +39,7 @@ namespace EliteSoft.Erwin.AddIn
 
         // State tracking
         private Timer _glossaryRefreshTimer;
+        private Timer _reconnectTimer;
         private DateTime? _lastGlossaryRefreshTime;
         private volatile bool _isRefreshingGlossary;
 
@@ -136,6 +137,7 @@ namespace EliteSoft.Erwin.AddIn
                 _session.Open(_currentModel);
 
                 _isConnected = true;
+                StopReconnectTimer();
                 UpdateConnectionStatus(StatusConnected, Color.DarkGreen);
                 LoadExistingValues();
                 EnableControls(true);
@@ -182,6 +184,77 @@ namespace EliteSoft.Erwin.AddIn
 
         #endregion
 
+        #region Reconnect Timer
+
+        private void StartReconnectTimer()
+        {
+            StopReconnectTimer();
+            _reconnectTimer = new Timer { Interval = 3000 }; // Poll every 3 seconds
+            _reconnectTimer.Tick += ReconnectTimer_Tick;
+            _reconnectTimer.Start();
+            Log("Reconnect timer started - waiting for model to open...");
+        }
+
+        private void StopReconnectTimer()
+        {
+            if (_reconnectTimer != null)
+            {
+                _reconnectTimer.Stop();
+                _reconnectTimer.Dispose();
+                _reconnectTimer = null;
+            }
+        }
+
+        private void ReconnectTimer_Tick(object sender, EventArgs e)
+        {
+            if (_isConnected)
+            {
+                StopReconnectTimer();
+                return;
+            }
+
+            try
+            {
+                dynamic persistenceUnits = _scapi.PersistenceUnits;
+                int count = persistenceUnits.Count;
+                if (count > 0)
+                {
+                    Log($"Model detected ({count} open). Reconnecting...");
+                    StopReconnectTimer();
+
+                    // Directly populate models and connect (bypass LoadOpenModels to avoid error dialogs)
+                    cmbModels.Items.Clear();
+                    _openModels.Clear();
+
+                    for (int i = 0; i < count; i++)
+                    {
+                        dynamic model = persistenceUnits.Item(i);
+                        _openModels.Add(model);
+                        string modelName = GetModelName(model) ?? $"(Model {i + 1})";
+                        cmbModels.Items.Add(modelName);
+                    }
+
+                    cmbModels.Enabled = true;
+                    if (_openModels.Count > 0)
+                    {
+                        cmbModels.SelectedIndex = 0;
+                        // Force connect if SelectedIndexChanged didn't trigger
+                        if (!_isConnected)
+                        {
+                            Log("SelectedIndexChanged did not trigger, forcing ConnectToModel...");
+                            ConnectToModel(0);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"Reconnect poll error: {ex.Message}");
+            }
+        }
+
+        #endregion
+
         #region Validation Service
 
         private void InitializeValidationService()
@@ -205,7 +278,7 @@ namespace EliteSoft.Erwin.AddIn
             _tableTypeMonitorService.StartMonitoring();
 
             // Initialize unified validation coordinator (single timer for all monitoring)
-            _validationCoordinatorService = new ValidationCoordinatorService(_session);
+            _validationCoordinatorService = new ValidationCoordinatorService(_session, _scapi);
             _validationCoordinatorService.OnLog += Log;
             _validationCoordinatorService.OnSessionLost += HandleSessionLost;
             _validationCoordinatorService.SetTableTypeMonitor(_tableTypeMonitorService);
@@ -1529,10 +1602,13 @@ namespace EliteSoft.Erwin.AddIn
 
         private void CloseCurrentSession()
         {
-            if (_session != null)
+            if (_session != null && _isConnected)
             {
+                // Only close if we believe the session is still alive.
+                // Calling Close() on a dead COM object causes a native crash in erwin.
                 try { _session.Close(); } catch { }
             }
+            _session = null;
         }
 
         private void DisposeServices()
@@ -1567,8 +1643,27 @@ namespace EliteSoft.Erwin.AddIn
                 _tableTypeMonitorService = null;
                 _validationCoordinatorService = null;
 
-                // Don't try _session.Close() — session is already dead
+                // Don't try _session.Close() — session is already dead (native crash risk)
                 _session = null;
+                _currentModel = null;
+                _isConnected = false;
+
+                // Clear stale model references to prevent user from selecting dead COM objects
+                _openModels.Clear();
+                cmbModels.Items.Clear();
+                cmbModels.Items.Add("(Waiting for model...)");
+                cmbModels.SelectedIndex = 0;
+                cmbModels.Enabled = false;
+
+                // Reset UI to disconnected state
+                UpdateConnectionStatus(StatusDisconnected, Color.Red);
+                EnableControls(false);
+                btnValidateAll.Enabled = false;
+                UpdateStatus("Model closed. Waiting for a model to open...", Color.Gray);
+
+                // Start reconnect timer to poll for new models
+                InitializeGlossaryRefreshTimer();
+                StartReconnectTimer();
             }
             catch { }
         }
@@ -1577,6 +1672,8 @@ namespace EliteSoft.Erwin.AddIn
         {
             try
             {
+                StopReconnectTimer();
+
                 _glossaryRefreshTimer?.Stop();
                 _glossaryRefreshTimer?.Dispose();
                 _glossaryRefreshTimer = null;

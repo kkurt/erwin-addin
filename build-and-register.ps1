@@ -1,5 +1,6 @@
 # Elite Soft Erwin Add-In Build and Register Script
 # Auto-elevates to Administrator if needed
+# Installs to C:\Program Files\EliteSoft\ErwinAddIn (accessible by all users)
 
 $ErrorActionPreference = "Stop"
 
@@ -20,6 +21,9 @@ Write-Host "Running as Administrator" -ForegroundColor Green
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $scriptDir
 
+# Install directory (accessible by all users)
+$installDir = "C:\Program Files\EliteSoft\ErwinAddIn"
+
 # Check if erwin is running and close it
 $erwinProcess = Get-Process -Name "erwin" -ErrorAction SilentlyContinue
 if ($erwinProcess) {
@@ -30,7 +34,7 @@ if ($erwinProcess) {
 }
 
 # Build
-Write-Host "`n[1/3] Building project..." -ForegroundColor Yellow
+Write-Host "`n[1/4] Building project..." -ForegroundColor Yellow
 dotnet clean erwin-addin.sln
 dotnet build erwin-addin.sln -c Release
 
@@ -43,29 +47,54 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host "Build successful!" -ForegroundColor Green
 
-$dllPath = Join-Path $scriptDir "bin\Release\net48\EliteSoft.Erwin.AddIn.dll"
-$tlbPath = Join-Path $scriptDir "bin\Release\net48\EliteSoft.Erwin.AddIn.tlb"
+$buildOutputDir = Join-Path $scriptDir "bin\Release\net48"
 $regasm = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\regasm.exe"
 
-if (-not (Test-Path $dllPath)) {
-    Write-Host "DLL not found: $dllPath" -ForegroundColor Red
+if (-not (Test-Path (Join-Path $buildOutputDir "EliteSoft.Erwin.AddIn.dll"))) {
+    Write-Host "DLL not found in build output!" -ForegroundColor Red
     Write-Host "`nPress any key to exit..." -ForegroundColor Gray
     $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
     exit 1
 }
 
-# Unregister first (if exists)
-Write-Host "`n[2/3] Unregistering old version (if exists)..." -ForegroundColor Yellow
-& $regasm $dllPath /unregister 2>&1 | Out-Null
-if ($LASTEXITCODE -eq 0) {
-    Write-Host "  Old version unregistered successfully" -ForegroundColor Green
+# Unregister old version (if exists)
+Write-Host "`n[2/4] Unregistering old version (if exists)..." -ForegroundColor Yellow
+$oldDll = Join-Path $installDir "EliteSoft.Erwin.AddIn.dll"
+if (Test-Path $oldDll) {
+    & $regasm $oldDll /unregister 2>&1 | Out-Null
+    Write-Host "  Old version unregistered" -ForegroundColor Green
 } else {
-    Write-Host "  No previous registration found (OK)" -ForegroundColor Gray
+    # Try unregistering from build directory too (in case previously registered from there)
+    & $regasm (Join-Path $buildOutputDir "EliteSoft.Erwin.AddIn.dll") /unregister 2>&1 | Out-Null
+    Write-Host "  No previous installation found (OK)" -ForegroundColor Gray
 }
 
-# Register COM with Type Library
-Write-Host "`n[3/3] Registering COM with Type Library..." -ForegroundColor Yellow
-& $regasm $dllPath /codebase /tlb:$tlbPath
+# Copy files to shared install directory
+Write-Host "`n[3/4] Installing to $installDir ..." -ForegroundColor Yellow
+if (-not (Test-Path $installDir)) {
+    New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+    Write-Host "  Created install directory" -ForegroundColor Green
+}
+
+# Copy all DLLs and dependencies
+$filesToCopy = Get-ChildItem -Path $buildOutputDir -Include "*.dll","*.tlb","*.pdb","*.config" -Recurse
+foreach ($file in $filesToCopy) {
+    Copy-Item -Path $file.FullName -Destination $installDir -Force
+}
+Write-Host "  Copied $($filesToCopy.Count) files to install directory" -ForegroundColor Green
+
+# Set read permissions for all users
+$acl = Get-Acl $installDir
+$rule = New-Object System.Security.AccessControl.FileSystemAccessRule("Users", "ReadAndExecute", "ContainerInherit,ObjectInherit", "None", "Allow")
+$acl.SetAccessRule($rule)
+Set-Acl $installDir $acl
+Write-Host "  Set read permissions for all users" -ForegroundColor Green
+
+# Register COM with Type Library from install directory
+Write-Host "`n[4/4] Registering COM with Type Library..." -ForegroundColor Yellow
+$installedDll = Join-Path $installDir "EliteSoft.Erwin.AddIn.dll"
+$installedTlb = Join-Path $installDir "EliteSoft.Erwin.AddIn.tlb"
+& $regasm $installedDll /codebase /tlb:$installedTlb
 
 if ($LASTEXITCODE -eq 0) {
     Write-Host "`nRegistration successful!" -ForegroundColor Green
@@ -80,11 +109,13 @@ if ($LASTEXITCODE -eq 0) {
         Write-Host "  ProgID '$progId' NOT FOUND in registry!" -ForegroundColor Red
     }
 
-    Write-Host "`nFiles created:" -ForegroundColor Cyan
-    Write-Host "  DLL: $dllPath"
-    Write-Host "  TLB: $tlbPath"
+    Write-Host "`nInstalled to:" -ForegroundColor Cyan
+    Write-Host "  $installDir"
 
-    Write-Host "`nProgID for erwin: EliteSoft.Erwin.AddIn" -ForegroundColor Yellow
+    Write-Host "`nFor other users:" -ForegroundColor Yellow
+    Write-Host "  1. Open erwin Data Modeler"
+    Write-Host "  2. Go to Tools > Add-Ins > Register"
+    Write-Host "  3. Enter ProgID: EliteSoft.Erwin.AddIn"
     Write-Host ""
 } else {
     Write-Host "Registration failed!" -ForegroundColor Red

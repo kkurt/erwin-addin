@@ -17,4 +17,11 @@
 |----|------|---|-------|------|
 | #2979 | 9:43 PM | 🟣 | Automatic Diagram Entity Addition via SCAPI ER_Model_Shape | ~386 |
 | #2892 | 9:50 AM | 🔵 | Scripts Directory with Test Data and Documentation | ~185 |
+
+### Feb 17, 2026
+
+| ID | Time | T | Title | Read |
+|----|------|---|-------|------|
+| #3193 | 11:42 AM | 🔴 | Source Folder Tree Structure Display Bug - c:/work Directory | ~342 |
+| #3192 | 10:00 AM | ✅ | GLOSSARY Test Data Script Updated for Extended Schema | ~505 |
 </claude-mem-context>

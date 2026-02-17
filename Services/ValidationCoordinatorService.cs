@@ -18,6 +18,7 @@ namespace EliteSoft.Erwin.AddIn.Services
     public class ValidationCoordinatorService : IDisposable
     {
         private readonly dynamic _session;
+        private readonly dynamic _scapi;
         private Timer _monitorTimer;
         private Timer _windowMonitorTimer;
         private TableTypeMonitorService _tableTypeMonitor;
@@ -65,9 +66,10 @@ namespace EliteSoft.Erwin.AddIn.Services
         // Event fired when session becomes invalid (model closed)
         public event Action OnSessionLost;
 
-        public ValidationCoordinatorService(dynamic session)
+        public ValidationCoordinatorService(dynamic session, dynamic scapi)
         {
             _session = session;
+            _scapi = scapi;
             _attributeSnapshots = new Dictionary<string, AttributeValidationSnapshot>();
             _domainCache = new Dictionary<string, string>();
             _pendingResults = new List<CollectedValidationResult>();
@@ -184,6 +186,22 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         #region Timer Event
 
+        /// <summary>
+        /// Check if any model is still open via SCAPI root (safe — doesn't touch the session).
+        /// Returns false if model was closed, triggering session lost without crashing.
+        /// </summary>
+        private bool IsModelStillOpen()
+        {
+            try
+            {
+                return _scapi.PersistenceUnits.Count > 0;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         private void HandleSessionLost()
         {
             if (_sessionLost) return;
@@ -201,6 +219,10 @@ namespace EliteSoft.Erwin.AddIn.Services
         private void MonitorTimer_Tick(object sender, EventArgs e)
         {
             if (_sessionLost || !_isMonitoring || _disposed || _isProcessingChange || _validationSuspended || _isCheckingForChanges) return;
+
+            // Safety: check if model is still open BEFORE touching the session.
+            // This avoids calling methods on a dead COM object (which causes native crash in erwin).
+            if (!IsModelStillOpen()) { HandleSessionLost(); return; }
 
             try
             {
@@ -292,6 +314,9 @@ namespace EliteSoft.Erwin.AddIn.Services
         private void WindowMonitorTimer_Tick(object sender, EventArgs e)
         {
             if (_sessionLost || !_isMonitoring || _disposed) return;
+
+            // Safety: check if model is still open BEFORE touching the session.
+            if (!IsModelStillOpen()) { HandleSessionLost(); return; }
 
             try
             {
@@ -485,16 +510,18 @@ namespace EliteSoft.Erwin.AddIn.Services
             _isProcessingChange = true;
             try
             {
-                // New attribute - validate both glossary and domain if set
+                // New attribute
                 bool hasValidDomain = IsValidDomain(currentState.DomainParentValue);
 
-                // Glossary validation for new columns (pass attr to apply DataType/Owner)
-                ValidateGlossary(attr, currentState, predefinedColumnNames);
-
-                // Domain validation if domain is set
                 if (hasValidDomain)
                 {
+                    // Domain is set -> only domain validation (skip glossary)
                     ValidateDomain(attr, currentState, null);
+                }
+                else
+                {
+                    // No domain -> glossary validation
+                    ValidateGlossary(attr, currentState, predefinedColumnNames);
                 }
             }
             finally
@@ -516,16 +543,19 @@ namespace EliteSoft.Erwin.AddIn.Services
             _isProcessingChange = true;
             try
             {
-                // Physical name changed - need glossary validation
                 if (physicalNameChanged)
                 {
                     Log($"Physical name changed: {previousState.TableName}.{previousState.PhysicalName} -> {currentState.PhysicalName}");
-                    ValidateGlossary(attr, currentState, predefinedColumnNames);
 
-                    // If has valid domain, also re-validate domain pattern
                     if (hasValidDomain)
                     {
+                        // Domain is set -> only domain validation (skip glossary)
                         ValidateDomain(attr, currentState, previousState.DomainParentValue);
+                    }
+                    else
+                    {
+                        // No domain -> glossary validation
+                        ValidateGlossary(attr, currentState, predefinedColumnNames);
                     }
                 }
 
