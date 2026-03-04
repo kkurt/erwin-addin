@@ -3,21 +3,21 @@ using System.Data.Common;
 using System.Data.SqlClient;
 using Npgsql;
 using Oracle.ManagedDataAccess.Client;
-using EliteSoft.Erwin.Shared.Models;
-using EliteSoft.Erwin.Shared.Services;
+using EliteSoft.MetaCenter.Shared.Models;
+using EliteSoft.MetaCenter.Shared.Services;
 
 namespace EliteSoft.Erwin.AddIn.Services
 {
     /// <summary>
     /// Database service for multi-provider support (MSSQL, PostgreSQL, Oracle).
-    /// Uses BootstrapService configuration from ErwinShared.
+    /// Reads config from Registry first (erwin-admin's current storage), falls back to bootstrap.json.
     /// </summary>
     public class DatabaseService
     {
         private static DatabaseService _instance;
         private static readonly object _lock = new object();
 
-        private readonly BootstrapService _bootstrapService;
+        private readonly IBootstrapService _bootstrapService;
         private BootstrapConfig _cachedConfig;
 
         /// <summary>
@@ -43,7 +43,17 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         private DatabaseService()
         {
-            _bootstrapService = new BootstrapService();
+            // Try Registry first (erwin-admin migrated config from JSON to Registry)
+            var registryService = new RegistryBootstrapService();
+            if (registryService.IsConfigured())
+            {
+                _bootstrapService = registryService;
+            }
+            else
+            {
+                // Fall back to legacy bootstrap.json
+                _bootstrapService = new BootstrapService();
+            }
         }
 
         /// <summary>
@@ -160,6 +170,6 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <summary>
         /// Gets the bootstrap service for direct access if needed
         /// </summary>
-        public BootstrapService BootstrapService => _bootstrapService;
+        public IBootstrapService BootstrapService => _bootstrapService;
     }
 }

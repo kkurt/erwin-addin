@@ -20,6 +20,7 @@
 
   <ItemGroup>
     <Reference Include="Microsoft.CSharp" />
+    <Reference Include="System.Security" />
     <Reference Include="System.Windows.Forms" />
     <Reference Include="EAL">
       <HintPath>References\EAL.dll</HintPath>
@@ -34,7 +35,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\erwin-admin\ErwinShared\ErwinShared.csproj" />
+    <ProjectReference Include="..\erwin-admin\MetaShared\MetaShared.csproj" />
   </ItemGroup>
 
   <ItemGroup>

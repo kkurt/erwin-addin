@@ -487,7 +487,7 @@ namespace EliteSoft.Erwin.AddIn
 
                 if (!glossaryConnService.IsLoaded)
                 {
-                    lblGlossaryStatus.Text = $"Failed to load GLOSSARY_CONNECTION_DEF: {glossaryConnService.LastError}";
+                    lblGlossaryStatus.Text = $"Failed to load CONNECTION_DEF: {glossaryConnService.LastError}";
                     lblGlossaryStatus.ForeColor = Color.Red;
                     return;
                 }
@@ -530,7 +530,7 @@ namespace EliteSoft.Erwin.AddIn
                     return;
                 }
 
-                lblGlossaryStatus.Text = "Reading GLOSSARY_CONNECTION_DEF from repository...";
+                lblGlossaryStatus.Text = "Reading CONNECTION_DEF from repository...";
                 Application.DoEvents();
 
                 var glossaryConnService = GlossaryConnectionService.Instance;

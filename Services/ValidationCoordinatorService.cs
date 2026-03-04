@@ -622,7 +622,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
             else
             {
-                Log($"Glossary validation passed: {state.TableName}.{state.PhysicalName}");
+                Log($"Glossary validation passed: {state.TableName}.{state.PhysicalName} (DataType={entry.DataType}, Owner={entry.Owner}, Comment='{entry.Comment ?? "NULL"}')");
 
                 // Apply DataType and Owner from glossary entry
                 if (attr != null)
@@ -650,6 +650,20 @@ namespace EliteSoft.Erwin.AddIn.Services
                     TrySetUdp(attr, "KVKK", glossaryEntry.Kvkk ? "True" : "False");
                     TrySetUdp(attr, "PCIDSS", glossaryEntry.Pcidss ? "True" : "False");
                     TrySetUdp(attr, "CLASSIFICATION", glossaryEntry.Classification);
+
+                    // Comment — set via Definition (same pattern as domain)
+                    if (!string.IsNullOrEmpty(glossaryEntry.Comment))
+                    {
+                        try
+                        {
+                            attr.Properties("Definition").Value = glossaryEntry.Comment;
+                            Log($"Set Definition to '{glossaryEntry.Comment}' from glossary");
+                        }
+                        catch (Exception ex)
+                        {
+                            Log($"Error setting Definition from glossary: {ex.Message}");
+                        }
+                    }
 
                     _session.CommitTransaction(transId);
                 }
@@ -1017,6 +1031,24 @@ namespace EliteSoft.Erwin.AddIn.Services
                             {
                                 return domainName;
                             }
+
+                            // Cache miss — resolve directly from model
+                            try
+                            {
+                                dynamic domainObj = modelObjects.Item(refValue);
+                                if (domainObj != null)
+                                {
+                                    string name = domainObj.Name?.ToString() ?? "";
+                                    if (!string.IsNullOrEmpty(name))
+                                    {
+                                        _domainCache[refValue] = name;
+                                        return name;
+                                    }
+                                }
+                            }
+                            catch { }
+
+                            Log($"Domain ref not resolved: {refValue}");
                         }
                         else
                         {

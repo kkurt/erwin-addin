@@ -16,7 +16,8 @@ namespace EliteSoft.Erwin.AddIn.Services
     ///   DB_TYPE       varchar(50)   - Database type
     ///   KVKK          bit           - KVKK flag
     ///   PCIDSS        bit           - PCI-DSS flag
-    ///   CLASSIFICATON varchar(50)   - Classification
+    ///   CLASSIFICATION varchar(50)   - Classification
+    ///   COMMENT       varchar(500)  - Column comment/definition
     /// </summary>
     public class GlossaryService
     {
@@ -88,31 +89,41 @@ namespace EliteSoft.Erwin.AddIn.Services
                     return false;
                 }
 
-                // Get glossary connection string from GLOSSARY_CONNECTION_DEF
+                // Get glossary connection string from CONNECTION_DEF (ID=4)
                 string connectionString = glossaryConnService.GetGlossaryConnectionString();
-                string dbType = DatabaseService.Instance.GetDbType();
+                string dbType = glossaryConnService.GetGlossaryDbType();
 
                 using (var connection = DatabaseService.Instance.CreateConnection(dbType, connectionString))
                 {
                     connection.Open();
 
-                    // Try full query first, fall back to basic if extended columns don't exist
-                    bool hasExtendedColumns = true;
-                    string query = GetGlossaryQuery(dbType, true);
+                    // 3-tier fallback: full (with COMMENT) → extended (without COMMENT) → basic
+                    bool hasExtendedColumns = false;
+                    bool hasCommentColumn = false;
+                    string query;
 
-                    try
+                    // Tier 1: Try full query with COMMENT
+                    query = GetGlossaryQuery(dbType, "full");
+                    if (TestQuery(connection, query))
                     {
-                        using (var testCmd = connection.CreateCommand())
-                        {
-                            testCmd.CommandText = query;
-                            using (testCmd.ExecuteReader()) { }
-                        }
+                        hasExtendedColumns = true;
+                        hasCommentColumn = true;
                     }
-                    catch
+                    else
                     {
-                        hasExtendedColumns = false;
-                        query = GetGlossaryQuery(dbType, false);
-                        System.Diagnostics.Debug.WriteLine("GlossaryService: Extended columns not available, using basic query");
+                        // Tier 2: Try extended without COMMENT
+                        query = GetGlossaryQuery(dbType, "extended");
+                        if (TestQuery(connection, query))
+                        {
+                            hasExtendedColumns = true;
+                            System.Diagnostics.Debug.WriteLine("GlossaryService: COMMENT column not available");
+                        }
+                        else
+                        {
+                            // Tier 3: Basic only
+                            query = GetGlossaryQuery(dbType, "basic");
+                            System.Diagnostics.Debug.WriteLine("GlossaryService: Extended columns not available, using basic query");
+                        }
                     }
 
                     using (var command = connection.CreateCommand())
@@ -130,13 +141,19 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 bool kvkk = false;
                                 bool pcidss = false;
                                 string classification = "";
+                                string comment = "";
 
                                 if (hasExtendedColumns)
                                 {
                                     dbTypeVal = SafeReadString(reader, "DB_TYPE");
                                     kvkk = SafeReadBool(reader, "KVKK");
                                     pcidss = SafeReadBool(reader, "PCIDSS");
-                                    classification = SafeReadString(reader, "CLASSIFICATON");
+                                    classification = SafeReadString(reader, "CLASSIFICATION");
+                                }
+
+                                if (hasCommentColumn)
+                                {
+                                    comment = SafeReadString(reader, "COMMENT");
                                 }
 
                                 if (!string.IsNullOrEmpty(name) && !_glossary.ContainsKey(name))
@@ -149,7 +166,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                                         DbType = dbTypeVal,
                                         Kvkk = kvkk,
                                         Pcidss = pcidss,
-                                        Classification = classification
+                                        Classification = classification,
+                                        Comment = comment
                                     };
                                 }
                             }
@@ -192,30 +210,49 @@ namespace EliteSoft.Erwin.AddIn.Services
             catch { return false; }
         }
 
-        /// <summary>
-        /// Gets the appropriate SQL query for the database type
-        /// </summary>
-        private string GetGlossaryQuery(string dbType, bool includeExtended)
+        private bool TestQuery(DbConnection connection, string query)
         {
-            // Base columns: NAME, DATA_TYPE, OWNER (always exist)
-            // Extended columns: DB_TYPE, KVKK, PCIDSS, CLASSIFICATON
+            try
+            {
+                using (var cmd = connection.CreateCommand())
+                {
+                    cmd.CommandText = query;
+                    using (cmd.ExecuteReader()) { }
+                }
+                return true;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// Gets the appropriate SQL query for the database type.
+        /// tier: "full" (all columns + COMMENT), "extended" (without COMMENT), "basic" (NAME, DATA_TYPE, OWNER)
+        /// </summary>
+        private string GetGlossaryQuery(string dbType, string tier)
+        {
             switch (dbType?.ToUpper())
             {
                 case "POSTGRESQL":
-                    return includeExtended
-                        ? "SELECT \"NAME\", \"DATA_TYPE\", \"OWNER\", \"DB_TYPE\", \"KVKK\", \"PCIDSS\", \"CLASSIFICATON\" FROM \"GLOSSARY\""
-                        : "SELECT \"NAME\", \"DATA_TYPE\", \"OWNER\" FROM \"GLOSSARY\"";
+                    if (tier == "full")
+                        return "SELECT \"NAME\", \"DATA_TYPE\", \"OWNER\", \"DB_TYPE\", \"KVKK\", \"PCIDSS\", \"CLASSIFICATION\", \"COMMENT\" FROM \"GLOSSARY\"";
+                    if (tier == "extended")
+                        return "SELECT \"NAME\", \"DATA_TYPE\", \"OWNER\", \"DB_TYPE\", \"KVKK\", \"PCIDSS\", \"CLASSIFICATION\" FROM \"GLOSSARY\"";
+                    return "SELECT \"NAME\", \"DATA_TYPE\", \"OWNER\" FROM \"GLOSSARY\"";
 
                 case "ORACLE":
-                    return includeExtended
-                        ? "SELECT NAME, DATA_TYPE, OWNER, DB_TYPE, KVKK, PCIDSS, CLASSIFICATON FROM GLOSSARY"
-                        : "SELECT NAME, DATA_TYPE, OWNER FROM GLOSSARY";
+                    if (tier == "full")
+                        return "SELECT NAME, DATA_TYPE, OWNER, DB_TYPE, KVKK, PCIDSS, CLASSIFICATION, \"COMMENT\" FROM GLOSSARY";
+                    if (tier == "extended")
+                        return "SELECT NAME, DATA_TYPE, OWNER, DB_TYPE, KVKK, PCIDSS, CLASSIFICATION FROM GLOSSARY";
+                    return "SELECT NAME, DATA_TYPE, OWNER FROM GLOSSARY";
 
                 case "MSSQL":
                 default:
-                    return includeExtended
-                        ? "SELECT [NAME], [DATA_TYPE], [OWNER], [DB_TYPE], [KVKK], [PCIDSS], [CLASSIFICATON] FROM [dbo].[GLOSSARY]"
-                        : "SELECT [NAME], [DATA_TYPE], [OWNER] FROM [dbo].[GLOSSARY]";
+                    if (tier == "full")
+                        return "SELECT [NAME], [DATA_TYPE], [OWNER], [DB_TYPE], [KVKK], [PCIDSS], [CLASSIFICATION], [COMMENT] FROM [dbo].[GLOSSARY]";
+                    if (tier == "extended")
+                        return "SELECT [NAME], [DATA_TYPE], [OWNER], [DB_TYPE], [KVKK], [PCIDSS], [CLASSIFICATION] FROM [dbo].[GLOSSARY]";
+                    return "SELECT [NAME], [DATA_TYPE], [OWNER] FROM [dbo].[GLOSSARY]";
             }
         }
 
@@ -286,5 +323,6 @@ namespace EliteSoft.Erwin.AddIn.Services
         public bool Kvkk { get; set; }
         public bool Pcidss { get; set; }
         public string Classification { get; set; }
+        public string Comment { get; set; }
     }
 }

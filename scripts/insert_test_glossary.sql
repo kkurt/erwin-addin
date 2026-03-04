@@ -1,5 +1,5 @@
 -- GLOSSARY Table Setup and Seed Data
--- Table structure: ID, NAME, DATA_TYPE, OWNER, DB_TYPE, KVKK, PCIDSS, CLASSIFICATON
+-- Table structure: ID, NAME, DATA_TYPE, OWNER, DB_TYPE, KVKK, PCIDSS, CLASSIFICATION, COMMENT
 
 USE Glossary;
 GO
@@ -20,7 +20,8 @@ CREATE TABLE [dbo].[GLOSSARY] (
     [DB_TYPE]        VARCHAR(50)  NOT NULL,
     [KVKK]           BIT          NOT NULL,
     [PCIDSS]         BIT          NOT NULL,
-    [CLASSIFICATON]  VARCHAR(50)  NULL
+    [CLASSIFICATION]  VARCHAR(50)  NULL,
+    [COMMENT]        VARCHAR(500) NULL
 );
 
 CREATE INDEX IX_GLOSSARY_NAME ON [dbo].[GLOSSARY]([NAME]);
@@ -33,15 +34,15 @@ GO
 -- ============================================================
 SET IDENTITY_INSERT [dbo].[GLOSSARY] ON;
 
-INSERT INTO [dbo].[GLOSSARY] ([ID], [NAME], [DATA_TYPE], [OWNER], [DB_TYPE], [KVKK], [PCIDSS], [CLASSIFICATON])
+INSERT INTO [dbo].[GLOSSARY] ([ID], [NAME], [DATA_TYPE], [OWNER], [DB_TYPE], [KVKK], [PCIDSS], [CLASSIFICATION], [COMMENT])
 VALUES
-    (14001, 'TEST',       'VARCHAR(250)',  'Kursat', 'Oracle',1, 0,  N'Kurum İçi'),
-    (14002, 'TEST_ADRES', 'VARCHAR(250)',  'Kursat', 'Oracle', 1, 0, N'Kurum İçi'),
-    (14006, 'Event',      'VARCHAR2(255)', 'Kursat', 'Oracle', 1, 0, N'Kurum İçi'),
-    (14008, 'MUSTERI_NO', 'VARCHAR2(50)',  'Ahmet',  'Oracle', 1, 0, N'Kurum İçi'),
-    (14009, 'HESAP_NO',   'VARCHAR2(50)',  'Emre',   'Oracle', 1, 0, N'Kurum İçi'),
-    (14010, 'KKR_NO',     'VARCHAR2(50)',  'Kursat', 'Oracle', 1, 1, N'Gizli'),
-    (14011, 'GSM_NO',     'VARCHAR2(50)',  'Emre',   'Oracle', 1, 0, N'Hizmete Özel');
+    (14001, 'TEST',       'VARCHAR(250)',  'Kursat', 'Oracle', 1, 0, N'Kurum İçi',     N'Test amaçlı alan'),
+    (14002, 'TEST_ADRES', 'VARCHAR(250)',  'Kursat', 'Oracle', 1, 0, N'Kurum İçi',     N'Test adres bilgisi'),
+    (14006, 'Event',      'VARCHAR2(255)', 'Kursat', 'Oracle', 1, 0, N'Kurum İçi',     N'Olay kayıt alanı'),
+    (14008, 'MUSTERI_NO', 'VARCHAR2(50)',  'Ahmet',  'Oracle', 1, 0, N'Kurum İçi',     N'Müşteri numarası'),
+    (14009, 'HESAP_NO',   'VARCHAR2(50)',  'Emre',   'Oracle', 1, 0, N'Kurum İçi',     N'Hesap numarası'),
+    (14010, 'KKR_NO',     'VARCHAR2(50)',  'Kursat', 'Oracle', 1, 1, N'Gizli',         N'Kredi kayıt numarası'),
+    (14011, 'GSM_NO',     'VARCHAR2(50)',  'Emre',   'Oracle', 1, 0, N'Hizmete Özel',  N'GSM telefon numarası');
 
 SET IDENTITY_INSERT [dbo].[GLOSSARY] OFF;
 
@@ -61,6 +62,7 @@ DECLARE @dbType VARCHAR(50);
 DECLARE @kvkk BIT;
 DECLARE @pcidss BIT;
 DECLARE @classification VARCHAR(50);
+DECLARE @comment VARCHAR(500);
 DECLARE @nameLength INT;
 DECLARE @chars VARCHAR(36) = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
 DECLARE @prefixes TABLE (prefix VARCHAR(4));
@@ -68,6 +70,7 @@ DECLARE @dataTypes TABLE (dt VARCHAR(20));
 DECLARE @owners TABLE (own VARCHAR(20));
 DECLARE @dbTypes TABLE (dbt VARCHAR(20));
 DECLARE @classifications TABLE (cls VARCHAR(20));
+DECLARE @comments TABLE (cmt VARCHAR(100));
 
 -- Prefixes for variety
 INSERT INTO @prefixes VALUES ('TST_'), ('XYZ_'), ('QWE_'), ('ABC_'), ('DEF_'), ('GHI_'), ('JKL_'), ('MNO_'), ('PQR_'), ('UVW_');
@@ -83,6 +86,9 @@ INSERT INTO @dbTypes VALUES ('Oracle'), ('SQLServer'), ('PostgreSQL'), ('MySQL')
 
 -- Classifications
 INSERT INTO @classifications VALUES (N'Kurum İçi'), (N'Gizli'), (N'Hizmete Özel'), (N'Çok Gizli');
+
+-- Comments
+INSERT INTO @comments VALUES (N'Açıklama alanı'), (N'Sistem tarafından oluşturuldu'), (N'Kullanıcı tanımlı alan'), (N'Referans veri'), (N'İşlem kayıt alanı');
 
 PRINT 'Starting insert of 14,000 test records...';
 PRINT 'Start time: ' + CONVERT(VARCHAR, GETDATE(), 120);
@@ -110,12 +116,14 @@ BEGIN
     SET @pcidss = CASE WHEN ABS(CHECKSUM(NEWID())) % 4 = 0 THEN 1 ELSE 0 END;
     SET @classification = CASE WHEN ABS(CHECKSUM(NEWID())) % 5 = 0 THEN NULL
                                ELSE (SELECT TOP 1 cls FROM @classifications ORDER BY NEWID()) END;
+    SET @comment = CASE WHEN ABS(CHECKSUM(NEWID())) % 3 = 0 THEN NULL
+                        ELSE (SELECT TOP 1 cmt FROM @comments ORDER BY NEWID()) END;
 
     -- Insert if name doesn't exist
     IF NOT EXISTS (SELECT 1 FROM [dbo].[GLOSSARY] WHERE [NAME] = @name)
     BEGIN
-        INSERT INTO [dbo].[GLOSSARY] ([NAME], [DATA_TYPE], [OWNER], [DB_TYPE], [KVKK], [PCIDSS], [CLASSIFICATON])
-        VALUES (@name, @dataType, @owner, @dbType, @kvkk, @pcidss, @classification);
+        INSERT INTO [dbo].[GLOSSARY] ([NAME], [DATA_TYPE], [OWNER], [DB_TYPE], [KVKK], [PCIDSS], [CLASSIFICATION], [COMMENT])
+        VALUES (@name, @dataType, @owner, @dbType, @kvkk, @pcidss, @classification, @comment);
     END
 
     IF @i % 1000 = 0
