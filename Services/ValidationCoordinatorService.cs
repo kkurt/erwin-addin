@@ -1,8 +1,6 @@
 using System;
 using System.Collections.Generic;
-using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
-using System.Security;
 using System.Text;
 using System.Windows.Forms;
 
@@ -214,8 +212,6 @@ namespace EliteSoft.Erwin.AddIn.Services
             try { OnSessionLost?.Invoke(); } catch { }
         }
 
-        [HandleProcessCorruptedStateExceptions]
-        [SecurityCritical]
         private void MonitorTimer_Tick(object sender, EventArgs e)
         {
             if (_sessionLost || !_isMonitoring || _disposed || _isProcessingChange || _validationSuspended || _isCheckingForChanges) return;
@@ -309,8 +305,6 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
         }
 
-        [HandleProcessCorruptedStateExceptions]
-        [SecurityCritical]
         private void WindowMonitorTimer_Tick(object sender, EventArgs e)
         {
             if (_sessionLost || !_isMonitoring || _disposed) return;

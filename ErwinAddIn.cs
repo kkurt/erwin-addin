@@ -7,7 +7,7 @@ namespace EliteSoft.Erwin.AddIn
 {
     /// <summary>
     /// Elite Soft Erwin Add-In - Model Configuration
-    /// Register with: regasm EliteSoft.Erwin.AddIn.dll /codebase
+    /// Register with: regsvr32 EliteSoft.Erwin.AddIn.comhost.dll
     /// </summary>
     [ComVisible(true)]
     [Guid("A1B2C3D4-E5F6-7890-ABCD-EF1234567890")]
