@@ -39,6 +39,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <EmbeddedResource Include="erwin-addi-in-splash.png" />
+  </ItemGroup>
+
+  <ItemGroup>
     <None Include="References\EAL.dll">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <Link>EAL.dll</Link>

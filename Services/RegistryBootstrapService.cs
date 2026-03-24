@@ -8,13 +8,13 @@ namespace EliteSoft.Erwin.AddIn.Services
 {
     /// <summary>
     /// Registry-based bootstrap config reader.
-    /// Reads Admin DB connection from Windows Registry (HKCU\Software\EliteSoft\MetaCenter\Bootstrap).
+    /// Reads Admin DB connection from Windows Registry (HKCU\Software\EliteSoft\MetaRepo\Bootstrap).
     /// Credentials are DPAPI-encrypted, matching erwin-admin's RegistryBootstrapService.
     /// </summary>
     [ComVisible(false)]
     public class RegistryBootstrapService : IBootstrapService
     {
-        private const string BaseKey = @"Software\EliteSoft\MetaCenter";
+        private const string BaseKey = @"Software\EliteSoft\MetaRepo";
         private const string SubKey = "Bootstrap";
         private BootstrapConfig _cachedConfig;
 
@@ -81,7 +81,7 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         public string GetConfigFilePath()
         {
-            return @"HKCU\Software\EliteSoft\MetaCenter\Bootstrap";
+            return @"HKCU\Software\EliteSoft\MetaRepo\Bootstrap";
         }
     }
 }

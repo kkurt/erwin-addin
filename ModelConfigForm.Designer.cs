@@ -118,8 +118,21 @@ namespace EliteSoft.Erwin.AddIn
             this.tabControl.TabIndex = 0;
 
             //
+            // lblPlatformStatus
+            //
+            this.lblPlatformStatus = new System.Windows.Forms.Label();
+            this.lblPlatformStatus.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
+            this.lblPlatformStatus.Location = new System.Drawing.Point(10, 85);
+            this.lblPlatformStatus.Name = "lblPlatformStatus";
+            this.lblPlatformStatus.Size = new System.Drawing.Size(817, 20);
+            this.lblPlatformStatus.TabIndex = 1;
+            this.lblPlatformStatus.Text = "";
+            this.lblPlatformStatus.ForeColor = System.Drawing.Color.Gray;
+
+            //
             // tabModel
             //
+            this.tabModel.Controls.Add(this.lblPlatformStatus);
             this.tabModel.Controls.Add(this.grpModel);
             this.tabModel.Location = new System.Drawing.Point(4, 24);
             this.tabModel.Name = "tabModel";
@@ -760,6 +773,7 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.Label lblModelName;
         private System.Windows.Forms.ComboBox cmbModels;
         private System.Windows.Forms.Label lblConnectionStatus;
+        private System.Windows.Forms.Label lblPlatformStatus;
 
         private System.Windows.Forms.GroupBox grpConfig;
         private System.Windows.Forms.Label lblDatabaseName;

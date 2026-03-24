@@ -36,6 +36,7 @@ namespace EliteSoft.Erwin.AddIn
         private ColumnValidationService _validationService;
         private TableTypeMonitorService _tableTypeMonitorService;
         private ValidationCoordinatorService _validationCoordinatorService;
+        private PropertyApplicatorService _propertyApplicatorService;
 
         // State tracking
         private Timer _glossaryRefreshTimer;
@@ -271,9 +272,14 @@ namespace EliteSoft.Erwin.AddIn
             _validationService = new ColumnValidationService(_session);
             btnValidateAll.Enabled = true;
 
+            // Initialize property applicator service (reads project standards from DB)
+            InitializePropertyApplicator();
+
             // Initialize TABLE_TYPE monitor service (timer managed by coordinator)
             _tableTypeMonitorService = new TableTypeMonitorService(_session);
             _tableTypeMonitorService.OnLog += Log;
+            if (_propertyApplicatorService != null)
+                _tableTypeMonitorService.SetPropertyApplicator(_propertyApplicatorService);
             _tableTypeMonitorService.TakeSnapshot();
             _tableTypeMonitorService.StartMonitoring();
 
@@ -669,6 +675,70 @@ namespace EliteSoft.Erwin.AddIn
             catch (Exception ex)
             {
                 Log($"LoadTableTypes error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Initialize PropertyApplicatorService: detect platform, load project standards from DB.
+        /// Standards will be auto-applied to new tables when created.
+        /// </summary>
+        private void InitializePropertyApplicator()
+        {
+            try
+            {
+                _propertyApplicatorService?.Dispose();
+                _propertyApplicatorService = null;
+
+                var bootstrapService = new RegistryBootstrapService();
+                var config = bootstrapService.GetConfig();
+                if (config == null || !config.IsConfigured)
+                {
+                    Log("PropertyApplicator: DB not configured, skipping");
+                    return;
+                }
+
+                var metadataService = new AddInPropertyMetadataService(bootstrapService);
+                _propertyApplicatorService = new PropertyApplicatorService(_session, metadataService);
+                _propertyApplicatorService.OnLog += Log;
+
+                if (_propertyApplicatorService.Initialize())
+                {
+                    var platform = _propertyApplicatorService.DetectedPlatform;
+                    int stdCount = _propertyApplicatorService.StandardCount;
+                    int qCount = _propertyApplicatorService.QuestionCount;
+                    string statusParts = $"Platform: {platform.Name}  |  {stdCount} standard(s)";
+                    if (qCount > 0) statusParts += $"  |  {qCount} rule(s) loaded";
+                    lblPlatformStatus.Text = statusParts;
+                    lblPlatformStatus.ForeColor = Color.DarkGreen;
+                    Log($"PropertyApplicator: Ready ({platform.Name}, {stdCount} standards, {qCount} questions)");
+                }
+                else
+                {
+                    string targetServer = _propertyApplicatorService.TargetServerValue;
+                    var detectedPlatform = _propertyApplicatorService.DetectedPlatform;
+
+                    if (string.IsNullOrEmpty(targetServer))
+                    {
+                        lblPlatformStatus.Text = "Platform: Target_Server not found in model";
+                    }
+                    else if (detectedPlatform != null)
+                    {
+                        // Platform matched but project not found
+                        lblPlatformStatus.Text = $"Platform: {detectedPlatform.Name} (OK)  |  Project not found in DB";
+                    }
+                    else
+                    {
+                        lblPlatformStatus.Text = $"Platform: No match for '{targetServer}' in MC_PLATFORM";
+                    }
+                    lblPlatformStatus.ForeColor = Color.OrangeRed;
+                    Log("PropertyApplicator: Initialization failed (no platform/project/standards)");
+                    _propertyApplicatorService.Dispose();
+                    _propertyApplicatorService = null;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"InitializePropertyApplicator error: {ex.Message}");
             }
         }
 
@@ -1503,29 +1573,84 @@ namespace EliteSoft.Erwin.AddIn
 
         private Form ShowLoadingDialog(string message)
         {
+            var assembly = System.Reflection.Assembly.GetExecutingAssembly();
+            System.IO.Stream imgStream = null;
+            Image splashImage = null;
+
+            foreach (var name in assembly.GetManifestResourceNames())
+            {
+                if (name.EndsWith("erwin-addi-in-splash.png", StringComparison.OrdinalIgnoreCase))
+                {
+                    imgStream = assembly.GetManifestResourceStream(name);
+                    break;
+                }
+            }
+
+            if (imgStream != null)
+                splashImage = Image.FromStream(imgStream);
+
+            int formWidth = 420;
+            int formHeight = 220;
+
             var loadingForm = new Form
             {
                 Text = "Elite Soft Erwin Add-In",
-                Size = new Size(350, 130),
-                StartPosition = FormStartPosition.CenterParent,
-                FormBorderStyle = FormBorderStyle.FixedDialog,
+                ClientSize = new Size(formWidth, formHeight),
+                StartPosition = FormStartPosition.CenterScreen,
+                FormBorderStyle = FormBorderStyle.None,
                 MaximizeBox = false,
                 MinimizeBox = false,
                 ControlBox = false,
-                ShowInTaskbar = false
+                ShowInTaskbar = false,
+                BackColor = Color.Black,
+                Padding = new Padding(2)
             };
 
-            var label = new Label
+            var innerPanel = new Panel
             {
-                Text = message,
-                Font = new Font("Segoe UI", 12, FontStyle.Regular),
-                AutoSize = false,
-                TextAlign = ContentAlignment.MiddleCenter,
-                Dock = DockStyle.Fill
+                Dock = DockStyle.Fill,
+                BackColor = Color.White
             };
+            loadingForm.Controls.Add(innerPanel);
 
-            loadingForm.Controls.Add(label);
-            loadingForm.Show(this);
+            if (splashImage != null)
+            {
+                var pictureBox = new PictureBox
+                {
+                    Image = splashImage,
+                    SizeMode = PictureBoxSizeMode.StretchImage,
+                    Dock = DockStyle.Fill
+                };
+                innerPanel.Controls.Add(pictureBox);
+
+                var label = new Label
+                {
+                    Text = message,
+                    Font = new Font("Segoe UI", 12, FontStyle.Bold),
+                    ForeColor = Color.Black,
+                    BackColor = Color.Transparent,
+                    AutoSize = false,
+                    TextAlign = ContentAlignment.MiddleCenter,
+                    Size = new Size(formWidth, 40),
+                    Location = new Point(0, formHeight - 45)
+                };
+                pictureBox.Controls.Add(label);
+            }
+            else
+            {
+                var label = new Label
+                {
+                    Text = message,
+                    Font = new Font("Segoe UI", 14, FontStyle.Bold),
+                    ForeColor = Color.FromArgb(60, 60, 60),
+                    AutoSize = false,
+                    TextAlign = ContentAlignment.MiddleCenter,
+                    Dock = DockStyle.Fill
+                };
+                innerPanel.Controls.Add(label);
+            }
+
+            loadingForm.Show();
             Application.DoEvents();
             return loadingForm;
         }
@@ -1616,6 +1741,8 @@ namespace EliteSoft.Erwin.AddIn
             _validationService?.Dispose();
             _tableTypeMonitorService?.Dispose();
             _validationCoordinatorService?.Dispose();
+            _propertyApplicatorService?.Dispose();
+            _propertyApplicatorService = null;
         }
 
         /// <summary>
@@ -1659,6 +1786,7 @@ namespace EliteSoft.Erwin.AddIn
                 UpdateConnectionStatus(StatusDisconnected, Color.Red);
                 EnableControls(false);
                 btnValidateAll.Enabled = false;
+                lblPlatformStatus.Text = "";
                 UpdateStatus("Model closed. Waiting for a model to open...", Color.Gray);
 
                 // Start reconnect timer to poll for new models

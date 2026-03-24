@@ -1,0 +1,702 @@
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Linq;
+using System.Windows.Forms;
+using EliteSoft.MetaCenter.Shared.Data.Entities;
+
+namespace EliteSoft.Erwin.AddIn.Forms
+{
+    /// <summary>
+    /// Wizard-style dialog for question-based property assignment.
+    /// Shown when a new table is created — asks questions, collects answers,
+    /// and returns property values to apply to the model.
+    /// </summary>
+    public class QuestionWizardForm : Form
+    {
+        private readonly string _tableName;
+        private readonly List<QuestionDef> _allQuestions;
+        private readonly List<QuestionStep> _steps = new List<QuestionStep>();
+        private int _currentStepIndex = -1;
+
+        // Collected answers: QuestionDefId -> answer value
+        private readonly Dictionary<int, string> _answers = new Dictionary<int, string>();
+
+        // Result: PropertyDefId -> value (populated from question rules)
+        public Dictionary<int, string> PropertyValues { get; } = new Dictionary<int, string>();
+
+        // UI Controls
+        private Panel pnlHeader;
+        private Label lblTitle;
+        private Label lblSubtitle;
+        private Panel pnlContent;
+        private Label lblQuestionNumber;
+        private Label lblQuestionText;
+        private Panel pnlAnswerArea;
+        private Panel pnlFooter;
+        private Panel pnlSteps;
+        private Button btnBack;
+        private Button btnNext;
+        private Button btnSkip;
+        private Button btnCancel;
+        private Label lblSummaryTitle;
+
+        public QuestionWizardForm(string tableName, List<QuestionDef> questions)
+        {
+            _tableName = tableName;
+            _allQuestions = questions;
+            InitializeUI();
+            BuildSteps();
+            ShowStep(0);
+        }
+
+        #region UI Setup
+
+        private void InitializeUI()
+        {
+            this.Text = "Table Properties Wizard";
+            this.Size = new Size(560, 420);
+            this.MinimumSize = new Size(480, 380);
+            this.StartPosition = FormStartPosition.CenterScreen;
+            this.FormBorderStyle = FormBorderStyle.FixedDialog;
+            this.MaximizeBox = false;
+            this.MinimizeBox = false;
+            this.ShowInTaskbar = false;
+            this.Font = new Font("Segoe UI", 9F);
+
+            // Header panel
+            pnlHeader = new Panel
+            {
+                Dock = DockStyle.Top,
+                Height = 70,
+                BackColor = Color.White,
+                Padding = new Padding(20, 12, 20, 8)
+            };
+
+            lblTitle = new Label
+            {
+                Text = $"New Table: {_tableName}",
+                Font = new Font("Segoe UI", 13F, FontStyle.Bold),
+                ForeColor = Color.FromArgb(30, 30, 30),
+                AutoSize = true,
+                Location = new Point(20, 12)
+            };
+
+            lblSubtitle = new Label
+            {
+                Text = "Answer the following questions to configure table properties.",
+                Font = new Font("Segoe UI", 9F),
+                ForeColor = Color.FromArgb(100, 100, 100),
+                AutoSize = true,
+                Location = new Point(20, 42)
+            };
+
+            pnlHeader.Controls.Add(lblTitle);
+            pnlHeader.Controls.Add(lblSubtitle);
+
+            // Header separator
+            var headerSep = new Panel
+            {
+                Dock = DockStyle.Top,
+                Height = 1,
+                BackColor = Color.FromArgb(220, 220, 220)
+            };
+
+            // Step indicator panel
+            pnlSteps = new Panel
+            {
+                Dock = DockStyle.Top,
+                Height = 32,
+                BackColor = Color.FromArgb(248, 248, 248),
+                Padding = new Padding(20, 6, 20, 6)
+            };
+
+            // Content panel
+            pnlContent = new Panel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = Color.White,
+                Padding = new Padding(28, 20, 28, 10)
+            };
+
+            lblQuestionNumber = new Label
+            {
+                Font = new Font("Segoe UI", 8F),
+                ForeColor = Color.FromArgb(0, 102, 204),
+                AutoSize = true,
+                Location = new Point(28, 20)
+            };
+
+            lblQuestionText = new Label
+            {
+                Font = new Font("Segoe UI", 11F),
+                ForeColor = Color.FromArgb(30, 30, 30),
+                Location = new Point(28, 42),
+                Size = new Size(480, 50),
+                AutoSize = false
+            };
+
+            pnlAnswerArea = new Panel
+            {
+                Location = new Point(28, 100),
+                Size = new Size(480, 160),
+                AutoScroll = true
+            };
+
+            lblSummaryTitle = new Label
+            {
+                Font = new Font("Segoe UI", 10F, FontStyle.Bold),
+                ForeColor = Color.FromArgb(30, 30, 30),
+                Text = "Summary",
+                AutoSize = true,
+                Location = new Point(28, 20),
+                Visible = false
+            };
+
+            pnlContent.Controls.Add(lblQuestionNumber);
+            pnlContent.Controls.Add(lblQuestionText);
+            pnlContent.Controls.Add(pnlAnswerArea);
+            pnlContent.Controls.Add(lblSummaryTitle);
+
+            // Footer separator
+            var footerSep = new Panel
+            {
+                Dock = DockStyle.Bottom,
+                Height = 1,
+                BackColor = Color.FromArgb(220, 220, 220)
+            };
+
+            // Footer panel
+            pnlFooter = new Panel
+            {
+                Dock = DockStyle.Bottom,
+                Height = 50,
+                BackColor = Color.FromArgb(243, 243, 243),
+                Padding = new Padding(16, 8, 16, 8)
+            };
+
+            btnCancel = new Button
+            {
+                Text = "Cancel",
+                Size = new Size(80, 32),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.White,
+                ForeColor = Color.FromArgb(80, 80, 80),
+                Anchor = AnchorStyles.Left | AnchorStyles.Bottom,
+                Visible = false
+            };
+            btnCancel.FlatAppearance.BorderColor = Color.FromArgb(200, 200, 200);
+            btnCancel.Click += (s, e) => { DialogResult = DialogResult.Cancel; Close(); };
+
+            btnBack = new Button
+            {
+                Text = "< Back",
+                Size = new Size(80, 32),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.White,
+                ForeColor = Color.FromArgb(80, 80, 80),
+                Enabled = false,
+                Anchor = AnchorStyles.Right | AnchorStyles.Bottom
+            };
+            btnBack.FlatAppearance.BorderColor = Color.FromArgb(200, 200, 200);
+            btnBack.Click += BtnBack_Click;
+
+            btnSkip = new Button
+            {
+                Text = "Skip >",
+                Size = new Size(80, 32),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.White,
+                ForeColor = Color.FromArgb(100, 100, 100),
+                Anchor = AnchorStyles.Right | AnchorStyles.Bottom,
+                Visible = false
+            };
+            btnSkip.FlatAppearance.BorderColor = Color.FromArgb(200, 200, 200);
+
+            btnNext = new Button
+            {
+                Text = "Next >",
+                Size = new Size(90, 32),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(0, 102, 204),
+                ForeColor = Color.White,
+                Font = new Font("Segoe UI", 9F, FontStyle.Bold),
+                Anchor = AnchorStyles.Right | AnchorStyles.Bottom
+            };
+            btnNext.FlatAppearance.BorderSize = 0;
+            btnNext.Click += BtnNext_Click;
+
+            // Position buttons
+            btnCancel.Location = new Point(16, 9);
+            btnNext.Location = new Point(pnlFooter.Width - 106, 9);
+            btnSkip.Location = new Point(btnNext.Left - 86, 9);
+            btnBack.Location = new Point(btnSkip.Left - 86, 9);
+
+            pnlFooter.Controls.AddRange(new Control[] { btnCancel, btnBack, btnSkip, btnNext });
+
+            // Add controls in reverse dock order
+            this.Controls.Add(pnlContent);
+            this.Controls.Add(pnlSteps);
+            this.Controls.Add(headerSep);
+            this.Controls.Add(pnlHeader);
+            this.Controls.Add(footerSep);
+            this.Controls.Add(pnlFooter);
+
+            // Reposition buttons on resize
+            pnlFooter.Resize += (s, e) =>
+            {
+                btnNext.Location = new Point(pnlFooter.Width - 106, 9);
+                btnSkip.Location = new Point(btnNext.Left - 86, 9);
+                btnBack.Location = new Point(btnSkip.Left - 86, 9);
+            };
+        }
+
+        #endregion
+
+        #region Step Management
+
+        private void BuildSteps()
+        {
+            // Root questions (no parent dependency)
+            var rootQuestions = _allQuestions
+                .Where(q => q.DependsOnQuestionDefId == null)
+                .OrderBy(q => q.SortOrder)
+                .ToList();
+
+            foreach (var q in rootQuestions)
+            {
+                _steps.Add(new QuestionStep { Question = q });
+            }
+        }
+
+        private void ShowStep(int index)
+        {
+            if (index < 0 || index >= _steps.Count)
+                return;
+
+            _currentStepIndex = index;
+            var step = _steps[index];
+
+            // Update step indicator
+            UpdateStepIndicator();
+
+            // Show question
+            lblSummaryTitle.Visible = false;
+            lblQuestionNumber.Visible = true;
+            lblQuestionText.Visible = true;
+            pnlAnswerArea.Visible = true;
+
+            lblQuestionNumber.Text = $"QUESTION {index + 1} OF {_steps.Count}";
+            lblQuestionText.Text = step.Question.QuestionText;
+
+            // Build answer controls
+            pnlAnswerArea.Controls.Clear();
+
+            if (step.Question.AnswerType == "YES_NO")
+            {
+                BuildYesNoAnswer(step);
+            }
+            else if (step.Question.AnswerType == "SINGLE_SELECT")
+            {
+                BuildSingleSelectAnswer(step);
+            }
+
+            // Button states
+            btnBack.Enabled = index > 0;
+            btnNext.Text = "Next >";
+
+            // Restore previous answer selection if going back
+            if (_answers.ContainsKey(step.Question.Id))
+            {
+                RestoreAnswer(step, _answers[step.Question.Id]);
+            }
+
+            UpdateNextButtonState();
+        }
+
+        private void ShowSummary()
+        {
+            lblQuestionNumber.Visible = false;
+            lblQuestionText.Visible = false;
+            pnlAnswerArea.Visible = false;
+            lblSummaryTitle.Visible = true;
+
+            // Clear and rebuild answer area as summary
+            pnlAnswerArea.Controls.Clear();
+            pnlAnswerArea.Location = new Point(28, 48);
+            pnlAnswerArea.Size = new Size(480, 200);
+            pnlAnswerArea.Visible = true;
+
+            int y = 0;
+            foreach (var step in _steps)
+            {
+                if (!_answers.ContainsKey(step.Question.Id))
+                    continue;
+
+                var answer = _answers[step.Question.Id];
+                string displayAnswer = GetDisplayAnswer(step.Question, answer);
+
+                var lblQ = new Label
+                {
+                    Text = step.Question.QuestionText,
+                    Font = new Font("Segoe UI", 8.5F),
+                    ForeColor = Color.FromArgb(100, 100, 100),
+                    AutoSize = true,
+                    Location = new Point(0, y)
+                };
+
+                var lblA = new Label
+                {
+                    Text = displayAnswer,
+                    Font = new Font("Segoe UI", 9F, FontStyle.Bold),
+                    ForeColor = Color.FromArgb(30, 30, 30),
+                    AutoSize = true,
+                    Location = new Point(12, y + 18)
+                };
+
+                pnlAnswerArea.Controls.Add(lblQ);
+                pnlAnswerArea.Controls.Add(lblA);
+                y += 44;
+            }
+
+            // Show property assignments
+            if (PropertyValues.Count > 0)
+            {
+                var lblProps = new Label
+                {
+                    Text = $"{PropertyValues.Count} property(s) will be applied.",
+                    Font = new Font("Segoe UI", 9F),
+                    ForeColor = Color.FromArgb(0, 128, 0),
+                    AutoSize = true,
+                    Location = new Point(0, y + 10)
+                };
+                pnlAnswerArea.Controls.Add(lblProps);
+            }
+
+            btnNext.Text = "OK";
+            btnBack.Enabled = _steps.Count > 0;
+
+            UpdateStepIndicator();
+        }
+
+        private void UpdateStepIndicator()
+        {
+            pnlSteps.Controls.Clear();
+            int x = 20;
+
+            for (int i = 0; i < _steps.Count; i++)
+            {
+                bool isCurrent = i == _currentStepIndex;
+                bool isCompleted = _answers.ContainsKey(_steps[i].Question.Id);
+
+                var indicator = new Label
+                {
+                    Text = (i + 1).ToString(),
+                    Size = new Size(22, 22),
+                    TextAlign = ContentAlignment.MiddleCenter,
+                    Font = new Font("Segoe UI", 8F, FontStyle.Bold),
+                    Location = new Point(x, 5)
+                };
+
+                if (isCurrent)
+                {
+                    indicator.BackColor = Color.FromArgb(0, 102, 204);
+                    indicator.ForeColor = Color.White;
+                }
+                else if (isCompleted)
+                {
+                    indicator.BackColor = Color.FromArgb(0, 153, 76);
+                    indicator.ForeColor = Color.White;
+                    indicator.Text = "\u2713"; // checkmark
+                }
+                else
+                {
+                    indicator.BackColor = Color.FromArgb(220, 220, 220);
+                    indicator.ForeColor = Color.FromArgb(100, 100, 100);
+                }
+
+                pnlSteps.Controls.Add(indicator);
+
+                // Connector line
+                if (i < _steps.Count - 1)
+                {
+                    var connector = new Panel
+                    {
+                        Size = new Size(20, 2),
+                        BackColor = isCompleted ? Color.FromArgb(0, 153, 76) : Color.FromArgb(220, 220, 220),
+                        Location = new Point(x + 24, 15)
+                    };
+                    pnlSteps.Controls.Add(connector);
+                }
+
+                x += 46;
+            }
+
+            // Summary indicator (always last)
+            bool isSummary = _currentStepIndex >= _steps.Count;
+            var summaryIndicator = new Label
+            {
+                Text = isSummary ? "\u2713" : "S",
+                Size = new Size(22, 22),
+                TextAlign = ContentAlignment.MiddleCenter,
+                Font = new Font("Segoe UI", 8F, FontStyle.Bold),
+                BackColor = isSummary ? Color.FromArgb(0, 102, 204) : Color.FromArgb(220, 220, 220),
+                ForeColor = isSummary ? Color.White : Color.FromArgb(100, 100, 100),
+                Location = new Point(x, 5)
+            };
+            pnlSteps.Controls.Add(summaryIndicator);
+        }
+
+        #endregion
+
+        #region Answer UI Builders
+
+        private void BuildYesNoAnswer(QuestionStep step)
+        {
+            var rbYes = new RadioButton
+            {
+                Text = "Yes",
+                Font = new Font("Segoe UI", 10F),
+                AutoSize = true,
+                Location = new Point(12, 10),
+                Tag = "YES",
+                Padding = new Padding(4)
+            };
+
+            var rbNo = new RadioButton
+            {
+                Text = "No",
+                Font = new Font("Segoe UI", 10F),
+                AutoSize = true,
+                Location = new Point(12, 42),
+                Tag = "NO",
+                Padding = new Padding(4)
+            };
+
+            rbYes.CheckedChanged += (s, e) => { if (rbYes.Checked) UpdateNextButtonState(); };
+            rbNo.CheckedChanged += (s, e) => { if (rbNo.Checked) UpdateNextButtonState(); };
+
+            pnlAnswerArea.Controls.Add(rbYes);
+            pnlAnswerArea.Controls.Add(rbNo);
+        }
+
+        private void BuildSingleSelectAnswer(QuestionStep step)
+        {
+            var options = step.Question.QuestionOptions?
+                .OrderBy(o => o.SortOrder)
+                .ToList() ?? new List<QuestionOption>();
+
+            int y = 10;
+            foreach (var opt in options)
+            {
+                string displayText = !string.IsNullOrEmpty(opt.DisplayText) ? opt.DisplayText : opt.Value;
+
+                var rb = new RadioButton
+                {
+                    Text = displayText,
+                    Font = new Font("Segoe UI", 10F),
+                    AutoSize = true,
+                    Location = new Point(12, y),
+                    Tag = opt.Value,
+                    Padding = new Padding(4)
+                };
+
+                rb.CheckedChanged += (s, e) => { if (rb.Checked) UpdateNextButtonState(); };
+                pnlAnswerArea.Controls.Add(rb);
+                y += 34;
+            }
+        }
+
+        private void RestoreAnswer(QuestionStep step, string answerValue)
+        {
+            foreach (Control c in pnlAnswerArea.Controls)
+            {
+                if (c is RadioButton rb && rb.Tag?.ToString() == answerValue)
+                {
+                    rb.Checked = true;
+                    break;
+                }
+            }
+        }
+
+        private string GetSelectedAnswer()
+        {
+            foreach (Control c in pnlAnswerArea.Controls)
+            {
+                if (c is RadioButton rb && rb.Checked)
+                    return rb.Tag?.ToString();
+            }
+            return null;
+        }
+
+        private string GetDisplayAnswer(QuestionDef question, string value)
+        {
+            if (question.AnswerType == "YES_NO")
+                return value == "YES" ? "Yes" : "No";
+
+            var option = question.QuestionOptions?.FirstOrDefault(o => o.Value == value);
+            return option?.DisplayText ?? option?.Value ?? value;
+        }
+
+        private void UpdateNextButtonState()
+        {
+            string selected = GetSelectedAnswer();
+            btnNext.Enabled = !string.IsNullOrEmpty(selected);
+        }
+
+        #endregion
+
+        #region Navigation
+
+        private void BtnNext_Click(object sender, EventArgs e)
+        {
+            // Summary screen -> Apply
+            if (_currentStepIndex >= _steps.Count)
+            {
+                DialogResult = DialogResult.OK;
+                Close();
+                return;
+            }
+
+            // Collect answer
+            string answer = GetSelectedAnswer();
+            if (string.IsNullOrEmpty(answer))
+                return;
+
+            var currentStep = _steps[_currentStepIndex];
+            _answers[currentStep.Question.Id] = answer;
+
+            // Apply rules for this answer
+            ApplyRulesForAnswer(currentStep.Question.Id, answer);
+
+            // Check for dependent sub-questions that should be inserted
+            InsertSubQuestions(currentStep.Question.Id, answer);
+
+            // Move to next step or summary
+            if (_currentStepIndex + 1 < _steps.Count)
+            {
+                ShowStep(_currentStepIndex + 1);
+            }
+            else
+            {
+                _currentStepIndex = _steps.Count; // past last step
+                ShowSummary();
+            }
+        }
+
+        private void BtnBack_Click(object sender, EventArgs e)
+        {
+            if (_currentStepIndex >= _steps.Count)
+            {
+                // From summary, go back to last step
+                ShowStep(_steps.Count - 1);
+                return;
+            }
+
+            if (_currentStepIndex > 0)
+            {
+                // Remove sub-questions that were added based on previous step's answer
+                var prevStep = _steps[_currentStepIndex - 1];
+                RemoveSubQuestions(prevStep.Question.Id);
+
+                // Remove previous answer's property values
+                if (_answers.ContainsKey(prevStep.Question.Id))
+                {
+                    RemoveRulesForAnswer(prevStep.Question.Id);
+                    _answers.Remove(prevStep.Question.Id);
+                }
+
+                ShowStep(_currentStepIndex - 1);
+            }
+        }
+
+        #endregion
+
+        #region Rule Processing
+
+        private void ApplyRulesForAnswer(int questionDefId, string answerValue)
+        {
+            var question = _allQuestions.FirstOrDefault(q => q.Id == questionDefId);
+            if (question?.QuestionRules == null) return;
+
+            var matchingRules = question.QuestionRules
+                .Where(r => r.AnswerValue == answerValue)
+                .ToList();
+
+            foreach (var rule in matchingRules)
+            {
+                PropertyValues[rule.PropertyDefId] = rule.PropertyValue;
+            }
+        }
+
+        private void RemoveRulesForAnswer(int questionDefId)
+        {
+            var question = _allQuestions.FirstOrDefault(q => q.Id == questionDefId);
+            if (question?.QuestionRules == null) return;
+
+            foreach (var rule in question.QuestionRules)
+            {
+                PropertyValues.Remove(rule.PropertyDefId);
+            }
+        }
+
+        private void InsertSubQuestions(int parentQuestionId, string answer)
+        {
+            // Find sub-questions that depend on this answer
+            var subQuestions = _allQuestions
+                .Where(q => q.DependsOnQuestionDefId == parentQuestionId
+                         && string.Equals(q.DependsOnAnswer, answer, StringComparison.OrdinalIgnoreCase))
+                .OrderBy(q => q.SortOrder)
+                .ToList();
+
+            if (!subQuestions.Any()) return;
+
+            // Insert after current step
+            int insertIndex = _currentStepIndex + 1;
+            foreach (var sq in subQuestions)
+            {
+                // Avoid duplicates
+                if (_steps.Any(s => s.Question.Id == sq.Id))
+                    continue;
+
+                _steps.Insert(insertIndex, new QuestionStep
+                {
+                    Question = sq,
+                    ParentQuestionId = parentQuestionId
+                });
+                insertIndex++;
+            }
+        }
+
+        private void RemoveSubQuestions(int parentQuestionId)
+        {
+            // Remove all steps that were added as sub-questions of this parent
+            var toRemove = _steps
+                .Where(s => s.ParentQuestionId == parentQuestionId)
+                .ToList();
+
+            foreach (var step in toRemove)
+            {
+                // Also remove their sub-questions recursively
+                RemoveSubQuestions(step.Question.Id);
+
+                // Remove answer and rules
+                if (_answers.ContainsKey(step.Question.Id))
+                {
+                    RemoveRulesForAnswer(step.Question.Id);
+                    _answers.Remove(step.Question.Id);
+                }
+
+                _steps.Remove(step);
+            }
+        }
+
+        #endregion
+
+        private class QuestionStep
+        {
+            public QuestionDef Question { get; set; }
+            public int? ParentQuestionId { get; set; }
+        }
+    }
+}

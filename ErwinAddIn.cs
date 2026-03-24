@@ -86,8 +86,9 @@ namespace EliteSoft.Erwin.AddIn
 
                 dynamic scapi = Activator.CreateInstance(scapiType);
 
-                // Show the form as non-modal (doesn't block other windows)
+                // Show the form centered on screen
                 _activeForm = new ModelConfigForm(scapi);
+                _activeForm.StartPosition = FormStartPosition.CenterScreen;
                 _activeForm.FormClosed += (s, e) => { _activeForm = null; };
                 _activeForm.Show();
             }
@@ -105,6 +106,7 @@ namespace EliteSoft.Erwin.AddIn
         {
             Execute();
         }
+
 
         /// <summary>
         /// Add-in display name for erwin menu

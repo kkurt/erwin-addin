@@ -31,6 +31,9 @@ namespace EliteSoft.Erwin.AddIn.Services
         // Snapshot of entity TABLE_TYPE values: ObjectId -> (PhysicalName, TableTypeValue)
         private Dictionary<string, EntitySnapshot> _entitySnapshots;
 
+        // Property applicator for applying project standards to new tables
+        private PropertyApplicatorService _propertyApplicator;
+
         // Event for logging
         public event Action<string> OnLog;
 
@@ -38,6 +41,14 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             _session = session;
             _entitySnapshots = new Dictionary<string, EntitySnapshot>();
+        }
+
+        /// <summary>
+        /// Set the property applicator service for applying project standards to new tables.
+        /// </summary>
+        public void SetPropertyApplicator(PropertyApplicatorService applicator)
+        {
+            _propertyApplicator = applicator;
         }
 
         /// <summary>
@@ -257,6 +268,12 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                         // Add new entity to diagram automatically
                         AddEntityToDiagram(entity, physicalName);
+
+                        // Apply project standard properties (LOGGING, COMPRESSION, etc.)
+                        if (_propertyApplicator != null && _propertyApplicator.IsInitialized)
+                        {
+                            _propertyApplicator.ApplyStandardsToEntity(entity, physicalName);
+                        }
 
                         // If new entity already has TABLE_TYPE set, apply affix
                         if (!string.IsNullOrEmpty(tableTypeValue))

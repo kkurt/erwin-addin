@@ -7,3 +7,4 @@ tmpclaude-*
 
 .claude/*/
 .claude-flow/
+dist/
