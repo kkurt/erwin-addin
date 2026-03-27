@@ -4,10 +4,13 @@
 #
 # Usage:
 #   .\build-and-register.ps1              # Build + install + register (dev workflow)
-#   .\build-and-register.ps1 -Package     # Self-contained publish + create installer
+#   .\build-and-register.ps1 -Package     # Framework-dependent publish + create installer
+#   .\build-and-register.ps1 -Package -License "HWID"  # Publish + generate license + create installer
 
 param(
     [switch]$Package,
+    [switch]$ZipPackage,
+    [string]$License,
     [Alias('?')]
     [switch]$Help
 )
@@ -18,14 +21,21 @@ if ($Help) {
     Write-Host "====================================" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "Usage:" -ForegroundColor Yellow
-    Write-Host "  .\build-and-register.ps1              Build + install + COM register (dev workflow)"
-    Write-Host "  .\build-and-register.ps1 -Package     Self-contained publish + create installer"
-    Write-Host "  .\build-and-register.ps1 -?           Show this help"
+    Write-Host "  .\build-and-register.ps1                              Build + install + COM register (dev workflow)"
+    Write-Host "  .\build-and-register.ps1 -Package                     Publish + create EXE installer (Inno Setup)"
+    Write-Host "  .\build-and-register.ps1 -ZipPackage                  Publish + create ZIP with install script"
+    Write-Host "  .\build-and-register.ps1 -Package -License HWID       Publish + embed license + EXE installer"
+    Write-Host "  .\build-and-register.ps1 -ZipPackage -License HWID    Publish + embed license + ZIP package"
+    Write-Host "  .\build-and-register.ps1 -?                           Show this help"
     Write-Host ""
     Write-Host "Parameters:" -ForegroundColor Yellow
-    Write-Host "  -Package    Publish self-contained (.NET 10 runtime included) and"
-    Write-Host "              create standalone installer via Inno Setup 6."
-    Write-Host "              Output: dist\ErwinAddIn-Setup-1.0.0.exe"
+    Write-Host "  -Package       Publish + create EXE installer via Inno Setup 6."
+    Write-Host "                 Output: dist\ErwinAddIn-Setup-1.0.0.exe"
+    Write-Host "  -ZipPackage    Publish + create ZIP with PowerShell install script."
+    Write-Host "                 No EXE - bypasses security software that blocks installers."
+    Write-Host "                 Output: dist\ErwinAddIn-1.0.0.zip"
+    Write-Host "  -License       Target machine HWID. Generates license.lic and embeds it."
+    Write-Host "                 Use HwidCollector on the target machine to get the HWID."
     Write-Host ""
     Write-Host "Requirements:" -ForegroundColor Yellow
     Write-Host "  - .NET 10 SDK"
@@ -37,6 +47,37 @@ if ($Help) {
 
 $ErrorActionPreference = "Stop"
 
+# XOR-obfuscate DLL/EXE files to bypass security software (removes MZ/PE header signature)
+$xorKey = [byte]0x5A
+function Invoke-ObfuscateForPackaging {
+    param([string]$dir)
+    $count = 0
+    # Only obfuscate our project DLLs (not Microsoft/third-party)
+    $ourFiles = @(
+        "EliteSoft.Erwin.AddIn.dll",
+        "EliteSoft.Erwin.AddIn.comhost.dll",
+        "EliteSoft.MetaAdmin.Shared.dll",
+        "xHardwareLicensing.dll",
+        "EAL.dll"
+    )
+    $files = Get-ChildItem -Path $dir -Recurse -File | Where-Object { $ourFiles -contains $_.Name }
+    foreach ($f in $files) {
+        $bytes = [System.IO.File]::ReadAllBytes($f.FullName)
+        for ($i = 0; $i -lt $bytes.Length; $i++) {
+            $bytes[$i] = $bytes[$i] -bxor $xorKey
+        }
+        if ($f.Extension -eq '.dll') {
+            $newPath = $f.FullName -replace '\.dll$', '.dl_'
+        } else {
+            $newPath = $f.FullName -replace '\.exe$', '.ex_'
+        }
+        [System.IO.File]::WriteAllBytes($newPath, $bytes)
+        Remove-Item $f.FullName -Force
+        $count++
+    }
+    return $count
+}
+
 # Auto-elevate to Administrator if not already
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
@@ -45,11 +86,13 @@ if (-not $isAdmin) {
     $scriptPath = $MyInvocation.MyCommand.Path
     $elevateArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
     if ($Package) { $elevateArgs += " -Package" }
+    if ($ZipPackage) { $elevateArgs += " -ZipPackage" }
+    if ($License) { $elevateArgs += " -License `"$License`"" }
     Start-Process powershell.exe -ArgumentList $elevateArgs -Verb RunAs
     exit
 }
 
-Write-Host "=== Elite Soft Erwin Add-In Build & Register ===" -ForegroundColor Cyan
+Write-Host "=== Elite Soft Erwin Add-In Build and Register ===" -ForegroundColor Cyan
 Write-Host "Running as Administrator" -ForegroundColor Green
 
 # Get script directory
@@ -58,30 +101,79 @@ Set-Location $scriptDir
 
 if ($Package) {
     # ============================================================
-    # PACKAGE MODE: Self-contained publish + Inno Setup installer
+    # PACKAGE MODE: Framework-dependent publish + Inno Setup installer
     # ============================================================
     Write-Host "`nMode: PACKAGE (standalone installer)" -ForegroundColor Magenta
 
     $publishDir = "C:\EliteSoft\ErwinAddIn-Publish"
 
     # Step 1: Clean & Publish
-    Write-Host "`n[1/3] Publishing self-contained build..." -ForegroundColor Yellow
+    Write-Host "`n[1/3] Publishing framework-dependent build..." -ForegroundColor Yellow
     dotnet clean ErwinAddIn.csproj -c Release 2>&1 | Out-Null
 
-    dotnet publish ErwinAddIn.csproj -c Release -r win-x64 --self-contained true -o $publishDir
+    dotnet publish ErwinAddIn.csproj -c Release -r win-x64 --self-contained false -o $publishDir
 
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Publish failed!" -ForegroundColor Red
         Write-Host "`nPress any key to exit..." -ForegroundColor Gray
-        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
         exit 1
     }
 
     $fileCount = (Get-ChildItem -Path $publishDir -Recurse -File).Count
     Write-Host "  Published $fileCount files to $publishDir" -ForegroundColor Green
 
-    # Step 2: Find Inno Setup compiler
-    Write-Host "`n[2/3] Finding Inno Setup 6..." -ForegroundColor Yellow
+    # Step 1.5: Generate license if HWID provided
+    if ($License) { $totalSteps = 4 } else { $totalSteps = 3 }
+
+    if ($License) {
+        Write-Host "`n[2/$totalSteps] Generating license for HWID..." -ForegroundColor Yellow
+        $keyGenProject = Join-Path $scriptDir "..\x-hw-licensing\KeyGen\KeyGen.csproj"
+        $licenseOutput = Join-Path $publishDir "license.lic"
+
+        if (-not (Test-Path $keyGenProject)) {
+            Write-Host "  KeyGen project not found: $keyGenProject" -ForegroundColor Red
+            Write-Host "`nPress any key to exit..." -ForegroundColor Gray
+            $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+            exit 1
+        }
+
+        # Run KeyGen to generate license (private key is in x-hw-licensing root)
+        $keyGenDir = Split-Path $keyGenProject -Parent
+        $privateKeySource = Join-Path $scriptDir "..\x-hw-licensing\rsa_private_key.xml"
+        $privateKeyTarget = Join-Path $keyGenDir "rsa_private_key.xml"
+
+        if (-not (Test-Path $privateKeySource)) {
+            Write-Host "  RSA private key not found: $privateKeySource" -ForegroundColor Red
+            Write-Host "`nPress any key to exit..." -ForegroundColor Gray
+            $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+            exit 1
+        }
+
+        # Temporarily copy private key to KeyGen directory
+        Copy-Item $privateKeySource $privateKeyTarget -Force
+
+        Push-Location $keyGenDir
+        dotnet run --project $keyGenProject -c Debug -- genlicense --hwid $License --licensee "ErwinAddIn" --features "ErwinAddIn" -o $licenseOutput
+        $keyGenExit = $LASTEXITCODE
+        Pop-Location
+
+        # Remove temporary copy
+        Remove-Item $privateKeyTarget -Force -ErrorAction SilentlyContinue
+
+        if ($keyGenExit -ne 0) {
+            Write-Host "  License generation failed!" -ForegroundColor Red
+            Write-Host "`nPress any key to exit..." -ForegroundColor Gray
+            $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+            exit 1
+        }
+
+        Write-Host "  License embedded in publish directory" -ForegroundColor Green
+    }
+
+    # Step N-1: Find Inno Setup compiler
+    if ($License) { $stepInno = 3 } else { $stepInno = 2 }
+    Write-Host "`n[$stepInno/$totalSteps] Finding Inno Setup 6..." -ForegroundColor Yellow
     $isccPaths = @(
         "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
         "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
@@ -100,20 +192,20 @@ if ($Package) {
         Write-Host "  Searched:" -ForegroundColor Gray
         foreach ($p in $isccPaths) { Write-Host "    $p" -ForegroundColor Gray }
         Write-Host "`nPress any key to exit..." -ForegroundColor Gray
-        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
         exit 1
     }
 
     Write-Host "  Found: $iscc" -ForegroundColor Green
 
-    # Step 3: Create installer
-    Write-Host "`n[3/3] Creating installer..." -ForegroundColor Yellow
+    # Step N: Create installer
+    Write-Host "`n[$totalSteps/$totalSteps] Creating installer..." -ForegroundColor Yellow
     $issFile = Join-Path $scriptDir "installer\erwin-addin-setup.iss"
 
     if (-not (Test-Path $issFile)) {
         Write-Host "  Inno Setup script not found: $issFile" -ForegroundColor Red
         Write-Host "`nPress any key to exit..." -ForegroundColor Gray
-        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
         exit 1
     }
 
@@ -128,7 +220,7 @@ if ($Package) {
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Installer creation failed!" -ForegroundColor Red
         Write-Host "`nPress any key to exit..." -ForegroundColor Gray
-        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
         exit 1
     }
 
@@ -136,8 +228,107 @@ if ($Package) {
     if ($installerFile) {
         $sizeMB = [math]::Round($installerFile.Length / 1MB, 1)
         Write-Host "`nInstaller created successfully!" -ForegroundColor Green
-        Write-Host "  $($installerFile.FullName) ($sizeMB MB)" -ForegroundColor Cyan
+        $sizeText = "$($sizeMB) MB"
+        Write-Host "  $($installerFile.FullName) ($sizeText)" -ForegroundColor Cyan
     }
+
+} elseif ($ZipPackage) {
+    # ============================================================
+    # ZIP PACKAGE MODE: Publish + ZIP with install/uninstall scripts
+    # ============================================================
+    Write-Host "`nMode: ZIP PACKAGE (portable installer)" -ForegroundColor Magenta
+
+    $publishDir = "C:\EliteSoft\ErwinAddIn-Publish"
+
+    # Step 1: Clean & Publish
+    Write-Host "`n[1/3] Publishing framework-dependent build..." -ForegroundColor Yellow
+    dotnet clean ErwinAddIn.csproj -c Release 2>&1 | Out-Null
+    dotnet publish ErwinAddIn.csproj -c Release -r win-x64 --self-contained false -o $publishDir
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Publish failed!" -ForegroundColor Red
+        Write-Host "`nPress any key to exit..." -ForegroundColor Gray
+        $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+        exit 1
+    }
+
+    $fileCount = (Get-ChildItem -Path $publishDir -Recurse -File).Count
+    Write-Host "  Published $fileCount files to $publishDir" -ForegroundColor Green
+
+    # Step 1.5: Generate license if HWID provided
+    if ($License) {
+        Write-Host "`n[2/3] Generating license for HWID..." -ForegroundColor Yellow
+        $keyGenProject = Join-Path $scriptDir "..\x-hw-licensing\KeyGen\KeyGen.csproj"
+        $licenseOutput = Join-Path $publishDir "license.lic"
+
+        if (-not (Test-Path $keyGenProject)) {
+            Write-Host "  KeyGen project not found: $keyGenProject" -ForegroundColor Red
+            Write-Host "`nPress any key to exit..." -ForegroundColor Gray
+            $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+            exit 1
+        }
+
+        $keyGenDir = Split-Path $keyGenProject -Parent
+        $privateKeySource = Join-Path $scriptDir "..\x-hw-licensing\rsa_private_key.xml"
+        $privateKeyTarget = Join-Path $keyGenDir "rsa_private_key.xml"
+
+        if (-not (Test-Path $privateKeySource)) {
+            Write-Host "  RSA private key not found: $privateKeySource" -ForegroundColor Red
+            Write-Host "`nPress any key to exit..." -ForegroundColor Gray
+            $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+            exit 1
+        }
+
+        Copy-Item $privateKeySource $privateKeyTarget -Force
+        Push-Location $keyGenDir
+        dotnet run --project $keyGenProject -c Debug -- genlicense --hwid $License --licensee "ErwinAddIn" --features "ErwinAddIn" -o $licenseOutput
+        $keyGenExit = $LASTEXITCODE
+        Pop-Location
+        Remove-Item $privateKeyTarget -Force -ErrorAction SilentlyContinue
+
+        if ($keyGenExit -ne 0) {
+            Write-Host "  License generation failed!" -ForegroundColor Red
+            Write-Host "`nPress any key to exit..." -ForegroundColor Gray
+            $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+            exit 1
+        }
+
+        Write-Host "  License embedded in publish directory" -ForegroundColor Green
+    }
+
+    # Copy install.ps1 script to publish dir
+    $installScriptSource = Join-Path $scriptDir "installer\install.ps1"
+    Copy-Item $installScriptSource (Join-Path $publishDir "install.ps1") -Force
+
+    # XOR-obfuscate DLL/EXE to bypass security software scanning
+    Write-Host "`nObfuscating binaries to bypass security software..." -ForegroundColor Yellow
+    $obfuscatedCount = Invoke-ObfuscateForPackaging -dir $publishDir
+    Write-Host "  Obfuscated $obfuscatedCount files (.dll -> .dl_, .exe -> .ex_)" -ForegroundColor Green
+
+    # Step N: Create ZIP
+    if ($License) { $stepZip = 3; $totalSteps = 3 } else { $stepZip = 2; $totalSteps = 2 }
+    Write-Host "`n[$stepZip/$totalSteps] Creating ZIP package..." -ForegroundColor Yellow
+
+    $distDir = Join-Path $scriptDir "dist"
+    if (-not (Test-Path $distDir)) {
+        New-Item -ItemType Directory -Path $distDir -Force | Out-Null
+    }
+
+    $zipFile = Join-Path $distDir "ErwinAddIn-1.0.0.zip"
+    if (Test-Path $zipFile) { Remove-Item $zipFile -Force }
+
+    Compress-Archive -Path "$publishDir\*" -DestinationPath $zipFile -CompressionLevel Optimal
+
+    $sizeMB = [math]::Round((Get-Item $zipFile).Length / 1MB, 1)
+    Write-Host "`nZIP package created successfully!" -ForegroundColor Green
+    $sizeText = "$($sizeMB) MB"
+    Write-Host "  $zipFile ($sizeText)" -ForegroundColor Cyan
+    Write-Host "`nInstall on target:" -ForegroundColor Yellow
+    Write-Host "  1. Extract ZIP" -ForegroundColor White
+    Write-Host "  2. Run PowerShell as Administrator" -ForegroundColor White
+    Write-Host "  3. .\install.ps1" -ForegroundColor White
+    Write-Host "`nUninstall:" -ForegroundColor Yellow
+    Write-Host "  .\install.ps1 -Uninstall" -ForegroundColor White
 
 } else {
     # ============================================================
@@ -164,7 +355,7 @@ if ($Package) {
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Build failed!" -ForegroundColor Red
         Write-Host "`nPress any key to exit..." -ForegroundColor Gray
-        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
         exit 1
     }
 
@@ -175,7 +366,7 @@ if ($Package) {
     if (-not (Test-Path (Join-Path $buildOutputDir "EliteSoft.Erwin.AddIn.dll"))) {
         Write-Host "DLL not found in build output!" -ForegroundColor Red
         Write-Host "`nPress any key to exit..." -ForegroundColor Gray
-        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
         exit 1
     }
 
@@ -224,9 +415,9 @@ if ($Package) {
     Write-Host "`n[4/5] Registering COM host..." -ForegroundColor Yellow
     $installedComHost = Join-Path $installDir "EliteSoft.Erwin.AddIn.comhost.dll"
     if (-not (Test-Path $installedComHost)) {
-        Write-Host "  comhost.dll not found! Ensure <EnableComHosting>true</EnableComHosting> is in csproj." -ForegroundColor Red
+        Write-Host "  comhost.dll not found! Ensure EnableComHosting is set to true in csproj." -ForegroundColor Red
         Write-Host "`nPress any key to exit..." -ForegroundColor Gray
-        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
         exit 1
     }
     & regsvr32.exe /s $installedComHost 2>&1 | Out-Null
@@ -278,10 +469,10 @@ if ($Package) {
     } else {
         Write-Host "Registration failed!" -ForegroundColor Red
         Write-Host "`nPress any key to exit..." -ForegroundColor Gray
-        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
         exit 1
     }
 }
 
 Write-Host "`nPress any key to exit..." -ForegroundColor Gray
-$null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+$null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')

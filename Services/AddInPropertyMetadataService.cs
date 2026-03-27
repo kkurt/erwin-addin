@@ -2,9 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using Microsoft.EntityFrameworkCore;
-using EliteSoft.MetaCenter.Shared.Data;
-using EliteSoft.MetaCenter.Shared.Data.Entities;
-using EliteSoft.MetaCenter.Shared.Services;
+using EliteSoft.MetaAdmin.Shared.Data;
+using EliteSoft.MetaAdmin.Shared.Data.Entities;
+using EliteSoft.MetaAdmin.Shared.Services;
 
 namespace EliteSoft.Erwin.AddIn.Services
 {

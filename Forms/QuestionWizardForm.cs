@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.Linq;
 using System.Windows.Forms;
-using EliteSoft.MetaCenter.Shared.Data.Entities;
+using EliteSoft.MetaAdmin.Shared.Data.Entities;
 
 namespace EliteSoft.Erwin.AddIn.Forms
 {
@@ -37,9 +37,15 @@ namespace EliteSoft.Erwin.AddIn.Forms
         private Panel pnlSteps;
         private Button btnBack;
         private Button btnNext;
-        private Button btnSkip;
-        private Button btnCancel;
         private Label lblSummaryTitle;
+
+        // Design system
+        private static readonly Color ClrPrimary = Color.FromArgb(0, 102, 204);
+        private static readonly Color ClrSuccess = Color.FromArgb(0, 138, 62);
+        private static readonly Color ClrTextPrimary = Color.FromArgb(26, 26, 26);
+        private static readonly Color ClrTextSecondary = Color.FromArgb(102, 102, 102);
+        private static readonly Color ClrBorder = Color.FromArgb(208, 208, 208);
+        private static readonly Color ClrSurface = Color.FromArgb(245, 247, 250);
 
         public QuestionWizardForm(string tableName, List<QuestionDef> questions)
         {
@@ -62,7 +68,8 @@ namespace EliteSoft.Erwin.AddIn.Forms
             this.MaximizeBox = false;
             this.MinimizeBox = false;
             this.ShowInTaskbar = false;
-            this.Font = new Font("Segoe UI", 9F);
+            this.BackColor = Color.White;
+            this.Font = new Font("Segoe UI", 9.5F);
 
             // Header panel
             pnlHeader = new Panel
@@ -77,7 +84,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
             {
                 Text = $"New Table: {_tableName}",
                 Font = new Font("Segoe UI", 13F, FontStyle.Bold),
-                ForeColor = Color.FromArgb(30, 30, 30),
+                ForeColor = ClrTextPrimary,
                 AutoSize = true,
                 Location = new Point(20, 12)
             };
@@ -85,8 +92,8 @@ namespace EliteSoft.Erwin.AddIn.Forms
             lblSubtitle = new Label
             {
                 Text = "Answer the following questions to configure table properties.",
-                Font = new Font("Segoe UI", 9F),
-                ForeColor = Color.FromArgb(100, 100, 100),
+                Font = new Font("Segoe UI", 9.5F),
+                ForeColor = ClrTextSecondary,
                 AutoSize = true,
                 Location = new Point(20, 42)
             };
@@ -99,7 +106,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
             {
                 Dock = DockStyle.Top,
                 Height = 1,
-                BackColor = Color.FromArgb(220, 220, 220)
+                BackColor = ClrBorder
             };
 
             // Step indicator panel
@@ -107,7 +114,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
             {
                 Dock = DockStyle.Top,
                 Height = 32,
-                BackColor = Color.FromArgb(248, 248, 248),
+                BackColor = ClrSurface,
                 Padding = new Padding(20, 6, 20, 6)
             };
 
@@ -121,16 +128,16 @@ namespace EliteSoft.Erwin.AddIn.Forms
 
             lblQuestionNumber = new Label
             {
-                Font = new Font("Segoe UI", 8F),
-                ForeColor = Color.FromArgb(0, 102, 204),
+                Font = new Font("Segoe UI", 8.5F),
+                ForeColor = ClrPrimary,
                 AutoSize = true,
                 Location = new Point(28, 20)
             };
 
             lblQuestionText = new Label
             {
-                Font = new Font("Segoe UI", 11F),
-                ForeColor = Color.FromArgb(30, 30, 30),
+                Font = new Font("Segoe UI", 11F, FontStyle.Regular),
+                ForeColor = ClrTextPrimary,
                 Location = new Point(28, 42),
                 Size = new Size(480, 50),
                 AutoSize = false
@@ -145,8 +152,8 @@ namespace EliteSoft.Erwin.AddIn.Forms
 
             lblSummaryTitle = new Label
             {
-                Font = new Font("Segoe UI", 10F, FontStyle.Bold),
-                ForeColor = Color.FromArgb(30, 30, 30),
+                Font = new Font("Segoe UI", 11F, FontStyle.Bold),
+                ForeColor = ClrTextPrimary,
                 Text = "Summary",
                 AutoSize = true,
                 Location = new Point(28, 20),
@@ -163,7 +170,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
             {
                 Dock = DockStyle.Bottom,
                 Height = 1,
-                BackColor = Color.FromArgb(220, 220, 220)
+                BackColor = ClrBorder
             };
 
             // Footer panel
@@ -171,68 +178,46 @@ namespace EliteSoft.Erwin.AddIn.Forms
             {
                 Dock = DockStyle.Bottom,
                 Height = 50,
-                BackColor = Color.FromArgb(243, 243, 243),
+                BackColor = ClrSurface,
                 Padding = new Padding(16, 8, 16, 8)
             };
 
-            btnCancel = new Button
-            {
-                Text = "Cancel",
-                Size = new Size(80, 32),
-                FlatStyle = FlatStyle.Flat,
-                BackColor = Color.White,
-                ForeColor = Color.FromArgb(80, 80, 80),
-                Anchor = AnchorStyles.Left | AnchorStyles.Bottom,
-                Visible = false
-            };
-            btnCancel.FlatAppearance.BorderColor = Color.FromArgb(200, 200, 200);
-            btnCancel.Click += (s, e) => { DialogResult = DialogResult.Cancel; Close(); };
-
+            // Back — Secondary style
             btnBack = new Button
             {
                 Text = "< Back",
-                Size = new Size(80, 32),
+                Size = new Size(100, 32),
                 FlatStyle = FlatStyle.Flat,
                 BackColor = Color.White,
-                ForeColor = Color.FromArgb(80, 80, 80),
+                ForeColor = ClrTextPrimary,
+                Font = new Font("Segoe UI", 9.5F),
                 Enabled = false,
+                Cursor = Cursors.Hand,
                 Anchor = AnchorStyles.Right | AnchorStyles.Bottom
             };
-            btnBack.FlatAppearance.BorderColor = Color.FromArgb(200, 200, 200);
+            btnBack.FlatAppearance.BorderColor = ClrBorder;
             btnBack.Click += BtnBack_Click;
 
-            btnSkip = new Button
-            {
-                Text = "Skip >",
-                Size = new Size(80, 32),
-                FlatStyle = FlatStyle.Flat,
-                BackColor = Color.White,
-                ForeColor = Color.FromArgb(100, 100, 100),
-                Anchor = AnchorStyles.Right | AnchorStyles.Bottom,
-                Visible = false
-            };
-            btnSkip.FlatAppearance.BorderColor = Color.FromArgb(200, 200, 200);
-
+            // Next — Primary style
             btnNext = new Button
             {
                 Text = "Next >",
-                Size = new Size(90, 32),
+                Size = new Size(110, 32),
                 FlatStyle = FlatStyle.Flat,
-                BackColor = Color.FromArgb(0, 102, 204),
+                BackColor = ClrPrimary,
                 ForeColor = Color.White,
-                Font = new Font("Segoe UI", 9F, FontStyle.Bold),
+                Font = new Font("Segoe UI", 9.5F, FontStyle.Bold),
+                Cursor = Cursors.Hand,
                 Anchor = AnchorStyles.Right | AnchorStyles.Bottom
             };
             btnNext.FlatAppearance.BorderSize = 0;
             btnNext.Click += BtnNext_Click;
 
-            // Position buttons
-            btnCancel.Location = new Point(16, 9);
-            btnNext.Location = new Point(pnlFooter.Width - 106, 9);
-            btnSkip.Location = new Point(btnNext.Left - 86, 9);
-            btnBack.Location = new Point(btnSkip.Left - 86, 9);
+            // Position buttons — only Back + Next
+            btnNext.Location = new Point(pnlFooter.Width - 126, 9);
+            btnBack.Location = new Point(btnNext.Left - 108, 9);
 
-            pnlFooter.Controls.AddRange(new Control[] { btnCancel, btnBack, btnSkip, btnNext });
+            pnlFooter.Controls.AddRange(new Control[] { btnBack, btnNext });
 
             // Add controls in reverse dock order
             this.Controls.Add(pnlContent);
@@ -245,9 +230,8 @@ namespace EliteSoft.Erwin.AddIn.Forms
             // Reposition buttons on resize
             pnlFooter.Resize += (s, e) =>
             {
-                btnNext.Location = new Point(pnlFooter.Width - 106, 9);
-                btnSkip.Location = new Point(btnNext.Left - 86, 9);
-                btnBack.Location = new Point(btnSkip.Left - 86, 9);
+                btnNext.Location = new Point(pnlFooter.Width - 126, 9);
+                btnBack.Location = new Point(btnNext.Left - 108, 9);
             };
         }
 
@@ -340,7 +324,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 {
                     Text = step.Question.QuestionText,
                     Font = new Font("Segoe UI", 8.5F),
-                    ForeColor = Color.FromArgb(100, 100, 100),
+                    ForeColor = ClrTextSecondary,
                     AutoSize = true,
                     Location = new Point(0, y)
                 };
@@ -348,8 +332,8 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 var lblA = new Label
                 {
                     Text = displayAnswer,
-                    Font = new Font("Segoe UI", 9F, FontStyle.Bold),
-                    ForeColor = Color.FromArgb(30, 30, 30),
+                    Font = new Font("Segoe UI", 9.5F, FontStyle.Bold),
+                    ForeColor = ClrTextPrimary,
                     AutoSize = true,
                     Location = new Point(12, y + 18)
                 };
@@ -365,8 +349,8 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 var lblProps = new Label
                 {
                     Text = $"{PropertyValues.Count} property(s) will be applied.",
-                    Font = new Font("Segoe UI", 9F),
-                    ForeColor = Color.FromArgb(0, 128, 0),
+                    Font = new Font("Segoe UI", 9.5F),
+                    ForeColor = ClrSuccess,
                     AutoSize = true,
                     Location = new Point(0, y + 10)
                 };
@@ -383,8 +367,42 @@ namespace EliteSoft.Erwin.AddIn.Forms
         {
             pnlSteps.Controls.Clear();
             int x = 20;
+            const int maxVisible = 8;
 
-            for (int i = 0; i < _steps.Count; i++)
+            // Determine visible range (keep current step centered when too many steps)
+            int totalSteps = _steps.Count;
+            int startIdx = 0;
+            int endIdx = totalSteps - 1;
+
+            if (totalSteps > maxVisible)
+            {
+                int half = maxVisible / 2;
+                startIdx = Math.Max(0, _currentStepIndex - half);
+                endIdx = startIdx + maxVisible - 1;
+                if (endIdx >= totalSteps)
+                {
+                    endIdx = totalSteps - 1;
+                    startIdx = endIdx - maxVisible + 1;
+                }
+            }
+
+            // Leading ellipsis
+            if (startIdx > 0)
+            {
+                var ellipsis = new Label
+                {
+                    Text = "...",
+                    Size = new Size(22, 22),
+                    TextAlign = ContentAlignment.MiddleCenter,
+                    Font = new Font("Segoe UI", 8F),
+                    ForeColor = ClrTextSecondary,
+                    Location = new Point(x, 5)
+                };
+                pnlSteps.Controls.Add(ellipsis);
+                x += 30;
+            }
+
+            for (int i = startIdx; i <= endIdx; i++)
             {
                 bool isCurrent = i == _currentStepIndex;
                 bool isCompleted = _answers.ContainsKey(_steps[i].Question.Id);
@@ -400,36 +418,64 @@ namespace EliteSoft.Erwin.AddIn.Forms
 
                 if (isCurrent)
                 {
-                    indicator.BackColor = Color.FromArgb(0, 102, 204);
+                    indicator.BackColor = ClrPrimary;
                     indicator.ForeColor = Color.White;
                 }
                 else if (isCompleted)
                 {
-                    indicator.BackColor = Color.FromArgb(0, 153, 76);
+                    indicator.BackColor = ClrSuccess;
                     indicator.ForeColor = Color.White;
-                    indicator.Text = "\u2713"; // checkmark
+                    indicator.Text = "\u2713";
                 }
                 else
                 {
-                    indicator.BackColor = Color.FromArgb(220, 220, 220);
-                    indicator.ForeColor = Color.FromArgb(100, 100, 100);
+                    indicator.BackColor = ClrBorder;
+                    indicator.ForeColor = ClrTextSecondary;
                 }
 
                 pnlSteps.Controls.Add(indicator);
 
                 // Connector line
-                if (i < _steps.Count - 1)
+                if (i < endIdx)
                 {
                     var connector = new Panel
                     {
                         Size = new Size(20, 2),
-                        BackColor = isCompleted ? Color.FromArgb(0, 153, 76) : Color.FromArgb(220, 220, 220),
+                        BackColor = isCompleted ? ClrSuccess : ClrBorder,
                         Location = new Point(x + 24, 15)
                     };
                     pnlSteps.Controls.Add(connector);
                 }
 
                 x += 46;
+            }
+
+            // Trailing ellipsis
+            if (endIdx < totalSteps - 1)
+            {
+                x += 4;
+                var ellipsis = new Label
+                {
+                    Text = "...",
+                    Size = new Size(22, 22),
+                    TextAlign = ContentAlignment.MiddleCenter,
+                    Font = new Font("Segoe UI", 8F),
+                    ForeColor = ClrTextSecondary,
+                    Location = new Point(x, 5)
+                };
+                pnlSteps.Controls.Add(ellipsis);
+                x += 30;
+            }
+            else
+            {
+                // Connector to summary
+                var connector = new Panel
+                {
+                    Size = new Size(20, 2),
+                    BackColor = (_currentStepIndex >= totalSteps) ? ClrSuccess : ClrBorder,
+                    Location = new Point(x - 22 + 24, 15)
+                };
+                pnlSteps.Controls.Add(connector);
             }
 
             // Summary indicator (always last)
@@ -440,8 +486,8 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 Size = new Size(22, 22),
                 TextAlign = ContentAlignment.MiddleCenter,
                 Font = new Font("Segoe UI", 8F, FontStyle.Bold),
-                BackColor = isSummary ? Color.FromArgb(0, 102, 204) : Color.FromArgb(220, 220, 220),
-                ForeColor = isSummary ? Color.White : Color.FromArgb(100, 100, 100),
+                BackColor = isSummary ? ClrPrimary : ClrBorder,
+                ForeColor = isSummary ? Color.White : ClrTextSecondary,
                 Location = new Point(x, 5)
             };
             pnlSteps.Controls.Add(summaryIndicator);
@@ -457,20 +503,22 @@ namespace EliteSoft.Erwin.AddIn.Forms
             {
                 Text = "Yes",
                 Font = new Font("Segoe UI", 10F),
+                ForeColor = ClrTextPrimary,
                 AutoSize = true,
                 Location = new Point(12, 10),
                 Tag = "YES",
-                Padding = new Padding(4)
+                Padding = new Padding(6)
             };
 
             var rbNo = new RadioButton
             {
                 Text = "No",
                 Font = new Font("Segoe UI", 10F),
+                ForeColor = ClrTextPrimary,
                 AutoSize = true,
-                Location = new Point(12, 42),
+                Location = new Point(12, 46),
                 Tag = "NO",
-                Padding = new Padding(4)
+                Padding = new Padding(6)
             };
 
             rbYes.CheckedChanged += (s, e) => { if (rbYes.Checked) UpdateNextButtonState(); };
@@ -495,15 +543,16 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 {
                     Text = displayText,
                     Font = new Font("Segoe UI", 10F),
+                    ForeColor = ClrTextPrimary,
                     AutoSize = true,
                     Location = new Point(12, y),
                     Tag = opt.Value,
-                    Padding = new Padding(4)
+                    Padding = new Padding(6)
                 };
 
                 rb.CheckedChanged += (s, e) => { if (rb.Checked) UpdateNextButtonState(); };
                 pnlAnswerArea.Controls.Add(rb);
-                y += 34;
+                y += 38;
             }
         }
 

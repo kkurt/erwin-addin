@@ -8,3 +8,4 @@ tmpclaude-*
 .claude/*/
 .claude-flow/
 dist/
+certs/*.pfx

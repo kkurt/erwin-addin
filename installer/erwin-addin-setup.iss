@@ -28,13 +28,17 @@ UninstallDisplayName={#MyAppName}
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
+[InstallDelete]
+; Clean old files before install (prevents stale self-contained runtime conflicts)
+Type: filesandordirs; Name: "{app}"
+
 [Files]
-; Self-contained publish output (includes .NET 10 runtime + all dependencies)
+; Framework-dependent publish output (requires .NET 10 runtime on target machine)
 Source: "C:\EliteSoft\ErwinAddIn-Publish\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Run]
-; Register COM host after install
-Filename: "regsvr32.exe"; Parameters: "/s ""{app}\EliteSoft.Erwin.AddIn.comhost.dll"""; StatusMsg: "Registering COM component..."; Flags: runhidden
+; Register COM host after install (no /s flag so user sees errors)
+Filename: "regsvr32.exe"; Parameters: """{app}\EliteSoft.Erwin.AddIn.comhost.dll"""; StatusMsg: "Registering COM component..."
 
 [UninstallRun]
 ; Unregister COM host before uninstall
@@ -52,37 +56,35 @@ var
 begin
   ErwinRegBase := 'SOFTWARE\erwin\Data Modeler';
 
-  if not RegKeyExists(HKEY_CURRENT_USER, ErwinRegBase) then
+  // Register in all erwin versions found in both HKLM and HKCU
+  if RegGetSubkeyNames(HKEY_LOCAL_MACHINE, ErwinRegBase, Versions) then
   begin
-    Log('erwin not installed, skipping Add-In Manager registration');
-    Exit;
-  end;
-
-  // Find latest erwin version
-  if RegGetSubkeyNames(HKEY_CURRENT_USER, ErwinRegBase, Versions) then
-  begin
-    LatestVersion := '';
     for I := 0 to GetArrayLength(Versions) - 1 do
     begin
-      if LatestVersion = '' then
-        LatestVersion := Versions[I]
-      else if CompareStr(Versions[I], LatestVersion) > 0 then
-        LatestVersion := Versions[I];
+      AddInsPath := ErwinRegBase + '\' + Versions[I] + '\Add-Ins\Elite Soft Erwin Addin';
+      RegWriteDWordValue(HKEY_LOCAL_MACHINE, AddInsPath, 'Menu Identifier', 1);
+      RegWriteStringValue(HKEY_LOCAL_MACHINE, AddInsPath, 'ProgID', 'EliteSoft.Erwin.AddIn');
+      RegWriteStringValue(HKEY_LOCAL_MACHINE, AddInsPath, 'Invoke Method', 'Execute');
+      RegWriteDWordValue(HKEY_LOCAL_MACHINE, AddInsPath, 'Invoke EXE', 0);
+      Log('Registered in erwin ' + Versions[I] + ' (HKLM)');
     end;
+  end;
 
-    if LatestVersion <> '' then
+  if RegGetSubkeyNames(HKEY_CURRENT_USER, ErwinRegBase, Versions) then
+  begin
+    for I := 0 to GetArrayLength(Versions) - 1 do
     begin
-      AddInsPath := ErwinRegBase + '\' + LatestVersion + '\Add-Ins\Elite Soft Erwin Addin';
+      AddInsPath := ErwinRegBase + '\' + Versions[I] + '\Add-Ins\Elite Soft Erwin Addin';
       RegWriteDWordValue(HKEY_CURRENT_USER, AddInsPath, 'Menu Identifier', 1);
       RegWriteStringValue(HKEY_CURRENT_USER, AddInsPath, 'ProgID', 'EliteSoft.Erwin.AddIn');
       RegWriteStringValue(HKEY_CURRENT_USER, AddInsPath, 'Invoke Method', 'Execute');
       RegWriteDWordValue(HKEY_CURRENT_USER, AddInsPath, 'Invoke EXE', 0);
-      Log('Registered in erwin ' + LatestVersion + ' Add-In Manager');
+      Log('Registered in erwin ' + Versions[I] + ' (HKCU)');
     end;
   end;
 end;
 
-// Unregister add-in from erwin Add-In Manager
+// Unregister add-in from erwin Add-In Manager (both HKLM and HKCU)
 procedure UnregisterErwinAddIn();
 var
   ErwinRegBase: String;
@@ -92,6 +94,18 @@ var
 begin
   ErwinRegBase := 'SOFTWARE\erwin\Data Modeler';
 
+  // Clean HKLM
+  if RegGetSubkeyNames(HKEY_LOCAL_MACHINE, ErwinRegBase, Versions) then
+  begin
+    for I := 0 to GetArrayLength(Versions) - 1 do
+    begin
+      AddInsPath := ErwinRegBase + '\' + Versions[I] + '\Add-Ins\Elite Soft Erwin Addin';
+      if RegKeyExists(HKEY_LOCAL_MACHINE, AddInsPath) then
+        RegDeleteKeyIncludingSubkeys(HKEY_LOCAL_MACHINE, AddInsPath);
+    end;
+  end;
+
+  // Clean HKCU (legacy installs)
   if RegGetSubkeyNames(HKEY_CURRENT_USER, ErwinRegBase, Versions) then
   begin
     for I := 0 to GetArrayLength(Versions) - 1 do

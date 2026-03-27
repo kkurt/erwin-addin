@@ -11,6 +11,7 @@
     <!-- COM Interop - .NET 10 COM hosting (generates .comhost.dll, register with regsvr32) -->
     <ComVisible>true</ComVisible>
     <EnableComHosting>true</EnableComHosting>
+    <NoWarn>MSB3246</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
@@ -36,6 +37,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\erwin-admin\MetaShared\MetaShared.csproj" />
+    <ProjectReference Include="..\x-hw-licensing\xHardwareLicensing\xHardwareLicensing.csproj" />
   </ItemGroup>
 
   <ItemGroup>

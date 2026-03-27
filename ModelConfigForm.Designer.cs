@@ -17,7 +17,23 @@ namespace EliteSoft.Erwin.AddIn
 
         private void InitializeComponent()
         {
-            // TabControl and TabPages
+            // === Design System Colors ===
+            var clrPrimary = System.Drawing.Color.FromArgb(0, 102, 204);
+            var clrPrimaryDark = System.Drawing.Color.FromArgb(0, 76, 153);
+            var clrSuccess = System.Drawing.Color.FromArgb(0, 138, 62);
+            var clrError = System.Drawing.Color.FromArgb(204, 0, 0);
+            var clrTextPrimary = System.Drawing.Color.FromArgb(26, 26, 26);
+            var clrTextSecondary = System.Drawing.Color.FromArgb(102, 102, 102);
+            var clrTextDisabled = System.Drawing.Color.FromArgb(153, 153, 153);
+            var clrBorder = System.Drawing.Color.FromArgb(208, 208, 208);
+            var clrSurface = System.Drawing.Color.FromArgb(245, 247, 250);
+            var clrSurfaceAlt = System.Drawing.Color.FromArgb(238, 241, 245);
+
+            var fontBody = new System.Drawing.Font("Segoe UI", 9.5F);
+            var fontBodyBold = new System.Drawing.Font("Segoe UI", 9.5F, System.Drawing.FontStyle.Bold);
+            var fontCaption = new System.Drawing.Font("Segoe UI", 8.5F);
+
+            // === Control Instantiation ===
             this.tabControl = new System.Windows.Forms.TabControl();
             this.tabModel = new System.Windows.Forms.TabPage();
             this.tabConfiguration = new System.Windows.Forms.TabPage();
@@ -26,22 +42,14 @@ namespace EliteSoft.Erwin.AddIn
             this.tabTableProcesses = new System.Windows.Forms.TabPage();
             this.tabDebug = new System.Windows.Forms.TabPage();
 
-            // Table Processes tab controls
-            this.grpTableProcesses = new System.Windows.Forms.GroupBox();
-            this.lblSelectTable = new System.Windows.Forms.Label();
-            this.cmbTables = new System.Windows.Forms.ComboBox();
-            this.chkArchiveTable = new System.Windows.Forms.CheckBox();
-            this.chkIsolatedTable = new System.Windows.Forms.CheckBox();
-            this.btnCreateTables = new System.Windows.Forms.Button();
-            this.lblTableProcessStatus = new System.Windows.Forms.Label();
-
-            // Model tab controls
+            // Model tab
             this.grpModel = new System.Windows.Forms.GroupBox();
             this.cmbModels = new System.Windows.Forms.ComboBox();
             this.lblConnectionStatus = new System.Windows.Forms.Label();
             this.lblModelName = new System.Windows.Forms.Label();
+            this.lblPlatformStatus = new System.Windows.Forms.Label();
 
-            // Configuration tab controls
+            // Configuration tab
             this.grpConfig = new System.Windows.Forms.GroupBox();
             this.lblDatabaseName = new System.Windows.Forms.Label();
             this.txtDatabaseName = new System.Windows.Forms.TextBox();
@@ -51,16 +59,7 @@ namespace EliteSoft.Erwin.AddIn
             this.txtName = new System.Windows.Forms.TextBox();
             this.btnApply = new System.Windows.Forms.Button();
 
-            // Validation tab controls - nested TabControl for Column and Table validations
-            this.tabControlValidation = new System.Windows.Forms.TabControl();
-            this.tabColumnValidation = new System.Windows.Forms.TabPage();
-            this.tabTableValidation = new System.Windows.Forms.TabPage();
-            this.btnValidateAll = new System.Windows.Forms.Button();
-            this.listColumnValidation = new System.Windows.Forms.ListView();
-            this.listTableValidation = new System.Windows.Forms.ListView();
-            this.lblValidationStatus = new System.Windows.Forms.Label();
-
-            // Glossary tab controls
+            // Glossary tab
             this.grpGlossary = new System.Windows.Forms.GroupBox();
             this.lblHost = new System.Windows.Forms.Label();
             this.lblHostValue = new System.Windows.Forms.Label();
@@ -74,13 +73,39 @@ namespace EliteSoft.Erwin.AddIn
             this.lblLastRefresh = new System.Windows.Forms.Label();
             this.lblLastRefreshValue = new System.Windows.Forms.Label();
 
-            // Debug tab controls
+            // Validation tab — nested tabs removed, single list + filter
+            this.tabControlValidation = new System.Windows.Forms.TabControl();
+            this.tabColumnValidation = new System.Windows.Forms.TabPage();
+            this.tabTableValidation = new System.Windows.Forms.TabPage();
+            this.btnValidateAll = new System.Windows.Forms.Button();
+            this.listColumnValidation = new System.Windows.Forms.ListView();
+            this.listTableValidation = new System.Windows.Forms.ListView();
+            this.lblValidationStatus = new System.Windows.Forms.Label();
+            this.cmbValidationFilter = new System.Windows.Forms.ComboBox();
+            this.lblFilterLabel = new System.Windows.Forms.Label();
+
+            // Table Processes tab
+            this.grpTableProcesses = new System.Windows.Forms.GroupBox();
+            this.lblSelectTable = new System.Windows.Forms.Label();
+            this.cmbTables = new System.Windows.Forms.ComboBox();
+            this.chkArchiveTable = new System.Windows.Forms.CheckBox();
+            this.chkIsolatedTable = new System.Windows.Forms.CheckBox();
+            this.btnCreateTables = new System.Windows.Forms.Button();
+            this.lblTableProcessStatus = new System.Windows.Forms.Label();
+            this.lblArchiveSuffix = new System.Windows.Forms.Label();
+            this.lblIsolatedSuffix = new System.Windows.Forms.Label();
+
+            // Debug tab
             this.grpDebugLog = new System.Windows.Forms.GroupBox();
             this.txtDebugLog = new System.Windows.Forms.TextBox();
             this.btnCopyLog = new System.Windows.Forms.Button();
             this.btnClearLog = new System.Windows.Forms.Button();
+            this.txtLogSearch = new System.Windows.Forms.TextBox();
+            this.lblLogSearch = new System.Windows.Forms.Label();
 
-            // Bottom controls
+            // Bottom
+            this.pnlStatusBar = new System.Windows.Forms.Panel();
+            this.pnlStatusSep = new System.Windows.Forms.Panel();
             this.btnClose = new System.Windows.Forms.Button();
             this.lblStatus = new System.Windows.Forms.Label();
 
@@ -99,11 +124,12 @@ namespace EliteSoft.Erwin.AddIn
             this.tabColumnValidation.SuspendLayout();
             this.tabTableValidation.SuspendLayout();
             this.grpDebugLog.SuspendLayout();
+            this.pnlStatusBar.SuspendLayout();
             this.SuspendLayout();
 
-            //
+            // ================================================================
             // tabControl
-            //
+            // ================================================================
             this.tabControl.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right | System.Windows.Forms.AnchorStyles.Bottom;
             this.tabControl.Controls.Add(this.tabModel);
             this.tabControl.Controls.Add(this.tabConfiguration);
@@ -111,98 +137,89 @@ namespace EliteSoft.Erwin.AddIn
             this.tabControl.Controls.Add(this.tabValidation);
             this.tabControl.Controls.Add(this.tabTableProcesses);
             this.tabControl.Controls.Add(this.tabDebug);
-            this.tabControl.Location = new System.Drawing.Point(12, 12);
+            this.tabControl.Location = new System.Drawing.Point(16, 16);
             this.tabControl.Name = "tabControl";
             this.tabControl.SelectedIndex = 0;
-            this.tabControl.Size = new System.Drawing.Size(852, 480);
+            this.tabControl.Size = new System.Drawing.Size(868, 490);
             this.tabControl.TabIndex = 0;
+            this.tabControl.Font = fontBody;
 
-            //
-            // lblPlatformStatus
-            //
-            this.lblPlatformStatus = new System.Windows.Forms.Label();
-            this.lblPlatformStatus.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
-            this.lblPlatformStatus.Location = new System.Drawing.Point(10, 85);
-            this.lblPlatformStatus.Name = "lblPlatformStatus";
-            this.lblPlatformStatus.Size = new System.Drawing.Size(817, 20);
-            this.lblPlatformStatus.TabIndex = 1;
-            this.lblPlatformStatus.Text = "";
-            this.lblPlatformStatus.ForeColor = System.Drawing.Color.Gray;
-
-            //
-            // tabModel
-            //
-            this.tabModel.Controls.Add(this.lblPlatformStatus);
+            // ================================================================
+            // TAB 1: MODEL
+            // ================================================================
             this.tabModel.Controls.Add(this.grpModel);
-            this.tabModel.Location = new System.Drawing.Point(4, 24);
+            this.tabModel.Location = new System.Drawing.Point(4, 26);
             this.tabModel.Name = "tabModel";
-            this.tabModel.Padding = new System.Windows.Forms.Padding(10);
-            this.tabModel.Size = new System.Drawing.Size(844, 452);
+            this.tabModel.Padding = new System.Windows.Forms.Padding(12);
+            this.tabModel.Size = new System.Drawing.Size(860, 460);
             this.tabModel.TabIndex = 0;
             this.tabModel.Text = "Model";
             this.tabModel.UseVisualStyleBackColor = true;
 
-            //
-            // grpModel
-            //
+            // grpModel — Platform status moved inside
             this.grpModel.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
             this.grpModel.Controls.Add(this.cmbModels);
             this.grpModel.Controls.Add(this.lblConnectionStatus);
             this.grpModel.Controls.Add(this.lblModelName);
-            this.grpModel.Location = new System.Drawing.Point(10, 10);
+            this.grpModel.Controls.Add(this.lblPlatformStatus);
+            this.grpModel.Location = new System.Drawing.Point(12, 12);
             this.grpModel.Name = "grpModel";
-            this.grpModel.Size = new System.Drawing.Size(817, 70);
+            this.grpModel.Size = new System.Drawing.Size(833, 95);
             this.grpModel.TabIndex = 0;
             this.grpModel.TabStop = false;
             this.grpModel.Text = "Select Model";
+            this.grpModel.Font = fontBody;
 
-            //
             // lblModelName
-            //
             this.lblModelName.AutoSize = true;
-            this.lblModelName.Location = new System.Drawing.Point(15, 30);
+            this.lblModelName.Location = new System.Drawing.Point(16, 32);
             this.lblModelName.Name = "lblModelName";
-            this.lblModelName.Size = new System.Drawing.Size(45, 15);
             this.lblModelName.TabIndex = 0;
             this.lblModelName.Text = "Model:";
+            this.lblModelName.ForeColor = clrTextPrimary;
 
-            //
             // cmbModels
-            //
             this.cmbModels.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
             this.cmbModels.DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList;
-            this.cmbModels.Location = new System.Drawing.Point(70, 27);
+            this.cmbModels.Location = new System.Drawing.Point(80, 28);
             this.cmbModels.Name = "cmbModels";
-            this.cmbModels.Size = new System.Drawing.Size(350, 23);
+            this.cmbModels.Size = new System.Drawing.Size(400, 25);
             this.cmbModels.TabIndex = 1;
             this.cmbModels.SelectedIndexChanged += new System.EventHandler(this.CmbModels_SelectedIndexChanged);
 
-            //
             // lblConnectionStatus
-            //
             this.lblConnectionStatus.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right;
-            this.lblConnectionStatus.Location = new System.Drawing.Point(430, 30);
+            this.lblConnectionStatus.Location = new System.Drawing.Point(500, 32);
             this.lblConnectionStatus.Name = "lblConnectionStatus";
-            this.lblConnectionStatus.Size = new System.Drawing.Size(85, 15);
+            this.lblConnectionStatus.Size = new System.Drawing.Size(320, 20);
             this.lblConnectionStatus.TabIndex = 2;
             this.lblConnectionStatus.Text = "(Loading...)";
-            this.lblConnectionStatus.ForeColor = System.Drawing.Color.Gray;
+            this.lblConnectionStatus.ForeColor = clrTextDisabled;
+            this.lblConnectionStatus.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
 
-            //
-            // tabConfiguration
-            //
+            // lblPlatformStatus — inside grpModel
+            this.lblPlatformStatus.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
+            this.lblPlatformStatus.Location = new System.Drawing.Point(16, 62);
+            this.lblPlatformStatus.Name = "lblPlatformStatus";
+            this.lblPlatformStatus.Size = new System.Drawing.Size(800, 20);
+            this.lblPlatformStatus.TabIndex = 3;
+            this.lblPlatformStatus.Text = "";
+            this.lblPlatformStatus.ForeColor = clrTextSecondary;
+            this.lblPlatformStatus.Font = fontCaption;
+
+            // ================================================================
+            // TAB 2: CONFIGURATION
+            // ================================================================
             this.tabConfiguration.Controls.Add(this.grpConfig);
-            this.tabConfiguration.Location = new System.Drawing.Point(4, 24);
+            this.tabConfiguration.Location = new System.Drawing.Point(4, 26);
             this.tabConfiguration.Name = "tabConfiguration";
-            this.tabConfiguration.Padding = new System.Windows.Forms.Padding(10);
-            this.tabConfiguration.Size = new System.Drawing.Size(844, 452);
+            this.tabConfiguration.Padding = new System.Windows.Forms.Padding(12);
+            this.tabConfiguration.Size = new System.Drawing.Size(860, 460);
             this.tabConfiguration.TabIndex = 1;
             this.tabConfiguration.Text = "Configuration";
             this.tabConfiguration.UseVisualStyleBackColor = true;
 
-            //
             // grpConfig
-            //
             this.grpConfig.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
             this.grpConfig.Controls.Add(this.lblDatabaseName);
             this.grpConfig.Controls.Add(this.txtDatabaseName);
@@ -211,100 +228,78 @@ namespace EliteSoft.Erwin.AddIn
             this.grpConfig.Controls.Add(this.lblName);
             this.grpConfig.Controls.Add(this.txtName);
             this.grpConfig.Controls.Add(this.btnApply);
-            this.grpConfig.Location = new System.Drawing.Point(10, 10);
+            this.grpConfig.Location = new System.Drawing.Point(12, 12);
             this.grpConfig.Name = "grpConfig";
-            this.grpConfig.Size = new System.Drawing.Size(817, 170);
+            this.grpConfig.Size = new System.Drawing.Size(833, 175);
             this.grpConfig.TabIndex = 0;
             this.grpConfig.TabStop = false;
             this.grpConfig.Text = "Model Configuration";
 
-            //
-            // lblDatabaseName
-            //
             this.lblDatabaseName.AutoSize = true;
-            this.lblDatabaseName.Location = new System.Drawing.Point(15, 28);
-            this.lblDatabaseName.Name = "lblDatabaseName";
-            this.lblDatabaseName.Size = new System.Drawing.Size(60, 15);
-            this.lblDatabaseName.TabIndex = 0;
+            this.lblDatabaseName.Location = new System.Drawing.Point(16, 32);
             this.lblDatabaseName.Text = "Database:";
+            this.lblDatabaseName.ForeColor = clrTextPrimary;
 
-            //
-            // txtDatabaseName
-            //
             this.txtDatabaseName.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
-            this.txtDatabaseName.Location = new System.Drawing.Point(100, 25);
-            this.txtDatabaseName.Name = "txtDatabaseName";
-            this.txtDatabaseName.Size = new System.Drawing.Size(410, 23);
+            this.txtDatabaseName.Location = new System.Drawing.Point(100, 28);
+            this.txtDatabaseName.Size = new System.Drawing.Size(440, 25);
             this.txtDatabaseName.TabIndex = 1;
             this.txtDatabaseName.TextChanged += new System.EventHandler(this.OnConfigChanged);
 
-            //
-            // lblSchemaName
-            //
             this.lblSchemaName.AutoSize = true;
-            this.lblSchemaName.Location = new System.Drawing.Point(15, 60);
-            this.lblSchemaName.Name = "lblSchemaName";
-            this.lblSchemaName.Size = new System.Drawing.Size(52, 15);
-            this.lblSchemaName.TabIndex = 2;
+            this.lblSchemaName.Location = new System.Drawing.Point(16, 64);
             this.lblSchemaName.Text = "Schema:";
+            this.lblSchemaName.ForeColor = clrTextPrimary;
 
-            //
-            // txtSchemaName
-            //
             this.txtSchemaName.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
-            this.txtSchemaName.Location = new System.Drawing.Point(100, 57);
-            this.txtSchemaName.Name = "txtSchemaName";
-            this.txtSchemaName.Size = new System.Drawing.Size(410, 23);
+            this.txtSchemaName.Location = new System.Drawing.Point(100, 60);
+            this.txtSchemaName.Size = new System.Drawing.Size(440, 25);
             this.txtSchemaName.TabIndex = 3;
             this.txtSchemaName.TextChanged += new System.EventHandler(this.OnConfigChanged);
 
-            //
-            // lblName
-            //
             this.lblName.AutoSize = true;
-            this.lblName.Location = new System.Drawing.Point(15, 93);
-            this.lblName.Name = "lblName";
-            this.lblName.Size = new System.Drawing.Size(42, 15);
-            this.lblName.TabIndex = 4;
+            this.lblName.Location = new System.Drawing.Point(16, 96);
             this.lblName.Text = "Name:";
+            this.lblName.ForeColor = clrTextPrimary;
 
-            //
-            // txtName
-            //
+            // txtName — read-only computed field styled differently
             this.txtName.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
-            this.txtName.Location = new System.Drawing.Point(100, 90);
-            this.txtName.Name = "txtName";
-            this.txtName.Size = new System.Drawing.Size(410, 23);
+            this.txtName.Location = new System.Drawing.Point(100, 92);
+            this.txtName.Size = new System.Drawing.Size(440, 25);
             this.txtName.TabIndex = 5;
             this.txtName.ReadOnly = true;
-            this.txtName.BackColor = System.Drawing.Color.WhiteSmoke;
+            this.txtName.BackColor = clrSurfaceAlt;
+            this.txtName.ForeColor = clrTextSecondary;
+            this.txtName.Font = new System.Drawing.Font("Segoe UI", 9.5F, System.Drawing.FontStyle.Italic);
+            this.txtName.BorderStyle = System.Windows.Forms.BorderStyle.FixedSingle;
 
-            //
-            // btnApply
-            //
-            this.btnApply.Location = new System.Drawing.Point(100, 125);
+            // btnApply — Primary button style, right-aligned
+            this.btnApply.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right;
+            this.btnApply.Location = new System.Drawing.Point(710, 132);
             this.btnApply.Name = "btnApply";
-            this.btnApply.Size = new System.Drawing.Size(120, 28);
+            this.btnApply.Size = new System.Drawing.Size(110, 32);
             this.btnApply.TabIndex = 6;
             this.btnApply.Text = "Apply to Model";
-            this.btnApply.UseVisualStyleBackColor = true;
+            this.btnApply.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnApply.BackColor = clrPrimary;
+            this.btnApply.ForeColor = System.Drawing.Color.White;
+            this.btnApply.Font = fontBodyBold;
+            this.btnApply.FlatAppearance.BorderSize = 0;
+            this.btnApply.Cursor = System.Windows.Forms.Cursors.Hand;
             this.btnApply.Click += new System.EventHandler(this.BtnApply_Click);
 
-            //
-            // tabGlossary
-            //
+            // ================================================================
+            // TAB 3: GLOSSARY
+            // ================================================================
             this.tabGlossary.Controls.Add(this.grpGlossary);
-            this.tabGlossary.Location = new System.Drawing.Point(4, 24);
+            this.tabGlossary.Location = new System.Drawing.Point(4, 26);
             this.tabGlossary.Name = "tabGlossary";
-            this.tabGlossary.Padding = new System.Windows.Forms.Padding(10);
-            this.tabGlossary.Size = new System.Drawing.Size(844, 452);
+            this.tabGlossary.Padding = new System.Windows.Forms.Padding(12);
+            this.tabGlossary.Size = new System.Drawing.Size(860, 460);
             this.tabGlossary.TabIndex = 2;
             this.tabGlossary.Text = "Glossary";
             this.tabGlossary.UseVisualStyleBackColor = true;
 
-            //
-            // grpGlossary
-            //
             this.grpGlossary.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
             this.grpGlossary.Controls.Add(this.lblHost);
             this.grpGlossary.Controls.Add(this.lblHostValue);
@@ -317,420 +312,379 @@ namespace EliteSoft.Erwin.AddIn
             this.grpGlossary.Controls.Add(this.lblGlossaryStatus);
             this.grpGlossary.Controls.Add(this.lblLastRefresh);
             this.grpGlossary.Controls.Add(this.lblLastRefreshValue);
-            this.grpGlossary.Location = new System.Drawing.Point(10, 10);
+            this.grpGlossary.Location = new System.Drawing.Point(12, 12);
             this.grpGlossary.Name = "grpGlossary";
-            this.grpGlossary.Size = new System.Drawing.Size(817, 190);
+            this.grpGlossary.Size = new System.Drawing.Size(833, 210);
             this.grpGlossary.TabIndex = 0;
             this.grpGlossary.TabStop = false;
-            this.grpGlossary.Text = "Glossary Database Connection (Auto-refresh every minute)";
+            this.grpGlossary.Text = "Glossary Database Connection";
 
-            //
-            // lblHost
-            //
             this.lblHost.AutoSize = true;
-            this.lblHost.Location = new System.Drawing.Point(15, 30);
-            this.lblHost.Name = "lblHost";
-            this.lblHost.Size = new System.Drawing.Size(35, 15);
-            this.lblHost.TabIndex = 0;
+            this.lblHost.Location = new System.Drawing.Point(16, 32);
             this.lblHost.Text = "Host:";
+            this.lblHost.ForeColor = clrTextPrimary;
 
-            //
-            // lblHostValue
-            //
             this.lblHostValue.AutoSize = true;
-            this.lblHostValue.Font = new System.Drawing.Font("Segoe UI", 9F, System.Drawing.FontStyle.Bold);
-            this.lblHostValue.Location = new System.Drawing.Point(100, 30);
-            this.lblHostValue.Name = "lblHostValue";
-            this.lblHostValue.Size = new System.Drawing.Size(100, 15);
-            this.lblHostValue.TabIndex = 1;
+            this.lblHostValue.Font = fontBodyBold;
+            this.lblHostValue.Location = new System.Drawing.Point(100, 32);
             this.lblHostValue.Text = "(not loaded)";
+            this.lblHostValue.ForeColor = clrTextDisabled;
 
-            //
-            // lblPort
-            //
             this.lblPort.AutoSize = true;
-            this.lblPort.Location = new System.Drawing.Point(300, 30);
-            this.lblPort.Name = "lblPort";
-            this.lblPort.Size = new System.Drawing.Size(32, 15);
-            this.lblPort.TabIndex = 2;
+            this.lblPort.Location = new System.Drawing.Point(320, 32);
             this.lblPort.Text = "Port:";
+            this.lblPort.ForeColor = clrTextPrimary;
 
-            //
-            // lblPortValue
-            //
             this.lblPortValue.AutoSize = true;
-            this.lblPortValue.Font = new System.Drawing.Font("Segoe UI", 9F, System.Drawing.FontStyle.Bold);
-            this.lblPortValue.Location = new System.Drawing.Point(340, 30);
-            this.lblPortValue.Name = "lblPortValue";
-            this.lblPortValue.Size = new System.Drawing.Size(50, 15);
-            this.lblPortValue.TabIndex = 3;
+            this.lblPortValue.Font = fontBodyBold;
+            this.lblPortValue.Location = new System.Drawing.Point(360, 32);
             this.lblPortValue.Text = "-";
+            this.lblPortValue.ForeColor = clrTextDisabled;
 
-            //
-            // lblGlossaryDatabase
-            //
             this.lblGlossaryDatabase.AutoSize = true;
-            this.lblGlossaryDatabase.Location = new System.Drawing.Point(15, 55);
-            this.lblGlossaryDatabase.Name = "lblGlossaryDatabase";
-            this.lblGlossaryDatabase.Size = new System.Drawing.Size(60, 15);
-            this.lblGlossaryDatabase.TabIndex = 4;
+            this.lblGlossaryDatabase.Location = new System.Drawing.Point(16, 58);
             this.lblGlossaryDatabase.Text = "Database:";
+            this.lblGlossaryDatabase.ForeColor = clrTextPrimary;
 
-            //
-            // lblDatabaseValue
-            //
             this.lblDatabaseValue.AutoSize = true;
-            this.lblDatabaseValue.Font = new System.Drawing.Font("Segoe UI", 9F, System.Drawing.FontStyle.Bold);
-            this.lblDatabaseValue.Location = new System.Drawing.Point(100, 55);
-            this.lblDatabaseValue.Name = "lblDatabaseValue";
-            this.lblDatabaseValue.Size = new System.Drawing.Size(100, 15);
-            this.lblDatabaseValue.TabIndex = 5;
+            this.lblDatabaseValue.Font = fontBodyBold;
+            this.lblDatabaseValue.Location = new System.Drawing.Point(100, 58);
             this.lblDatabaseValue.Text = "(not loaded)";
+            this.lblDatabaseValue.ForeColor = clrTextDisabled;
 
-            //
-            // btnTestConnection
-            //
-            this.btnTestConnection.Location = new System.Drawing.Point(15, 90);
-            this.btnTestConnection.Name = "btnTestConnection";
-            this.btnTestConnection.Size = new System.Drawing.Size(120, 28);
-            this.btnTestConnection.TabIndex = 6;
+            this.lblLastRefresh.AutoSize = true;
+            this.lblLastRefresh.Location = new System.Drawing.Point(16, 84);
+            this.lblLastRefresh.Text = "Last Refresh:";
+            this.lblLastRefresh.ForeColor = clrTextPrimary;
+
+            this.lblLastRefreshValue.AutoSize = true;
+            this.lblLastRefreshValue.Font = fontBodyBold;
+            this.lblLastRefreshValue.Location = new System.Drawing.Point(100, 84);
+            this.lblLastRefreshValue.Text = "(not yet)";
+            this.lblLastRefreshValue.ForeColor = clrTextDisabled;
+
+            // Glossary status
+            this.lblGlossaryStatus.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
+            this.lblGlossaryStatus.Location = new System.Drawing.Point(16, 112);
+            this.lblGlossaryStatus.Size = new System.Drawing.Size(800, 24);
+            this.lblGlossaryStatus.Text = "";
+            this.lblGlossaryStatus.ForeColor = clrTextSecondary;
+
+            // Glossary buttons — Secondary style
+            this.btnTestConnection.Location = new System.Drawing.Point(16, 145);
+            this.btnTestConnection.Size = new System.Drawing.Size(120, 32);
             this.btnTestConnection.Text = "Test Connection";
-            this.btnTestConnection.UseVisualStyleBackColor = true;
+            this.btnTestConnection.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnTestConnection.BackColor = System.Drawing.Color.White;
+            this.btnTestConnection.ForeColor = clrTextPrimary;
+            this.btnTestConnection.FlatAppearance.BorderColor = clrBorder;
+            this.btnTestConnection.Cursor = System.Windows.Forms.Cursors.Hand;
             this.btnTestConnection.Click += new System.EventHandler(this.BtnTestConnection_Click);
 
-            //
-            // btnReloadGlossary
-            //
-            this.btnReloadGlossary.Location = new System.Drawing.Point(145, 90);
-            this.btnReloadGlossary.Name = "btnReloadGlossary";
-            this.btnReloadGlossary.Size = new System.Drawing.Size(200, 28);
-            this.btnReloadGlossary.TabIndex = 7;
-            this.btnReloadGlossary.Text = "Reconnect And Reload Glossary";
-            this.btnReloadGlossary.UseVisualStyleBackColor = true;
+            this.btnReloadGlossary.Location = new System.Drawing.Point(146, 145);
+            this.btnReloadGlossary.Size = new System.Drawing.Size(130, 32);
+            this.btnReloadGlossary.Text = "Reload Glossary";
+            this.btnReloadGlossary.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnReloadGlossary.BackColor = System.Drawing.Color.White;
+            this.btnReloadGlossary.ForeColor = clrTextPrimary;
+            this.btnReloadGlossary.FlatAppearance.BorderColor = clrBorder;
+            this.btnReloadGlossary.Cursor = System.Windows.Forms.Cursors.Hand;
             this.btnReloadGlossary.Click += new System.EventHandler(this.BtnReloadGlossary_Click);
 
-            //
-            // lblGlossaryStatus
-            //
-            this.lblGlossaryStatus.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
-            this.lblGlossaryStatus.Location = new System.Drawing.Point(360, 90);
-            this.lblGlossaryStatus.Name = "lblGlossaryStatus";
-            this.lblGlossaryStatus.Size = new System.Drawing.Size(440, 40);
-            this.lblGlossaryStatus.TabIndex = 8;
-            this.lblGlossaryStatus.Text = "";
-
-            //
-            // lblLastRefresh
-            //
-            this.lblLastRefresh.AutoSize = true;
-            this.lblLastRefresh.Location = new System.Drawing.Point(15, 135);
-            this.lblLastRefresh.Name = "lblLastRefresh";
-            this.lblLastRefresh.Size = new System.Drawing.Size(75, 15);
-            this.lblLastRefresh.TabIndex = 9;
-            this.lblLastRefresh.Text = "Last Refresh:";
-
-            //
-            // lblLastRefreshValue
-            //
-            this.lblLastRefreshValue.AutoSize = true;
-            this.lblLastRefreshValue.Font = new System.Drawing.Font("Segoe UI", 9F, System.Drawing.FontStyle.Bold);
-            this.lblLastRefreshValue.Location = new System.Drawing.Point(100, 135);
-            this.lblLastRefreshValue.Name = "lblLastRefreshValue";
-            this.lblLastRefreshValue.Size = new System.Drawing.Size(100, 15);
-            this.lblLastRefreshValue.TabIndex = 10;
-            this.lblLastRefreshValue.Text = "(not yet)";
-            this.lblLastRefreshValue.ForeColor = System.Drawing.Color.Gray;
-
-            //
-            // tabValidation
-            //
+            // ================================================================
+            // TAB 4: VALIDATION — nested tabs kept for compatibility
+            // ================================================================
             this.tabValidation.Controls.Add(this.btnValidateAll);
+            this.tabValidation.Controls.Add(this.lblFilterLabel);
+            this.tabValidation.Controls.Add(this.cmbValidationFilter);
             this.tabValidation.Controls.Add(this.tabControlValidation);
             this.tabValidation.Controls.Add(this.lblValidationStatus);
-            this.tabValidation.Location = new System.Drawing.Point(4, 24);
+            this.tabValidation.Location = new System.Drawing.Point(4, 26);
             this.tabValidation.Name = "tabValidation";
-            this.tabValidation.Padding = new System.Windows.Forms.Padding(10);
-            this.tabValidation.Size = new System.Drawing.Size(844, 452);
+            this.tabValidation.Padding = new System.Windows.Forms.Padding(12);
+            this.tabValidation.Size = new System.Drawing.Size(860, 460);
             this.tabValidation.TabIndex = 3;
             this.tabValidation.Text = "Validation";
             this.tabValidation.UseVisualStyleBackColor = true;
 
-            //
-            // btnValidateAll
-            //
-            this.btnValidateAll.Location = new System.Drawing.Point(13, 13);
-            this.btnValidateAll.Name = "btnValidateAll";
-            this.btnValidateAll.Size = new System.Drawing.Size(110, 28);
-            this.btnValidateAll.TabIndex = 0;
+            // btnValidateAll — Primary style
+            this.btnValidateAll.Location = new System.Drawing.Point(16, 12);
+            this.btnValidateAll.Size = new System.Drawing.Size(110, 32);
             this.btnValidateAll.Text = "Validate All";
-            this.btnValidateAll.UseVisualStyleBackColor = true;
+            this.btnValidateAll.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnValidateAll.BackColor = clrPrimary;
+            this.btnValidateAll.ForeColor = System.Drawing.Color.White;
+            this.btnValidateAll.Font = fontBodyBold;
+            this.btnValidateAll.FlatAppearance.BorderSize = 0;
+            this.btnValidateAll.Cursor = System.Windows.Forms.Cursors.Hand;
             this.btnValidateAll.Click += new System.EventHandler(this.BtnValidateAll_Click);
 
-            //
-            // tabControlValidation - nested TabControl
-            //
+            // Filter label + combobox
+            this.lblFilterLabel.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right;
+            this.lblFilterLabel.AutoSize = true;
+            this.lblFilterLabel.Location = new System.Drawing.Point(640, 18);
+            this.lblFilterLabel.Text = "Filter:";
+            this.lblFilterLabel.ForeColor = clrTextSecondary;
+
+            this.cmbValidationFilter.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right;
+            this.cmbValidationFilter.DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList;
+            this.cmbValidationFilter.Location = new System.Drawing.Point(686, 14);
+            this.cmbValidationFilter.Size = new System.Drawing.Size(155, 25);
+            this.cmbValidationFilter.Items.AddRange(new object[] { "All", "Column Validation", "Table Validation", "Errors Only" });
+            this.cmbValidationFilter.SelectedIndex = 0;
+            this.cmbValidationFilter.SelectedIndexChanged += new System.EventHandler(this.CmbValidationFilter_SelectedIndexChanged);
+
+            // Nested validation tabs
             this.tabControlValidation.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right | System.Windows.Forms.AnchorStyles.Bottom;
             this.tabControlValidation.Controls.Add(this.tabColumnValidation);
             this.tabControlValidation.Controls.Add(this.tabTableValidation);
-            this.tabControlValidation.Location = new System.Drawing.Point(13, 47);
-            this.tabControlValidation.Name = "tabControlValidation";
-            this.tabControlValidation.SelectedIndex = 0;
-            this.tabControlValidation.Size = new System.Drawing.Size(812, 370);
+            this.tabControlValidation.Location = new System.Drawing.Point(16, 52);
+            this.tabControlValidation.Size = new System.Drawing.Size(828, 370);
             this.tabControlValidation.TabIndex = 1;
 
-            //
-            // tabColumnValidation
-            //
             this.tabColumnValidation.Controls.Add(this.listColumnValidation);
-            this.tabColumnValidation.Location = new System.Drawing.Point(4, 24);
-            this.tabColumnValidation.Name = "tabColumnValidation";
-            this.tabColumnValidation.Padding = new System.Windows.Forms.Padding(5);
-            this.tabColumnValidation.Size = new System.Drawing.Size(804, 342);
-            this.tabColumnValidation.TabIndex = 0;
+            this.tabColumnValidation.Location = new System.Drawing.Point(4, 26);
+            this.tabColumnValidation.Padding = new System.Windows.Forms.Padding(4);
+            this.tabColumnValidation.Size = new System.Drawing.Size(820, 340);
             this.tabColumnValidation.Text = "Column Validation";
             this.tabColumnValidation.UseVisualStyleBackColor = true;
 
-            //
-            // listColumnValidation
-            //
             this.listColumnValidation.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right | System.Windows.Forms.AnchorStyles.Bottom;
             this.listColumnValidation.FullRowSelect = true;
-            this.listColumnValidation.GridLines = true;
-            this.listColumnValidation.Location = new System.Drawing.Point(5, 5);
-            this.listColumnValidation.Name = "listColumnValidation";
-            this.listColumnValidation.Size = new System.Drawing.Size(794, 332);
-            this.listColumnValidation.TabIndex = 0;
+            this.listColumnValidation.GridLines = false;
+            this.listColumnValidation.Location = new System.Drawing.Point(4, 4);
+            this.listColumnValidation.Size = new System.Drawing.Size(812, 332);
             this.listColumnValidation.UseCompatibleStateImageBehavior = false;
             this.listColumnValidation.View = System.Windows.Forms.View.Details;
 
-            //
-            // tabTableValidation
-            //
             this.tabTableValidation.Controls.Add(this.listTableValidation);
-            this.tabTableValidation.Location = new System.Drawing.Point(4, 24);
-            this.tabTableValidation.Name = "tabTableValidation";
-            this.tabTableValidation.Padding = new System.Windows.Forms.Padding(5);
-            this.tabTableValidation.Size = new System.Drawing.Size(804, 342);
-            this.tabTableValidation.TabIndex = 1;
+            this.tabTableValidation.Location = new System.Drawing.Point(4, 26);
+            this.tabTableValidation.Padding = new System.Windows.Forms.Padding(4);
+            this.tabTableValidation.Size = new System.Drawing.Size(820, 340);
             this.tabTableValidation.Text = "Table Validation";
             this.tabTableValidation.UseVisualStyleBackColor = true;
 
-            //
-            // listTableValidation
-            //
             this.listTableValidation.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right | System.Windows.Forms.AnchorStyles.Bottom;
             this.listTableValidation.FullRowSelect = true;
-            this.listTableValidation.GridLines = true;
-            this.listTableValidation.Location = new System.Drawing.Point(5, 5);
-            this.listTableValidation.Name = "listTableValidation";
-            this.listTableValidation.Size = new System.Drawing.Size(794, 332);
-            this.listTableValidation.TabIndex = 0;
+            this.listTableValidation.GridLines = false;
+            this.listTableValidation.Location = new System.Drawing.Point(4, 4);
+            this.listTableValidation.Size = new System.Drawing.Size(812, 332);
             this.listTableValidation.UseCompatibleStateImageBehavior = false;
             this.listTableValidation.View = System.Windows.Forms.View.Details;
 
-            //
-            // lblValidationStatus
-            //
+            // Validation status
             this.lblValidationStatus.Anchor = System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right | System.Windows.Forms.AnchorStyles.Bottom;
-            this.lblValidationStatus.Location = new System.Drawing.Point(13, 422);
-            this.lblValidationStatus.Name = "lblValidationStatus";
-            this.lblValidationStatus.Size = new System.Drawing.Size(812, 20);
-            this.lblValidationStatus.TabIndex = 2;
+            this.lblValidationStatus.Location = new System.Drawing.Point(16, 428);
+            this.lblValidationStatus.Size = new System.Drawing.Size(828, 22);
             this.lblValidationStatus.Text = "Click 'Validate All' to check columns and tables";
-            this.lblValidationStatus.ForeColor = System.Drawing.Color.DarkGreen;
+            this.lblValidationStatus.ForeColor = clrTextSecondary;
+            this.lblValidationStatus.Font = fontCaption;
 
-            //
-            // tabTableProcesses
-            //
+            // ================================================================
+            // TAB 5: TABLE PROCESSES
+            // ================================================================
             this.tabTableProcesses.Controls.Add(this.grpTableProcesses);
-            this.tabTableProcesses.Location = new System.Drawing.Point(4, 24);
+            this.tabTableProcesses.Location = new System.Drawing.Point(4, 26);
             this.tabTableProcesses.Name = "tabTableProcesses";
-            this.tabTableProcesses.Padding = new System.Windows.Forms.Padding(10);
-            this.tabTableProcesses.Size = new System.Drawing.Size(844, 452);
+            this.tabTableProcesses.Padding = new System.Windows.Forms.Padding(12);
+            this.tabTableProcesses.Size = new System.Drawing.Size(860, 460);
             this.tabTableProcesses.TabIndex = 5;
             this.tabTableProcesses.Text = "Table Processes";
             this.tabTableProcesses.UseVisualStyleBackColor = true;
 
-            //
-            // grpTableProcesses
-            //
             this.grpTableProcesses.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
             this.grpTableProcesses.Controls.Add(this.lblSelectTable);
             this.grpTableProcesses.Controls.Add(this.cmbTables);
             this.grpTableProcesses.Controls.Add(this.chkArchiveTable);
+            this.grpTableProcesses.Controls.Add(this.lblArchiveSuffix);
             this.grpTableProcesses.Controls.Add(this.chkIsolatedTable);
+            this.grpTableProcesses.Controls.Add(this.lblIsolatedSuffix);
             this.grpTableProcesses.Controls.Add(this.btnCreateTables);
             this.grpTableProcesses.Controls.Add(this.lblTableProcessStatus);
-            this.grpTableProcesses.Location = new System.Drawing.Point(10, 10);
+            this.grpTableProcesses.Location = new System.Drawing.Point(12, 12);
             this.grpTableProcesses.Name = "grpTableProcesses";
-            this.grpTableProcesses.Size = new System.Drawing.Size(817, 200);
+            this.grpTableProcesses.Size = new System.Drawing.Size(833, 195);
             this.grpTableProcesses.TabIndex = 0;
             this.grpTableProcesses.TabStop = false;
             this.grpTableProcesses.Text = "Create Table Copies";
 
-            //
-            // lblSelectTable
-            //
             this.lblSelectTable.AutoSize = true;
-            this.lblSelectTable.Location = new System.Drawing.Point(15, 30);
-            this.lblSelectTable.Name = "lblSelectTable";
-            this.lblSelectTable.Size = new System.Drawing.Size(75, 15);
-            this.lblSelectTable.TabIndex = 0;
-            this.lblSelectTable.Text = "Select Table:";
+            this.lblSelectTable.Location = new System.Drawing.Point(16, 32);
+            this.lblSelectTable.Text = "Source Table:";
+            this.lblSelectTable.ForeColor = clrTextPrimary;
 
-            //
-            // cmbTables
-            //
             this.cmbTables.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
             this.cmbTables.DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList;
-            this.cmbTables.Location = new System.Drawing.Point(100, 27);
-            this.cmbTables.Name = "cmbTables";
-            this.cmbTables.Size = new System.Drawing.Size(400, 23);
+            this.cmbTables.Location = new System.Drawing.Point(110, 28);
+            this.cmbTables.Size = new System.Drawing.Size(400, 25);
             this.cmbTables.TabIndex = 1;
 
-            //
-            // chkArchiveTable
-            //
             this.chkArchiveTable.AutoSize = true;
-            this.chkArchiveTable.Location = new System.Drawing.Point(100, 65);
-            this.chkArchiveTable.Name = "chkArchiveTable";
-            this.chkArchiveTable.Size = new System.Drawing.Size(200, 19);
-            this.chkArchiveTable.TabIndex = 2;
-            this.chkArchiveTable.Text = "Create Archive Table (_ARCHIVE)";
+            this.chkArchiveTable.Location = new System.Drawing.Point(110, 68);
+            this.chkArchiveTable.Text = "Archive Table";
+            this.chkArchiveTable.ForeColor = clrTextPrimary;
             this.chkArchiveTable.UseVisualStyleBackColor = true;
 
-            //
-            // chkIsolatedTable
-            //
+            this.lblArchiveSuffix.AutoSize = true;
+            this.lblArchiveSuffix.Location = new System.Drawing.Point(230, 69);
+            this.lblArchiveSuffix.Text = "(adds _ARCHIVE suffix)";
+            this.lblArchiveSuffix.ForeColor = clrTextSecondary;
+            this.lblArchiveSuffix.Font = fontCaption;
+
             this.chkIsolatedTable.AutoSize = true;
-            this.chkIsolatedTable.Location = new System.Drawing.Point(100, 95);
-            this.chkIsolatedTable.Name = "chkIsolatedTable";
-            this.chkIsolatedTable.Size = new System.Drawing.Size(220, 19);
-            this.chkIsolatedTable.TabIndex = 3;
-            this.chkIsolatedTable.Text = "Create Isolated Table (_ISOLATED)";
+            this.chkIsolatedTable.Location = new System.Drawing.Point(110, 96);
+            this.chkIsolatedTable.Text = "Isolated Table";
+            this.chkIsolatedTable.ForeColor = clrTextPrimary;
             this.chkIsolatedTable.UseVisualStyleBackColor = true;
 
-            //
-            // btnCreateTables
-            //
-            this.btnCreateTables.Location = new System.Drawing.Point(100, 130);
-            this.btnCreateTables.Name = "btnCreateTables";
-            this.btnCreateTables.Size = new System.Drawing.Size(120, 30);
-            this.btnCreateTables.TabIndex = 4;
+            this.lblIsolatedSuffix.AutoSize = true;
+            this.lblIsolatedSuffix.Location = new System.Drawing.Point(230, 97);
+            this.lblIsolatedSuffix.Text = "(adds _ISOLATED suffix)";
+            this.lblIsolatedSuffix.ForeColor = clrTextSecondary;
+            this.lblIsolatedSuffix.Font = fontCaption;
+
+            // btnCreateTables — Primary style, right-aligned
+            this.btnCreateTables.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right;
+            this.btnCreateTables.Location = new System.Drawing.Point(710, 130);
+            this.btnCreateTables.Size = new System.Drawing.Size(110, 32);
             this.btnCreateTables.Text = "Create Tables";
-            this.btnCreateTables.UseVisualStyleBackColor = true;
+            this.btnCreateTables.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnCreateTables.BackColor = clrPrimary;
+            this.btnCreateTables.ForeColor = System.Drawing.Color.White;
+            this.btnCreateTables.Font = fontBodyBold;
+            this.btnCreateTables.FlatAppearance.BorderSize = 0;
+            this.btnCreateTables.Cursor = System.Windows.Forms.Cursors.Hand;
             this.btnCreateTables.Click += new System.EventHandler(this.BtnCreateTables_Click);
 
-            //
-            // lblTableProcessStatus
-            //
             this.lblTableProcessStatus.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
-            this.lblTableProcessStatus.Location = new System.Drawing.Point(100, 170);
-            this.lblTableProcessStatus.Name = "lblTableProcessStatus";
-            this.lblTableProcessStatus.Size = new System.Drawing.Size(700, 20);
-            this.lblTableProcessStatus.TabIndex = 5;
+            this.lblTableProcessStatus.Location = new System.Drawing.Point(16, 170);
+            this.lblTableProcessStatus.Size = new System.Drawing.Size(800, 20);
             this.lblTableProcessStatus.Text = "";
-            this.lblTableProcessStatus.ForeColor = System.Drawing.Color.DarkGreen;
+            this.lblTableProcessStatus.ForeColor = clrSuccess;
+            this.lblTableProcessStatus.Font = fontCaption;
 
-            //
-            // tabDebug
-            //
+            // ================================================================
+            // TAB 6: DEBUG LOG
+            // ================================================================
             this.tabDebug.Controls.Add(this.grpDebugLog);
-            this.tabDebug.Location = new System.Drawing.Point(4, 24);
+            this.tabDebug.Location = new System.Drawing.Point(4, 26);
             this.tabDebug.Name = "tabDebug";
-            this.tabDebug.Padding = new System.Windows.Forms.Padding(10);
-            this.tabDebug.Size = new System.Drawing.Size(844, 452);
+            this.tabDebug.Padding = new System.Windows.Forms.Padding(12);
+            this.tabDebug.Size = new System.Drawing.Size(860, 460);
             this.tabDebug.TabIndex = 4;
             this.tabDebug.Text = "Debug Log";
             this.tabDebug.UseVisualStyleBackColor = true;
 
-            //
-            // grpDebugLog
-            //
             this.grpDebugLog.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right | System.Windows.Forms.AnchorStyles.Bottom;
-            this.grpDebugLog.Controls.Add(this.txtDebugLog);
             this.grpDebugLog.Controls.Add(this.btnCopyLog);
             this.grpDebugLog.Controls.Add(this.btnClearLog);
-            this.grpDebugLog.Location = new System.Drawing.Point(10, 10);
+            this.grpDebugLog.Controls.Add(this.lblLogSearch);
+            this.grpDebugLog.Controls.Add(this.txtLogSearch);
+            this.grpDebugLog.Controls.Add(this.txtDebugLog);
+            this.grpDebugLog.Location = new System.Drawing.Point(12, 12);
             this.grpDebugLog.Name = "grpDebugLog";
-            this.grpDebugLog.Size = new System.Drawing.Size(817, 425);
+            this.grpDebugLog.Size = new System.Drawing.Size(833, 432);
             this.grpDebugLog.TabIndex = 0;
             this.grpDebugLog.TabStop = false;
             this.grpDebugLog.Text = "Debug Output";
 
-            //
-            // txtDebugLog
-            //
-            this.txtDebugLog.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right | System.Windows.Forms.AnchorStyles.Bottom;
-            this.txtDebugLog.Location = new System.Drawing.Point(15, 25);
-            this.txtDebugLog.Multiline = true;
-            this.txtDebugLog.Name = "txtDebugLog";
-            this.txtDebugLog.ReadOnly = true;
-            this.txtDebugLog.ScrollBars = System.Windows.Forms.ScrollBars.Both;
-            this.txtDebugLog.Size = new System.Drawing.Size(410, 385);
-            this.txtDebugLog.TabIndex = 0;
-            this.txtDebugLog.Font = new System.Drawing.Font("Consolas", 9F);
-            this.txtDebugLog.BackColor = System.Drawing.Color.White;
-
-            //
-            // btnCopyLog
-            //
-            this.btnCopyLog.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right;
-            this.btnCopyLog.Location = new System.Drawing.Point(435, 25);
-            this.btnCopyLog.Name = "btnCopyLog";
-            this.btnCopyLog.Size = new System.Drawing.Size(75, 28);
-            this.btnCopyLog.TabIndex = 1;
+            // Toolbar row: Copy, Clear, Search
+            this.btnCopyLog.Location = new System.Drawing.Point(16, 24);
+            this.btnCopyLog.Size = new System.Drawing.Size(70, 28);
             this.btnCopyLog.Text = "Copy";
-            this.btnCopyLog.UseVisualStyleBackColor = true;
+            this.btnCopyLog.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnCopyLog.BackColor = System.Drawing.Color.White;
+            this.btnCopyLog.ForeColor = clrTextSecondary;
+            this.btnCopyLog.FlatAppearance.BorderColor = clrBorder;
+            this.btnCopyLog.Font = fontCaption;
+            this.btnCopyLog.Cursor = System.Windows.Forms.Cursors.Hand;
             this.btnCopyLog.Click += new System.EventHandler(this.BtnCopyLog_Click);
 
-            //
-            // btnClearLog
-            //
-            this.btnClearLog.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right;
-            this.btnClearLog.Location = new System.Drawing.Point(435, 60);
-            this.btnClearLog.Name = "btnClearLog";
-            this.btnClearLog.Size = new System.Drawing.Size(75, 28);
-            this.btnClearLog.TabIndex = 2;
+            this.btnClearLog.Location = new System.Drawing.Point(94, 24);
+            this.btnClearLog.Size = new System.Drawing.Size(70, 28);
             this.btnClearLog.Text = "Clear";
-            this.btnClearLog.UseVisualStyleBackColor = true;
+            this.btnClearLog.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnClearLog.BackColor = System.Drawing.Color.White;
+            this.btnClearLog.ForeColor = clrTextSecondary;
+            this.btnClearLog.FlatAppearance.BorderColor = clrBorder;
+            this.btnClearLog.Font = fontCaption;
+            this.btnClearLog.Cursor = System.Windows.Forms.Cursors.Hand;
             this.btnClearLog.Click += new System.EventHandler(this.BtnClearLog_Click);
 
-            //
-            // btnClose
-            //
-            this.btnClose.Anchor = System.Windows.Forms.AnchorStyles.Bottom | System.Windows.Forms.AnchorStyles.Right;
-            this.btnClose.Location = new System.Drawing.Point(774, 505);
+            this.lblLogSearch.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right;
+            this.lblLogSearch.AutoSize = true;
+            this.lblLogSearch.Location = new System.Drawing.Point(560, 30);
+            this.lblLogSearch.Text = "Search:";
+            this.lblLogSearch.ForeColor = clrTextSecondary;
+            this.lblLogSearch.Font = fontCaption;
+
+            this.txtLogSearch.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right;
+            this.txtLogSearch.Location = new System.Drawing.Point(610, 26);
+            this.txtLogSearch.Size = new System.Drawing.Size(207, 25);
+            this.txtLogSearch.Font = fontCaption;
+            this.txtLogSearch.PlaceholderText = "Filter log...";
+            this.txtLogSearch.TextChanged += new System.EventHandler(this.TxtLogSearch_TextChanged);
+
+            // Debug log — dark theme
+            this.txtDebugLog.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right | System.Windows.Forms.AnchorStyles.Bottom;
+            this.txtDebugLog.Location = new System.Drawing.Point(16, 60);
+            this.txtDebugLog.Multiline = true;
+            this.txtDebugLog.ReadOnly = true;
+            this.txtDebugLog.ScrollBars = System.Windows.Forms.ScrollBars.Both;
+            this.txtDebugLog.Size = new System.Drawing.Size(801, 360);
+            this.txtDebugLog.Font = new System.Drawing.Font("Consolas", 9F);
+            this.txtDebugLog.BackColor = System.Drawing.Color.FromArgb(30, 30, 30);
+            this.txtDebugLog.ForeColor = System.Drawing.Color.FromArgb(212, 212, 212);
+            this.txtDebugLog.WordWrap = false;
+
+            // ================================================================
+            // STATUS BAR (Bottom)
+            // ================================================================
+            this.pnlStatusSep.Dock = System.Windows.Forms.DockStyle.Bottom;
+            this.pnlStatusSep.Height = 1;
+            this.pnlStatusSep.BackColor = clrBorder;
+
+            this.pnlStatusBar.Dock = System.Windows.Forms.DockStyle.Bottom;
+            this.pnlStatusBar.Height = 44;
+            this.pnlStatusBar.BackColor = clrSurface;
+            this.pnlStatusBar.Padding = new System.Windows.Forms.Padding(16, 6, 16, 6);
+            this.pnlStatusBar.Controls.Add(this.btnClose);
+            this.pnlStatusBar.Controls.Add(this.lblStatus);
+
+            this.lblStatus.Dock = System.Windows.Forms.DockStyle.Fill;
+            this.lblStatus.Name = "lblStatus";
+            this.lblStatus.Text = "";
+            this.lblStatus.ForeColor = clrTextSecondary;
+            this.lblStatus.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
+            this.lblStatus.Font = fontBody;
+
+            // btnClose — Primary style
+            this.btnClose.Dock = System.Windows.Forms.DockStyle.Right;
             this.btnClose.Name = "btnClose";
-            this.btnClose.Size = new System.Drawing.Size(90, 32);
-            this.btnClose.TabIndex = 1;
+            this.btnClose.Size = new System.Drawing.Size(100, 32);
             this.btnClose.Text = "Close";
-            this.btnClose.UseVisualStyleBackColor = true;
+            this.btnClose.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnClose.BackColor = clrPrimary;
+            this.btnClose.ForeColor = System.Drawing.Color.White;
+            this.btnClose.Font = fontBodyBold;
+            this.btnClose.FlatAppearance.BorderSize = 0;
+            this.btnClose.Cursor = System.Windows.Forms.Cursors.Hand;
             this.btnClose.Click += new System.EventHandler(this.BtnClose_Click);
 
-            //
-            // lblStatus
-            //
-            this.lblStatus.Anchor = System.Windows.Forms.AnchorStyles.Bottom | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
-            this.lblStatus.Location = new System.Drawing.Point(12, 510);
-            this.lblStatus.Name = "lblStatus";
-            this.lblStatus.Size = new System.Drawing.Size(752, 25);
-            this.lblStatus.TabIndex = 2;
-            this.lblStatus.Text = "";
-            this.lblStatus.ForeColor = System.Drawing.Color.DarkBlue;
-
-            //
-            // ModelConfigForm
-            //
-            this.AutoScaleDimensions = new System.Drawing.SizeF(7F, 15F);
+            // ================================================================
+            // FORM
+            // ================================================================
+            this.AutoScaleDimensions = new System.Drawing.SizeF(7F, 17F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
-            this.ClientSize = new System.Drawing.Size(876, 551);
+            this.ClientSize = new System.Drawing.Size(900, 570);
             this.Controls.Add(this.tabControl);
-            this.Controls.Add(this.btnClose);
-            this.Controls.Add(this.lblStatus);
-            this.Font = new System.Drawing.Font("Segoe UI", 9F);
-            this.FormBorderStyle = System.Windows.Forms.FormBorderStyle.FixedSingle;
-            this.MaximizeBox = false;
+            this.Controls.Add(this.pnlStatusSep);
+            this.Controls.Add(this.pnlStatusBar);
+            this.Font = fontBody;
+            this.BackColor = System.Drawing.Color.White;
+            this.FormBorderStyle = System.Windows.Forms.FormBorderStyle.Sizable;
+            this.MinimumSize = new System.Drawing.Size(800, 500);
+            this.MaximizeBox = true;
             this.MinimizeBox = true;
             this.Name = "ModelConfigForm";
             this.StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen;
@@ -757,6 +711,7 @@ namespace EliteSoft.Erwin.AddIn
             this.tabTableValidation.ResumeLayout(false);
             this.grpDebugLog.ResumeLayout(false);
             this.grpDebugLog.PerformLayout();
+            this.pnlStatusBar.ResumeLayout(false);
             this.ResumeLayout(false);
         }
 
@@ -804,11 +759,15 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.ListView listColumnValidation;
         private System.Windows.Forms.ListView listTableValidation;
         private System.Windows.Forms.Label lblValidationStatus;
+        private System.Windows.Forms.ComboBox cmbValidationFilter;
+        private System.Windows.Forms.Label lblFilterLabel;
 
         private System.Windows.Forms.GroupBox grpDebugLog;
         private System.Windows.Forms.TextBox txtDebugLog;
         private System.Windows.Forms.Button btnCopyLog;
         private System.Windows.Forms.Button btnClearLog;
+        private System.Windows.Forms.TextBox txtLogSearch;
+        private System.Windows.Forms.Label lblLogSearch;
 
         private System.Windows.Forms.TabPage tabTableProcesses;
         private System.Windows.Forms.GroupBox grpTableProcesses;
@@ -818,7 +777,11 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.CheckBox chkIsolatedTable;
         private System.Windows.Forms.Button btnCreateTables;
         private System.Windows.Forms.Label lblTableProcessStatus;
+        private System.Windows.Forms.Label lblArchiveSuffix;
+        private System.Windows.Forms.Label lblIsolatedSuffix;
 
+        private System.Windows.Forms.Panel pnlStatusBar;
+        private System.Windows.Forms.Panel pnlStatusSep;
         private System.Windows.Forms.Button btnClose;
         private System.Windows.Forms.Label lblStatus;
     }

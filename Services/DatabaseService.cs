@@ -3,8 +3,8 @@ using System.Data.Common;
 using Microsoft.Data.SqlClient;
 using Npgsql;
 using Oracle.ManagedDataAccess.Client;
-using EliteSoft.MetaCenter.Shared.Models;
-using EliteSoft.MetaCenter.Shared.Services;
+using EliteSoft.MetaAdmin.Shared.Models;
+using EliteSoft.MetaAdmin.Shared.Services;
 
 namespace EliteSoft.Erwin.AddIn.Services
 {

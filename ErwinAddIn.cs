@@ -1,7 +1,10 @@
 using System;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Forms;
+using xHardwareLicensing;
+using xHardwareLicensing.Core;
 
 namespace EliteSoft.Erwin.AddIn
 {
@@ -67,6 +70,10 @@ namespace EliteSoft.Erwin.AddIn
             {
                 EnsureExceptionHandler();
 
+                // License check
+                if (!CheckLicense())
+                    return;
+
                 // If form is already open, bring it to front
                 if (_activeForm != null && !_activeForm.IsDisposed)
                 {
@@ -97,6 +104,61 @@ namespace EliteSoft.Erwin.AddIn
                 MessageBox.Show("Add-In Error: " + ex.Message, "Error",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
+        }
+
+        /// <summary>
+        /// Validates hardware license. Returns true if valid, false otherwise.
+        /// </summary>
+        private bool CheckLicense()
+        {
+            // Skip if already validated and cached
+            if (LicensingService.IsValid)
+                return true;
+
+            // License file is in the same directory as the DLL
+            var assemblyLocation = typeof(ErwinAddIn).Assembly.Location;
+            if (string.IsNullOrEmpty(assemblyLocation))
+                assemblyLocation = AppContext.BaseDirectory;
+            var assemblyDir = Path.GetDirectoryName(assemblyLocation) ?? AppContext.BaseDirectory;
+            var licensePath = Path.Combine(assemblyDir, "license.lic");
+
+            var status = LicensingService.Initialize(licensePath);
+
+            if (status == LicenseStatus.Valid)
+                return true;
+
+            string message = status switch
+            {
+                LicenseStatus.FileNotFound =>
+                    "License file not found.\n\n" +
+                    "Please contact Elite Soft to obtain a license file for this machine.\n\n" +
+                    $"Machine ID: {LicensingService.GetCurrentHwid()}",
+                LicenseStatus.Expired =>
+                    "Your license has expired.\n\n" +
+                    "Please contact Elite Soft to renew your license.",
+                LicenseStatus.HwidMismatch =>
+                    "This license is not valid for this machine.\n\n" +
+                    "Please contact Elite Soft with your Machine ID to obtain a new license.\n\n" +
+                    $"Machine ID: {LicensingService.GetCurrentHwid()}",
+                LicenseStatus.DecryptionFailed =>
+                    "License file is corrupted or not valid for this machine.\n\n" +
+                    "Please contact Elite Soft to obtain a new license file.\n\n" +
+                    $"Machine ID: {LicensingService.GetCurrentHwid()}",
+                LicenseStatus.SignatureInvalid =>
+                    "License file has been tampered with.\n\n" +
+                    "Please contact Elite Soft to obtain a valid license file.",
+                LicenseStatus.TamperingDetected =>
+                    "License validation failed due to security check.\n\n" +
+                    "Please close any debugging tools and try again.",
+                _ =>
+                    "License validation failed.\n\n" +
+                    "Please contact Elite Soft for assistance."
+            };
+
+            MessageBox.Show(message, "Elite Soft - License Error",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+
+            return false;
         }
 
         /// <summary>

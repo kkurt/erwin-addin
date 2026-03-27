@@ -383,6 +383,33 @@ namespace EliteSoft.Erwin.AddIn
             }
         }
 
+        private void CmbValidationFilter_SelectedIndexChanged(object sender, EventArgs e)
+        {
+            if (cmbValidationFilter.SelectedIndex < 0) return;
+
+            string filter = cmbValidationFilter.SelectedItem?.ToString() ?? "All";
+
+            switch (filter)
+            {
+                case "Column Validation":
+                    tabControlValidation.SelectedTab = tabColumnValidation;
+                    tabControlValidation.Visible = true;
+                    break;
+                case "Table Validation":
+                    tabControlValidation.SelectedTab = tabTableValidation;
+                    tabControlValidation.Visible = true;
+                    break;
+                case "All":
+                    tabControlValidation.SelectedIndex = 0;
+                    tabControlValidation.Visible = true;
+                    break;
+                case "Errors Only":
+                    // Show both tabs but filter is informational for now
+                    tabControlValidation.Visible = true;
+                    break;
+            }
+        }
+
         private void UpdateValidationStatus()
         {
             var glossary = GlossaryService.Instance;
@@ -1543,13 +1570,24 @@ namespace EliteSoft.Erwin.AddIn
             }
 
             string timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
-            txtDebugLog.AppendText($"[{timestamp}] {message}\r\n");
-            txtDebugLog.SelectionStart = txtDebugLog.Text.Length;
-            txtDebugLog.ScrollToCaret();
+            string line = $"[{timestamp}] {message}\r\n";
+            _fullLogText += line;
+
+            // Only append if no search filter is active
+            string filter = txtLogSearch?.Text?.Trim() ?? "";
+            if (string.IsNullOrEmpty(filter) || line.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                txtDebugLog.AppendText(line);
+                txtDebugLog.SelectionStart = txtDebugLog.Text.Length;
+                txtDebugLog.ScrollToCaret();
+            }
         }
+
+        private string _fullLogText = "";
 
         private void BtnClearLog_Click(object sender, EventArgs e)
         {
+            _fullLogText = "";
             txtDebugLog.Clear();
         }
 
@@ -1559,6 +1597,21 @@ namespace EliteSoft.Erwin.AddIn
             {
                 Clipboard.SetText(txtDebugLog.Text);
                 UpdateStatus("Log copied to clipboard!", Color.DarkGreen);
+            }
+        }
+
+        private void TxtLogSearch_TextChanged(object sender, EventArgs e)
+        {
+            string filter = txtLogSearch.Text.Trim();
+            if (string.IsNullOrEmpty(filter))
+            {
+                txtDebugLog.Text = _fullLogText;
+            }
+            else
+            {
+                var lines = _fullLogText.Split(new[] { "\r\n" }, StringSplitOptions.RemoveEmptyEntries);
+                var filtered = lines.Where(l => l.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0);
+                txtDebugLog.Text = string.Join("\r\n", filtered);
             }
         }
 
@@ -1602,8 +1655,8 @@ namespace EliteSoft.Erwin.AddIn
                 MinimizeBox = false,
                 ControlBox = false,
                 ShowInTaskbar = false,
-                BackColor = Color.Black,
-                Padding = new Padding(2)
+                BackColor = Color.FromArgb(208, 208, 208),
+                Padding = new Padding(1)
             };
 
             var innerPanel = new Panel
