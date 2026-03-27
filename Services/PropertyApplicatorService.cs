@@ -522,7 +522,7 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                     try
                     {
-                        using (var wizard = new QuestionWizardForm(physicalName, _questions))
+                        using (var wizard = new QuestionWizardForm(physicalName, _questions, _session, entity))
                         {
                             var result = wizard.ShowDialog();
 
@@ -557,7 +557,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
 
                 // 3. Apply merged values to model
+                //    Two passes: first standard properties, then compound properties (PARTITIONED)
+                //    This ensures PhysicalStorage etc. are created before partition attempts
                 int applied = 0;
+                PropertyDef deferredPartitionDef = null;
+                string deferredPartitionValue = null;
+
                 foreach (var def in _tablePropertyDefs)
                 {
                     if (!mergedValues.TryGetValue(def.Id, out var value))
@@ -577,7 +582,22 @@ namespace EliteSoft.Erwin.AddIn.Services
                         }
                     }
 
-                    bool success = ApplyPropertyToModel(entity, physicalName, def, value);
+                    // Defer PARTITIONED to second pass (compound operation, must run last)
+                    if (def.PropertyCode == "PARTITIONED")
+                    {
+                        deferredPartitionDef = def;
+                        deferredPartitionValue = value;
+                        continue;
+                    }
+
+                    bool success = ApplyPropertyToModel(entity, physicalName, def, value, mergedValues);
+                    if (success) applied++;
+                }
+
+                // Second pass: apply deferred partition creation
+                if (deferredPartitionDef != null && deferredPartitionValue != null)
+                {
+                    bool success = ApplyPropertyToModel(entity, physicalName, deferredPartitionDef, deferredPartitionValue, mergedValues);
                     if (success) applied++;
                 }
 
@@ -594,7 +614,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// Apply a single property to the erwin model.
         /// Maps PropertyCode to the correct erwin SCAPI path.
         /// </summary>
-        private bool ApplyPropertyToModel(dynamic entity, string physicalName, PropertyDef def, string value)
+        private bool ApplyPropertyToModel(dynamic entity, string physicalName, PropertyDef def, string value, Dictionary<int, string> mergedValues = null)
         {
             try
             {
@@ -616,15 +636,19 @@ namespace EliteSoft.Erwin.AddIn.Services
                         return ApplyParallelDegree(entity, physicalName, value);
 
                     case "PARTITIONED":
-                        // Partition properties are complex — may require separate handling
-                        Log($"PropertyApplicator: PARTITIONED not yet implemented for '{physicalName}'");
-                        return false;
+                        return ApplyPartitioned(entity, physicalName, value, mergedValues);
 
                     case "PARTITION_TYPE":
-                    case "PARTITION_KEY":
-                    case "PARTITION_TBS_RULE":
-                        Log($"PropertyApplicator: {def.PropertyCode} not yet implemented for '{physicalName}'");
+                        // Applied as part of PARTITIONED — skip standalone
                         return false;
+
+                    case "PARTITION_KEY":
+                        // Applied as part of PARTITIONED — skip standalone
+                        return false;
+
+                    case "PARTITION_TBS_RULE":
+                        Log($"PropertyApplicator: PARTITION_TBS_RULE='{value}' noted for '{physicalName}'");
+                        return true;
 
                     default:
                         Log($"PropertyApplicator: Unknown property code '{def.PropertyCode}'");
@@ -654,7 +678,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 string erwinValue = value.ToUpperInvariant() switch
                 {
                     "LOGGING" => "Logging",
-                    "NOLOGGING" => "No Logging",
+                    "NOLOGGING" => "Nologging",
                     _ => null
                 };
                 if (erwinValue == null) return false;
@@ -836,6 +860,188 @@ namespace EliteSoft.Erwin.AddIn.Services
             {
                 Log($"PropertyApplicator: ApplyParallelDegree error: {ex.Message}");
                 return false;
+            }
+        }
+
+        /// <summary>
+        /// PARTITIONED → Creates Oracle_Entity_Partition under entity.
+        /// Compound operation: also reads PARTITION_TYPE and PARTITION_KEY from mergedValues.
+        /// SCAPI hierarchy: Entity → Oracle_Entity_Partition → Partition_Column
+        ///   Oracle_Entity_Partition properties: Oracle_Entity_Partition_Type (Range/Hash/List)
+        ///   Partition_Column properties: Attribute_Ref, Partition_Columns_Order_Ref
+        /// </summary>
+        private bool ApplyPartitioned(dynamic entity, string physicalName, string value, Dictionary<int, string> mergedValues)
+        {
+            try
+            {
+                // Only apply when PARTITIONED = true/yes
+                bool isPartitioned = string.Equals(value, "true", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(value, "1", StringComparison.OrdinalIgnoreCase);
+
+                if (!isPartitioned)
+                {
+                    Log($"PropertyApplicator: PARTITIONED='{value}' (not partitioned) — skipping for '{physicalName}'");
+                    return false;
+                }
+
+                // Look up companion values from mergedValues
+                string partitionType = null;
+                string partitionKey = null;
+
+                if (mergedValues != null)
+                {
+                    foreach (var def in _tablePropertyDefs)
+                    {
+                        if (def.PropertyCode == "PARTITION_TYPE" && mergedValues.TryGetValue(def.Id, out var ptVal))
+                            partitionType = ptVal;
+                        else if (def.PropertyCode == "PARTITION_KEY" && mergedValues.TryGetValue(def.Id, out var pkVal))
+                            partitionKey = pkVal;
+                    }
+                }
+
+                if (string.IsNullOrEmpty(partitionType))
+                {
+                    Log($"PropertyApplicator: PARTITIONED=true but PARTITION_TYPE is missing for '{physicalName}' — cannot create partition");
+                    return false;
+                }
+
+                // Map MC partition type to erwin Oracle_Entity_Partition_Type value
+                string erwinPartitionType = partitionType.ToUpperInvariant() switch
+                {
+                    "RANGE" => "Range",
+                    "HASH" => "Hash",
+                    "LIST" => "List",
+                    "RANGE-RANGE" => "Range-Range",
+                    "RANGE-HASH" => "Range-Hash",
+                    "RANGE-LIST" => "Range-List",
+                    "LIST-RANGE" => "List-Range",
+                    "LIST-HASH" => "List-Hash",
+                    "LIST-LIST" => "List-List",
+                    "HASH-HASH" => "Hash-Hash",
+                    "HASH-LIST" => "Hash-List",
+                    "HASH-RANGE" => "Hash-Range",
+                    _ => partitionType // Use as-is if no mapping
+                };
+
+                Log($"PropertyApplicator: Creating partition on '{physicalName}': Type={erwinPartitionType}, Key={partitionKey ?? "(none)"}");
+
+                dynamic modelObjects = _session.ModelObjects;
+
+                // Check if partition already exists
+                try
+                {
+                    dynamic existingPartitions = modelObjects.Collect(entity, "Oracle_Entity_Partition");
+                    if (existingPartitions != null && existingPartitions.Count > 0)
+                    {
+                        Log($"PropertyApplicator: Partition already exists on '{physicalName}' (count={existingPartitions.Count}) — skipping");
+                        return false;
+                    }
+                }
+                catch { }
+
+                // Create Oracle_Entity_Partition under entity
+                int transId = _session.BeginNamedTransaction("CreatePartition");
+                try
+                {
+                    dynamic entityChildren = modelObjects.Collect(entity);
+                    dynamic partition = entityChildren.Add("Oracle_Entity_Partition");
+
+                    if (partition == null)
+                    {
+                        _session.RollbackTransaction(transId);
+                        Log($"PropertyApplicator: Failed to create Oracle_Entity_Partition for '{physicalName}'");
+                        return false;
+                    }
+
+                    // Set partition type
+                    partition.Properties("Oracle_Entity_Partition_Type").Value = erwinPartitionType;
+                    Log($"PropertyApplicator: Set Oracle_Entity_Partition_Type='{erwinPartitionType}'");
+
+                    // Set partition column if PARTITION_KEY is specified
+                    if (!string.IsNullOrEmpty(partitionKey))
+                    {
+                        // Find the attribute (column) by physical name within this entity
+                        string attributeRef = FindAttributeRef(entity, partitionKey, modelObjects);
+
+                        if (!string.IsNullOrEmpty(attributeRef))
+                        {
+                            // Create Partition_Column child under the partition
+                            dynamic partitionChildren = modelObjects.Collect(partition);
+                            dynamic partitionColumn = partitionChildren.Add("Partition_Column");
+
+                            if (partitionColumn != null)
+                            {
+                                partitionColumn.Properties("Attribute_Ref").Value = attributeRef;
+                                partitionColumn.Properties("Partition_Columns_Order_Ref").Value = partitionKey;
+                                Log($"PropertyApplicator: Created Partition_Column: Attribute_Ref='{attributeRef}', Key='{partitionKey}'");
+                            }
+                            else
+                            {
+                                Log($"PropertyApplicator: Warning — could not create Partition_Column for key '{partitionKey}'");
+                            }
+                        }
+                        else
+                        {
+                            Log($"PropertyApplicator: Warning — attribute '{partitionKey}' not found on entity '{physicalName}', partition created without key column");
+                        }
+                    }
+
+                    _session.CommitTransaction(transId);
+                    Log($"PropertyApplicator: Successfully created partition on '{physicalName}'");
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    try { _session.RollbackTransaction(transId); } catch { }
+                    Log($"PropertyApplicator: CreatePartition transaction error: {ex.Message}");
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"PropertyApplicator: ApplyPartitioned error: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Find an attribute's reference ID within an entity by its physical column name.
+        /// Used to set Partition_Column.Attribute_Ref.
+        /// </summary>
+        private string FindAttributeRef(dynamic entity, string columnPhysicalName, dynamic modelObjects)
+        {
+            try
+            {
+                dynamic attributes = modelObjects.Collect(entity, "Attribute");
+                if (attributes == null) return null;
+
+                for (int i = 0; i < attributes.Count; i++)
+                {
+                    dynamic attr = attributes.Item(i);
+                    try
+                    {
+                        string physName = attr.Properties("Physical_Name").Value?.ToString();
+                        if (string.Equals(physName, columnPhysicalName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            // Return the attribute's Long_Id as reference
+                            string longId = attr.Properties("Long_Id").Value?.ToString();
+                            if (!string.IsNullOrEmpty(longId))
+                                return longId;
+
+                            // Fallback: try Name
+                            return attr.Properties("Name").Value?.ToString();
+                        }
+                    }
+                    catch { }
+                }
+
+                return null;
+            }
+            catch (Exception ex)
+            {
+                Log($"PropertyApplicator: FindAttributeRef error: {ex.Message}");
+                return null;
             }
         }
 

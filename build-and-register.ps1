@@ -405,30 +405,30 @@ if ($Package) {
         Write-Host "`nInstalled to:" -ForegroundColor Cyan
         Write-Host "  $installDir"
 
-        # Register in erwin Add-In Manager (auto-load on startup)
+        # Register in erwin Add-In Manager (HKLM only — machine-wide for all users)
         Write-Host "`n[5/5] Configuring erwin Add-In Manager..." -ForegroundColor Yellow
-        $erwinRegBase = "HKCU:\SOFTWARE\erwin\Data Modeler"
-        if (Test-Path $erwinRegBase) {
-            $erwinVersion = Get-ChildItem $erwinRegBase -ErrorAction SilentlyContinue |
-                Select-Object -ExpandProperty PSChildName |
-                Sort-Object { [version]($_ + ".0") } -Descending |
-                Select-Object -First 1
-
-            if ($erwinVersion) {
-                $addInsPath = "$erwinRegBase\$erwinVersion\Add-Ins\Elite Soft Erwin Addin"
-                if (-not (Test-Path $addInsPath)) {
-                    New-Item -Path $addInsPath -Force | Out-Null
+        $erwinRegBaseName = "SOFTWARE\erwin\Data Modeler"
+        $registeredAny = $false
+        foreach ($root in @("HKLM")) {
+            $erwinRegBase = "${root}:\$erwinRegBaseName"
+            if (Test-Path $erwinRegBase) {
+                Get-ChildItem $erwinRegBase -ErrorAction SilentlyContinue | ForEach-Object {
+                    $ver = $_.PSChildName
+                    $addInsPath = "$($_.PSPath)\Add-Ins\Elite Soft Erwin Addin"
+                    if (-not (Test-Path $addInsPath)) {
+                        New-Item -Path $addInsPath -Force | Out-Null
+                    }
+                    Set-ItemProperty -Path $addInsPath -Name "Menu Identifier" -Value 1 -Type DWord
+                    Set-ItemProperty -Path $addInsPath -Name "ProgID"          -Value $progId -Type String
+                    Set-ItemProperty -Path $addInsPath -Name "Invoke Method"   -Value "Execute" -Type String
+                    Set-ItemProperty -Path $addInsPath -Name "Invoke EXE"      -Value 0 -Type DWord
+                    Write-Host "  erwin $ver ($root) - OK" -ForegroundColor Green
+                    $registeredAny = $true
                 }
-                Set-ItemProperty -Path $addInsPath -Name "Menu Identifier" -Value 1 -Type DWord
-                Set-ItemProperty -Path $addInsPath -Name "ProgID"          -Value $progId -Type String
-                Set-ItemProperty -Path $addInsPath -Name "Invoke Method"   -Value "Execute" -Type String
-                Set-ItemProperty -Path $addInsPath -Name "Invoke EXE"      -Value 0 -Type DWord
-                Write-Host "  erwin $erwinVersion Add-In Manager entry OK" -ForegroundColor Green
-            } else {
-                Write-Host "  erwin version not found, skipping Add-In Manager" -ForegroundColor Yellow
             }
-        } else {
-            Write-Host "  erwin not installed, skipping Add-In Manager" -ForegroundColor Yellow
+        }
+        if (-not $registeredAny) {
+            Write-Host "  erwin not found in registry, skipping Add-In Manager" -ForegroundColor Yellow
         }
         Write-Host ""
     } else {

@@ -263,6 +263,8 @@ namespace EliteSoft.Erwin.AddIn
             Log("Initializing validation service...");
 
             DisposeServices();
+            GlossaryConnectionService.Instance.OnLog += Log;
+            GlossaryService.Instance.OnLog += Log;
             LoadGlossary();
             LoadTableTypes();
             LoadDomainDefs();
@@ -528,7 +530,7 @@ namespace EliteSoft.Erwin.AddIn
                 UpdateGlossaryConnectionLabels();
 
                 string connectionString = glossaryConnService.GetGlossaryConnectionString();
-                string dbType = DatabaseService.Instance.GetDbType();
+                string dbType = glossaryConnService.GetGlossaryDbType();
 
                 using (var connection = DatabaseService.Instance.CreateConnection(dbType, connectionString))
                 {
@@ -802,57 +804,70 @@ namespace EliteSoft.Erwin.AddIn
 
                 Log($"Found {existingUdps.Count} existing Property_Type entries");
 
-                // TABLE_TYPE UDP (Entity, List type)
+                // Determine which UDPs need to be created
+                bool needTableType = false;
                 var tableTypeService = TableTypeService.Instance;
                 if (tableTypeService.IsLoaded && tableTypeService.Count > 0)
-                {
-                    if (existingUdps.Contains("Entity.Physical.TABLE_TYPE"))
-                    {
-                        Log("TABLE_TYPE UDP already exists - skipping");
-                    }
-                    else
-                    {
-                        string listValues = tableTypeService.GetNamesAsCommaSeparated();
-                        int transId = metamodelSession.BeginNamedTransaction("CreateTableTypeUDP");
-                        try
-                        {
-                            dynamic udpType = mmObjects.Add("Property_Type");
-                            udpType.Properties("Name").Value = "Entity.Physical.TABLE_TYPE";
-                            TrySetProperty(udpType, "tag_Udp_Owner_Type", "Entity");
-                            TrySetProperty(udpType, "tag_Is_Physical", true);
-                            TrySetProperty(udpType, "tag_Is_Logical", false);
-                            TrySetProperty(udpType, "tag_Udp_Data_Type", 6); // List type
-                            TrySetProperty(udpType, "tag_Udp_Values_List", listValues);
-                            string defaultValue = listValues.Split(',').FirstOrDefault()?.Trim() ?? "";
-                            if (!string.IsNullOrEmpty(defaultValue))
-                                TrySetProperty(udpType, "tag_Udp_Default_Value", defaultValue);
-                            TrySetProperty(udpType, "tag_Order", "1");
-                            TrySetProperty(udpType, "tag_Is_Locally_Defined", true);
-                            metamodelSession.CommitTransaction(transId);
-                            Log("TABLE_TYPE UDP created");
-                        }
-                        catch (Exception ex)
-                        {
-                            try { metamodelSession.RollbackTransaction(transId); } catch { }
-                            if (ex.Message.Contains("must be unique") || ex.Message.Contains("EBS-1057"))
-                                Log("TABLE_TYPE UDP already exists (unique constraint)");
-                            else
-                                Log($"Error creating TABLE_TYPE UDP: {ex.Message}");
-                        }
-                    }
-                }
+                    needTableType = !existingUdps.Contains("Entity.Physical.TABLE_TYPE");
 
-                // Glossary UDPs (Attribute, Text type): OWNER, KVKK, PCIDSS, CLASSIFICATION
                 string[] glossaryUdps = { "OWNER", "KVKK", "PCIDSS", "CLASSIFICATION" };
+                var missingGlossaryUdps = new List<string>();
                 foreach (var udpName in glossaryUdps)
                 {
                     string fullName = $"Attribute.Physical.{udpName}";
-                    if (existingUdps.Contains(fullName))
-                    {
+                    if (!existingUdps.Contains(fullName))
+                        missingGlossaryUdps.Add(udpName);
+                    else
                         Log($"{fullName} UDP already exists - skipping");
-                        continue;
-                    }
+                }
 
+                // If all UDPs exist, skip entirely — no transactions needed
+                if (!needTableType && missingGlossaryUdps.Count == 0)
+                {
+                    Log("All UDPs already exist - nothing to create");
+                    return;
+                }
+
+                // TABLE_TYPE UDP (Entity, List type)
+                if (needTableType)
+                {
+                    string listValues = tableTypeService.GetNamesAsCommaSeparated();
+                    int transId = metamodelSession.BeginNamedTransaction("CreateTableTypeUDP");
+                    try
+                    {
+                        dynamic udpType = mmObjects.Add("Property_Type");
+                        udpType.Properties("Name").Value = "Entity.Physical.TABLE_TYPE";
+                        TrySetProperty(udpType, "tag_Udp_Owner_Type", "Entity");
+                        TrySetProperty(udpType, "tag_Is_Physical", true);
+                        TrySetProperty(udpType, "tag_Is_Logical", false);
+                        TrySetProperty(udpType, "tag_Udp_Data_Type", 6); // List type
+                        TrySetProperty(udpType, "tag_Udp_Values_List", listValues);
+                        string defaultValue = listValues.Split(',').FirstOrDefault()?.Trim() ?? "";
+                        if (!string.IsNullOrEmpty(defaultValue))
+                            TrySetProperty(udpType, "tag_Udp_Default_Value", defaultValue);
+                        TrySetProperty(udpType, "tag_Order", "1");
+                        TrySetProperty(udpType, "tag_Is_Locally_Defined", true);
+                        metamodelSession.CommitTransaction(transId);
+                        Log("TABLE_TYPE UDP created");
+                    }
+                    catch (Exception ex)
+                    {
+                        try { metamodelSession.RollbackTransaction(transId); } catch { }
+                        if (ex.Message.Contains("must be unique") || ex.Message.Contains("EBS-1057"))
+                            Log("TABLE_TYPE UDP already exists (unique constraint)");
+                        else
+                            Log($"Error creating TABLE_TYPE UDP: {ex.Message}");
+                    }
+                }
+                else if (tableTypeService.IsLoaded && tableTypeService.Count > 0)
+                {
+                    Log("TABLE_TYPE UDP already exists - skipping");
+                }
+
+                // Glossary UDPs (Attribute, Text type): only create missing ones
+                foreach (var udpName in missingGlossaryUdps)
+                {
+                    string fullName = $"Attribute.Physical.{udpName}";
                     int transId = metamodelSession.BeginNamedTransaction($"Create_{udpName}");
                     try
                     {

@@ -18,6 +18,8 @@ namespace EliteSoft.Erwin.AddIn.Forms
         private readonly List<QuestionDef> _allQuestions;
         private readonly List<QuestionStep> _steps = new List<QuestionStep>();
         private int _currentStepIndex = -1;
+        private readonly dynamic _entity; // erwin entity for COLUMN_SELECT
+        private readonly dynamic _session; // erwin session for SCAPI access
 
         // Collected answers: QuestionDefId -> answer value
         private readonly Dictionary<int, string> _answers = new Dictionary<int, string>();
@@ -38,6 +40,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
         private Button btnBack;
         private Button btnNext;
         private Label lblSummaryTitle;
+        private ComboBox cmbColumnSelect; // For COLUMN_SELECT answer type
 
         // Design system
         private static readonly Color ClrPrimary = Color.FromArgb(0, 102, 204);
@@ -47,10 +50,12 @@ namespace EliteSoft.Erwin.AddIn.Forms
         private static readonly Color ClrBorder = Color.FromArgb(208, 208, 208);
         private static readonly Color ClrSurface = Color.FromArgb(245, 247, 250);
 
-        public QuestionWizardForm(string tableName, List<QuestionDef> questions)
+        public QuestionWizardForm(string tableName, List<QuestionDef> questions, dynamic session = null, dynamic entity = null)
         {
             _tableName = tableName;
             _allQuestions = questions;
+            _session = session;
+            _entity = entity;
             InitializeUI();
             BuildSteps();
             ShowStep(0);
@@ -275,6 +280,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
 
             // Build answer controls
             pnlAnswerArea.Controls.Clear();
+            cmbColumnSelect = null;
 
             if (step.Question.AnswerType == "YES_NO")
             {
@@ -283,6 +289,10 @@ namespace EliteSoft.Erwin.AddIn.Forms
             else if (step.Question.AnswerType == "SINGLE_SELECT")
             {
                 BuildSingleSelectAnswer(step);
+            }
+            else if (step.Question.AnswerType == "COLUMN_SELECT")
+            {
+                BuildColumnSelectAnswer(step);
             }
 
             // Button states
@@ -556,8 +566,75 @@ namespace EliteSoft.Erwin.AddIn.Forms
             }
         }
 
+        private void BuildColumnSelectAnswer(QuestionStep step)
+        {
+            var lblHint = new Label
+            {
+                Text = "Select a column from the table:",
+                Font = new Font("Segoe UI", 9F),
+                ForeColor = ClrTextSecondary,
+                AutoSize = true,
+                Location = new Point(12, 10)
+            };
+
+            cmbColumnSelect = new ComboBox
+            {
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                Font = new Font("Segoe UI", 10F),
+                Location = new Point(12, 34),
+                Size = new Size(350, 30)
+            };
+
+            // Load columns from entity via SCAPI
+            if (_entity != null && _session != null)
+            {
+                try
+                {
+                    dynamic modelObjects = _session.ModelObjects;
+                    dynamic attributes = modelObjects.Collect(_entity, "Attribute");
+                    if (attributes != null)
+                    {
+                        for (int i = 0; i < attributes.Count; i++)
+                        {
+                            try
+                            {
+                                dynamic attr = attributes.Item(i);
+                                string physName = attr.Properties("Physical_Name").Value?.ToString();
+                                if (!string.IsNullOrEmpty(physName))
+                                    cmbColumnSelect.Items.Add(physName);
+                            }
+                            catch { }
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            if (cmbColumnSelect.Items.Count == 0)
+            {
+                lblHint.Text = "No columns found on this table. Type the column name:";
+                cmbColumnSelect.DropDownStyle = ComboBoxStyle.DropDown;
+            }
+
+            cmbColumnSelect.SelectedIndexChanged += (s, e) => UpdateNextButtonState();
+            cmbColumnSelect.TextChanged += (s, e) => UpdateNextButtonState();
+
+            pnlAnswerArea.Controls.Add(lblHint);
+            pnlAnswerArea.Controls.Add(cmbColumnSelect);
+        }
+
         private void RestoreAnswer(QuestionStep step, string answerValue)
         {
+            if (step.Question.AnswerType == "COLUMN_SELECT" && cmbColumnSelect != null)
+            {
+                int idx = cmbColumnSelect.Items.IndexOf(answerValue);
+                if (idx >= 0)
+                    cmbColumnSelect.SelectedIndex = idx;
+                else
+                    cmbColumnSelect.Text = answerValue;
+                return;
+            }
+
             foreach (Control c in pnlAnswerArea.Controls)
             {
                 if (c is RadioButton rb && rb.Tag?.ToString() == answerValue)
@@ -570,6 +647,13 @@ namespace EliteSoft.Erwin.AddIn.Forms
 
         private string GetSelectedAnswer()
         {
+            // Check COLUMN_SELECT ComboBox first
+            if (cmbColumnSelect != null && cmbColumnSelect.Visible)
+            {
+                string colVal = cmbColumnSelect.SelectedItem?.ToString() ?? cmbColumnSelect.Text;
+                return string.IsNullOrWhiteSpace(colVal) ? null : colVal.Trim();
+            }
+
             foreach (Control c in pnlAnswerArea.Controls)
             {
                 if (c is RadioButton rb && rb.Checked)
@@ -582,6 +666,9 @@ namespace EliteSoft.Erwin.AddIn.Forms
         {
             if (question.AnswerType == "YES_NO")
                 return value == "YES" ? "Yes" : "No";
+
+            if (question.AnswerType == "COLUMN_SELECT")
+                return value;
 
             var option = question.QuestionOptions?.FirstOrDefault(o => o.Value == value);
             return option?.DisplayText ?? option?.Value ?? value;
@@ -644,18 +731,27 @@ namespace EliteSoft.Erwin.AddIn.Forms
 
             if (_currentStepIndex > 0)
             {
-                // Remove sub-questions that were added based on previous step's answer
-                var prevStep = _steps[_currentStepIndex - 1];
-                RemoveSubQuestions(prevStep.Question.Id);
+                // 1. Remove current step's answer and sub-questions (if answered)
+                var currentStep = _steps[_currentStepIndex];
+                if (_answers.ContainsKey(currentStep.Question.Id))
+                {
+                    RemoveSubQuestions(currentStep.Question.Id);
+                    RemoveRulesForAnswer(currentStep.Question.Id);
+                    _answers.Remove(currentStep.Question.Id);
+                }
 
-                // Remove previous answer's property values
+                // 2. Go to previous step — remove its sub-questions and answer too
+                //    so user can re-answer it (sub-questions will be re-inserted on Next)
+                int prevIdx = _currentStepIndex - 1;
+                var prevStep = _steps[prevIdx];
+                RemoveSubQuestions(prevStep.Question.Id);
                 if (_answers.ContainsKey(prevStep.Question.Id))
                 {
                     RemoveRulesForAnswer(prevStep.Question.Id);
                     _answers.Remove(prevStep.Question.Id);
                 }
 
-                ShowStep(_currentStepIndex - 1);
+                ShowStep(prevIdx);
             }
         }
 
@@ -668,13 +764,19 @@ namespace EliteSoft.Erwin.AddIn.Forms
             var question = _allQuestions.FirstOrDefault(q => q.Id == questionDefId);
             if (question?.QuestionRules == null) return;
 
+            // Match exact answer (case-insensitive) OR wildcard '*'
             var matchingRules = question.QuestionRules
-                .Where(r => r.AnswerValue == answerValue)
+                .Where(r => string.Equals(r.AnswerValue, answerValue, StringComparison.OrdinalIgnoreCase) || r.AnswerValue == "*")
                 .ToList();
 
             foreach (var rule in matchingRules)
             {
-                PropertyValues[rule.PropertyDefId] = rule.PropertyValue;
+                // {ANSWER} placeholder: replace with actual answer value
+                string propertyValue = rule.PropertyValue;
+                if (propertyValue.Contains("{ANSWER}"))
+                    propertyValue = propertyValue.Replace("{ANSWER}", answerValue);
+
+                PropertyValues[rule.PropertyDefId] = propertyValue;
             }
         }
 

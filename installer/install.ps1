@@ -29,8 +29,8 @@ if ($Uninstall) {
         Write-Host "  COM unregistered" -ForegroundColor Green
     }
 
-    # Remove erwin Add-In registry (HKLM + HKCU)
-    foreach ($root in @("HKLM", "HKCU")) {
+    # Remove erwin Add-In registry (HKLM only)
+    foreach ($root in @("HKLM")) {
         $base = "${root}:\$erwinRegBase"
         if (Test-Path $base) {
             Get-ChildItem $base -ErrorAction SilentlyContinue | ForEach-Object {
@@ -87,10 +87,10 @@ if ($LASTEXITCODE -eq 0) {
     exit 1
 }
 
-# Register in erwin Add-In Manager (all versions, HKLM + HKCU)
+# Register in erwin Add-In Manager (HKLM only — machine-wide for all users)
 Write-Host "`n[3/3] Registering in erwin Add-In Manager..." -ForegroundColor Yellow
 $registered = $false
-foreach ($root in @("HKLM", "HKCU")) {
+foreach ($root in @("HKLM")) {
     $base = "${root}:\$erwinRegBase"
     if (Test-Path $base) {
         Get-ChildItem $base -ErrorAction SilentlyContinue | ForEach-Object {

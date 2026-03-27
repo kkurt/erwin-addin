@@ -28,6 +28,8 @@ namespace EliteSoft.Erwin.AddIn.Services
         private bool _isLoaded;
         private string _lastError;
 
+        public event Action<string> OnLog;
+
         /// <summary>
         /// Singleton instance
         /// </summary>
@@ -70,7 +72,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 {
                     _lastError = "Repository database not configured. Please configure in ErwinAdmin.";
                     _isLoaded = false;
-                    System.Diagnostics.Debug.WriteLine($"GlossaryService: {_lastError}");
+                    Log($"GlossaryService: {_lastError}");
                     return false;
                 }
 
@@ -85,13 +87,15 @@ namespace EliteSoft.Erwin.AddIn.Services
                 {
                     _lastError = glossaryConnService.LastError ?? "Glossary connection definition not found.";
                     _isLoaded = false;
-                    System.Diagnostics.Debug.WriteLine($"GlossaryService: {_lastError}");
+                    Log($"GlossaryService: {_lastError}");
                     return false;
                 }
 
                 // Get glossary connection string from CONNECTION_DEF (ID=4)
                 string connectionString = glossaryConnService.GetGlossaryConnectionString();
                 string dbType = glossaryConnService.GetGlossaryDbType();
+                string tableName = glossaryConnService.ConnectionDef?.TableName ?? "GLOSSARY";
+                Log($"GlossaryService: Connecting to {dbType} glossary (table: {tableName})");
 
                 using (var connection = DatabaseService.Instance.CreateConnection(dbType, connectionString))
                 {
@@ -116,13 +120,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                         if (TestQuery(connection, query))
                         {
                             hasExtendedColumns = true;
-                            System.Diagnostics.Debug.WriteLine("GlossaryService: COMMENT column not available");
+                            Log("GlossaryService: COMMENT column not available");
                         }
                         else
                         {
                             // Tier 3: Basic only
                             query = GetGlossaryQuery(dbType, "basic");
-                            System.Diagnostics.Debug.WriteLine("GlossaryService: Extended columns not available, using basic query");
+                            Log("GlossaryService: Extended columns not available, using basic query");
                         }
                     }
 
@@ -176,14 +180,14 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
 
                 _isLoaded = true;
-                System.Diagnostics.Debug.WriteLine($"GlossaryService: Loaded {_glossary.Count} entries from {glossaryConnService.ConnectionDef.Host}/{glossaryConnService.ConnectionDef.DbSchema}");
+                Log($"GlossaryService: Loaded {_glossary.Count} entries from {glossaryConnService.ConnectionDef.Host}/{glossaryConnService.ConnectionDef.DbSchema} (table: {glossaryConnService.ConnectionDef.TableName})");
                 return true;
             }
             catch (Exception ex)
             {
                 _lastError = ex.Message;
                 _isLoaded = false;
-                System.Diagnostics.Debug.WriteLine($"GlossaryService.LoadGlossary error: {ex.Message}");
+                Log($"GlossaryService.LoadGlossary error: {ex.Message}");
                 return false;
             }
         }
@@ -227,32 +231,35 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <summary>
         /// Gets the appropriate SQL query for the database type.
         /// tier: "full" (all columns + COMMENT), "extended" (without COMMENT), "basic" (NAME, DATA_TYPE, OWNER)
+        /// Table name comes from CONNECTION_DEF.TABLE_NAME (defaults to "GLOSSARY")
         /// </summary>
         private string GetGlossaryQuery(string dbType, string tier)
         {
+            string tableName = GlossaryConnectionService.Instance.ConnectionDef?.TableName ?? "GLOSSARY";
+
             switch (dbType?.ToUpper())
             {
                 case "POSTGRESQL":
                     if (tier == "full")
-                        return "SELECT \"NAME\", \"DATA_TYPE\", \"OWNER\", \"DB_TYPE\", \"KVKK\", \"PCIDSS\", \"CLASSIFICATION\", \"COMMENT\" FROM \"GLOSSARY\"";
+                        return $"SELECT \"NAME\", \"DATA_TYPE\", \"OWNER\", \"DB_TYPE\", \"KVKK\", \"PCIDSS\", \"CLASSIFICATION\", \"COMMENT\" FROM \"{tableName}\"";
                     if (tier == "extended")
-                        return "SELECT \"NAME\", \"DATA_TYPE\", \"OWNER\", \"DB_TYPE\", \"KVKK\", \"PCIDSS\", \"CLASSIFICATION\" FROM \"GLOSSARY\"";
-                    return "SELECT \"NAME\", \"DATA_TYPE\", \"OWNER\" FROM \"GLOSSARY\"";
+                        return $"SELECT \"NAME\", \"DATA_TYPE\", \"OWNER\", \"DB_TYPE\", \"KVKK\", \"PCIDSS\", \"CLASSIFICATION\" FROM \"{tableName}\"";
+                    return $"SELECT \"NAME\", \"DATA_TYPE\", \"OWNER\" FROM \"{tableName}\"";
 
                 case "ORACLE":
                     if (tier == "full")
-                        return "SELECT NAME, DATA_TYPE, OWNER, DB_TYPE, KVKK, PCIDSS, CLASSIFICATION, \"COMMENT\" FROM GLOSSARY";
+                        return $"SELECT NAME, DATA_TYPE, OWNER, DB_TYPE, KVKK, PCIDSS, CLASSIFICATION, \"COMMENT\" FROM {tableName}";
                     if (tier == "extended")
-                        return "SELECT NAME, DATA_TYPE, OWNER, DB_TYPE, KVKK, PCIDSS, CLASSIFICATION FROM GLOSSARY";
-                    return "SELECT NAME, DATA_TYPE, OWNER FROM GLOSSARY";
+                        return $"SELECT NAME, DATA_TYPE, OWNER, DB_TYPE, KVKK, PCIDSS, CLASSIFICATION FROM {tableName}";
+                    return $"SELECT NAME, DATA_TYPE, OWNER FROM {tableName}";
 
                 case "MSSQL":
                 default:
                     if (tier == "full")
-                        return "SELECT [NAME], [DATA_TYPE], [OWNER], [DB_TYPE], [KVKK], [PCIDSS], [CLASSIFICATION], [COMMENT] FROM [dbo].[GLOSSARY]";
+                        return $"SELECT [NAME], [DATA_TYPE], [OWNER], [DB_TYPE], [KVKK], [PCIDSS], [CLASSIFICATION], [COMMENT] FROM [dbo].[{tableName}]";
                     if (tier == "extended")
-                        return "SELECT [NAME], [DATA_TYPE], [OWNER], [DB_TYPE], [KVKK], [PCIDSS], [CLASSIFICATION] FROM [dbo].[GLOSSARY]";
-                    return "SELECT [NAME], [DATA_TYPE], [OWNER] FROM [dbo].[GLOSSARY]";
+                        return $"SELECT [NAME], [DATA_TYPE], [OWNER], [DB_TYPE], [KVKK], [PCIDSS], [CLASSIFICATION] FROM [dbo].[{tableName}]";
+                    return $"SELECT [NAME], [DATA_TYPE], [OWNER] FROM [dbo].[{tableName}]";
             }
         }
 
@@ -309,6 +316,12 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// Gets the glossary connection definition
         /// </summary>
         public GlossaryConnectionDef ConnectionDef => GlossaryConnectionService.Instance.ConnectionDef;
+
+        private void Log(string message)
+        {
+            OnLog?.Invoke(message);
+            System.Diagnostics.Debug.WriteLine(message);
+        }
     }
 
     /// <summary>

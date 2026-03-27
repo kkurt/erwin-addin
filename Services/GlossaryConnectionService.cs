@@ -15,6 +15,8 @@ namespace EliteSoft.Erwin.AddIn.Services
         private bool _isLoaded;
         private string _lastError;
 
+        public event Action<string> OnLog;
+
         public static GlossaryConnectionService Instance
         {
             get
@@ -56,11 +58,25 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
 
                 string repoDbType = DatabaseService.Instance.GetDbType();
-                string query = GetQuery(repoDbType);
 
                 using (var connection = DatabaseService.Instance.CreateConnection())
                 {
                     connection.Open();
+
+                    // Try with TABLE_NAME column first, fall back to without if column doesn't exist yet
+                    string query = GetQuery(repoDbType, withTableName: true);
+                    bool hasTableNameColumn = true;
+
+                    try
+                    {
+                        using (var testCmd = DatabaseService.Instance.CreateCommand(query, connection))
+                        using (testCmd.ExecuteReader()) { }
+                    }
+                    catch
+                    {
+                        hasTableNameColumn = false;
+                        query = GetQuery(repoDbType, withTableName: false);
+                    }
 
                     using (var command = DatabaseService.Instance.CreateCommand(query, connection))
                     {
@@ -71,6 +87,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 var encryptedUsername = reader["USERNAME"]?.ToString()?.Trim() ?? "";
                                 var encryptedPassword = reader["PASSWORD"]?.ToString()?.Trim() ?? "";
 
+                                string tableName = null;
+                                if (hasTableNameColumn)
+                                {
+                                    try { tableName = reader["TABLE_NAME"]?.ToString()?.Trim(); } catch { }
+                                }
+
                                 _connectionDef = new GlossaryConnectionDef
                                 {
                                     Id = Convert.ToInt32(reader["ID"]),
@@ -79,7 +101,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     Port = reader["PORT"]?.ToString()?.Trim() ?? "",
                                     DbSchema = reader["DB_SCHEMA"]?.ToString()?.Trim() ?? "",
                                     Username = PasswordEncryptionService.Decrypt(encryptedUsername) ?? encryptedUsername,
-                                    Password = PasswordEncryptionService.Decrypt(encryptedPassword) ?? encryptedPassword
+                                    Password = PasswordEncryptionService.Decrypt(encryptedPassword) ?? encryptedPassword,
+                                    TableName = !string.IsNullOrEmpty(tableName) ? tableName : "GLOSSARY"
                                 };
                             }
                         }
@@ -94,14 +117,14 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
 
                 _isLoaded = true;
-                System.Diagnostics.Debug.WriteLine($"GlossaryConnectionService: Loaded connection def - DbType: {_connectionDef.DbType}, Host: {_connectionDef.Host}, DB: {_connectionDef.DbSchema}");
+                Log($"GlossaryConnectionService: Loaded connection def - DbType: {_connectionDef.DbType}, Host: {_connectionDef.Host}, DB: {_connectionDef.DbSchema}, Table: {_connectionDef.TableName}");
                 return true;
             }
             catch (Exception ex)
             {
                 _lastError = ex.Message;
                 _isLoaded = false;
-                System.Diagnostics.Debug.WriteLine($"GlossaryConnectionService.LoadConnectionDef error: {ex.Message}");
+                Log($"GlossaryConnectionService.LoadConnectionDef error: {ex.Message}");
                 return false;
             }
         }
@@ -110,19 +133,23 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// Gets the appropriate SQL query for the repository database type.
         /// Queries CONNECTION_DEF table with ID=4 (Glossary).
         /// </summary>
-        private string GetQuery(string repoDbType)
+        private string GetQuery(string repoDbType, bool withTableName = true)
         {
+            string tn = withTableName ? ", \"TABLE_NAME\"" : "";
+            string tnOracle = withTableName ? ", TABLE_NAME" : "";
+            string tnMssql = withTableName ? ", [TABLE_NAME]" : "";
+
             switch (repoDbType?.ToUpper())
             {
                 case "POSTGRESQL":
-                    return "SELECT \"ID\", \"DB_TYPE\", \"HOST\", \"PORT\", \"DB_SCHEMA\", \"USERNAME\", \"PASSWORD\" FROM \"connection_def\" WHERE \"ID\" = 4";
+                    return $"SELECT \"ID\", \"DB_TYPE\", \"HOST\", \"PORT\", \"DB_SCHEMA\", \"USERNAME\", \"PASSWORD\"{tn} FROM \"CONNECTION_DEF\" WHERE \"ID\" = 4";
 
                 case "ORACLE":
-                    return "SELECT ID, DB_TYPE, HOST, PORT, DB_SCHEMA, USERNAME, PASSWORD FROM CONNECTION_DEF WHERE ID = 4";
+                    return $"SELECT ID, DB_TYPE, HOST, PORT, DB_SCHEMA, USERNAME, PASSWORD{tnOracle} FROM CONNECTION_DEF WHERE ID = 4";
 
                 case "MSSQL":
                 default:
-                    return "SELECT [ID], [DB_TYPE], [HOST], [PORT], [DB_SCHEMA], [USERNAME], [PASSWORD] FROM [dbo].[CONNECTION_DEF] WHERE [ID] = 4";
+                    return $"SELECT [ID], [DB_TYPE], [HOST], [PORT], [DB_SCHEMA], [USERNAME], [PASSWORD]{tnMssql} FROM [dbo].[CONNECTION_DEF] WHERE [ID] = 4";
             }
         }
 
@@ -141,7 +168,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     return $"Host={_connectionDef.Host};Port={_connectionDef.Port};Database={_connectionDef.DbSchema};Username={_connectionDef.Username};Password={_connectionDef.Password};";
 
                 case "ORACLE":
-                    return $"Data Source={_connectionDef.Host}:{_connectionDef.Port}/{_connectionDef.DbSchema};User Id={_connectionDef.Username};Password={_connectionDef.Password};";
+                    return $"Data Source=(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST={_connectionDef.Host})(PORT={_connectionDef.Port}))(CONNECT_DATA=(SERVICE_NAME={_connectionDef.DbSchema})));User Id={_connectionDef.Username};Password={_connectionDef.Password};";
 
                 case "MSSQL":
                 default:
@@ -171,6 +198,12 @@ namespace EliteSoft.Erwin.AddIn.Services
             _connectionDef = null;
             _isLoaded = false;
         }
+
+        private void Log(string message)
+        {
+            OnLog?.Invoke(message);
+            System.Diagnostics.Debug.WriteLine(message);
+        }
     }
 
     /// <summary>
@@ -185,5 +218,6 @@ namespace EliteSoft.Erwin.AddIn.Services
         public string DbSchema { get; set; }
         public string Username { get; set; }
         public string Password { get; set; }
+        public string TableName { get; set; }
     }
 }
