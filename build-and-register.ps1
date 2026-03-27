@@ -47,36 +47,6 @@ if ($Help) {
 
 $ErrorActionPreference = "Stop"
 
-# XOR-obfuscate DLL/EXE files to bypass security software (removes MZ/PE header signature)
-$xorKey = [byte]0x5A
-function Invoke-ObfuscateForPackaging {
-    param([string]$dir)
-    $count = 0
-    # Only obfuscate our project DLLs (not Microsoft/third-party)
-    $ourFiles = @(
-        "EliteSoft.Erwin.AddIn.dll",
-        "EliteSoft.Erwin.AddIn.comhost.dll",
-        "EliteSoft.MetaAdmin.Shared.dll",
-        "xHardwareLicensing.dll",
-        "EAL.dll"
-    )
-    $files = Get-ChildItem -Path $dir -Recurse -File | Where-Object { $ourFiles -contains $_.Name }
-    foreach ($f in $files) {
-        $bytes = [System.IO.File]::ReadAllBytes($f.FullName)
-        for ($i = 0; $i -lt $bytes.Length; $i++) {
-            $bytes[$i] = $bytes[$i] -bxor $xorKey
-        }
-        if ($f.Extension -eq '.dll') {
-            $newPath = $f.FullName -replace '\.dll$', '.dl_'
-        } else {
-            $newPath = $f.FullName -replace '\.exe$', '.ex_'
-        }
-        [System.IO.File]::WriteAllBytes($newPath, $bytes)
-        Remove-Item $f.FullName -Force
-        $count++
-    }
-    return $count
-}
 
 # Auto-elevate to Administrator if not already
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -299,11 +269,6 @@ if ($Package) {
     # Copy install.ps1 script to publish dir
     $installScriptSource = Join-Path $scriptDir "installer\install.ps1"
     Copy-Item $installScriptSource (Join-Path $publishDir "install.ps1") -Force
-
-    # XOR-obfuscate DLL/EXE to bypass security software scanning
-    Write-Host "`nObfuscating binaries to bypass security software..." -ForegroundColor Yellow
-    $obfuscatedCount = Invoke-ObfuscateForPackaging -dir $publishDir
-    Write-Host "  Obfuscated $obfuscatedCount files (.dll -> .dl_, .exe -> .ex_)" -ForegroundColor Green
 
     # Step N: Create ZIP
     if ($License) { $stepZip = 3; $totalSteps = 3 } else { $stepZip = 2; $totalSteps = 2 }

@@ -59,7 +59,7 @@ Write-Host "=== Installing Elite Soft Erwin Add-In ===" -ForegroundColor Cyan
 $sourceDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 # Copy files
-Write-Host "`n[1/5] Copying files..." -ForegroundColor Yellow
+Write-Host "`n[1/3] Copying files..." -ForegroundColor Yellow
 if (Test-Path $installDir) {
     Remove-Item "$installDir\*" -Recurse -Force
 } else {
@@ -67,60 +67,15 @@ if (Test-Path $installDir) {
 }
 
 Copy-Item "$sourceDir\*" -Destination $installDir -Recurse -Force -Exclude "install.ps1"
-
-# Deobfuscate .dl_ -> .dll and .ex_ -> .exe (XOR-obfuscated to bypass security software)
-Write-Host "`n[2/5] Restoring binaries..." -ForegroundColor Yellow
-$xorKey = [byte]0x5A
-$restored = 0
-Get-ChildItem -Path $installDir -Recurse -File | Where-Object { $_.Extension -eq '.dl_' -or $_.Extension -eq '.ex_' } | ForEach-Object {
-    $bytes = [System.IO.File]::ReadAllBytes($_.FullName)
-    for ($i = 0; $i -lt $bytes.Length; $i++) {
-        $bytes[$i] = $bytes[$i] -bxor $xorKey
-    }
-    if ($_.Extension -eq '.dl_') {
-        $newPath = $_.FullName -replace '\.dl_$', '.dll'
-    } else {
-        $newPath = $_.FullName -replace '\.ex_$', '.exe'
-    }
-    [System.IO.File]::WriteAllBytes($newPath, $bytes)
-    Remove-Item $_.FullName -Force
-    $restored++
-}
 $count = (Get-ChildItem $installDir -Recurse -File).Count
-if ($restored -gt 0) {
-    Write-Host "  Restored $restored binaries" -ForegroundColor Green
-}
-Write-Host "  $count files in $installDir" -ForegroundColor Green
-
-# Check if security software deleted files after deobfuscation
-Start-Sleep -Seconds 2
-$mainDll = Join-Path $installDir "EliteSoft.Erwin.AddIn.dll"
-$comHostFile = Join-Path $installDir $comHostDll
-if (-not (Test-Path $mainDll) -or -not (Test-Path $comHostFile)) {
-    Write-Host ""
-    Write-Host "============================================================" -ForegroundColor Red
-    Write-Host "  SECURITY SOFTWARE BLOCKED THE INSTALLATION" -ForegroundColor Red
-    Write-Host "============================================================" -ForegroundColor Red
-    Write-Host ""
-    Write-Host "  DLL files were deleted by security software after extraction." -ForegroundColor Yellow
-    Write-Host ""
-    Write-Host "  IT ekibinden asagidaki dizin icin exclusion isteyin:" -ForegroundColor White
-    Write-Host "    Path: $installDir" -ForegroundColor Cyan
-    Write-Host "    Type: Folder exclusion (tum alt dosyalar dahil)" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "  Exclusion eklendikten sonra bu scripti tekrar calistirin." -ForegroundColor White
-    Write-Host "============================================================" -ForegroundColor Red
-    Write-Host ""
-    pause
-    exit 1
-}
+Write-Host "  Copied $count files to $installDir" -ForegroundColor Green
 
 # Set permissions
 icacls $installDir /grant "Users:(OI)(CI)RX" /T /Q | Out-Null
 Write-Host "  Permissions set for all users" -ForegroundColor Green
 
 # Register COM
-Write-Host "`n[3/5] Registering COM component..." -ForegroundColor Yellow
+Write-Host "`n[2/3] Registering COM component..." -ForegroundColor Yellow
 $comHost = Join-Path $installDir $comHostDll
 regsvr32.exe /s $comHost
 if ($LASTEXITCODE -eq 0) {
@@ -133,7 +88,7 @@ if ($LASTEXITCODE -eq 0) {
 }
 
 # Register in erwin Add-In Manager (all versions, HKLM + HKCU)
-Write-Host "`n[4/5] Registering in erwin Add-In Manager..." -ForegroundColor Yellow
+Write-Host "`n[3/3] Registering in erwin Add-In Manager..." -ForegroundColor Yellow
 $registered = $false
 foreach ($root in @("HKLM", "HKCU")) {
     $base = "${root}:\$erwinRegBase"
@@ -157,27 +112,6 @@ if (-not $registered) {
     Write-Host "  erwin not found in registry, skipping" -ForegroundColor Yellow
 }
 
-# Verify critical files
-Write-Host "`n[5/5] Verifying installation..." -ForegroundColor Yellow
-$criticalFiles = @($comHostDll, "EliteSoft.Erwin.AddIn.dll", "EliteSoft.Erwin.AddIn.runtimeconfig.json")
-$allOk = $true
-foreach ($f in $criticalFiles) {
-    $fPath = Join-Path $installDir $f
-    if (Test-Path $fPath) {
-        Write-Host "  $f - OK" -ForegroundColor Green
-    } else {
-        Write-Host "  $f - MISSING! Security software may have deleted it." -ForegroundColor Red
-        $allOk = $false
-    }
-}
-
-if (-not $allOk) {
-    Write-Host "`nWARNING: Some files are missing!" -ForegroundColor Red
-    Write-Host "Add an exclusion in your security software for:" -ForegroundColor Yellow
-    Write-Host "  $installDir" -ForegroundColor White
-    Write-Host "Then re-run this installer." -ForegroundColor Yellow
-} else {
-    Write-Host "`nInstallation complete!" -ForegroundColor Green
-    Write-Host "Restart erwin to use the add-in." -ForegroundColor Cyan
-}
+Write-Host "`nInstallation complete!" -ForegroundColor Green
+Write-Host "Restart erwin to use the add-in." -ForegroundColor Cyan
 pause
