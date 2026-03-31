@@ -31,8 +31,52 @@ namespace EliteSoft.Erwin.AddIn.Services
         // Snapshot of entity TABLE_TYPE values: ObjectId -> (PhysicalName, TableTypeValue)
         private Dictionary<string, EntitySnapshot> _entitySnapshots;
 
+        // Snapshot of Key_Group (Index) names: ObjectId -> PhysicalName
+        private Dictionary<string, string> _keyGroupSnapshots;
+
+        // MODEL_PATH read-only enforcement
+        private string _modelPathOriginalValue;
+
+        /// <summary>
+        /// Silently restore MODEL_PATH if user changed it.
+        /// </summary>
+        private void EnforceModelPathReadOnly()
+        {
+            if (_modelPathOriginalValue == null) return;
+            try
+            {
+                dynamic modelObjects = _session.ModelObjects;
+                dynamic root = modelObjects.Root;
+                if (root == null) return;
+
+                string currentValue = "";
+                try { currentValue = root.Properties("Model.Physical.MODEL_PATH").Value?.ToString() ?? ""; }
+                catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"EnforceModelPath: Read failed: {ex.Message}"); return; }
+
+                if (currentValue != _modelPathOriginalValue)
+                {
+                    int transId = _session.BeginNamedTransaction("EnforceModelPath");
+                    try
+                    {
+                        root.Properties("Model.Physical.MODEL_PATH").Value = _modelPathOriginalValue;
+                        _session.CommitTransaction(transId);
+                        Log($"MODEL_PATH restored (user changed '{currentValue}' → '{_modelPathOriginalValue}')");
+                    }
+                    catch (Exception ex)
+                    {
+                        try { _session.RollbackTransaction(transId); } catch (Exception rbEx) { Log($"EnforceModelPath: Rollback failed: {rbEx.Message}"); }
+                        Log($"EnforceModelPath: Write failed: {ex.Message}");
+                    }
+                }
+            }
+            catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"EnforceModelPath error: {ex.Message}"); }
+        }
+
         // Property applicator for applying project standards to new tables
         private PropertyApplicatorService _propertyApplicator;
+
+        // UDP runtime service for applying UDP defaults and dependency evaluation
+        private UdpRuntimeService _udpRuntimeService;
 
         // Event for logging
         public event Action<string> OnLog;
@@ -41,6 +85,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             _session = session;
             _entitySnapshots = new Dictionary<string, EntitySnapshot>();
+            _keyGroupSnapshots = new Dictionary<string, string>();
         }
 
         /// <summary>
@@ -49,6 +94,14 @@ namespace EliteSoft.Erwin.AddIn.Services
         public void SetPropertyApplicator(PropertyApplicatorService applicator)
         {
             _propertyApplicator = applicator;
+        }
+
+        /// <summary>
+        /// Set the UDP runtime service for applying UDP defaults and evaluating dependencies.
+        /// </summary>
+        public void SetUdpRuntimeService(UdpRuntimeService service)
+        {
+            _udpRuntimeService = service;
         }
 
         /// <summary>
@@ -114,17 +167,55 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                     if (!string.IsNullOrEmpty(objectId))
                     {
-                        _entitySnapshots[objectId] = new EntitySnapshot
+                        var snapshot = new EntitySnapshot
                         {
                             ObjectId = objectId,
                             EntityName = entityName,
                             PhysicalName = physicalName,
                             TableTypeValue = tableTypeValue
                         };
+
+                        // Also snapshot UDP values for dependency monitoring
+                        if (_udpRuntimeService != null && _udpRuntimeService.IsInitialized)
+                        {
+                            snapshot.UdpValues = _udpRuntimeService.ReadUdpValues(entity);
+                        }
+
+                        _entitySnapshots[objectId] = snapshot;
                     }
                 }
 
-                Log($"TableTypeMonitorService: Snapshot taken - {_entitySnapshots.Count} entities");
+                // Snapshot Key_Group (Index) names
+                _keyGroupSnapshots.Clear();
+                try
+                {
+                    dynamic allKeyGroups = modelObjects.Collect(root, "Key_Group");
+                    if (allKeyGroups != null)
+                    {
+                        foreach (dynamic kg in allKeyGroups)
+                        {
+                            if (kg == null) continue;
+                            try
+                            {
+                                string kgId = kg.ObjectId?.ToString() ?? "";
+                                string kgName = kg.Name ?? "";
+                                if (!string.IsNullOrEmpty(kgId))
+                                    _keyGroupSnapshots[kgId] = kgName;
+                            }
+                            catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"Key_Group snapshot item error: {ex.Message}"); }
+                        }
+                    }
+                }
+                catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"Key_Group snapshot error: {ex.Message}"); }
+
+                // Snapshot MODEL_PATH for read-only enforcement
+                try
+                {
+                    _modelPathOriginalValue = root.Properties("Model.Physical.MODEL_PATH").Value?.ToString() ?? "";
+                }
+                catch (Exception ex) { _modelPathOriginalValue = null; System.Diagnostics.Debug.WriteLine($"MODEL_PATH snapshot error: {ex.Message}"); }
+
+                Log($"TableTypeMonitorService: Snapshot taken - {_entitySnapshots.Count} entities, {_keyGroupSnapshots.Count} key groups");
             }
             catch (Exception ex)
             {
@@ -164,6 +255,9 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// </summary>
         public void CheckForTableTypeChanges(dynamic allEntities)
         {
+            // Read-only enforcement: restore MODEL_PATH if user changed it
+            EnforceModelPathReadOnly();
+
             try
             {
                 foreach (dynamic entity in allEntities)
@@ -234,12 +328,28 @@ namespace EliteSoft.Erwin.AddIn.Services
                             // Apply affix based on NAME_EXTENSION_LOCATION
                             ApplyTableTypeAffix(entity, physicalName, tableTypeEntry);
                         }
+
+                        // Evaluate UDP dependencies triggered by TABLE_TYPE change
+                        if (_udpRuntimeService != null && _udpRuntimeService.IsInitialized)
+                        {
+                            try
+                            {
+                                _udpRuntimeService.HandleUdpValueChange(entity, "TABLE_TYPE", tableTypeValue);
+                            }
+                            catch (Exception ex)
+                            {
+                                Log($"UDP dependency evaluation error for '{physicalName}': {ex.Message}");
+                            }
+                        }
                     }
                     else if (physicalNameChanged)
                     {
                         // Physical name changed (user manually edited table name)
                         string oldPhysicalName = _entitySnapshots[objectId].PhysicalName;
                         Log($"Physical name changed for entity: '{oldPhysicalName}' -> '{physicalName}'");
+
+                        // Validate Table naming standards (with auto-apply)
+                        ValidateNamingStandard("Table", physicalName, entity);
 
                         // If TABLE_TYPE is set, check if affix needs to be reapplied
                         if (!string.IsNullOrEmpty(tableTypeValue))
@@ -255,7 +365,14 @@ namespace EliteSoft.Erwin.AddIn.Services
                         // Update snapshot with new name
                         _entitySnapshots[objectId].PhysicalName = physicalName;
                     }
-                    else if (isNew)
+
+                    // Check for UDP value changes on existing entities (regardless of TABLE_TYPE or name changes)
+                    if (!isNew && _udpRuntimeService != null && _udpRuntimeService.IsInitialized)
+                    {
+                        CheckForUdpValueChanges(entity, objectId, physicalName);
+                    }
+
+                    if (isNew)
                     {
                         // Add new entity to snapshot
                         _entitySnapshots[objectId] = new EntitySnapshot
@@ -275,6 +392,23 @@ namespace EliteSoft.Erwin.AddIn.Services
                             _propertyApplicator.ApplyStandardsToEntity(entity, physicalName);
                         }
 
+                        // Apply UDP defaults for new entity
+                        if (_udpRuntimeService != null && _udpRuntimeService.IsInitialized)
+                        {
+                            try
+                            {
+                                _udpRuntimeService.ApplyDefaults(entity);
+                                Log($"UDP defaults applied for new entity '{physicalName}'");
+
+                                // Snapshot UDP values after defaults applied (so first check doesn't re-trigger)
+                                _entitySnapshots[objectId].UdpValues = _udpRuntimeService.ReadUdpValues(entity);
+                            }
+                            catch (Exception ex)
+                            {
+                                Log($"UDP defaults error for '{physicalName}': {ex.Message}");
+                            }
+                        }
+
                         // If new entity already has TABLE_TYPE set, apply affix
                         if (!string.IsNullOrEmpty(tableTypeValue))
                         {
@@ -285,12 +419,135 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 ApplyTableTypeAffix(entity, physicalName, tableTypeEntry);
                             }
                         }
+
+                        // Validate Table naming standards for new entity (with auto-apply)
+                        ValidateNamingStandard("Table", physicalName, entity);
                     }
                 }
             }
             catch (Exception ex)
             {
                 System.Diagnostics.Debug.WriteLine($"CheckForTableTypeChanges error: {ex.Message}");
+            }
+
+            // Check Key_Group (Index) and View naming standards
+            CheckKeyGroupAndViewNaming();
+        }
+
+        /// <summary>
+        /// Check for new/renamed Key_Group (Index) and View objects and validate naming standards.
+        /// </summary>
+        private void CheckKeyGroupAndViewNaming()
+        {
+            if (!NamingStandardService.Instance.IsLoaded) return;
+
+            try
+            {
+                dynamic modelObjects = _session.ModelObjects;
+                dynamic root = modelObjects.Root;
+                if (root == null) return;
+
+                // Key_Group (Index) monitoring
+                try
+                {
+                    dynamic allKeyGroups = modelObjects.Collect(root, "Key_Group");
+                    if (allKeyGroups != null)
+                    {
+                        foreach (dynamic kg in allKeyGroups)
+                        {
+                            if (kg == null) continue;
+                            try
+                            {
+                                string kgId = kg.ObjectId?.ToString() ?? "";
+                                string kgName = kg.Name ?? "";
+                                if (string.IsNullOrEmpty(kgId) || string.IsNullOrEmpty(kgName)) continue;
+
+                                bool isNew = !_keyGroupSnapshots.ContainsKey(kgId);
+                                bool nameChanged = !isNew && _keyGroupSnapshots[kgId] != kgName;
+
+                                if (isNew || nameChanged)
+                                {
+                                    ValidateNamingStandard("Index", kgName, kg);
+                                    _keyGroupSnapshots[kgId] = kgName;
+                                }
+                            }
+                            catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"Key_Group naming check error: {ex.Message}"); }
+                        }
+                    }
+                }
+                catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"Key_Group collect error: {ex.Message}"); }
+
+                // View monitoring
+                try
+                {
+                    dynamic allViews = modelObjects.Collect(root, "View");
+                    if (allViews != null)
+                    {
+                        foreach (dynamic view in allViews)
+                        {
+                            if (view == null) continue;
+                            try
+                            {
+                                string viewId = view.ObjectId?.ToString() ?? "";
+                                string viewName = "";
+                                try
+                                {
+                                    string physName = view.Properties("Physical_Name").Value?.ToString() ?? "";
+                                    viewName = (!string.IsNullOrEmpty(physName) && !physName.StartsWith("%")) ? physName : (view.Name ?? "");
+                                }
+                                catch (Exception ex) { viewName = view.Name ?? ""; System.Diagnostics.Debug.WriteLine($"View Physical_Name read error: {ex.Message}"); }
+
+                                if (string.IsNullOrEmpty(viewId) || string.IsNullOrEmpty(viewName)) continue;
+
+                                bool isNew = !_keyGroupSnapshots.ContainsKey("V_" + viewId);
+                                bool nameChanged = !isNew && _keyGroupSnapshots["V_" + viewId] != viewName;
+
+                                if (isNew || nameChanged)
+                                {
+                                    ValidateNamingStandard("View", viewName, view);
+                                    _keyGroupSnapshots["V_" + viewId] = viewName;
+                                }
+                            }
+                            catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"View naming check error: {ex.Message}"); }
+                        }
+                    }
+                }
+                catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"View collect error: {ex.Message}"); }
+
+                // Subject Area monitoring
+                try
+                {
+                    dynamic allSAs = modelObjects.Collect(root, "Subject_Area");
+                    if (allSAs != null)
+                    {
+                        foreach (dynamic sa in allSAs)
+                        {
+                            if (sa == null) continue;
+                            try
+                            {
+                                string saId = sa.ObjectId?.ToString() ?? "";
+                                string saName = sa.Name ?? "";
+                                if (string.IsNullOrEmpty(saId) || string.IsNullOrEmpty(saName)) continue;
+
+                                string saKey = "SA_" + saId;
+                                bool isNew = !_keyGroupSnapshots.ContainsKey(saKey);
+                                bool nameChanged = !isNew && _keyGroupSnapshots[saKey] != saName;
+
+                                if (isNew || nameChanged)
+                                {
+                                    ValidateNamingStandard("Subject Area", saName, sa);
+                                    _keyGroupSnapshots[saKey] = saName;
+                                }
+                            }
+                            catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"Subject_Area naming check error: {ex.Message}"); }
+                        }
+                    }
+                }
+                catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"Subject_Area collect error: {ex.Message}"); }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"CheckKeyGroupAndViewNaming error: {ex.Message}");
             }
         }
 
@@ -758,6 +1015,132 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
         }
 
+        /// <summary>
+        /// Validate object name against naming standards and log/show results.
+        /// </summary>
+        /// <summary>
+        /// Validate naming standards and auto-apply prefix/suffix if AUTO_APPLY=true.
+        /// Shows confirmation dialog before auto-applying.
+        /// </summary>
+        private void ValidateNamingStandard(string objectType, string physicalName, dynamic scapiObject = null)
+        {
+            if (!NamingStandardService.Instance.IsLoaded) return;
+
+            // Step 1: Check if auto-apply would change the name
+            if (scapiObject != null && NamingValidationEngine.HasAutoApplyChanges(objectType, physicalName))
+            {
+                string newName = NamingValidationEngine.ApplyNamingStandards(objectType, physicalName);
+
+                var answer = System.Windows.Forms.MessageBox.Show(
+                    $"Naming standard requires changes for '{physicalName}':\n\n" +
+                    $"'{physicalName}' → '{newName}'\n\n" +
+                    $"Apply automatically?",
+                    "Naming Standard — Auto Apply",
+                    System.Windows.Forms.MessageBoxButtons.YesNo,
+                    System.Windows.Forms.MessageBoxIcon.Question);
+
+                if (answer == System.Windows.Forms.DialogResult.Yes)
+                {
+                    int transId = _session.BeginNamedTransaction("ApplyNamingStandard");
+                    try
+                    {
+                        scapiObject.Properties("Physical_Name").Value = newName;
+                        _session.CommitTransaction(transId);
+                        Log($"Naming standard auto-applied: '{physicalName}' → '{newName}'");
+
+                        // Update snapshot
+                        string objectId = scapiObject.ObjectId?.ToString() ?? "";
+                        if (_entitySnapshots.ContainsKey(objectId))
+                            _entitySnapshots[objectId].PhysicalName = newName;
+
+                        return; // Auto-applied — skip further validation (will re-validate on next tick)
+                    }
+                    catch (Exception ex)
+                    {
+                        try { _session.RollbackTransaction(transId); } catch { }
+                        Log($"Naming standard auto-apply failed: {ex.Message}");
+                    }
+                }
+            }
+
+            // Step 2: Validate (after auto-apply or if user declined)
+            string nameToValidate = physicalName;
+            if (scapiObject != null)
+            {
+                try
+                {
+                    string currentPhys = scapiObject.Properties("Physical_Name").Value?.ToString() ?? "";
+                    if (!string.IsNullOrEmpty(currentPhys) && !currentPhys.StartsWith("%"))
+                        nameToValidate = currentPhys;
+                }
+                catch { }
+            }
+
+            var results = NamingValidationEngine.ValidateObjectName(objectType, nameToValidate);
+            var failures = results.Where(r => !r.IsValid).ToList();
+
+            if (failures.Count > 0)
+            {
+                foreach (var f in failures)
+                {
+                    Log($"Naming standard violation ({f.RuleName}): '{nameToValidate}' — {f.ErrorMessage}");
+                }
+
+                string messages = string.Join("\n", failures.Select(f => $"• {f.ErrorMessage}"));
+                System.Windows.Forms.MessageBox.Show(
+                    $"Naming standard violation(s) for '{nameToValidate}':\n\n{messages}",
+                    "Naming Standard",
+                    System.Windows.Forms.MessageBoxButtons.OK,
+                    System.Windows.Forms.MessageBoxIcon.Warning);
+            }
+        }
+
+        /// <summary>
+        /// Check if any UDP values changed on an existing entity and trigger dependency evaluation.
+        /// </summary>
+        private void CheckForUdpValueChanges(dynamic entity, string objectId, string physicalName)
+        {
+            try
+            {
+                if (!_entitySnapshots.ContainsKey(objectId)) return;
+                var snapshot = _entitySnapshots[objectId];
+
+                // Read current UDP values
+                var currentValues = _udpRuntimeService.ReadUdpValues(entity);
+                if (currentValues.Count == 0) return;
+
+                // Compare with snapshot
+                foreach (var kvp in currentValues)
+                {
+                    string oldValue = "";
+                    snapshot.UdpValues.TryGetValue(kvp.Key, out oldValue);
+                    oldValue = oldValue ?? "";
+
+                    if (kvp.Value != oldValue)
+                    {
+                        Log($"UDP '{kvp.Key}' changed on '{physicalName}': '{oldValue}' -> '{kvp.Value}'");
+
+                        // Evaluate dependencies for this change
+                        _udpRuntimeService.HandleUdpValueChange(entity, kvp.Key, kvp.Value);
+
+                        // Update snapshot with new value
+                        snapshot.UdpValues[kvp.Key] = kvp.Value;
+                    }
+                }
+
+                // Re-read after dependency writes (dependencies might have changed other values)
+                var updatedValues = _udpRuntimeService.ReadUdpValues(entity);
+                foreach (var kvp in updatedValues)
+                {
+                    snapshot.UdpValues[kvp.Key] = kvp.Value;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"CheckForUdpValueChanges error for '{physicalName}': {ex.Message}");
+            }
+        }
+
         private void Log(string message)
         {
             OnLog?.Invoke(message);
@@ -781,6 +1164,8 @@ namespace EliteSoft.Erwin.AddIn.Services
             public string EntityName { get; set; }
             public string PhysicalName { get; set; }
             public string TableTypeValue { get; set; }
+            /// <summary>UDP name -> value snapshot for dependency change detection</summary>
+            public Dictionary<string, string> UdpValues { get; set; } = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         }
     }
 }

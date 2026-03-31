@@ -37,6 +37,7 @@ namespace EliteSoft.Erwin.AddIn
         private TableTypeMonitorService _tableTypeMonitorService;
         private ValidationCoordinatorService _validationCoordinatorService;
         private PropertyApplicatorService _propertyApplicatorService;
+        private UdpRuntimeService _udpRuntimeService;
 
         // State tracking
         private Timer _glossaryRefreshTimer;
@@ -268,7 +269,11 @@ namespace EliteSoft.Erwin.AddIn
             LoadGlossary();
             LoadTableTypes();
             LoadDomainDefs();
+            LoadNamingStandards();
             EnsureAllUdpsExist();
+
+            // Set MODEL_PATH UDP value (must be after metamodel session is closed)
+            SetModelPathValue();
 
             // ColumnValidationService is kept for ValidateAll button functionality only (no monitoring)
             _validationService = new ColumnValidationService(_session);
@@ -277,11 +282,26 @@ namespace EliteSoft.Erwin.AddIn
             // Initialize property applicator service (reads project standards from DB)
             InitializePropertyApplicator();
 
+            // Initialize UDP runtime service (reads UDP definitions and dependencies from DB)
+            _udpRuntimeService = new UdpRuntimeService(_session, _scapi, _currentModel);
+            _udpRuntimeService.OnLog += Log;
+            if (_udpRuntimeService.Initialize())
+            {
+                var objectTypes = string.Join(", ", UdpDefinitionService.Instance.GetLoadedObjectTypes());
+                Log($"UDP runtime initialized: {UdpDefinitionService.Instance.Count} definitions [{objectTypes}], {UdpDependencyService.Instance.Count} dependencies");
+            }
+            else
+            {
+                Log("UDP runtime initialization skipped (no definitions or DB not configured)");
+            }
+
             // Initialize TABLE_TYPE monitor service (timer managed by coordinator)
             _tableTypeMonitorService = new TableTypeMonitorService(_session);
             _tableTypeMonitorService.OnLog += Log;
             if (_propertyApplicatorService != null)
                 _tableTypeMonitorService.SetPropertyApplicator(_propertyApplicatorService);
+            if (_udpRuntimeService.IsInitialized)
+                _tableTypeMonitorService.SetUdpRuntimeService(_udpRuntimeService);
             _tableTypeMonitorService.TakeSnapshot();
             _tableTypeMonitorService.StartMonitoring();
 
@@ -290,6 +310,8 @@ namespace EliteSoft.Erwin.AddIn
             _validationCoordinatorService.OnLog += Log;
             _validationCoordinatorService.OnSessionLost += HandleSessionLost;
             _validationCoordinatorService.SetTableTypeMonitor(_tableTypeMonitorService);
+            if (_udpRuntimeService.IsInitialized)
+                _validationCoordinatorService.SetUdpRuntimeService(_udpRuntimeService);
             _validationCoordinatorService.StartMonitoring();
 
             // Load tables for Table Processes tab
@@ -301,87 +323,278 @@ namespace EliteSoft.Erwin.AddIn
 
         private void InitializeValidationUI()
         {
-            listColumnValidation.Columns.Add("Table", 150);
-            listColumnValidation.Columns.Add("Physical Name", 250);
-            listColumnValidation.Columns.Add("Status", 80);
-
-            listTableValidation.Columns.Add("Table", 250);
-            listTableValidation.Columns.Add("Type Selected", 100);
+            listValidationResults.Columns.Add("Type", 70);
+            listValidationResults.Columns.Add("Object Name", 220);
+            listValidationResults.Columns.Add("Rule", 110);
+            listValidationResults.Columns.Add("", 36);     // Status icon column (narrow)
+            listValidationResults.Columns.Add("Message", 380);
 
             btnValidateAll.Enabled = false;
         }
 
         private void BtnValidateAll_Click(object sender, EventArgs e)
         {
-            if (_validationService == null) return;
+            listValidationResults.Items.Clear();
 
-            listColumnValidation.Items.Clear();
-            listTableValidation.Items.Clear();
+            string filter = cmbValidationFilter.SelectedItem?.ToString() ?? "All";
+            int errorCount = 0;
+            int totalCount = 0;
 
-            var allResults = _validationService.ValidateAllColumns();
-            var columnResults = allResults.Where(r => r.RuleName != "TableTypeRule").ToList();
-            var tableResults = allResults.Where(r => r.RuleName == "TableTypeRule").ToList();
-
-            PopulateColumnValidationResults(columnResults);
-            PopulateTableValidationResults(tableResults);
-            ShowValidationSummary(columnResults, tableResults);
-        }
-
-        private void PopulateColumnValidationResults(List<ColumnValidationIssue> results)
-        {
-            // Sort: valid first, then invalid
-            var sortedResults = results.OrderByDescending(r => r.IsValid).ThenBy(r => r.TableName);
-
-            foreach (var col in sortedResults)
+            try
             {
-                var item = new ListViewItem(col.TableName);
-                item.SubItems.Add(col.PhysicalName);
-                item.SubItems.Add(col.IsValid ? "\u2713" : "\u2717");
-                item.ForeColor = col.IsValid ? Color.DarkGreen : Color.Red;
-                listColumnValidation.Items.Add(item);
+                dynamic modelObjects = _session.ModelObjects;
+                dynamic root = modelObjects.Root;
+                if (root == null) return;
+
+                // Table validation (Glossary column check + TableType + Naming Standards)
+                if (filter == "All" || filter == "Table")
+                {
+                    dynamic allEntities = modelObjects.Collect(root, "Entity");
+                    if (allEntities != null)
+                    {
+                        foreach (dynamic entity in allEntities)
+                        {
+                            if (entity == null) continue;
+                            string tableName = "";
+                            try
+                            {
+                                string physName = entity.Properties("Physical_Name").Value?.ToString() ?? "";
+                                tableName = (!string.IsNullOrEmpty(physName) && !physName.StartsWith("%")) ? physName : (entity.Name ?? "");
+                            }
+                            catch { try { tableName = entity.Name ?? ""; } catch { continue; } }
+
+                            // Naming standard validation
+                            var namingResults = NamingValidationEngine.ValidateObjectName("Table", tableName);
+                            foreach (var r in namingResults)
+                            {
+                                totalCount++;
+                                if (!r.IsValid) errorCount++;
+                                AddValidationRow("Table", tableName, $"Naming ({r.RuleName})", r.IsValid, r.ErrorMessage);
+                            }
+
+                            // TableType check
+                            if (_validationService != null)
+                            {
+                                string tableType = "";
+                                try { tableType = entity.Properties("Entity.Physical.TABLE_TYPE").Value?.ToString() ?? ""; } catch { }
+                                bool hasType = !string.IsNullOrEmpty(tableType) && tableType != "(SELECT)";
+                                totalCount++;
+                                if (!hasType) errorCount++;
+                                AddValidationRow("Table", tableName, "TableType", hasType, hasType ? "" : "TABLE_TYPE not selected");
+                            }
+                        }
+                    }
+                }
+
+                // Column validation (Glossary + Naming Standards)
+                if (filter == "All" || filter == "Column")
+                {
+                    dynamic allEntities = modelObjects.Collect(root, "Entity");
+                    if (allEntities != null)
+                    {
+                        var glossary = GlossaryService.Instance;
+                        foreach (dynamic entity in allEntities)
+                        {
+                            if (entity == null) continue;
+                            string tableName = "";
+                            try
+                            {
+                                string physName = entity.Properties("Physical_Name").Value?.ToString() ?? "";
+                                tableName = (!string.IsNullOrEmpty(physName) && !physName.StartsWith("%")) ? physName : (entity.Name ?? "");
+                            }
+                            catch { try { tableName = entity.Name ?? ""; } catch { continue; } }
+
+                            dynamic attrs = null;
+                            try { attrs = modelObjects.Collect(entity, "Attribute"); } catch { continue; }
+                            if (attrs == null) continue;
+
+                            foreach (dynamic attr in attrs)
+                            {
+                                if (attr == null) continue;
+                                string colName = "";
+                                try
+                                {
+                                    string physCol = attr.Properties("Physical_Name").Value?.ToString() ?? "";
+                                    colName = (!string.IsNullOrEmpty(physCol) && !physCol.StartsWith("%")) ? physCol : (attr.Name ?? "");
+                                }
+                                catch { try { colName = attr.Name ?? ""; } catch { continue; } }
+
+                                // Glossary check
+                                if (glossary.IsLoaded)
+                                {
+                                    bool inGlossary = glossary.GetEntry(colName) != null;
+                                    totalCount++;
+                                    if (!inGlossary) errorCount++;
+                                    AddValidationRow("Column", $"{tableName}.{colName}", "Glossary", inGlossary, inGlossary ? "" : "Not found in glossary");
+                                }
+
+                                // Naming standard validation
+                                var namingResults = NamingValidationEngine.ValidateObjectName("Column", colName);
+                                foreach (var r in namingResults)
+                                {
+                                    totalCount++;
+                                    if (!r.IsValid) errorCount++;
+                                    AddValidationRow("Column", $"{tableName}.{colName}", $"Naming ({r.RuleName})", r.IsValid, r.ErrorMessage);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Index (Key_Group) validation
+                if (filter == "All" || filter == "Index")
+                {
+                    try
+                    {
+                        dynamic allKg = modelObjects.Collect(root, "Key_Group");
+                        if (allKg != null)
+                        {
+                            foreach (dynamic kg in allKg)
+                            {
+                                if (kg == null) continue;
+                                string kgName = "";
+                                try { kgName = kg.Name ?? ""; } catch { continue; }
+
+                                var namingResults = NamingValidationEngine.ValidateObjectName("Index", kgName);
+                                foreach (var r in namingResults)
+                                {
+                                    totalCount++;
+                                    if (!r.IsValid) errorCount++;
+                                    AddValidationRow("Index", kgName, $"Naming ({r.RuleName})", r.IsValid, r.ErrorMessage);
+                                }
+                            }
+                        }
+                    }
+                    catch { }
+                }
+
+                // View validation
+                if (filter == "All" || filter == "View")
+                {
+                    try
+                    {
+                        dynamic allViews = modelObjects.Collect(root, "View");
+                        if (allViews != null)
+                        {
+                            foreach (dynamic view in allViews)
+                            {
+                                if (view == null) continue;
+                                string viewName = "";
+                                try
+                                {
+                                    string physName = view.Properties("Physical_Name").Value?.ToString() ?? "";
+                                    viewName = (!string.IsNullOrEmpty(physName) && !physName.StartsWith("%")) ? physName : (view.Name ?? "");
+                                }
+                                catch { try { viewName = view.Name ?? ""; } catch { continue; } }
+
+                                var namingResults = NamingValidationEngine.ValidateObjectName("View", viewName);
+                                foreach (var r in namingResults)
+                                {
+                                    totalCount++;
+                                    if (!r.IsValid) errorCount++;
+                                    AddValidationRow("View", viewName, $"Naming ({r.RuleName})", r.IsValid, r.ErrorMessage);
+                                }
+                            }
+                        }
+                    }
+                    catch { }
+                }
+
+                // Model validation (naming standards)
+                if (filter == "All" || filter == "Model")
+                {
+                    try
+                    {
+                        string modelName = "";
+                        try
+                        {
+                            dynamic modelRoot = modelObjects.Root;
+                            modelName = modelRoot?.Name ?? "";
+                        }
+                        catch { }
+
+                        if (!string.IsNullOrEmpty(modelName))
+                        {
+                            var namingResults = NamingValidationEngine.ValidateObjectName("Model", modelName);
+                            foreach (var r in namingResults)
+                            {
+                                totalCount++;
+                                if (!r.IsValid) errorCount++;
+                                AddValidationRow("Model", modelName, $"Naming ({r.RuleName})", r.IsValid, r.ErrorMessage);
+                            }
+                        }
+                    }
+                    catch { }
+                }
+
+                // Subject Area validation (naming standards)
+                if (filter == "All" || filter == "Subject Area")
+                {
+                    try
+                    {
+                        dynamic allSAs = modelObjects.Collect(root, "Subject_Area");
+                        if (allSAs != null)
+                        {
+                            foreach (dynamic sa in allSAs)
+                            {
+                                if (sa == null) continue;
+                                string saName = "";
+                                try { saName = sa.Name ?? ""; } catch { continue; }
+
+                                var namingResults = NamingValidationEngine.ValidateObjectName("Subject Area", saName);
+                                foreach (var r in namingResults)
+                                {
+                                    totalCount++;
+                                    if (!r.IsValid) errorCount++;
+                                    AddValidationRow("Subject Area", saName, $"Naming ({r.RuleName})", r.IsValid, r.ErrorMessage);
+                                }
+                            }
+                        }
+                    }
+                    catch { }
+                }
+
+                // Apply "Errors Only" checkbox filter
+                if (chkErrorsOnly.Checked)
+                {
+                    var toRemove = new List<ListViewItem>();
+                    foreach (ListViewItem item in listValidationResults.Items)
+                    {
+                        if (item.SubItems[3].Text == "\u2713") toRemove.Add(item);
+                    }
+                    foreach (var item in toRemove) listValidationResults.Items.Remove(item);
+                }
             }
-        }
-
-        private void PopulateTableValidationResults(List<ColumnValidationIssue> results)
-        {
-            // Sort: valid first, then invalid
-            var sortedResults = results.OrderByDescending(r => r.IsValid).ThenBy(r => r.TableName);
-
-            foreach (var tbl in sortedResults)
+            catch (Exception ex)
             {
-                var item = new ListViewItem(tbl.TableName);
-                item.SubItems.Add(tbl.IsValid ? "\u2713" : "\u2717");
-                item.ForeColor = tbl.IsValid ? Color.DarkGreen : Color.Red;
-                listTableValidation.Items.Add(item);
+                Log($"ValidateAll error: {ex.Message}");
             }
+
+            ShowValidationSummary(totalCount, errorCount);
         }
 
-        private void ShowValidationSummary(List<ColumnValidationIssue> columnResults, List<ColumnValidationIssue> tableResults)
+        private void AddValidationRow(string objectType, string objectName, string rule, bool isValid, string message)
         {
-            int invalidColumns = columnResults.Count(r => !r.IsValid);
-            int invalidTables = tableResults.Count(r => !r.IsValid);
-            int validColumns = columnResults.Count(r => r.IsValid);
-            int validTables = tableResults.Count(r => r.IsValid);
+            var item = new ListViewItem(objectType);
+            item.SubItems.Add(objectName);
+            item.SubItems.Add(rule);
+            item.SubItems.Add(isValid ? "\u2713" : "\u2717");
+            item.SubItems.Add(isValid ? "" : message);
+            item.ForeColor = isValid ? Color.DarkGreen : Color.Red;
+            listValidationResults.Items.Add(item);
+        }
 
-            if (invalidColumns == 0 && invalidTables == 0)
+        private void ShowValidationSummary(int totalCount, int errorCount)
+        {
+            if (errorCount == 0)
             {
-                lblValidationStatus.Text = $"All validations passed - {validColumns} columns, {validTables} tables OK";
+                lblValidationStatus.Text = $"All validations passed ({totalCount} checks)";
                 lblValidationStatus.ForeColor = Color.DarkGreen;
-                MessageBox.Show(
-                    $"All validations passed!\n\nColumns: {validColumns} found in glossary\nTables: All tables have type selected",
-                    "Validation Passed", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
             else
             {
-                lblValidationStatus.Text = $"Validation: {invalidColumns} column errors, {invalidTables} table errors";
+                lblValidationStatus.Text = $"Validation: {errorCount} error(s) / {totalCount} checks";
                 lblValidationStatus.ForeColor = Color.Red;
-
-                string message = "";
-                if (invalidColumns > 0) message += $"Column Errors: {invalidColumns} not found in glossary\n";
-                if (invalidTables > 0) message += $"Table Errors: {invalidTables} tables without type selected\n";
-                message += "\nSee the tabs for details.";
-
-                MessageBox.Show(message, "Validation Result", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
 
@@ -389,26 +602,19 @@ namespace EliteSoft.Erwin.AddIn
         {
             if (cmbValidationFilter.SelectedIndex < 0) return;
 
-            string filter = cmbValidationFilter.SelectedItem?.ToString() ?? "All";
-
-            switch (filter)
+            // Re-run validation with the selected filter
+            if (_isConnected && _session != null)
             {
-                case "Column Validation":
-                    tabControlValidation.SelectedTab = tabColumnValidation;
-                    tabControlValidation.Visible = true;
-                    break;
-                case "Table Validation":
-                    tabControlValidation.SelectedTab = tabTableValidation;
-                    tabControlValidation.Visible = true;
-                    break;
-                case "All":
-                    tabControlValidation.SelectedIndex = 0;
-                    tabControlValidation.Visible = true;
-                    break;
-                case "Errors Only":
-                    // Show both tabs but filter is informational for now
-                    tabControlValidation.Visible = true;
-                    break;
+                BtnValidateAll_Click(sender, e);
+            }
+        }
+
+        private void ChkErrorsOnly_CheckedChanged(object sender, EventArgs e)
+        {
+            // Re-run validation with current filter + errors only toggle
+            if (_isConnected && _session != null)
+            {
+                BtnValidateAll_Click(sender, e);
             }
         }
 
@@ -804,32 +1010,10 @@ namespace EliteSoft.Erwin.AddIn
 
                 Log($"Found {existingUdps.Count} existing Property_Type entries");
 
-                // Determine which UDPs need to be created
-                bool needTableType = false;
+                // --- TABLE_TYPE UDP ---
                 var tableTypeService = TableTypeService.Instance;
-                if (tableTypeService.IsLoaded && tableTypeService.Count > 0)
-                    needTableType = !existingUdps.Contains("Entity.Physical.TABLE_TYPE");
-
-                string[] glossaryUdps = { "OWNER", "KVKK", "PCIDSS", "CLASSIFICATION" };
-                var missingGlossaryUdps = new List<string>();
-                foreach (var udpName in glossaryUdps)
-                {
-                    string fullName = $"Attribute.Physical.{udpName}";
-                    if (!existingUdps.Contains(fullName))
-                        missingGlossaryUdps.Add(udpName);
-                    else
-                        Log($"{fullName} UDP already exists - skipping");
-                }
-
-                // If all UDPs exist, skip entirely — no transactions needed
-                if (!needTableType && missingGlossaryUdps.Count == 0)
-                {
-                    Log("All UDPs already exist - nothing to create");
-                    return;
-                }
-
-                // TABLE_TYPE UDP (Entity, List type)
-                if (needTableType)
+                if (tableTypeService.IsLoaded && tableTypeService.Count > 0 &&
+                    !existingUdps.Contains("Entity.Physical.TABLE_TYPE"))
                 {
                     string listValues = tableTypeService.GetNamesAsCommaSeparated();
                     int transId = metamodelSession.BeginNamedTransaction("CreateTableTypeUDP");
@@ -859,36 +1043,37 @@ namespace EliteSoft.Erwin.AddIn
                             Log($"Error creating TABLE_TYPE UDP: {ex.Message}");
                     }
                 }
-                else if (tableTypeService.IsLoaded && tableTypeService.Count > 0)
-                {
-                    Log("TABLE_TYPE UDP already exists - skipping");
-                }
 
-                // Glossary UDPs (Attribute, Text type): only create missing ones
-                foreach (var udpName in missingGlossaryUdps)
+                // --- MODEL_PATH UDP (hidden, read-only — stores repository path) ---
+                // Determine model path BEFORE creating UDP (to set as default value in metamodel)
+                string modelPathForUdp = ReadModelPath();
+
+                if (!existingUdps.Contains("Model.Physical.MODEL_PATH"))
                 {
-                    string fullName = $"Attribute.Physical.{udpName}";
-                    int transId = metamodelSession.BeginNamedTransaction($"Create_{udpName}");
+                    int transId = metamodelSession.BeginNamedTransaction("CreateModelPathUDP");
                     try
                     {
                         dynamic udpType = mmObjects.Add("Property_Type");
-                        udpType.Properties("Name").Value = fullName;
-                        TrySetProperty(udpType, "tag_Udp_Owner_Type", "Attribute");
+                        udpType.Properties("Name").Value = "Model.Physical.MODEL_PATH";
+                        TrySetProperty(udpType, "tag_Udp_Owner_Type", "Model");
                         TrySetProperty(udpType, "tag_Is_Physical", true);
                         TrySetProperty(udpType, "tag_Is_Logical", false);
                         TrySetProperty(udpType, "tag_Udp_Data_Type", 1); // Text type
-                        TrySetProperty(udpType, "tag_Order", "1");
+                        // Set model path as default value — ensures it's embedded even before model session can see the UDP
+                        if (!string.IsNullOrEmpty(modelPathForUdp))
+                            TrySetProperty(udpType, "tag_Udp_Default_Value", modelPathForUdp);
+                        TrySetProperty(udpType, "tag_Order", "999");
                         TrySetProperty(udpType, "tag_Is_Locally_Defined", true);
                         metamodelSession.CommitTransaction(transId);
-                        Log($"{fullName} UDP created");
+                        Log($"MODEL_PATH UDP created (default='{modelPathForUdp ?? ""}')");
                     }
                     catch (Exception ex)
                     {
-                        try { metamodelSession.RollbackTransaction(transId); } catch { }
+                        try { metamodelSession.RollbackTransaction(transId); } catch (Exception rbEx) { Log($"MODEL_PATH rollback error: {rbEx.Message}"); }
                         if (ex.Message.Contains("must be unique") || ex.Message.Contains("EBS-1057"))
-                            Log($"{fullName} UDP already exists (unique constraint)");
+                            Log("MODEL_PATH UDP already exists (unique constraint)");
                         else
-                            Log($"Error creating {fullName} UDP: {ex.Message}");
+                            Log($"Error creating MODEL_PATH UDP: {ex.Message}");
                     }
                 }
 
@@ -905,6 +1090,185 @@ namespace EliteSoft.Erwin.AddIn
                     try { metamodelSession.Close(); } catch { }
                 }
             }
+        }
+
+        /// <summary>
+        /// Set MODEL_PATH UDP value from the model's repository or file path.
+        /// Only writes if the current value is empty (first time).
+        /// </summary>
+        private void SetModelPathValue()
+        {
+            // Use a fresh session to see newly created UDP (main session may have stale schema)
+            dynamic freshSession = null;
+            try
+            {
+                // Determine path first (before opening new session)
+                string modelPath = ReadModelPath();
+
+                freshSession = _scapi.Sessions.Add();
+                freshSession.Open(_currentModel);
+
+                dynamic modelObjects = freshSession.ModelObjects;
+                dynamic root = modelObjects.Root;
+                if (root == null)
+                {
+                    Log("MODEL_PATH: Fresh session root is null");
+                    return;
+                }
+
+                // Read current MODEL_PATH value
+                string currentModelPath = "";
+                try
+                {
+                    currentModelPath = root.Properties("Model.Physical.MODEL_PATH").Value?.ToString() ?? "";
+                }
+                catch (Exception ex)
+                {
+                    Log($"MODEL_PATH UDP not readable: {ex.Message}");
+                    return;
+                }
+
+                if (!string.IsNullOrEmpty(currentModelPath))
+                {
+                    Log($"MODEL_PATH already set: '{currentModelPath}'");
+                    return;
+                }
+
+                if (string.IsNullOrEmpty(modelPath))
+                {
+                    Log("MODEL_PATH: Could not determine model path");
+                    return;
+                }
+
+                // Write to UDP
+                int transId = freshSession.BeginNamedTransaction("SetModelPath");
+                try
+                {
+                    root.Properties("Model.Physical.MODEL_PATH").Value = modelPath;
+                    freshSession.CommitTransaction(transId);
+                    Log($"MODEL_PATH set to: '{modelPath}'");
+                }
+                catch (Exception ex)
+                {
+                    try { freshSession.RollbackTransaction(transId); } catch (Exception rbEx) { Log($"MODEL_PATH rollback error: {rbEx.Message}"); }
+                    Log($"MODEL_PATH write failed: {ex.Message}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"SetModelPathValue error: {ex.Message}");
+            }
+            finally
+            {
+                if (freshSession != null)
+                {
+                    try { freshSession.Close(); } catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"SetModelPath: Session close error: {ex.Message}"); }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Read model full path from PersistenceUnit (repository) or file system.
+        /// Probes multiple COM properties to find the complete path including folder structure.
+        /// </summary>
+        private string ReadModelPath()
+        {
+            try
+            {
+                // Phase 1: Probe PersistenceUnit COM object for full path
+                if (_currentModel != null)
+                {
+                    // Try all possible PersistenceUnit properties that might contain full path
+                    string[] puProps = { "FullName", "Path", "Location", "ConnectionString",
+                                         "Source", "FileName", "FilePath", "URL", "URI" };
+                    foreach (var prop in puProps)
+                    {
+                        try
+                        {
+                            dynamic val = null;
+                            // Try as direct property first
+                            try { val = ((dynamic)_currentModel).GetType().GetProperty(prop)?.GetValue(_currentModel); } catch { }
+                            // Try as COM late-bound property
+                            if (val == null) try { val = ((dynamic)_currentModel).GetType().InvokeMember(prop, System.Reflection.BindingFlags.GetProperty, null, _currentModel, null); } catch { }
+
+                            string strVal = val?.ToString() ?? "";
+                            if (!string.IsNullOrEmpty(strVal) && strVal != _currentModel.Name?.ToString())
+                            {
+                                Log($"MODEL_PATH: PersistenceUnit.{prop} = '{strVal}'");
+                                return strVal;
+                            }
+                        }
+                        catch { }
+                    }
+
+                    // Log PersistenceUnit.Name for debugging
+                    try
+                    {
+                        string puName = _currentModel.Name?.ToString() ?? "";
+                        Log($"MODEL_PATH: PersistenceUnit.Name = '{puName}' (no full path found on PU)");
+                    }
+                    catch { }
+                }
+
+                // Phase 2: Try session/root properties for Mart path
+                dynamic modelObjects = _session.ModelObjects;
+                dynamic root = modelObjects.Root;
+
+                // Try Mart-specific properties on root
+                string[] rootProps = { "Long_Id", "Source_File_Name", "File_Name", "File_Path",
+                                        "Model_File_Name", "Mart_Model_Path", "Repository_Path" };
+                foreach (var propName in rootProps)
+                {
+                    try
+                    {
+                        string val = root.Properties(propName).Value?.ToString();
+                        if (!string.IsNullOrEmpty(val) && !val.StartsWith("%"))
+                        {
+                            Log($"MODEL_PATH: root.{propName} = '{val}'");
+                            // Skip Long_Id as path (it's a GUID), just log it
+                            if (propName == "Long_Id") continue;
+                            return val;
+                        }
+                    }
+                    catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"MODEL_PATH: root.{propName} error: {ex.Message}"); }
+                }
+
+                // Phase 3: Try to get Mart folder path from SCAPI session
+                try
+                {
+                    // Some erwin versions expose path on the session itself
+                    string[] sessionProps = { "ModelPath", "FileName", "Source" };
+                    foreach (var prop in sessionProps)
+                    {
+                        try
+                        {
+                            string val = _session.GetType().InvokeMember(prop, System.Reflection.BindingFlags.GetProperty, null, (object)_session, null)?.ToString();
+                            if (!string.IsNullOrEmpty(val))
+                            {
+                                Log($"MODEL_PATH: session.{prop} = '{val}'");
+                                return val;
+                            }
+                        }
+                        catch { }
+                    }
+                }
+                catch { }
+
+                // Phase 4: Fallback — use model root Name
+                try
+                {
+                    string modelName = root.Properties("Name").Value?.ToString();
+                    if (!string.IsNullOrEmpty(modelName))
+                    {
+                        Log($"MODEL_PATH: Fallback to root.Name = '{modelName}'");
+                        return modelName;
+                    }
+                }
+                catch (Exception ex) { Log($"MODEL_PATH: Name fallback error: {ex.Message}"); }
+
+                return null;
+            }
+            catch (Exception ex) { Log($"ReadModelPath error: {ex.Message}"); return null; }
         }
 
         #endregion
@@ -931,6 +1295,28 @@ namespace EliteSoft.Erwin.AddIn
             catch (Exception ex)
             {
                 Log($"LoadDomainDefs error: {ex.Message}");
+            }
+        }
+
+        private void LoadNamingStandards()
+        {
+            try
+            {
+                var service = NamingStandardService.Instance;
+                service.LoadStandards();
+
+                if (service.IsLoaded)
+                {
+                    Log($"NAMING_STANDARD loaded: {service.Count} active rules");
+                }
+                else
+                {
+                    Log($"NAMING_STANDARD not loaded: {service.LastError}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"LoadNamingStandards error: {ex.Message}");
             }
         }
 
@@ -1811,6 +2197,8 @@ namespace EliteSoft.Erwin.AddIn
             _validationCoordinatorService?.Dispose();
             _propertyApplicatorService?.Dispose();
             _propertyApplicatorService = null;
+            _udpRuntimeService?.Dispose();
+            _udpRuntimeService = null;
         }
 
         /// <summary>

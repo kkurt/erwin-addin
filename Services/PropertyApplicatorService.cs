@@ -5,6 +5,7 @@ using System.Windows.Forms;
 using EliteSoft.MetaAdmin.Shared.Data;
 using EliteSoft.MetaAdmin.Shared.Data.Entities;
 using EliteSoft.MetaAdmin.Shared.Services;
+using EliteSoft.MetaAdmin.Shared.Models;
 using EliteSoft.Erwin.AddIn.Forms;
 
 namespace EliteSoft.Erwin.AddIn.Services
@@ -122,11 +123,24 @@ namespace EliteSoft.Erwin.AddIn.Services
                     return -1;
                 }
 
-                // 1. Try matching by full file path
-                string modelPath = ReadModelFilePath();
+                // 1. Read MODEL_PATH UDP (primary source)
+                string modelPath = ReadModelPathUdp();
+
+                // 2. If MODEL_PATH is empty, try file path and set it
+                if (string.IsNullOrEmpty(modelPath))
+                {
+                    modelPath = ReadModelFilePath();
+                    if (!string.IsNullOrEmpty(modelPath))
+                        Log($"PropertyApplicator: MODEL_PATH empty, using file path: '{modelPath}'");
+                }
+                else
+                {
+                    Log($"PropertyApplicator: MODEL_PATH = '{modelPath}'");
+                }
+
+                // 3. Try matching MODEL_PATH against PROJECT.PATH
                 if (!string.IsNullOrEmpty(modelPath))
                 {
-                    Log($"PropertyApplicator: Model file path = '{modelPath}'");
                     string normalizedModelPath = modelPath.Replace("/", "\\").TrimEnd('\\').ToUpperInvariant();
 
                     using (var context = new RepoDbContext(config))
@@ -138,64 +152,47 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                         if (project != null)
                         {
-                            Log($"PropertyApplicator: Matched project by full path, ID={project.Id}");
+                            Log($"PropertyApplicator: Matched project by MODEL_PATH, ID={project.Id}");
                             return project.Id;
                         }
                     }
+
+                    // 3b. Fallback: match model name portion against PROJECT.PATH filename
+                    string modelName = ReadModelName();
+                    if (!string.IsNullOrEmpty(modelName))
+                    {
+                        using (var context = new RepoDbContext(config))
+                        {
+                            var project = context.Projects
+                                .AsEnumerable()
+                                .FirstOrDefault(p => !string.IsNullOrEmpty(p.Path) &&
+                                    MatchesModelName(p.Path, modelName));
+
+                            if (project != null)
+                            {
+                                Log($"PropertyApplicator: Matched project by model name, ID={project.Id}, PATH='{project.Path}'");
+                                // Write the full project path back to MODEL_PATH UDP so next time it matches directly
+                                UpdateModelPathUdp(project.Path);
+                                return project.Id;
+                            }
+                        }
+                    }
+
+                    Log($"PropertyApplicator: No project matched path '{modelPath}'");
                 }
 
-                // Log all projects for debugging
+                // 4. Default Corporate fallback
+                int defaultProjectId = FindDefaultCorporateProject(config);
+                if (defaultProjectId > 0)
+                    return defaultProjectId;
+
+                // 5. Last resort: first project in DB
                 using (var ctx = new RepoDbContext(config))
                 {
-                    var allProjects = ctx.Projects.ToList();
-                    Log($"PropertyApplicator: DB projects ({allProjects.Count}): [{string.Join(", ", allProjects.Select(p => $"ID={p.Id} PATH='{p.Path}'"))}]");
-                }
-
-                // 2. Fallback: match model name against filename portion of PROJECT.PATH
-                string modelName = ReadModelName();
-                if (!string.IsNullOrEmpty(modelName))
-                {
-                    Log($"PropertyApplicator: Model name = '{modelName}', trying name-based match");
-
-                    using (var context = new RepoDbContext(config))
-                    {
-                        var project = context.Projects
-                            .AsEnumerable()
-                            .FirstOrDefault(p => !string.IsNullOrEmpty(p.Path) &&
-                                MatchesModelName(p.Path, modelName));
-
-                        if (project != null)
-                        {
-                            Log($"PropertyApplicator: Matched project by model name, ID={project.Id}, PATH='{project.Path}'");
-                            return project.Id;
-                        }
-                    }
-
-                    Log($"PropertyApplicator: No project matched model name '{modelName}'");
-                }
-                else
-                {
-                    Log("PropertyApplicator: Could not read model file path or name");
-                }
-
-                // 3. Fallback: use root project (PATH = "\")
-                using (var context = new RepoDbContext(config))
-                {
-                    var rootProject = context.Projects
-                        .AsEnumerable()
-                        .FirstOrDefault(p => p.Path == "\\" || p.Path == "/" || p.Path == "\\\\");
-
-                    if (rootProject != null)
-                    {
-                        Log($"PropertyApplicator: Using root project fallback, ID={rootProject.Id}");
-                        return rootProject.Id;
-                    }
-
-                    // 4. Last resort: use first project in DB
-                    var firstProject = context.Projects.OrderBy(p => p.Id).FirstOrDefault();
+                    var firstProject = ctx.Projects.OrderBy(p => p.Id).FirstOrDefault();
                     if (firstProject != null)
                     {
-                        Log($"PropertyApplicator: Using first project as fallback, ID={firstProject.Id}, PATH='{firstProject.Path}'");
+                        Log($"PropertyApplicator: Last resort fallback, ID={firstProject.Id}, PATH='{firstProject.Path}'");
                         return firstProject.Id;
                     }
                 }
@@ -206,6 +203,114 @@ namespace EliteSoft.Erwin.AddIn.Services
             catch (Exception ex)
             {
                 Log($"PropertyApplicator: FindProjectId error: {ex.Message}");
+                return -1;
+            }
+        }
+
+        /// <summary>
+        /// Read MODEL_PATH UDP from erwin model root.
+        /// </summary>
+        private string ReadModelPathUdp()
+        {
+            try
+            {
+                dynamic modelObjects = _session.ModelObjects;
+                dynamic root = modelObjects.Root;
+                string val = root?.Properties("Model.Physical.MODEL_PATH").Value?.ToString() ?? "";
+                return string.IsNullOrEmpty(val) || val.StartsWith("%") ? null : val;
+            }
+            catch (Exception ex) { Log($"PropertyApplicator: ReadModelPathUdp error: {ex.Message}"); return null; }
+        }
+
+        /// <summary>
+        /// Write project path to MODEL_PATH UDP so it persists in the model for future opens.
+        /// </summary>
+        private void UpdateModelPathUdp(string projectPath)
+        {
+            if (string.IsNullOrEmpty(projectPath)) return;
+            try
+            {
+                dynamic modelObjects = _session.ModelObjects;
+                dynamic root = modelObjects.Root;
+
+                string currentValue = "";
+                try { currentValue = root.Properties("Model.Physical.MODEL_PATH").Value?.ToString() ?? ""; }
+                catch { return; } // UDP not available yet
+
+                // Only update if different from current value
+                if (currentValue.Equals(projectPath, StringComparison.OrdinalIgnoreCase)) return;
+
+                int transId = _session.BeginNamedTransaction("UpdateModelPath");
+                try
+                {
+                    root.Properties("Model.Physical.MODEL_PATH").Value = projectPath;
+                    _session.CommitTransaction(transId);
+                    Log($"PropertyApplicator: MODEL_PATH updated to project path: '{projectPath}'");
+                }
+                catch (Exception ex)
+                {
+                    try { _session.RollbackTransaction(transId); } catch (Exception rbEx) { Log($"PropertyApplicator: MODEL_PATH rollback error: {rbEx.Message}"); }
+                    Log($"PropertyApplicator: MODEL_PATH update failed: {ex.Message}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"PropertyApplicator: UpdateModelPathUdp error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Find default project via default corporate.
+        /// MC_CORPORATE.IS_DEFAULT=1 → its projects → PROJECT.IS_DEFAULT=1 or first project.
+        /// </summary>
+        private int FindDefaultCorporateProject(BootstrapConfig config)
+        {
+            try
+            {
+                using (var context = new RepoDbContext(config))
+                {
+                    // Find default corporate
+                    var defaultCorp = context.Corporates
+                        .FirstOrDefault(c => c.IsDefault);
+
+                    if (defaultCorp == null)
+                    {
+                        Log("PropertyApplicator: No default corporate found");
+                        return -1;
+                    }
+
+                    Log($"PropertyApplicator: Default corporate = '{defaultCorp.Name}' (ID={defaultCorp.Id})");
+
+                    // Find default project under this corporate
+                    var defaultProject = context.Projects
+                        .Where(p => p.CorporateId == defaultCorp.Id && p.IsDefault == true)
+                        .FirstOrDefault();
+
+                    if (defaultProject != null)
+                    {
+                        Log($"PropertyApplicator: Default corporate project (IS_DEFAULT), ID={defaultProject.Id}");
+                        return defaultProject.Id;
+                    }
+
+                    // Fallback: first project under this corporate
+                    var firstProject = context.Projects
+                        .Where(p => p.CorporateId == defaultCorp.Id)
+                        .OrderBy(p => p.Id)
+                        .FirstOrDefault();
+
+                    if (firstProject != null)
+                    {
+                        Log($"PropertyApplicator: Default corporate first project, ID={firstProject.Id}");
+                        return firstProject.Id;
+                    }
+
+                    Log($"PropertyApplicator: Default corporate '{defaultCorp.Name}' has no projects");
+                    return -1;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"PropertyApplicator: FindDefaultCorporateProject error: {ex.Message}");
                 return -1;
             }
         }

@@ -74,14 +74,11 @@ namespace EliteSoft.Erwin.AddIn
             this.lblLastRefreshValue = new System.Windows.Forms.Label();
 
             // Validation tab — nested tabs removed, single list + filter
-            this.tabControlValidation = new System.Windows.Forms.TabControl();
-            this.tabColumnValidation = new System.Windows.Forms.TabPage();
-            this.tabTableValidation = new System.Windows.Forms.TabPage();
+            this.listValidationResults = new System.Windows.Forms.ListView();
             this.btnValidateAll = new System.Windows.Forms.Button();
-            this.listColumnValidation = new System.Windows.Forms.ListView();
-            this.listTableValidation = new System.Windows.Forms.ListView();
             this.lblValidationStatus = new System.Windows.Forms.Label();
             this.cmbValidationFilter = new System.Windows.Forms.ComboBox();
+            this.chkErrorsOnly = new System.Windows.Forms.CheckBox();
             this.lblFilterLabel = new System.Windows.Forms.Label();
 
             // Table Processes tab
@@ -120,9 +117,6 @@ namespace EliteSoft.Erwin.AddIn
             this.grpModel.SuspendLayout();
             this.grpConfig.SuspendLayout();
             this.grpGlossary.SuspendLayout();
-            this.tabControlValidation.SuspendLayout();
-            this.tabColumnValidation.SuspendLayout();
-            this.tabTableValidation.SuspendLayout();
             this.grpDebugLog.SuspendLayout();
             this.pnlStatusBar.SuspendLayout();
             this.SuspendLayout();
@@ -392,24 +386,17 @@ namespace EliteSoft.Erwin.AddIn
             this.btnReloadGlossary.Click += new System.EventHandler(this.BtnReloadGlossary_Click);
 
             // ================================================================
-            // TAB 4: VALIDATION — nested tabs kept for compatibility
+            // TAB 4: VALIDATION
             // ================================================================
-            this.tabValidation.Controls.Add(this.btnValidateAll);
-            this.tabValidation.Controls.Add(this.lblFilterLabel);
-            this.tabValidation.Controls.Add(this.cmbValidationFilter);
-            this.tabValidation.Controls.Add(this.tabControlValidation);
-            this.tabValidation.Controls.Add(this.lblValidationStatus);
-            this.tabValidation.Location = new System.Drawing.Point(4, 26);
-            this.tabValidation.Name = "tabValidation";
-            this.tabValidation.Padding = new System.Windows.Forms.Padding(12);
-            this.tabValidation.Size = new System.Drawing.Size(860, 460);
-            this.tabValidation.TabIndex = 3;
-            this.tabValidation.Text = "Validation";
-            this.tabValidation.UseVisualStyleBackColor = true;
+            // Toolbar panel (top strip)
+            var pnlValidationToolbar = new System.Windows.Forms.Panel();
+            pnlValidationToolbar.Dock = System.Windows.Forms.DockStyle.Top;
+            pnlValidationToolbar.Height = 44;
+            pnlValidationToolbar.Padding = new System.Windows.Forms.Padding(12, 8, 12, 4);
 
-            // btnValidateAll — Primary style
-            this.btnValidateAll.Location = new System.Drawing.Point(16, 12);
-            this.btnValidateAll.Size = new System.Drawing.Size(110, 32);
+            // Validate All button
+            this.btnValidateAll.Location = new System.Drawing.Point(12, 8);
+            this.btnValidateAll.Size = new System.Drawing.Size(110, 30);
             this.btnValidateAll.Text = "Validate All";
             this.btnValidateAll.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
             this.btnValidateAll.BackColor = clrPrimary;
@@ -419,64 +406,73 @@ namespace EliteSoft.Erwin.AddIn
             this.btnValidateAll.Cursor = System.Windows.Forms.Cursors.Hand;
             this.btnValidateAll.Click += new System.EventHandler(this.BtnValidateAll_Click);
 
-            // Filter label + combobox
+            // Object Type label
             this.lblFilterLabel.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right;
             this.lblFilterLabel.AutoSize = true;
-            this.lblFilterLabel.Location = new System.Drawing.Point(640, 18);
-            this.lblFilterLabel.Text = "Filter:";
+            this.lblFilterLabel.Text = "Object Type:";
             this.lblFilterLabel.ForeColor = clrTextSecondary;
+            this.lblFilterLabel.Font = fontBody;
 
+            // Object Type combo
             this.cmbValidationFilter.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right;
             this.cmbValidationFilter.DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList;
-            this.cmbValidationFilter.Location = new System.Drawing.Point(686, 14);
-            this.cmbValidationFilter.Size = new System.Drawing.Size(155, 25);
-            this.cmbValidationFilter.Items.AddRange(new object[] { "All", "Column Validation", "Table Validation", "Errors Only" });
+            this.cmbValidationFilter.Size = new System.Drawing.Size(95, 25);
+            this.cmbValidationFilter.Font = fontBody;
+            this.cmbValidationFilter.Items.AddRange(new object[] { "All", "Table", "Column", "Index", "View", "Model", "Subject Area" });
             this.cmbValidationFilter.SelectedIndex = 0;
             this.cmbValidationFilter.SelectedIndexChanged += new System.EventHandler(this.CmbValidationFilter_SelectedIndexChanged);
 
-            // Nested validation tabs
-            this.tabControlValidation.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right | System.Windows.Forms.AnchorStyles.Bottom;
-            this.tabControlValidation.Controls.Add(this.tabColumnValidation);
-            this.tabControlValidation.Controls.Add(this.tabTableValidation);
-            this.tabControlValidation.Location = new System.Drawing.Point(16, 52);
-            this.tabControlValidation.Size = new System.Drawing.Size(828, 370);
-            this.tabControlValidation.TabIndex = 1;
+            // Errors Only checkbox
+            this.chkErrorsOnly.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right;
+            this.chkErrorsOnly.AutoSize = true;
+            this.chkErrorsOnly.Text = "Errors Only";
+            this.chkErrorsOnly.Font = fontBody;
+            this.chkErrorsOnly.ForeColor = System.Drawing.Color.FromArgb(180, 0, 0);
+            this.chkErrorsOnly.CheckedChanged += new System.EventHandler(this.ChkErrorsOnly_CheckedChanged);
 
-            this.tabColumnValidation.Controls.Add(this.listColumnValidation);
-            this.tabColumnValidation.Location = new System.Drawing.Point(4, 26);
-            this.tabColumnValidation.Padding = new System.Windows.Forms.Padding(4);
-            this.tabColumnValidation.Size = new System.Drawing.Size(820, 340);
-            this.tabColumnValidation.Text = "Column Validation";
-            this.tabColumnValidation.UseVisualStyleBackColor = true;
+            // Position controls in toolbar using right-anchored flow
+            // Layout: [Validate All] ............. [x Errors Only]  [Object Type: [combo]]
+            pnlValidationToolbar.Controls.Add(this.btnValidateAll);
+            pnlValidationToolbar.Controls.Add(this.chkErrorsOnly);
+            pnlValidationToolbar.Controls.Add(this.lblFilterLabel);
+            pnlValidationToolbar.Controls.Add(this.cmbValidationFilter);
 
-            this.listColumnValidation.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right | System.Windows.Forms.AnchorStyles.Bottom;
-            this.listColumnValidation.FullRowSelect = true;
-            this.listColumnValidation.GridLines = false;
-            this.listColumnValidation.Location = new System.Drawing.Point(4, 4);
-            this.listColumnValidation.Size = new System.Drawing.Size(812, 332);
-            this.listColumnValidation.UseCompatibleStateImageBehavior = false;
-            this.listColumnValidation.View = System.Windows.Forms.View.Details;
+            // Manual right-align positioning via Resize event
+            pnlValidationToolbar.Resize += (s, ev) =>
+            {
+                int right = pnlValidationToolbar.ClientSize.Width - 12;
+                this.cmbValidationFilter.Location = new System.Drawing.Point(right - this.cmbValidationFilter.Width, 8);
+                this.lblFilterLabel.Location = new System.Drawing.Point(this.cmbValidationFilter.Left - this.lblFilterLabel.Width - 6, 12);
+                this.chkErrorsOnly.Location = new System.Drawing.Point(this.lblFilterLabel.Left - this.chkErrorsOnly.Width - 18, 12);
+            };
 
-            this.tabTableValidation.Controls.Add(this.listTableValidation);
-            this.tabTableValidation.Location = new System.Drawing.Point(4, 26);
-            this.tabTableValidation.Padding = new System.Windows.Forms.Padding(4);
-            this.tabTableValidation.Size = new System.Drawing.Size(820, 340);
-            this.tabTableValidation.Text = "Table Validation";
-            this.tabTableValidation.UseVisualStyleBackColor = true;
+            // Results ListView
+            this.listValidationResults.Dock = System.Windows.Forms.DockStyle.Fill;
+            this.listValidationResults.FullRowSelect = true;
+            this.listValidationResults.GridLines = true;
+            this.listValidationResults.UseCompatibleStateImageBehavior = false;
+            this.listValidationResults.View = System.Windows.Forms.View.Details;
+            this.listValidationResults.Font = fontBody;
 
-            this.listTableValidation.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right | System.Windows.Forms.AnchorStyles.Bottom;
-            this.listTableValidation.FullRowSelect = true;
-            this.listTableValidation.GridLines = false;
-            this.listTableValidation.Location = new System.Drawing.Point(4, 4);
-            this.listTableValidation.Size = new System.Drawing.Size(812, 332);
-            this.listTableValidation.UseCompatibleStateImageBehavior = false;
-            this.listTableValidation.View = System.Windows.Forms.View.Details;
+            // Status bar (bottom strip)
+            this.lblValidationStatus.Dock = System.Windows.Forms.DockStyle.Bottom;
+            this.lblValidationStatus.Height = 24;
+            this.lblValidationStatus.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
+            this.lblValidationStatus.Padding = new System.Windows.Forms.Padding(12, 0, 0, 0);
+            this.lblValidationStatus.Text = "Click 'Validate All' to run all checks.";
+            this.lblValidationStatus.BackColor = System.Drawing.Color.FromArgb(245, 245, 245);
 
-            // Validation status
-            this.lblValidationStatus.Anchor = System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right | System.Windows.Forms.AnchorStyles.Bottom;
-            this.lblValidationStatus.Location = new System.Drawing.Point(16, 428);
-            this.lblValidationStatus.Size = new System.Drawing.Size(828, 22);
-            this.lblValidationStatus.Text = "Click 'Validate All' to check columns and tables";
+            // Assemble tab — Fill first, then Top/Bottom (WinForms Z-order)
+            this.tabValidation.Controls.Add(this.listValidationResults);
+            this.tabValidation.Controls.Add(pnlValidationToolbar);
+            this.tabValidation.Controls.Add(this.lblValidationStatus);
+            this.tabValidation.Location = new System.Drawing.Point(4, 26);
+            this.tabValidation.Name = "tabValidation";
+            this.tabValidation.Padding = new System.Windows.Forms.Padding(0);
+            this.tabValidation.Size = new System.Drawing.Size(860, 460);
+            this.tabValidation.TabIndex = 3;
+            this.tabValidation.Text = "Validation";
+            this.tabValidation.UseVisualStyleBackColor = true;
             this.lblValidationStatus.ForeColor = clrTextSecondary;
             this.lblValidationStatus.Font = fontCaption;
 
@@ -706,9 +702,6 @@ namespace EliteSoft.Erwin.AddIn
             this.grpConfig.PerformLayout();
             this.grpGlossary.ResumeLayout(false);
             this.grpGlossary.PerformLayout();
-            this.tabControlValidation.ResumeLayout(false);
-            this.tabColumnValidation.ResumeLayout(false);
-            this.tabTableValidation.ResumeLayout(false);
             this.grpDebugLog.ResumeLayout(false);
             this.grpDebugLog.PerformLayout();
             this.pnlStatusBar.ResumeLayout(false);
@@ -752,14 +745,11 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.Label lblLastRefresh;
         private System.Windows.Forms.Label lblLastRefreshValue;
 
-        private System.Windows.Forms.TabControl tabControlValidation;
-        private System.Windows.Forms.TabPage tabColumnValidation;
-        private System.Windows.Forms.TabPage tabTableValidation;
+        private System.Windows.Forms.ListView listValidationResults;
         private System.Windows.Forms.Button btnValidateAll;
-        private System.Windows.Forms.ListView listColumnValidation;
-        private System.Windows.Forms.ListView listTableValidation;
         private System.Windows.Forms.Label lblValidationStatus;
         private System.Windows.Forms.ComboBox cmbValidationFilter;
+        private System.Windows.Forms.CheckBox chkErrorsOnly;
         private System.Windows.Forms.Label lblFilterLabel;
 
         private System.Windows.Forms.GroupBox grpDebugLog;

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows.Forms;
@@ -20,6 +21,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         private Timer _monitorTimer;
         private Timer _windowMonitorTimer;
         private TableTypeMonitorService _tableTypeMonitor;
+        private UdpRuntimeService _udpRuntimeService;
         private bool _isMonitoring;
         private bool _disposed;
         private bool _isProcessingChange;
@@ -86,6 +88,11 @@ namespace EliteSoft.Erwin.AddIn.Services
         public void SetTableTypeMonitor(TableTypeMonitorService monitor)
         {
             _tableTypeMonitor = monitor;
+        }
+
+        public void SetUdpRuntimeService(UdpRuntimeService service)
+        {
+            _udpRuntimeService = service;
         }
 
         public void StartMonitoring()
@@ -517,6 +524,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // No domain -> glossary validation
                     ValidateGlossary(attr, currentState, predefinedColumnNames);
                 }
+
+                // Apply Column UDP defaults (with Glossary mapping if configured)
+                ApplyColumnUdpDefaults(attr, currentState.PhysicalName);
+
+                // Validate Column naming standards
+                ValidateColumnNamingStandard(attr, currentState);
             }
             finally
             {
@@ -530,6 +543,9 @@ namespace EliteSoft.Erwin.AddIn.Services
             bool domainChanged = previousState.DomainParentValue != currentState.DomainParentValue;
             bool hasValidDomain = IsValidDomain(currentState.DomainParentValue);
             bool hadValidDomain = IsValidDomain(previousState.DomainParentValue);
+
+            // Check for Column UDP value changes (dependency evaluation)
+            CheckForColumnUdpValueChanges(attr, previousState, currentState);
 
             // No changes relevant to validation
             if (!physicalNameChanged && !domainChanged) return;
@@ -551,6 +567,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                         // No domain -> glossary validation
                         ValidateGlossary(attr, currentState, predefinedColumnNames);
                     }
+
+                    // Re-apply Column UDP defaults with new column name (Glossary mapping resolves by name)
+                    ApplyColumnUdpDefaults(attr, currentState.PhysicalName);
+
+                    // Validate Column naming standards
+                    ValidateColumnNamingStandard(attr, currentState);
                 }
 
                 // Domain changed (and new domain is valid) - need domain validation
@@ -623,6 +645,122 @@ namespace EliteSoft.Erwin.AddIn.Services
                 {
                     ApplyGlossaryProperties(attr, entry);
                 }
+            }
+        }
+
+        /// <summary>
+        /// Validate column name against naming standards and add failures to pending results.
+        /// </summary>
+        private void ValidateColumnNamingStandard(dynamic attr, AttributeValidationSnapshot state)
+        {
+            if (!NamingStandardService.Instance.IsLoaded) return;
+            if (string.IsNullOrEmpty(state.PhysicalName) ||
+                state.PhysicalName.Equals("<default>", StringComparison.OrdinalIgnoreCase) ||
+                state.PhysicalName.StartsWith("<default>", StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            // Auto-apply prefix/suffix if AUTO_APPLY=true
+            if (attr != null && NamingValidationEngine.HasAutoApplyChanges("Column", state.PhysicalName))
+            {
+                string newName = NamingValidationEngine.ApplyNamingStandards("Column", state.PhysicalName);
+
+                var answer = MessageBox.Show(
+                    $"Naming standard requires changes for column '{state.TableName}.{state.PhysicalName}':\n\n" +
+                    $"'{state.PhysicalName}' → '{newName}'\n\n" +
+                    $"Apply automatically?",
+                    "Naming Standard — Auto Apply",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Question);
+
+                if (answer == DialogResult.Yes)
+                {
+                    int transId = _session.BeginNamedTransaction("ApplyColumnNamingStandard");
+                    try
+                    {
+                        attr.Properties("Physical_Name").Value = newName;
+                        _session.CommitTransaction(transId);
+                        Log($"Naming standard auto-applied: '{state.TableName}.{state.PhysicalName}' → '{newName}'");
+                        state.PhysicalName = newName;
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        try { _session.RollbackTransaction(transId); } catch { }
+                        Log($"Naming standard auto-apply failed: {ex.Message}");
+                    }
+                }
+            }
+
+            // Validate (after auto-apply or if user declined)
+            var results = NamingValidationEngine.ValidateObjectName("Column", state.PhysicalName);
+            foreach (var r in results.Where(r => !r.IsValid))
+            {
+                Log($"Naming standard violation ({r.RuleName}): {state.TableName}.{state.PhysicalName} — {r.ErrorMessage}");
+                _pendingResults.Add(new CollectedValidationResult
+                {
+                    ValidationType = CollectedValidationResultType.NamingStandard,
+                    TableName = state.TableName,
+                    ColumnName = state.PhysicalName,
+                    Message = r.ErrorMessage
+                });
+            }
+        }
+
+        /// <summary>
+        /// Check if any Column UDP values changed and trigger dependency evaluation.
+        /// </summary>
+        private void CheckForColumnUdpValueChanges(dynamic attr, AttributeValidationSnapshot previousState, AttributeValidationSnapshot currentState)
+        {
+            if (_udpRuntimeService == null || !_udpRuntimeService.IsInitialized) return;
+            if (currentState.UdpValues == null || currentState.UdpValues.Count == 0) return;
+
+            foreach (var kvp in currentState.UdpValues)
+            {
+                string oldValue = "";
+                previousState.UdpValues?.TryGetValue(kvp.Key, out oldValue);
+                oldValue = oldValue ?? "";
+
+                if (kvp.Value != oldValue)
+                {
+                    Log($"Column UDP '{kvp.Key}' changed on '{currentState.TableName}.{currentState.PhysicalName}': '{oldValue}' -> '{kvp.Value}'");
+                    _udpRuntimeService.HandleUdpValueChange(attr, kvp.Key, kvp.Value, "Column");
+
+                    // Update previous state so re-read after dependency writes picks up new values
+                    if (previousState.UdpValues == null)
+                        previousState.UdpValues = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                    previousState.UdpValues[kvp.Key] = kvp.Value;
+                }
+            }
+
+            // Re-read after dependency writes to update snapshot
+            var updatedValues = _udpRuntimeService.ReadUdpValues(attr, "Column");
+            currentState.UdpValues = updatedValues;
+        }
+
+        /// <summary>
+        /// Apply Column UDP defaults (with Glossary mapping if configured).
+        /// Called when a new column is added or column name changes.
+        /// </summary>
+        private void ApplyColumnUdpDefaults(dynamic attr, string columnPhysicalName)
+        {
+            if (_udpRuntimeService == null || !_udpRuntimeService.IsInitialized) return;
+            if (string.IsNullOrEmpty(columnPhysicalName) ||
+                columnPhysicalName.Equals("<default>", StringComparison.OrdinalIgnoreCase) ||
+                columnPhysicalName.StartsWith("<default>", StringComparison.OrdinalIgnoreCase) ||
+                columnPhysicalName.Equals("PLEASE CHANGE IT", StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            try
+            {
+                _udpRuntimeService.ApplyDefaults(attr, "Column", columnPhysicalName);
+            }
+            catch (Exception ex)
+            {
+                Log($"Column UDP defaults error for '{columnPhysicalName}': {ex.Message}");
             }
         }
 
@@ -877,17 +1015,41 @@ namespace EliteSoft.Erwin.AddIn.Services
                     }
                 }
 
+                var namingResults = _pendingResults.FindAll(r => r.ValidationType == CollectedValidationResultType.NamingStandard);
+
+                if (namingResults.Count > 0)
+                {
+                    if (domainResults.Count > 0 || glossaryResults.Count > 0)
+                    {
+                        sb.AppendLine("---");
+                        sb.AppendLine();
+                    }
+                    sb.AppendLine("=== NAMING STANDARD VALIDATION ===");
+                    sb.AppendLine();
+                    foreach (var result in namingResults)
+                    {
+                        sb.AppendLine($"Table: {result.TableName}");
+                        sb.AppendLine($"Column: {result.ColumnName}");
+                        sb.AppendLine($"Issue: {result.Message}");
+                        sb.AppendLine();
+                    }
+                }
+
                 int totalErrors = _pendingResults.Count;
                 sb.AppendLine($"Total: {totalErrors} validation error(s)");
 
                 string title = "Validation Warnings";
-                if (domainResults.Count > 0 && glossaryResults.Count == 0)
+                if (domainResults.Count > 0 && glossaryResults.Count == 0 && namingResults.Count == 0)
                 {
                     title = "Domain Validation Warning";
                 }
-                else if (glossaryResults.Count > 0 && domainResults.Count == 0)
+                else if (glossaryResults.Count > 0 && domainResults.Count == 0 && namingResults.Count == 0)
                 {
                     title = "Glossary Validation Warning";
+                }
+                else if (namingResults.Count > 0 && domainResults.Count == 0 && glossaryResults.Count == 0)
+                {
+                    title = "Naming Standard Warning";
                 }
 
                 MessageBox.Show(
@@ -980,7 +1142,7 @@ namespace EliteSoft.Erwin.AddIn.Services
 
             domainParentValue = GetDomainParentValue(attr, modelObjects);
 
-            return new AttributeValidationSnapshot
+            var snapshot = new AttributeValidationSnapshot
             {
                 ObjectId = objectId,
                 AttributeName = attrName,
@@ -988,6 +1150,14 @@ namespace EliteSoft.Erwin.AddIn.Services
                 DomainParentValue = domainParentValue,
                 TableName = tableName
             };
+
+            // Read Column UDP values for dependency monitoring
+            if (_udpRuntimeService != null && _udpRuntimeService.IsInitialized)
+            {
+                snapshot.UdpValues = _udpRuntimeService.ReadUdpValues(attr, "Column");
+            }
+
+            return snapshot;
         }
 
         private string GetTableName(dynamic entity)
@@ -1170,6 +1340,8 @@ namespace EliteSoft.Erwin.AddIn.Services
             public string PhysicalName { get; set; }
             public string DomainParentValue { get; set; }
             public string TableName { get; set; }
+            /// <summary>Column UDP values for dependency change detection</summary>
+            public Dictionary<string, string> UdpValues { get; set; } = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         }
 
         #endregion
@@ -1196,6 +1368,7 @@ namespace EliteSoft.Erwin.AddIn.Services
     public enum CollectedValidationResultType
     {
         Glossary,
-        Domain
+        Domain,
+        NamingStandard
     }
 }
