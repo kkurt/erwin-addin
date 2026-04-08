@@ -5,21 +5,40 @@ using System.Linq;
 namespace EliteSoft.Erwin.AddIn.Services
 {
     /// <summary>
-    /// Service for loading and caching PREDEFINED_COLUMN entries from database.
-    /// These columns are automatically added to tables when a TABLE_TYPE is selected.
+    /// Represents a PREDEFINED_COLUMN entry with UDP condition support.
+    /// </summary>
+    public class PredefinedColumn
+    {
+        public int Id { get; set; }
+        public int ProjectId { get; set; }
+        public string ColumnName { get; set; }
+        public string DataType { get; set; }
+        public bool Nullable { get; set; }
+        public string DefaultValue { get; set; }
+        public int DependsOnUdpId { get; set; }
+        public string DependsOnUdpValue { get; set; }
+        public string DependsOnUdpName { get; set; } // Resolved from JOIN
+        public string DbType { get; set; }
+        public int SortOrder { get; set; }
+
+        // Backward compat — old code uses .Name
+        public string Name => ColumnName;
+    }
+
+    /// <summary>
+    /// Service for loading and caching PREDEFINED_COLUMN entries.
+    /// Columns are conditioned on UDP values (DEPENDS_ON_UDP_ID + DEPENDS_ON_UDP_VALUE)
+    /// and filtered by DB_TYPE (platform-specific columns).
     /// </summary>
     public class PredefinedColumnService
     {
         private static PredefinedColumnService _instance;
         private static readonly object _lock = new object();
 
-        private readonly List<PredefinedColumn> _columns;
+        private List<PredefinedColumn> _columns;
         private bool _isLoaded;
         private string _lastError;
 
-        /// <summary>
-        /// Singleton instance
-        /// </summary>
         public static PredefinedColumnService Instance
         {
             get
@@ -29,9 +48,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     lock (_lock)
                     {
                         if (_instance == null)
-                        {
                             _instance = new PredefinedColumnService();
-                        }
                     }
                 }
                 return _instance;
@@ -41,13 +58,16 @@ namespace EliteSoft.Erwin.AddIn.Services
         private PredefinedColumnService()
         {
             _columns = new List<PredefinedColumn>();
-            _isLoaded = false;
         }
 
+        public bool IsLoaded => _isLoaded;
+        public int Count => _columns.Count;
+        public string LastError => _lastError;
+
         /// <summary>
-        /// Load predefined columns from database
+        /// Load predefined columns filtered by project and DB type.
         /// </summary>
-        public bool LoadPredefinedColumns()
+        public bool LoadPredefinedColumns(int? projectId = null, string platformDbType = null)
         {
             try
             {
@@ -74,23 +94,37 @@ namespace EliteSoft.Erwin.AddIn.Services
                         {
                             while (reader.Read())
                             {
-                                int id = Convert.ToInt32(reader["ID"]);
-                                int tableTypeId = Convert.ToInt32(reader["TABLE_TYPE_ID"]);
-                                string name = reader["NAME"]?.ToString()?.Trim() ?? "";
-                                string dataType = reader["TYPE"]?.ToString()?.Trim() ?? "";
-                                bool nullable = Convert.ToBoolean(reader["NULLABLE"]);
+                                int rowProjectId = reader["PROJECT_ID"] == DBNull.Value ? 0 : Convert.ToInt32(reader["PROJECT_ID"]);
+                                string rowDbType = reader["DB_TYPE"] == DBNull.Value ? "" : reader["DB_TYPE"]?.ToString()?.Trim() ?? "";
 
-                                if (!string.IsNullOrEmpty(name))
+                                // Corporate scope filter
+                                var effectiveProjectIds = CorporateContextService.Instance.IsInitialized
+                                    ? CorporateContextService.Instance.EffectiveProjectIds : null;
+                                if (effectiveProjectIds != null && rowProjectId > 0 && !effectiveProjectIds.Contains(rowProjectId))
+                                    continue;
+
+                                // DB_TYPE filter: match platform or empty (all platforms)
+                                if (!string.IsNullOrEmpty(platformDbType) && !string.IsNullOrEmpty(rowDbType) &&
+                                    !rowDbType.Equals(platformDbType, StringComparison.OrdinalIgnoreCase))
+                                    continue;
+
+                                string colName = reader["COLUMN_NAME"]?.ToString()?.Trim() ?? "";
+                                if (string.IsNullOrEmpty(colName)) continue;
+
+                                _columns.Add(new PredefinedColumn
                                 {
-                                    _columns.Add(new PredefinedColumn
-                                    {
-                                        Id = id,
-                                        TableTypeId = tableTypeId,
-                                        Name = name,
-                                        DataType = dataType,
-                                        Nullable = nullable
-                                    });
-                                }
+                                    Id = Convert.ToInt32(reader["ID"]),
+                                    ProjectId = rowProjectId,
+                                    ColumnName = colName,
+                                    DataType = reader["DATA_TYPE"]?.ToString()?.Trim() ?? "",
+                                    Nullable = reader["NULLABLE"] != DBNull.Value && Convert.ToBoolean(reader["NULLABLE"]),
+                                    DefaultValue = reader["DEFAULT_VALUE"] == DBNull.Value ? "" : reader["DEFAULT_VALUE"]?.ToString() ?? "",
+                                    DependsOnUdpId = reader["DEPENDS_ON_UDP_ID"] == DBNull.Value ? 0 : Convert.ToInt32(reader["DEPENDS_ON_UDP_ID"]),
+                                    DependsOnUdpValue = reader["DEPENDS_ON_UDP_VALUE"] == DBNull.Value ? "" : reader["DEPENDS_ON_UDP_VALUE"]?.ToString()?.Trim() ?? "",
+                                    DependsOnUdpName = reader["UDP_NAME"] == DBNull.Value ? "" : reader["UDP_NAME"]?.ToString()?.Trim() ?? "",
+                                    DbType = rowDbType,
+                                    SortOrder = reader["SORT_ORDER"] == DBNull.Value ? 0 : Convert.ToInt32(reader["SORT_ORDER"])
+                                });
                             }
                         }
                     }
@@ -109,66 +143,77 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
         }
 
-        /// <summary>
-        /// Gets the appropriate SQL query for the database type
-        /// </summary>
         private string GetQuery(string dbType)
         {
             switch (dbType?.ToUpper())
             {
                 case "POSTGRESQL":
-                    return "SELECT \"ID\", \"TABLE_TYPE_ID\", \"NAME\", \"TYPE\", \"NULLABLE\" FROM \"PREDEFINED_COLUMN\"";
+                    return @"SELECT pc.""ID"", pc.""PROJECT_ID"", pc.""COLUMN_NAME"", pc.""DATA_TYPE"", pc.""NULLABLE"",
+                            pc.""DEFAULT_VALUE"", pc.""DEPENDS_ON_UDP_ID"", pc.""DEPENDS_ON_UDP_VALUE"",
+                            pc.""DB_TYPE"", pc.""SORT_ORDER"",
+                            udp.""NAME"" AS ""UDP_NAME""
+                            FROM ""PREDEFINED_COLUMN"" pc
+                            LEFT JOIN ""MC_UDP_DEFINITION"" udp ON pc.""DEPENDS_ON_UDP_ID"" = udp.""ID""
+                            ORDER BY pc.""SORT_ORDER""";
 
                 case "ORACLE":
-                    return "SELECT ID, TABLE_TYPE_ID, NAME, TYPE, NULLABLE FROM PREDEFINED_COLUMN";
+                    return @"SELECT pc.ID, pc.PROJECT_ID, pc.COLUMN_NAME, pc.DATA_TYPE, pc.NULLABLE,
+                            pc.DEFAULT_VALUE, pc.DEPENDS_ON_UDP_ID, pc.DEPENDS_ON_UDP_VALUE,
+                            pc.DB_TYPE, pc.SORT_ORDER,
+                            udp.NAME AS UDP_NAME
+                            FROM PREDEFINED_COLUMN pc
+                            LEFT JOIN MC_UDP_DEFINITION udp ON pc.DEPENDS_ON_UDP_ID = udp.ID
+                            ORDER BY pc.SORT_ORDER";
 
                 case "MSSQL":
                 default:
-                    return "SELECT [ID], [TABLE_TYPE_ID], [NAME], [TYPE], [NULLABLE] FROM [dbo].[PREDEFINED_COLUMN]";
+                    return @"SELECT pc.[ID], pc.[PROJECT_ID], pc.[COLUMN_NAME], pc.[DATA_TYPE], pc.[NULLABLE],
+                            pc.[DEFAULT_VALUE], pc.[DEPENDS_ON_UDP_ID], pc.[DEPENDS_ON_UDP_VALUE],
+                            pc.[DB_TYPE], pc.[SORT_ORDER],
+                            udp.[NAME] AS [UDP_NAME]
+                            FROM [dbo].[PREDEFINED_COLUMN] pc
+                            LEFT JOIN [dbo].[MC_UDP_DEFINITION] udp ON pc.[DEPENDS_ON_UDP_ID] = udp.[ID]
+                            ORDER BY pc.[SORT_ORDER]";
             }
         }
 
         /// <summary>
-        /// Get predefined columns for a specific TABLE_TYPE ID
+        /// Get predefined columns that match a specific UDP condition.
+        /// Used when a UDP value changes — find columns conditioned on that UDP+value.
         /// </summary>
-        public IEnumerable<PredefinedColumn> GetByTableTypeId(int tableTypeId)
+        public IEnumerable<PredefinedColumn> GetByUdpCondition(string udpName, string udpValue)
         {
-            if (!_isLoaded)
-                return Enumerable.Empty<PredefinedColumn>();
+            if (!_isLoaded) return Enumerable.Empty<PredefinedColumn>();
 
-            return _columns.Where(c => c.TableTypeId == tableTypeId);
+            return _columns.Where(c =>
+                !string.IsNullOrEmpty(c.DependsOnUdpName) &&
+                c.DependsOnUdpName.Equals(udpName, StringComparison.OrdinalIgnoreCase) &&
+                c.DependsOnUdpValue.Equals(udpValue, StringComparison.OrdinalIgnoreCase))
+                .OrderBy(c => c.SortOrder);
         }
 
         /// <summary>
-        /// Get all predefined columns
+        /// Get predefined columns conditioned on a specific UDP (any value).
+        /// Used to find all columns that depend on a given UDP.
         /// </summary>
-        public IEnumerable<PredefinedColumn> GetAll()
+        public IEnumerable<PredefinedColumn> GetByUdpName(string udpName)
         {
-            return _columns;
-        }
+            if (!_isLoaded) return Enumerable.Empty<PredefinedColumn>();
 
-        public bool IsLoaded => _isLoaded;
-        public int Count => _columns.Count;
-        public string LastError => _lastError;
+            return _columns.Where(c =>
+                !string.IsNullOrEmpty(c.DependsOnUdpName) &&
+                c.DependsOnUdpName.Equals(udpName, StringComparison.OrdinalIgnoreCase))
+                .OrderBy(c => c.SortOrder);
+        }
 
         /// <summary>
-        /// Force reload
+        /// Get all loaded predefined columns.
         /// </summary>
-        public void Reload()
-        {
-            LoadPredefinedColumns();
-        }
-    }
+        public IEnumerable<PredefinedColumn> GetAll() => _columns;
 
-    /// <summary>
-    /// Represents a PREDEFINED_COLUMN entry
-    /// </summary>
-    public class PredefinedColumn
-    {
-        public int Id { get; set; }
-        public int TableTypeId { get; set; }
-        public string Name { get; set; }
-        public string DataType { get; set; }
-        public bool Nullable { get; set; }
+        public void Reload(int? projectId = null, string platformDbType = null)
+        {
+            LoadPredefinedColumns(projectId, platformDbType);
+        }
     }
 }

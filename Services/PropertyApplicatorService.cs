@@ -123,6 +123,11 @@ namespace EliteSoft.Erwin.AddIn.Services
                     return -1;
                 }
 
+                // Corporate scope: only match within effective projects
+                var effectiveIds = CorporateContextService.Instance.IsInitialized
+                    ? new HashSet<int>(CorporateContextService.Instance.EffectiveProjectIds)
+                    : null;
+
                 // 1. Read MODEL_PATH UDP (primary source)
                 string modelPath = ReadModelPathUdp();
 
@@ -147,6 +152,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     {
                         var project = context.Projects
                             .AsEnumerable()
+                            .Where(p => effectiveIds == null || effectiveIds.Contains(p.Id))
                             .FirstOrDefault(p => !string.IsNullOrEmpty(p.Path) &&
                                 p.Path.Replace("/", "\\").TrimEnd('\\').ToUpperInvariant() == normalizedModelPath);
 
@@ -165,6 +171,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                         {
                             var project = context.Projects
                                 .AsEnumerable()
+                                .Where(p => effectiveIds == null || effectiveIds.Contains(p.Id))
                                 .FirstOrDefault(p => !string.IsNullOrEmpty(p.Path) &&
                                     MatchesModelName(p.Path, modelName));
 
@@ -181,10 +188,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                     Log($"PropertyApplicator: No project matched path '{modelPath}'");
                 }
 
-                // 4. Default Corporate fallback
-                int defaultProjectId = FindDefaultCorporateProject(config);
-                if (defaultProjectId > 0)
-                    return defaultProjectId;
+                // 4. Fallback: first effective project (default corporate's project is included)
+                if (effectiveIds != null && effectiveIds.Count > 0)
+                {
+                    int fallbackId = effectiveIds.First();
+                    Log($"PropertyApplicator: Fallback to first effective project, ID={fallbackId}");
+                    return fallbackId;
+                }
 
                 // 5. Last resort: first project in DB
                 using (var ctx = new RepoDbContext(config))
@@ -256,62 +266,6 @@ namespace EliteSoft.Erwin.AddIn.Services
             catch (Exception ex)
             {
                 Log($"PropertyApplicator: UpdateModelPathUdp error: {ex.Message}");
-            }
-        }
-
-        /// <summary>
-        /// Find default project via default corporate.
-        /// MC_CORPORATE.IS_DEFAULT=1 → its projects → PROJECT.IS_DEFAULT=1 or first project.
-        /// </summary>
-        private int FindDefaultCorporateProject(BootstrapConfig config)
-        {
-            try
-            {
-                using (var context = new RepoDbContext(config))
-                {
-                    // Find default corporate
-                    var defaultCorp = context.Corporates
-                        .FirstOrDefault(c => c.IsDefault);
-
-                    if (defaultCorp == null)
-                    {
-                        Log("PropertyApplicator: No default corporate found");
-                        return -1;
-                    }
-
-                    Log($"PropertyApplicator: Default corporate = '{defaultCorp.Name}' (ID={defaultCorp.Id})");
-
-                    // Find default project under this corporate
-                    var defaultProject = context.Projects
-                        .Where(p => p.CorporateId == defaultCorp.Id && p.IsDefault == true)
-                        .FirstOrDefault();
-
-                    if (defaultProject != null)
-                    {
-                        Log($"PropertyApplicator: Default corporate project (IS_DEFAULT), ID={defaultProject.Id}");
-                        return defaultProject.Id;
-                    }
-
-                    // Fallback: first project under this corporate
-                    var firstProject = context.Projects
-                        .Where(p => p.CorporateId == defaultCorp.Id)
-                        .OrderBy(p => p.Id)
-                        .FirstOrDefault();
-
-                    if (firstProject != null)
-                    {
-                        Log($"PropertyApplicator: Default corporate first project, ID={firstProject.Id}");
-                        return firstProject.Id;
-                    }
-
-                    Log($"PropertyApplicator: Default corporate '{defaultCorp.Name}' has no projects");
-                    return -1;
-                }
-            }
-            catch (Exception ex)
-            {
-                Log($"PropertyApplicator: FindDefaultCorporateProject error: {ex.Message}");
-                return -1;
             }
         }
 

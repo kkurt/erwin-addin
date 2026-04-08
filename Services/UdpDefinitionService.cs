@@ -25,8 +25,6 @@ namespace EliteSoft.Erwin.AddIn.Services
         public string ErrorMessage { get; set; }
         public string ApplyOn { get; set; }
         public int SortOrder { get; set; }
-        public string GlossaryMatchColumn { get; set; }
-        public string GlossaryValueColumn { get; set; }
         public List<UdpListOption> ListOptions { get; set; } = new List<UdpListOption>();
     }
 
@@ -105,6 +103,11 @@ namespace EliteSoft.Erwin.AddIn.Services
                 bool filterByType = !string.IsNullOrEmpty(objectType);
                 string query = GetDefinitionQuery(dbType, filterByType);
 
+                // Effective project IDs for corporate filtering (applied in-memory)
+                var effectiveProjectIds = CorporateContextService.Instance.IsInitialized
+                    ? new HashSet<int>(CorporateContextService.Instance.EffectiveProjectIds)
+                    : null;
+
                 using (var connection = DatabaseService.Instance.CreateConnection())
                 {
                     connection.Open();
@@ -123,6 +126,14 @@ namespace EliteSoft.Erwin.AddIn.Services
                         {
                             while (reader.Read())
                             {
+                                // Corporate scope filter (in-memory)
+                                if (effectiveProjectIds != null)
+                                {
+                                    int rowProjectId = reader["PROJECT_ID"] == DBNull.Value ? 0 : Convert.ToInt32(reader["PROJECT_ID"]);
+                                    if (rowProjectId > 0 && !effectiveProjectIds.Contains(rowProjectId))
+                                        continue;
+                                }
+
                                 int defId = Convert.ToInt32(reader["DEF_ID"]);
                                 string name = reader["NAME"]?.ToString()?.Trim() ?? "";
                                 string objType = reader["OBJECT_TYPE"]?.ToString()?.Trim() ?? "";
@@ -150,9 +161,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                                         ValidationValue = reader["VALIDATION_VALUE"]?.ToString() ?? "",
                                         ErrorMessage = reader["ERROR_MESSAGE"]?.ToString() ?? "",
                                         ApplyOn = reader["APPLY_ON"]?.ToString()?.Trim() ?? "Both",
-                                        SortOrder = reader["SORT_ORDER"] == DBNull.Value ? 0 : Convert.ToInt32(reader["SORT_ORDER"]),
-                                        GlossaryMatchColumn = reader["GLOSSARY_MATCH_COLUMN"] == DBNull.Value ? "" : reader["GLOSSARY_MATCH_COLUMN"]?.ToString()?.Trim() ?? "",
-                                        GlossaryValueColumn = reader["GLOSSARY_VALUE_COLUMN"] == DBNull.Value ? "" : reader["GLOSSARY_VALUE_COLUMN"]?.ToString()?.Trim() ?? ""
+                                        SortOrder = reader["SORT_ORDER"] == DBNull.Value ? 0 : Convert.ToInt32(reader["SORT_ORDER"])
                                     };
                                     _definitions[key] = def;
                                 }
@@ -220,7 +229,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                     return $@"SELECT d.""ID"" AS ""DEF_ID"", d.""NAME"", d.""DESCRIPTION"", d.""OBJECT_TYPE"", d.""UDP_TYPE"",
                             d.""DEFAULT_VALUE"", d.""IS_REQUIRED"", d.""MIN_VALUE"", d.""MAX_VALUE"", d.""MAX_LENGTH"",
                             d.""VALIDATION_OPERATOR"", d.""VALIDATION_VALUE"", d.""ERROR_MESSAGE"", d.""APPLY_ON"", d.""SORT_ORDER"",
-                            d.""GLOSSARY_MATCH_COLUMN"", d.""GLOSSARY_VALUE_COLUMN"",
+                            d.""PROJECT_ID"",
+
                             o.""VALUE"" AS ""OPT_VALUE"", o.""DISPLAY_TEXT"" AS ""OPT_DISPLAY"", o.""SORT_ORDER"" AS ""OPT_ORDER""
                             FROM ""MC_UDP_DEFINITION"" d
                             LEFT JOIN ""MC_UDP_LIST_OPTION"" o ON o.""UDP_DEFINITION_ID"" = d.""ID""
@@ -232,7 +242,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                     return $@"SELECT d.ID AS DEF_ID, d.NAME, d.DESCRIPTION, d.OBJECT_TYPE, d.UDP_TYPE,
                             d.DEFAULT_VALUE, d.IS_REQUIRED, d.MIN_VALUE, d.MAX_VALUE, d.MAX_LENGTH,
                             d.VALIDATION_OPERATOR, d.VALIDATION_VALUE, d.ERROR_MESSAGE, d.APPLY_ON, d.SORT_ORDER,
-                            d.GLOSSARY_MATCH_COLUMN, d.GLOSSARY_VALUE_COLUMN,
+                            d.PROJECT_ID,
+
                             o.VALUE AS OPT_VALUE, o.DISPLAY_TEXT AS OPT_DISPLAY, o.SORT_ORDER AS OPT_ORDER
                             FROM MC_UDP_DEFINITION d
                             LEFT JOIN MC_UDP_LIST_OPTION o ON o.UDP_DEFINITION_ID = d.ID
@@ -245,7 +256,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                     return $@"SELECT d.[ID] AS [DEF_ID], d.[NAME], d.[DESCRIPTION], d.[OBJECT_TYPE], d.[UDP_TYPE],
                             d.[DEFAULT_VALUE], d.[IS_REQUIRED], d.[MIN_VALUE], d.[MAX_VALUE], d.[MAX_LENGTH],
                             d.[VALIDATION_OPERATOR], d.[VALIDATION_VALUE], d.[ERROR_MESSAGE], d.[APPLY_ON], d.[SORT_ORDER],
-                            d.[GLOSSARY_MATCH_COLUMN], d.[GLOSSARY_VALUE_COLUMN],
+                            d.[PROJECT_ID],
+
                             o.[VALUE] AS [OPT_VALUE], o.[DISPLAY_TEXT] AS [OPT_DISPLAY], o.[SORT_ORDER] AS [OPT_ORDER]
                             FROM [dbo].[MC_UDP_DEFINITION] d
                             LEFT JOIN [dbo].[MC_UDP_LIST_OPTION] o ON o.[UDP_DEFINITION_ID] = d.[ID]

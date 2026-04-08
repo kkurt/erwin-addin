@@ -8,9 +8,8 @@ namespace EliteSoft.Erwin.AddIn.Services
 {
     /// <summary>
     /// Registry-based bootstrap config reader.
-    /// Reads Admin DB connection from HKLM first (machine-wide, set by erwin-admin),
-    /// falls back to HKCU for backward compatibility.
-    /// Credentials are DPAPI-encrypted (machine-scope for HKLM, user-scope for HKCU).
+    /// Reads Admin DB connection from HKCU (per-user, set by erwin-admin).
+    /// Credentials are DPAPI-encrypted with CurrentUser scope.
     /// </summary>
     [ComVisible(false)]
     public class RegistryBootstrapService : IBootstrapService
@@ -24,12 +23,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             if (_cachedConfig != null)
                 return _cachedConfig;
 
-            // Try HKLM first (machine-wide, written by erwin-admin)
-            _cachedConfig = ReadFromRegistry(Registry.LocalMachine, useMachineScope: true);
-            if (_cachedConfig != null)
-                return _cachedConfig;
-
-            // Fallback to HKCU (legacy, per-user)
+            // Read from HKCU only (per-user)
             _cachedConfig = ReadFromRegistry(Registry.CurrentUser, useMachineScope: false);
             return _cachedConfig;
         }
@@ -52,17 +46,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                     var encryptedUsername = key.GetValue("Username", "")?.ToString() ?? "";
                     var encryptedPassword = key.GetValue("Password", "")?.ToString() ?? "";
 
-                    string username, password;
-                    if (useMachineScope)
-                    {
-                        username = PasswordEncryptionService.DecryptMachine(encryptedUsername) ?? encryptedUsername;
-                        password = PasswordEncryptionService.DecryptMachine(encryptedPassword) ?? encryptedPassword;
-                    }
-                    else
-                    {
-                        username = PasswordEncryptionService.Decrypt(encryptedUsername) ?? encryptedUsername;
-                        password = PasswordEncryptionService.Decrypt(encryptedPassword) ?? encryptedPassword;
-                    }
+                    string username = PasswordEncryptionService.Decrypt(encryptedUsername) ?? encryptedUsername;
+                    string password = PasswordEncryptionService.Decrypt(encryptedPassword) ?? encryptedPassword;
 
                     return new BootstrapConfig
                     {
@@ -75,8 +60,9 @@ namespace EliteSoft.Erwin.AddIn.Services
                         IsConfigured = true
                     };
                 }
-                catch
+                catch (Exception ex)
                 {
+                    System.Diagnostics.Debug.WriteLine($"RegistryBootstrapService: Read error: {ex.Message}");
                     return null;
                 }
             }
@@ -105,7 +91,7 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         public string GetConfigFilePath()
         {
-            return @"HKLM\Software\EliteSoft\MetaRepo\Bootstrap";
+            return @"HKCU\Software\EliteSoft\MetaRepo\Bootstrap";
         }
     }
 }

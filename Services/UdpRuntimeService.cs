@@ -400,26 +400,30 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         /// <summary>
         /// Resolve the default value for a UDP definition.
-        /// If GlossaryMatchColumn and GlossaryValueColumn are set, looks up the value from Glossary.
-        /// Otherwise returns the static DefaultValue.
+        /// For Column UDPs, checks glossary mapping (DG_TABLE_MAPPING_COLUMN) first.
+        /// Falls back to static DefaultValue.
         /// </summary>
         private string ResolveDefaultValue(UdpDefinitionRuntime def, string columnName)
         {
-            // If glossary mapping is configured and we have a column name, resolve from Glossary
-            if (!string.IsNullOrEmpty(def.GlossaryMatchColumn) &&
-                !string.IsNullOrEmpty(def.GlossaryValueColumn) &&
-                !string.IsNullOrEmpty(columnName))
+            // Check glossary for dynamic value (Column UDPs only)
+            if (!string.IsNullOrEmpty(columnName))
             {
                 var glossaryService = GlossaryService.Instance;
                 if (glossaryService != null && glossaryService.IsLoaded)
                 {
-                    var entry = glossaryService.GetEntry(columnName);
-                    if (entry != null)
+                    var udpValues = glossaryService.GetUdpValues(columnName);
+                    if (udpValues != null)
                     {
-                        string glossaryValue = GetGlossaryFieldValue(entry, def.GlossaryValueColumn);
+                        // Try exact match first, then prefixed variants: [UDP] Name, plain Name
+                        string glossaryValue = null;
+                        if (udpValues.TryGetValue(def.Name, out glossaryValue) && !string.IsNullOrEmpty(glossaryValue))
+                        { }
+                        else if (udpValues.TryGetValue($"[UDP] {def.Name}", out glossaryValue) && !string.IsNullOrEmpty(glossaryValue))
+                        { }
+
                         if (!string.IsNullOrEmpty(glossaryValue))
                         {
-                            Log($"UdpRuntime: Glossary resolved '{def.Name}' for column '{columnName}': {def.GlossaryValueColumn}='{glossaryValue}'");
+                            Log($"UdpRuntime: Glossary resolved '{def.Name}' for column '{columnName}': '{glossaryValue}'");
                             return glossaryValue;
                         }
                     }
@@ -428,27 +432,6 @@ namespace EliteSoft.Erwin.AddIn.Services
 
             // Fallback to static default
             return def.DefaultValue;
-        }
-
-        /// <summary>
-        /// Get a field value from a GlossaryEntry by column name.
-        /// </summary>
-        private string GetGlossaryFieldValue(GlossaryEntry entry, string columnName)
-        {
-            switch (columnName?.ToUpper())
-            {
-                case "NAME": return entry.Name;
-                case "DATA_TYPE": return entry.DataType;
-                case "OWNER": return entry.Owner;
-                case "DB_TYPE": return entry.DbType;
-                case "KVKK": return entry.Kvkk ? "1" : "0";
-                case "PCIDSS": return entry.Pcidss ? "1" : "0";
-                case "CLASSIFICATION": return entry.Classification;
-                case "COMMENT": return entry.Comment;
-                default:
-                    Log($"UdpRuntime: Unknown glossary column '{columnName}'");
-                    return null;
-            }
         }
 
         /// <summary>

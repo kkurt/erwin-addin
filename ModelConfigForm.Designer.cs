@@ -35,6 +35,7 @@ namespace EliteSoft.Erwin.AddIn
 
             // === Control Instantiation ===
             this.tabControl = new System.Windows.Forms.TabControl();
+            this.tabGeneral = new System.Windows.Forms.TabPage();
             this.tabModel = new System.Windows.Forms.TabPage();
             this.tabConfiguration = new System.Windows.Forms.TabPage();
             this.tabGlossary = new System.Windows.Forms.TabPage();
@@ -125,6 +126,7 @@ namespace EliteSoft.Erwin.AddIn
             // tabControl
             // ================================================================
             this.tabControl.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right | System.Windows.Forms.AnchorStyles.Bottom;
+            this.tabControl.Controls.Add(this.tabGeneral);
             this.tabControl.Controls.Add(this.tabModel);
             this.tabControl.Controls.Add(this.tabConfiguration);
             this.tabControl.Controls.Add(this.tabGlossary);
@@ -137,6 +139,19 @@ namespace EliteSoft.Erwin.AddIn
             this.tabControl.Size = new System.Drawing.Size(868, 490);
             this.tabControl.TabIndex = 0;
             this.tabControl.Font = fontBody;
+
+            // ================================================================
+            // TAB 0: GENERAL
+            // ================================================================
+            this.tabGeneral.Location = new System.Drawing.Point(4, 26);
+            this.tabGeneral.Name = "tabGeneral";
+            this.tabGeneral.Padding = new System.Windows.Forms.Padding(20);
+            this.tabGeneral.Size = new System.Drawing.Size(860, 460);
+            this.tabGeneral.TabIndex = 10;
+            this.tabGeneral.Text = "General";
+            this.tabGeneral.UseVisualStyleBackColor = true;
+
+            // --- General tab content (built at runtime in InitializeGeneralTab) ---
 
             // ================================================================
             // TAB 1: MODEL
@@ -711,6 +726,7 @@ namespace EliteSoft.Erwin.AddIn
         #endregion
 
         private System.Windows.Forms.TabControl tabControl;
+        private System.Windows.Forms.TabPage tabGeneral;
         private System.Windows.Forms.TabPage tabModel;
         private System.Windows.Forms.TabPage tabConfiguration;
         private System.Windows.Forms.TabPage tabGlossary;

@@ -56,20 +56,7 @@ var
 begin
   ErwinRegBase := 'SOFTWARE\erwin\Data Modeler';
 
-  // Register in all erwin versions found in both HKLM and HKCU
-  if RegGetSubkeyNames(HKEY_LOCAL_MACHINE, ErwinRegBase, Versions) then
-  begin
-    for I := 0 to GetArrayLength(Versions) - 1 do
-    begin
-      AddInsPath := ErwinRegBase + '\' + Versions[I] + '\Add-Ins\Elite Soft Erwin Addin';
-      RegWriteDWordValue(HKEY_LOCAL_MACHINE, AddInsPath, 'Menu Identifier', 1);
-      RegWriteStringValue(HKEY_LOCAL_MACHINE, AddInsPath, 'ProgID', 'EliteSoft.Erwin.AddIn');
-      RegWriteStringValue(HKEY_LOCAL_MACHINE, AddInsPath, 'Invoke Method', 'Execute');
-      RegWriteDWordValue(HKEY_LOCAL_MACHINE, AddInsPath, 'Invoke EXE', 0);
-      Log('Registered in erwin ' + Versions[I] + ' (HKLM)');
-    end;
-  end;
-
+  // Register in all erwin versions found in HKCU (per-user, no admin needed)
   if RegGetSubkeyNames(HKEY_CURRENT_USER, ErwinRegBase, Versions) then
   begin
     for I := 0 to GetArrayLength(Versions) - 1 do
@@ -84,7 +71,7 @@ begin
   end;
 end;
 
-// Unregister add-in from erwin Add-In Manager (both HKLM and HKCU)
+// Unregister add-in from erwin Add-In Manager (HKCU only)
 procedure UnregisterErwinAddIn();
 var
   ErwinRegBase: String;
@@ -94,18 +81,7 @@ var
 begin
   ErwinRegBase := 'SOFTWARE\erwin\Data Modeler';
 
-  // Clean HKLM
-  if RegGetSubkeyNames(HKEY_LOCAL_MACHINE, ErwinRegBase, Versions) then
-  begin
-    for I := 0 to GetArrayLength(Versions) - 1 do
-    begin
-      AddInsPath := ErwinRegBase + '\' + Versions[I] + '\Add-Ins\Elite Soft Erwin Addin';
-      if RegKeyExists(HKEY_LOCAL_MACHINE, AddInsPath) then
-        RegDeleteKeyIncludingSubkeys(HKEY_LOCAL_MACHINE, AddInsPath);
-    end;
-  end;
-
-  // Clean HKCU (legacy installs)
+  // Clean HKCU
   if RegGetSubkeyNames(HKEY_CURRENT_USER, ErwinRegBase, Versions) then
   begin
     for I := 0 to GetArrayLength(Versions) - 1 do
@@ -136,7 +112,7 @@ begin
 
   UninstallKey := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{#SetupSetting("AppId")}_is1';
 
-  if RegQueryStringValue(HKLM, UninstallKey, 'UninstallString', UninstallString) then
+  if RegQueryStringValue(HKCU, UninstallKey, 'UninstallString', UninstallString) then
   begin
     if MsgBox('A previous version of ' + '{#MyAppName}' + ' is installed.' + #13#10 +
               'Would you like to uninstall it first?', mbConfirmation, MB_YESNO) = IDYES then

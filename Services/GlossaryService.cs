@@ -1,38 +1,33 @@
 using System;
 using System.Collections.Generic;
 using System.Data.Common;
+using System.Linq;
 
 namespace EliteSoft.Erwin.AddIn.Services
 {
     /// <summary>
-    /// Service for loading and querying the GLOSSARY table from database.
-    /// Uses GlossaryConnectionService to get connection info from GLOSSARY_CONNECTION_DEF table.
-    ///
-    /// GLOSSARY Table Schema:
-    ///   ID            int           (PK)
-    ///   NAME          varchar(50)   - Column name
-    ///   DATA_TYPE     varchar(50)   - Physical data type
-    ///   OWNER         varchar(50)   - Owner
-    ///   DB_TYPE       varchar(50)   - Database type
-    ///   KVKK          bit           - KVKK flag
-    ///   PCIDSS        bit           - PCI-DSS flag
-    ///   CLASSIFICATION varchar(50)   - Classification
-    ///   COMMENT       varchar(500)  - Column comment/definition
+    /// Glossary service with dynamic mapping support.
+    /// Reads glossary config from DG_TABLE_MAPPING (MAPPING_CODE='GLOSSARY') + DG_TABLE_MAPPING_COLUMN.
+    /// Cache: Dictionary&lt;matchValue, Dictionary&lt;targetUdp, value&gt;&gt;
     /// </summary>
     public class GlossaryService
     {
         private static GlossaryService _instance;
         private static readonly object _lock = new object();
 
-        private readonly Dictionary<string, GlossaryEntry> _glossary;
+        // Dynamic cache: matchValue → { targetUdp → value }
+        private Dictionary<string, Dictionary<string, string>> _glossaryCache;
         private bool _isLoaded;
         private string _lastError;
+        private int? _lastProjectId;
+
+        // Mapping metadata (for logging/debugging)
+        private string _matchSourceColumn;
+        private List<(string sourceCol, string targetType, string targetField)> _valueMappings;
+        private string _tableName;
 
         public event Action<string> OnLog;
 
-        /// <summary>
-        /// Singleton instance
-        /// </summary>
         public static GlossaryService Instance
         {
             get
@@ -42,9 +37,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     lock (_lock)
                     {
                         if (_instance == null)
-                        {
                             _instance = new GlossaryService();
-                        }
                     }
                 }
                 return _instance;
@@ -53,134 +46,193 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         private GlossaryService()
         {
-            _glossary = new Dictionary<string, GlossaryEntry>(StringComparer.OrdinalIgnoreCase);
-            _isLoaded = false;
+            _glossaryCache = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+            _valueMappings = new List<(string, string, string)>();
         }
 
+        public bool IsLoaded => _isLoaded;
+        public int Count => _glossaryCache.Count;
+        public string LastError => _lastError;
+
         /// <summary>
-        /// Load glossary from database using connection info from GLOSSARY_CONNECTION_DEF table
+        /// Load glossary using DG_TABLE_MAPPING config.
         /// </summary>
-        public bool LoadGlossary()
+        public bool LoadGlossary(int? projectId = null)
         {
             try
             {
-                _glossary.Clear();
+                _glossaryCache.Clear();
                 _lastError = null;
+                _lastProjectId = projectId;
+                _matchSourceColumn = null;
+                _valueMappings.Clear();
+                _tableName = null;
 
-                // First check if repo database is configured
                 if (!DatabaseService.Instance.IsConfigured)
                 {
-                    _lastError = "Repository database not configured. Please configure in ErwinAdmin.";
+                    _lastError = "Repository database not configured.";
                     _isLoaded = false;
                     Log($"GlossaryService: {_lastError}");
                     return false;
                 }
 
-                // Load glossary connection definition from GLOSSARY_CONNECTION_DEF table
-                var glossaryConnService = GlossaryConnectionService.Instance;
-                if (!glossaryConnService.IsLoaded)
+                string repoDbType = DatabaseService.Instance.GetDbType();
+
+                // Step 1: Read DG_TABLE_MAPPING (MAPPING_CODE='GLOSSARY')
+                int? mappingId = null;
+                int? connectionDefId = null;
+
+                using (var conn = DatabaseService.Instance.CreateConnection())
                 {
-                    glossaryConnService.LoadConnectionDef();
-                }
+                    conn.Open();
 
-                if (!glossaryConnService.IsLoaded || glossaryConnService.ConnectionDef == null)
-                {
-                    _lastError = glossaryConnService.LastError ?? "Glossary connection definition not found.";
-                    _isLoaded = false;
-                    Log($"GlossaryService: {_lastError}");
-                    return false;
-                }
-
-                // Get glossary connection string from CONNECTION_DEF (ID=4)
-                string connectionString = glossaryConnService.GetGlossaryConnectionString();
-                string dbType = glossaryConnService.GetGlossaryDbType();
-                string tableName = glossaryConnService.ConnectionDef?.TableName ?? "GLOSSARY";
-                Log($"GlossaryService: Connecting to {dbType} glossary (table: {tableName})");
-
-                using (var connection = DatabaseService.Instance.CreateConnection(dbType, connectionString))
-                {
-                    connection.Open();
-
-                    // 3-tier fallback: full (with COMMENT) → extended (without COMMENT) → basic
-                    bool hasExtendedColumns = false;
-                    bool hasCommentColumn = false;
-                    string query;
-
-                    // Tier 1: Try full query with COMMENT
-                    query = GetGlossaryQuery(dbType, "full");
-                    if (TestQuery(connection, query))
+                    // Try DG_TABLE_MAPPING first (new dynamic mapping)
+                    try
                     {
-                        hasExtendedColumns = true;
-                        hasCommentColumn = true;
-                    }
-                    else
-                    {
-                        // Tier 2: Try extended without COMMENT
-                        query = GetGlossaryQuery(dbType, "extended");
-                        if (TestQuery(connection, query))
-                        {
-                            hasExtendedColumns = true;
-                            Log("GlossaryService: COMMENT column not available");
-                        }
-                        else
-                        {
-                            // Tier 3: Basic only
-                            query = GetGlossaryQuery(dbType, "basic");
-                            Log("GlossaryService: Extended columns not available, using basic query");
-                        }
-                    }
+                        // Use corporate effective project IDs if available
+                        var corpContext = CorporateContextService.Instance;
+                        bool hasCorporateFilter = corpContext.IsInitialized && corpContext.EffectiveProjectIds.Count > 0;
+                        string effectiveIds = hasCorporateFilter
+                            ? string.Join(",", corpContext.EffectiveProjectIds)
+                            : null;
 
-                    using (var command = connection.CreateCommand())
-                    {
-                        command.CommandText = query;
-                        using (var reader = command.ExecuteReader())
+                        string mappingQuery = GetMappingQuery(repoDbType, hasCorporateFilter, effectiveIds);
+                        using (var cmd = DatabaseService.Instance.CreateCommand(mappingQuery, conn))
                         {
-                            while (reader.Read())
+
+                            using (var reader = cmd.ExecuteReader())
                             {
-                                string name = reader["NAME"]?.ToString()?.Trim() ?? "";
-                                string dataType = reader["DATA_TYPE"]?.ToString()?.Trim() ?? "";
-                                string owner = reader["OWNER"]?.ToString()?.Trim() ?? "";
-
-                                string dbTypeVal = "";
-                                bool kvkk = false;
-                                bool pcidss = false;
-                                string classification = "";
-                                string comment = "";
-
-                                if (hasExtendedColumns)
+                                if (reader.Read())
                                 {
-                                    dbTypeVal = SafeReadString(reader, "DB_TYPE");
-                                    kvkk = SafeReadBool(reader, "KVKK");
-                                    pcidss = SafeReadBool(reader, "PCIDSS");
-                                    classification = SafeReadString(reader, "CLASSIFICATION");
-                                }
-
-                                if (hasCommentColumn)
-                                {
-                                    comment = SafeReadString(reader, "COMMENT");
-                                }
-
-                                if (!string.IsNullOrEmpty(name) && !_glossary.ContainsKey(name))
-                                {
-                                    _glossary[name] = new GlossaryEntry
-                                    {
-                                        Name = name,
-                                        DataType = dataType,
-                                        Owner = owner,
-                                        DbType = dbTypeVal,
-                                        Kvkk = kvkk,
-                                        Pcidss = pcidss,
-                                        Classification = classification,
-                                        Comment = comment
-                                    };
+                                    mappingId = Convert.ToInt32(reader["ID"]);
+                                    connectionDefId = reader["CONNECTION_DEF_ID"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["CONNECTION_DEF_ID"]);
+                                    _tableName = reader["TABLE_NAME"]?.ToString()?.Trim() ?? "";
                                 }
                             }
                         }
                     }
+                    catch (Exception ex)
+                    {
+                        Log($"GlossaryService: DG_TABLE_MAPPING not available ({ex.Message}), trying legacy CONNECTION_DEF...");
+                    }
+
+                    if (mappingId == null)
+                    {
+                        _lastError = "Glossary not configured. Please configure GLOSSARY mapping in Admin > Data Governance.";
+                        _isLoaded = false;
+                        Log($"GlossaryService: {_lastError}");
+                        return false;
+                    }
+
+                    Log($"GlossaryService: Found mapping ID={mappingId}, table='{_tableName}', connDefId={connectionDefId}");
+
+                    // Step 2: Read DG_TABLE_MAPPING_COLUMN
+                    string colQuery = GetMappingColumnQuery(repoDbType);
+                    using (var cmd2 = DatabaseService.Instance.CreateCommand(colQuery, conn))
+                    {
+                        var param = cmd2.CreateParameter();
+                        param.ParameterName = repoDbType == "ORACLE" ? ":mappingId" : "@mappingId";
+                        param.Value = mappingId.Value;
+                        cmd2.Parameters.Add(param);
+
+                        using (var reader = cmd2.ExecuteReader())
+                        {
+                            while (reader.Read())
+                            {
+                                string sourceCol = reader["SOURCE_COLUMN"]?.ToString()?.Trim() ?? "";
+                                string targetField = reader["TARGET_FIELD"]?.ToString()?.Trim() ?? "";
+                                string targetType = "";
+                                try { targetType = reader["TARGET_TYPE"]?.ToString()?.Trim() ?? ""; }
+                                catch { targetType = ""; } // Column may not exist in older schemas
+
+                                if (string.IsNullOrEmpty(sourceCol)) continue;
+
+                                if (targetField == "_MATCH_")
+                                    _matchSourceColumn = sourceCol;
+                                else if (!string.IsNullOrEmpty(targetField))
+                                    _valueMappings.Add((sourceCol, targetType, targetField));
+                            }
+                        }
+                    }
+
+                    if (string.IsNullOrEmpty(_matchSourceColumn))
+                    {
+                        _lastError = "No _MATCH_ column defined in DG_TABLE_MAPPING_COLUMN.";
+                        _isLoaded = false;
+                        Log($"GlossaryService: {_lastError}");
+                        return false;
+                    }
+
+                    Log($"GlossaryService: Match column='{_matchSourceColumn}', {_valueMappings.Count} value mapping(s): [{string.Join(", ", _valueMappings.Select(m => $"{m.sourceCol}→{m.targetType}:{m.targetField}"))}]");
+
+                    // Step 3: Read CONNECTION_DEF for glossary DB connection
+                    if (connectionDefId == null)
+                    {
+                        _lastError = "No CONNECTION_DEF_ID in GLOSSARY mapping.";
+                        _isLoaded = false;
+                        Log($"GlossaryService: {_lastError}");
+                        return false;
+                    }
+
+                    string glossaryConnStr = null;
+                    string glossaryDbType = null;
+
+                    string connQuery = GetConnectionDefQuery(repoDbType);
+                    using (var cmd3 = DatabaseService.Instance.CreateCommand(connQuery, conn))
+                    {
+                        var param = cmd3.CreateParameter();
+                        param.ParameterName = repoDbType == "ORACLE" ? ":connId" : "@connId";
+                        param.Value = connectionDefId.Value;
+                        cmd3.Parameters.Add(param);
+
+                        using (var reader = cmd3.ExecuteReader())
+                        {
+                            if (reader.Read())
+                            {
+                                glossaryDbType = reader["DB_TYPE"]?.ToString()?.Trim() ?? "MSSQL";
+                                string host = reader["HOST"]?.ToString()?.Trim() ?? "";
+                                string port = reader["PORT"]?.ToString()?.Trim() ?? "";
+                                string dbSchema = reader["DB_SCHEMA"]?.ToString()?.Trim() ?? "";
+                                string encUser = reader["USERNAME"]?.ToString()?.Trim() ?? "";
+                                string encPass = reader["PASSWORD"]?.ToString()?.Trim() ?? "";
+
+                                string username = PasswordEncryptionService.Decrypt(encUser);
+                                string password = PasswordEncryptionService.Decrypt(encPass);
+
+                                // If DPAPI decrypt failed (credentials encrypted by different user),
+                                // fall back to Bootstrap credentials (encrypted by install script for this user)
+                                bool decryptFailed = string.IsNullOrEmpty(username) || (username.Length > 50 && username == encUser);
+                                if (decryptFailed)
+                                {
+                                    Log("GlossaryService: CONNECTION_DEF credentials not decryptable, using Bootstrap credentials");
+                                    var bootstrapConfig = DatabaseService.Instance.GetConfig();
+                                    if (bootstrapConfig != null)
+                                    {
+                                        username = bootstrapConfig.Username;
+                                        password = bootstrapConfig.Password;
+                                    }
+                                }
+
+                                glossaryConnStr = BuildConnectionString(glossaryDbType, host, port, dbSchema, username, password);
+                                Log($"GlossaryService: Connection = {glossaryDbType}, {host}/{dbSchema}");
+                            }
+                        }
+                    }
+
+                    if (string.IsNullOrEmpty(glossaryConnStr))
+                    {
+                        _lastError = $"CONNECTION_DEF ID={connectionDefId} not found or invalid.";
+                        _isLoaded = false;
+                        Log($"GlossaryService: {_lastError}");
+                        return false;
+                    }
+
+                    // Step 4: Load glossary data from external DB
+                    LoadGlossaryData(glossaryDbType, glossaryConnStr);
                 }
 
                 _isLoaded = true;
-                Log($"GlossaryService: Loaded {_glossary.Count} entries from {glossaryConnService.ConnectionDef.Host}/{glossaryConnService.ConnectionDef.DbSchema} (table: {glossaryConnService.ConnectionDef.TableName})");
+                Log($"GlossaryService: Loaded {_glossaryCache.Count} entries (table='{_tableName}', match='{_matchSourceColumn}')");
                 return true;
             }
             catch (Exception ex)
@@ -192,150 +244,219 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
         }
 
-        private string SafeReadString(DbDataReader reader, string columnName)
+        private void LoadGlossaryData(string dbType, string connectionString)
         {
-            try
-            {
-                var value = reader[columnName];
-                return value == null || value == DBNull.Value ? "" : value.ToString().Trim();
-            }
-            catch { return ""; }
-        }
+            // Build dynamic SELECT with only needed columns
+            var allCols = new List<string> { _matchSourceColumn };
+            allCols.AddRange(_valueMappings.Select(m => m.sourceCol));
+            var distinctCols = allCols.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
 
-        private bool SafeReadBool(DbDataReader reader, string columnName)
-        {
-            try
-            {
-                var value = reader[columnName];
-                if (value == null || value == DBNull.Value) return false;
-                if (value is bool b) return b;
-                return Convert.ToBoolean(value);
-            }
-            catch { return false; }
-        }
+            string selectCols = string.Join(", ", distinctCols.Select(c => QuoteColumn(dbType, c)));
+            string fromTable = QuoteTable(dbType, _tableName);
+            string query = $"SELECT {selectCols} FROM {fromTable}";
 
-        private bool TestQuery(DbConnection connection, string query)
-        {
-            try
+            using (var connection = DatabaseService.Instance.CreateConnection(dbType, connectionString))
             {
+                connection.Open();
+
                 using (var cmd = connection.CreateCommand())
                 {
                     cmd.CommandText = query;
-                    using (cmd.ExecuteReader()) { }
+                    using (var reader = cmd.ExecuteReader())
+                    {
+                        while (reader.Read())
+                        {
+                            string matchValue = "";
+                            try { matchValue = reader[_matchSourceColumn]?.ToString()?.Trim() ?? ""; }
+                            catch (Exception ex) { Log($"GlossaryService: Match column read error: {ex.Message}"); continue; }
+
+                            if (string.IsNullOrEmpty(matchValue)) continue;
+
+                            var udpValues = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                            foreach (var (sourceCol, targetType, targetField) in _valueMappings)
+                            {
+                                try
+                                {
+                                    string val = reader[sourceCol]?.ToString()?.Trim() ?? "";
+                                    udpValues[targetField] = val;
+                                }
+                                catch (Exception ex)
+                                {
+                                    Log($"GlossaryService: Column '{sourceCol}' read error: {ex.Message}");
+                                    udpValues[targetField] = "";
+                                }
+                            }
+
+                            if (!_glossaryCache.ContainsKey(matchValue))
+                                _glossaryCache[matchValue] = udpValues;
+                        }
+                    }
                 }
-                return true;
-            }
-            catch { return false; }
-        }
-
-        /// <summary>
-        /// Gets the appropriate SQL query for the database type.
-        /// tier: "full" (all columns + COMMENT), "extended" (without COMMENT), "basic" (NAME, DATA_TYPE, OWNER)
-        /// Table name comes from CONNECTION_DEF.TABLE_NAME (defaults to "GLOSSARY")
-        /// </summary>
-        private string GetGlossaryQuery(string dbType, string tier)
-        {
-            string tableName = GlossaryConnectionService.Instance.ConnectionDef?.TableName ?? "GLOSSARY";
-
-            switch (dbType?.ToUpper())
-            {
-                case "POSTGRESQL":
-                    if (tier == "full")
-                        return $"SELECT \"NAME\", \"DATA_TYPE\", \"OWNER\", \"DB_TYPE\", \"KVKK\", \"PCIDSS\", \"CLASSIFICATION\", \"COMMENT\" FROM \"{tableName}\"";
-                    if (tier == "extended")
-                        return $"SELECT \"NAME\", \"DATA_TYPE\", \"OWNER\", \"DB_TYPE\", \"KVKK\", \"PCIDSS\", \"CLASSIFICATION\" FROM \"{tableName}\"";
-                    return $"SELECT \"NAME\", \"DATA_TYPE\", \"OWNER\" FROM \"{tableName}\"";
-
-                case "ORACLE":
-                    if (tier == "full")
-                        return $"SELECT NAME, DATA_TYPE, OWNER, DB_TYPE, KVKK, PCIDSS, CLASSIFICATION, \"COMMENT\" FROM {tableName}";
-                    if (tier == "extended")
-                        return $"SELECT NAME, DATA_TYPE, OWNER, DB_TYPE, KVKK, PCIDSS, CLASSIFICATION FROM {tableName}";
-                    return $"SELECT NAME, DATA_TYPE, OWNER FROM {tableName}";
-
-                case "MSSQL":
-                default:
-                    if (tier == "full")
-                        return $"SELECT [NAME], [DATA_TYPE], [OWNER], [DB_TYPE], [KVKK], [PCIDSS], [CLASSIFICATION], [COMMENT] FROM [dbo].[{tableName}]";
-                    if (tier == "extended")
-                        return $"SELECT [NAME], [DATA_TYPE], [OWNER], [DB_TYPE], [KVKK], [PCIDSS], [CLASSIFICATION] FROM [dbo].[{tableName}]";
-                    return $"SELECT [NAME], [DATA_TYPE], [OWNER] FROM [dbo].[{tableName}]";
             }
         }
 
+        #region Public API
+
         /// <summary>
-        /// Check if a column name exists in the glossary
+        /// Check if a column name exists in the glossary.
         /// </summary>
-        public bool Exists(string columnName)
+        public bool HasEntry(string columnName)
         {
             if (string.IsNullOrEmpty(columnName)) return false;
-            return _glossary.ContainsKey(columnName);
+            return _glossaryCache.ContainsKey(columnName);
         }
 
         /// <summary>
-        /// Get glossary entry for a column name
+        /// Alias for HasEntry (backward compatibility).
         /// </summary>
-        public GlossaryEntry GetEntry(string columnName)
+        public bool Exists(string columnName) => HasEntry(columnName);
+
+        /// <summary>
+        /// Get UDP values for a matched column name.
+        /// Returns null if not found.
+        /// </summary>
+        public Dictionary<string, string> GetUdpValues(string columnName)
         {
             if (string.IsNullOrEmpty(columnName)) return null;
-            _glossary.TryGetValue(columnName, out var entry);
-            return entry;
+            _glossaryCache.TryGetValue(columnName, out var values);
+            return values;
         }
 
         /// <summary>
-        /// Get all glossary entries
+        /// Get the target type for a mapping target field (UDP, ERWIN_PROPERTY, DB_PROPERTY).
         /// </summary>
-        public IEnumerable<GlossaryEntry> GetAll()
+        public string GetTargetType(string targetField)
         {
-            return _glossary.Values;
+            var mapping = _valueMappings.FirstOrDefault(m => m.targetField.Equals(targetField, StringComparison.OrdinalIgnoreCase));
+            return mapping.targetType ?? "";
         }
 
-        public bool IsLoaded => _isLoaded;
-        public int Count => _glossary.Count;
-        public string LastError => _lastError;
-
         /// <summary>
-        /// Force reload
+        /// Reload with last used projectId.
         /// </summary>
         public void Reload()
         {
-            LoadGlossary();
+            LoadGlossary(_lastProjectId);
         }
 
-        /// <summary>
-        /// Get current connection string from GlossaryConnectionService
-        /// </summary>
-        public string ConnectionString => GlossaryConnectionService.Instance.GetGlossaryConnectionString();
-
-        /// <summary>
-        /// Checks if the database is configured
-        /// </summary>
         public bool IsConfigured => DatabaseService.Instance.IsConfigured;
 
-        /// <summary>
-        /// Gets the glossary connection definition
-        /// </summary>
-        public GlossaryConnectionDef ConnectionDef => GlossaryConnectionService.Instance.ConnectionDef;
+        #endregion
+
+        #region SQL Helpers
+
+        private string GetMappingQuery(string dbType, bool hasCorporateFilter, string effectiveIds)
+        {
+            // effectiveIds is a safe comma-separated list of integer IDs (no SQL injection risk)
+            switch (dbType?.ToUpper())
+            {
+                case "POSTGRESQL":
+                {
+                    string where = hasCorporateFilter && !string.IsNullOrEmpty(effectiveIds)
+                        ? $@"""MAPPING_CODE"" = 'GLOSSARY' AND ""PROJECT_ID"" IN ({effectiveIds})"
+                        : @"""MAPPING_CODE"" = 'GLOSSARY'";
+                    return $@"SELECT ""ID"", ""CONNECTION_DEF_ID"", ""TABLE_NAME"" FROM ""DG_TABLE_MAPPING""
+                            WHERE {where}
+                            ORDER BY ""PROJECT_ID"" DESC NULLS LAST LIMIT 1";
+                }
+                case "ORACLE":
+                {
+                    string where = hasCorporateFilter && !string.IsNullOrEmpty(effectiveIds)
+                        ? $"MAPPING_CODE = 'GLOSSARY' AND PROJECT_ID IN ({effectiveIds})"
+                        : "MAPPING_CODE = 'GLOSSARY'";
+                    return $@"SELECT ID, CONNECTION_DEF_ID, TABLE_NAME FROM DG_TABLE_MAPPING
+                            WHERE {where}
+                            ORDER BY PROJECT_ID DESC NULLS LAST FETCH FIRST 1 ROWS ONLY";
+                }
+                case "MSSQL":
+                default:
+                {
+                    string where = hasCorporateFilter && !string.IsNullOrEmpty(effectiveIds)
+                        ? $"[MAPPING_CODE] = 'GLOSSARY' AND [PROJECT_ID] IN ({effectiveIds})"
+                        : "[MAPPING_CODE] = 'GLOSSARY'";
+                    return $@"SELECT TOP 1 [ID], [CONNECTION_DEF_ID], [TABLE_NAME] FROM [dbo].[DG_TABLE_MAPPING]
+                            WHERE {where}
+                            ORDER BY [PROJECT_ID] DESC";
+                }
+            }
+        }
+
+        private string GetMappingColumnQuery(string dbType)
+        {
+            switch (dbType?.ToUpper())
+            {
+                case "POSTGRESQL":
+                    return @"SELECT ""SOURCE_COLUMN"", ""TARGET_TYPE"", ""TARGET_FIELD"" FROM ""DG_TABLE_MAPPING_COLUMN""
+                            WHERE ""TABLE_MAPPING_ID"" = @mappingId ORDER BY ""SORT_ORDER""";
+                case "ORACLE":
+                    return @"SELECT SOURCE_COLUMN, TARGET_TYPE, TARGET_FIELD FROM DG_TABLE_MAPPING_COLUMN
+                            WHERE TABLE_MAPPING_ID = :mappingId ORDER BY SORT_ORDER";
+                case "MSSQL":
+                default:
+                    return @"SELECT [SOURCE_COLUMN], [TARGET_TYPE], [TARGET_FIELD] FROM [dbo].[DG_TABLE_MAPPING_COLUMN]
+                            WHERE [TABLE_MAPPING_ID] = @mappingId ORDER BY [SORT_ORDER]";
+            }
+        }
+
+        private string GetConnectionDefQuery(string dbType)
+        {
+            switch (dbType?.ToUpper())
+            {
+                case "POSTGRESQL":
+                    return @"SELECT ""DB_TYPE"", ""HOST"", ""PORT"", ""DB_SCHEMA"", ""USERNAME"", ""PASSWORD""
+                            FROM ""CONNECTION_DEF"" WHERE ""ID"" = @connId";
+                case "ORACLE":
+                    return @"SELECT DB_TYPE, HOST, PORT, DB_SCHEMA, USERNAME, PASSWORD
+                            FROM CONNECTION_DEF WHERE ID = :connId";
+                case "MSSQL":
+                default:
+                    return @"SELECT [DB_TYPE], [HOST], [PORT], [DB_SCHEMA], [USERNAME], [PASSWORD]
+                            FROM [dbo].[CONNECTION_DEF] WHERE [ID] = @connId";
+            }
+        }
+
+        private string BuildConnectionString(string dbType, string host, string port, string database, string username, string password)
+        {
+            switch (dbType?.ToUpper())
+            {
+                case "POSTGRESQL":
+                    return $"Host={host};Port={port};Database={database};Username={username};Password={password};";
+                case "ORACLE":
+                    return $"Data Source=(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST={host})(PORT={port}))(CONNECT_DATA=(SERVICE_NAME={database})));User Id={username};Password={password};";
+                case "MSSQL":
+                default:
+                    return $"Server={host},{port};Database={database};User Id={username};Password={password};TrustServerCertificate=True;";
+            }
+        }
+
+        private string QuoteColumn(string dbType, string col)
+        {
+            switch (dbType?.ToUpper())
+            {
+                case "POSTGRESQL": return $"\"{col}\"";
+                case "ORACLE": return col;
+                case "MSSQL":
+                default: return $"[{col}]";
+            }
+        }
+
+        private string QuoteTable(string dbType, string table)
+        {
+            switch (dbType?.ToUpper())
+            {
+                case "POSTGRESQL": return $"\"{table}\"";
+                case "ORACLE": return table;
+                case "MSSQL":
+                default: return $"[dbo].[{table}]";
+            }
+        }
+
+        #endregion
 
         private void Log(string message)
         {
             OnLog?.Invoke(message);
             System.Diagnostics.Debug.WriteLine(message);
         }
-    }
-
-    /// <summary>
-    /// Represents a glossary entry matching the GLOSSARY table schema
-    /// </summary>
-    public class GlossaryEntry
-    {
-        public string Name { get; set; }
-        public string DataType { get; set; }
-        public string Owner { get; set; }
-        public string DbType { get; set; }
-        public bool Kvkk { get; set; }
-        public bool Pcidss { get; set; }
-        public string Classification { get; set; }
-        public string Comment { get; set; }
     }
 }

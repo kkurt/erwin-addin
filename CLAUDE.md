@@ -254,3 +254,9 @@ npx @claude-flow/cli@latest doctor --fix
 - Act as a professional Windows Form UX designer when making UI changes
 - Consider user experience and ease of use in every change
 - For complex UI changes, sketch out the design first and get feedback before implementation
+
+
+Hiçbir yerde emdash kullanma! Scriptlerde ve dökümantasyonda!
+
+Her zaman benim söylediğim doğru olmayabilir, yanlış analiz etmiş olabilirim.
+Söylediklerimi sorgula, ayrıca senin de çözüm için bulduğun  mantıklarını  da sorgula. Bunları unutma!

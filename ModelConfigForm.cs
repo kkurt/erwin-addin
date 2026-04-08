@@ -54,6 +54,7 @@ namespace EliteSoft.Erwin.AddIn
             _scapi = scapi ?? throw new ArgumentNullException(nameof(scapi));
             InitializeComponent();
             InitializeValidationUI();
+            InitializeGeneralTab();
             InitializeGlossaryRefreshTimer();
         }
 
@@ -263,11 +264,26 @@ namespace EliteSoft.Erwin.AddIn
         {
             Log("Initializing validation service...");
 
+            // Corporate guard: read active corporate from registry + load effective projects
+            var corpContext = CorporateContextService.Instance;
+            corpContext.OnLog += Log;
+            if (!corpContext.Initialize())
+            {
+                MessageBox.Show(
+                    corpContext.LastError ?? "Active Corporate not configured.\nPlease run Admin panel first.",
+                    "Configuration Error",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+                Log($"Corporate not configured — closing extension.");
+                this.Close();
+                return;
+            }
+            Log($"Corporate: {corpContext.ActiveCorporateName} (ID={corpContext.ActiveCorporateId}), {corpContext.EffectiveProjectIds.Count} effective project(s)");
+
             DisposeServices();
-            GlossaryConnectionService.Instance.OnLog += Log;
             GlossaryService.Instance.OnLog += Log;
             LoadGlossary();
-            LoadTableTypes();
+            LoadPredefinedColumns();
             LoadDomainDefs();
             LoadNamingStandards();
             EnsureAllUdpsExist();
@@ -319,7 +335,135 @@ namespace EliteSoft.Erwin.AddIn
 
             UpdateValidationStatus();
             Log("Validation service initialized.");
+            UpdateGeneralTab();
         }
+
+        #region General Tab
+
+        // Labels to update after corporate initialization
+        private Label _lblCorporateValue;
+        private Label _lblDbValue;
+
+        private void InitializeGeneralTab()
+        {
+            var font = new Font("Segoe UI", 9.5f);
+            var fontBold = new Font("Segoe UI", 9.5f, FontStyle.Bold);
+            var fontTitle = new Font("Segoe UI", 14f, FontStyle.Bold);
+            var clrAccent = Color.FromArgb(0, 120, 212);
+            var clrCardBg = Color.White;
+            var clrLabelDim = Color.FromArgb(100, 100, 100);
+
+            // --- Header ---
+            var lblTitle = new Label
+            {
+                Text = "Elite Soft Erwin AddIn",
+                Font = fontTitle,
+                ForeColor = clrAccent,
+                AutoSize = true,
+                Location = new Point(24, 20)
+            };
+            tabGeneral.Controls.Add(lblTitle);
+
+            var lblCopyright = new Label
+            {
+                Text = "\u00A9 2026 Elite Soft. All rights reserved.",
+                Font = new Font("Segoe UI", 8f),
+                ForeColor = Color.FromArgb(160, 160, 160),
+                AutoSize = true,
+                Anchor = AnchorStyles.Bottom | AnchorStyles.Left,
+                Location = new Point(24, 430)
+            };
+            tabGeneral.Controls.Add(lblCopyright);
+
+            // --- Info Card ---
+            var card = CreateInfoCard("", 24, 60, 812, 80, clrCardBg);
+            AddCardRow(card, "Corporate:", "", fontBold, font, 0, out _, out _lblCorporateValue);
+            AddCardRow(card, "Database:", "", fontBold, font, 1, out _, out _lblDbValue);
+            tabGeneral.Controls.Add(card);
+
+            // Initial state
+            _lblCorporateValue.Text = "(not loaded)";
+            _lblDbValue.Text = "(not loaded)";
+        }
+
+        private Panel CreateInfoCard(string title, int x, int y, int w, int h, Color bgColor)
+        {
+            var card = new Panel
+            {
+                Location = new Point(x, y),
+                Size = new Size(w, h),
+                BackColor = bgColor,
+                BorderStyle = BorderStyle.FixedSingle,
+                Padding = new Padding(16, 12, 16, 12)
+            };
+
+            if (!string.IsNullOrEmpty(title))
+            {
+                var lblTitle = new Label
+                {
+                    Text = title,
+                    Font = new Font("Segoe UI", 10f, FontStyle.Bold),
+                    ForeColor = Color.FromArgb(60, 60, 60),
+                    AutoSize = true,
+                    Location = new Point(16, 10)
+                };
+                card.Controls.Add(lblTitle);
+            }
+
+            return card;
+        }
+
+        private void AddCardRow(Panel card, string label, string value, Font labelFont, Font valueFont, int row, out Label lblLabel, out Label lblValue)
+        {
+            int y = 14 + row * 26;
+
+            lblLabel = new Label
+            {
+                Text = label,
+                Font = labelFont,
+                ForeColor = Color.FromArgb(80, 80, 80),
+                AutoSize = true,
+                Location = new Point(16, y)
+            };
+            card.Controls.Add(lblLabel);
+
+            lblValue = new Label
+            {
+                Text = value,
+                Font = valueFont,
+                ForeColor = Color.FromArgb(40, 40, 40),
+                AutoSize = true,
+                Location = new Point(120, y)
+            };
+            card.Controls.Add(lblValue);
+        }
+
+        /// <summary>
+        /// Update General tab with corporate and connection info after initialization.
+        /// </summary>
+        private void UpdateGeneralTab()
+        {
+            try
+            {
+                var corp = CorporateContextService.Instance;
+                if (corp.IsInitialized)
+                {
+                    _lblCorporateValue.Text = corp.ActiveCorporateName;
+                }
+
+                var config = DatabaseService.Instance.GetConfig();
+                if (config != null && config.IsConfigured)
+                {
+                    _lblDbValue.Text = $"{config.Host}/{config.Database} ({DatabaseService.Instance.GetDbType()})";
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"UpdateGeneralTab error: {ex.Message}");
+            }
+        }
+
+        #endregion
 
         private void InitializeValidationUI()
         {
@@ -364,7 +508,7 @@ namespace EliteSoft.Erwin.AddIn
                             catch { try { tableName = entity.Name ?? ""; } catch { continue; } }
 
                             // Naming standard validation
-                            var namingResults = NamingValidationEngine.ValidateObjectName("Table", tableName);
+                            var namingResults = NamingValidationEngine.ValidateObjectName("Table", tableName, entity);
                             foreach (var r in namingResults)
                             {
                                 totalCount++;
@@ -372,16 +516,7 @@ namespace EliteSoft.Erwin.AddIn
                                 AddValidationRow("Table", tableName, $"Naming ({r.RuleName})", r.IsValid, r.ErrorMessage);
                             }
 
-                            // TableType check
-                            if (_validationService != null)
-                            {
-                                string tableType = "";
-                                try { tableType = entity.Properties("Entity.Physical.TABLE_TYPE").Value?.ToString() ?? ""; } catch { }
-                                bool hasType = !string.IsNullOrEmpty(tableType) && tableType != "(SELECT)";
-                                totalCount++;
-                                if (!hasType) errorCount++;
-                                AddValidationRow("Table", tableName, "TableType", hasType, hasType ? "" : "TABLE_TYPE not selected");
-                            }
+                            // TABLE_TYPE validation is now handled by NamingStandard rules with UDP conditions
                         }
                     }
                 }
@@ -422,14 +557,14 @@ namespace EliteSoft.Erwin.AddIn
                                 // Glossary check
                                 if (glossary.IsLoaded)
                                 {
-                                    bool inGlossary = glossary.GetEntry(colName) != null;
+                                    bool inGlossary = glossary.HasEntry(colName);
                                     totalCount++;
                                     if (!inGlossary) errorCount++;
                                     AddValidationRow("Column", $"{tableName}.{colName}", "Glossary", inGlossary, inGlossary ? "" : "Not found in glossary");
                                 }
 
                                 // Naming standard validation
-                                var namingResults = NamingValidationEngine.ValidateObjectName("Column", colName);
+                                var namingResults = NamingValidationEngine.ValidateObjectName("Column", colName, attr);
                                 foreach (var r in namingResults)
                                 {
                                     totalCount++;
@@ -455,7 +590,7 @@ namespace EliteSoft.Erwin.AddIn
                                 string kgName = "";
                                 try { kgName = kg.Name ?? ""; } catch { continue; }
 
-                                var namingResults = NamingValidationEngine.ValidateObjectName("Index", kgName);
+                                var namingResults = NamingValidationEngine.ValidateObjectName("Index", kgName, kg);
                                 foreach (var r in namingResults)
                                 {
                                     totalCount++;
@@ -487,7 +622,7 @@ namespace EliteSoft.Erwin.AddIn
                                 }
                                 catch { try { viewName = view.Name ?? ""; } catch { continue; } }
 
-                                var namingResults = NamingValidationEngine.ValidateObjectName("View", viewName);
+                                var namingResults = NamingValidationEngine.ValidateObjectName("View", viewName, view);
                                 foreach (var r in namingResults)
                                 {
                                     totalCount++;
@@ -541,7 +676,7 @@ namespace EliteSoft.Erwin.AddIn
                                 string saName = "";
                                 try { saName = sa.Name ?? ""; } catch { continue; }
 
-                                var namingResults = NamingValidationEngine.ValidateObjectName("Subject Area", saName);
+                                var namingResults = NamingValidationEngine.ValidateObjectName("Subject Area", saName, sa);
                                 foreach (var r in namingResults)
                                 {
                                     totalCount++;
@@ -722,27 +857,19 @@ namespace EliteSoft.Erwin.AddIn
                     return;
                 }
 
-                var glossaryConnService = GlossaryConnectionService.Instance;
-                glossaryConnService.ClearCache();
-                glossaryConnService.LoadConnectionDef();
+                // Test glossary loading via DG_TABLE_MAPPING
+                var glossary = GlossaryService.Instance;
+                glossary.LoadGlossary();
 
-                if (!glossaryConnService.IsLoaded)
+                if (glossary.IsLoaded)
                 {
-                    lblGlossaryStatus.Text = $"Failed to load CONNECTION_DEF: {glossaryConnService.LastError}";
-                    lblGlossaryStatus.ForeColor = Color.Red;
-                    return;
-                }
-
-                UpdateGlossaryConnectionLabels();
-
-                string connectionString = glossaryConnService.GetGlossaryConnectionString();
-                string dbType = glossaryConnService.GetGlossaryDbType();
-
-                using (var connection = DatabaseService.Instance.CreateConnection(dbType, connectionString))
-                {
-                    connection.Open();
-                    lblGlossaryStatus.Text = $"Glossary connection successful! ({dbType})";
+                    lblGlossaryStatus.Text = $"Glossary connection successful! ({glossary.Count} entries)";
                     lblGlossaryStatus.ForeColor = Color.DarkGreen;
+                }
+                else
+                {
+                    lblGlossaryStatus.Text = $"Glossary: {glossary.LastError}";
+                    lblGlossaryStatus.ForeColor = Color.Red;
                 }
             }
             catch (Exception ex)
@@ -761,7 +888,6 @@ namespace EliteSoft.Erwin.AddIn
                 Application.DoEvents();
 
                 DatabaseService.Instance.ClearCache();
-                GlossaryConnectionService.Instance.ClearCache();
 
                 if (!DatabaseService.Instance.IsConfigured)
                 {
@@ -771,29 +897,14 @@ namespace EliteSoft.Erwin.AddIn
                     return;
                 }
 
-                lblGlossaryStatus.Text = "Reading CONNECTION_DEF from repository...";
-                Application.DoEvents();
-
-                var glossaryConnService = GlossaryConnectionService.Instance;
-                if (!glossaryConnService.LoadConnectionDef())
-                {
-                    lblGlossaryStatus.Text = $"Failed to read connection def: {glossaryConnService.LastError}";
-                    lblGlossaryStatus.ForeColor = Color.Red;
-                    ClearGlossaryConnectionLabels();
-                    return;
-                }
-
-                UpdateGlossaryConnectionLabels();
-
-                lblGlossaryStatus.Text = "Loading glossary entries...";
+                lblGlossaryStatus.Text = "Loading glossary...";
                 Application.DoEvents();
 
                 GlossaryService.Instance.Reload();
 
                 if (GlossaryService.Instance.IsLoaded)
                 {
-                    var connDef = GlossaryService.Instance.ConnectionDef;
-                    lblGlossaryStatus.Text = $"Glossary loaded: {GlossaryService.Instance.Count} entries from {connDef?.Host}/{connDef?.DbSchema}";
+                    lblGlossaryStatus.Text = $"Glossary loaded: {GlossaryService.Instance.Count} entries";
                     lblGlossaryStatus.ForeColor = Color.DarkGreen;
 
                     _lastGlossaryRefreshTime = DateTime.Now;
@@ -854,12 +965,11 @@ namespace EliteSoft.Erwin.AddIn
 
         private void UpdateGlossaryConnectionLabels()
         {
-            var connDef = GlossaryConnectionService.Instance.ConnectionDef;
-            if (connDef != null)
+            if (GlossaryService.Instance.IsLoaded)
             {
-                lblHostValue.Text = connDef.Host ?? "(not set)";
-                lblPortValue.Text = connDef.Port ?? "-";
-                lblDatabaseValue.Text = connDef.DbSchema ?? "(not set)";
+                lblHostValue.Text = "Configured";
+                lblPortValue.Text = "-";
+                lblDatabaseValue.Text = $"{GlossaryService.Instance.Count} entries";
             }
             else
             {
@@ -878,38 +988,25 @@ namespace EliteSoft.Erwin.AddIn
 
         #region Table Type Management
 
-        private void LoadTableTypes()
+        private void LoadPredefinedColumns()
         {
             try
             {
-                var tableTypeService = TableTypeService.Instance;
-                tableTypeService.Reload();
+                var predefinedColumnService = PredefinedColumnService.Instance;
+                predefinedColumnService.LoadPredefinedColumns();
 
-                if (tableTypeService.IsLoaded)
+                if (predefinedColumnService.IsLoaded)
                 {
-                    Log($"TABLE_TYPE loaded: {tableTypeService.Count} entries");
-                    Log($"TABLE_TYPE values: {tableTypeService.GetNamesAsCommaSeparated()}");
-
-                    var predefinedColumnService = PredefinedColumnService.Instance;
-                    predefinedColumnService.Reload();
-
-                    if (predefinedColumnService.IsLoaded)
-                    {
-                        Log($"PREDEFINED_COLUMN loaded: {predefinedColumnService.Count} entries");
-                    }
-                    else
-                    {
-                        Log($"PREDEFINED_COLUMN not loaded: {predefinedColumnService.LastError}");
-                    }
+                    Log($"PREDEFINED_COLUMN loaded: {predefinedColumnService.Count} entries");
                 }
                 else
                 {
-                    Log($"TABLE_TYPE not loaded: {tableTypeService.LastError}");
+                    Log($"PREDEFINED_COLUMN not loaded: {predefinedColumnService.LastError}");
                 }
             }
             catch (Exception ex)
             {
-                Log($"LoadTableTypes error: {ex.Message}");
+                Log($"LoadPredefinedColumns error: {ex.Message}");
             }
         }
 
@@ -1010,39 +1107,7 @@ namespace EliteSoft.Erwin.AddIn
 
                 Log($"Found {existingUdps.Count} existing Property_Type entries");
 
-                // --- TABLE_TYPE UDP ---
-                var tableTypeService = TableTypeService.Instance;
-                if (tableTypeService.IsLoaded && tableTypeService.Count > 0 &&
-                    !existingUdps.Contains("Entity.Physical.TABLE_TYPE"))
-                {
-                    string listValues = tableTypeService.GetNamesAsCommaSeparated();
-                    int transId = metamodelSession.BeginNamedTransaction("CreateTableTypeUDP");
-                    try
-                    {
-                        dynamic udpType = mmObjects.Add("Property_Type");
-                        udpType.Properties("Name").Value = "Entity.Physical.TABLE_TYPE";
-                        TrySetProperty(udpType, "tag_Udp_Owner_Type", "Entity");
-                        TrySetProperty(udpType, "tag_Is_Physical", true);
-                        TrySetProperty(udpType, "tag_Is_Logical", false);
-                        TrySetProperty(udpType, "tag_Udp_Data_Type", 6); // List type
-                        TrySetProperty(udpType, "tag_Udp_Values_List", listValues);
-                        string defaultValue = listValues.Split(',').FirstOrDefault()?.Trim() ?? "";
-                        if (!string.IsNullOrEmpty(defaultValue))
-                            TrySetProperty(udpType, "tag_Udp_Default_Value", defaultValue);
-                        TrySetProperty(udpType, "tag_Order", "1");
-                        TrySetProperty(udpType, "tag_Is_Locally_Defined", true);
-                        metamodelSession.CommitTransaction(transId);
-                        Log("TABLE_TYPE UDP created");
-                    }
-                    catch (Exception ex)
-                    {
-                        try { metamodelSession.RollbackTransaction(transId); } catch { }
-                        if (ex.Message.Contains("must be unique") || ex.Message.Contains("EBS-1057"))
-                            Log("TABLE_TYPE UDP already exists (unique constraint)");
-                        else
-                            Log($"Error creating TABLE_TYPE UDP: {ex.Message}");
-                    }
-                }
+                // TABLE_TYPE UDP is now managed by UdpRuntimeService (MC_UDP_DEFINITION)
 
                 // --- MODEL_PATH UDP (hidden, read-only — stores repository path) ---
                 // Determine model path BEFORE creating UDP (to set as default value in metamodel)

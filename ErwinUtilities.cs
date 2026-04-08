@@ -33,29 +33,10 @@ namespace EliteSoft.Erwin.AddIn
 
             try
             {
-                // Check HKEY_CURRENT_USER first
+                // Read ODBC connections from HKCU only (per-user)
                 string keyPath = @"SOFTWARE\ODBC\ODBC.INI\ODBC Data Sources";
-                bool foundInCurrentUser = false;
 
                 using (RegistryKey key = Registry.CurrentUser.OpenSubKey(keyPath))
-                {
-                    if (key != null)
-                    {
-                        foreach (string valueName in key.GetValueNames())
-                        {
-                            if (valueName == oracleDB)
-                            {
-                                foundInCurrentUser = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                // If not found, check HKEY_LOCAL_MACHINE
-                RegistryKey rootKey = foundInCurrentUser ? Registry.CurrentUser : Registry.LocalMachine;
-
-                using (RegistryKey key = rootKey.OpenSubKey(keyPath))
                 {
                     if (key != null)
                     {

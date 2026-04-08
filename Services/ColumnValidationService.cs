@@ -374,10 +374,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     PreviousName = previousName,
                                     ValidationMessage = validationResult.Message,
                                     RuleName = validationResult.RuleName,
-                                    GlossaryEntry = null
+                                    GlossaryUdpValues = null
                                 });
                             }
-                            else if (validationResult.GlossaryEntry != null)
+                            else if (validationResult.GlossaryUdpValues != null)
                             {
                                 // Valid and found in glossary - trigger action to set DataType and Owner
                                 OnValidationPassed?.Invoke(this, new ColumnValidationEventArgs
@@ -389,7 +389,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     PreviousName = previousName,
                                     ValidationMessage = "Found in glossary",
                                     RuleName = "GlossaryRule",
-                                    GlossaryEntry = validationResult.GlossaryEntry
+                                    GlossaryUdpValues = validationResult.GlossaryUdpValues
                                 });
                             }
 
@@ -441,7 +441,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     return result;
                 }
                 // If valid and has glossary entry, return it
-                if (result.GlossaryEntry != null)
+                if (result.GlossaryUdpValues != null)
                 {
                     return result;
                 }
@@ -481,45 +481,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     }
                     catch { tableName = entityName; }
 
-                    // Check TABLE_TYPE UDP for this table
-                    // Always add a table validation result
-                    string tableTypeValue = "";
-                    bool tableTypeUdpExists = false;
-                    try
-                    {
-                        var prop = entity.Properties("Entity.Physical.TABLE_TYPE");
-                        if (prop != null)
-                        {
-                            tableTypeValue = prop.Value?.ToString() ?? "";
-                            tableTypeUdpExists = true;
-                        }
-                    }
-                    catch
-                    {
-                        // UDP doesn't exist or can't be read
-                        tableTypeUdpExists = false;
-                    }
-
-                    // If TABLE_TYPE UDP doesn't exist, is empty, or is not a valid table type, add validation error
-                    // A valid table type must exist in TableTypeService (from database)
-                    var tableTypeEntry = TableTypeService.Instance.GetByName(tableTypeValue);
-                    bool isValidTableType = tableTypeEntry != null;
-
-                    bool tableTypeNotSelected = !tableTypeUdpExists ||
-                                                string.IsNullOrEmpty(tableTypeValue) ||
-                                                !isValidTableType;
-
-                    // Always add table validation result
-                    results.Add(new ColumnValidationIssue
-                    {
-                        TableName = tableName,
-                        AttributeName = "(Table)",
-                        PhysicalName = tableName,
-                        Issue = tableTypeNotSelected ? "Table type not selected" : $"Table type: {tableTypeValue}",
-                        RuleName = "TableTypeRule",
-                        IsValid = !tableTypeNotSelected,
-                        GlossaryEntry = null
-                    });
+                    // TABLE_TYPE validation moved to NamingStandard rules with UDP conditions
 
                     dynamic entityAttrs = null;
                     try { entityAttrs = modelObjects.Collect(entity, "Attribute"); } catch { continue; }
@@ -559,7 +521,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                             Issue = result.IsValid ? "Found in glossary" : result.Message,
                             RuleName = result.RuleName ?? "GlossaryRule",
                             IsValid = result.IsValid,
-                            GlossaryEntry = result.GlossaryEntry
+                            GlossaryUdpValues = result.GlossaryUdpValues
                         });
                     }
                 }
@@ -614,7 +576,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         public string PreviousName { get; set; }
         public string ValidationMessage { get; set; }
         public string RuleName { get; set; }
-        public GlossaryEntry GlossaryEntry { get; set; }
+        public Dictionary<string, string> GlossaryUdpValues { get; set; }
     }
 
     public class ColumnValidationIssue
@@ -625,7 +587,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         public string Issue { get; set; }
         public string RuleName { get; set; }
         public bool IsValid { get; set; }
-        public GlossaryEntry GlossaryEntry { get; set; }
+        public Dictionary<string, string> GlossaryUdpValues { get; set; }
     }
 
     public class ValidationResult
@@ -633,10 +595,10 @@ namespace EliteSoft.Erwin.AddIn.Services
         public bool IsValid { get; set; }
         public string Message { get; set; }
         public string RuleName { get; set; }
-        public GlossaryEntry GlossaryEntry { get; set; }
+        public Dictionary<string, string> GlossaryUdpValues { get; set; }
 
         public static ValidationResult Valid() => new ValidationResult { IsValid = true };
-        public static ValidationResult ValidWithEntry(GlossaryEntry entry) => new ValidationResult { IsValid = true, GlossaryEntry = entry };
+        public static ValidationResult ValidWithEntry(Dictionary<string, string> udpValues) => new ValidationResult { IsValid = true, GlossaryUdpValues = udpValues };
         public static ValidationResult Invalid(string message, string ruleName) =>
             new ValidationResult { IsValid = false, Message = message, RuleName = ruleName };
     }
@@ -679,16 +641,15 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
 
             // Check if column name exists in glossary
-            var entry = glossary.GetEntry(columnName);
-            if (entry == null)
+            if (!glossary.HasEntry(columnName))
             {
                 return ValidationResult.Invalid(
                     $"'{columnName}' not found in glossary. This column name is not allowed.",
                     RuleName);
             }
 
-            // Valid - return with glossary entry for further processing
-            return ValidationResult.ValidWithEntry(entry);
+            // Valid - return with glossary UDP values for further processing
+            return ValidationResult.ValidWithEntry(glossary.GetUdpValues(columnName));
         }
     }
 

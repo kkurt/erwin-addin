@@ -21,6 +21,10 @@ namespace EliteSoft.Erwin.AddIn.Services
         public bool AutoApply { get; set; }
         public bool IsActive { get; set; }
         public int SortOrder { get; set; }
+        public int? ProjectId { get; set; }
+        public int? DependsOnUdpId { get; set; }
+        public string DependsOnUdpValue { get; set; }
+        public string DependsOnUdpName { get; set; }  // Resolved UDP name from JOIN
     }
 
     /// <summary>
@@ -85,6 +89,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                 string dbType = DatabaseService.Instance.GetDbType();
                 string query = GetQuery(dbType);
 
+                var effectiveProjectIds = CorporateContextService.Instance.IsInitialized
+                    ? new HashSet<int>(CorporateContextService.Instance.EffectiveProjectIds)
+                    : null;
+
                 using (var connection = DatabaseService.Instance.CreateConnection())
                 {
                     connection.Open();
@@ -95,6 +103,14 @@ namespace EliteSoft.Erwin.AddIn.Services
                         {
                             while (reader.Read())
                             {
+                                // Corporate scope filter
+                                if (effectiveProjectIds != null)
+                                {
+                                    int rowProjectId = reader["PROJECT_ID"] == DBNull.Value ? 0 : Convert.ToInt32(reader["PROJECT_ID"]);
+                                    if (rowProjectId > 0 && !effectiveProjectIds.Contains(rowProjectId))
+                                        continue;
+                                }
+
                                 var rule = new NamingStandardRule
                                 {
                                     Id = Convert.ToInt32(reader["ID"]),
@@ -107,7 +123,11 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     ErrorMessage = reader["ERROR_MESSAGE"] == DBNull.Value ? "" : reader["ERROR_MESSAGE"]?.ToString() ?? "",
                                     AutoApply = reader["AUTO_APPLY"] != DBNull.Value && Convert.ToBoolean(reader["AUTO_APPLY"]),
                                     IsActive = Convert.ToBoolean(reader["IS_ACTIVE"]),
-                                    SortOrder = reader["SORT_ORDER"] == DBNull.Value ? 0 : Convert.ToInt32(reader["SORT_ORDER"])
+                                    SortOrder = reader["SORT_ORDER"] == DBNull.Value ? 0 : Convert.ToInt32(reader["SORT_ORDER"]),
+                                    ProjectId = reader["PROJECT_ID"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["PROJECT_ID"]),
+                                    DependsOnUdpId = reader["DEPENDS_ON_UDP_ID"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["DEPENDS_ON_UDP_ID"]),
+                                    DependsOnUdpValue = reader["DEPENDS_ON_UDP_VALUE"] == DBNull.Value ? "" : reader["DEPENDS_ON_UDP_VALUE"]?.ToString()?.Trim() ?? "",
+                                    DependsOnUdpName = reader["UDP_NAME"] == DBNull.Value ? "" : reader["UDP_NAME"]?.ToString()?.Trim() ?? ""
                                 };
 
                                 if (!rule.IsActive) continue;
@@ -141,26 +161,35 @@ namespace EliteSoft.Erwin.AddIn.Services
             switch (dbType?.ToUpper())
             {
                 case "POSTGRESQL":
-                    return @"SELECT ""ID"", ""OBJECT_TYPE"", ""PREFIX"", ""SUFFIX"", ""LENGTH_OPERATOR"", ""LENGTH_VALUE"",
-                            ""REGEXP_PATTERN"", ""ERROR_MESSAGE"", ""AUTO_APPLY"", ""IS_ACTIVE"", ""SORT_ORDER""
-                            FROM ""MC_NAMING_STANDARD""
-                            WHERE ""IS_ACTIVE"" = true
-                            ORDER BY ""OBJECT_TYPE"", ""SORT_ORDER""";
+                    return @"SELECT ns.""ID"", ns.""OBJECT_TYPE"", ns.""PREFIX"", ns.""SUFFIX"", ns.""LENGTH_OPERATOR"", ns.""LENGTH_VALUE"",
+                            ns.""REGEXP_PATTERN"", ns.""ERROR_MESSAGE"", ns.""AUTO_APPLY"", ns.""IS_ACTIVE"", ns.""SORT_ORDER"",
+                            ns.""PROJECT_ID"", ns.""DEPENDS_ON_UDP_ID"", ns.""DEPENDS_ON_UDP_VALUE"",
+                            udp.""NAME"" AS ""UDP_NAME""
+                            FROM ""MC_NAMING_STANDARD"" ns
+                            LEFT JOIN ""MC_UDP_DEFINITION"" udp ON ns.""DEPENDS_ON_UDP_ID"" = udp.""ID""
+                            WHERE ns.""IS_ACTIVE"" = true
+                            ORDER BY ns.""OBJECT_TYPE"", ns.""SORT_ORDER""";
 
                 case "ORACLE":
-                    return @"SELECT ID, OBJECT_TYPE, PREFIX, SUFFIX, LENGTH_OPERATOR, LENGTH_VALUE,
-                            REGEXP_PATTERN, ERROR_MESSAGE, AUTO_APPLY, IS_ACTIVE, SORT_ORDER
-                            FROM MC_NAMING_STANDARD
-                            WHERE IS_ACTIVE = 1
-                            ORDER BY OBJECT_TYPE, SORT_ORDER";
+                    return @"SELECT ns.ID, ns.OBJECT_TYPE, ns.PREFIX, ns.SUFFIX, ns.LENGTH_OPERATOR, ns.LENGTH_VALUE,
+                            ns.REGEXP_PATTERN, ns.ERROR_MESSAGE, ns.AUTO_APPLY, ns.IS_ACTIVE, ns.SORT_ORDER,
+                            ns.PROJECT_ID, ns.DEPENDS_ON_UDP_ID, ns.DEPENDS_ON_UDP_VALUE,
+                            udp.NAME AS UDP_NAME
+                            FROM MC_NAMING_STANDARD ns
+                            LEFT JOIN MC_UDP_DEFINITION udp ON ns.DEPENDS_ON_UDP_ID = udp.ID
+                            WHERE ns.IS_ACTIVE = 1
+                            ORDER BY ns.OBJECT_TYPE, ns.SORT_ORDER";
 
                 case "MSSQL":
                 default:
-                    return @"SELECT [ID], [OBJECT_TYPE], [PREFIX], [SUFFIX], [LENGTH_OPERATOR], [LENGTH_VALUE],
-                            [REGEXP_PATTERN], [ERROR_MESSAGE], [AUTO_APPLY], [IS_ACTIVE], [SORT_ORDER]
-                            FROM [dbo].[MC_NAMING_STANDARD]
-                            WHERE [IS_ACTIVE] = 1
-                            ORDER BY [OBJECT_TYPE], [SORT_ORDER]";
+                    return @"SELECT ns.[ID], ns.[OBJECT_TYPE], ns.[PREFIX], ns.[SUFFIX], ns.[LENGTH_OPERATOR], ns.[LENGTH_VALUE],
+                            ns.[REGEXP_PATTERN], ns.[ERROR_MESSAGE], ns.[AUTO_APPLY], ns.[IS_ACTIVE], ns.[SORT_ORDER],
+                            ns.[PROJECT_ID], ns.[DEPENDS_ON_UDP_ID], ns.[DEPENDS_ON_UDP_VALUE],
+                            udp.[NAME] AS [UDP_NAME]
+                            FROM [dbo].[MC_NAMING_STANDARD] ns
+                            LEFT JOIN [dbo].[MC_UDP_DEFINITION] udp ON ns.[DEPENDS_ON_UDP_ID] = udp.[ID]
+                            WHERE ns.[IS_ACTIVE] = 1
+                            ORDER BY ns.[OBJECT_TYPE], ns.[SORT_ORDER]";
             }
         }
 

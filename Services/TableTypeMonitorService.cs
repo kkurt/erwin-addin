@@ -6,21 +6,8 @@ using System.Windows.Forms;
 namespace EliteSoft.Erwin.AddIn.Services
 {
     /// <summary>
-    /// Event args for TABLE_TYPE UDP changes
-    /// </summary>
-    public class TableTypeChangedEventArgs : EventArgs
-    {
-        public string TableName { get; set; }
-        public string PhysicalName { get; set; }
-        public string TableTypeValue { get; set; }
-        public string OldPhysicalName { get; set; }
-        public string NewPhysicalName { get; set; }
-        public TableTypeEntry TableTypeEntry { get; set; }
-    }
-
-    /// <summary>
-    /// Service to monitor TABLE_TYPE UDP changes on entities (tables)
-    /// and automatically apply prefix based on NAME_EXTENSION_LOCATION
+    /// Service to monitor entity changes, enforce naming standards,
+    /// and add UDP-based predefined columns automatically.
     /// </summary>
     public class TableTypeMonitorService : IDisposable
     {
@@ -28,8 +15,12 @@ namespace EliteSoft.Erwin.AddIn.Services
         private bool _isMonitoring;
         private bool _disposed;
 
-        // Snapshot of entity TABLE_TYPE values: ObjectId -> (PhysicalName, TableTypeValue)
+        // Snapshot of entity state: ObjectId -> EntitySnapshot
         private Dictionary<string, EntitySnapshot> _entitySnapshots;
+
+        // Throttle counter for expensive operations (Key_Group/View/SA scans)
+        private int _cycleCount;
+        private const int HeavyScanInterval = 4; // Every 4 cycles (2 seconds at 500ms tick)
 
         // Snapshot of Key_Group (Index) names: ObjectId -> PhysicalName
         private Dictionary<string, string> _keyGroupSnapshots;
@@ -105,7 +96,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// Start monitoring TABLE_TYPE UDP changes (timer managed by ValidationCoordinatorService)
+        /// Start monitoring entity changes (timer managed by ValidationCoordinatorService)
         /// </summary>
         public void StartMonitoring()
         {
@@ -145,7 +136,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                     string objectId = "";
                     string entityName = "";
                     string physicalName = "";
-                    string tableTypeValue = "";
 
                     try { objectId = entity.ObjectId?.ToString() ?? ""; }
                     catch (Exception ex) { Log($"ObjectId read error: {ex.Message}"); continue; }
@@ -158,21 +148,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                     }
                     catch (Exception ex) { physicalName = entityName; Log($"Physical_Name read error: {ex.Message}"); }
 
-                    // Get TABLE_TYPE UDP value
-                    try
-                    {
-                        tableTypeValue = entity.Properties("Entity.Physical.TABLE_TYPE").Value?.ToString() ?? "";
-                    }
-                    catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"TABLE_TYPE read error: {ex.Message}"); }
-
                     if (!string.IsNullOrEmpty(objectId))
                     {
                         var snapshot = new EntitySnapshot
                         {
                             ObjectId = objectId,
                             EntityName = entityName,
-                            PhysicalName = physicalName,
-                            TableTypeValue = tableTypeValue
+                            PhysicalName = physicalName
                         };
 
                         // Also snapshot UDP values for dependency monitoring
@@ -224,12 +206,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// Timer tick - check for TABLE_TYPE UDP changes
-        /// </summary>
-
-
-        /// <summary>
-        /// Check for TABLE_TYPE UDP value changes (called by ValidationCoordinatorService)
+        /// Check for entity changes (called by ValidationCoordinatorService)
         /// </summary>
         public void CheckForTableTypeChanges()
         {
@@ -251,7 +228,8 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// Check for TABLE_TYPE UDP value changes using pre-collected entity list (avoids double model scan)
+        /// Check for entity changes using pre-collected entity list (avoids double model scan).
+        /// Detects new entities, physical name changes, and UDP value changes.
         /// </summary>
         public void CheckForTableTypeChanges(dynamic allEntities)
         {
@@ -267,7 +245,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                     string objectId = "";
                     string entityName = "";
                     string physicalName = "";
-                    string tableTypeValue = "";
 
                     try { objectId = entity.ObjectId?.ToString() ?? ""; }
                     catch (Exception ex) { Log($"ObjectId read error: {ex.Message}"); continue; }
@@ -280,69 +257,14 @@ namespace EliteSoft.Erwin.AddIn.Services
                     }
                     catch (Exception ex) { physicalName = entityName; Log($"Physical_Name read error: {ex.Message}"); }
 
-                    // Get TABLE_TYPE UDP value
-                    try
-                    {
-                        tableTypeValue = entity.Properties("Entity.Physical.TABLE_TYPE").Value?.ToString() ?? "";
-                    }
-                    catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"TABLE_TYPE read error: {ex.Message}"); }
-
-                    // Check if this is a new entity or TABLE_TYPE changed
+                    // Check if this is a new entity or physical name changed
                     bool isNew = !_entitySnapshots.ContainsKey(objectId);
-                    bool tableTypeChanged = !isNew &&
-                        !string.IsNullOrEmpty(tableTypeValue) &&
-                        _entitySnapshots[objectId].TableTypeValue != tableTypeValue;
 
                     // Check if physical name changed (user manually edited the table name)
                     bool physicalNameChanged = !isNew &&
                         _entitySnapshots[objectId].PhysicalName != physicalName;
 
-                    if (tableTypeChanged)
-                    {
-                        string oldTableType = _entitySnapshots[objectId].TableTypeValue;
-                        Log($"TABLE_TYPE changed for '{physicalName}': '{oldTableType}' -> '{tableTypeValue}'");
-
-                        // Update snapshot FIRST to prevent duplicate popups
-                        _entitySnapshots[objectId] = new EntitySnapshot
-                        {
-                            ObjectId = objectId,
-                            EntityName = entityName,
-                            PhysicalName = physicalName,
-                            TableTypeValue = tableTypeValue
-                        };
-
-                        // If old TABLE_TYPE had predefined columns, ask user if they want to delete them
-                        if (!string.IsNullOrEmpty(oldTableType))
-                        {
-                            var oldTableTypeEntry = TableTypeService.Instance.GetByName(oldTableType);
-                            if (oldTableTypeEntry != null)
-                            {
-                                RemoveOldPredefinedColumnsWithConfirmation(entity, oldTableTypeEntry, physicalName);
-                            }
-                        }
-
-                        // Get the TableTypeEntry for the new value
-                        var tableTypeEntry = TableTypeService.Instance.GetByName(tableTypeValue);
-                        if (tableTypeEntry != null)
-                        {
-                            // Apply affix based on NAME_EXTENSION_LOCATION
-                            ApplyTableTypeAffix(entity, physicalName, tableTypeEntry);
-                        }
-
-                        // Evaluate UDP dependencies triggered by TABLE_TYPE change
-                        if (_udpRuntimeService != null && _udpRuntimeService.IsInitialized)
-                        {
-                            try
-                            {
-                                _udpRuntimeService.HandleUdpValueChange(entity, "TABLE_TYPE", tableTypeValue);
-                            }
-                            catch (Exception ex)
-                            {
-                                Log($"UDP dependency evaluation error for '{physicalName}': {ex.Message}");
-                            }
-                        }
-                    }
-                    else if (physicalNameChanged)
+                    if (physicalNameChanged)
                     {
                         // Physical name changed (user manually edited table name)
                         string oldPhysicalName = _entitySnapshots[objectId].PhysicalName;
@@ -351,23 +273,14 @@ namespace EliteSoft.Erwin.AddIn.Services
                         // Validate Table naming standards (with auto-apply)
                         ValidateNamingStandard("Table", physicalName, entity);
 
-                        // If TABLE_TYPE is set, check if affix needs to be reapplied
-                        if (!string.IsNullOrEmpty(tableTypeValue))
-                        {
-                            var tableTypeEntry = TableTypeService.Instance.GetByName(tableTypeValue);
-                            if (tableTypeEntry != null && !tableTypeEntry.HasAffixApplied(physicalName))
-                            {
-                                Log($"Affix missing after name change, reapplying for TABLE_TYPE '{tableTypeValue}'");
-                                ApplyTableTypeAffix(entity, physicalName, tableTypeEntry);
-                            }
-                        }
-
                         // Update snapshot with new name
                         _entitySnapshots[objectId].PhysicalName = physicalName;
                     }
 
-                    // Check for UDP value changes on existing entities (regardless of TABLE_TYPE or name changes)
-                    if (!isNew && _udpRuntimeService != null && _udpRuntimeService.IsInitialized)
+                    // Check for UDP value changes only on existing entities with known snapshots
+                    // This reads UDP values via COM — only done for entities already in snapshot
+                    if (!isNew && !physicalNameChanged && _udpRuntimeService != null && _udpRuntimeService.IsInitialized
+                        && _entitySnapshots.ContainsKey(objectId) && _entitySnapshots[objectId].UdpValues.Count > 0)
                     {
                         CheckForUdpValueChanges(entity, objectId, physicalName);
                     }
@@ -379,8 +292,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                         {
                             ObjectId = objectId,
                             EntityName = entityName,
-                            PhysicalName = physicalName,
-                            TableTypeValue = tableTypeValue
+                            PhysicalName = physicalName
                         };
 
                         // Add new entity to diagram automatically
@@ -409,17 +321,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                             }
                         }
 
-                        // If new entity already has TABLE_TYPE set, apply affix
-                        if (!string.IsNullOrEmpty(tableTypeValue))
-                        {
-                            var tableTypeEntry = TableTypeService.Instance.GetByName(tableTypeValue);
-                            if (tableTypeEntry != null && !tableTypeEntry.HasAffixApplied(physicalName))
-                            {
-                                Log($"New entity '{physicalName}' with TABLE_TYPE '{tableTypeValue}'");
-                                ApplyTableTypeAffix(entity, physicalName, tableTypeEntry);
-                            }
-                        }
-
                         // Validate Table naming standards for new entity (with auto-apply)
                         ValidateNamingStandard("Table", physicalName, entity);
                     }
@@ -430,8 +331,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                 System.Diagnostics.Debug.WriteLine($"CheckForTableTypeChanges error: {ex.Message}");
             }
 
-            // Check Key_Group (Index) and View naming standards
-            CheckKeyGroupAndViewNaming();
+            // Check Key_Group, View, Subject Area naming (throttled — 3 model scans per call)
+            _cycleCount++;
+            if (_cycleCount % HeavyScanInterval == 0)
+            {
+                CheckKeyGroupAndViewNaming();
+            }
         }
 
         /// <summary>
@@ -447,35 +352,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                 dynamic root = modelObjects.Root;
                 if (root == null) return;
 
-                // Key_Group (Index) monitoring
-                try
-                {
-                    dynamic allKeyGroups = modelObjects.Collect(root, "Key_Group");
-                    if (allKeyGroups != null)
-                    {
-                        foreach (dynamic kg in allKeyGroups)
-                        {
-                            if (kg == null) continue;
-                            try
-                            {
-                                string kgId = kg.ObjectId?.ToString() ?? "";
-                                string kgName = kg.Name ?? "";
-                                if (string.IsNullOrEmpty(kgId) || string.IsNullOrEmpty(kgName)) continue;
-
-                                bool isNew = !_keyGroupSnapshots.ContainsKey(kgId);
-                                bool nameChanged = !isNew && _keyGroupSnapshots[kgId] != kgName;
-
-                                if (isNew || nameChanged)
-                                {
-                                    ValidateNamingStandard("Index", kgName, kg);
-                                    _keyGroupSnapshots[kgId] = kgName;
-                                }
-                            }
-                            catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"Key_Group naming check error: {ex.Message}"); }
-                        }
-                    }
-                }
-                catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"Key_Group collect error: {ex.Message}"); }
+                // Key_Group (Index) monitoring moved to ValidationCoordinatorService.CheckEntityKeyGroups
+                // (runs during entity batch scan — no separate Collect needed)
 
                 // View monitoring
                 try
@@ -502,7 +380,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 bool isNew = !_keyGroupSnapshots.ContainsKey("V_" + viewId);
                                 bool nameChanged = !isNew && _keyGroupSnapshots["V_" + viewId] != viewName;
 
-                                if (isNew || nameChanged)
+                                if (isNew)
+                                {
+                                    // New view — just snapshot, validate on name change
+                                    _keyGroupSnapshots["V_" + viewId] = viewName;
+                                }
+                                else if (nameChanged)
                                 {
                                     ValidateNamingStandard("View", viewName, view);
                                     _keyGroupSnapshots["V_" + viewId] = viewName;
@@ -533,7 +416,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 bool isNew = !_keyGroupSnapshots.ContainsKey(saKey);
                                 bool nameChanged = !isNew && _keyGroupSnapshots[saKey] != saName;
 
-                                if (isNew || nameChanged)
+                                if (isNew)
+                                {
+                                    // New SA — just snapshot, validate on name change
+                                    _keyGroupSnapshots[saKey] = saName;
+                                }
+                                else if (nameChanged)
                                 {
                                     ValidateNamingStandard("Subject Area", saName, sa);
                                     _keyGroupSnapshots[saKey] = saName;
@@ -548,314 +436,6 @@ namespace EliteSoft.Erwin.AddIn.Services
             catch (Exception ex)
             {
                 System.Diagnostics.Debug.WriteLine($"CheckKeyGroupAndViewNaming error: {ex.Message}");
-            }
-        }
-
-        /// <summary>
-        /// Ask user if they want to remove old predefined columns when TABLE_TYPE changes
-        /// </summary>
-        private void RemoveOldPredefinedColumnsWithConfirmation(dynamic entity, TableTypeEntry oldTableTypeEntry, string tableName)
-        {
-            try
-            {
-                // Ensure PredefinedColumnService is loaded
-                if (!PredefinedColumnService.Instance.IsLoaded)
-                {
-                    PredefinedColumnService.Instance.LoadPredefinedColumns();
-                }
-
-                var oldPredefinedColumns = PredefinedColumnService.Instance.GetByTableTypeId(oldTableTypeEntry.Id);
-                if (!oldPredefinedColumns.Any())
-                {
-                    Log($"No predefined columns to remove for old TABLE_TYPE '{oldTableTypeEntry.Name}'");
-                    return;
-                }
-
-                // Get existing attributes (columns) of the entity
-                dynamic modelObjects = _session.ModelObjects;
-                var columnsToRemove = new List<dynamic>();
-                var columnNamesToRemove = new List<string>();
-
-                try
-                {
-                    dynamic attributes = modelObjects.Collect(entity, "Attribute");
-                    if (attributes != null)
-                    {
-                        foreach (dynamic attr in attributes)
-                        {
-                            try
-                            {
-                                string attrName = attr.Name ?? "";
-                                // Check if this column is from the old TABLE_TYPE's predefined columns
-                                if (oldPredefinedColumns.Any(pc => pc.Name.Equals(attrName, StringComparison.OrdinalIgnoreCase)))
-                                {
-                                    columnsToRemove.Add(attr);
-                                    columnNamesToRemove.Add(attrName);
-                                }
-                            }
-                            catch (Exception ex) { Log($"RemoveOldPredefined: Error reading attr name: {ex.Message}"); }
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Log($"Error checking existing columns: {ex.Message}");
-                    return;
-                }
-
-                if (!columnsToRemove.Any())
-                {
-                    Log($"No matching predefined columns found to remove for old TABLE_TYPE '{oldTableTypeEntry.Name}'");
-                    return;
-                }
-
-                // Show confirmation dialog
-                string columnList = string.Join(", ", columnNamesToRemove);
-                var result = MessageBox.Show(
-                    $"TABLE_TYPE has changed for table '{tableName}'.\n\n" +
-                    $"Do you want to delete the following columns that were added for the old TABLE_TYPE '{oldTableTypeEntry.Name}'?\n\n" +
-                    $"{columnList}",
-                    "Delete Old Predefined Columns?",
-                    MessageBoxButtons.YesNo,
-                    MessageBoxIcon.Question);
-
-                if (result == DialogResult.Yes)
-                {
-                    int deletedCount = 0;
-                    foreach (dynamic attr in columnsToRemove)
-                    {
-                        try
-                        {
-                            int transId = _session.BeginNamedTransaction("DeleteOldPredefinedColumn");
-                            try
-                            {
-                                string attrName = attr.Name ?? "";
-                                modelObjects.Remove(attr);
-                                _session.CommitTransaction(transId);
-                                deletedCount++;
-                                Log($"Deleted old predefined column '{attrName}'");
-                            }
-                            catch (Exception ex)
-                            {
-                                try { _session.RollbackTransaction(transId); }
-                                catch (Exception rbEx) { Log($"Rollback failed: {rbEx.Message}"); }
-                                Log($"Error deleting column: {ex.Message}");
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            Log($"Error removing attribute: {ex.Message}");
-                        }
-                    }
-
-                    if (deletedCount > 0)
-                    {
-                        Log($"Deleted {deletedCount} old predefined column(s)");
-                    }
-                }
-                else
-                {
-                    Log($"User chose to keep old predefined columns");
-                }
-            }
-            catch (Exception ex)
-            {
-                Log($"RemoveOldPredefinedColumnsWithConfirmation error: {ex.Message}");
-            }
-        }
-
-        /// <summary>
-        /// Apply affix to table physical name based on TABLE_TYPE entry
-        /// First removes any existing affix, then applies the new one
-        /// Also adds predefined columns for the TABLE_TYPE
-        /// </summary>
-        private void ApplyTableTypeAffix(dynamic entity, string currentPhysicalName, TableTypeEntry tableTypeEntry)
-        {
-            try
-            {
-                // Check if the correct affix is already applied
-                bool affixAlreadyApplied = tableTypeEntry.HasAffixApplied(currentPhysicalName);
-
-                if (!affixAlreadyApplied)
-                {
-                    // First, remove any existing affix from other TABLE_TYPEs
-                    string cleanName = TableTypeService.Instance.RemoveAllAffixes(currentPhysicalName);
-
-                    if (cleanName != currentPhysicalName)
-                    {
-                        Log($"Removed old affix: '{currentPhysicalName}' -> '{cleanName}'");
-                    }
-
-                    // Now apply the new affix
-                    string newPhysicalName = tableTypeEntry.ApplyAffix(cleanName);
-
-                    if (newPhysicalName != currentPhysicalName)
-                    {
-                        Log($"Applying affix: '{currentPhysicalName}' -> '{newPhysicalName}'");
-
-                        // Update the Physical_Name
-                        int transId = _session.BeginNamedTransaction("ApplyTableTypeAffix");
-                        try
-                        {
-                            entity.Properties("Physical_Name").Value = newPhysicalName;
-                            _session.CommitTransaction(transId);
-
-                            Log($"Successfully renamed table to '{newPhysicalName}'");
-
-                            // Update snapshot with new name
-                            string objectId = entity.ObjectId?.ToString() ?? "";
-                            if (_entitySnapshots.ContainsKey(objectId))
-                            {
-                                _entitySnapshots[objectId].PhysicalName = newPhysicalName;
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            try { _session.RollbackTransaction(transId); }
-                            catch (Exception rbEx) { Log($"ApplyAffix: Rollback failed: {rbEx.Message}"); }
-                            Log($"Error applying affix: {ex.Message}");
-                        }
-                    }
-                    else
-                    {
-                        Log($"No affix change needed for '{currentPhysicalName}'");
-                    }
-                }
-                else
-                {
-                    Log($"Correct affix already applied to '{currentPhysicalName}'");
-                }
-
-                // Add predefined columns for this TABLE_TYPE
-                AddPredefinedColumns(entity, tableTypeEntry);
-            }
-            catch (Exception ex)
-            {
-                Log($"ApplyTableTypeAffix error: {ex.Message}");
-            }
-        }
-
-        /// <summary>
-        /// Add predefined columns to the entity based on TABLE_TYPE
-        /// </summary>
-        private void AddPredefinedColumns(dynamic entity, TableTypeEntry tableTypeEntry)
-        {
-            try
-            {
-                // Ensure PredefinedColumnService is loaded
-                if (!PredefinedColumnService.Instance.IsLoaded)
-                {
-                    PredefinedColumnService.Instance.LoadPredefinedColumns();
-                }
-
-                var predefinedColumns = PredefinedColumnService.Instance.GetByTableTypeId(tableTypeEntry.Id);
-                if (!predefinedColumns.Any())
-                {
-                    Log($"No predefined columns for TABLE_TYPE '{tableTypeEntry.Name}'");
-                    return;
-                }
-
-                // Get existing attributes (columns) of the entity
-                dynamic modelObjects = _session.ModelObjects;
-                var existingColumnNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-                try
-                {
-                    dynamic attributes = modelObjects.Collect(entity, "Attribute");
-                    if (attributes != null)
-                    {
-                        foreach (dynamic attr in attributes)
-                        {
-                            try
-                            {
-                                string attrName = attr.Name ?? "";
-                                if (!string.IsNullOrEmpty(attrName))
-                                {
-                                    existingColumnNames.Add(attrName);
-                                }
-                            }
-                            catch (Exception ex) { Log($"AddPredefined: Error reading attr name: {ex.Message}"); }
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Log($"Error getting existing columns: {ex.Message}");
-                }
-
-                int addedCount = 0;
-                foreach (var predefinedCol in predefinedColumns)
-                {
-                    // Skip if column already exists
-                    if (existingColumnNames.Contains(predefinedCol.Name))
-                    {
-                        Log($"Column '{predefinedCol.Name}' already exists, skipping");
-                        continue;
-                    }
-
-                    try
-                    {
-                        // Use ErwinUtilities.CreateAttribute which is already working
-                        dynamic newAttribute = ErwinUtilities.CreateAttribute(_session, entity, predefinedCol.Name);
-
-                        if (newAttribute != null)
-                        {
-                            // Set additional properties in separate transaction
-                            int transId = _session.BeginNamedTransaction("SetAttributeProperties");
-                            try
-                            {
-                                // Set physical name
-                                try
-                                {
-                                    newAttribute.Properties("Physical_Name").Value = predefinedCol.Name;
-                                }
-                                catch (Exception ex) { Log($"AddPredefined: Failed to set Physical_Name for '{predefinedCol.Name}': {ex.Message}"); }
-
-                                // Set data type
-                                try
-                                {
-                                    newAttribute.Properties("Physical_Data_Type").Value = predefinedCol.DataType;
-                                }
-                                catch (Exception ex) { Log($"AddPredefined: Failed to set Physical_Data_Type for '{predefinedCol.Name}': {ex.Message}"); }
-
-                                // Set nullability
-                                try
-                                {
-                                    newAttribute.Properties("Null_Option_Type").Value = predefinedCol.Nullable ? 0 : 1;
-                                }
-                                catch (Exception ex) { Log($"AddPredefined: Failed to set Null_Option_Type for '{predefinedCol.Name}': {ex.Message}"); }
-
-                                _session.CommitTransaction(transId);
-                            }
-                            catch (Exception ex)
-                            {
-                                try { _session.RollbackTransaction(transId); }
-                                catch (Exception rbEx) { Log($"AddPredefined: Rollback failed: {rbEx.Message}"); }
-                                Log($"AddPredefined: Transaction failed for '{predefinedCol.Name}': {ex.Message}");
-                            }
-
-                            addedCount++;
-                            Log($"Added predefined column '{predefinedCol.Name}' ({predefinedCol.DataType})");
-                        }
-                        else
-                        {
-                            Log($"Failed to create attribute '{predefinedCol.Name}'");
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Log($"Error adding column '{predefinedCol.Name}': {ex.Message}");
-                    }
-                }
-
-                if (addedCount > 0)
-                {
-                    Log($"Added {addedCount} predefined column(s) to entity");
-                }
-            }
-            catch (Exception ex)
-            {
-                Log($"AddPredefinedColumns error: {ex.Message}");
             }
         }
 
@@ -1109,7 +689,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                 var currentValues = _udpRuntimeService.ReadUdpValues(entity);
                 if (currentValues.Count == 0) return;
 
-                // Compare with snapshot
+                // Compare with snapshot — only process changes
+                bool anyChanged = false;
                 foreach (var kvp in currentValues)
                 {
                     string oldValue = "";
@@ -1118,26 +699,168 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                     if (kvp.Value != oldValue)
                     {
+                        anyChanged = true;
                         Log($"UDP '{kvp.Key}' changed on '{physicalName}': '{oldValue}' -> '{kvp.Value}'");
 
                         // Evaluate dependencies for this change
                         _udpRuntimeService.HandleUdpValueChange(entity, kvp.Key, kvp.Value);
 
-                        // Update snapshot with new value
+                        // Check if this UDP change triggers predefined columns
+                        var newPredefined = PredefinedColumnService.Instance.GetByUdpCondition(kvp.Key, kvp.Value);
+                        if (newPredefined.Any())
+                        {
+                            AddPredefinedColumnsForUdp(entity, kvp.Key, kvp.Value, physicalName);
+                        }
+
                         snapshot.UdpValues[kvp.Key] = kvp.Value;
                     }
                 }
 
-                // Re-read after dependency writes (dependencies might have changed other values)
-                var updatedValues = _udpRuntimeService.ReadUdpValues(entity);
-                foreach (var kvp in updatedValues)
+                // Only re-read if dependencies actually changed something
+                if (anyChanged)
                 {
-                    snapshot.UdpValues[kvp.Key] = kvp.Value;
+                    var updatedValues = _udpRuntimeService.ReadUdpValues(entity);
+                    foreach (var kvp in updatedValues)
+                    {
+                        snapshot.UdpValues[kvp.Key] = kvp.Value;
+                    }
                 }
             }
             catch (Exception ex)
             {
                 Log($"CheckForUdpValueChanges error for '{physicalName}': {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Add predefined columns to the entity based on a UDP condition match.
+        /// Called when a UDP value change matches predefined column rules.
+        /// </summary>
+        private void AddPredefinedColumnsForUdp(dynamic entity, string udpName, string udpValue, string physicalName)
+        {
+            try
+            {
+                // Ensure PredefinedColumnService is loaded
+                if (!PredefinedColumnService.Instance.IsLoaded)
+                {
+                    PredefinedColumnService.Instance.LoadPredefinedColumns();
+                }
+
+                var predefinedColumns = PredefinedColumnService.Instance.GetByUdpCondition(udpName, udpValue);
+                if (!predefinedColumns.Any())
+                {
+                    return;
+                }
+
+                // Get existing attributes (columns) of the entity
+                dynamic modelObjects = _session.ModelObjects;
+                var existingColumnNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                try
+                {
+                    dynamic attributes = modelObjects.Collect(entity, "Attribute");
+                    if (attributes != null)
+                    {
+                        foreach (dynamic attr in attributes)
+                        {
+                            try
+                            {
+                                string attrName = attr.Name ?? "";
+                                if (!string.IsNullOrEmpty(attrName))
+                                {
+                                    existingColumnNames.Add(attrName);
+                                }
+                            }
+                            catch (Exception ex) { Log($"AddPredefinedForUdp: Error reading attr name: {ex.Message}"); }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log($"Error getting existing columns for '{physicalName}': {ex.Message}");
+                }
+
+                int addedCount = 0;
+                foreach (var col in predefinedColumns)
+                {
+                    // Skip if column already exists
+                    if (existingColumnNames.Contains(col.ColumnName))
+                    {
+                        Log($"Column '{col.ColumnName}' already exists on '{physicalName}', skipping");
+                        continue;
+                    }
+
+                    try
+                    {
+                        dynamic newAttribute = ErwinUtilities.CreateAttribute(_session, entity, col.ColumnName);
+
+                        if (newAttribute != null)
+                        {
+                            int transId = _session.BeginNamedTransaction("SetPredefinedColumnProperties");
+                            try
+                            {
+                                // Set physical name
+                                try
+                                {
+                                    newAttribute.Properties("Physical_Name").Value = col.ColumnName;
+                                }
+                                catch (Exception ex) { Log($"AddPredefinedForUdp: Failed to set Physical_Name for '{col.ColumnName}': {ex.Message}"); }
+
+                                // Set data type
+                                try
+                                {
+                                    newAttribute.Properties("Physical_Data_Type").Value = col.DataType;
+                                }
+                                catch (Exception ex) { Log($"AddPredefinedForUdp: Failed to set Physical_Data_Type for '{col.ColumnName}': {ex.Message}"); }
+
+                                // Set nullability
+                                try
+                                {
+                                    newAttribute.Properties("Null_Option_Type").Value = col.Nullable ? 0 : 1;
+                                }
+                                catch (Exception ex) { Log($"AddPredefinedForUdp: Failed to set Null_Option_Type for '{col.ColumnName}': {ex.Message}"); }
+
+                                // Set default value if specified
+                                if (!string.IsNullOrEmpty(col.DefaultValue))
+                                {
+                                    try
+                                    {
+                                        newAttribute.Properties("Physical_Default_Value").Value = col.DefaultValue;
+                                    }
+                                    catch (Exception ex) { Log($"AddPredefinedForUdp: Failed to set default value for '{col.ColumnName}': {ex.Message}"); }
+                                }
+
+                                _session.CommitTransaction(transId);
+                            }
+                            catch (Exception ex)
+                            {
+                                try { _session.RollbackTransaction(transId); }
+                                catch (Exception rbEx) { Log($"AddPredefinedForUdp: Rollback failed: {rbEx.Message}"); }
+                                Log($"AddPredefinedForUdp: Transaction failed for '{col.ColumnName}': {ex.Message}");
+                            }
+
+                            addedCount++;
+                            Log($"Added predefined column '{col.ColumnName}' ({col.DataType}) for UDP '{udpName}'='{udpValue}'");
+                        }
+                        else
+                        {
+                            Log($"Failed to create attribute '{col.ColumnName}'");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"Error adding predefined column '{col.ColumnName}': {ex.Message}");
+                    }
+                }
+
+                if (addedCount > 0)
+                {
+                    Log($"Added {addedCount} predefined column(s) to '{physicalName}' for UDP '{udpName}'='{udpValue}'");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"AddPredefinedColumnsForUdp error for '{physicalName}': {ex.Message}");
             }
         }
 
@@ -1163,7 +886,6 @@ namespace EliteSoft.Erwin.AddIn.Services
             public string ObjectId { get; set; }
             public string EntityName { get; set; }
             public string PhysicalName { get; set; }
-            public string TableTypeValue { get; set; }
             /// <summary>UDP name -> value snapshot for dependency change detection</summary>
             public Dictionary<string, string> UdpValues { get; set; } = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         }

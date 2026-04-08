@@ -50,6 +50,9 @@ namespace EliteSoft.Erwin.AddIn.Services
         // Snapshot of all attributes
         private Dictionary<string, AttributeValidationSnapshot> _attributeSnapshots;
 
+        // Snapshot of Key_Group (Index) names for naming standard checks
+        private Dictionary<string, string> _keyGroupSnapshots;
+
         // Cache of Domain ObjectId -> Domain Name
         private Dictionary<string, string> _domainCache;
 
@@ -71,6 +74,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             _session = session;
             _scapi = scapi;
             _attributeSnapshots = new Dictionary<string, AttributeValidationSnapshot>();
+            _keyGroupSnapshots = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             _domainCache = new Dictionary<string, string>();
             _pendingResults = new List<CollectedValidationResult>();
 
@@ -133,6 +137,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             try
             {
                 _attributeSnapshots.Clear();
+                _keyGroupSnapshots.Clear();
                 _domainCache.Clear();
 
                 dynamic modelObjects = _session.ModelObjects;
@@ -175,11 +180,33 @@ namespace EliteSoft.Erwin.AddIn.Services
                             }
                         }
                         finally { ReleaseCom(entityAttrs); }
+
+                        // Snapshot Key_Groups for this entity (so they're not flagged as "new" on first check)
+                        try
+                        {
+                            dynamic keyGroups = modelObjects.Collect(entity, "Key_Group");
+                            if (keyGroups != null)
+                            {
+                                foreach (dynamic kg in keyGroups)
+                                {
+                                    if (kg == null) continue;
+                                    try
+                                    {
+                                        string kgId = kg.ObjectId?.ToString() ?? "";
+                                        string kgName = kg.Name ?? "";
+                                        if (!string.IsNullOrEmpty(kgId))
+                                            _keyGroupSnapshots[kgId] = kgName;
+                                    }
+                                    catch { }
+                                }
+                            }
+                        }
+                        catch { }
                     }
                 }
                 finally { ReleaseCom(allEntities); }
 
-                Log($"ValidationCoordinatorService: Snapshot taken - {_attributeSnapshots.Count} attributes");
+                Log($"ValidationCoordinatorService: Snapshot taken - {_attributeSnapshots.Count} attributes, {_keyGroupSnapshots.Count} key groups");
             }
             catch (Exception ex)
             {
@@ -499,6 +526,9 @@ namespace EliteSoft.Erwin.AddIn.Services
                     }
                 }
                 finally { ReleaseCom(entityAttrs); }
+
+                // Check Key_Group (Index) naming for this entity's indexes
+                CheckEntityKeyGroups(entity, modelObjects, tableName);
             }
             catch (Exception ex)
             {
@@ -543,9 +573,6 @@ namespace EliteSoft.Erwin.AddIn.Services
             bool domainChanged = previousState.DomainParentValue != currentState.DomainParentValue;
             bool hasValidDomain = IsValidDomain(currentState.DomainParentValue);
             bool hadValidDomain = IsValidDomain(previousState.DomainParentValue);
-
-            // Check for Column UDP value changes (dependency evaluation)
-            CheckForColumnUdpValueChanges(attr, previousState, currentState);
 
             // No changes relevant to validation
             if (!physicalNameChanged && !domainChanged) return;
@@ -622,8 +649,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 return;
             }
 
-            var entry = glossary.GetEntry(state.PhysicalName);
-            if (entry == null)
+            if (!glossary.HasEntry(state.PhysicalName))
             {
                 Log($"Glossary validation FAILED: {state.TableName}.{state.PhysicalName}");
                 _pendingResults.Add(new CollectedValidationResult
@@ -638,12 +664,14 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
             else
             {
-                Log($"Glossary validation passed: {state.TableName}.{state.PhysicalName} (DataType={entry.DataType}, Owner={entry.Owner}, Comment='{entry.Comment ?? "NULL"}')");
+                var udpValues = glossary.GetUdpValues(state.PhysicalName);
+                string mappingSummary = udpValues != null ? string.Join(", ", udpValues.Select(kv => $"{kv.Key}={kv.Value}")) : "";
+                Log($"Glossary validation passed: {state.TableName}.{state.PhysicalName} ({mappingSummary})");
 
-                // Apply DataType and Owner from glossary entry
-                if (attr != null)
+                // Apply glossary UDP values dynamically
+                if (attr != null && udpValues != null && udpValues.Count > 0)
                 {
-                    ApplyGlossaryProperties(attr, entry);
+                    ApplyGlossaryUdpValues(attr, udpValues, state.PhysicalName);
                 }
             }
         }
@@ -743,6 +771,90 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// Apply Column UDP defaults (with Glossary mapping if configured).
         /// Called when a new column is added or column name changes.
         /// </summary>
+        /// <summary>
+        /// Check Key_Group (Index) naming for a specific entity's indexes.
+        /// Called during entity batch scan — no separate Collect needed.
+        /// </summary>
+        private void CheckEntityKeyGroups(dynamic entity, dynamic modelObjects, string tableName)
+        {
+            try
+            {
+                dynamic keyGroups = null;
+                try { keyGroups = modelObjects.Collect(entity, "Key_Group"); }
+                catch { return; }
+                if (keyGroups == null) return;
+
+                foreach (dynamic kg in keyGroups)
+                {
+                    if (kg == null) continue;
+                    try
+                    {
+                        string kgId = kg.ObjectId?.ToString() ?? "";
+                        string kgName = kg.Name ?? "";
+                        if (string.IsNullOrEmpty(kgId) || string.IsNullOrEmpty(kgName)) continue;
+
+                        bool isNew = !_keyGroupSnapshots.ContainsKey(kgId);
+                        bool nameChanged = !isNew && _keyGroupSnapshots[kgId] != kgName;
+
+                        if (isNew)
+                        {
+                            // New index — just snapshot, don't validate yet
+                            // (user hasn't had a chance to set the name)
+                            _keyGroupSnapshots[kgId] = kgName;
+                        }
+                        else if (nameChanged)
+                        {
+                            // Name changed — auto-apply prefix/suffix if configured
+                            if (NamingValidationEngine.HasAutoApplyChanges("Index", kgName, (object)kg))
+                            {
+                                string newName = NamingValidationEngine.ApplyNamingStandards("Index", kgName, (object)kg);
+                                var answer = MessageBox.Show(
+                                    $"Naming standard requires changes for index '{tableName}.{kgName}':\n\n" +
+                                    $"'{kgName}' → '{newName}'\n\nApply automatically?",
+                                    "Naming Standard — Auto Apply",
+                                    MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+
+                                if (answer == DialogResult.Yes)
+                                {
+                                    int transId = _session.BeginNamedTransaction("ApplyIndexNaming");
+                                    try
+                                    {
+                                        kg.Properties("Name").Value = newName;
+                                        _session.CommitTransaction(transId);
+                                        Log($"Index naming auto-applied: '{kgName}' → '{newName}'");
+                                        kgName = newName;
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        try { _session.RollbackTransaction(transId); } catch (Exception rbEx) { Log($"Index naming rollback error: {rbEx.Message}"); }
+                                        Log($"Index naming auto-apply failed: {ex.Message}");
+                                    }
+                                }
+                            }
+
+                            // Validate (after auto-apply or if user declined)
+                            List<NamingValidationResult> results = NamingValidationEngine.ValidateObjectName("Index", kgName, (object)kg);
+                            foreach (var r in results.Where(r => !r.IsValid))
+                            {
+                                Log($"Index naming violation ({r.RuleName}): {tableName}.{kgName} — {r.ErrorMessage}");
+                                _pendingResults.Add(new CollectedValidationResult
+                                {
+                                    ValidationType = CollectedValidationResultType.NamingStandard,
+                                    TableName = tableName,
+                                    ColumnName = kgName,
+                                    Message = $"[Index] {r.ErrorMessage}"
+                                });
+                            }
+
+                            _keyGroupSnapshots[kgId] = kgName;
+                        }
+                    }
+                    catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"CheckEntityKeyGroups item error: {ex.Message}"); }
+                }
+            }
+            catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"CheckEntityKeyGroups error: {ex.Message}"); }
+        }
+
         private void ApplyColumnUdpDefaults(dynamic attr, string columnPhysicalName)
         {
             if (_udpRuntimeService == null || !_udpRuntimeService.IsInitialized) return;
@@ -764,51 +876,83 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
         }
 
-        private void ApplyGlossaryProperties(dynamic attr, GlossaryEntry glossaryEntry)
+        /// <summary>
+        /// Apply glossary-mapped UDP values dynamically to a column attribute.
+        /// Target UDP names come from DG_TABLE_MAPPING_COLUMN configuration.
+        /// </summary>
+        /// <summary>
+        /// Apply glossary-mapped values to a column attribute.
+        /// Target fields may have prefixes from admin: [UDP], [Erwin Property], [DB Property]
+        /// Prefix-less targets are treated as UDPs for backward compatibility.
+        /// </summary>
+        private void ApplyGlossaryUdpValues(dynamic attr, Dictionary<string, string> udpValues, string columnName)
         {
             try
             {
-                int transId = _session.BeginNamedTransaction("ApplyGlossaryProperties");
+                int transId = _session.BeginNamedTransaction("ApplyGlossaryUdpValues");
                 try
                 {
-                    // Physical_Data_Type
-                    if (!string.IsNullOrEmpty(glossaryEntry.DataType))
+                    var glossary = GlossaryService.Instance;
+                    foreach (var kvp in udpValues)
                     {
-                        TrySetProperty(attr, "Physical_Data_Type", glossaryEntry.DataType);
-                    }
+                        if (string.IsNullOrEmpty(kvp.Value)) continue;
 
-                    // UDP'ler: OWNER, KVKK, PCIDSS, CLASSIFICATION (internal erwin property)
-                    TrySetUdp(attr, "OWNER", glossaryEntry.Owner);
-                    TrySetUdp(attr, "KVKK", glossaryEntry.Kvkk ? "True" : "False");
-                    TrySetUdp(attr, "PCIDSS", glossaryEntry.Pcidss ? "True" : "False");
-                    TrySetUdp(attr, "CLASSIFICATION", glossaryEntry.Classification);
+                        string targetField = kvp.Key;
+                        string targetType = glossary.GetTargetType(targetField);
 
-                    // Comment — set via Definition (same pattern as domain)
-                    if (!string.IsNullOrEmpty(glossaryEntry.Comment))
-                    {
-                        try
+                        switch (targetType?.ToUpper())
                         {
-                            attr.Properties("Definition").Value = glossaryEntry.Comment;
-                            Log($"Set Definition to '{glossaryEntry.Comment}' from glossary");
-                        }
-                        catch (Exception ex)
-                        {
-                            Log($"Error setting Definition from glossary: {ex.Message}");
+                            case "ERWIN_PROPERTY":
+                                string erwinPropName = MapPropertyCodeToErwin(targetField);
+                                TrySetProperty(attr, erwinPropName, kvp.Value);
+                                break;
+
+                            case "UDP":
+                                TrySetUdp(attr, targetField, kvp.Value);
+                                break;
+
+                            case "DB_PROPERTY":
+                                Log($"Glossary: Skipping DB property '{targetField}' for '{columnName}'");
+                                break;
+
+                            default:
+                                // No type info (backward compat) — treat as UDP
+                                TrySetUdp(attr, targetField, kvp.Value);
+                                break;
                         }
                     }
 
                     _session.CommitTransaction(transId);
+                    Log($"Glossary values applied for '{columnName}': {udpValues.Count} mapping(s)");
                 }
                 catch (Exception ex)
                 {
                     try { _session.RollbackTransaction(transId); }
-                    catch (Exception rbEx) { Log($"ApplyGlossaryProperties: Rollback failed: {rbEx.Message}"); }
-                    Log($"Error applying glossary properties: {ex.Message}");
+                    catch (Exception rbEx) { Log($"ApplyGlossaryUdpValues: Rollback failed: {rbEx.Message}"); }
+                    Log($"Error applying glossary values: {ex.Message}");
                 }
             }
             catch (Exception ex)
             {
-                Log($"ApplyGlossaryProperties error: {ex.Message}");
+                Log($"ApplyGlossaryUdpValues error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Map admin PROPERTY_CODE to erwin SCAPI property name.
+        /// Admin stores uppercase codes, erwin uses PascalCase/specific names.
+        /// </summary>
+        private string MapPropertyCodeToErwin(string propertyCode)
+        {
+            switch (propertyCode?.ToUpper())
+            {
+                case "PHYSICAL_DATA_TYPE": return "Physical_Data_Type";
+                case "COMMENTS": return "Definition";
+                case "COMMENT": return "Definition";
+                case "DEFINITION": return "Definition";
+                case "NULL_OPTION_TYPE": return "Null_Option_Type";
+                case "PHYSICAL_NAME": return "Physical_Name";
+                default: return propertyCode;  // Pass through as-is
             }
         }
 
@@ -1151,11 +1295,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                 TableName = tableName
             };
 
-            // Read Column UDP values for dependency monitoring
-            if (_udpRuntimeService != null && _udpRuntimeService.IsInitialized)
-            {
-                snapshot.UdpValues = _udpRuntimeService.ReadUdpValues(attr, "Column");
-            }
+            // Column UDP values are read lazily in ProcessAttributeChanges only when needed
+            // (not in every snapshot — too expensive for 100+ attributes per tick)
 
             return snapshot;
         }
@@ -1254,30 +1395,18 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// Gets predefined column names for the entity's TABLE_TYPE.
-        /// Returns null if entity has no TABLE_TYPE or predefined columns not loaded.
+        /// Gets all predefined column names (used to skip glossary validation on auto-added columns).
         /// </summary>
         private HashSet<string> GetPredefinedColumnNames(dynamic entity)
         {
             try
             {
-                string tableTypeValue = "";
-                try { tableTypeValue = entity.Properties("Entity.Physical.TABLE_TYPE").Value?.ToString() ?? ""; }
-                catch { return null; }
-
-                if (string.IsNullOrEmpty(tableTypeValue) || tableTypeValue == "(SELECT)")
-                    return null;
-
-                var tableTypeEntry = TableTypeService.Instance.GetByName(tableTypeValue);
-                if (tableTypeEntry == null)
-                    return null;
-
                 if (!PredefinedColumnService.Instance.IsLoaded)
                     PredefinedColumnService.Instance.LoadPredefinedColumns();
 
-                var predefinedColumns = PredefinedColumnService.Instance.GetByTableTypeId(tableTypeEntry.Id);
+                var allPredefined = PredefinedColumnService.Instance.GetAll();
                 var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                foreach (var col in predefinedColumns)
+                foreach (var col in allPredefined)
                 {
                     names.Add(col.Name);
                 }

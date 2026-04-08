@@ -42,7 +42,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 return context.ObjectTypes.OrderBy(o => o.Name).ToList();
         }
 
-        public List<PropertyDef> GetPropertyDefs(int platformId, int objectTypeId)
+        public List<PropertyDef> GetPropertyDefs(int platformId, int objectTypeId, bool erwinMode = false)
         {
             using (var context = CreateContext())
             {
