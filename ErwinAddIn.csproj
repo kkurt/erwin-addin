@@ -12,7 +12,7 @@
     <ComVisible>true</ComVisible>
     <EnableComHosting>true</EnableComHosting>
     <NoWarn>MSB3246</NoWarn>
-    <!-- Exclude inject-test subprojects from this compilation -->
+    <!-- Exclude erwin-injector subprojects from this compilation -->
     <DefaultItemExcludes>$(DefaultItemExcludes);scripts\**\*.cs</DefaultItemExcludes>
   </PropertyGroup>
 

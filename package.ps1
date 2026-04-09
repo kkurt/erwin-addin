@@ -143,8 +143,8 @@ $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
 # STEP 4: Build and copy injection components
 Write-Host "`n[4] Building injection components..." -ForegroundColor Yellow
 
-$triggerDllProject = Join-Path $scriptDir "scripts\inject-test\TriggerDll\TriggerDll.csproj"
-$injectorProject = Join-Path $scriptDir "scripts\inject-test\InjectTest.csproj"
+$triggerDllProject = Join-Path $scriptDir "scripts\erwin-injector\TriggerDll\TriggerDll.csproj"
+$injectorProject = Join-Path $scriptDir "scripts\erwin-injector\ErwinInjector.csproj"
 
 # Add vswhere to PATH for NativeAOT linking
 $vsInstallerPath = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
@@ -162,7 +162,7 @@ if ($LASTEXITCODE -ne 0) {
     $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
     exit 1
 }
-$triggerDllSource = Join-Path $scriptDir "scripts\inject-test\TriggerDll\bin\Release\net10.0-windows\win-x64\publish\TriggerDll.dll"
+$triggerDllSource = Join-Path $scriptDir "scripts\erwin-injector\TriggerDll\bin\Release\net10.0-windows\win-x64\publish\TriggerDll.dll"
 Copy-Item $triggerDllSource (Join-Path $publishDir "TriggerDll.dll") -Force
 Write-Host "  TriggerDll.dll published" -ForegroundColor Green
 
@@ -175,7 +175,7 @@ if ($LASTEXITCODE -ne 0) {
     $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
     exit 1
 }
-$injectorSource = Join-Path $scriptDir "scripts\inject-test\bin\Release\net10.0\win-x64\publish\ErwinInjector.exe"
+$injectorSource = Join-Path $scriptDir "scripts\erwin-injector\bin\Release\net10.0\win-x64\publish\ErwinInjector.exe"
 Copy-Item $injectorSource (Join-Path $publishDir "ErwinInjector.exe") -Force
 Write-Host "  ErwinInjector.exe published" -ForegroundColor Green
 

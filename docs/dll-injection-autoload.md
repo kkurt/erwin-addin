@@ -9,7 +9,7 @@ SCAPI is an InprocServer32 COM object - it only sees models in the calling proce
 ## Solution: 3-Layer DLL Injection
 
 ```
-[1] InjectTest.exe (Injector - runs externally)
+[1] ErwinInjector.exe (Injector - runs externally)
          |
          | CreateRemoteThread + LoadLibraryW
          v
@@ -20,9 +20,9 @@ SCAPI is an InprocServer32 COM object - it only sees models in the calling proce
 [3] EliteSoft.Erwin.AddIn (COM add-in, .NET runtime - runs inside erwin.exe)
 ```
 
-## Layer 1: InjectTest.exe (Injector)
+## Layer 1: ErwinInjector.exe (Injector)
 
-**Location:** `scripts/inject-test/Program.cs`
+**Location:** `scripts/erwin-injector/Program.cs`
 
 1. Finds `erwin.exe` in the current user session
 2. Opens the process with `PROCESS_ALL_ACCESS`
@@ -38,7 +38,7 @@ SCAPI is an InprocServer32 COM object - it only sees models in the calling proce
 
 ## Layer 2: TriggerDll.dll (NativeAOT Bridge)
 
-**Location:** `scripts/inject-test/TriggerDll/TriggerDll.cs`
+**Location:** `scripts/erwin-injector/TriggerDll/TriggerDll.cs`
 
 Compiled with `<PublishAot>true</PublishAot>` - produces a pure native DLL with no .NET runtime dependency.
 
@@ -100,7 +100,7 @@ ErwinAddIn.csproj must exclude `scripts/**/*.cs` from compilation:
 ```xml
 <DefaultItemExcludes>$(DefaultItemExcludes);scripts\**\*.cs</DefaultItemExcludes>
 ```
-Otherwise SDK-style project includes TriggerDll/InjectTest source files and causes duplicate assembly attribute errors.
+Otherwise SDK-style project includes TriggerDll/ErwinInjector source files and causes duplicate assembly attribute errors.
 
 ## Integration with Autostart Watcher
 
@@ -110,10 +110,10 @@ The autostart-watcher.ps1 (WMI event subscription) detects erwin.exe and waits f
 
 | File | Purpose |
 |------|---------|
-| `scripts/inject-test/Program.cs` | Injector executable |
-| `scripts/inject-test/InjectTest.csproj` | Injector project (net10.0) |
-| `scripts/inject-test/TriggerDll/TriggerDll.cs` | NativeAOT bridge DLL |
-| `scripts/inject-test/TriggerDll/TriggerDll.csproj` | NativeAOT project |
+| `scripts/erwin-injector/Program.cs` | Injector executable |
+| `scripts/erwin-injector/ErwinInjector.csproj` | Injector project (net10.0) |
+| `scripts/erwin-injector/TriggerDll/TriggerDll.cs` | NativeAOT bridge DLL |
+| `scripts/erwin-injector/TriggerDll/TriggerDll.csproj` | NativeAOT project |
 | `ErwinAddIn.cs` | COM add-in entry point |
 | `scripts/autostart-watcher.ps1` | WMI process watcher |
 | `scripts/erwin-launcher.ps1` | Manual launcher (legacy) |
