@@ -9,3 +9,5 @@ tmpclaude-*
 .claude-flow/
 dist/
 certs/*.pfx
+.swarm/
+.mcp.json
