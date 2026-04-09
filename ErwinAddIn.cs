@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -20,6 +21,40 @@ namespace EliteSoft.Erwin.AddIn
     {
         private static ModelConfigForm _activeForm = null;
         private static bool _exceptionHandlerInstalled = false;
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int MessageBoxW(IntPtr hWnd, string text, string caption, uint type);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+        [DllImport("kernel32.dll")]
+        private static extern uint GetCurrentThreadId();
+
+        [DllImport("user32.dll")]
+        private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+
+        // MB flags
+        private const uint MB_OK = 0x0;
+        private const uint MB_ICONERROR = 0x10;
+        private const uint MB_ICONWARNING = 0x30;
+        private const uint MB_TOPMOST = 0x40000;
+        private const uint MB_SETFOREGROUND = 0x10000;
+
+        /// <summary>
+        /// Shows a MessageBox that is always on top, even when called from a background thread.
+        /// </summary>
+        internal static void ShowTopMostMessage(string text, string caption, bool isError = true)
+        {
+            uint flags = MB_OK | MB_TOPMOST | MB_SETFOREGROUND | (isError ? MB_ICONERROR : MB_ICONWARNING);
+            MessageBoxW(IntPtr.Zero, text, caption, flags);
+        }
 
         public ErwinAddIn()
         {
@@ -77,8 +112,10 @@ namespace EliteSoft.Erwin.AddIn
                 // If form is already open, bring it to front
                 if (_activeForm != null && !_activeForm.IsDisposed)
                 {
+                    _activeForm.TopMost = true;
                     _activeForm.BringToFront();
                     _activeForm.Activate();
+                    _activeForm.TopMost = false;
                     return;
                 }
 
@@ -86,23 +123,21 @@ namespace EliteSoft.Erwin.AddIn
                 Type scapiType = Type.GetTypeFromProgID("erwin9.SCAPI");
                 if (scapiType == null)
                 {
-                    MessageBox.Show("Could not find erwin SCAPI!", "Error",
-                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    ShowTopMostMessage("Could not find erwin SCAPI!", "Error");
                     return;
                 }
 
                 dynamic scapi = Activator.CreateInstance(scapiType);
 
-                // Show the form centered on screen
                 _activeForm = new ModelConfigForm(scapi);
                 _activeForm.StartPosition = FormStartPosition.CenterScreen;
-                _activeForm.FormClosed += (s, e) => { _activeForm = null; };
+                _activeForm.TopMost = true;
+                _activeForm.Shown += (s, e) => { ((Form)s).TopMost = false; };
                 _activeForm.Show();
             }
             catch (Exception ex)
             {
-                MessageBox.Show("Add-In Error: " + ex.Message, "Error",
-                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                ShowTopMostMessage("Add-In Error: " + ex.Message, "Error");
             }
         }
 
@@ -155,8 +190,7 @@ namespace EliteSoft.Erwin.AddIn
                     "Please contact Elite Soft for assistance."
             };
 
-            MessageBox.Show(message, "Elite Soft - License Error",
-                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            ShowTopMostMessage(message, "Elite Soft - License Error", isError: false);
 
             return false;
         }

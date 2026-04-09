@@ -95,25 +95,37 @@ namespace EliteSoft.Erwin.AddIn.Services
                 {
                     var corporates = GetNonDefaultCorporates(dbType);
 
-                    if (corporates.Count == 0)
+                    if (corporates.Count == 1)
                     {
-                        LastError = "No corporate found in database. Please configure a corporate in Admin panel.";
-                        Log($"CorporateContext: {LastError}");
-                        return false;
+                        // Exactly 1 non-default corporate → auto-select
+                        ActiveCorporateId = corporates[0].id;
+                        ActiveCorporateName = corporates[0].name;
+                        Log($"CorporateContext: Auto-detected single corporate -> '{ActiveCorporateName}' (ID={ActiveCorporateId})");
                     }
-
-                    if (corporates.Count > 1)
+                    else if (corporates.Count > 1)
                     {
                         string names = string.Join(", ", corporates.Select(c => $"'{c.name}' (ID={c.id})"));
                         LastError = $"Multiple corporates found: {names}. Please run Admin panel to select active corporate.";
                         Log($"CorporateContext: {LastError}");
                         return false;
                     }
-
-                    // Exactly 1 corporate — auto-select
-                    ActiveCorporateId = corporates[0].id;
-                    ActiveCorporateName = corporates[0].name;
-                    Log($"CorporateContext: Auto-detected single corporate → '{ActiveCorporateName}' (ID={ActiveCorporateId})");
+                    else
+                    {
+                        // No non-default corporates. Check if All Corporates (ID=1) exists.
+                        string allCorpName = GetCorporateName(dbType, AllCorporatesId);
+                        if (allCorpName != null)
+                        {
+                            ActiveCorporateId = AllCorporatesId;
+                            ActiveCorporateName = allCorpName;
+                            Log($"CorporateContext: Only All Corporates found -> using '{ActiveCorporateName}' (ID={AllCorporatesId})");
+                        }
+                        else
+                        {
+                            LastError = "No corporate found in database. Please configure a corporate in Admin panel.";
+                            Log($"CorporateContext: {LastError}");
+                            return false;
+                        }
+                    }
                 }
 
                 // Step 3: Load effective project IDs

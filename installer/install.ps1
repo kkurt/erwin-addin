@@ -93,17 +93,17 @@ if (-not $dotnetOk) {
     exit 1
 }
 
-# Stop watcher task + process if running (locks COM host DLL)
+# Stop ALL watcher processes (prevents duplicates, unlocks COM host DLL)
 try {
     $taskName = "EliteSoft Erwin AddIn AutoStart"
     Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-    # Kill watcher PowerShell + cscript processes
+    # Kill ALL autostart-watcher PowerShell processes
     Get-WmiObject Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -match "autostart-watcher" } |
-        ForEach-Object { $_.Terminate() | Out-Null }
-    Get-WmiObject Win32_Process -Filter "Name='cscript.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -match "elite-addin-activate" } |
-        ForEach-Object { $_.Terminate() | Out-Null }
+        ForEach-Object {
+            Write-Host "  Stopping watcher process PID=$($_.ProcessId)" -ForegroundColor Gray
+            $_.Terminate() | Out-Null
+        }
     Start-Sleep -Seconds 2
 } catch { }
 
@@ -257,11 +257,21 @@ if ($MetaRepo) {
     }
 }
 
-# Configure auto-start watcher (WMI event-driven)
+# Configure auto-start watcher (DLL injection based)
 Write-Host "`n[5] Configuring auto-start watcher..." -ForegroundColor Yellow
 $taskName = "EliteSoft Erwin AddIn AutoStart"
 $watcherSource = Join-Path $sourceDir "autostart-watcher.ps1"
 $watcherTarget = Join-Path $installDir "autostart-watcher.ps1"
+
+# Verify injection components exist in install dir
+$injectorPath = Join-Path $installDir "ErwinInjector.exe"
+$triggerDllPath = Join-Path $installDir "TriggerDll.dll"
+if (-not (Test-Path $injectorPath)) {
+    Write-Host "  WARNING: ErwinInjector.exe not found in package" -ForegroundColor Yellow
+}
+if (-not (Test-Path $triggerDllPath)) {
+    Write-Host "  WARNING: TriggerDll.dll not found in package" -ForegroundColor Yellow
+}
 
 if (Test-Path $watcherSource) {
     Copy-Item $watcherSource $watcherTarget -Force
@@ -277,7 +287,7 @@ if (Test-Path $watcherSource) {
         -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)
 
     Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
-        -Settings $settings -Description "Auto-starts Elite Soft Erwin Add-In when erwin opens" | Out-Null
+        -Settings $settings -Description "Auto-starts Elite Soft Erwin Add-In when erwin opens (DLL injection)" | Out-Null
 
     Write-Host "  Scheduled Task '$taskName' created" -ForegroundColor Green
     Write-Host "  Add-in will auto-load when erwin starts" -ForegroundColor Gray

@@ -30,6 +30,7 @@ namespace EliteSoft.Erwin.AddIn
         private dynamic _currentModel;
         private dynamic _session;
         private bool _isConnected;
+        private bool _allowClose = false;
         private readonly List<dynamic> _openModels = new List<dynamic>();
 
         // Services
@@ -269,13 +270,11 @@ namespace EliteSoft.Erwin.AddIn
             corpContext.OnLog += Log;
             if (!corpContext.Initialize())
             {
-                MessageBox.Show(
+                ErwinAddIn.ShowTopMostMessage(
                     corpContext.LastError ?? "Active Corporate not configured.\nPlease run Admin panel first.",
-                    "Configuration Error",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Error);
-                Log($"Corporate not configured — closing extension.");
-                this.Close();
+                    "Configuration Error");
+                Log($"Corporate not configured -- closing extension.");
+                this.ForceClose();
                 return;
             }
             Log($"Corporate: {corpContext.ActiveCorporateName} (ID={corpContext.ActiveCorporateId}), {corpContext.EffectiveProjectIds.Count} effective project(s)");
@@ -2087,6 +2086,28 @@ namespace EliteSoft.Erwin.AddIn
 
         private void BtnClose_Click(object sender, EventArgs e)
         {
+            this.WindowState = FormWindowState.Minimized;
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            // Only block user-initiated close (X button, Alt+F4).
+            // Allow: erwin shutdown, Windows shutdown, TaskKill, internal ForceClose.
+            if (!_allowClose && e.CloseReason == CloseReason.UserClosing)
+            {
+                e.Cancel = true;
+                this.WindowState = FormWindowState.Minimized;
+                return;
+            }
+            base.OnFormClosing(e);
+        }
+
+        /// <summary>
+        /// Actually closes the form (called when erwin shuts down or corporate check fails).
+        /// </summary>
+        internal void ForceClose()
+        {
+            _allowClose = true;
             Close();
         }
 
@@ -2121,6 +2142,7 @@ namespace EliteSoft.Erwin.AddIn
                 MinimizeBox = false,
                 ControlBox = false,
                 ShowInTaskbar = false,
+                TopMost = true,
                 BackColor = Color.FromArgb(208, 208, 208),
                 Padding = new Padding(1)
             };
@@ -2200,7 +2222,7 @@ namespace EliteSoft.Erwin.AddIn
             _isConnected = false;
             EnableControls(false);
             UpdateStatus("Connection failed.", Color.Red);
-            MessageBox.Show(message, title, MessageBoxButtons.OK, MessageBoxIcon.Error);
+            MessageBox.Show(this, message, title, MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
 
         #endregion

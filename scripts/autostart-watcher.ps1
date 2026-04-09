@@ -1,14 +1,18 @@
 # Elite Soft Erwin Add-In - WMI Event-Driven Auto-Start Watcher
-# Detects erwin.exe start via WMI event, waits for model to open, then activates add-in.
+# Detects erwin.exe start via WMI event, waits for model to open,
+# then activates add-in via DLL injection.
 # Runs as a hidden Scheduled Task at user logon.
 
-$progId = "EliteSoft.Erwin.AddIn"
 $erwinName = "erwin.exe"
 $mySessionId = (Get-Process -Id $PID).SessionId
-$modelCheckIntervalSec = 3
+$modelCheckIntervalSec = 1
 $modelTimeoutSec = 300  # Give up after 5 minutes if no model opened
 $fallbackPollSec = 30
-$logFile = Join-Path $env:LOCALAPPDATA "EliteSoft\ErwinAddIn\autostart.log"
+
+$installDir = Join-Path $env:LOCALAPPDATA "EliteSoft\ErwinAddIn"
+$logFile = Join-Path $installDir "autostart.log"
+$injectorExe = Join-Path $installDir "ErwinInjector.exe"
+$triggerDll = Join-Path $installDir "TriggerDll.dll"
 
 function Write-Log([string]$msg) {
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
@@ -48,6 +52,26 @@ function Wait-ForModel {
 }
 
 Write-Log "Watcher started (PID=$PID, Session=$mySessionId)"
+
+# Kill other watcher instances (prevent duplicates)
+try {
+    Get-WmiObject Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -match "autostart-watcher" -and $_.ProcessId -ne $PID } |
+        ForEach-Object {
+            Write-Log "Killing duplicate watcher PID=$($_.ProcessId)"
+            $_.Terminate() | Out-Null
+        }
+} catch { }
+
+# Validate injector files exist
+if (-not (Test-Path $injectorExe)) {
+    Write-Log "ERROR: Injector not found at $injectorExe"
+    exit 1
+}
+if (-not (Test-Path $triggerDll)) {
+    Write-Log "ERROR: TriggerDll not found at $triggerDll"
+    exit 1
+}
 
 while ($true) {
     # Skip if erwin is already running
@@ -95,29 +119,36 @@ while ($true) {
         continue
     }
 
-    # --- Activate add-in via VBScript ---
+    # --- Remember which erwin PID we're injecting into ---
+    $targetErwin = Get-MyErwin | Where-Object { $_.MainWindowTitle -match "erwin.*\[.+\]" } | Select-Object -First 1
+    $targetPid = $targetErwin.Id
+    Write-Log "Target erwin PID=$targetPid"
+
+    # Model is already detected via window title - no extra delay needed
+
+    # --- Activate add-in via DLL injection ---
     try {
-        $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-        $vbsPath = Join-Path $scriptDir "activate-addin.vbs"
-        if (-not (Test-Path $vbsPath)) {
-            $vbsContent = "On Error Resume Next`r`nSet a = CreateObject(`"$progId`")`r`na.Execute`r`n"
-            Set-Content -Path $vbsPath -Value $vbsContent -Encoding ASCII
+        Write-Log "Launching injector: $injectorExe"
+        $proc = Start-Process -FilePath $injectorExe -ArgumentList "`"$triggerDll`"" -PassThru -WindowStyle Hidden -Wait
+        if ($proc.ExitCode -eq 0) {
+            Write-Log "Injector completed successfully (exit code 0)"
+        } else {
+            Write-Log "Injector exited with code $($proc.ExitCode)"
         }
-        Start-Process "cscript.exe" -ArgumentList "//nologo `"$vbsPath`"" -WindowStyle Hidden
-        Write-Log "Add-in activation triggered"
     } catch {
-        Write-Log "Activation failed: $_"
+        Write-Log "Injection failed: $_"
     }
 
-    # --- Wait for erwin to close ---
-    Write-Log "Monitoring erwin process..."
+    # --- Wait for THIS specific erwin to close (PID-based) ---
+    Write-Log "Monitoring erwin PID=$targetPid..."
     while ($true) {
-        Start-Sleep -Seconds 5
-        if (-not (Get-MyErwin)) {
-            Write-Log "erwin closed - resuming watch"
+        Start-Sleep -Seconds 3
+        $stillRunning = Get-Process -Id $targetPid -ErrorAction SilentlyContinue
+        if (-not $stillRunning) {
+            Write-Log "erwin PID=$targetPid closed - resuming watch"
             break
         }
     }
 
-    Start-Sleep -Seconds 3
+    Start-Sleep -Seconds 2
 }

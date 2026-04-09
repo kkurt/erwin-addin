@@ -140,11 +140,70 @@ $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
     Write-Host "  Config: localhost/$MetaRepo (MSSQL)" -ForegroundColor Green
 }
 
-# STEP 4: Copy install script + watcher
+# STEP 4: Build and copy injection components
+Write-Host "`n[4] Building injection components..." -ForegroundColor Yellow
+
+$triggerDllProject = Join-Path $scriptDir "scripts\inject-test\TriggerDll\TriggerDll.csproj"
+$injectorProject = Join-Path $scriptDir "scripts\inject-test\InjectTest.csproj"
+
+# Add vswhere to PATH for NativeAOT linking
+$vsInstallerPath = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
+if (Test-Path $vsInstallerPath) {
+    $env:PATH = "$env:PATH;$vsInstallerPath"
+}
+
+# Publish TriggerDll (NativeAOT)
+Write-Host "  Publishing TriggerDll (NativeAOT)..." -ForegroundColor Gray
+dotnet publish $triggerDllProject -c Release 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "  TriggerDll publish failed!" -ForegroundColor Red
+    Write-Host "  Ensure Visual Studio C++ Build Tools are installed" -ForegroundColor Yellow
+    Write-Host "`nPress any key to exit..." -ForegroundColor Gray
+    $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+    exit 1
+}
+$triggerDllSource = Join-Path $scriptDir "scripts\inject-test\TriggerDll\bin\Release\net10.0-windows\win-x64\publish\TriggerDll.dll"
+Copy-Item $triggerDllSource (Join-Path $publishDir "TriggerDll.dll") -Force
+Write-Host "  TriggerDll.dll published" -ForegroundColor Green
+
+# Publish ErwinInjector (framework-dependent single file)
+Write-Host "  Publishing ErwinInjector..." -ForegroundColor Gray
+dotnet publish $injectorProject -c Release 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "  ErwinInjector publish failed!" -ForegroundColor Red
+    Write-Host "`nPress any key to exit..." -ForegroundColor Gray
+    $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+    exit 1
+}
+$injectorSource = Join-Path $scriptDir "scripts\inject-test\bin\Release\net10.0\win-x64\publish\ErwinInjector.exe"
+Copy-Item $injectorSource (Join-Path $publishDir "ErwinInjector.exe") -Force
+Write-Host "  ErwinInjector.exe published" -ForegroundColor Green
+
+# STEP 5: Copy install script + watcher
 Copy-Item (Join-Path $scriptDir "installer\install.ps1") (Join-Path $publishDir "install.ps1") -Force
 Copy-Item (Join-Path $scriptDir "scripts\autostart-watcher.ps1") (Join-Path $publishDir "autostart-watcher.ps1") -Force
 
-# STEP 5: Create package (or just leave folder)
+# STEP 7: Create uninstall script in package
+$uninstallScript = @'
+# Elite Soft Erwin Add-In - Uninstaller
+# Run: .\uninstall.ps1
+
+$installScript = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "install.ps1"
+if (Test-Path $installScript) {
+    & $installScript -Uninstall
+} else {
+    $installDir = Join-Path $env:LOCALAPPDATA "EliteSoft\ErwinAddIn"
+    $installed = Join-Path $installDir "install.ps1"
+    if (Test-Path $installed) {
+        & $installed -Uninstall
+    } else {
+        Write-Host "install.ps1 not found!" -ForegroundColor Red
+    }
+}
+'@
+Set-Content (Join-Path $publishDir "uninstall.ps1") $uninstallScript -Encoding UTF8
+
+# STEP 8: Create package (or just leave folder)
 if (-not (Test-Path $distDir)) {
     New-Item -ItemType Directory -Path $distDir -Force | Out-Null
 }
