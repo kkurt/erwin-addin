@@ -42,6 +42,11 @@ if ($Uninstall) {
         }
     }
 
+    # Remove auto-start watcher task
+    $taskName = "EliteSoft Erwin AddIn AutoStart"
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    Write-Host "  Removed Scheduled Task '$taskName'" -ForegroundColor Green
+
     # Remove MetaRepo registry
     $bootstrapPath = "HKCU:\Software\EliteSoft\MetaRepo\Bootstrap"
     $extPath = "HKCU:\Software\EliteSoft\MetaRepo\Extension"
@@ -63,6 +68,44 @@ if ($Uninstall) {
 # === INSTALL ===
 Write-Host "=== Installing Elite Soft Erwin Add-In ===" -ForegroundColor Cyan
 $sourceDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# Check .NET 10 Desktop Runtime
+$dotnetOk = $false
+try {
+    $runtimes = & dotnet --list-runtimes 2>&1
+    if ($runtimes -match "Microsoft\.WindowsDesktop\.App 10\.") {
+        $dotnetOk = $true
+    }
+} catch { }
+
+if (-not $dotnetOk) {
+    Write-Host ""
+    Write-Host "  ERROR: .NET 10 Desktop Runtime is not installed!" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  Download from:" -ForegroundColor Yellow
+    Write-Host "  https://dotnet.microsoft.com/download/dotnet/10.0" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  Select: .NET Desktop Runtime 10.x (Windows x64)" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  After installing, run this script again." -ForegroundColor Gray
+    Write-Host "`nPress any key to exit..." -ForegroundColor Gray
+    $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+    exit 1
+}
+
+# Stop watcher task + process if running (locks COM host DLL)
+try {
+    $taskName = "EliteSoft Erwin AddIn AutoStart"
+    Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    # Kill watcher PowerShell + cscript processes
+    Get-WmiObject Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -match "autostart-watcher" } |
+        ForEach-Object { $_.Terminate() | Out-Null }
+    Get-WmiObject Win32_Process -Filter "Name='cscript.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -match "elite-addin-activate" } |
+        ForEach-Object { $_.Terminate() | Out-Null }
+    Start-Sleep -Seconds 2
+} catch { }
 
 # Check if erwin is running for CURRENT USER (locks COM host DLL)
 $currentSessionId = (Get-Process -Id $PID).SessionId
@@ -96,51 +139,26 @@ Copy-Item "$sourceDir\*" -Destination $installDir -Recurse -Force -Exclude "inst
 $count = (Get-ChildItem $installDir -Recurse -File).Count
 Write-Host "  Copied $count files" -ForegroundColor Green
 
-# Step 2: Register COM component
+# Step 2: Register COM component (requires admin for regsvr32)
 Write-Host "`n[2/3] Registering COM component..." -ForegroundColor Yellow
 $comHost = Join-Path $installDir $comHostDll
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if ($isAdmin) {
     regsvr32.exe /s $comHost
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "  COM registered (admin)" -ForegroundColor Green
-    } else {
-        Write-Host "  COM registration failed (code: $LASTEXITCODE)" -ForegroundColor Red
-        Write-Host "  Ensure .NET 10 Desktop Runtime is installed" -ForegroundColor Yellow
-        Write-Host "`nPress any key to exit..." -ForegroundColor Gray
-        $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
-        exit 1
-    }
 } else {
-    # Non-admin: try per-user COM registration via reg.exe
-    Write-Host "  No admin privileges - attempting per-user COM registration..." -ForegroundColor Yellow
-    try {
-        $clsid = "A1B2C3D4-E5F6-7890-ABCD-EF1234567890"
-        $regBase = "HKCU:\Software\Classes"
-
-        # ProgID -> CLSID mapping
-        $progIdPath = "$regBase\$progId\CLSID"
-        if (-not (Test-Path $progIdPath)) { New-Item -Path $progIdPath -Force | Out-Null }
-        Set-ItemProperty "$regBase\$progId\CLSID" -Name "(Default)" -Value "{$clsid}"
-
-        # CLSID -> InprocServer32 mapping
-        $clsidPath = "$regBase\CLSID\{$clsid}"
-        if (-not (Test-Path "$clsidPath\InprocServer32")) { New-Item -Path "$clsidPath\InprocServer32" -Force | Out-Null }
-        Set-ItemProperty "$clsidPath\InprocServer32" -Name "(Default)" -Value $comHost
-        Set-ItemProperty "$clsidPath\InprocServer32" -Name "ThreadingModel" -Value "Both"
-
-        # ProgID reference
-        if (-not (Test-Path "$clsidPath\ProgID")) { New-Item -Path "$clsidPath\ProgID" -Force | Out-Null }
-        Set-ItemProperty "$clsidPath\ProgID" -Name "(Default)" -Value $progId
-
-        Write-Host "  COM registered (per-user HKCU)" -ForegroundColor Green
-    } catch {
-        Write-Host "  Per-user COM registration failed: $_" -ForegroundColor Red
-        Write-Host "  Try running as Administrator for full COM registration" -ForegroundColor Yellow
-        Write-Host "`nPress any key to exit..." -ForegroundColor Gray
-        $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
-        exit 1
-    }
+    # Elevate just for regsvr32 (UAC prompt)
+    Write-Host "  COM registration requires admin - requesting elevation..." -ForegroundColor Yellow
+    $regProc = Start-Process regsvr32.exe -ArgumentList "/s `"$comHost`"" -Verb RunAs -Wait -PassThru -ErrorAction Stop
+    $LASTEXITCODE = $regProc.ExitCode
+}
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "  COM registered" -ForegroundColor Green
+} else {
+    Write-Host "  COM registration failed (code: $LASTEXITCODE)" -ForegroundColor Red
+    Write-Host "  Ensure .NET 10 Desktop Runtime is installed" -ForegroundColor Yellow
+    Write-Host "`nPress any key to exit..." -ForegroundColor Gray
+    $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+    exit 1
 }
 
 # Step 3: Register in erwin Add-In Manager (HKCU - per user)
@@ -239,7 +257,38 @@ if ($MetaRepo) {
     }
 }
 
+# Configure auto-start watcher (WMI event-driven)
+Write-Host "`n[5] Configuring auto-start watcher..." -ForegroundColor Yellow
+$taskName = "EliteSoft Erwin AddIn AutoStart"
+$watcherSource = Join-Path $sourceDir "autostart-watcher.ps1"
+$watcherTarget = Join-Path $installDir "autostart-watcher.ps1"
+
+if (Test-Path $watcherSource) {
+    Copy-Item $watcherSource $watcherTarget -Force
+
+    # Remove old task if exists
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+
+    # Create Scheduled Task - runs at logon, hidden
+    $action = New-ScheduledTaskAction -Execute "powershell.exe" `
+        -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watcherTarget`""
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)
+
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
+        -Settings $settings -Description "Auto-starts Elite Soft Erwin Add-In when erwin opens" | Out-Null
+
+    Write-Host "  Scheduled Task '$taskName' created" -ForegroundColor Green
+    Write-Host "  Add-in will auto-load when erwin starts" -ForegroundColor Gray
+
+    # Start watcher immediately (don't wait for next logon)
+    Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+} else {
+    Write-Host "  autostart-watcher.ps1 not found in package, skipping" -ForegroundColor Yellow
+}
+
 Write-Host "`nInstallation complete!" -ForegroundColor Green
-Write-Host "Restart erwin to use the add-in." -ForegroundColor Cyan
+Write-Host "Add-in will auto-load when erwin starts." -ForegroundColor Cyan
 Write-Host "`nPress any key to exit..." -ForegroundColor Gray
 $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')

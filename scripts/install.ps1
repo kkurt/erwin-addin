@@ -30,10 +30,10 @@ $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIde
 
 if (-not $isAdmin) {
     Write-Host "Requesting Administrator privileges..." -ForegroundColor Yellow
-    $args = "-NoProfile -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`""
-    if ($SourceDir) { $args += " -SourceDir `"$SourceDir`"" }
-    if ($Uninstall) { $args += " -Uninstall" }
-    Start-Process powershell.exe -ArgumentList $args -Verb RunAs
+    $elevateArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`""
+    if ($SourceDir) { $elevateArgs += " -SourceDir `"$SourceDir`"" }
+    if ($Uninstall) { $elevateArgs += " -Uninstall" }
+    Start-Process powershell.exe -ArgumentList $elevateArgs -Verb RunAs
     exit
 }
 
@@ -199,75 +199,35 @@ Set-ItemProperty -Path $addInsRegPath -Name "Invoke EXE"      -Value 0 -Type DWo
 
 Write-Host "  Add-In Manager entry created" -ForegroundColor Green
 
-# ── Step 5: Auto-start watcher (Scheduled Task) ────────────────
-Write-Host "[5/5] Configuring auto-start..." -ForegroundColor Yellow
+# ── Step 5: Auto-start watcher (WMI event-driven) ────────────────
+Write-Host "[5/5] Configuring auto-start watcher..." -ForegroundColor Yellow
 
 $taskName = "EliteSoft Erwin AddIn AutoStart"
-$watcherScript = Join-Path $installDir "autostart-watcher.ps1"
+$watcherSource = Join-Path $scriptDir "autostart-watcher.ps1"
+$watcherTarget = Join-Path $installDir "autostart-watcher.ps1"
 
-# Create the watcher script
-$watcherContent = @'
-# Elite Soft Erwin Add-In Auto-Start Watcher
-# Detects erwin.exe start and launches the add-in automatically.
-# Runs as a background Scheduled Task at user logon.
-
-$progId = "EliteSoft.Erwin.AddIn"
-$method = "Execute"
-$erwinProcess = "erwin"
-
-while ($true) {
-    try {
-        $proc = Get-Process -Name $erwinProcess -ErrorAction SilentlyContinue
-        if ($proc) {
-            # erwin is running — wait for it to fully initialize
-            Start-Sleep -Seconds 12
-
-            # Double-check it's still running
-            $proc = Get-Process -Name $erwinProcess -ErrorAction SilentlyContinue
-            if ($proc) {
-                try {
-                    $addIn = New-Object -ComObject $progId
-                    $addIn.$method()
-                } catch {
-                    # COM call failed (erwin not ready or add-in error) — ignore
-                }
-
-                # Wait until erwin closes before watching again
-                while ($true) {
-                    Start-Sleep -Seconds 5
-                    $proc = Get-Process -Name $erwinProcess -ErrorAction SilentlyContinue
-                    if (-not $proc) { break }
-                }
-
-                # erwin closed — small cooldown then resume watching
-                Start-Sleep -Seconds 3
-            }
-        }
-    } catch {
-        # Unexpected error — continue watching
-    }
-
-    Start-Sleep -Seconds 3
+if (Test-Path $watcherSource) {
+    Copy-Item $watcherSource $watcherTarget -Force
+    Write-Host "  Copied autostart-watcher.ps1" -ForegroundColor Green
 }
-'@
-
-Set-Content -Path $watcherScript -Value $watcherContent -Encoding UTF8
-Write-Host "  Created $watcherScript" -ForegroundColor Green
 
 # Remove old task if exists
 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
 
-# Create Scheduled Task — runs at logon, hidden
-$action  = New-ScheduledTaskAction -Execute "powershell.exe" `
-    -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watcherScript`""
+# Create Scheduled Task - runs at logon, hidden
+$action = New-ScheduledTaskAction -Execute "powershell.exe" `
+    -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watcherTarget`""
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)
 
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
-    -Settings $settings -Description "Auto-starts Elite Soft Erwin Add-In when erwin Data Modeler opens" | Out-Null
+    -Settings $settings -Description "Auto-starts Elite Soft Erwin Add-In when erwin opens (WMI event)" | Out-Null
 
 Write-Host "  Scheduled Task '$taskName' created" -ForegroundColor Green
+
+# Start watcher immediately
+Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
 
 # ── Summary ─────────────────────────────────────────────────────
 Write-Host ""

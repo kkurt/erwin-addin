@@ -140,8 +140,9 @@ $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
     Write-Host "  Config: localhost/$MetaRepo (MSSQL)" -ForegroundColor Green
 }
 
-# STEP 4: Copy install script
+# STEP 4: Copy install script + watcher
 Copy-Item (Join-Path $scriptDir "installer\install.ps1") (Join-Path $publishDir "install.ps1") -Force
+Copy-Item (Join-Path $scriptDir "scripts\autostart-watcher.ps1") (Join-Path $publishDir "autostart-watcher.ps1") -Force
 
 # STEP 5: Create package (or just leave folder)
 if (-not (Test-Path $distDir)) {
