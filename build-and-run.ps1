@@ -45,8 +45,7 @@ Write-Host "Running as Administrator" -ForegroundColor Green
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $scriptDir
 
-$installDir = "C:\Program Files\EliteSoft\ErwinAddIn"
-$progId = "EliteSoft.Erwin.AddIn"
+$installDir = Join-Path $env:LOCALAPPDATA "EliteSoft\ErwinAddIn"
 
 # --- Step 1: Close erwin if running ---
 $erwinProcess = Get-Process -Name "erwin" -ErrorAction SilentlyContinue
@@ -114,23 +113,6 @@ if ($LASTEXITCODE -ne 0) {
     Write-Host "`nPress any key to exit..." -ForegroundColor Gray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown"); exit 1
 }
 Write-Host "  COM registered" -ForegroundColor Green
-
-# --- Step 6: Register in erwin Add-In Manager ---
-Write-Host "`n[5/5] Configuring erwin Add-In Manager..." -ForegroundColor Yellow
-$erwinRegBase = "HKCU:\SOFTWARE\erwin\Data Modeler"
-if (Test-Path $erwinRegBase) {
-    Get-ChildItem $erwinRegBase -ErrorAction SilentlyContinue | ForEach-Object {
-        $addInPath = "$($_.PSPath)\Add-Ins\Elite Soft Erwin Addin"
-        if (-not (Test-Path $addInPath)) { New-Item -Path $addInPath -Force | Out-Null }
-        Set-ItemProperty $addInPath -Name "Menu Identifier" -Value 1 -Type DWord
-        Set-ItemProperty $addInPath -Name "ProgID" -Value $progId -Type String
-        Set-ItemProperty $addInPath -Name "Invoke Method" -Value "Execute" -Type String
-        Set-ItemProperty $addInPath -Name "Invoke EXE" -Value 0 -Type DWord
-        Write-Host "  erwin $($_.PSChildName) - OK" -ForegroundColor Green
-    }
-} else {
-    Write-Host "  erwin not found in registry, skipping" -ForegroundColor Yellow
-}
 
 Write-Host "`nDone! Restart erwin to use the add-in." -ForegroundColor Green
 Write-Host "`nPress any key to exit..." -ForegroundColor Gray

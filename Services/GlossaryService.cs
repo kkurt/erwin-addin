@@ -19,7 +19,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         private Dictionary<string, Dictionary<string, string>> _glossaryCache;
         private bool _isLoaded;
         private string _lastError;
-        private int? _lastProjectId;
+        private int? _lastModelId;
 
         // Mapping metadata (for logging/debugging)
         private string _matchSourceColumn;
@@ -57,13 +57,13 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <summary>
         /// Load glossary using DG_TABLE_MAPPING config.
         /// </summary>
-        public bool LoadGlossary(int? projectId = null)
+        public bool LoadGlossary(int? modelId = null)
         {
             try
             {
                 _glossaryCache.Clear();
                 _lastError = null;
-                _lastProjectId = projectId;
+                _lastModelId = modelId;
                 _matchSourceColumn = null;
                 _valueMappings.Clear();
                 _tableName = null;
@@ -91,9 +91,9 @@ namespace EliteSoft.Erwin.AddIn.Services
                     {
                         // Use corporate effective project IDs if available
                         var corpContext = CorporateContextService.Instance;
-                        bool hasCorporateFilter = corpContext.IsInitialized && corpContext.EffectiveProjectIds.Count > 0;
+                        bool hasCorporateFilter = corpContext.IsInitialized && corpContext.EffectiveModelIds.Count > 0;
                         string effectiveIds = hasCorporateFilter
-                            ? string.Join(",", corpContext.EffectiveProjectIds)
+                            ? string.Join(",", corpContext.EffectiveModelIds)
                             : null;
 
                         string mappingQuery = GetMappingQuery(repoDbType, hasCorporateFilter, effectiveIds);
@@ -332,11 +332,11 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// Reload with last used projectId.
+        /// Reload with last used modelId.
         /// </summary>
         public void Reload()
         {
-            LoadGlossary(_lastProjectId);
+            LoadGlossary(_lastModelId);
         }
 
         public bool IsConfigured => DatabaseService.Instance.IsConfigured;
@@ -353,30 +353,30 @@ namespace EliteSoft.Erwin.AddIn.Services
                 case "POSTGRESQL":
                 {
                     string where = hasCorporateFilter && !string.IsNullOrEmpty(effectiveIds)
-                        ? $@"""MAPPING_CODE"" = 'GLOSSARY' AND ""PROJECT_ID"" IN ({effectiveIds})"
+                        ? $@"""MAPPING_CODE"" = 'GLOSSARY' AND ""MODEL_ID"" IN ({effectiveIds})"
                         : @"""MAPPING_CODE"" = 'GLOSSARY'";
                     return $@"SELECT ""ID"", ""CONNECTION_DEF_ID"", ""TABLE_NAME"" FROM ""DG_TABLE_MAPPING""
                             WHERE {where}
-                            ORDER BY ""PROJECT_ID"" DESC NULLS LAST LIMIT 1";
+                            ORDER BY ""MODEL_ID"" DESC NULLS LAST LIMIT 1";
                 }
                 case "ORACLE":
                 {
                     string where = hasCorporateFilter && !string.IsNullOrEmpty(effectiveIds)
-                        ? $"MAPPING_CODE = 'GLOSSARY' AND PROJECT_ID IN ({effectiveIds})"
+                        ? $"MAPPING_CODE = 'GLOSSARY' AND MODEL_ID IN ({effectiveIds})"
                         : "MAPPING_CODE = 'GLOSSARY'";
                     return $@"SELECT ID, CONNECTION_DEF_ID, TABLE_NAME FROM DG_TABLE_MAPPING
                             WHERE {where}
-                            ORDER BY PROJECT_ID DESC NULLS LAST FETCH FIRST 1 ROWS ONLY";
+                            ORDER BY MODEL_ID DESC NULLS LAST FETCH FIRST 1 ROWS ONLY";
                 }
                 case "MSSQL":
                 default:
                 {
                     string where = hasCorporateFilter && !string.IsNullOrEmpty(effectiveIds)
-                        ? $"[MAPPING_CODE] = 'GLOSSARY' AND [PROJECT_ID] IN ({effectiveIds})"
+                        ? $"[MAPPING_CODE] = 'GLOSSARY' AND [MODEL_ID] IN ({effectiveIds})"
                         : "[MAPPING_CODE] = 'GLOSSARY'";
                     return $@"SELECT TOP 1 [ID], [CONNECTION_DEF_ID], [TABLE_NAME] FROM [dbo].[DG_TABLE_MAPPING]
                             WHERE {where}
-                            ORDER BY [PROJECT_ID] DESC";
+                            ORDER BY [MODEL_ID] DESC";
                 }
             }
         }

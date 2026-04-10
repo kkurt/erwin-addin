@@ -2,30 +2,28 @@ using System;
 using System.Collections.Generic;
 using System.Data.Common;
 using System.Linq;
-using Microsoft.Win32;
 
 namespace EliteSoft.Erwin.AddIn.Services
 {
     /// <summary>
-    /// Determines active corporate and loads effective project IDs.
+    /// Determines active corporate and loads effective model IDs.
     /// All Corporates = ID 1 (hardcoded, always present).
     ///
     /// Flow:
-    ///   1. Registry has ActiveCorporateId? → validate in DB → load its projects + All Corporates projects
-    ///   2. Registry empty? → DB has exactly 1 non-default corporate? → use it + All Corporates
-    ///   3. Otherwise → error, extension closes
+    ///   1. DB has exactly 1 non-default corporate? -> auto-select it + All Corporates
+    ///   2. Multiple corporates? -> use the one with IS_ACTIVE = true
+    ///   3. No active corporate found -> error, extension closes
     /// </summary>
     public class CorporateContextService
     {
         private static CorporateContextService _instance;
         private static readonly object _lock = new object();
 
-        private const string RegistryPath = @"Software\EliteSoft\MetaRepo\Extension";
         private const int AllCorporatesId = 1;
 
         public int ActiveCorporateId { get; private set; }
         public string ActiveCorporateName { get; private set; }
-        public List<int> EffectiveProjectIds { get; private set; }
+        public List<int> EffectiveModelIds { get; private set; }
         public bool IsInitialized { get; private set; }
         public string LastError { get; private set; }
 
@@ -49,7 +47,7 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         private CorporateContextService()
         {
-            EffectiveProjectIds = new List<int>();
+            EffectiveModelIds = new List<int>();
         }
 
         public bool Initialize()
@@ -61,83 +59,69 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                 if (!DatabaseService.Instance.IsConfigured)
                 {
-                    LastError = "Database not configured. Please run Admin panel or install with -MetaRepo parameter.";
+                    LastError = "Database not configured. Please run Admin panel to configure the database connection.";
                     Log($"CorporateContext: {LastError}");
                     return false;
                 }
 
                 string dbType = DatabaseService.Instance.GetDbType();
 
-                // Step 1: Try registry
-                int registryCorporateId = ReadCorporateIdFromRegistry();
+                // Step 1: Get all non-default corporates from DB
+                var corporates = GetNonDefaultCorporates(dbType);
 
-                if (registryCorporateId > 0 && registryCorporateId != AllCorporatesId)
+                if (corporates.Count == 1)
                 {
-                    // Validate corporate exists in DB
-                    string corpName = GetCorporateName(dbType, registryCorporateId);
-                    if (corpName != null)
+                    // Single corporate -> auto-select
+                    ActiveCorporateId = corporates[0].id;
+                    ActiveCorporateName = corporates[0].name;
+                    Log($"CorporateContext: Auto-detected single corporate -> '{ActiveCorporateName}' (ID={ActiveCorporateId})");
+                }
+                else if (corporates.Count > 1)
+                {
+                    // Multiple corporates -> find the active one (IS_ACTIVE = true)
+                    var activeCorp = GetActiveCorporate(dbType);
+                    if (activeCorp != null)
                     {
-                        ActiveCorporateId = registryCorporateId;
-                        ActiveCorporateName = corpName;
-                        Log($"CorporateContext: From registry → '{corpName}' (ID={registryCorporateId})");
+                        ActiveCorporateId = activeCorp.Value.id;
+                        ActiveCorporateName = activeCorp.Value.name;
+                        Log($"CorporateContext: Active corporate from DB -> '{ActiveCorporateName}' (ID={ActiveCorporateId})");
                     }
                     else
                     {
-                        // Corporate not found in DB — clear invalid registry entry
-                        Log($"CorporateContext: Registry corporate ID={registryCorporateId} not found in DB — clearing registry");
-                        ClearCorporateRegistry();
-                        registryCorporateId = 0;
-                    }
-                }
-
-                // Step 2: No valid registry → auto-detect from DB
-                if (ActiveCorporateId == 0)
-                {
-                    var corporates = GetNonDefaultCorporates(dbType);
-
-                    if (corporates.Count == 1)
-                    {
-                        // Exactly 1 non-default corporate → auto-select
-                        ActiveCorporateId = corporates[0].id;
-                        ActiveCorporateName = corporates[0].name;
-                        Log($"CorporateContext: Auto-detected single corporate -> '{ActiveCorporateName}' (ID={ActiveCorporateId})");
-                    }
-                    else if (corporates.Count > 1)
-                    {
                         string names = string.Join(", ", corporates.Select(c => $"'{c.name}' (ID={c.id})"));
-                        LastError = $"Multiple corporates found: {names}. Please run Admin panel to select active corporate.";
+                        LastError = $"Multiple corporates found but none is active: {names}. Please set IS_ACTIVE in Admin panel.";
                         Log($"CorporateContext: {LastError}");
                         return false;
                     }
+                }
+                else
+                {
+                    // No non-default corporates. Check if All Corporates (ID=1) exists.
+                    string allCorpName = GetCorporateName(dbType, AllCorporatesId);
+                    if (allCorpName != null)
+                    {
+                        ActiveCorporateId = AllCorporatesId;
+                        ActiveCorporateName = allCorpName;
+                        Log($"CorporateContext: Only All Corporates found -> using '{ActiveCorporateName}' (ID={AllCorporatesId})");
+                    }
                     else
                     {
-                        // No non-default corporates. Check if All Corporates (ID=1) exists.
-                        string allCorpName = GetCorporateName(dbType, AllCorporatesId);
-                        if (allCorpName != null)
-                        {
-                            ActiveCorporateId = AllCorporatesId;
-                            ActiveCorporateName = allCorpName;
-                            Log($"CorporateContext: Only All Corporates found -> using '{ActiveCorporateName}' (ID={AllCorporatesId})");
-                        }
-                        else
-                        {
-                            LastError = "No corporate found in database. Please configure a corporate in Admin panel.";
-                            Log($"CorporateContext: {LastError}");
-                            return false;
-                        }
+                        LastError = "No corporate found in database. Please configure a corporate in Admin panel.";
+                        Log($"CorporateContext: {LastError}");
+                        return false;
                     }
                 }
 
-                // Step 3: Load effective project IDs
-                if (!LoadEffectiveProjectIds(dbType))
+                // Step 3: Load effective model IDs
+                if (!LoadEffectiveModelIds(dbType))
                 {
-                    LastError = $"No projects found for corporate '{ActiveCorporateName}' (ID={ActiveCorporateId}).";
+                    LastError = $"No models found for corporate '{ActiveCorporateName}' (ID={ActiveCorporateId}).";
                     Log($"CorporateContext: {LastError}");
                     return false;
                 }
 
                 IsInitialized = true;
-                Log($"CorporateContext: Ready — '{ActiveCorporateName}' + All Corporates, {EffectiveProjectIds.Count} project(s): [{string.Join(", ", EffectiveProjectIds)}]");
+                Log($"CorporateContext: Ready - '{ActiveCorporateName}' + All Corporates, {EffectiveModelIds.Count} model(s): [{string.Join(", ", EffectiveModelIds)}]");
                 return true;
             }
             catch (Exception ex)
@@ -147,45 +131,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                 return false;
             }
         }
-
-        #region Registry
-
-        private int ReadCorporateIdFromRegistry()
-        {
-            try
-            {
-                using (var key = Registry.CurrentUser.OpenSubKey(RegistryPath))
-                {
-                    if (key == null) return 0;
-                    var val = key.GetValue("ActiveCorporateId")?.ToString();
-                    return int.TryParse(val, out int id) && id > 0 ? id : 0;
-                }
-            }
-            catch (Exception ex)
-            {
-                Log($"CorporateContext: Registry read error: {ex.Message}");
-                return 0;
-            }
-        }
-
-        private void ClearCorporateRegistry()
-        {
-            try
-            {
-                using (var key = Registry.CurrentUser.OpenSubKey(RegistryPath, writable: true))
-                {
-                    if (key == null) return;
-                    key.DeleteValue("ActiveCorporateId", throwOnMissingValue: false);
-                    key.DeleteValue("ActiveCorporateCode", throwOnMissingValue: false);
-                }
-            }
-            catch (Exception ex)
-            {
-                Log($"CorporateContext: Registry clear error: {ex.Message}");
-            }
-        }
-
-        #endregion
 
         #region DB Queries
 
@@ -255,22 +200,53 @@ namespace EliteSoft.Erwin.AddIn.Services
             return result;
         }
 
-        private bool LoadEffectiveProjectIds(string dbType)
+        private (int id, string name)? GetActiveCorporate(string dbType)
         {
-            EffectiveProjectIds.Clear();
+            try
+            {
+                string query = dbType?.ToUpper() switch
+                {
+                    "POSTGRESQL" => @"SELECT ""ID"", ""NAME"" FROM ""MC_CORPORATE"" WHERE ""ID"" != 1 AND ""IS_ACTIVE"" = true",
+                    "ORACLE" => "SELECT ID, NAME FROM MC_CORPORATE WHERE ID != 1 AND IS_ACTIVE = 1",
+                    _ => "SELECT [ID], [NAME] FROM [dbo].[MC_CORPORATE] WHERE [ID] != 1 AND [IS_ACTIVE] = 1"
+                };
 
-            // Active corporate projects + All Corporates (ID=1) projects
+                using (var conn = DatabaseService.Instance.CreateConnection())
+                {
+                    conn.Open();
+                    using (var cmd = DatabaseService.Instance.CreateCommand(query, conn))
+                    using (var reader = cmd.ExecuteReader())
+                    {
+                        if (reader.Read())
+                        {
+                            return (Convert.ToInt32(reader["ID"]), reader["NAME"]?.ToString()?.Trim() ?? "");
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"CorporateContext: GetActiveCorporate error: {ex.Message}");
+            }
+            return null;
+        }
+
+        private bool LoadEffectiveModelIds(string dbType)
+        {
+            EffectiveModelIds.Clear();
+
+            // Active corporate models + All Corporates (ID=1) models
             string query = dbType?.ToUpper() switch
             {
-                "POSTGRESQL" => @"SELECT ""ID"" FROM ""PROJECT"" WHERE ""CORPORATE_ID"" = @corpId
+                "POSTGRESQL" => @"SELECT ""ID"" FROM ""MODEL"" WHERE ""CORPORATE_ID"" = @corpId
                                 UNION
-                                SELECT ""ID"" FROM ""PROJECT"" WHERE ""CORPORATE_ID"" = 1",
-                "ORACLE" => @"SELECT ID FROM PROJECT WHERE CORPORATE_ID = :corpId
+                                SELECT ""ID"" FROM ""MODEL"" WHERE ""CORPORATE_ID"" = 1",
+                "ORACLE" => @"SELECT ID FROM MODEL WHERE CORPORATE_ID = :corpId
                             UNION
-                            SELECT ID FROM PROJECT WHERE CORPORATE_ID = 1",
-                _ => @"SELECT [ID] FROM [dbo].[PROJECT] WHERE [CORPORATE_ID] = @corpId
+                            SELECT ID FROM MODEL WHERE CORPORATE_ID = 1",
+                _ => @"SELECT [ID] FROM [dbo].[MODEL] WHERE [CORPORATE_ID] = @corpId
                       UNION
-                      SELECT [ID] FROM [dbo].[PROJECT] WHERE [CORPORATE_ID] = 1"
+                      SELECT [ID] FROM [dbo].[MODEL] WHERE [CORPORATE_ID] = 1"
             };
 
             using (var conn = DatabaseService.Instance.CreateConnection())
@@ -287,13 +263,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                     {
                         while (reader.Read())
                         {
-                            EffectiveProjectIds.Add(Convert.ToInt32(reader["ID"]));
+                            EffectiveModelIds.Add(Convert.ToInt32(reader["ID"]));
                         }
                     }
                 }
             }
 
-            return EffectiveProjectIds.Count > 0;
+            return EffectiveModelIds.Count > 0;
         }
 
         #endregion
@@ -301,19 +277,19 @@ namespace EliteSoft.Erwin.AddIn.Services
         #region Helpers
 
         /// <summary>
-        /// Build parameterized IN clause for EffectiveProjectIds.
+        /// Build parameterized IN clause for EffectiveModelIds.
         /// </summary>
-        public string BuildProjectInParams(string dbType, DbCommand command, string prefix = "prj")
+        public string BuildModelInParams(string dbType, DbCommand command, string prefix = "mdl")
         {
             var paramNames = new List<string>();
-            for (int i = 0; i < EffectiveProjectIds.Count; i++)
+            for (int i = 0; i < EffectiveModelIds.Count; i++)
             {
                 string paramName = dbType == "ORACLE" ? $":{prefix}{i}" : $"@{prefix}{i}";
                 paramNames.Add(paramName);
 
                 var param = command.CreateParameter();
                 param.ParameterName = paramName;
-                param.Value = EffectiveProjectIds[i];
+                param.Value = EffectiveModelIds[i];
                 command.Parameters.Add(param);
             }
             return string.Join(", ", paramNames);

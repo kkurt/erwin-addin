@@ -1,1 +1,1 @@
-.\package.ps1 -MetaRepo "MetaRepo" -DbUser "postgres" -DbPass "Elite12345..." -License "8AE1630BB275087AEE2E161944A2BF7184380156D0F90812ACF1405802564156"
+.\package.ps1 -Zip -MetaRepo "MetaRepo" -DbUser "postgres" -DbPass "Elite12345..." -License "8AE1630BB275087AEE2E161944A2BF7184380156D0F90812ACF1405802564156"

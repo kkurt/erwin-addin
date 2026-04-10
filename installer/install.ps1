@@ -2,13 +2,9 @@
 # Usage:
 #   .\install.ps1                                                    Install
 #   .\install.ps1 -Uninstall                                         Uninstall
-#   .\install.ps1 -MetaRepo "MetaRepoTTKOM" -DbUser "sa" -DbPass "123"  Install + configure DB
 #
 param(
-    [switch]$Uninstall,
-    [string]$MetaRepo,
-    [string]$DbUser,
-    [string]$DbPass
+    [switch]$Uninstall
 )
 
 $ErrorActionPreference = "Stop"
@@ -127,15 +123,20 @@ if ($erwinProcess) {
     }
 }
 
-# Step 1: Copy files
+# Step 1: Unregister old COM + copy files
 Write-Host "`n[1/3] Copying files to $installDir..." -ForegroundColor Yellow
 if (Test-Path $installDir) {
+    $oldComHost = Join-Path $installDir $comHostDll
+    if (Test-Path $oldComHost) {
+        Write-Host "  Unregistering old COM component..." -ForegroundColor Gray
+        regsvr32.exe /u /s $oldComHost 2>&1 | Out-Null
+    }
     Remove-Item "$installDir\*" -Recurse -Force
 } else {
     New-Item -ItemType Directory -Path $installDir -Force | Out-Null
 }
 
-Copy-Item "$sourceDir\*" -Destination $installDir -Recurse -Force -Exclude "install.ps1","metarepo.json"
+Copy-Item "$sourceDir\*" -Destination $installDir -Recurse -Force -Exclude "install.ps1"
 $count = (Get-ChildItem $installDir -Recurse -File).Count
 Write-Host "  Copied $count files" -ForegroundColor Green
 
@@ -178,83 +179,6 @@ if (Test-Path $base) {
     }
 } else {
     Write-Host "  erwin not found in registry, skipping" -ForegroundColor Yellow
-}
-
-# Auto-read MetaRepo config from embedded metarepo.json (if no params given)
-if (-not $MetaRepo) {
-    $configFile = Join-Path $sourceDir "metarepo.json"
-    if (Test-Path $configFile) {
-        $cfg = Get-Content $configFile -Raw | ConvertFrom-Json
-        $MetaRepo = $cfg.MetaRepo
-        $DbUser = $cfg.DbUser
-        $DbPass = $cfg.DbPass
-        Write-Host "`nFound embedded MetaRepo config: $MetaRepo" -ForegroundColor Cyan
-    }
-}
-
-# Configure MetaRepo connection
-if ($MetaRepo) {
-    Write-Host "`n[4] Configuring MetaRepo connection..." -ForegroundColor Yellow
-
-    # Clear existing registry keys
-    $bootstrapPath = "HKCU:\Software\EliteSoft\MetaRepo\Bootstrap"
-    $extPath = "HKCU:\Software\EliteSoft\MetaRepo\Extension"
-    if (Test-Path $bootstrapPath) { Remove-Item $bootstrapPath -Recurse -Force; Write-Host "  Cleared old Bootstrap config" -ForegroundColor Gray }
-    if (Test-Path $extPath) { Remove-Item $extPath -Recurse -Force; Write-Host "  Cleared old Extension config" -ForegroundColor Gray }
-
-    if (-not $DbUser -or -not $DbPass) {
-        Write-Host "  ERROR: -DbUser and -DbPass required with -MetaRepo" -ForegroundColor Red
-        Write-Host "`nPress any key to exit..." -ForegroundColor Gray
-        $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
-        exit 1
-    }
-
-    # DPAPI encrypt credentials (CurrentUser scope)
-    Add-Type -AssemblyName System.Security
-    function Protect-String([string]$text) {
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes($text)
-        $encrypted = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
-        return [Convert]::ToBase64String($encrypted)
-    }
-
-    $encUser = Protect-String $DbUser
-    $encPass = Protect-String $DbPass
-
-    # Write Bootstrap config (HKCU)
-    if (-not (Test-Path $bootstrapPath)) {
-        New-Item -Path $bootstrapPath -Force | Out-Null
-    }
-    Set-ItemProperty $bootstrapPath -Name "DbType" -Value "MSSQL" -Type String
-    Set-ItemProperty $bootstrapPath -Name "Host" -Value "localhost" -Type String
-    Set-ItemProperty $bootstrapPath -Name "Port" -Value "1433" -Type String
-    Set-ItemProperty $bootstrapPath -Name "Database" -Value $MetaRepo -Type String
-    Set-ItemProperty $bootstrapPath -Name "Username" -Value $encUser -Type String
-    Set-ItemProperty $bootstrapPath -Name "Password" -Value $encPass -Type String
-    Set-ItemProperty $bootstrapPath -Name "IsConfigured" -Value 1 -Type DWord
-    Write-Host "  Bootstrap: localhost/$MetaRepo (MSSQL) - OK" -ForegroundColor Green
-
-    # Update CONNECTION_DEF credentials in DB (re-encrypt with this user's DPAPI)
-    try {
-        $connStr = "Server=localhost,1433;Database=$MetaRepo;User Id=$DbUser;Password=$DbPass;TrustServerCertificate=True;"
-        $sqlConn = New-Object System.Data.SqlClient.SqlConnection($connStr)
-        $sqlConn.Open()
-
-        $updateSql = "UPDATE CONNECTION_DEF SET USERNAME = @user, PASSWORD = @pass WHERE CONNECTION_GROUP = 'OPERATIONAL' OR ID = 4"
-        $cmd = $sqlConn.CreateCommand()
-        $cmd.CommandText = $updateSql
-        $cmd.Parameters.AddWithValue("@user", $encUser) | Out-Null
-        $cmd.Parameters.AddWithValue("@pass", $encPass) | Out-Null
-        $rows = $cmd.ExecuteNonQuery()
-        $sqlConn.Close()
-
-        if ($rows -gt 0) {
-            Write-Host "  Glossary credentials updated ($rows connection(s)) - OK" -ForegroundColor Green
-        } else {
-            Write-Host "  No glossary connections found to update" -ForegroundColor Gray
-        }
-    } catch {
-        Write-Host "  Glossary credentials update skipped: $_" -ForegroundColor Yellow
-    }
 }
 
 # Configure auto-start watcher (DLL injection based)

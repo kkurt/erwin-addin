@@ -11,7 +11,7 @@ using EliteSoft.Erwin.AddIn.Forms;
 namespace EliteSoft.Erwin.AddIn.Services
 {
     /// <summary>
-    /// Reads project standards from DB (MC_ tables) and applies them to erwin model objects.
+    /// Reads model standards from DB (MC_ tables) and applies them to erwin model objects.
     /// Detects model's target DB platform via SCAPI and loads only matching property definitions.
     /// </summary>
     public class PropertyApplicatorService : IDisposable
@@ -24,9 +24,9 @@ namespace EliteSoft.Erwin.AddIn.Services
         private Platform _detectedPlatform;
         private string _targetServerValue;
         private List<PropertyDef> _tablePropertyDefs;
-        private Dictionary<int, string> _projectStandardMap; // PropertyDefId -> Value
+        private Dictionary<int, string> _modelStandardMap; // PropertyDefId -> Value
         private List<QuestionDef> _questions; // Question definitions for this platform+TABLE
-        private int _projectId;
+        private int _modelId;
         private int _tableObjectTypeId;
 
         public event Action<string> OnLog;
@@ -40,7 +40,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         #region Initialization
 
         /// <summary>
-        /// Initialize: detect platform from model, find project by model path, load property defs + standards.
+        /// Initialize: detect platform from model, find model by path, load property defs + standards.
         /// </summary>
         public bool Initialize()
         {
@@ -55,14 +55,14 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
                 Log($"PropertyApplicator: Detected platform = {_detectedPlatform.Name} (ID={_detectedPlatform.Id})");
 
-                // 2. Find project by model file path
-                _projectId = FindProjectId();
-                if (_projectId <= 0)
+                // 2. Find model by file path
+                _modelId = FindModelId();
+                if (_modelId <= 0)
                 {
-                    Log("PropertyApplicator: No matching project found in DB for this model");
+                    Log("PropertyApplicator: No matching model found in DB");
                     return false;
                 }
-                Log($"PropertyApplicator: Matched project ID = {_projectId}");
+                Log($"PropertyApplicator: Matched model ID = {_modelId}");
 
                 // 3. Get TABLE object type
                 var objectTypes = _metadataService.GetObjectTypes();
@@ -78,9 +78,9 @@ namespace EliteSoft.Erwin.AddIn.Services
                 _tablePropertyDefs = _metadataService.GetPropertyDefs(_detectedPlatform.Id, tableType.Id);
                 Log($"PropertyApplicator: Loaded {_tablePropertyDefs.Count} property definitions for {_detectedPlatform.Name} TABLE");
 
-                // 5. Load project standards
-                var standards = _metadataService.GetProjectStandards(_projectId);
-                Log($"PropertyApplicator: Raw standards from DB for PROJECT_ID={_projectId}: {standards.Count} record(s)");
+                // 5. Load model standards
+                var standards = _metadataService.GetModelStandards(_modelId);
+                Log($"PropertyApplicator: Raw standards from DB for MODEL_ID={_modelId}: {standards.Count} record(s)");
                 foreach (var s in standards)
                 {
                     var matchingDef = _tablePropertyDefs.FirstOrDefault(pd => pd.Id == s.PropertyDefId);
@@ -89,10 +89,10 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                 Log($"PropertyApplicator: Table PropertyDef IDs: [{string.Join(", ", _tablePropertyDefs.Select(pd => $"{pd.Id}:{pd.PropertyCode}"))}]");
 
-                _projectStandardMap = standards
+                _modelStandardMap = standards
                     .Where(s => _tablePropertyDefs.Any(pd => pd.Id == s.PropertyDefId))
                     .ToDictionary(s => s.PropertyDefId, s => s.Value);
-                Log($"PropertyApplicator: Loaded {_projectStandardMap.Count} project standards (after filter)");
+                Log($"PropertyApplicator: Loaded {_modelStandardMap.Count} model standards (after filter)");
 
                 // 6. Load question definitions for this platform + TABLE
                 _questions = _metadataService.GetQuestions(_detectedPlatform.Id, tableType.Id);
@@ -108,10 +108,10 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// Find the PROJECT record by matching model file path.
-        /// PROJECT.PATH is set by erwin-admin when a project is registered.
+        /// Find the MODEL record by matching model file path.
+        /// MODEL.PATH is set by erwin-admin when a model is registered.
         /// </summary>
-        private int FindProjectId()
+        private int FindModelId()
         {
             try
             {
@@ -123,9 +123,9 @@ namespace EliteSoft.Erwin.AddIn.Services
                     return -1;
                 }
 
-                // Corporate scope: only match within effective projects
+                // Corporate scope: only match within effective models
                 var effectiveIds = CorporateContextService.Instance.IsInitialized
-                    ? new HashSet<int>(CorporateContextService.Instance.EffectiveProjectIds)
+                    ? new HashSet<int>(CorporateContextService.Instance.EffectiveModelIds)
                     : null;
 
                 // 1. Read MODEL_PATH UDP (primary source)
@@ -143,76 +143,75 @@ namespace EliteSoft.Erwin.AddIn.Services
                     Log($"PropertyApplicator: MODEL_PATH = '{modelPath}'");
                 }
 
-                // 3. Try matching MODEL_PATH against PROJECT.PATH
+                // 3. Try matching MODEL_PATH against MODEL.PATH
                 if (!string.IsNullOrEmpty(modelPath))
                 {
                     string normalizedModelPath = modelPath.Replace("/", "\\").TrimEnd('\\').ToUpperInvariant();
 
                     using (var context = new RepoDbContext(config))
                     {
-                        var project = context.Projects
+                        var model = context.Models
                             .AsEnumerable()
                             .Where(p => effectiveIds == null || effectiveIds.Contains(p.Id))
                             .FirstOrDefault(p => !string.IsNullOrEmpty(p.Path) &&
                                 p.Path.Replace("/", "\\").TrimEnd('\\').ToUpperInvariant() == normalizedModelPath);
 
-                        if (project != null)
+                        if (model != null)
                         {
-                            Log($"PropertyApplicator: Matched project by MODEL_PATH, ID={project.Id}");
-                            return project.Id;
+                            Log($"PropertyApplicator: Matched model by MODEL_PATH, ID={model.Id}");
+                            return model.Id;
                         }
                     }
 
-                    // 3b. Fallback: match model name portion against PROJECT.PATH filename
+                    // 3b. Fallback: match model name portion against MODEL.PATH filename
                     string modelName = ReadModelName();
                     if (!string.IsNullOrEmpty(modelName))
                     {
                         using (var context = new RepoDbContext(config))
                         {
-                            var project = context.Projects
+                            var model = context.Models
                                 .AsEnumerable()
                                 .Where(p => effectiveIds == null || effectiveIds.Contains(p.Id))
                                 .FirstOrDefault(p => !string.IsNullOrEmpty(p.Path) &&
                                     MatchesModelName(p.Path, modelName));
 
-                            if (project != null)
+                            if (model != null)
                             {
-                                Log($"PropertyApplicator: Matched project by model name, ID={project.Id}, PATH='{project.Path}'");
-                                // Write the full project path back to MODEL_PATH UDP so next time it matches directly
-                                UpdateModelPathUdp(project.Path);
-                                return project.Id;
+                                Log($"PropertyApplicator: Matched model by name, ID={model.Id}, PATH='{model.Path}'");
+                                UpdateModelPathUdp(model.Path);
+                                return model.Id;
                             }
                         }
                     }
 
-                    Log($"PropertyApplicator: No project matched path '{modelPath}'");
+                    Log($"PropertyApplicator: No model matched path '{modelPath}'");
                 }
 
-                // 4. Fallback: first effective project (default corporate's project is included)
+                // 4. Fallback: first effective model
                 if (effectiveIds != null && effectiveIds.Count > 0)
                 {
                     int fallbackId = effectiveIds.First();
-                    Log($"PropertyApplicator: Fallback to first effective project, ID={fallbackId}");
+                    Log($"PropertyApplicator: Fallback to first effective model, ID={fallbackId}");
                     return fallbackId;
                 }
 
-                // 5. Last resort: first project in DB
+                // 5. Last resort: first model in DB
                 using (var ctx = new RepoDbContext(config))
                 {
-                    var firstProject = ctx.Projects.OrderBy(p => p.Id).FirstOrDefault();
-                    if (firstProject != null)
+                    var firstModel = ctx.Models.OrderBy(p => p.Id).FirstOrDefault();
+                    if (firstModel != null)
                     {
-                        Log($"PropertyApplicator: Last resort fallback, ID={firstProject.Id}, PATH='{firstProject.Path}'");
-                        return firstProject.Id;
+                        Log($"PropertyApplicator: Last resort fallback, ID={firstModel.Id}, PATH='{firstModel.Path}'");
+                        return firstModel.Id;
                     }
                 }
 
-                Log("PropertyApplicator: No projects found in DB");
+                Log("PropertyApplicator: No models found in DB");
                 return -1;
             }
             catch (Exception ex)
             {
-                Log($"PropertyApplicator: FindProjectId error: {ex.Message}");
+                Log($"PropertyApplicator: FindModelId error: {ex.Message}");
                 return -1;
             }
         }
@@ -233,11 +232,11 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// Write project path to MODEL_PATH UDP so it persists in the model for future opens.
+        /// Write model path to MODEL_PATH UDP so it persists in the model for future opens.
         /// </summary>
-        private void UpdateModelPathUdp(string projectPath)
+        private void UpdateModelPathUdp(string modelPath)
         {
-            if (string.IsNullOrEmpty(projectPath)) return;
+            if (string.IsNullOrEmpty(modelPath)) return;
             try
             {
                 dynamic modelObjects = _session.ModelObjects;
@@ -248,14 +247,14 @@ namespace EliteSoft.Erwin.AddIn.Services
                 catch { return; } // UDP not available yet
 
                 // Only update if different from current value
-                if (currentValue.Equals(projectPath, StringComparison.OrdinalIgnoreCase)) return;
+                if (currentValue.Equals(modelPath, StringComparison.OrdinalIgnoreCase)) return;
 
                 int transId = _session.BeginNamedTransaction("UpdateModelPath");
                 try
                 {
-                    root.Properties("Model.Physical.MODEL_PATH").Value = projectPath;
+                    root.Properties("Model.Physical.MODEL_PATH").Value = modelPath;
                     _session.CommitTransaction(transId);
-                    Log($"PropertyApplicator: MODEL_PATH updated to project path: '{projectPath}'");
+                    Log($"PropertyApplicator: MODEL_PATH updated to: '{modelPath}'");
                 }
                 catch (Exception ex)
                 {
@@ -270,14 +269,14 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// Check if a PROJECT.PATH contains the model name as its filename (without extension).
+        /// Check if a MODEL.PATH contains the model name as its filename (without extension).
         /// E.g. PATH="C:\Models\AchModel.erwin" matches modelName="AchModel"
         /// </summary>
-        private bool MatchesModelName(string projectPath, string modelName)
+        private bool MatchesModelName(string modelPath, string modelName)
         {
             try
             {
-                string fileName = System.IO.Path.GetFileNameWithoutExtension(projectPath);
+                string fileName = System.IO.Path.GetFileNameWithoutExtension(modelPath);
                 return string.Equals(fileName, modelName, StringComparison.OrdinalIgnoreCase);
             }
             catch
@@ -353,11 +352,11 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             try
             {
-                var standards = _metadataService.GetProjectStandards(_projectId);
-                _projectStandardMap = standards
+                var standards = _metadataService.GetModelStandards(_modelId);
+                _modelStandardMap = standards
                     .Where(s => _tablePropertyDefs.Any(pd => pd.Id == s.PropertyDefId))
                     .ToDictionary(s => s.PropertyDefId, s => s.Value);
-                Log($"PropertyApplicator: Reloaded {_projectStandardMap.Count} project standards");
+                Log($"PropertyApplicator: Reloaded {_modelStandardMap.Count} model standards");
             }
             catch (Exception ex)
             {
@@ -554,8 +553,8 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <summary>
         /// Apply properties to a new entity (table).
         /// Flow: 1) Show question wizard (if questions exist) → 2) Apply question rule values
-        ///       → 3) Fill remaining from project standards (fallback)
-        /// Priority: Question rules > Project standards
+        ///       → 3) Fill remaining from model standards (fallback)
+        /// Priority: Question rules > Model standards
         /// </summary>
         public void ApplyStandardsToEntity(dynamic entity, string physicalName)
         {
@@ -567,10 +566,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // Merged property values: PropertyDefId -> Value
                 var mergedValues = new Dictionary<int, string>();
 
-                // 1. Start with project standards as baseline
-                if (_projectStandardMap != null)
+                // 1. Start with model standards as baseline
+                if (_modelStandardMap != null)
                 {
-                    foreach (var kvp in _projectStandardMap)
+                    foreach (var kvp in _modelStandardMap)
                         mergedValues[kvp.Key] = kvp.Value;
                 }
 
@@ -599,7 +598,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                             }
                             else
                             {
-                                Log("PropertyApplicator: Wizard cancelled or no values — using project standards only");
+                                Log("PropertyApplicator: Wizard cancelled or no values — using model standards only");
                             }
                         }
                     }
@@ -1173,7 +1172,7 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         public Platform DetectedPlatform => _detectedPlatform;
         public string TargetServerValue => _targetServerValue;
-        public int StandardCount => _projectStandardMap?.Count ?? 0;
+        public int StandardCount => _modelStandardMap?.Count ?? 0;
         public int QuestionCount => _questions?.Count ?? 0;
         public List<PropertyDef> TablePropertyDefs => _tablePropertyDefs;
         public bool IsInitialized => _detectedPlatform != null && _tablePropertyDefs != null;
@@ -1185,7 +1184,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             if (_disposed) return;
             _disposed = true;
             _tablePropertyDefs = null;
-            _projectStandardMap = null;
+            _modelStandardMap = null;
         }
 
         private void Log(string message)

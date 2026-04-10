@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using System.Windows.Forms;
-using Microsoft.Win32;
 
 namespace EliteSoft.Erwin.AddIn
 {
@@ -18,68 +17,6 @@ namespace EliteSoft.Erwin.AddIn
         {
             "1_DEV", "2_INT", "3_FIX", "4_BAU", "5_REG", "6_PREPROD", "7_PROD"
         };
-
-        #endregion
-
-        #region ODBC Connection
-
-        /// <summary>
-        /// Gets ODBC connection string from Windows Registry
-        /// Converted from: GetODBCConnection
-        /// </summary>
-        public static string GetODBCConnection(string oracleDB, string modelEnvironment)
-        {
-            string result = null;
-
-            try
-            {
-                // Read ODBC connections from HKCU only (per-user)
-                string keyPath = @"SOFTWARE\ODBC\ODBC.INI\ODBC Data Sources";
-
-                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(keyPath))
-                {
-                    if (key != null)
-                    {
-                        foreach (string valueName in key.GetValueNames())
-                        {
-                            string value = key.GetValue(valueName)?.ToString() ?? "";
-
-                            if (value.Contains("Oracle in"))
-                            {
-                                bool environmentMatch = false;
-
-                                if (modelEnvironment.Contains("1_DEV") && valueName.StartsWith(oracleDB))
-                                    environmentMatch = true;
-                                else if (modelEnvironment.Contains("2_INT") && valueName.StartsWith(oracleDB))
-                                    environmentMatch = true;
-                                else if (modelEnvironment.Contains("3_FIX") && valueName.StartsWith(oracleDB))
-                                    environmentMatch = true;
-                                else if (modelEnvironment.Contains("4_BAU") && valueName.StartsWith(oracleDB))
-                                    environmentMatch = true;
-                                else if (modelEnvironment.Contains("5_REG") && valueName.StartsWith(oracleDB))
-                                    environmentMatch = true;
-                                else if (modelEnvironment.Contains("6_PREPROD") && valueName.StartsWith(oracleDB))
-                                    environmentMatch = true;
-                                else if (modelEnvironment.Contains("7_PROD") && valueName.StartsWith(oracleDB))
-                                    environmentMatch = true;
-
-                                if (environmentMatch)
-                                {
-                                    result = $"odbc{valueName}:{value}";
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine($"GetODBCConnection Error: {ex.Message}");
-            }
-
-            return result;
-        }
 
         #endregion
 

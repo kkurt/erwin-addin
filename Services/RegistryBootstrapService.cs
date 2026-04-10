@@ -37,12 +37,15 @@ namespace EliteSoft.Erwin.AddIn.Services
                 if (key == null)
                     return null;
 
-                var isConfigured = key.GetValue("IsConfigured");
-                if (isConfigured == null || (isConfigured is int intVal && intVal == 0))
-                    return null;
-
                 try
                 {
+                    var host = key.GetValue("Host", "")?.ToString() ?? "";
+                    var database = key.GetValue("Database", "")?.ToString() ?? "";
+
+                    // IsConfigured is now computed: Host + Database must be non-empty
+                    if (string.IsNullOrEmpty(host) || string.IsNullOrEmpty(database))
+                        return null;
+
                     var encryptedUsername = key.GetValue("Username", "")?.ToString() ?? "";
                     var encryptedPassword = key.GetValue("Password", "")?.ToString() ?? "";
 
@@ -52,12 +55,11 @@ namespace EliteSoft.Erwin.AddIn.Services
                     return new BootstrapConfig
                     {
                         DbType = key.GetValue("DbType", "MSSQL")?.ToString() ?? "MSSQL",
-                        Host = key.GetValue("Host", "localhost")?.ToString() ?? "localhost",
+                        Host = host,
                         Port = key.GetValue("Port", "1433")?.ToString() ?? "1433",
-                        Database = key.GetValue("Database", "")?.ToString() ?? "",
+                        Database = database,
                         Username = username,
-                        Password = password,
-                        IsConfigured = true
+                        Password = password
                     };
                 }
                 catch (Exception ex)

@@ -155,9 +155,15 @@ namespace EliteSoft.Erwin.AddIn
                 }
                 finally
                 {
-                    loadingDialog?.Close();
-                    loadingDialog?.Dispose();
+                    if (loadingDialog != null && !loadingDialog.IsDisposed)
+                    {
+                        loadingDialog.Close();
+                        loadingDialog.Dispose();
+                    }
                 }
+
+                // If ForceClose was triggered during init, stop further processing
+                if (_allowClose || this.IsDisposed) return;
             }
             catch (Exception ex)
             {
@@ -277,7 +283,7 @@ namespace EliteSoft.Erwin.AddIn
                 this.ForceClose();
                 return;
             }
-            Log($"Corporate: {corpContext.ActiveCorporateName} (ID={corpContext.ActiveCorporateId}), {corpContext.EffectiveProjectIds.Count} effective project(s)");
+            Log($"Corporate: {corpContext.ActiveCorporateName} (ID={corpContext.ActiveCorporateId}), {corpContext.EffectiveModelIds.Count} effective model(s)");
 
             DisposeServices();
             GlossaryService.Instance.OnLog += Log;

@@ -3,17 +3,11 @@
 # Usage:
 #   .\package.ps1                                                Publish to folder (no compression)
 #   .\package.ps1 -Zip                                           ZIP package
-#   .\package.ps1 -Exe                                           EXE installer (Inno Setup)
-#   .\package.ps1 -Zip -MetaRepo "MetaRepoTTKOM" -DbUser "sa" -DbPass "123"
 #   .\package.ps1 -?                                             Show help
 
 param(
     [switch]$Zip,
-    [switch]$Exe,
     [string]$License,
-    [string]$MetaRepo,
-    [string]$DbUser,
-    [string]$DbPass,
     [Alias('?')]
     [switch]$Help
 )
@@ -26,30 +20,18 @@ if ($Help) {
     Write-Host "Usage:" -ForegroundColor Yellow
     Write-Host "  .\package.ps1                              Publish to folder (no compression)"
     Write-Host "  .\package.ps1 -Zip                         Create ZIP package"
-    Write-Host "  .\package.ps1 -Exe                         Create EXE installer (Inno Setup 6)"
     Write-Host "  .\package.ps1 -Zip -License HWID           Embed hardware license"
-    Write-Host "  .\package.ps1 -Zip -MetaRepo DB ...        Embed MetaRepo config"
-    Write-Host ""
-    Write-Host "MetaRepo Parameters:" -ForegroundColor Yellow
-    Write-Host "  -MetaRepo        Database name (e.g. MetaRepoTTKOM)"
-    Write-Host "  -DbUser          SQL Server username"
-    Write-Host "  -DbPass          SQL Server password"
-    Write-Host ""
-    Write-Host "Example:" -ForegroundColor Yellow
-    Write-Host '  .\package.ps1 -Zip -MetaRepo "MetaRepoTTKOM" -DbUser "sa" -DbPass "123"'
     Write-Host ""
     exit 0
 }
 
-# --- Auto-elevate to Administrator ---
+# --- Auto-elevate to Administrator (required for writing to C:\EliteSoft\) ---
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
     Write-Host "Requesting Administrator privileges..." -ForegroundColor Yellow
     $elevateArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`""
     if ($Zip) { $elevateArgs += " -Zip" }
-    if ($Exe) { $elevateArgs += " -Exe" }
     if ($License) { $elevateArgs += " -License `"$License`"" }
-    if ($MetaRepo) { $elevateArgs += " -MetaRepo `"$MetaRepo`" -DbUser `"$DbUser`" -DbPass `"$DbPass`"" }
     Start-Process powershell.exe -ArgumentList $elevateArgs -Verb RunAs
     exit
 }
@@ -57,10 +39,10 @@ if (-not $isAdmin) {
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $scriptDir
 
-$publishDir = "C:\EliteSoft\ErwinAddIn-Publish"
+$publishDir = "C:\EliteSoft\ErwinAddIn"
 $distDir = Join-Path $scriptDir "dist"
 
-if ($Exe) { $format = "EXE" } elseif ($Zip) { $format = "ZIP" } else { $format = "FOLDER" }
+if ($Zip) { $format = "ZIP" } else { $format = "FOLDER" }
 
 Write-Host "=== Elite Soft Erwin Add-In - Package ($format) ===" -ForegroundColor Cyan
 
@@ -119,28 +101,7 @@ $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
     Write-Host "  License embedded" -ForegroundColor Green
 }
 
-# STEP 3: Embed MetaRepo config (optional)
-if ($MetaRepo) {
-    Write-Host "`n[3] Embedding MetaRepo config..." -ForegroundColor Yellow
-
-    if (-not $DbUser -or -not $DbPass) {
-        Write-Host "  ERROR: -DbUser and -DbPass required with -MetaRepo" -ForegroundColor Red
-        Write-Host "`nPress any key to exit..." -ForegroundColor Gray
-$null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
-        exit 1
-    }
-
-    $config = @{
-        MetaRepo = $MetaRepo
-        DbUser   = $DbUser
-        DbPass   = $DbPass
-    }
-    $config | ConvertTo-Json | Out-File (Join-Path $publishDir "metarepo.json") -Encoding UTF8
-
-    Write-Host "  Config: localhost/$MetaRepo (MSSQL)" -ForegroundColor Green
-}
-
-# STEP 4: Build and copy injection components
+# STEP 3: Build and copy injection components
 Write-Host "`n[4] Building injection components..." -ForegroundColor Yellow
 
 $triggerDllProject = Join-Path $scriptDir "scripts\erwin-injector\TriggerDll\TriggerDll.csproj"
@@ -208,46 +169,7 @@ if (-not (Test-Path $distDir)) {
     New-Item -ItemType Directory -Path $distDir -Force | Out-Null
 }
 
-if ($Exe) {
-    Write-Host "`n[4] Creating EXE installer (Inno Setup)..." -ForegroundColor Yellow
-
-    $isccPaths = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe")
-    $iscc = $null
-    foreach ($p in $isccPaths) {
-        if (Test-Path $p) { $iscc = $p; break }
-    }
-
-    if (-not $iscc) {
-        Write-Host "  Inno Setup 6 not found!" -ForegroundColor Red
-        Write-Host "`nPress any key to exit..." -ForegroundColor Gray
-$null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
-        exit 1
-    }
-
-    $issFile = Join-Path $scriptDir "installer\erwin-addin-setup.iss"
-    if (-not (Test-Path $issFile)) {
-        Write-Host "  ISS script not found: $issFile" -ForegroundColor Red
-        Write-Host "`nPress any key to exit..." -ForegroundColor Gray
-$null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
-        exit 1
-    }
-
-    & $iscc $issFile
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "  Installer creation failed!" -ForegroundColor Red
-        Write-Host "`nPress any key to exit..." -ForegroundColor Gray
-$null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
-        exit 1
-    }
-
-    $installer = Get-ChildItem $distDir -Filter "ErwinAddIn-Setup-*.exe" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    if ($installer) {
-        $sizeMB = [math]::Round($installer.Length / 1MB, 1)
-        Write-Host "`nPackage ready!" -ForegroundColor Green
-        Write-Host "  $($installer.FullName) ($sizeMB MB)" -ForegroundColor Cyan
-    }
-
-} elseif ($Zip) {
+if ($Zip) {
     Write-Host "`n[4] Creating ZIP package..." -ForegroundColor Yellow
 
     $zipFile = Join-Path $distDir "ErwinAddIn-1.0.0.zip"
@@ -267,11 +189,9 @@ $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
 }
 
 Write-Host "`nInstall on target:" -ForegroundColor Yellow
-Write-Host "  1. Copy folder (or extract ZIP/run EXE)" -ForegroundColor White
+Write-Host "  1. Copy folder (or extract ZIP)" -ForegroundColor White
 Write-Host "  2. PowerShell as Admin: .\install.ps1" -ForegroundColor White
-if ($MetaRepo) {
-    Write-Host "  MetaRepo config will be applied automatically from embedded metarepo.json" -ForegroundColor Gray
-}
+Write-Host "  3. Run Admin tool to configure DB connection" -ForegroundColor White
 
 Write-Host "`nPress any key to exit..." -ForegroundColor Gray
 $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')

@@ -66,13 +66,13 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
         }
 
-        public List<ProjectStandard> GetProjectStandards(int projectId)
+        public List<ModelStandard> GetModelStandards(int modelId)
         {
             using (var context = CreateContext())
             {
-                return context.ProjectStandards
+                return context.ModelStandards
                     .Include(ps => ps.PropertyDef)
-                    .Where(ps => ps.ProjectId == projectId)
+                    .Where(ps => ps.ModelId == modelId)
                     .ToList();
             }
         }
@@ -118,8 +118,8 @@ namespace EliteSoft.Erwin.AddIn.Services
         public PropertyDef SavePropertyDef(PropertyDef def) => throw new NotSupportedException("Add-in is read-only");
         public void DeletePropertyDef(int id) => throw new NotSupportedException("Add-in is read-only");
         public void SaveEnumOptions(int propertyDefId, List<EnumOption> options) => throw new NotSupportedException("Add-in is read-only");
-        public void SaveProjectStandard(int projectId, int propertyDefId, string value) => throw new NotSupportedException("Add-in is read-only");
-        public void DeleteProjectStandard(int projectId, int propertyDefId) => throw new NotSupportedException("Add-in is read-only");
+        public void SaveModelStandard(int modelId, int propertyDefId, string value) => throw new NotSupportedException("Add-in is read-only");
+        public void DeleteModelStandard(int modelId, int propertyDefId) => throw new NotSupportedException("Add-in is read-only");
         public QuestionDef SaveQuestionDef(QuestionDef def) => throw new NotSupportedException("Add-in is read-only");
         public void DeleteQuestionDef(int id) => throw new NotSupportedException("Add-in is read-only");
         public void SaveQuestionOptions(int questionDefId, List<QuestionOption> options) => throw new NotSupportedException("Add-in is read-only");

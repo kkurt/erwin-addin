@@ -104,8 +104,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                 string query = GetDefinitionQuery(dbType, filterByType);
 
                 // Effective project IDs for corporate filtering (applied in-memory)
-                var effectiveProjectIds = CorporateContextService.Instance.IsInitialized
-                    ? new HashSet<int>(CorporateContextService.Instance.EffectiveProjectIds)
+                var effectiveModelIds = CorporateContextService.Instance.IsInitialized
+                    ? new HashSet<int>(CorporateContextService.Instance.EffectiveModelIds)
                     : null;
 
                 using (var connection = DatabaseService.Instance.CreateConnection())
@@ -127,10 +127,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                             while (reader.Read())
                             {
                                 // Corporate scope filter (in-memory)
-                                if (effectiveProjectIds != null)
+                                if (effectiveModelIds != null)
                                 {
-                                    int rowProjectId = reader["PROJECT_ID"] == DBNull.Value ? 0 : Convert.ToInt32(reader["PROJECT_ID"]);
-                                    if (rowProjectId > 0 && !effectiveProjectIds.Contains(rowProjectId))
+                                    int rowModelId = reader["MODEL_ID"] == DBNull.Value ? 0 : Convert.ToInt32(reader["MODEL_ID"]);
+                                    if (rowModelId > 0 && !effectiveModelIds.Contains(rowModelId))
                                         continue;
                                 }
 
@@ -229,7 +229,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     return $@"SELECT d.""ID"" AS ""DEF_ID"", d.""NAME"", d.""DESCRIPTION"", d.""OBJECT_TYPE"", d.""UDP_TYPE"",
                             d.""DEFAULT_VALUE"", d.""IS_REQUIRED"", d.""MIN_VALUE"", d.""MAX_VALUE"", d.""MAX_LENGTH"",
                             d.""VALIDATION_OPERATOR"", d.""VALIDATION_VALUE"", d.""ERROR_MESSAGE"", d.""APPLY_ON"", d.""SORT_ORDER"",
-                            d.""PROJECT_ID"",
+                            d.""MODEL_ID"",
 
                             o.""VALUE"" AS ""OPT_VALUE"", o.""DISPLAY_TEXT"" AS ""OPT_DISPLAY"", o.""SORT_ORDER"" AS ""OPT_ORDER""
                             FROM ""MC_UDP_DEFINITION"" d
@@ -242,7 +242,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     return $@"SELECT d.ID AS DEF_ID, d.NAME, d.DESCRIPTION, d.OBJECT_TYPE, d.UDP_TYPE,
                             d.DEFAULT_VALUE, d.IS_REQUIRED, d.MIN_VALUE, d.MAX_VALUE, d.MAX_LENGTH,
                             d.VALIDATION_OPERATOR, d.VALIDATION_VALUE, d.ERROR_MESSAGE, d.APPLY_ON, d.SORT_ORDER,
-                            d.PROJECT_ID,
+                            d.MODEL_ID,
 
                             o.VALUE AS OPT_VALUE, o.DISPLAY_TEXT AS OPT_DISPLAY, o.SORT_ORDER AS OPT_ORDER
                             FROM MC_UDP_DEFINITION d
@@ -256,7 +256,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     return $@"SELECT d.[ID] AS [DEF_ID], d.[NAME], d.[DESCRIPTION], d.[OBJECT_TYPE], d.[UDP_TYPE],
                             d.[DEFAULT_VALUE], d.[IS_REQUIRED], d.[MIN_VALUE], d.[MAX_VALUE], d.[MAX_LENGTH],
                             d.[VALIDATION_OPERATOR], d.[VALIDATION_VALUE], d.[ERROR_MESSAGE], d.[APPLY_ON], d.[SORT_ORDER],
-                            d.[PROJECT_ID],
+                            d.[MODEL_ID],
 
                             o.[VALUE] AS [OPT_VALUE], o.[DISPLAY_TEXT] AS [OPT_DISPLAY], o.[SORT_ORDER] AS [OPT_ORDER]
                             FROM [dbo].[MC_UDP_DEFINITION] d

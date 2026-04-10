@@ -10,7 +10,7 @@ namespace EliteSoft.Erwin.AddIn.Services
     public class PredefinedColumn
     {
         public int Id { get; set; }
-        public int ProjectId { get; set; }
+        public int ModelId { get; set; }
         public string ColumnName { get; set; }
         public string DataType { get; set; }
         public bool Nullable { get; set; }
@@ -67,7 +67,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <summary>
         /// Load predefined columns filtered by project and DB type.
         /// </summary>
-        public bool LoadPredefinedColumns(int? projectId = null, string platformDbType = null)
+        public bool LoadPredefinedColumns(int? modelId = null, string platformDbType = null)
         {
             try
             {
@@ -94,13 +94,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                         {
                             while (reader.Read())
                             {
-                                int rowProjectId = reader["PROJECT_ID"] == DBNull.Value ? 0 : Convert.ToInt32(reader["PROJECT_ID"]);
+                                int rowModelId = reader["MODEL_ID"] == DBNull.Value ? 0 : Convert.ToInt32(reader["MODEL_ID"]);
                                 string rowDbType = reader["DB_TYPE"] == DBNull.Value ? "" : reader["DB_TYPE"]?.ToString()?.Trim() ?? "";
 
                                 // Corporate scope filter
-                                var effectiveProjectIds = CorporateContextService.Instance.IsInitialized
-                                    ? CorporateContextService.Instance.EffectiveProjectIds : null;
-                                if (effectiveProjectIds != null && rowProjectId > 0 && !effectiveProjectIds.Contains(rowProjectId))
+                                var effectiveModelIds = CorporateContextService.Instance.IsInitialized
+                                    ? CorporateContextService.Instance.EffectiveModelIds : null;
+                                if (effectiveModelIds != null && rowModelId > 0 && !effectiveModelIds.Contains(rowModelId))
                                     continue;
 
                                 // DB_TYPE filter: match platform or empty (all platforms)
@@ -114,7 +114,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 _columns.Add(new PredefinedColumn
                                 {
                                     Id = Convert.ToInt32(reader["ID"]),
-                                    ProjectId = rowProjectId,
+                                    ModelId = rowModelId,
                                     ColumnName = colName,
                                     DataType = reader["DATA_TYPE"]?.ToString()?.Trim() ?? "",
                                     Nullable = reader["NULLABLE"] != DBNull.Value && Convert.ToBoolean(reader["NULLABLE"]),
@@ -148,7 +148,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             switch (dbType?.ToUpper())
             {
                 case "POSTGRESQL":
-                    return @"SELECT pc.""ID"", pc.""PROJECT_ID"", pc.""COLUMN_NAME"", pc.""DATA_TYPE"", pc.""NULLABLE"",
+                    return @"SELECT pc.""ID"", pc.""MODEL_ID"", pc.""COLUMN_NAME"", pc.""DATA_TYPE"", pc.""NULLABLE"",
                             pc.""DEFAULT_VALUE"", pc.""DEPENDS_ON_UDP_ID"", pc.""DEPENDS_ON_UDP_VALUE"",
                             pc.""DB_TYPE"", pc.""SORT_ORDER"",
                             udp.""NAME"" AS ""UDP_NAME""
@@ -157,7 +157,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                             ORDER BY pc.""SORT_ORDER""";
 
                 case "ORACLE":
-                    return @"SELECT pc.ID, pc.PROJECT_ID, pc.COLUMN_NAME, pc.DATA_TYPE, pc.NULLABLE,
+                    return @"SELECT pc.ID, pc.MODEL_ID, pc.COLUMN_NAME, pc.DATA_TYPE, pc.NULLABLE,
                             pc.DEFAULT_VALUE, pc.DEPENDS_ON_UDP_ID, pc.DEPENDS_ON_UDP_VALUE,
                             pc.DB_TYPE, pc.SORT_ORDER,
                             udp.NAME AS UDP_NAME
@@ -167,7 +167,7 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                 case "MSSQL":
                 default:
-                    return @"SELECT pc.[ID], pc.[PROJECT_ID], pc.[COLUMN_NAME], pc.[DATA_TYPE], pc.[NULLABLE],
+                    return @"SELECT pc.[ID], pc.[MODEL_ID], pc.[COLUMN_NAME], pc.[DATA_TYPE], pc.[NULLABLE],
                             pc.[DEFAULT_VALUE], pc.[DEPENDS_ON_UDP_ID], pc.[DEPENDS_ON_UDP_VALUE],
                             pc.[DB_TYPE], pc.[SORT_ORDER],
                             udp.[NAME] AS [UDP_NAME]
@@ -211,9 +211,9 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// </summary>
         public IEnumerable<PredefinedColumn> GetAll() => _columns;
 
-        public void Reload(int? projectId = null, string platformDbType = null)
+        public void Reload(int? modelId = null, string platformDbType = null)
         {
-            LoadPredefinedColumns(projectId, platformDbType);
+            LoadPredefinedColumns(modelId, platformDbType);
         }
     }
 }
