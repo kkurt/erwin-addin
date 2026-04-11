@@ -1,10 +1,13 @@
-# Elite Soft Erwin Add-In - Install Script (No Admin Required)
+# Elite Soft Erwin Add-In - Install Script
 # Usage:
-#   .\install.ps1                                                    Install
+#   .\install.ps1                                                    Install (User scope, default)
+#   .\install.ps1 -Scope Machine                                     Install (Machine scope, all users)
 #   .\install.ps1 -Uninstall                                         Uninstall
 #
 param(
-    [switch]$Uninstall
+    [switch]$Uninstall,
+    [ValidateSet("User", "Machine")]
+    [string]$Scope = "User"
 )
 
 $ErrorActionPreference = "Stop"
@@ -18,7 +21,16 @@ $erwinRegBase = "SOFTWARE\erwin\Data Modeler"
 if ($Uninstall) {
     Write-Host "=== Uninstalling Elite Soft Erwin Add-In ===" -ForegroundColor Cyan
 
-    # Unregister COM (per-user)
+    # Detect scope from installed registry.scope file
+    $scopeFile = Join-Path $installDir "registry.scope"
+    $uninstallHive = "HKCU"
+    if (Test-Path $scopeFile) {
+        $content = (Get-Content $scopeFile -Raw).Trim()
+        if ($content -eq "HKLM") { $uninstallHive = "HKLM" }
+    }
+    Write-Host "  Detected scope: $uninstallHive" -ForegroundColor Gray
+
+    # Unregister COM
     $comHost = Join-Path $installDir $comHostDll
     if (Test-Path $comHost) {
         Write-Host "Unregistering COM component..." -ForegroundColor Yellow
@@ -26,14 +38,14 @@ if ($Uninstall) {
         Write-Host "  COM unregistered" -ForegroundColor Green
     }
 
-    # Remove erwin Add-In registry (HKCU)
-    $base = "HKCU:\$erwinRegBase"
+    # Remove erwin Add-In registry
+    $base = "${uninstallHive}:\$erwinRegBase"
     if (Test-Path $base) {
         Get-ChildItem $base -ErrorAction SilentlyContinue | ForEach-Object {
             $addInPath = "$($_.PSPath)\Add-Ins\Elite Soft Erwin Addin"
             if (Test-Path $addInPath) {
                 Remove-Item $addInPath -Recurse -Force
-                Write-Host "  Removed erwin Add-In entry from HKCU\$($_.PSChildName)" -ForegroundColor Green
+                Write-Host "  Removed erwin Add-In entry from $uninstallHive\$($_.PSChildName)" -ForegroundColor Green
             }
         }
     }
@@ -43,11 +55,13 @@ if ($Uninstall) {
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
     Write-Host "  Removed Scheduled Task '$taskName'" -ForegroundColor Green
 
-    # Remove MetaRepo registry
-    $bootstrapPath = "HKCU:\Software\EliteSoft\MetaRepo\Bootstrap"
-    $extPath = "HKCU:\Software\EliteSoft\MetaRepo\Extension"
-    if (Test-Path $bootstrapPath) { Remove-Item $bootstrapPath -Recurse -Force; Write-Host "  Removed Bootstrap config" -ForegroundColor Green }
-    if (Test-Path $extPath) { Remove-Item $extPath -Recurse -Force; Write-Host "  Removed Extension config" -ForegroundColor Green }
+    # Remove MetaRepo registry (both hives for clean uninstall)
+    foreach ($hive in @("HKCU", "HKLM")) {
+        $bootstrapPath = "${hive}:\Software\EliteSoft\MetaRepo\Bootstrap"
+        $extPath = "${hive}:\Software\EliteSoft\MetaRepo\Extension"
+        if (Test-Path $bootstrapPath) { Remove-Item $bootstrapPath -Recurse -Force; Write-Host "  Removed Bootstrap config ($hive)" -ForegroundColor Green }
+        if (Test-Path $extPath) { Remove-Item $extPath -Recurse -Force; Write-Host "  Removed Extension config ($hive)" -ForegroundColor Green }
+    }
 
     # Remove files
     if (Test-Path $installDir) {
@@ -140,6 +154,16 @@ Copy-Item "$sourceDir\*" -Destination $installDir -Recurse -Force -Exclude "inst
 $count = (Get-ChildItem $installDir -Recurse -File).Count
 Write-Host "  Copied $count files" -ForegroundColor Green
 
+# Write registry.scope file
+$scopeFile = Join-Path $installDir "registry.scope"
+if ($Scope -eq "Machine") {
+    Set-Content $scopeFile "HKLM" -Encoding UTF8
+    Write-Host "  Registry scope: Machine (HKLM)" -ForegroundColor Green
+} else {
+    if (Test-Path $scopeFile) { Remove-Item $scopeFile -Force }
+    Write-Host "  Registry scope: User (HKCU, default)" -ForegroundColor Green
+}
+
 # Step 2: Register COM component (requires admin for regsvr32)
 Write-Host "`n[2/3] Registering COM component..." -ForegroundColor Yellow
 $comHost = Join-Path $installDir $comHostDll
@@ -162,9 +186,10 @@ if ($LASTEXITCODE -eq 0) {
     exit 1
 }
 
-# Step 3: Register in erwin Add-In Manager (HKCU - per user)
-Write-Host "`n[3/3] Registering in erwin Add-In Manager (HKCU)..." -ForegroundColor Yellow
-$base = "HKCU:\$erwinRegBase"
+# Step 3: Register in erwin Add-In Manager
+$regHive = if ($Scope -eq "Machine") { "HKLM" } else { "HKCU" }
+Write-Host "`n[3/3] Registering in erwin Add-In Manager ($regHive)..." -ForegroundColor Yellow
+$base = "${regHive}:\$erwinRegBase"
 if (Test-Path $base) {
     Get-ChildItem $base -ErrorAction SilentlyContinue | ForEach-Object {
         $addInPath = "$($_.PSPath)\Add-Ins\Elite Soft Erwin Addin"
@@ -175,7 +200,7 @@ if (Test-Path $base) {
         Set-ItemProperty $addInPath -Name "ProgID" -Value $progId -Type String
         Set-ItemProperty $addInPath -Name "Invoke Method" -Value "Execute" -Type String
         Set-ItemProperty $addInPath -Name "Invoke EXE" -Value 0 -Type DWord
-        Write-Host "  erwin $($_.PSChildName) (HKCU) - OK" -ForegroundColor Green
+        Write-Host "  erwin $($_.PSChildName) ($regHive) - OK" -ForegroundColor Green
     }
 } else {
     Write-Host "  erwin not found in registry, skipping" -ForegroundColor Yellow

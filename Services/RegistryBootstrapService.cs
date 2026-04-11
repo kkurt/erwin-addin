@@ -1,5 +1,7 @@
 using System;
+using System.IO;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using Microsoft.Win32;
 using EliteSoft.MetaAdmin.Shared.Models;
 using EliteSoft.MetaAdmin.Shared.Services;
@@ -8,8 +10,8 @@ namespace EliteSoft.Erwin.AddIn.Services
 {
     /// <summary>
     /// Registry-based bootstrap config reader.
-    /// Reads Admin DB connection from HKCU (per-user, set by erwin-admin).
-    /// Credentials are DPAPI-encrypted with CurrentUser scope.
+    /// Scope (HKCU vs HKLM) determined by registry.scope file next to the executable.
+    /// DPAPI encryption follows scope: HKLM = LocalMachine, HKCU = CurrentUser.
     /// </summary>
     [ComVisible(false)]
     public class RegistryBootstrapService : IBootstrapService
@@ -18,21 +20,57 @@ namespace EliteSoft.Erwin.AddIn.Services
         private const string SubKey = "Bootstrap";
         private BootstrapConfig _cachedConfig;
 
+        private static bool? _useMachineScope;
+
+        /// <summary>
+        /// Determines registry scope from registry.scope file.
+        /// HKLM = machine-wide (production), HKCU = per-user (development, default).
+        /// </summary>
+        private static bool UseMachineScope
+        {
+            get
+            {
+                if (_useMachineScope == null)
+                {
+                    try
+                    {
+                        var scopeFile = Path.Combine(AppContext.BaseDirectory, "registry.scope");
+                        if (File.Exists(scopeFile))
+                        {
+                            var content = File.ReadAllText(scopeFile).Trim();
+                            _useMachineScope = content.Equals("HKLM", StringComparison.OrdinalIgnoreCase);
+                        }
+                        else
+                        {
+                            _useMachineScope = false; // default: HKCU
+                        }
+                    }
+                    catch
+                    {
+                        _useMachineScope = false;
+                    }
+                    System.Diagnostics.Debug.WriteLine($"RegistryBootstrapService: Scope = {(_useMachineScope.Value ? "HKLM" : "HKCU")}");
+                }
+                return _useMachineScope.Value;
+            }
+        }
+
+        private static RegistryKey RootKey => UseMachineScope ? Registry.LocalMachine : Registry.CurrentUser;
+
         public BootstrapConfig GetConfig()
         {
             if (_cachedConfig != null)
                 return _cachedConfig;
 
-            // Read from HKCU only (per-user)
-            _cachedConfig = ReadFromRegistry(Registry.CurrentUser, useMachineScope: false);
+            _cachedConfig = ReadFromRegistry();
             return _cachedConfig;
         }
 
-        private BootstrapConfig ReadFromRegistry(RegistryKey root, bool useMachineScope)
+        private BootstrapConfig ReadFromRegistry()
         {
             var fullKey = $@"{BaseKey}\{SubKey}";
 
-            using (var key = root.OpenSubKey(fullKey))
+            using (var key = RootKey.OpenSubKey(fullKey))
             {
                 if (key == null)
                     return null;
@@ -42,15 +80,22 @@ namespace EliteSoft.Erwin.AddIn.Services
                     var host = key.GetValue("Host", "")?.ToString() ?? "";
                     var database = key.GetValue("Database", "")?.ToString() ?? "";
 
-                    // IsConfigured is now computed: Host + Database must be non-empty
+                    // IsConfigured is computed: Host + Database must be non-empty
                     if (string.IsNullOrEmpty(host) || string.IsNullOrEmpty(database))
                         return null;
 
                     var encryptedUsername = key.GetValue("Username", "")?.ToString() ?? "";
                     var encryptedPassword = key.GetValue("Password", "")?.ToString() ?? "";
 
-                    string username = PasswordEncryptionService.Decrypt(encryptedUsername) ?? encryptedUsername;
-                    string password = PasswordEncryptionService.Decrypt(encryptedPassword) ?? encryptedPassword;
+                    // DPAPI scope follows registry scope
+                    var dpapiScope = UseMachineScope
+                        ? DataProtectionScope.LocalMachine
+                        : DataProtectionScope.CurrentUser;
+
+                    string username = PasswordEncryptionService.Decrypt(encryptedUsername, dpapiScope)
+                                      ?? encryptedUsername;
+                    string password = PasswordEncryptionService.Decrypt(encryptedPassword, dpapiScope)
+                                      ?? encryptedPassword;
 
                     return new BootstrapConfig
                     {
@@ -93,7 +138,8 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         public string GetConfigFilePath()
         {
-            return @"HKCU\Software\EliteSoft\MetaRepo\Bootstrap";
+            var hive = UseMachineScope ? "HKLM" : "HKCU";
+            return $@"{hive}\Software\EliteSoft\MetaRepo\Bootstrap";
         }
     }
 }

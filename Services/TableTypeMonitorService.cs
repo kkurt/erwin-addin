@@ -298,10 +298,16 @@ namespace EliteSoft.Erwin.AddIn.Services
                         // Add new entity to diagram automatically
                         AddEntityToDiagram(entity, physicalName);
 
-                        // Apply project standard properties (LOGGING, COMPRESSION, etc.)
+                        // Apply model standard properties (LOGGING, COMPRESSION, etc.)
                         if (_propertyApplicator != null && _propertyApplicator.IsInitialized)
                         {
                             _propertyApplicator.ApplyStandardsToEntity(entity, physicalName);
+
+                            // Delete auto-created PK index if model property is enabled
+                            if (_propertyApplicator.IsPropertyEnabled("DELETE_AUTO_CREATED_INDEX_PK"))
+                            {
+                                DeleteAutoCreatedPKIndex(entity, physicalName);
+                            }
                         }
 
                         // Apply UDP defaults for new entity
@@ -436,6 +442,58 @@ namespace EliteSoft.Erwin.AddIn.Services
             catch (Exception ex)
             {
                 System.Diagnostics.Debug.WriteLine($"CheckKeyGroupAndViewNaming error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Delete erwin's auto-created PK index (XPK/XPKE prefix) from a newly created entity.
+        /// Only called during new entity detection, so user-created indexes are never affected.
+        /// </summary>
+        private void DeleteAutoCreatedPKIndex(dynamic entity, string physicalName)
+        {
+            try
+            {
+                dynamic modelObjects = _session.ModelObjects;
+                dynamic keyGroups = null;
+                try { keyGroups = modelObjects.Collect(entity, "Key_Group"); }
+                catch { return; }
+                if (keyGroups == null || keyGroups.Count == 0) return;
+
+                foreach (dynamic kg in keyGroups)
+                {
+                    if (kg == null) continue;
+                    try
+                    {
+                        string kgName = kg.Name ?? "";
+                        string kgType = "";
+                        try { kgType = kg.Properties("Key_Group_Type").Value?.ToString() ?? ""; } catch { }
+
+                        if (kgType == "PK" && kgName.StartsWith("XPK", StringComparison.OrdinalIgnoreCase))
+                        {
+                            int transId = _session.BeginNamedTransaction("DisableAutoCreatedPK");
+                            try
+                            {
+                                kg.Properties("Generate_As_Constraint").Value = false;
+                                _session.CommitTransaction(transId);
+                                Log($"Auto-created PK index '{kgName}' disabled (Generate_As_Constraint=false) for '{physicalName}'");
+                            }
+                            catch (Exception ex)
+                            {
+                                try { _session.RollbackTransaction(transId); } catch { }
+                                Log($"Failed to disable auto-created PK index '{kgName}': {ex.Message}");
+                            }
+                            break;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"DeleteAutoCreatedPKIndex item error: {ex.Message}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"DeleteAutoCreatedPKIndex error: {ex.Message}");
             }
         }
 

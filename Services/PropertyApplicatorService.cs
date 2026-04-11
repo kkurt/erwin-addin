@@ -1177,6 +1177,44 @@ namespace EliteSoft.Erwin.AddIn.Services
         public List<PropertyDef> TablePropertyDefs => _tablePropertyDefs;
         public bool IsInitialized => _detectedPlatform != null && _tablePropertyDefs != null;
 
+        /// <summary>
+        /// Check if a model property (MODEL_PROPERTY table) is enabled.
+        /// Values "Yes", "True", or "1" are considered enabled.
+        /// </summary>
+        public bool IsPropertyEnabled(string propertyKey)
+        {
+            try
+            {
+                var bootstrapService = new RegistryBootstrapService();
+                var config = bootstrapService.GetConfig();
+                if (config == null || !config.IsConfigured) return false;
+
+                using (var context = new RepoDbContext(config))
+                {
+                    var prop = context.ModelProperties
+                        .FirstOrDefault(p => p.ModelId == _modelId && p.Key == propertyKey);
+
+                    if (prop == null)
+                    {
+                        // Fallback: check "All Models" (ID=1) if not found for specific model
+                        prop = context.ModelProperties
+                            .FirstOrDefault(p => p.ModelId == 1 && p.Key == propertyKey);
+                    }
+
+                    if (prop == null) return false;
+
+                    return prop.Value.Equals("Yes", StringComparison.OrdinalIgnoreCase)
+                        || prop.Value.Equals("True", StringComparison.OrdinalIgnoreCase)
+                        || prop.Value == "1";
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"PropertyApplicator: IsPropertyEnabled({propertyKey}) error: {ex.Message}");
+                return false;
+            }
+        }
+
         #endregion
 
         public void Dispose()

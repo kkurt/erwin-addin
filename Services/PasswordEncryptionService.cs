@@ -16,7 +16,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             return Decrypt(encryptedBase64, DataProtectionScope.CurrentUser);
         }
 
-        private static string Decrypt(string encryptedBase64, DataProtectionScope scope)
+        public static string Decrypt(string encryptedBase64, DataProtectionScope scope)
         {
             if (string.IsNullOrEmpty(encryptedBase64))
                 return null;

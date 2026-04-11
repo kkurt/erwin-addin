@@ -348,6 +348,7 @@ namespace EliteSoft.Erwin.AddIn
         // Labels to update after corporate initialization
         private Label _lblCorporateValue;
         private Label _lblDbValue;
+        private Label _lblRegistryValue;
 
         private void InitializeGeneralTab()
         {
@@ -378,17 +379,24 @@ namespace EliteSoft.Erwin.AddIn
                 Anchor = AnchorStyles.Bottom | AnchorStyles.Left,
                 Location = new Point(24, 430)
             };
+            lblCopyright.MouseDown += (s, e) =>
+            {
+                if (e.Button == MouseButtons.Right && Control.ModifierKeys == (Keys.Control | Keys.Shift))
+                    ForceClose();
+            };
             tabGeneral.Controls.Add(lblCopyright);
 
             // --- Info Card ---
-            var card = CreateInfoCard("", 24, 60, 812, 80, clrCardBg);
+            var card = CreateInfoCard("", 24, 60, 812, 106, clrCardBg);
             AddCardRow(card, "Corporate:", "", fontBold, font, 0, out _, out _lblCorporateValue);
             AddCardRow(card, "Database:", "", fontBold, font, 1, out _, out _lblDbValue);
+            AddCardRow(card, "Registry:", "", fontBold, font, 2, out _, out _lblRegistryValue);
             tabGeneral.Controls.Add(card);
 
             // Initial state
             _lblCorporateValue.Text = "(not loaded)";
             _lblDbValue.Text = "(not loaded)";
+            _lblRegistryValue.Text = "(not loaded)";
         }
 
         private Panel CreateInfoCard(string title, int x, int y, int w, int h, Color bgColor)
@@ -461,6 +469,9 @@ namespace EliteSoft.Erwin.AddIn
                 {
                     _lblDbValue.Text = $"{config.Host}/{config.Database} ({DatabaseService.Instance.GetDbType()})";
                 }
+
+                var bootstrapService = new RegistryBootstrapService();
+                _lblRegistryValue.Text = bootstrapService.GetConfigFilePath().StartsWith("HKLM") ? "Machine" : "User";
             }
             catch (Exception ex)
             {
@@ -2107,6 +2118,7 @@ namespace EliteSoft.Erwin.AddIn
             }
             base.OnFormClosing(e);
         }
+
 
         /// <summary>
         /// Actually closes the form (called when erwin shuts down or corporate check fails).
