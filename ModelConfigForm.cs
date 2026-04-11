@@ -33,6 +33,7 @@ namespace EliteSoft.Erwin.AddIn
         private bool _allowClose = false;
         private readonly List<dynamic> _openModels = new List<dynamic>();
         private string _connectedModelName;
+        private bool _globalDataLoaded;
 
         // Services
         private ColumnValidationService _validationService;
@@ -187,8 +188,20 @@ namespace EliteSoft.Erwin.AddIn
                 Form loadingDialog = null;
                 try
                 {
-                    loadingDialog = ShowLoadingDialog("Please Wait...");
-                    InitializeValidationService();
+                    string splashMessage = _globalDataLoaded ? $"Switching to {_connectedModelName}..." : "Please Wait...";
+                    loadingDialog = ShowLoadingDialog(splashMessage);
+
+                    if (_globalDataLoaded)
+                    {
+                        // Model switch: only reload model-specific services (fast)
+                        ReinitializeForModelSwitch();
+                    }
+                    else
+                    {
+                        // First connect: full initialization
+                        InitializeValidationService();
+                        _globalDataLoaded = true;
+                    }
                 }
                 finally
                 {
@@ -292,13 +305,17 @@ namespace EliteSoft.Erwin.AddIn
 
         #region Validation Service
 
+        /// <summary>
+        /// Full initialization: corporate + global data + model-specific services.
+        /// Called on first connect.
+        /// </summary>
         private void InitializeValidationService()
         {
-            Log("Initializing validation service...");
+            Log("Initializing validation service (full)...");
 
-            // Corporate guard: read active corporate from DB
+            // Corporate guard
             var corpContext = CorporateContextService.Instance;
-            corpContext.OnLog -= Log; // Prevent stacking
+            corpContext.OnLog -= Log;
             corpContext.OnLog += Log;
             if (!corpContext.Initialize())
             {
@@ -311,26 +328,44 @@ namespace EliteSoft.Erwin.AddIn
             }
             Log($"Corporate: {corpContext.ActiveCorporateName} (ID={corpContext.ActiveCorporateId}), {corpContext.EffectiveModelIds.Count} effective model(s)");
 
+            // Global data (corporate-scoped, not model-specific)
             DisposeServices();
-            GlossaryService.Instance.OnLog -= Log; // Prevent stacking
+            GlossaryService.Instance.OnLog -= Log;
             GlossaryService.Instance.OnLog += Log;
             LoadGlossary();
             LoadPredefinedColumns();
             LoadDomainDefs();
             LoadNamingStandards();
-            EnsureAllUdpsExist();
 
-            // Set MODEL_PATH UDP value (must be after metamodel session is closed)
+            // Model-specific initialization
+            InitializeModelServices();
+        }
+
+        /// <summary>
+        /// Model-only initialization: model-specific services only.
+        /// Called on model switch (corporate + global data already loaded).
+        /// </summary>
+        private void ReinitializeForModelSwitch()
+        {
+            Log("Reinitializing for model switch (model-only)...");
+            DisposeServices();
+            InitializeModelServices();
+        }
+
+        /// <summary>
+        /// Initialize model-specific services: UDPs, PropertyApplicator, monitoring.
+        /// Shared by both full init and model switch.
+        /// </summary>
+        private void InitializeModelServices()
+        {
+            EnsureAllUdpsExist();
             SetModelPathValue();
 
-            // ColumnValidationService is kept for ValidateAll button functionality only (no monitoring)
             _validationService = new ColumnValidationService(_session);
             btnValidateAll.Enabled = true;
 
-            // Initialize property applicator service (reads project standards from DB)
             InitializePropertyApplicator();
 
-            // Initialize UDP runtime service (reads UDP definitions and dependencies from DB)
             _udpRuntimeService = new UdpRuntimeService(_session, _scapi, _currentModel);
             _udpRuntimeService.OnLog += Log;
             if (_udpRuntimeService.Initialize())
@@ -343,7 +378,6 @@ namespace EliteSoft.Erwin.AddIn
                 Log("UDP runtime initialization skipped (no definitions or DB not configured)");
             }
 
-            // Initialize TABLE_TYPE monitor service (timer managed by coordinator)
             _tableTypeMonitorService = new TableTypeMonitorService(_session);
             _tableTypeMonitorService.OnLog += Log;
             if (_propertyApplicatorService != null)
@@ -353,7 +387,6 @@ namespace EliteSoft.Erwin.AddIn
             _tableTypeMonitorService.TakeSnapshot();
             _tableTypeMonitorService.StartMonitoring();
 
-            // Initialize unified validation coordinator (single timer for all monitoring)
             _validationCoordinatorService = new ValidationCoordinatorService(_session, _scapi);
             _validationCoordinatorService.OnLog += Log;
             _validationCoordinatorService.OnSessionLost += HandleSessionLost;
@@ -363,9 +396,7 @@ namespace EliteSoft.Erwin.AddIn
                 _validationCoordinatorService.SetUdpRuntimeService(_udpRuntimeService);
             _validationCoordinatorService.StartMonitoring();
 
-            // Load tables for Table Processes tab
             LoadTablesComboBox();
-
             UpdateValidationStatus();
             Log("Validation service initialized.");
             UpdateGeneralTab();
@@ -2378,6 +2409,7 @@ namespace EliteSoft.Erwin.AddIn
                 // Clear stale model references to prevent user from selecting dead COM objects
                 _openModels.Clear();
                 _connectedModelName = null;
+                _globalDataLoaded = false;
                 lblActiveModel.Text = "(Waiting for model...)";
 
                 // Reset UI to disconnected state
