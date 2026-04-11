@@ -65,7 +65,6 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         // Model change detection
         private string _lastKnownModelName;
-        private int _lastKnownModelCount;
         private int _modelCheckCounter;
         private const int ModelCheckEveryNTicks = 4; // Check every 2 seconds (4 * 500ms)
 
@@ -113,11 +112,12 @@ namespace EliteSoft.Erwin.AddIn.Services
             if (_isMonitoring) return;
             _isMonitoring = true;
 
-            // Initialize model change tracking
+            // Initialize model change tracking (use same source as detection: window title)
             try
             {
-                _lastKnownModelName = _session.ModelObjects.Root?.Name ?? "";
-                _lastKnownModelCount = _scapi.PersistenceUnits.Count;
+                _lastKnownModelName = GetErwinActiveModelName();
+                if (string.IsNullOrEmpty(_lastKnownModelName))
+                    _lastKnownModelName = _session.ModelObjects.Root?.Name ?? "";
                 _modelCheckCounter = 0;
             }
             catch { }
@@ -252,38 +252,23 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
         }
 
+        /// <summary>
+        /// Called externally to suppress model change detection during reconnect.
+        /// </summary>
         private void CheckForModelChanges()
         {
             try
             {
-                // 1. Get erwin's active model from window title
-                string erwinActiveModel = GetErwinActiveModelFromTitle();
+                string erwinActiveModel = GetErwinActiveModelName();
+                if (string.IsNullOrEmpty(erwinActiveModel)) return;
 
-                // 2. Check PersistenceUnits count
-                int puCount = 0;
-                try { puCount = _scapi.PersistenceUnits.Count; }
-                catch { return; }
+                // Same model? No action.
+                if (string.Equals(erwinActiveModel, _lastKnownModelName, StringComparison.OrdinalIgnoreCase))
+                    return;
 
-                // 3. Detect model count change (new model opened or closed)
-                bool modelCountChanged = _lastKnownModelCount > 0 && puCount != _lastKnownModelCount;
-                if (modelCountChanged)
-                {
-                    Log($"[ModelWatch] Model count changed: {_lastKnownModelCount} -> {puCount}");
-                    OnModelChanged?.Invoke(erwinActiveModel);
-                }
-
-                // 4. Detect active model change (user switched tab in erwin)
-                if (!string.IsNullOrEmpty(erwinActiveModel) && !string.IsNullOrEmpty(_lastKnownModelName)
-                    && erwinActiveModel != _lastKnownModelName && !modelCountChanged)
-                {
-                    Log($"[ModelWatch] Active model changed: '{_lastKnownModelName}' -> '{erwinActiveModel}'");
-                    OnModelChanged?.Invoke(erwinActiveModel);
-                }
-
-                // Update tracking
-                if (!string.IsNullOrEmpty(erwinActiveModel))
-                    _lastKnownModelName = erwinActiveModel;
-                _lastKnownModelCount = puCount;
+                Log($"[ModelWatch] Active model changed: '{_lastKnownModelName}' -> '{erwinActiveModel}'");
+                _lastKnownModelName = erwinActiveModel;
+                OnModelChanged?.Invoke(erwinActiveModel);
             }
             catch (Exception ex)
             {
@@ -295,49 +280,47 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// Parse erwin's main window title to get the active model name.
         /// erwin title format: "erwin DM - [ModelName*] - ..." or "erwin DM - ModelName - ..."
         /// </summary>
-        private string GetErwinActiveModelFromTitle()
+        /// <summary>
+        /// Get erwin's active model name from the erwin process's main window title.
+        /// Process.MainWindowTitle always reflects the active/focused model tab.
+        /// </summary>
+        private string GetErwinActiveModelName()
         {
-            string activeModel = "";
-
-            EnumWindows((hWnd, lParam) =>
+            try
             {
-                if (!IsWindowVisible(hWnd)) return true;
+                var erwinProcesses = System.Diagnostics.Process.GetProcessesByName("erwin");
+                if (erwinProcesses.Length == 0) return "";
 
-                StringBuilder title = new StringBuilder(512);
-                GetWindowText(hWnd, title, 512);
-                string windowTitle = title.ToString();
+                string windowTitle = erwinProcesses[0].MainWindowTitle;
+                if (string.IsNullOrEmpty(windowTitle)) return "";
 
-                // erwin main window title contains "erwin"
-                if (windowTitle.IndexOf("erwin", StringComparison.OrdinalIgnoreCase) < 0) return true;
-                // Skip add-in and other erwin child windows
-                if (windowTitle.Contains("Elite Soft") || windowTitle.Contains("Column") || windowTitle.Contains("Editor")) return true;
-
-                // Parse model name from title
-                // Format: "erwin DM - ModelName : ModelName* (Read-Only) - ..."
-                // We want just "ModelName"
+                // Parse: "erwin DM - [ModelName : ModelName* (Read-Only)] - ..."
                 int firstDash = windowTitle.IndexOf(" - ");
-                if (firstDash >= 0)
+                if (firstDash < 0) return "";
+
+                string afterDash = windowTitle.Substring(firstDash + 3).Trim();
+
+                // Take part before " : "
+                int colonIdx = afterDash.IndexOf(" : ");
+                string modelPart = colonIdx >= 0 ? afterDash.Substring(0, colonIdx).Trim() : afterDash.Trim();
+
+                // If no colon, take part before next " - "
+                if (colonIdx < 0)
                 {
-                    string afterDash = windowTitle.Substring(firstDash + 3).Trim();
-                    // Take part before " : " (if present)
-                    int colonIdx = afterDash.IndexOf(" : ");
-                    string modelPart = colonIdx >= 0 ? afterDash.Substring(0, colonIdx).Trim() : afterDash.Trim();
-                    // If no colon, take part before next " - "
-                    if (colonIdx < 0)
-                    {
-                        int secondDash = modelPart.IndexOf(" - ");
-                        if (secondDash >= 0) modelPart = modelPart.Substring(0, secondDash).Trim();
-                    }
-                    // Remove brackets and trailing * (unsaved changes indicator)
-                    if (modelPart.StartsWith("[")) modelPart = modelPart.Substring(1);
-                    if (modelPart.EndsWith("*")) modelPart = modelPart.Substring(0, modelPart.Length - 1);
-                    activeModel = modelPart.Trim();
+                    int secondDash = modelPart.IndexOf(" - ");
+                    if (secondDash >= 0) modelPart = modelPart.Substring(0, secondDash).Trim();
                 }
 
-                return false; // Stop enumeration
-            }, IntPtr.Zero);
+                // Clean brackets and unsaved indicator
+                if (modelPart.StartsWith("[")) modelPart = modelPart.Substring(1);
+                if (modelPart.EndsWith("*")) modelPart = modelPart.Substring(0, modelPart.Length - 1);
 
-            return activeModel;
+                return modelPart.Trim();
+            }
+            catch
+            {
+                return "";
+            }
         }
 
         private void HandleSessionLost()

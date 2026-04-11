@@ -45,7 +45,7 @@ namespace EliteSoft.Erwin.AddIn
 
             // Model tab
             this.grpModel = new System.Windows.Forms.GroupBox();
-            this.cmbModels = new System.Windows.Forms.ComboBox();
+            this.lblActiveModel = new System.Windows.Forms.Label();
             this.lblConnectionStatus = new System.Windows.Forms.Label();
             this.lblModelName = new System.Windows.Forms.Label();
             this.lblPlatformStatus = new System.Windows.Forms.Label();
@@ -167,7 +167,7 @@ namespace EliteSoft.Erwin.AddIn
 
             // grpModel — Platform status moved inside
             this.grpModel.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
-            this.grpModel.Controls.Add(this.cmbModels);
+            this.grpModel.Controls.Add(this.lblActiveModel);
             this.grpModel.Controls.Add(this.lblConnectionStatus);
             this.grpModel.Controls.Add(this.lblModelName);
             this.grpModel.Controls.Add(this.lblPlatformStatus);
@@ -176,7 +176,7 @@ namespace EliteSoft.Erwin.AddIn
             this.grpModel.Size = new System.Drawing.Size(833, 95);
             this.grpModel.TabIndex = 0;
             this.grpModel.TabStop = false;
-            this.grpModel.Text = "Select Model";
+            this.grpModel.Text = "Active Model";
             this.grpModel.Font = fontBody;
 
             // lblModelName
@@ -187,14 +187,16 @@ namespace EliteSoft.Erwin.AddIn
             this.lblModelName.Text = "Model:";
             this.lblModelName.ForeColor = clrTextPrimary;
 
-            // cmbModels
-            this.cmbModels.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
-            this.cmbModels.DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList;
-            this.cmbModels.Location = new System.Drawing.Point(80, 28);
-            this.cmbModels.Name = "cmbModels";
-            this.cmbModels.Size = new System.Drawing.Size(400, 25);
-            this.cmbModels.TabIndex = 1;
-            this.cmbModels.SelectedIndexChanged += new System.EventHandler(this.CmbModels_SelectedIndexChanged);
+            // lblActiveModel
+            this.lblActiveModel.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
+            this.lblActiveModel.Location = new System.Drawing.Point(80, 28);
+            this.lblActiveModel.Name = "lblActiveModel";
+            this.lblActiveModel.Size = new System.Drawing.Size(400, 25);
+            this.lblActiveModel.TabIndex = 1;
+            this.lblActiveModel.Text = "(Loading...)";
+            this.lblActiveModel.Font = new System.Drawing.Font("Segoe UI", 10f, System.Drawing.FontStyle.Bold);
+            this.lblActiveModel.ForeColor = clrTextPrimary;
+            this.lblActiveModel.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
 
             // lblConnectionStatus
             this.lblConnectionStatus.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right;
@@ -735,7 +737,7 @@ namespace EliteSoft.Erwin.AddIn
 
         private System.Windows.Forms.GroupBox grpModel;
         private System.Windows.Forms.Label lblModelName;
-        private System.Windows.Forms.ComboBox cmbModels;
+        private System.Windows.Forms.Label lblActiveModel;
         private System.Windows.Forms.Label lblConnectionStatus;
         private System.Windows.Forms.Label lblPlatformStatus;
 

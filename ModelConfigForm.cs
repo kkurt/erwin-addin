@@ -32,6 +32,7 @@ namespace EliteSoft.Erwin.AddIn
         private bool _isConnected;
         private bool _allowClose = false;
         private readonly List<dynamic> _openModels = new List<dynamic>();
+        private string _connectedModelName;
 
         // Services
         private ColumnValidationService _validationService;
@@ -83,7 +84,6 @@ namespace EliteSoft.Erwin.AddIn
             try
             {
                 UpdateConnectionStatus(StatusLoading, Color.Gray);
-                cmbModels.Items.Clear();
                 _openModels.Clear();
                 Application.DoEvents();
 
@@ -91,9 +91,7 @@ namespace EliteSoft.Erwin.AddIn
 
                 if (persistenceUnits.Count == 0)
                 {
-                    cmbModels.Items.Add("(No models found)");
-                    cmbModels.SelectedIndex = 0;
-                    cmbModels.Enabled = false;
+                    lblActiveModel.Text = "(No models found)";
                     ShowError("No open models found in erwin.\nPlease open a model first.", "Connection Error");
                     return;
                 }
@@ -102,14 +100,11 @@ namespace EliteSoft.Erwin.AddIn
                 {
                     dynamic model = persistenceUnits.Item(i);
                     _openModels.Add(model);
-
-                    string modelName = GetModelName(model) ?? $"(Model {i + 1})";
-                    cmbModels.Items.Add(modelName);
                 }
 
-                if (cmbModels.Items.Count > 0)
+                if (_openModels.Count > 0)
                 {
-                    cmbModels.SelectedIndex = 0;
+                    ConnectToModel(0);
                 }
             }
             catch (Exception ex)
@@ -118,18 +113,57 @@ namespace EliteSoft.Erwin.AddIn
             }
         }
 
-        private void CmbModels_SelectedIndexChanged(object sender, EventArgs e)
+        /// <summary>
+        /// Switch to a different model by name (called when erwin active model changes).
+        /// </summary>
+        private void SwitchToModel(string modelName)
         {
-            if (cmbModels.SelectedIndex < 0 || cmbModels.SelectedIndex >= _openModels.Count)
-                return;
+            if (string.IsNullOrEmpty(modelName)) return;
+            if (string.Equals(modelName, _connectedModelName, StringComparison.OrdinalIgnoreCase)) return;
 
-            ConnectToModel(cmbModels.SelectedIndex);
+            Log($"Model switch detected: '{_connectedModelName}' -> '{modelName}'");
+
+            // Refresh PersistenceUnits list
+            _openModels.Clear();
+            try
+            {
+                dynamic pus = _scapi.PersistenceUnits;
+                for (int i = 0; i < pus.Count; i++)
+                    _openModels.Add(pus.Item(i));
+            }
+            catch (Exception ex)
+            {
+                Log($"SwitchToModel: Failed to refresh models: {ex.Message}");
+                return;
+            }
+
+            // Find the target model by name
+            for (int i = 0; i < _openModels.Count; i++)
+            {
+                string name = GetModelName(_openModels[i]) ?? "";
+                if (name.Equals(modelName, StringComparison.OrdinalIgnoreCase))
+                {
+                    ConnectToModel(i);
+                    return;
+                }
+            }
+
+            Log($"SwitchToModel: Model '{modelName}' not found in PersistenceUnits");
         }
 
         private void ConnectToModel(int modelIndex)
         {
             try
             {
+                // Stop old monitoring BEFORE closing session (prevents COM exception race)
+                if (_validationCoordinatorService != null)
+                {
+                    _validationCoordinatorService.OnSessionLost -= HandleSessionLost;
+                    _validationCoordinatorService.OnModelChanged -= HandleModelChanged;
+                    _validationCoordinatorService.StopMonitoring();
+                }
+                _tableTypeMonitorService?.StopMonitoring();
+
                 CloseCurrentSession();
                 _isConnected = false;
                 UpdateConnectionStatus(StatusConnecting, Color.Gray);
@@ -139,6 +173,9 @@ namespace EliteSoft.Erwin.AddIn
                 _currentModel = _openModels[modelIndex];
                 _session = _scapi.Sessions.Add();
                 _session.Open(_currentModel);
+
+                _connectedModelName = GetModelName(_currentModel) ?? $"Model {modelIndex + 1}";
+                lblActiveModel.Text = _connectedModelName;
 
                 _isConnected = true;
                 StopReconnectTimer();
@@ -232,28 +269,16 @@ namespace EliteSoft.Erwin.AddIn
                     Log($"Model detected ({count} open). Reconnecting...");
                     StopReconnectTimer();
 
-                    // Directly populate models and connect (bypass LoadOpenModels to avoid error dialogs)
-                    cmbModels.Items.Clear();
                     _openModels.Clear();
-
                     for (int i = 0; i < count; i++)
                     {
                         dynamic model = persistenceUnits.Item(i);
                         _openModels.Add(model);
-                        string modelName = GetModelName(model) ?? $"(Model {i + 1})";
-                        cmbModels.Items.Add(modelName);
                     }
 
-                    cmbModels.Enabled = true;
                     if (_openModels.Count > 0)
                     {
-                        cmbModels.SelectedIndex = 0;
-                        // Force connect if SelectedIndexChanged didn't trigger
-                        if (!_isConnected)
-                        {
-                            Log("SelectedIndexChanged did not trigger, forcing ConnectToModel...");
-                            ConnectToModel(0);
-                        }
+                        ConnectToModel(0);
                     }
                 }
             }
@@ -271,8 +296,9 @@ namespace EliteSoft.Erwin.AddIn
         {
             Log("Initializing validation service...");
 
-            // Corporate guard: read active corporate from registry + load effective projects
+            // Corporate guard: read active corporate from DB
             var corpContext = CorporateContextService.Instance;
+            corpContext.OnLog -= Log; // Prevent stacking
             corpContext.OnLog += Log;
             if (!corpContext.Initialize())
             {
@@ -286,6 +312,7 @@ namespace EliteSoft.Erwin.AddIn
             Log($"Corporate: {corpContext.ActiveCorporateName} (ID={corpContext.ActiveCorporateId}), {corpContext.EffectiveModelIds.Count} effective model(s)");
 
             DisposeServices();
+            GlossaryService.Instance.OnLog -= Log; // Prevent stacking
             GlossaryService.Instance.OnLog += Log;
             LoadGlossary();
             LoadPredefinedColumns();
@@ -330,6 +357,7 @@ namespace EliteSoft.Erwin.AddIn
             _validationCoordinatorService = new ValidationCoordinatorService(_session, _scapi);
             _validationCoordinatorService.OnLog += Log;
             _validationCoordinatorService.OnSessionLost += HandleSessionLost;
+            _validationCoordinatorService.OnModelChanged += HandleModelChanged;
             _validationCoordinatorService.SetTableTypeMonitor(_tableTypeMonitorService);
             if (_udpRuntimeService.IsInitialized)
                 _validationCoordinatorService.SetUdpRuntimeService(_udpRuntimeService);
@@ -2310,6 +2338,17 @@ namespace EliteSoft.Erwin.AddIn
         /// Called when the SCAPI session becomes invalid (model closed from erwin).
         /// Safely stops all services without trying to access the dead session.
         /// </summary>
+        private void HandleModelChanged(string newModelName)
+        {
+            if (InvokeRequired)
+            {
+                try { BeginInvoke(new Action<string>(HandleModelChanged), newModelName); } catch { }
+                return;
+            }
+
+            SwitchToModel(newModelName);
+        }
+
         private void HandleSessionLost()
         {
             if (InvokeRequired)
@@ -2338,10 +2377,8 @@ namespace EliteSoft.Erwin.AddIn
 
                 // Clear stale model references to prevent user from selecting dead COM objects
                 _openModels.Clear();
-                cmbModels.Items.Clear();
-                cmbModels.Items.Add("(Waiting for model...)");
-                cmbModels.SelectedIndex = 0;
-                cmbModels.Enabled = false;
+                _connectedModelName = null;
+                lblActiveModel.Text = "(Waiting for model...)";
 
                 // Reset UI to disconnected state
                 UpdateConnectionStatus(StatusDisconnected, Color.Red);
