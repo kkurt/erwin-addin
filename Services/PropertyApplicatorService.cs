@@ -1170,6 +1170,7 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         #region Public Properties
 
+        public int ModelId => _modelId;
         public Platform DetectedPlatform => _detectedPlatform;
         public string TargetServerValue => _targetServerValue;
         public int StandardCount => _modelStandardMap?.Count ?? 0;

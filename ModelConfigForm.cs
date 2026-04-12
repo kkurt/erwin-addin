@@ -16,7 +16,6 @@ namespace EliteSoft.Erwin.AddIn
     {
         #region Constants
 
-        private const int GlossaryRefreshIntervalMs = 60000; // 1 minute
         private const string StatusConnected = "Connected";
         private const string StatusDisconnected = "Disconnected";
         private const string StatusConnecting = "Connecting...";
@@ -865,10 +864,47 @@ namespace EliteSoft.Erwin.AddIn
 
         private void InitializeGlossaryRefreshTimer()
         {
-            _glossaryRefreshTimer = new Timer { Interval = GlossaryRefreshIntervalMs };
+            int intervalMinutes = GetGlossaryLoadInterval();
+            int intervalMs = intervalMinutes * 60 * 1000;
+
+            _glossaryRefreshTimer = new Timer { Interval = intervalMs };
             _glossaryRefreshTimer.Tick += GlossaryRefreshTimer_Tick;
             _glossaryRefreshTimer.Start();
-            Log("Glossary auto-refresh timer started (every 1 minute)");
+            Log($"Glossary auto-refresh timer started (every {intervalMinutes} minute(s))");
+        }
+
+        private int GetGlossaryLoadInterval()
+        {
+            const int defaultInterval = 1; // 1 minute default
+            try
+            {
+                if (!DatabaseService.Instance.IsConfigured) return defaultInterval;
+
+                var config = new RegistryBootstrapService().GetConfig();
+                if (config == null || !config.IsConfigured) return defaultInterval;
+
+                // Read from MODEL_PROPERTY: check effective model first, then All Models (ID=1)
+                int modelId = _propertyApplicatorService?.ModelId ?? 0;
+                using (var context = new EliteSoft.MetaAdmin.Shared.Data.RepoDbContext(config))
+                {
+                    var prop = context.ModelProperties
+                        .FirstOrDefault(p => p.ModelId == modelId && p.Key == "GLOSSARY_LOAD_INTERVAL");
+
+                    if (prop == null && modelId != 1)
+                    {
+                        prop = context.ModelProperties
+                            .FirstOrDefault(p => p.ModelId == 1 && p.Key == "GLOSSARY_LOAD_INTERVAL");
+                    }
+
+                    if (prop != null && int.TryParse(prop.Value, out int minutes) && minutes > 0)
+                        return minutes;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"GetGlossaryLoadInterval error: {ex.Message}");
+            }
+            return defaultInterval;
         }
 
         private void GlossaryRefreshTimer_Tick(object sender, EventArgs e)
