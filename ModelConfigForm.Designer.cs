@@ -590,6 +590,18 @@ namespace EliteSoft.Erwin.AddIn
 
             this.grpDebugLog.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right | System.Windows.Forms.AnchorStyles.Bottom;
             this.grpDebugLog.Controls.Add(this.btnCopyLog);
+            this.btnDumpScapi = new System.Windows.Forms.Button();
+            this.btnDumpScapi.Location = new System.Drawing.Point(170, 24);
+            this.btnDumpScapi.Size = new System.Drawing.Size(100, 28);
+            this.btnDumpScapi.Text = "Dump SCAPI";
+            this.btnDumpScapi.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnDumpScapi.BackColor = System.Drawing.Color.White;
+            this.btnDumpScapi.ForeColor = clrTextSecondary;
+            this.btnDumpScapi.FlatAppearance.BorderColor = clrBorder;
+            this.btnDumpScapi.Font = fontCaption;
+            this.btnDumpScapi.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnDumpScapi.Click += new System.EventHandler(this.BtnDumpScapi_Click);
+            this.grpDebugLog.Controls.Add(this.btnDumpScapi);
             this.grpDebugLog.Controls.Add(this.btnClearLog);
             this.grpDebugLog.Controls.Add(this.lblLogSearch);
             this.grpDebugLog.Controls.Add(this.txtLogSearch);
@@ -774,6 +786,7 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.TextBox txtDebugLog;
         private System.Windows.Forms.Button btnCopyLog;
         private System.Windows.Forms.Button btnClearLog;
+        private System.Windows.Forms.Button btnDumpScapi;
         private System.Windows.Forms.TextBox txtLogSearch;
         private System.Windows.Forms.Label lblLogSearch;
 

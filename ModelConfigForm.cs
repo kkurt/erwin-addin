@@ -2178,6 +2178,174 @@ namespace EliteSoft.Erwin.AddIn
 
         private string _fullLogText = "";
 
+        private void BtnDumpScapi_Click(object sender, EventArgs e)
+        {
+            Log("=== SCAPI COM Interface Discovery ===");
+            try
+            {
+                // 1. ISCApplication (_scapi)
+                Log("--- ISCApplication (SCAPI root) ---");
+                DumpComMembers(_scapi, "SCAPI");
+
+                // 2. ISCSession (_session)
+                if (_session != null)
+                {
+                    Log("--- ISCSession ---");
+                    DumpComMembers(_session, "Session");
+                }
+
+                // 3. PersistenceUnit
+                try
+                {
+                    dynamic pus = _scapi.PersistenceUnits;
+                    Log($"--- PersistenceUnits (count={pus.Count}) ---");
+                    DumpComMembers(pus, "PersistenceUnits");
+
+                    if (pus.Count > 0)
+                    {
+                        dynamic pu = pus.Item(0);
+                        Log("--- ISCPersistenceUnit (first model) ---");
+                        DumpComMembers(pu, "PU");
+                    }
+                }
+                catch (Exception ex) { Log($"PU dump error: {ex.Message}"); }
+
+                // 4. ModelObjects
+                if (_session != null)
+                {
+                    try
+                    {
+                        dynamic mo = _session.ModelObjects;
+                        Log("--- ISCModelObjects ---");
+                        DumpComMembers(mo, "ModelObjects");
+                    }
+                    catch (Exception ex) { Log($"ModelObjects dump error: {ex.Message}"); }
+                }
+
+                // 5. Probe PU properties (Mart info)
+                Log("--- PU Properties (Mart detection) ---");
+                string[] puProbes = { "Name", "FilePath", "FileName", "FileFormat",
+                    "Path", "FullPath", "Location", "URI", "URL",
+                    "IsFromMart", "IsMart", "IsReadOnly", "ReadOnly",
+                    "IsLocked", "LockedBy", "MartURI", "MartPath", "MartURL",
+                    "Version", "VersionNumber", "VersionId", "VersionLabel",
+                    "Status", "State", "ObjectId", "ClassName",
+                    "Save", "SaveAs", "Close", "Open",
+                    "Review", "CheckIn", "CheckOut", "Lock", "Unlock" };
+                try
+                {
+                    dynamic pu2 = _scapi.PersistenceUnits.Item(0);
+                    foreach (var name in puProbes)
+                        ProbeMethod(pu2, "PU", name);
+                }
+                catch { }
+
+                // 6. Probe SCAPI for script execution
+                Log("--- SCAPI Script/Macro methods ---");
+                string[] scriptProbes = { "ExecuteScript", "RunScript", "RunMacro",
+                    "ExecuteMacro", "DoScript", "Eval", "Execute",
+                    "ScriptEngine", "Macros", "Scripts",
+                    "SendKeys", "DoMenuItem", "RunCommand",
+                    "Review", "CompareModels", "ModelDirectories" };
+                foreach (var name in scriptProbes)
+                    ProbeMethod(_scapi, "SCAPI", name);
+
+                // 7. Probe Session for script/review
+                Log("--- Session Script/Review methods ---");
+                string[] sessionProbes = { "Review", "Compare", "Merge",
+                    "ExecuteScript", "RunScript", "ModelDirectories",
+                    "Open", "Close", "Save", "SaveAs" };
+                if (_session != null)
+                {
+                    foreach (var name in sessionProbes)
+                        ProbeMethod(_session, "Session", name);
+                }
+
+                Log("=== SCAPI Discovery Complete ===");
+            }
+            catch (Exception ex)
+            {
+                Log($"SCAPI dump error: {ex.Message}");
+            }
+        }
+
+        private void DumpComMembers(dynamic comObj, string label)
+        {
+            try
+            {
+                Type type = comObj.GetType();
+                Log($"  [{label}] COM Type: {type.FullName}");
+
+                // Get IDispatch type info
+                var members = type.GetMembers(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+                foreach (var member in members)
+                {
+                    if (member.DeclaringType == typeof(object)) continue;
+                    string kind = member.MemberType.ToString();
+                    Log($"  [{label}] {kind}: {member.Name}");
+                }
+
+            }
+            catch (Exception ex)
+            {
+                Log($"  [{label}] Reflection error: {ex.Message}");
+            }
+        }
+
+        private void ProbeMethod(dynamic obj, string label, string methodName)
+        {
+            try
+            {
+                Type type = obj.GetType();
+                var method = type.GetMethod(methodName);
+                var prop = type.GetProperty(methodName);
+
+                if (method != null)
+                    Log($"  [{label}] FOUND METHOD: {methodName}({string.Join(", ", method.GetParameters().Select(p => p.ParameterType.Name))})");
+                else if (prop != null)
+                    Log($"  [{label}] FOUND PROPERTY: {methodName} ({prop.PropertyType.Name})");
+            }
+            catch { }
+
+            // Try as property via IDispatch
+            try
+            {
+                var result = obj.GetType().InvokeMember(methodName,
+                    System.Reflection.BindingFlags.GetProperty | System.Reflection.BindingFlags.IgnoreCase,
+                    null, obj, null);
+                string valStr = result?.ToString() ?? "(null)";
+                if (valStr.Length > 80) valStr = valStr.Substring(0, 80) + "...";
+                Log($"  [{label}] PROP '{methodName}' = {valStr}");
+                return;
+            }
+            catch (Exception ex)
+            {
+                string msg = ex.InnerException?.Message ?? ex.Message;
+                if (!msg.Contains("not found") && !msg.Contains("Unknown name") && !msg.Contains("DISP_E_UNKNOWNNAME"))
+                {
+                    Log($"  [{label}] '{methodName}' RECOGNIZED: {msg}");
+                    return;
+                }
+            }
+
+            // Try as method with no args
+            try
+            {
+                var result = obj.GetType().InvokeMember(methodName,
+                    System.Reflection.BindingFlags.InvokeMethod | System.Reflection.BindingFlags.IgnoreCase,
+                    null, obj, null);
+                Log($"  [{label}] METHOD '{methodName}()' = {result}");
+            }
+            catch (Exception ex)
+            {
+                string msg = ex.InnerException?.Message ?? ex.Message;
+                if (!msg.Contains("not found") && !msg.Contains("Unknown name") && !msg.Contains("DISP_E_UNKNOWNNAME"))
+                {
+                    Log($"  [{label}] '{methodName}()' RECOGNIZED: {msg}");
+                }
+            }
+        }
+
         private void BtnClearLog_Click(object sender, EventArgs e)
         {
             _fullLogText = "";
