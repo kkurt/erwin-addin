@@ -82,13 +82,19 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             using (var context = CreateContext())
             {
-                return context.QuestionDefs
+                var query = context.QuestionDefs
                     .Include(q => q.QuestionOptions)
                     .Include(q => q.QuestionRules)
                         .ThenInclude(r => r.PropertyDef)
-                    .Where(q => q.PlatformId == platformId && q.ObjectTypeId == objectTypeId)
-                    .OrderBy(q => q.SortOrder)
-                    .ToList();
+                    .Where(q => q.PlatformId == platformId && q.ObjectTypeId == objectTypeId);
+
+                // Filter by effective model IDs (corporate scope)
+                var effectiveModelIds = CorporateContextService.Instance.IsInitialized
+                    ? CorporateContextService.Instance.EffectiveModelIds : null;
+                if (effectiveModelIds != null && effectiveModelIds.Count > 0)
+                    query = query.Where(q => effectiveModelIds.Contains(q.ModelId));
+
+                return query.OrderBy(q => q.SortOrder).ToList();
             }
         }
 

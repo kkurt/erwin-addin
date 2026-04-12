@@ -288,11 +288,16 @@ namespace EliteSoft.Erwin.AddIn.Services
                 {
                     conn.Open();
 
-                    // Search by model name in catalog
+                    // Find the latest version of this model in Mart catalog
+                    // Model directory (Type='D') has name=modelName, versions (Type='V') are children
+                    Log($"Review: Searching m9Catalog for model '{modelName}'...");
+
+                    // Find model directory (Type='D') - model objects are stored under the directory, not version
                     string query = @"
-                        SELECT TOP 1 C_Id
+                        SELECT TOP 1 C_Id, C_Name, CAST(C_Path AS VARCHAR(1000)) AS C_Path
                         FROM m9Catalog
-                        WHERE C_Name = @ModelName
+                        WHERE C_Type = 'D'
+                          AND C_Name = @ModelName
                         ORDER BY C_Id DESC";
 
                     using (var cmd = conn.CreateCommand())
@@ -300,27 +305,19 @@ namespace EliteSoft.Erwin.AddIn.Services
                         cmd.CommandText = query;
                         AddParam(cmd, "@ModelName", modelName);
 
-                        var result = cmd.ExecuteScalar();
-                        if (result != null && result != DBNull.Value)
-                            return Convert.ToInt32(result);
+                        using (var reader = cmd.ExecuteReader())
+                        {
+                            if (reader.Read())
+                            {
+                                int id = Convert.ToInt32(reader["C_Id"]);
+                                string path = reader["C_Path"]?.ToString() ?? "";
+                                Log($"Review: Found model directory: C_Id={id}, Path='{path}'");
+                                return id;
+                            }
+                        }
                     }
 
-                    // Fallback: search by name pattern (with path)
-                    string likeQuery = @"
-                        SELECT TOP 1 C_Id
-                        FROM m9Catalog
-                        WHERE CAST(C_Path AS VARCHAR(1000)) LIKE @Pattern
-                        ORDER BY C_Id DESC";
-
-                    using (var cmd = conn.CreateCommand())
-                    {
-                        cmd.CommandText = likeQuery;
-                        AddParam(cmd, "@Pattern", "%" + modelName);
-
-                        var result = cmd.ExecuteScalar();
-                        if (result != null && result != DBNull.Value)
-                            return Convert.ToInt32(result);
-                    }
+                    Log($"Review: Model '{modelName}' not found in Mart catalog");
                 }
             }
             catch (Exception ex)
@@ -442,15 +439,14 @@ namespace EliteSoft.Erwin.AddIn.Services
                 {
                     conn.Open();
 
-                    // Find ErwinRepository connection (DB_TYPE contains 'MSSQL' and DB_SCHEMA is ErwinRepository-like)
-                    // or NAME = 'Mart Server' / 'ErwinRepository'
+                    // Find ErwinPortal connection (Mart catalog is in ErwinPortal DB, not ErwinRepository)
                     string query = repoDbType?.ToUpper() switch
                     {
                         "POSTGRESQL" => @"SELECT ""ID"", ""DB_TYPE"", ""HOST"", ""PORT"", ""DB_SCHEMA"", ""USERNAME"", ""PASSWORD""
-                                         FROM ""CONNECTION_DEF"" WHERE ""DB_SCHEMA"" LIKE '%Repository%' OR ""DB_SCHEMA"" LIKE '%Erwin%'
+                                         FROM ""CONNECTION_DEF"" WHERE ""DB_SCHEMA"" LIKE '%Portal%'
                                          ORDER BY ""ID"" LIMIT 1",
                         _ => @"SELECT TOP 1 [ID], [DB_TYPE], [HOST], [PORT], [DB_SCHEMA], [USERNAME], [PASSWORD]
-                               FROM [dbo].[CONNECTION_DEF] WHERE [DB_SCHEMA] LIKE '%Repository%' OR [DB_SCHEMA] LIKE '%Erwin%'
+                               FROM [dbo].[CONNECTION_DEF] WHERE [DB_SCHEMA] LIKE '%Portal%'
                                ORDER BY [ID]"
                     };
 

@@ -2150,6 +2150,79 @@ namespace EliteSoft.Erwin.AddIn
 
         #endregion
 
+        #region Approval / Review
+
+        private void BtnReview_Click(object sender, EventArgs e)
+        {
+            if (!_isConnected || _session == null)
+            {
+                ErwinAddIn.ShowTopMostMessage("No model connected.", "Review");
+                return;
+            }
+
+            btnReview.Enabled = false;
+            lblReviewStatus.Text = "Running review...";
+            lblReviewStatus.ForeColor = Color.Gray;
+            lvReviewResults.Items.Clear();
+            Application.DoEvents();
+
+            try
+            {
+                var reviewService = new MartReviewService(_session, _scapi);
+                reviewService.OnLog += Log;
+
+                if (!reviewService.IsModelFromMart())
+                {
+                    lblReviewStatus.Text = "Model is not from Mart. Review not available.";
+                    lblReviewStatus.ForeColor = Color.OrangeRed;
+                    return;
+                }
+
+                var differences = reviewService.RunReview();
+
+                if (differences.Count == 0)
+                {
+                    lblReviewStatus.Text = "No changes detected. Model is in sync with Mart.";
+                    lblReviewStatus.ForeColor = Color.DarkGreen;
+                }
+                else
+                {
+                    lblReviewStatus.Text = $"{differences.Count} difference(s) found.";
+                    lblReviewStatus.ForeColor = Color.DarkOrange;
+
+                    foreach (var diff in differences)
+                    {
+                        var item = new System.Windows.Forms.ListViewItem(diff.ObjectType);
+                        item.SubItems.Add(diff.ObjectName);
+                        item.SubItems.Add(diff.ChangeType);
+                        item.SubItems.Add(diff.Detail ?? "");
+
+                        // Color code
+                        switch (diff.ChangeType)
+                        {
+                            case "Added": item.ForeColor = Color.DarkGreen; break;
+                            case "Deleted": item.ForeColor = Color.DarkRed; break;
+                            case "Modified": item.ForeColor = Color.DarkOrange; break;
+                        }
+
+                        lvReviewResults.Items.Add(item);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                lblReviewStatus.Text = $"Review failed: {ex.Message}";
+                lblReviewStatus.ForeColor = Color.Red;
+                Log($"BtnReview_Click error: {ex.Message}");
+            }
+            finally
+            {
+                btnReview.Enabled = true;
+            }
+        }
+
+        #endregion
+
         #region Debug Log
 
         private void Log(string message)

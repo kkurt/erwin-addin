@@ -41,6 +41,7 @@ namespace EliteSoft.Erwin.AddIn
             this.tabGlossary = new System.Windows.Forms.TabPage();
             this.tabValidation = new System.Windows.Forms.TabPage();
             this.tabTableProcesses = new System.Windows.Forms.TabPage();
+            this.tabApproval = new System.Windows.Forms.TabPage();
             this.tabDebug = new System.Windows.Forms.TabPage();
 
             // Model tab
@@ -132,6 +133,7 @@ namespace EliteSoft.Erwin.AddIn
             this.tabControl.Controls.Add(this.tabGlossary);
             this.tabControl.Controls.Add(this.tabValidation);
             this.tabControl.Controls.Add(this.tabTableProcesses);
+            this.tabControl.Controls.Add(this.tabApproval);
             this.tabControl.Controls.Add(this.tabDebug);
             this.tabControl.Location = new System.Drawing.Point(16, 16);
             this.tabControl.Name = "tabControl";
@@ -588,6 +590,46 @@ namespace EliteSoft.Erwin.AddIn
             this.tabDebug.Text = "Debug Log";
             this.tabDebug.UseVisualStyleBackColor = true;
 
+            // tabApproval
+            this.tabApproval.Padding = new System.Windows.Forms.Padding(12);
+            this.tabApproval.Size = new System.Drawing.Size(860, 460);
+            this.tabApproval.Text = "Approval";
+            this.tabApproval.UseVisualStyleBackColor = true;
+
+            this.btnReview = new System.Windows.Forms.Button();
+            this.btnReview.Location = new System.Drawing.Point(15, 15);
+            this.btnReview.Size = new System.Drawing.Size(160, 32);
+            this.btnReview.Text = "Review Changes";
+            this.btnReview.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnReview.BackColor = clrPrimary;
+            this.btnReview.ForeColor = System.Drawing.Color.White;
+            this.btnReview.Font = new System.Drawing.Font("Segoe UI", 9.5f, System.Drawing.FontStyle.Bold);
+            this.btnReview.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnReview.Click += new System.EventHandler(this.BtnReview_Click);
+            this.tabApproval.Controls.Add(this.btnReview);
+
+            this.lblReviewStatus = new System.Windows.Forms.Label();
+            this.lblReviewStatus.Location = new System.Drawing.Point(185, 22);
+            this.lblReviewStatus.Size = new System.Drawing.Size(400, 20);
+            this.lblReviewStatus.Text = "";
+            this.lblReviewStatus.Font = fontCaption;
+            this.lblReviewStatus.ForeColor = clrTextSecondary;
+            this.tabApproval.Controls.Add(this.lblReviewStatus);
+
+            this.lvReviewResults = new System.Windows.Forms.ListView();
+            this.lvReviewResults.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right | System.Windows.Forms.AnchorStyles.Bottom;
+            this.lvReviewResults.Location = new System.Drawing.Point(15, 55);
+            this.lvReviewResults.Size = new System.Drawing.Size(830, 390);
+            this.lvReviewResults.View = System.Windows.Forms.View.Details;
+            this.lvReviewResults.FullRowSelect = true;
+            this.lvReviewResults.GridLines = true;
+            this.lvReviewResults.Font = fontCaption;
+            this.lvReviewResults.Columns.Add("Type", 80);
+            this.lvReviewResults.Columns.Add("Object", 300);
+            this.lvReviewResults.Columns.Add("Change", 80);
+            this.lvReviewResults.Columns.Add("Detail", 350);
+            this.tabApproval.Controls.Add(this.lvReviewResults);
+
             this.grpDebugLog.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right | System.Windows.Forms.AnchorStyles.Bottom;
             this.grpDebugLog.Controls.Add(this.btnCopyLog);
             this.btnDumpScapi = new System.Windows.Forms.Button();
@@ -745,6 +787,10 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.TabPage tabConfiguration;
         private System.Windows.Forms.TabPage tabGlossary;
         private System.Windows.Forms.TabPage tabValidation;
+        private System.Windows.Forms.TabPage tabApproval;
+        private System.Windows.Forms.Button btnReview;
+        private System.Windows.Forms.Label lblReviewStatus;
+        private System.Windows.Forms.ListView lvReviewResults;
         private System.Windows.Forms.TabPage tabDebug;
 
         private System.Windows.Forms.GroupBox grpModel;
