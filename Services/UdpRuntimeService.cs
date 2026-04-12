@@ -28,6 +28,60 @@ namespace EliteSoft.Erwin.AddIn.Services
             _dependencySetService = service;
         }
 
+        /// <summary>
+        /// Read current Model-level UDP values from erwin model root.
+        /// Used for cascade filtering in dependency sets.
+        /// </summary>
+        /// <summary>
+        /// Read model-level UDP values using actual Property_Type names from erwin metamodel.
+        /// Uses existingUdpNames for correct case-sensitive property paths.
+        /// </summary>
+        public Dictionary<string, string> ReadModelUdpValues(HashSet<string> existingUdpNames = null)
+        {
+            var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                dynamic modelObjects = _session.ModelObjects;
+                dynamic root = modelObjects.Root;
+                if (root == null) return values;
+
+                // Find Model.Physical.* entries from existing Property_Type names
+                var modelPaths = (existingUdpNames ?? new HashSet<string>())
+                    .Where(n => n.StartsWith("Model.Physical.", StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+
+                Log($"UdpRuntime.ReadModelUdpValues: Found {modelPaths.Count} Model.Physical.* Property_Type(s)");
+
+                foreach (var path in modelPaths)
+                {
+                    try
+                    {
+                        // Use the EXACT name from erwin metamodel (correct case)
+                        string val = root.Properties(path)?.Value?.ToString() ?? "";
+                        string udpName = path.Substring("Model.Physical.".Length);
+
+                        if (!string.IsNullOrEmpty(val))
+                        {
+                            values[udpName] = val;
+                            Log($"UdpRuntime.ReadModelUdpValues: {udpName} = '{val}' (path='{path}')");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"UdpRuntime.ReadModelUdpValues: '{path}' error: {ex.Message}");
+                    }
+                }
+
+                if (values.Count == 0)
+                    Log($"UdpRuntime.ReadModelUdpValues: No model UDP values set");
+            }
+            catch (Exception ex)
+            {
+                Log($"UdpRuntime.ReadModelUdpValues error: {ex.Message}");
+            }
+            return values;
+        }
+
         // Track which UDPs have been verified/created in the erwin model
         private HashSet<string> _verifiedUdps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -145,6 +199,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
                 Log($"UdpRuntime: Found {existingUdpNames.Count} existing Property_Type entries");
 
+                // Read current model-level UDP values for cascade filtering
+                // Use existingUdpNames to find correct case for property paths
+                var modelUdpValues = ReadModelUdpValues(existingUdpNames);
+                if (modelUdpValues.Count > 0)
+                    Log($"UdpRuntime: Model UDP values for cascade: {string.Join(", ", modelUdpValues.Select(kv => $"{kv.Key}='{kv.Value}'"))}");
+
                 // Check which UDPs need to be created, and which existing List UDPs need value updates
                 var missingDefs = new List<UdpDefinitionRuntime>();
                 var existingListUdpsToUpdate = new List<(UdpDefinitionRuntime def, string fullName)>();
@@ -159,10 +219,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                     {
                         _verifiedUdps.Add(def.Name);
 
-                        // Check if dependency set has options for this UDP (any type)
+                        // Check if dependency set has options for this UDP (with cascade filter)
                         if (_dependencySetService != null && _dependencySetService.IsLoaded)
                         {
-                            var depOptions = _dependencySetService.GetListUdpOptions(def.Name);
+                            var depOptions = _dependencySetService.GetListUdpOptions(def.Name, modelUdpValues);
                             if (depOptions != null && depOptions.Count > 0)
                             {
                                 existingListUdpsToUpdate.Add((def, fullName));
@@ -181,7 +241,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // Update existing List UDPs with dependency set values
                 if (existingListUdpsToUpdate.Count > 0)
                 {
-                    UpdateExistingListUdps(mmObjects, mmRoot, existingListUdpsToUpdate, metamodelSession);
+                    UpdateExistingListUdps(mmObjects, mmRoot, existingListUdpsToUpdate, metamodelSession, modelUdpValues);
                 }
 
                 if (missingDefs.Count == 0 && existingListUdpsToUpdate.Count == 0)
@@ -200,7 +260,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 {
                     string defOwnerClass = GetScapiOwnerClass(def.ObjectType);
                     if (defOwnerClass == null) continue;
-                    if (CreateUdpInMetamodel(mmObjects, def, defOwnerClass, metamodelSession))
+                    if (CreateUdpInMetamodel(mmObjects, def, defOwnerClass, metamodelSession, modelUdpValues))
                         createdCount++;
                 }
 
@@ -226,7 +286,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <summary>
         /// Update existing List UDPs with values from dependency set external tables.
         /// </summary>
-        private void UpdateExistingListUdps(dynamic mmObjects, dynamic mmRoot, List<(UdpDefinitionRuntime def, string fullName)> udpsToUpdate, dynamic metamodelSession)
+        private void UpdateExistingListUdps(dynamic mmObjects, dynamic mmRoot, List<(UdpDefinitionRuntime def, string fullName)> udpsToUpdate, dynamic metamodelSession, Dictionary<string, string> modelUdpValues)
         {
             try
             {
@@ -254,7 +314,7 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                         if (targetPt == null) continue;
 
-                        var depOptions = _dependencySetService.GetListUdpOptions(def.Name);
+                        var depOptions = _dependencySetService.GetListUdpOptions(def.Name, modelUdpValues);
                         if (depOptions == null || depOptions.Count == 0) continue;
 
                         string validValues = string.Join(",", depOptions);
@@ -287,7 +347,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
         }
 
-        private bool CreateUdpInMetamodel(dynamic mmObjects, UdpDefinitionRuntime def, string ownerClass, dynamic metamodelSession)
+        private bool CreateUdpInMetamodel(dynamic mmObjects, UdpDefinitionRuntime def, string ownerClass, dynamic metamodelSession, Dictionary<string, string> modelUdpValues = null)
         {
             string fullName = $"{ownerClass}.Physical.{def.Name}";
             int transId = metamodelSession.BeginNamedTransaction($"CreateUDP_{def.Name}");
@@ -317,7 +377,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // Override/supplement with dependency set external table data
                     if (_dependencySetService != null && _dependencySetService.IsLoaded)
                     {
-                        var depOptions = _dependencySetService.GetListUdpOptions(def.Name);
+                        var depOptions = _dependencySetService.GetListUdpOptions(def.Name, modelUdpValues);
                         if (depOptions != null && depOptions.Count > 0)
                         {
                             validValues = string.Join(",", depOptions);

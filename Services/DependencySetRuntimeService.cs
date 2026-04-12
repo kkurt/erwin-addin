@@ -154,9 +154,9 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         /// <summary>
         /// Get List UDP options from a TABLE source mapping.
-        /// Called when a List UDP needs to be populated from external table data.
+        /// Applies cascade filtering through relations if a parent filter is active.
         /// </summary>
-        public List<string> GetListUdpOptions(string udpName)
+        public List<string> GetListUdpOptions(string udpName, Dictionary<string, string> currentUdpValues = null)
         {
             if (!_isLoaded || _sets == null) return null;
 
@@ -172,8 +172,11 @@ namespace EliteSoft.Erwin.AddIn.Services
                 var tableData = GetCachedTableData(mapping.SourceConnectionId, mapping.SourceTable);
                 if (tableData == null) continue;
 
+                // Check if this table has a parent relation (cascade filter)
+                var filteredRows = ApplyRelationFilter(set, mapping.SourceTable, tableData, currentUdpValues);
+
                 var column = mapping.SourceColumn;
-                return tableData
+                return filteredRows
                     .Select(row => row.ContainsKey(column) ? row[column] : null)
                     .Where(v => !string.IsNullOrEmpty(v))
                     .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -182,6 +185,68 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
 
             return null;
+        }
+
+        /// <summary>
+        /// Apply relation-based cascade filter on table data.
+        /// If this table is a child in a relation (TABLE_B), find the parent value from UDPs
+        /// and filter rows by FK.
+        /// </summary>
+        private List<Dictionary<string, string>> ApplyRelationFilter(
+            DependencySet set,
+            string tableName,
+            List<Dictionary<string, string>> tableData,
+            Dictionary<string, string> currentUdpValues)
+        {
+            if (currentUdpValues == null || currentUdpValues.Count == 0)
+                return tableData;
+
+            // Find relations where this table is the child (TABLE_B)
+            var parentRelations = set.Relations?
+                .Where(r => r.TableB.Equals(tableName, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            if (parentRelations == null || parentRelations.Count == 0)
+                return tableData;
+
+            foreach (var relation in parentRelations)
+            {
+                // Find the mapping that links the parent table to a UDP
+                var parentMapping = set.Mappings?.FirstOrDefault(m =>
+                    m.SourceType == "TABLE" && m.TargetType == "UDP" && m.TargetUdp != null
+                    && m.SourceTable != null
+                    && m.SourceTable.Equals(relation.TableA, StringComparison.OrdinalIgnoreCase));
+
+                if (parentMapping == null) continue;
+
+                // Get current value of the parent UDP
+                string parentUdpName = parentMapping.TargetUdp.Name;
+                if (!currentUdpValues.TryGetValue(parentUdpName, out var parentUdpValue))
+                    continue;
+                if (string.IsNullOrEmpty(parentUdpValue)) continue;
+
+                // Get parent table data and find PK(s) matching the UDP value
+                var parentData = GetCachedTableData(parentMapping.SourceConnectionId, parentMapping.SourceTable);
+                if (parentData == null) continue;
+
+                var matchingPks = parentData
+                    .Where(row => row.ContainsKey(parentMapping.SourceColumn)
+                        && row[parentMapping.SourceColumn].Equals(parentUdpValue, StringComparison.OrdinalIgnoreCase))
+                    .Select(row => row.ContainsKey(relation.ColumnA) ? row[relation.ColumnA] : null)
+                    .Where(pk => !string.IsNullOrEmpty(pk))
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+                if (matchingPks.Count == 0) continue;
+
+                // Filter child table by FK
+                tableData = tableData
+                    .Where(row => row.ContainsKey(relation.ColumnB) && matchingPks.Contains(row[relation.ColumnB]))
+                    .ToList();
+
+                Log($"DependencySetRuntime: Cascade filter '{relation.TableA}.{parentMapping.SourceColumn}'='{parentUdpValue}' -> {tableName} filtered to {tableData.Count} rows");
+            }
+
+            return tableData;
         }
 
         /// <summary>
