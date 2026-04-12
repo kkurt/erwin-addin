@@ -406,13 +406,17 @@ namespace EliteSoft.Erwin.AddIn
             _validationCoordinatorService.SetTableTypeMonitor(_tableTypeMonitorService);
             if (_udpRuntimeService.IsInitialized)
                 _validationCoordinatorService.SetUdpRuntimeService(_udpRuntimeService);
+            if (_dependencySetService != null && _dependencySetService.IsLoaded)
+                _validationCoordinatorService.SetDependencySetService(_dependencySetService);
             _validationCoordinatorService.StartMonitoring();
 
             LoadTablesComboBox();
             UpdateValidationStatus();
             Log("Validation service initialized.");
             UpdateGeneralTab();
+
         }
+
 
         #region General Tab
 
@@ -2424,15 +2428,15 @@ namespace EliteSoft.Erwin.AddIn
                     dynamic mmObjects = mmSession.ModelObjects;
                     dynamic mmRoot = mmObjects.Root;
 
-                    // Build suffix lookup for fast matching
-                    var suffixMap = updates.ToDictionary(
-                        u => u.target.OwnerClass + u.target.PtPathSuffix,
-                        u => u, StringComparer.OrdinalIgnoreCase);
+                    // Build UDP name -> (target, validValues, count) lookup
+                    var udpUpdateMap = new Dictionary<string, (CascadeTarget target, string validValues, int count)>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var u in updates)
+                        udpUpdateMap[u.target.UdpName] = u;
 
-                    int remaining = suffixMap.Count;
+                    int remaining = udpUpdateMap.Count;
                     var ptMatches = new Dictionary<string, dynamic>(StringComparer.OrdinalIgnoreCase);
 
-                    // Single PT scan with early exit
+                    // Single PT scan - match by UDP name suffix (after last dot)
                     dynamic propertyTypes = mmObjects.Collect(mmRoot, "Property_Type");
                     foreach (dynamic pt in propertyTypes)
                     {
@@ -2441,9 +2445,13 @@ namespace EliteSoft.Erwin.AddIn
                         try
                         {
                             string ptName = pt.Name ?? "";
-                            if (suffixMap.ContainsKey(ptName))
+                            int lastDot = ptName.LastIndexOf('.');
+                            if (lastDot < 0) continue;
+                            string udpSuffix = ptName.Substring(lastDot + 1);
+
+                            if (udpUpdateMap.ContainsKey(udpSuffix) && !ptMatches.ContainsKey(udpSuffix))
                             {
-                                ptMatches[ptName] = pt;
+                                ptMatches[udpSuffix] = pt;
                                 remaining--;
                             }
                         }
@@ -2455,14 +2463,17 @@ namespace EliteSoft.Erwin.AddIn
                     var updatedNames = new List<string>();
                     try
                     {
-                        foreach (var (target, validValues, count) in updates)
+                        foreach (var kvp in udpUpdateMap)
                         {
-                            string fullPath = target.OwnerClass + target.PtPathSuffix;
-                            if (!ptMatches.TryGetValue(fullPath, out var targetPt)) continue;
+                            if (!ptMatches.TryGetValue(kvp.Key, out var targetPt))
+                            {
+                                Log($"Cascade: PT not found for '{kvp.Key}'");
+                                continue;
+                            }
 
                             targetPt.Properties("tag_Udp_Data_Type").Value = 6;
-                            targetPt.Properties("tag_Udp_Values_List").Value = validValues;
-                            updatedNames.Add($"{target.UdpName}({count})");
+                            targetPt.Properties("tag_Udp_Values_List").Value = kvp.Value.validValues;
+                            updatedNames.Add($"{kvp.Key}({kvp.Value.count})");
                         }
                         mmSession.CommitTransaction(transId);
                     }

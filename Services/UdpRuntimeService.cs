@@ -614,9 +614,9 @@ namespace EliteSoft.Erwin.AddIn.Services
 
             foreach (var update in updates)
             {
-                if (update.UpdateType == DependencyUpdateType.SetValue && !string.IsNullOrEmpty(update.Value))
+                if (update.UpdateType == DependencyUpdateType.SetValue)
                 {
-                    childUpdates[update.UdpName] = update.Value;
+                    childUpdates[update.UdpName] = update.Value ?? "";
                 }
                 else if (update.UpdateType == DependencyUpdateType.SetListOptions && update.ListOptions != null)
                 {
@@ -708,10 +708,22 @@ namespace EliteSoft.Erwin.AddIn.Services
             currentValues[changedUdpName] = newValue;
 
             var updates = EvaluateDependencies(changedUdpName, newValue, currentValues);
-            if (updates.Count > 0)
+            if (updates.Count == 0) return;
+
+            // Filter out updates where value is already set (avoid redundant writes)
+            var actualUpdates = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kvp in updates)
             {
-                WriteUdpValues(entity, updates, objectType);
-                Log($"UdpRuntime: Applied {updates.Count} dependency update(s) after '{changedUdpName}' changed to '{newValue}'");
+                string existing = "";
+                currentValues.TryGetValue(kvp.Key, out existing);
+                if (!string.Equals(kvp.Value, existing ?? "", StringComparison.Ordinal))
+                    actualUpdates[kvp.Key] = kvp.Value;
+            }
+
+            if (actualUpdates.Count > 0)
+            {
+                WriteUdpValues(entity, actualUpdates, objectType);
+                Log($"UdpRuntime: Applied {actualUpdates.Count} dependency update(s) after '{changedUdpName}' changed to '{newValue}'");
             }
         }
 

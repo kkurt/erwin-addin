@@ -115,37 +115,55 @@ namespace EliteSoft.Erwin.AddIn.Services
 
             foreach (var set in _sets)
             {
-                // Find mappings where changed UDP is the source
-                var sourceMappings = set.Mappings?
+                // 1. UDP -> UDP mappings: source UDP's linked table column -> target UDP value
+                var udpToUdpMappings = set.Mappings?
                     .Where(m => m.SourceType == "UDP" && m.SourceUdp != null
-                        && m.SourceUdp.Name.Equals(changedUdpName, StringComparison.OrdinalIgnoreCase))
+                        && m.SourceUdp.Name.Equals(changedUdpName, StringComparison.OrdinalIgnoreCase)
+                        && m.TargetType == "UDP" && m.TargetUdp != null)
                     .OrderBy(m => m.SortOrder)
                     .ToList();
 
-                if (sourceMappings == null || sourceMappings.Count == 0) continue;
-
-                foreach (var mapping in sourceMappings)
+                if (udpToUdpMappings != null && udpToUdpMappings.Count > 0)
                 {
-                    if (mapping.TargetType == "UDP" && mapping.TargetUdp != null)
+                    // Find the TABLE->UDP mapping that populates the source UDP (to find its table)
+                    var sourceTableMapping = set.Mappings?.FirstOrDefault(m =>
+                        m.SourceType == "TABLE" && m.TargetType == "UDP" && m.TargetUdp != null
+                        && m.TargetUdp.Name.Equals(changedUdpName, StringComparison.OrdinalIgnoreCase));
+
+                    if (sourceTableMapping != null)
                     {
-                        // UDP -> UDP: direct value mapping (like old system)
-                        updates.Add(new DependencyUpdate
+                        // Get the table data and find the row matching the selected value
+                        var tableData = GetCachedTableData(sourceTableMapping.SourceConnectionId, sourceTableMapping.SourceTable);
+                        var matchColumn = sourceTableMapping.SourceColumn;
+
+                        var matchingRow = tableData?.FirstOrDefault(row =>
+                            row.ContainsKey(matchColumn) &&
+                            row[matchColumn].Equals(newValue, StringComparison.OrdinalIgnoreCase));
+
+                        foreach (var mapping in udpToUdpMappings)
                         {
-                            UdpName = mapping.TargetUdp.Name,
-                            UpdateType = DependencyUpdateType.SetValue,
-                            Value = newValue,
-                            SetName = set.Name
-                        });
-                    }
-                    else if (mapping.TargetType == "TABLE" && !string.IsNullOrEmpty(mapping.TargetTable))
-                    {
-                        // UDP -> TABLE: filter table by UDP value, then cascade to related mappings
-                        var cascadeUpdates = EvaluateCascade(set, mapping, newValue);
-                        updates.AddRange(cascadeUpdates);
+                            string columnToRead = mapping.SourceColumn; // e.g. "KVKK"
+                            string targetValue = "";
+
+                            if (matchingRow != null && !string.IsNullOrEmpty(columnToRead) && matchingRow.ContainsKey(columnToRead))
+                            {
+                                targetValue = matchingRow[columnToRead];
+                            }
+
+                            updates.Add(new DependencyUpdate
+                            {
+                                UdpName = mapping.TargetUdp.Name,
+                                UpdateType = DependencyUpdateType.SetValue,
+                                Value = targetValue,
+                                SetName = set.Name
+                            });
+
+                            Log($"DependencySetRuntime: UDP->UDP: {changedUdpName}='{newValue}' -> {sourceTableMapping.SourceTable}.{columnToRead}='{targetValue}' -> {mapping.TargetUdp.Name}");
+                        }
                     }
                 }
 
-                // Also check TABLE -> UDP mappings where a relation connects through the changed UDP
+                // 2. TABLE -> UDP cascade (existing: model-level filter through relations)
                 var tableToUdpUpdates = EvaluateTableToUdpCascade(set, changedUdpName, newValue, currentUdpValues);
                 updates.AddRange(tableToUdpUpdates);
             }
@@ -204,20 +222,18 @@ namespace EliteSoft.Erwin.AddIn.Services
             List<Dictionary<string, string>> tableData,
             Dictionary<string, string> currentUdpValues)
         {
-            if (currentUdpValues == null || currentUdpValues.Count == 0)
-                return tableData;
-
             // Find relations where this table is the child (TABLE_B)
             var parentRelations = set.Relations?
                 .Where(r => r.TableB.Equals(tableName, StringComparison.OrdinalIgnoreCase))
                 .ToList();
 
+            // No parent relation = standalone table, return all rows
             if (parentRelations == null || parentRelations.Count == 0)
                 return tableData;
 
+            // This table IS a child in a relation. Parent must be selected, otherwise return empty.
             foreach (var relation in parentRelations)
             {
-                // Find the mapping that links the parent table to a UDP
                 var parentMapping = set.Mappings?.FirstOrDefault(m =>
                     m.SourceType == "TABLE" && m.TargetType == "UDP" && m.TargetUdp != null
                     && m.SourceTable != null
@@ -225,11 +241,14 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                 if (parentMapping == null) continue;
 
-                // Get current value of the parent UDP
                 string parentUdpName = parentMapping.TargetUdp.Name;
-                if (!currentUdpValues.TryGetValue(parentUdpName, out var parentUdpValue))
-                    continue;
-                if (string.IsNullOrEmpty(parentUdpValue)) continue;
+
+                // Parent UDP not set -> return empty (dependent UDPs stay empty until parent is selected)
+                if (currentUdpValues == null || !currentUdpValues.TryGetValue(parentUdpName, out var parentUdpValue)
+                    || string.IsNullOrEmpty(parentUdpValue))
+                {
+                    return new List<Dictionary<string, string>>();
+                }
 
                 // Get parent table data and find PK(s) matching the UDP value
                 var parentData = GetCachedTableData(parentMapping.SourceConnectionId, parentMapping.SourceTable);
@@ -256,6 +275,53 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// For UDP->UDP mapping: get the value to set on the target UDP
+        /// by looking up the source UDP's selected value in its linked table.
+        /// </summary>
+        public string GetUdpToUdpValue(string sourceUdpName, string sourceValue, string targetUdpName)
+        {
+            if (!_isLoaded || _sets == null) return null;
+
+            foreach (var set in _sets)
+            {
+                // Find the UDP->UDP mapping
+                var udpMapping = set.Mappings?.FirstOrDefault(m =>
+                    m.SourceType == "UDP" && m.SourceUdp != null
+                    && m.SourceUdp.Name.Equals(sourceUdpName, StringComparison.OrdinalIgnoreCase)
+                    && m.TargetType == "UDP" && m.TargetUdp != null
+                    && m.TargetUdp.Name.Equals(targetUdpName, StringComparison.OrdinalIgnoreCase));
+
+                if (udpMapping == null) continue;
+
+                // Find the TABLE->UDP mapping that feeds the source UDP (to get its table)
+                var tableMapping = set.Mappings?.FirstOrDefault(m =>
+                    m.SourceType == "TABLE" && m.TargetType == "UDP" && m.TargetUdp != null
+                    && m.TargetUdp.Name.Equals(sourceUdpName, StringComparison.OrdinalIgnoreCase));
+
+                if (tableMapping == null) continue;
+
+                var tableData = GetCachedTableData(tableMapping.SourceConnectionId, tableMapping.SourceTable);
+                if (tableData == null) continue;
+
+                // Find the row where the source column matches the selected value
+                var matchingRow = tableData.FirstOrDefault(row =>
+                    row.ContainsKey(tableMapping.SourceColumn) &&
+                    row[tableMapping.SourceColumn].Equals(sourceValue, StringComparison.OrdinalIgnoreCase));
+
+                if (matchingRow == null) return "";
+
+                // Read the target column value from that row
+                string columnToRead = udpMapping.SourceColumn;
+                if (!string.IsNullOrEmpty(columnToRead) && matchingRow.ContainsKey(columnToRead))
+                    return matchingRow[columnToRead];
+
+                return "";
+            }
+
+            return null;
+        }
+
+        /// <summary>
         /// Refresh external table data cache for a specific connection.
         /// Called when external data might have changed.
         /// </summary>
@@ -276,6 +342,56 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <summary>
         /// Get cascade targets affected by a change in the given parent UDP.
         /// </summary>
+        /// <summary>
+        /// Get all UDP names that are cascade sources (have dependent UDPs).
+        /// Used to efficiently check only relevant column UDPs for changes.
+        /// </summary>
+        public List<string> GetAllCascadeSourceUdps()
+        {
+            if (_cascadeMap == null) return new List<string>();
+            return _cascadeMap.Keys.ToList();
+        }
+
+        /// <summary>
+        /// Check for unset parent UDPs that have dependents.
+        /// Returns list of messages like "Select 'ASSET' on Model to populate PROCESS, DATA_CATEGORY"
+        /// </summary>
+        public List<string> GetMissingParentWarnings(Dictionary<string, string> modelUdpValues)
+        {
+            var warnings = new List<string>();
+            if (_cascadeMap == null) return warnings;
+
+            foreach (var kvp in _cascadeMap)
+            {
+                string parentUdpName = kvp.Key;
+                var children = kvp.Value;
+
+                // Check if parent is set
+                bool parentSet = modelUdpValues != null
+                    && modelUdpValues.TryGetValue(parentUdpName, out var val)
+                    && !string.IsNullOrEmpty(val);
+
+                if (!parentSet)
+                {
+                    // Determine parent level
+                    var parentDef = UdpDefinitionService.Instance.GetAll()
+                        .FirstOrDefault(d => d.Name.Equals(parentUdpName, StringComparison.OrdinalIgnoreCase));
+                    string level = (parentDef?.ObjectType ?? "Model") switch
+                    {
+                        "Model" => "Model properties",
+                        "Table" => "Table UDP",
+                        "Column" => "Column UDP",
+                        _ => "Model properties"
+                    };
+
+                    var childNames = string.Join(", ", children.Select(c => c.UdpName));
+                    warnings.Add($"'{parentUdpName}' ({level}) is not set. Dependent UDPs will be empty: {childNames}");
+                }
+            }
+
+            return warnings;
+        }
+
         public List<CascadeTarget> GetAffectedUdps(string parentUdpName)
         {
             if (_cascadeMap != null && _cascadeMap.TryGetValue(parentUdpName, out var affected))
@@ -344,11 +460,44 @@ namespace EliteSoft.Erwin.AddIn.Services
                         }
                     }
                 }
+
+                // UDP -> UDP mappings: source UDP changes -> target UDP gets value from table column
+                foreach (var udpMapping in set.Mappings.Where(m =>
+                    m.SourceType == "UDP" && m.SourceUdp != null
+                    && m.TargetType == "UDP" && m.TargetUdp != null))
+                {
+                    string srcUdpName = udpMapping.SourceUdp.Name;
+                    string tgtUdpName = udpMapping.TargetUdp.Name;
+
+                    if (!_cascadeMap.ContainsKey(srcUdpName))
+                        _cascadeMap[srcUdpName] = new List<CascadeTarget>();
+
+                    if (_cascadeMap[srcUdpName].Any(t => t.UdpName.Equals(tgtUdpName, StringComparison.OrdinalIgnoreCase)))
+                        continue;
+
+                    var childDef = UdpDefinitionService.Instance.GetAll()
+                        .FirstOrDefault(d => d.Name.Equals(tgtUdpName, StringComparison.OrdinalIgnoreCase));
+                    string ownerClass = (childDef?.ObjectType ?? "Column") switch
+                    {
+                        "Table" => "Entity",
+                        "Column" => "Attribute",
+                        "Model" => "Model",
+                        _ => "Attribute"
+                    };
+
+                    _cascadeMap[srcUdpName].Add(new CascadeTarget
+                    {
+                        UdpName = tgtUdpName,
+                        PtPathSuffix = $".Physical.{tgtUdpName}",
+                        OwnerClass = ownerClass,
+                        IsValueMapping = true // UDP->UDP: set value, not list options
+                    });
+                }
             }
 
             foreach (var kvp in _cascadeMap)
             {
-                var names = string.Join(", ", kvp.Value.Select(t => t.UdpName));
+                var names = string.Join(", ", kvp.Value.Select(t => $"{t.UdpName}{(t.IsValueMapping ? "(val)" : "(list)")}"));
                 Log($"DependencySetRuntime: Cascade map: '{kvp.Key}' -> [{names}]");
             }
         }
@@ -740,5 +889,6 @@ namespace EliteSoft.Erwin.AddIn.Services
         public string UdpName { get; set; }       // e.g. "PROCESS"
         public string PtPathSuffix { get; set; }  // e.g. ".Physical.PROCESS"
         public string OwnerClass { get; set; }    // e.g. "Entity"
+        public bool IsValueMapping { get; set; }  // true=UDP->UDP (set value), false=TABLE->UDP (set list)
     }
 }

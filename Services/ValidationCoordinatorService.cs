@@ -22,6 +22,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         private Timer _windowMonitorTimer;
         private TableTypeMonitorService _tableTypeMonitor;
         private UdpRuntimeService _udpRuntimeService;
+        private DependencySetRuntimeService _dependencySetService;
         private bool _isMonitoring;
         private bool _disposed;
         private bool _isProcessingChange;
@@ -84,6 +85,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         // Event fired when a model-level UDP value changes (for cascade update)
         public event Action<string, string> OnModelUdpChanged; // udpName, newValue
 
+
         public ValidationCoordinatorService(dynamic session, dynamic scapi)
         {
             _session = session;
@@ -112,6 +114,16 @@ namespace EliteSoft.Erwin.AddIn.Services
         public void SetUdpRuntimeService(UdpRuntimeService service)
         {
             _udpRuntimeService = service;
+        }
+
+        public void SetDependencySetService(DependencySetRuntimeService service)
+        {
+            _dependencySetService = service;
+        }
+
+        public Dictionary<string, string> GetModelUdpValues()
+        {
+            return _lastModelUdpValues ?? new Dictionary<string, string>();
         }
 
         public void StartMonitoring()
@@ -723,7 +735,6 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                         if (isNew)
                         {
-                            // New attribute added
                             _attributeSnapshots[objectId] = currentState;
                             ProcessNewAttribute(attr, currentState, predefinedColumnNames);
                         }
@@ -731,8 +742,14 @@ namespace EliteSoft.Erwin.AddIn.Services
                         {
                             var previousState = _attributeSnapshots[objectId];
                             ProcessAttributeChanges(attr, previousState, currentState, predefinedColumnNames);
+                            // Carry over UDP values from old snapshot to new
+                            foreach (var kvp in previousState.UdpValues)
+                                currentState.UdpValues[kvp.Key] = kvp.Value;
                             _attributeSnapshots[objectId] = currentState;
                         }
+
+                        // Check column-level UDP changes for dependency cascade
+                        CheckAttributeUdpDependencies(attr, objectId, currentState.PhysicalName);
                     }
                 }
                 finally { ReleaseCom(entityAttrs); }
@@ -744,6 +761,50 @@ namespace EliteSoft.Erwin.AddIn.Services
             {
                 System.Diagnostics.Debug.WriteLine($"CheckEntityForChanges error: {ex.Message}");
             }
+        }
+
+        /// <summary>
+        /// Check column-level UDP changes for dependency cascade.
+        /// Only checks UDPs that are source in a cascade map (efficient).
+        /// </summary>
+        private void CheckAttributeUdpDependencies(dynamic attr, string objectId, string columnName)
+        {
+            if (_dependencySetService == null || !_dependencySetService.IsLoaded) return;
+            if (_udpRuntimeService == null || !_udpRuntimeService.IsInitialized) return;
+
+            var snapshot = _attributeSnapshots.ContainsKey(objectId) ? _attributeSnapshots[objectId] : null;
+            if (snapshot == null) return;
+
+            // Only read UDPs that have cascade dependencies (not all)
+            var cascadeSourceUdps = _dependencySetService.GetAllCascadeSourceUdps();
+            if (cascadeSourceUdps == null || cascadeSourceUdps.Count == 0) return;
+
+            try
+            {
+                foreach (var udpName in cascadeSourceUdps)
+                {
+                    try
+                    {
+                        string path = $"Attribute.Physical.{udpName}";
+                        string currentVal = attr.Properties(path)?.Value?.ToString() ?? "";
+
+                        string prevVal = "";
+                        snapshot.UdpValues.TryGetValue(udpName, out prevVal);
+                        prevVal = prevVal ?? "";
+
+                        if (currentVal != prevVal && !string.IsNullOrEmpty(currentVal))
+                        {
+                            snapshot.UdpValues[udpName] = currentVal;
+                            Log($"Column UDP '{udpName}' changed on '{columnName}': '{prevVal}' -> '{currentVal}'");
+
+                            // Trigger dependency evaluation
+                            _udpRuntimeService.HandleUdpValueChange(attr, udpName, currentVal, "Column");
+                        }
+                    }
+                    catch { }
+                }
+            }
+            catch { }
         }
 
         private void ProcessNewAttribute(dynamic attr, AttributeValidationSnapshot currentState, HashSet<string> predefinedColumnNames)
