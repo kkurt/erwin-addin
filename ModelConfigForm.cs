@@ -162,6 +162,7 @@ namespace EliteSoft.Erwin.AddIn
                 {
                     _validationCoordinatorService.OnSessionLost -= HandleSessionLost;
                     _validationCoordinatorService.OnModelChanged -= HandleModelChanged;
+                    _validationCoordinatorService.OnModelUdpChanged -= HandleModelUdpChanged;
                     _validationCoordinatorService.StopMonitoring();
                 }
                 _tableTypeMonitorService?.StopMonitoring();
@@ -401,6 +402,7 @@ namespace EliteSoft.Erwin.AddIn
             _validationCoordinatorService.OnLog += Log;
             _validationCoordinatorService.OnSessionLost += HandleSessionLost;
             _validationCoordinatorService.OnModelChanged += HandleModelChanged;
+            _validationCoordinatorService.OnModelUdpChanged += HandleModelUdpChanged;
             _validationCoordinatorService.SetTableTypeMonitor(_tableTypeMonitorService);
             if (_udpRuntimeService.IsInitialized)
                 _validationCoordinatorService.SetUdpRuntimeService(_udpRuntimeService);
@@ -2379,6 +2381,111 @@ namespace EliteSoft.Erwin.AddIn
         /// Called when the SCAPI session becomes invalid (model closed from erwin).
         /// Safely stops all services without trying to access the dead session.
         /// </summary>
+        private void HandleModelUdpChanged(string udpName, string newValue)
+        {
+            if (InvokeRequired)
+            {
+                try { BeginInvoke(new Action<string, string>(HandleModelUdpChanged), udpName, newValue); } catch { }
+                return;
+            }
+
+            if (_dependencySetService == null || !_dependencySetService.IsLoaded) return;
+            if (_udpRuntimeService == null || !_udpRuntimeService.IsInitialized) return;
+
+            var targets = _dependencySetService.GetAffectedUdps(udpName);
+            if (targets.Count == 0) return;
+
+            Log($"Model UDP '{udpName}' = '{newValue}' -> cascade: [{string.Join(", ", targets.Select(t => t.UdpName))}]");
+
+            try
+            {
+                var modelUdpValues = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    [udpName] = newValue
+                };
+
+                // Pre-compute new options for each target
+                var updates = new List<(CascadeTarget target, string validValues, int count)>();
+                foreach (var target in targets)
+                {
+                    var opts = _dependencySetService.GetListUdpOptions(target.UdpName, modelUdpValues);
+                    if (opts != null && opts.Count > 0)
+                        updates.Add((target, string.Join(",", opts), opts.Count));
+                }
+
+                if (updates.Count == 0) return;
+
+                // Single metamodel session, single PT scan, single transaction
+                dynamic mmSession = null;
+                try
+                {
+                    mmSession = _scapi.Sessions.Add();
+                    mmSession.Open(_currentModel, 1);
+                    dynamic mmObjects = mmSession.ModelObjects;
+                    dynamic mmRoot = mmObjects.Root;
+
+                    // Build suffix lookup for fast matching
+                    var suffixMap = updates.ToDictionary(
+                        u => u.target.OwnerClass + u.target.PtPathSuffix,
+                        u => u, StringComparer.OrdinalIgnoreCase);
+
+                    int remaining = suffixMap.Count;
+                    var ptMatches = new Dictionary<string, dynamic>(StringComparer.OrdinalIgnoreCase);
+
+                    // Single PT scan with early exit
+                    dynamic propertyTypes = mmObjects.Collect(mmRoot, "Property_Type");
+                    foreach (dynamic pt in propertyTypes)
+                    {
+                        if (remaining == 0) break;
+                        if (pt == null) continue;
+                        try
+                        {
+                            string ptName = pt.Name ?? "";
+                            if (suffixMap.ContainsKey(ptName))
+                            {
+                                ptMatches[ptName] = pt;
+                                remaining--;
+                            }
+                        }
+                        catch { }
+                    }
+
+                    // Single transaction for all updates
+                    int transId = mmSession.BeginNamedTransaction("CascadeUpdate");
+                    var updatedNames = new List<string>();
+                    try
+                    {
+                        foreach (var (target, validValues, count) in updates)
+                        {
+                            string fullPath = target.OwnerClass + target.PtPathSuffix;
+                            if (!ptMatches.TryGetValue(fullPath, out var targetPt)) continue;
+
+                            targetPt.Properties("tag_Udp_Data_Type").Value = 6;
+                            targetPt.Properties("tag_Udp_Values_List").Value = validValues;
+                            updatedNames.Add($"{target.UdpName}({count})");
+                        }
+                        mmSession.CommitTransaction(transId);
+                    }
+                    catch (Exception ex)
+                    {
+                        try { mmSession.RollbackTransaction(transId); } catch { }
+                        Log($"Cascade transaction failed: {ex.Message}");
+                    }
+
+                    if (updatedNames.Count > 0)
+                        Log($"Cascade updated: {string.Join(", ", updatedNames)}");
+                }
+                finally
+                {
+                    try { mmSession?.Close(); } catch { }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"HandleModelUdpChanged error: {ex.Message}");
+            }
+        }
+
         private void HandleModelChanged(string newModelName)
         {
             if (InvokeRequired)

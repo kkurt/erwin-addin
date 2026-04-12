@@ -68,6 +68,10 @@ namespace EliteSoft.Erwin.AddIn.Services
         private int _modelCheckCounter;
         private const int ModelCheckEveryNTicks = 4; // Check every 2 seconds (4 * 500ms)
 
+        // Model UDP change detection
+        private Dictionary<string, string> _lastModelUdpValues;
+        private HashSet<string> _modelUdpPaths; // Actual Property_Type paths for model UDPs
+
         // Event for logging
         public event Action<string> OnLog;
 
@@ -76,6 +80,9 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         // Event fired when active model changes in erwin
         public event Action<string> OnModelChanged;
+
+        // Event fired when a model-level UDP value changes (for cascade update)
+        public event Action<string, string> OnModelUdpChanged; // udpName, newValue
 
         public ValidationCoordinatorService(dynamic session, dynamic scapi)
         {
@@ -121,6 +128,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                 _modelCheckCounter = 0;
             }
             catch { }
+
+            // Initialize model UDP change tracking
+            InitializeModelUdpTracking();
+
             TakeSnapshot();
             _monitorTimer.Start();
             _windowMonitorTimer.Start();
@@ -255,6 +266,107 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <summary>
         /// Called externally to suppress model change detection during reconnect.
         /// </summary>
+        #region Model UDP Change Detection
+
+        /// <summary>
+        /// Scan metamodel for Model.Physical.* Property_Type names and read initial values.
+        /// </summary>
+        private void InitializeModelUdpTracking()
+        {
+            _modelUdpPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            _lastModelUdpValues = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            try
+            {
+                dynamic modelObjects = _session.ModelObjects;
+                dynamic root = modelObjects.Root;
+                if (root == null) return;
+
+                // Open metamodel to find Model.Physical.* Property_Type names
+                dynamic mmSession = null;
+                try
+                {
+                    mmSession = _scapi.Sessions.Add();
+                    mmSession.Open(_scapi.PersistenceUnits.Item(0), 1);
+                    dynamic mmObjects = mmSession.ModelObjects;
+                    dynamic mmRoot = mmObjects.Root;
+
+                    dynamic propertyTypes = mmObjects.Collect(mmRoot, "Property_Type");
+                    foreach (dynamic pt in propertyTypes)
+                    {
+                        if (pt == null) continue;
+                        try
+                        {
+                            string name = pt.Name ?? "";
+                            if (name.StartsWith("Model.Physical.", StringComparison.OrdinalIgnoreCase))
+                                _modelUdpPaths.Add(name);
+                        }
+                        catch { }
+                    }
+                }
+                catch { }
+                finally
+                {
+                    try { mmSession?.Close(); } catch { }
+                }
+
+                // Read initial values
+                foreach (var path in _modelUdpPaths)
+                {
+                    try
+                    {
+                        string val = root.Properties(path)?.Value?.ToString() ?? "";
+                        string udpName = path.Substring("Model.Physical.".Length);
+                        if (!string.IsNullOrEmpty(val))
+                            _lastModelUdpValues[udpName] = val;
+                    }
+                    catch { }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"InitializeModelUdpTracking error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Check if any model-level UDP values changed since last check.
+        /// Called from MonitorTimer_Tick (same tick as model change detection).
+        /// </summary>
+        private void CheckModelUdpChanges()
+        {
+            if (_modelUdpPaths == null || _modelUdpPaths.Count == 0) return;
+
+            try
+            {
+                dynamic modelObjects = _session.ModelObjects;
+                dynamic root = modelObjects.Root;
+                if (root == null) return;
+
+                foreach (var path in _modelUdpPaths)
+                {
+                    try
+                    {
+                        string val = root.Properties(path)?.Value?.ToString() ?? "";
+                        string udpName = path.Substring("Model.Physical.".Length);
+                        string prevVal = "";
+                        _lastModelUdpValues.TryGetValue(udpName, out prevVal);
+
+                        if (!string.Equals(val, prevVal ?? "", StringComparison.Ordinal) && !string.IsNullOrEmpty(val))
+                        {
+                            _lastModelUdpValues[udpName] = val;
+                            Log($"[ModelUDP] '{udpName}' changed: '{prevVal}' -> '{val}'");
+                            OnModelUdpChanged?.Invoke(udpName, val);
+                        }
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+        }
+
+        #endregion
+
         private void CheckForModelChanges()
         {
             try
@@ -343,12 +455,13 @@ namespace EliteSoft.Erwin.AddIn.Services
             // This avoids calling methods on a dead COM object (which causes native crash in erwin).
             if (!IsModelStillOpen()) { HandleSessionLost(); return; }
 
-            // Periodic model change detection (every N ticks)
+            // Periodic model change + model UDP change detection (every N ticks)
             _modelCheckCounter++;
             if (_modelCheckCounter >= ModelCheckEveryNTicks)
             {
                 _modelCheckCounter = 0;
                 CheckForModelChanges();
+                CheckModelUdpChanges();
             }
 
             try

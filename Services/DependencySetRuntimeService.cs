@@ -18,8 +18,10 @@ namespace EliteSoft.Erwin.AddIn.Services
     public class DependencySetRuntimeService
     {
         private List<DependencySet> _sets;
-        private readonly Dictionary<int, List<Dictionary<string, string>>> _tableDataCache; // connectionId+table -> rows
-        private readonly Dictionary<string, string> _connectionStringCache; // connectionDefId -> connStr+dbType
+        private readonly Dictionary<int, List<Dictionary<string, string>>> _tableDataCache;
+        private readonly Dictionary<string, string> _connectionStringCache;
+        // Cache: parent UDP name -> list of affected child UDPs with their PT paths (built once at load)
+        private Dictionary<string, List<CascadeTarget>> _cascadeMap;
         private bool _isLoaded;
         private string _lastError;
 
@@ -35,6 +37,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             _sets = new List<DependencySet>();
             _tableDataCache = new Dictionary<int, List<Dictionary<string, string>>>();
             _connectionStringCache = new Dictionary<string, string>();
+            _cascadeMap = new Dictionary<string, List<CascadeTarget>>(StringComparer.OrdinalIgnoreCase);
         }
 
         /// <summary>
@@ -85,6 +88,9 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                 // Pre-fetch external table data for TABLE source mappings
                 PreFetchTableData(config);
+
+                // Build cascade dependency map (parent UDP -> affected child UDPs)
+                BuildCascadeMap();
 
                 _isLoaded = true;
                 return true;
@@ -264,6 +270,86 @@ namespace EliteSoft.Erwin.AddIn.Services
             catch (Exception ex)
             {
                 Log($"DependencySetRuntime.RefreshTableData error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Get cascade targets affected by a change in the given parent UDP.
+        /// </summary>
+        public List<CascadeTarget> GetAffectedUdps(string parentUdpName)
+        {
+            if (_cascadeMap != null && _cascadeMap.TryGetValue(parentUdpName, out var affected))
+                return affected;
+            return new List<CascadeTarget>();
+        }
+
+        /// <summary>
+        /// Build cascade map at load time. Each entry contains the child UDP name
+        /// and its PT path suffix for fast metamodel lookup.
+        /// </summary>
+        private void BuildCascadeMap()
+        {
+            _cascadeMap = new Dictionary<string, List<CascadeTarget>>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var set in _sets)
+            {
+                if (set.Mappings == null || set.Relations == null) continue;
+
+                foreach (var parentMapping in set.Mappings.Where(m =>
+                    m.SourceType == "TABLE" && m.TargetType == "UDP" && m.TargetUdp != null))
+                {
+                    string parentTable = parentMapping.SourceTable;
+                    string parentUdpName = parentMapping.TargetUdp.Name;
+
+                    var childRelations = set.Relations
+                        .Where(r => r.TableA.Equals(parentTable, StringComparison.OrdinalIgnoreCase))
+                        .ToList();
+
+                    if (childRelations.Count == 0) continue;
+
+                    foreach (var relation in childRelations)
+                    {
+                        var childMappings = set.Mappings
+                            .Where(m => m.SourceType == "TABLE" && m.TargetType == "UDP" && m.TargetUdp != null
+                                && m.SourceTable != null
+                                && m.SourceTable.Equals(relation.TableB, StringComparison.OrdinalIgnoreCase))
+                            .ToList();
+
+                        foreach (var childMapping in childMappings)
+                        {
+                            if (!_cascadeMap.ContainsKey(parentUdpName))
+                                _cascadeMap[parentUdpName] = new List<CascadeTarget>();
+
+                            string childUdpName = childMapping.TargetUdp.Name;
+                            if (_cascadeMap[parentUdpName].Any(t => t.UdpName.Equals(childUdpName, StringComparison.OrdinalIgnoreCase)))
+                                continue;
+
+                            // Resolve object type -> erwin owner class
+                            var childDef = UdpDefinitionService.Instance.GetAll()
+                                .FirstOrDefault(d => d.Name.Equals(childUdpName, StringComparison.OrdinalIgnoreCase));
+                            string ownerClass = (childDef?.ObjectType ?? "Table") switch
+                            {
+                                "Table" => "Entity",
+                                "Column" => "Attribute",
+                                "Model" => "Model",
+                                _ => "Entity"
+                            };
+
+                            _cascadeMap[parentUdpName].Add(new CascadeTarget
+                            {
+                                UdpName = childUdpName,
+                                PtPathSuffix = $".Physical.{childUdpName}",
+                                OwnerClass = ownerClass
+                            });
+                        }
+                    }
+                }
+            }
+
+            foreach (var kvp in _cascadeMap)
+            {
+                var names = string.Join(", ", kvp.Value.Select(t => t.UdpName));
+                Log($"DependencySetRuntime: Cascade map: '{kvp.Key}' -> [{names}]");
             }
         }
 
@@ -641,8 +727,18 @@ namespace EliteSoft.Erwin.AddIn.Services
     {
         public string UdpName { get; set; }
         public DependencyUpdateType UpdateType { get; set; }
-        public string Value { get; set; }           // For SetValue
-        public List<string> ListOptions { get; set; } // For SetListOptions
-        public string SetName { get; set; }          // Which set triggered this
+        public string Value { get; set; }
+        public List<string> ListOptions { get; set; }
+        public string SetName { get; set; }
+    }
+
+    /// <summary>
+    /// Pre-computed cascade target: which child UDP to update and how to find it in metamodel.
+    /// </summary>
+    public class CascadeTarget
+    {
+        public string UdpName { get; set; }       // e.g. "PROCESS"
+        public string PtPathSuffix { get; set; }  // e.g. ".Physical.PROCESS"
+        public string OwnerClass { get; set; }    // e.g. "Entity"
     }
 }
