@@ -2190,7 +2190,17 @@ namespace EliteSoft.Erwin.AddIn
                     lblReviewStatus.Text = $"{differences.Count} difference(s) found.";
                     lblReviewStatus.ForeColor = Color.DarkOrange;
 
-                    foreach (var diff in differences)
+                    // Apply type filter
+                    var filtered = differences.Where(d =>
+                    {
+                        if (d.ObjectType == "Entity" && !chkFilterEntity.Checked) return false;
+                        if (d.ObjectType == "Column" && !chkFilterColumn.Checked) return false;
+                        return true;
+                    }).ToList();
+
+                    lblReviewStatus.Text = $"{filtered.Count} difference(s) shown ({differences.Count} total).";
+
+                    foreach (var diff in filtered)
                     {
                         var item = new System.Windows.Forms.ListViewItem(diff.ObjectType);
                         item.SubItems.Add(diff.ObjectName);

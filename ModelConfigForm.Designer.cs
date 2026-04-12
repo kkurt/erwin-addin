@@ -616,10 +616,26 @@ namespace EliteSoft.Erwin.AddIn
             this.lblReviewStatus.ForeColor = clrTextSecondary;
             this.tabApproval.Controls.Add(this.lblReviewStatus);
 
+            this.chkFilterEntity = new System.Windows.Forms.CheckBox();
+            this.chkFilterEntity.Location = new System.Drawing.Point(15, 52);
+            this.chkFilterEntity.Size = new System.Drawing.Size(70, 20);
+            this.chkFilterEntity.Text = "Entity";
+            this.chkFilterEntity.Checked = true;
+            this.chkFilterEntity.Font = fontCaption;
+            this.tabApproval.Controls.Add(this.chkFilterEntity);
+
+            this.chkFilterColumn = new System.Windows.Forms.CheckBox();
+            this.chkFilterColumn.Location = new System.Drawing.Point(90, 52);
+            this.chkFilterColumn.Size = new System.Drawing.Size(80, 20);
+            this.chkFilterColumn.Text = "Column";
+            this.chkFilterColumn.Checked = true;
+            this.chkFilterColumn.Font = fontCaption;
+            this.tabApproval.Controls.Add(this.chkFilterColumn);
+
             this.lvReviewResults = new System.Windows.Forms.ListView();
             this.lvReviewResults.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right | System.Windows.Forms.AnchorStyles.Bottom;
-            this.lvReviewResults.Location = new System.Drawing.Point(15, 55);
-            this.lvReviewResults.Size = new System.Drawing.Size(830, 390);
+            this.lvReviewResults.Location = new System.Drawing.Point(15, 75);
+            this.lvReviewResults.Size = new System.Drawing.Size(830, 370);
             this.lvReviewResults.View = System.Windows.Forms.View.Details;
             this.lvReviewResults.FullRowSelect = true;
             this.lvReviewResults.GridLines = true;
@@ -791,6 +807,8 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.Button btnReview;
         private System.Windows.Forms.Label lblReviewStatus;
         private System.Windows.Forms.ListView lvReviewResults;
+        private System.Windows.Forms.CheckBox chkFilterEntity;
+        private System.Windows.Forms.CheckBox chkFilterColumn;
         private System.Windows.Forms.TabPage tabDebug;
 
         private System.Windows.Forms.GroupBox grpModel;

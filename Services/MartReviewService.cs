@@ -16,9 +16,13 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         public event Action<string> OnLog;
 
-        // ErwinRepository Mart DB object type constants
+        // ErwinPortal Mart DB object type constants
         private const int ENTITY_TYPE = 1075838979;
         private const int ATTRIBUTE_TYPE = 1075838981;
+        private const int KEY_GROUP_TYPE = 1075838984;
+        private const int INDEX_TYPE = 1075838985;
+        private const int RELATIONSHIP_TYPE = 1075839016;
+        private const int SUBJECT_AREA_TYPE = 1075839014;
 
         public MartReviewService(dynamic session, dynamic scapi)
         {
@@ -171,6 +175,29 @@ namespace EliteSoft.Erwin.AddIn.Services
                         }
                         catch { }
 
+                        // Get key groups
+                        try
+                        {
+                            dynamic kgs = modelObjects.Collect(entity, "Key_Group");
+                            if (kgs != null)
+                            {
+                                foreach (dynamic kg in kgs)
+                                {
+                                    if (kg == null) continue;
+                                    try
+                                    {
+                                        string kgName = kg.Name ?? "";
+                                        string kgType = "";
+                                        try { kgType = kg.Properties("Key_Group_Type").Value?.ToString() ?? ""; } catch { }
+                                        if (!string.IsNullOrEmpty(kgName))
+                                            localEntity.KeyGroups[kgName] = kgType;
+                                    }
+                                    catch { }
+                                }
+                            }
+                        }
+                        catch { }
+
                         entities[physName] = localEntity;
                     }
                     catch { }
@@ -236,27 +263,34 @@ namespace EliteSoft.Erwin.AddIn.Services
                         }
                     }
 
-                    // Get attributes
-                    string attrQuery = @"
-                        SELECT DISTINCT O_Id, O_ParentId, CONVERT(VARCHAR(500), O_Name) AS O_Name
+                    // Get all child objects (attributes, indexes) for entities in one query
+                    string childQuery = @"
+                        SELECT O_Id, O_Type, O_ParentId, CONVERT(VARCHAR(500), O_Name) AS O_Name
                         FROM m9Object
-                        WHERE C_Id = @CatalogId AND O_Type = @AttrType AND O_EndVersion = 999999999
-                        ORDER BY O_ParentId, O_Name";
+                        WHERE C_Id = @CatalogId
+                          AND O_Type IN (@AttrType, @IndexType)
+                          AND O_EndVersion = 999999999
+                        ORDER BY O_ParentId, O_Type, O_Name";
 
                     using (var cmd = conn.CreateCommand())
                     {
-                        cmd.CommandText = attrQuery;
+                        cmd.CommandText = childQuery;
                         AddParam(cmd, "@CatalogId", catalogId);
                         AddParam(cmd, "@AttrType", ATTRIBUTE_TYPE);
+                        AddParam(cmd, "@IndexType", INDEX_TYPE);
 
                         using (var reader = cmd.ExecuteReader())
                         {
                             while (reader.Read())
                             {
                                 int parentId = reader["O_ParentId"] == DBNull.Value ? 0 : Convert.ToInt32(reader["O_ParentId"]);
+                                int objType = Convert.ToInt32(reader["O_Type"]);
                                 string name = reader["O_Name"]?.ToString()?.Trim() ?? "";
 
-                                if (entityMap.TryGetValue(parentId, out var parentEntity) && !string.IsNullOrEmpty(name))
+                                if (!entityMap.TryGetValue(parentId, out var parentEntity) || string.IsNullOrEmpty(name))
+                                    continue;
+
+                                if (objType == ATTRIBUTE_TYPE)
                                 {
                                     if (!parentEntity.Attributes.ContainsKey(name))
                                     {
@@ -266,6 +300,11 @@ namespace EliteSoft.Erwin.AddIn.Services
                                             PhysicalName = name
                                         };
                                     }
+                                }
+                                else if (objType == INDEX_TYPE)
+                                {
+                                    if (!parentEntity.KeyGroups.ContainsKey(name))
+                                        parentEntity.KeyGroups[name] = "";
                                 }
                             }
                         }
@@ -338,7 +377,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             var diffs = new List<ReviewDifference>();
 
-            // Added entities (in local but not in mart)
+            // Added entities (in local but not in mart) - expand columns
             foreach (var kvp in local)
             {
                 if (!mart.ContainsKey(kvp.Key))
@@ -350,6 +389,18 @@ namespace EliteSoft.Erwin.AddIn.Services
                         ChangeType = "Added",
                         Detail = $"{kvp.Value.Attributes.Count} column(s)"
                     });
+
+                    // List each column of the new entity
+                    foreach (var attr in kvp.Value.Attributes)
+                    {
+                        diffs.Add(new ReviewDifference
+                        {
+                            ObjectType = "Column",
+                            ObjectName = $"{kvp.Value.PhysicalName}.{attr.Value.PhysicalName}",
+                            ChangeType = "Added",
+                            Detail = attr.Value.DataType
+                        });
+                    }
                 }
             }
 
@@ -368,12 +419,25 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
             }
 
-            // Modified entities (in both, compare attributes)
+            // Modified entities (in both, compare attributes + entity name changes)
             foreach (var kvp in local)
             {
                 if (mart.TryGetValue(kvp.Key, out var martEntity))
                 {
                     var localEntity = kvp.Value;
+
+                    // Entity name change (logical name different from physical)
+                    if (!string.Equals(localEntity.Name, martEntity.Name, StringComparison.OrdinalIgnoreCase)
+                        && !string.Equals(localEntity.Name, localEntity.PhysicalName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        diffs.Add(new ReviewDifference
+                        {
+                            ObjectType = "Entity",
+                            ObjectName = localEntity.PhysicalName,
+                            ChangeType = "Modified",
+                            Detail = $"Name: '{martEntity.Name}' -> '{localEntity.Name}'"
+                        });
+                    }
 
                     // Added columns
                     foreach (var attr in localEntity.Attributes)
@@ -402,6 +466,53 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 ChangeType = "Deleted",
                                 Detail = ""
                             });
+                        }
+                    }
+
+                    // Key Group / Index differences
+                    foreach (var kg in localEntity.KeyGroups)
+                    {
+                        if (!martEntity.KeyGroups.ContainsKey(kg.Key))
+                        {
+                            diffs.Add(new ReviewDifference
+                            {
+                                ObjectType = "Index",
+                                ObjectName = $"{localEntity.PhysicalName}.{kg.Key}",
+                                ChangeType = "Added",
+                                Detail = kg.Value
+                            });
+                        }
+                    }
+                    foreach (var kg in martEntity.KeyGroups)
+                    {
+                        if (!localEntity.KeyGroups.ContainsKey(kg.Key))
+                        {
+                            diffs.Add(new ReviewDifference
+                            {
+                                ObjectType = "Index",
+                                ObjectName = $"{martEntity.PhysicalName}.{kg.Key}",
+                                ChangeType = "Deleted",
+                                Detail = ""
+                            });
+                        }
+                    }
+
+                    // Column name changes (in both, check if name differs)
+                    foreach (var attr in localEntity.Attributes)
+                    {
+                        if (martEntity.Attributes.TryGetValue(attr.Key, out var martAttr))
+                        {
+                            if (!string.Equals(attr.Value.Name, martAttr.Name, StringComparison.OrdinalIgnoreCase)
+                                && !string.Equals(attr.Value.Name, attr.Value.PhysicalName, StringComparison.OrdinalIgnoreCase))
+                            {
+                                diffs.Add(new ReviewDifference
+                                {
+                                    ObjectType = "Column",
+                                    ObjectName = $"{localEntity.PhysicalName}.{attr.Value.PhysicalName}",
+                                    ChangeType = "Modified",
+                                    Detail = $"Name: '{martAttr.Name}' -> '{attr.Value.Name}'"
+                                });
+                            }
                         }
                     }
                 }
@@ -518,6 +629,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         public string Name { get; set; }
         public string PhysicalName { get; set; }
         public Dictionary<string, LocalAttribute> Attributes { get; set; } = new Dictionary<string, LocalAttribute>(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, string> KeyGroups { get; set; } = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase); // name -> type
     }
 
     public class LocalAttribute
@@ -533,6 +645,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         public string Name { get; set; }
         public string PhysicalName { get; set; }
         public Dictionary<string, MartAttribute> Attributes { get; set; } = new Dictionary<string, MartAttribute>(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, string> KeyGroups { get; set; } = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
     }
 
     public class MartAttribute
