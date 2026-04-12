@@ -21,7 +21,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         public bool AutoApply { get; set; }
         public bool IsActive { get; set; }
         public int SortOrder { get; set; }
-        public int? ModelId { get; set; }
+        public int ModelId { get; set; }
         public int? DependsOnUdpId { get; set; }
         public string DependsOnUdpValue { get; set; }
         public string DependsOnUdpName { get; set; }  // Resolved UDP name from JOIN
@@ -106,7 +106,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 // Corporate scope filter
                                 if (effectiveModelIds != null)
                                 {
-                                    int rowModelId = reader["MODEL_ID"] == DBNull.Value ? 0 : Convert.ToInt32(reader["MODEL_ID"]);
+                                    int rowModelId = Convert.ToInt32(reader["MODEL_ID"]);
                                     if (rowModelId > 0 && !effectiveModelIds.Contains(rowModelId))
                                         continue;
                                 }
@@ -124,7 +124,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     AutoApply = reader["AUTO_APPLY"] != DBNull.Value && Convert.ToBoolean(reader["AUTO_APPLY"]),
                                     IsActive = Convert.ToBoolean(reader["IS_ACTIVE"]),
                                     SortOrder = reader["SORT_ORDER"] == DBNull.Value ? 0 : Convert.ToInt32(reader["SORT_ORDER"]),
-                                    ModelId = reader["MODEL_ID"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["MODEL_ID"]),
+                                    ModelId = Convert.ToInt32(reader["MODEL_ID"]),
                                     DependsOnUdpId = reader["DEPENDS_ON_UDP_ID"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["DEPENDS_ON_UDP_ID"]),
                                     DependsOnUdpValue = reader["DEPENDS_ON_UDP_VALUE"] == DBNull.Value ? "" : reader["DEPENDS_ON_UDP_VALUE"]?.ToString()?.Trim() ?? "",
                                     DependsOnUdpName = reader["UDP_NAME"] == DBNull.Value ? "" : reader["UDP_NAME"]?.ToString()?.Trim() ?? ""

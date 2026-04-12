@@ -67,7 +67,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <summary>
         /// Load predefined columns filtered by project and DB type.
         /// </summary>
-        public bool LoadPredefinedColumns(int? modelId = null, string platformDbType = null)
+        public bool LoadPredefinedColumns(string platformDbType = null)
         {
             try
             {
@@ -94,7 +94,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                         {
                             while (reader.Read())
                             {
-                                int rowModelId = reader["MODEL_ID"] == DBNull.Value ? 0 : Convert.ToInt32(reader["MODEL_ID"]);
+                                int rowModelId = Convert.ToInt32(reader["MODEL_ID"]);
                                 string rowDbType = reader["DB_TYPE"] == DBNull.Value ? "" : reader["DB_TYPE"]?.ToString()?.Trim() ?? "";
 
                                 // Corporate scope filter
@@ -211,9 +211,9 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// </summary>
         public IEnumerable<PredefinedColumn> GetAll() => _columns;
 
-        public void Reload(int? modelId = null, string platformDbType = null)
+        public void Reload(string platformDbType = null)
         {
-            LoadPredefinedColumns(modelId, platformDbType);
+            LoadPredefinedColumns(platformDbType);
         }
     }
 }

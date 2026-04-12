@@ -41,6 +41,7 @@ namespace EliteSoft.Erwin.AddIn
         private ValidationCoordinatorService _validationCoordinatorService;
         private PropertyApplicatorService _propertyApplicatorService;
         private UdpRuntimeService _udpRuntimeService;
+        private DependencySetRuntimeService _dependencySetService;
 
         // State tracking
         private Timer _glossaryRefreshTimer;
@@ -366,12 +367,21 @@ namespace EliteSoft.Erwin.AddIn
 
             InitializePropertyApplicator();
 
+            // Load dependency sets BEFORE UdpRuntime (so List UDP options are available during creation)
+            _dependencySetService = new DependencySetRuntimeService();
+            _dependencySetService.OnLog += Log;
+            if (_dependencySetService.Load())
+            {
+                Log($"Dependency sets loaded: {_dependencySetService.SetCount} set(s), {_dependencySetService.MappingCount} mapping(s)");
+            }
+
             _udpRuntimeService = new UdpRuntimeService(_session, _scapi, _currentModel);
             _udpRuntimeService.OnLog += Log;
+            _udpRuntimeService.SetDependencySetService(_dependencySetService);
             if (_udpRuntimeService.Initialize())
             {
                 var objectTypes = string.Join(", ", UdpDefinitionService.Instance.GetLoadedObjectTypes());
-                Log($"UDP runtime initialized: {UdpDefinitionService.Instance.Count} definitions [{objectTypes}], {UdpDependencyService.Instance.Count} dependencies");
+                Log($"UDP runtime initialized: {UdpDefinitionService.Instance.Count} definitions [{objectTypes}]");
             }
             else
             {
@@ -2411,6 +2421,11 @@ namespace EliteSoft.Erwin.AddIn
                 _connectedModelName = null;
                 _globalDataLoaded = false;
                 lblActiveModel.Text = "(Waiting for model...)";
+
+                // Reset General tab info
+                _lblCorporateValue.Text = "-";
+                _lblDbValue.Text = "-";
+                _lblRegistryValue.Text = "-";
 
                 // Reset UI to disconnected state
                 UpdateConnectionStatus(StatusDisconnected, Color.Red);

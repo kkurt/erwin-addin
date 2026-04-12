@@ -19,7 +19,6 @@ namespace EliteSoft.Erwin.AddIn.Services
         private Dictionary<string, Dictionary<string, string>> _glossaryCache;
         private bool _isLoaded;
         private string _lastError;
-        private int? _lastModelId;
 
         // Mapping metadata (for logging/debugging)
         private string _matchSourceColumn;
@@ -57,13 +56,12 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <summary>
         /// Load glossary using DG_TABLE_MAPPING config.
         /// </summary>
-        public bool LoadGlossary(int? modelId = null)
+        public bool LoadGlossary()
         {
             try
             {
                 _glossaryCache.Clear();
                 _lastError = null;
-                _lastModelId = modelId;
                 _matchSourceColumn = null;
                 _valueMappings.Clear();
                 _tableName = null;
@@ -336,7 +334,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// </summary>
         public void Reload()
         {
-            LoadGlossary(_lastModelId);
+            LoadGlossary();
         }
 
         public bool IsConfigured => DatabaseService.Instance.IsConfigured;

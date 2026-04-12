@@ -15,12 +15,18 @@ namespace EliteSoft.Erwin.AddIn.Services
         private readonly dynamic _session;
         private readonly dynamic _scapi;
         private readonly dynamic _currentModel;
+        private DependencySetRuntimeService _dependencySetService;
         private bool _disposed;
         private bool _initialized;
 
         public event Action<string> OnLog;
 
         public bool IsInitialized => _initialized;
+
+        public void SetDependencySetService(DependencySetRuntimeService service)
+        {
+            _dependencySetService = service;
+        }
 
         // Track which UDPs have been verified/created in the erwin model
         private HashSet<string> _verifiedUdps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -50,16 +56,6 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                 var objectTypes = UdpDefinitionService.Instance.GetLoadedObjectTypes().ToList();
                 Log($"UdpRuntime: Loaded {UdpDefinitionService.Instance.Count} UDP definitions for [{string.Join(", ", objectTypes)}]");
-
-                bool depLoaded = UdpDependencyService.Instance.LoadDependencies();
-                if (!depLoaded)
-                {
-                    Log($"UdpRuntime: Failed to load dependencies: {UdpDependencyService.Instance.LastError}");
-                }
-                else
-                {
-                    Log($"UdpRuntime: Loaded {UdpDependencyService.Instance.Count} dependency rules");
-                }
 
                 // Ensure all UDP definitions exist in the erwin model (all object types)
                 EnsureUdpsExistInModel();
@@ -149,17 +145,31 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
                 Log($"UdpRuntime: Found {existingUdpNames.Count} existing Property_Type entries");
 
-                // Check which UDPs need to be created
+                // Check which UDPs need to be created, and which existing List UDPs need value updates
                 var missingDefs = new List<UdpDefinitionRuntime>();
+                var existingListUdpsToUpdate = new List<(UdpDefinitionRuntime def, string fullName)>();
+
                 foreach (var def in definitions)
                 {
                     string defOwnerClass = GetScapiOwnerClass(def.ObjectType);
-                    if (defOwnerClass == null) continue; // Unknown object type
+                    if (defOwnerClass == null) continue;
 
                     string fullName = $"{defOwnerClass}.Physical.{def.Name}";
                     if (existingUdpNames.Contains(fullName))
                     {
                         _verifiedUdps.Add(def.Name);
+
+                        // Check if dependency set has options for this UDP (any type)
+                        if (_dependencySetService != null && _dependencySetService.IsLoaded)
+                        {
+                            var depOptions = _dependencySetService.GetListUdpOptions(def.Name);
+                            if (depOptions != null && depOptions.Count > 0)
+                            {
+                                existingListUdpsToUpdate.Add((def, fullName));
+                                continue;
+                            }
+                        }
+
                         Log($"UdpRuntime: {fullName} already exists - skipping");
                     }
                     else
@@ -168,9 +178,19 @@ namespace EliteSoft.Erwin.AddIn.Services
                     }
                 }
 
-                if (missingDefs.Count == 0)
+                // Update existing List UDPs with dependency set values
+                if (existingListUdpsToUpdate.Count > 0)
+                {
+                    UpdateExistingListUdps(mmObjects, mmRoot, existingListUdpsToUpdate, metamodelSession);
+                }
+
+                if (missingDefs.Count == 0 && existingListUdpsToUpdate.Count == 0)
                 {
                     Log("UdpRuntime: All UDPs already exist - nothing to create");
+                    return;
+                }
+                if (missingDefs.Count == 0)
+                {
                     return;
                 }
 
@@ -203,6 +223,70 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// Create a single UDP in the erwin metamodel via Property_Type.
         /// Follows the same pattern as EnsureAllUdpsExist in ModelConfigForm.
         /// </summary>
+        /// <summary>
+        /// Update existing List UDPs with values from dependency set external tables.
+        /// </summary>
+        private void UpdateExistingListUdps(dynamic mmObjects, dynamic mmRoot, List<(UdpDefinitionRuntime def, string fullName)> udpsToUpdate, dynamic metamodelSession)
+        {
+            try
+            {
+                dynamic propertyTypes = mmObjects.Collect(mmRoot, "Property_Type");
+                foreach (var (def, fullName) in udpsToUpdate)
+                {
+                    try
+                    {
+                        // Find the existing Property_Type by name
+                        dynamic targetPt = null;
+                        foreach (dynamic pt in propertyTypes)
+                        {
+                            if (pt == null) continue;
+                            try
+                            {
+                                string ptName = pt.Name ?? "";
+                                if (ptName.Equals(fullName, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    targetPt = pt;
+                                    break;
+                                }
+                            }
+                            catch { }
+                        }
+
+                        if (targetPt == null) continue;
+
+                        var depOptions = _dependencySetService.GetListUdpOptions(def.Name);
+                        if (depOptions == null || depOptions.Count == 0) continue;
+
+                        string validValues = string.Join(",", depOptions);
+
+                        int transId = metamodelSession.BeginNamedTransaction($"UpdateListUDP_{def.Name}");
+                        try
+                        {
+                            // Ensure UDP type is List (dataTypeId=6) for dropdown display
+                            TrySetProperty(targetPt, "tag_Udp_Data_Type", 6);
+                            TrySetProperty(targetPt, "tag_Udp_Values_List", validValues);
+                            metamodelSession.CommitTransaction(transId);
+                            _verifiedUdps.Add(def.Name);
+                            Log($"UdpRuntime: {fullName} updated as List from dependency set ({depOptions.Count} items): {validValues}");
+                        }
+                        catch (Exception ex)
+                        {
+                            try { metamodelSession.RollbackTransaction(transId); } catch { }
+                            Log($"UdpRuntime: Failed to update {fullName}: {ex.Message}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"UdpRuntime: UpdateExistingListUdps item error for {fullName}: {ex.Message}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"UdpRuntime: UpdateExistingListUdps error: {ex.Message}");
+            }
+        }
+
         private bool CreateUdpInMetamodel(dynamic mmObjects, UdpDefinitionRuntime def, string ownerClass, dynamic metamodelSession)
         {
             string fullName = $"{ownerClass}.Physical.{def.Name}";
@@ -222,15 +306,33 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // For List-type UDPs, set valid values as comma-separated string
                 if (def.UdpType?.Equals("List", StringComparison.OrdinalIgnoreCase) == true)
                 {
+                    string validValues = null;
+
                     if (def.ListOptions.Count > 0)
                     {
-                        string validValues = string.Join(",", def.ListOptions.Select(o => o.Value));
+                        // Static list options from MC_UDP_LIST_OPTION
+                        validValues = string.Join(",", def.ListOptions.Select(o => o.Value));
+                    }
+
+                    // Override/supplement with dependency set external table data
+                    if (_dependencySetService != null && _dependencySetService.IsLoaded)
+                    {
+                        var depOptions = _dependencySetService.GetListUdpOptions(def.Name);
+                        if (depOptions != null && depOptions.Count > 0)
+                        {
+                            validValues = string.Join(",", depOptions);
+                            Log($"UdpRuntime: {fullName} List values from dependency set ({depOptions.Count} items)");
+                        }
+                    }
+
+                    if (!string.IsNullOrEmpty(validValues))
+                    {
                         TrySetProperty(udpType, "tag_Udp_Values_List", validValues);
                         Log($"UdpRuntime: {fullName} List values = '{validValues}'");
                     }
                     else
                     {
-                        Log($"UdpRuntime: WARNING - {fullName} is List type but has 0 list options in MC_UDP_LIST_OPTION!");
+                        Log($"UdpRuntime: WARNING - {fullName} is List type but has no list options!");
                     }
                 }
 
@@ -436,7 +538,7 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         /// <summary>
         /// Evaluate dependency rules when a parent UDP value changes.
-        /// Supports chained dependencies (child of one rule can be parent of another).
+        /// Uses DependencySetRuntimeService for set-based cascading dependencies.
         /// </summary>
         public Dictionary<string, string> EvaluateDependencies(
             string parentUdpName,
@@ -445,113 +547,26 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             var childUpdates = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
-            if (!UdpDependencyService.Instance.IsLoaded) return childUpdates;
+            if (_dependencySetService == null || !_dependencySetService.IsLoaded)
+                return childUpdates;
 
-            var rules = UdpDependencyService.Instance.GetByParent(parentUdpName);
+            var updates = _dependencySetService.EvaluateUdpChange(parentUdpName, parentValue, currentValues);
 
-            foreach (var rule in rules)
+            foreach (var update in updates)
             {
-                bool conditionMet = EvaluateCondition(rule.ConditionOperator, rule.ConditionValues, parentValue);
-
-                if (conditionMet)
+                if (update.UpdateType == DependencyUpdateType.SetValue && !string.IsNullOrEmpty(update.Value))
                 {
-                    childUpdates[rule.ChildUdpName] = rule.ChildValue;
-                    Log($"UdpRuntime: Dependency triggered: {rule.ParentUdpName}='{parentValue}' -> {rule.ChildUdpName}='{rule.ChildValue}'");
+                    childUpdates[update.UdpName] = update.Value;
                 }
-            }
-
-            // Chained dependencies: check if any child is also a parent
-            var chainedUpdates = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var update in childUpdates)
-            {
-                var chainedRules = UdpDependencyService.Instance.GetByParent(update.Key);
-                if (chainedRules.Any())
+                else if (update.UpdateType == DependencyUpdateType.SetListOptions && update.ListOptions != null)
                 {
-                    // Update currentValues with the new child value for chained evaluation
-                    var updatedValues = new Dictionary<string, string>(currentValues, StringComparer.OrdinalIgnoreCase);
-                    updatedValues[update.Key] = update.Value;
-
-                    var chained = EvaluateChainedDependencies(update.Key, update.Value, updatedValues, new HashSet<string>(StringComparer.OrdinalIgnoreCase) { parentUdpName });
-                    foreach (var c in chained)
-                    {
-                        chainedUpdates[c.Key] = c.Value;
-                    }
+                    // For list options, set first value as default if available
+                    if (update.ListOptions.Count > 0)
+                        childUpdates[update.UdpName] = update.ListOptions[0];
                 }
-            }
-
-            foreach (var c in chainedUpdates)
-            {
-                childUpdates[c.Key] = c.Value;
             }
 
             return childUpdates;
-        }
-
-        private Dictionary<string, string> EvaluateChainedDependencies(
-            string parentUdpName,
-            string parentValue,
-            Dictionary<string, string> currentValues,
-            HashSet<string> visited)
-        {
-            var updates = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-
-            if (visited.Contains(parentUdpName)) return updates; // Prevent circular
-            visited.Add(parentUdpName);
-
-            var rules = UdpDependencyService.Instance.GetByParent(parentUdpName);
-            foreach (var rule in rules)
-            {
-                bool conditionMet = EvaluateCondition(rule.ConditionOperator, rule.ConditionValues, parentValue);
-                if (conditionMet)
-                {
-                    updates[rule.ChildUdpName] = rule.ChildValue;
-                    Log($"UdpRuntime: Chained dependency: {rule.ParentUdpName}='{parentValue}' -> {rule.ChildUdpName}='{rule.ChildValue}'");
-
-                    // Recurse
-                    var chained = EvaluateChainedDependencies(rule.ChildUdpName, rule.ChildValue, currentValues, visited);
-                    foreach (var c in chained)
-                        updates[c.Key] = c.Value;
-                }
-            }
-
-            return updates;
-        }
-
-        private bool EvaluateCondition(string op, string conditionValues, string actualValue)
-        {
-            if (string.IsNullOrEmpty(op) || string.IsNullOrEmpty(conditionValues))
-                return false;
-
-            var values = conditionValues.Split(',').Select(v => v.Trim()).ToArray();
-
-            switch (op)
-            {
-                case "Equals":
-                    return string.Equals(actualValue, values[0], StringComparison.OrdinalIgnoreCase);
-                case "NotEquals":
-                    return !string.Equals(actualValue, values[0], StringComparison.OrdinalIgnoreCase);
-                case "In":
-                    return values.Any(v => string.Equals(v, actualValue, StringComparison.OrdinalIgnoreCase));
-                case "NotIn":
-                    return !values.Any(v => string.Equals(v, actualValue, StringComparison.OrdinalIgnoreCase));
-                case "GreaterThan":
-                    return decimal.TryParse(actualValue, out decimal gtActual) &&
-                           decimal.TryParse(values[0], out decimal gtVal) && gtActual > gtVal;
-                case "LessThan":
-                    return decimal.TryParse(actualValue, out decimal ltActual) &&
-                           decimal.TryParse(values[0], out decimal ltVal) && ltActual < ltVal;
-                case "Between":
-                    if (values.Length >= 2 &&
-                        decimal.TryParse(actualValue, out decimal btActual) &&
-                        decimal.TryParse(values[0], out decimal btMin) &&
-                        decimal.TryParse(values[1], out decimal btMax))
-                    {
-                        return btActual >= btMin && btActual <= btMax;
-                    }
-                    return false;
-                default:
-                    return false;
-            }
         }
 
         /// <summary>

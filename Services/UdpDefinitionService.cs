@@ -129,7 +129,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 // Corporate scope filter (in-memory)
                                 if (effectiveModelIds != null)
                                 {
-                                    int rowModelId = reader["MODEL_ID"] == DBNull.Value ? 0 : Convert.ToInt32(reader["MODEL_ID"]);
+                                    int rowModelId = Convert.ToInt32(reader["MODEL_ID"]);
                                     if (rowModelId > 0 && !effectiveModelIds.Contains(rowModelId))
                                         continue;
                                 }
