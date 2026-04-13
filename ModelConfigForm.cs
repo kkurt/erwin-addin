@@ -92,8 +92,9 @@ namespace EliteSoft.Erwin.AddIn
 
                 if (persistenceUnits.Count == 0)
                 {
-                    lblActiveModel.Text = "(No models found)";
-                    ShowError("No open models found in erwin.\nPlease open a model first.", "Connection Error");
+                    lblActiveModel.Text = "(Waiting for model...)";
+                    UpdateStatus("No models open. Waiting for a model...", Color.Gray);
+                    StartReconnectTimer();
                     return;
                 }
 
@@ -154,6 +155,7 @@ namespace EliteSoft.Erwin.AddIn
 
         private void ConnectToModel(int modelIndex)
         {
+            Log($">>> ConnectToModel({modelIndex}) called. Stack: {new System.Diagnostics.StackTrace(1, false).GetFrame(0)?.GetMethod()?.Name ?? "?"}");
             try
             {
                 // Stop old monitoring BEFORE closing session (prevents COM exception race)
@@ -215,6 +217,7 @@ namespace EliteSoft.Erwin.AddIn
 
                 // If ForceClose was triggered during init, stop further processing
                 if (_allowClose || this.IsDisposed) return;
+
             }
             catch (Exception ex)
             {
@@ -250,7 +253,7 @@ namespace EliteSoft.Erwin.AddIn
         private void StartReconnectTimer()
         {
             StopReconnectTimer();
-            _reconnectTimer = new Timer { Interval = 3000 }; // Poll every 3 seconds
+            _reconnectTimer = new Timer { Interval = 500 };
             _reconnectTimer.Tick += ReconnectTimer_Tick;
             _reconnectTimer.Start();
             Log("Reconnect timer started - waiting for model to open...");
@@ -413,6 +416,10 @@ namespace EliteSoft.Erwin.AddIn
             UpdateValidationStatus();
             Log("Validation service initialized.");
             UpdateGeneralTab();
+            PopulateVersionCombos();
+
+            // Save baseline DDL at connect time (FEModel_DDL does NOT corrupt PU)
+            DdlGenerationService.SaveBaselineDDL((object)_currentModel, "", (Action<string>)Log);
 
         }
 
@@ -2152,82 +2159,286 @@ namespace EliteSoft.Erwin.AddIn
 
         #region Approval / Review
 
-        private void BtnReview_Click(object sender, EventArgs e)
+        private void BtnMartReview_Click(object sender, EventArgs e)
         {
-            if (!_isConnected || _session == null)
+            var hWnd = Services.Win32Helper.GetErwinMainWindow();
+            if (hWnd == IntPtr.Zero)
             {
-                ErwinAddIn.ShowTopMostMessage("No model connected.", "Review");
+                ErwinAddIn.ShowTopMostMessage("erwin window not found.", "Mart Review");
                 return;
             }
 
-            btnReview.Enabled = false;
-            lblReviewStatus.Text = "Running review...";
-            lblReviewStatus.ForeColor = Color.Gray;
-            lvReviewResults.Items.Clear();
+            Log("[REVIEW] Triggering erwin Mart Review...");
+            bool invoked = Services.Win32Helper.InvokeToolbarButton(hWnd, "Review", Log);
+
+            if (invoked)
+                Log("[REVIEW] Review triggered.");
+            else
+            {
+                Log("[REVIEW] 'Review' button not found.");
+                ErwinAddIn.ShowTopMostMessage("'Review' button not found in erwin.", "Mart Review");
+            }
+        }
+
+        private void BtnGenerateDDL_Click(object sender, EventArgs e)
+        {
+            if (!_isConnected || _currentModel == null)
+            {
+                ErwinAddIn.ShowTopMostMessage("No model connected.", "DDL Generation");
+                return;
+            }
+
+            string feOptionXml = txtFEOptionXml.Text.Trim();
+
+            // Check if model has unsaved changes (asterisk in erwin window title)
+            bool hasUnsavedChanges = HasModelUnsavedChanges();
+            bool isDiffMode = cmbRightModel.Items.Count > 0 && cmbRightModel.SelectedIndex >= 0;
+
+            btnGenerateDDL.Enabled = false;
+            rtbDDLOutput.Text = "";
             Application.DoEvents();
+
+            _validationCoordinatorService?.SuspendValidation();
 
             try
             {
-                var reviewService = new MartReviewService(_session, _scapi);
-                reviewService.OnLog += Log;
+                lblDDLStatus.Text = "Generating DDL diff (current vs Mart baseline)...";
+                lblDDLStatus.ForeColor = Color.Gray;
+                Application.DoEvents();
 
-                if (!reviewService.IsModelFromMart())
-                {
-                    lblReviewStatus.Text = "Model is not from Mart. Review not available.";
-                    lblReviewStatus.ForeColor = Color.OrangeRed;
-                    return;
-                }
-
-                var differences = reviewService.RunReview();
-
-                if (differences.Count == 0)
-                {
-                    lblReviewStatus.Text = "No changes detected. Model is in sync with Mart.";
-                    lblReviewStatus.ForeColor = Color.DarkGreen;
-                }
-                else
-                {
-                    lblReviewStatus.Text = $"{differences.Count} difference(s) found.";
-                    lblReviewStatus.ForeColor = Color.DarkOrange;
-
-                    // Apply type filter
-                    var filtered = differences.Where(d =>
-                    {
-                        if (d.ObjectType == "Entity" && !chkFilterEntity.Checked) return false;
-                        if (d.ObjectType == "Column" && !chkFilterColumn.Checked) return false;
-                        return true;
-                    }).ToList();
-
-                    lblReviewStatus.Text = $"{filtered.Count} difference(s) shown ({differences.Count} total).";
-
-                    foreach (var diff in filtered)
-                    {
-                        var item = new System.Windows.Forms.ListViewItem(diff.ObjectType);
-                        item.SubItems.Add(diff.ObjectName);
-                        item.SubItems.Add(diff.ChangeType);
-                        item.SubItems.Add(diff.Detail ?? "");
-
-                        // Color code
-                        switch (diff.ChangeType)
-                        {
-                            case "Added": item.ForeColor = Color.DarkGreen; break;
-                            case "Deleted": item.ForeColor = Color.DarkRed; break;
-                            case "Modified": item.ForeColor = Color.DarkOrange; break;
-                        }
-
-                        lvReviewResults.Items.Add(item);
-                    }
-                }
+                string diff = DdlGenerationService.GenerateDiffWithDuplicate(
+                    _scapi, _currentModel, feOptionXml, (Action<string>)Log);
+                ShowDDLResult(diff, "DDL Diff");
             }
             catch (Exception ex)
             {
-                lblReviewStatus.Text = $"Review failed: {ex.Message}";
-                lblReviewStatus.ForeColor = Color.Red;
-                Log($"BtnReview_Click error: {ex.Message}");
+                lblDDLStatus.Text = $"Error: {ex.Message}";
+                lblDDLStatus.ForeColor = Color.Red;
+                Log($"DDL Generation error: {ex.Message}");
             }
             finally
             {
-                btnReview.Enabled = true;
+                _validationCoordinatorService?.ResumeValidation();
+                btnGenerateDDL.Enabled = true;
+                this.Activate();
+                this.BringToFront();
+            }
+        }
+
+        private bool HasModelUnsavedChanges()
+        {
+            try
+            {
+                var hWnd = Services.Win32Helper.GetErwinMainWindow();
+                if (hWnd == IntPtr.Zero) return false;
+
+                var sb = new System.Text.StringBuilder(512);
+                Services.Win32Helper.GetWindowTextPublic(hWnd, sb, sb.Capacity);
+                string title = sb.ToString();
+
+                // erwin shows "*" in title when model has unsaved changes
+                // e.g., "erwin DM - [Mart://Mart/KKB/KKB_Demo : v4 : ER_Diagram_164 * ]"
+                bool hasChanges = title.Contains("* ]") || title.Contains("*]");
+                Log($"DDL: Window title='{title}', unsaved changes={hasChanges}");
+                return hasChanges;
+            }
+            catch { return false; }
+        }
+
+        private void ShowDDLResult(string ddl, string label)
+        {
+            if (!string.IsNullOrEmpty(ddl))
+            {
+                ApplySqlHighlighting(ddl);
+                int lineCount = ddl.Split('\n').Length;
+                lblDDLStatus.Text = $"{label}: {lineCount} lines.";
+                lblDDLStatus.ForeColor = Color.DarkGreen;
+            }
+            else
+            {
+                lblDDLStatus.Text = "No DDL output generated.";
+                lblDDLStatus.ForeColor = Color.OrangeRed;
+            }
+        }
+
+        private void ApplySqlHighlighting(string sql)
+        {
+            rtbDDLOutput.SuspendLayout();
+            rtbDDLOutput.Clear();
+            rtbDDLOutput.Text = sql;
+
+            // Set default color
+            rtbDDLOutput.SelectAll();
+            rtbDDLOutput.SelectionColor = Color.FromArgb(220, 220, 220);
+
+            // IMPORTANT: Use RichTextBox's own text for regex matching
+            // RichTextBox converts \r\n to \n internally, so indices differ from original string
+            string rtbText = rtbDDLOutput.Text;
+
+            var clrKeyword = Color.FromArgb(86, 156, 214);     // VS Code blue
+            var clrType = Color.FromArgb(78, 201, 176);         // VS Code teal
+            var clrComment = Color.FromArgb(106, 153, 85);      // VS Code green
+            var clrString = Color.FromArgb(206, 145, 120);      // VS Code orange
+            var clrNumber = Color.FromArgb(181, 206, 168);      // VS Code light green
+            var clrGo = Color.FromArgb(197, 134, 192);          // VS Code purple
+            var clrDiffNew = Color.FromArgb(80, 220, 80);       // Bright green
+            var clrDiffDrop = Color.FromArgb(240, 80, 80);      // Bright red
+            var clrDiffChange = Color.FromArgb(255, 180, 50);   // Bright orange
+            var clrSection = Color.FromArgb(220, 220, 100);     // Yellow
+
+            // 1. Keywords (blue)
+            HighlightRegex(rtbText, @"\b(CREATE|ALTER|DROP|TABLE|ADD|COLUMN|CONSTRAINT|PRIMARY|KEY|FOREIGN|REFERENCES|NOT|NULL|DEFAULT|IDENTITY|CLUSTERED|NONCLUSTERED|INDEX|UNIQUE|ON|DELETE|UPDATE|CASCADE|SET|CHECK|WITH|ASC|DESC|BEGIN|END|DECLARE|IF|EXISTS|SELECT|FROM|WHERE|AND|OR|RETURN|GOTO|TRIGGER|FOR|INSERT|AS|RAISERROR|ROLLBACK|TRANSACTION|INTO|ACTION)\b", clrKeyword);
+
+            // 2. Data types (teal)
+            HighlightRegex(rtbText, @"\b(int|bigint|smallint|tinyint|bit|varchar|nvarchar|char|nchar|text|ntext|datetime|smalldatetime|date|time|timestamp|decimal|numeric|float|real|money|smallmoney|varbinary|binary|image|uniqueidentifier|VARCHAR2|NUMBER|CLOB|BLOB|COLLATE)\b", clrType);
+
+            // 3. Numbers (light green)
+            HighlightRegex(rtbText, @"(?<![a-zA-Z_])\d+(?![a-zA-Z_])", clrNumber);
+
+            // 4. GO (purple)
+            HighlightRegex(rtbText, @"(?m)^go$", clrGo);
+
+            // 5. String literals (orange)
+            HighlightRegex(rtbText, @"'[^']*'", clrString);
+
+            // 6. Comments (green) - overrides keywords inside comments
+            HighlightRegex(rtbText, @"--[^\n]*", clrComment);
+
+            // 7. Diff markers (override comment color)
+            HighlightRegex(rtbText, @"-- NEW:.*", clrDiffNew);
+            HighlightRegex(rtbText, @"-- DROPPED:.*", clrDiffDrop);
+            HighlightRegex(rtbText, @"-- CHANGED:.*", clrDiffChange);
+            HighlightRegex(rtbText, @"-- =+.*=+", clrSection);
+            HighlightRegex(rtbText, @"-- Summary:.*", clrSection);
+            HighlightRegex(rtbText, @"-- WARNING:.*", clrDiffDrop);
+
+            rtbDDLOutput.SelectionStart = 0;
+            rtbDDLOutput.SelectionLength = 0;
+            rtbDDLOutput.ResumeLayout();
+        }
+
+        private void HighlightRegex(string rtbText, string pattern, Color color)
+        {
+            try
+            {
+                foreach (System.Text.RegularExpressions.Match m in
+                    System.Text.RegularExpressions.Regex.Matches(rtbText, pattern,
+                        System.Text.RegularExpressions.RegexOptions.IgnoreCase |
+                        System.Text.RegularExpressions.RegexOptions.Multiline))
+                {
+                    rtbDDLOutput.Select(m.Index, m.Length);
+                    rtbDDLOutput.SelectionColor = color;
+                }
+            }
+            catch { }
+        }
+
+        private void BtnBrowseFEOption_Click(object sender, EventArgs e)
+        {
+            using (var dlg = new OpenFileDialog())
+            {
+                dlg.Title = "Select FE Option Set XML";
+                dlg.Filter = "XML files (*.xml)|*.xml|All files (*.*)|*.*";
+                if (dlg.ShowDialog() == DialogResult.OK)
+                {
+                    txtFEOptionXml.Text = dlg.FileName;
+                    txtFEOptionXml.ForeColor = System.Drawing.SystemColors.WindowText;
+                }
+            }
+        }
+
+        private void BtnCopyDDL_Click(object sender, EventArgs e)
+        {
+            if (!string.IsNullOrEmpty(rtbDDLOutput.Text))
+            {
+                Clipboard.SetText(rtbDDLOutput.Text);
+                lblDDLStatus.Text = "DDL copied to clipboard!";
+                lblDDLStatus.ForeColor = Color.DarkGreen;
+            }
+        }
+
+        private void BtnSaveDDL_Click(object sender, EventArgs e)
+        {
+            if (string.IsNullOrEmpty(rtbDDLOutput.Text)) return;
+
+            using (var dlg = new SaveFileDialog())
+            {
+                dlg.Title = "Save DDL Script";
+                dlg.Filter = "SQL files (*.sql)|*.sql|DDL files (*.ddl)|*.ddl|All files (*.*)|*.*";
+                dlg.FileName = $"ddl_diff_{DateTime.Now:yyyyMMdd_HHmmss}.sql";
+                if (dlg.ShowDialog() == DialogResult.OK)
+                {
+                    System.IO.File.WriteAllText(dlg.FileName, rtbDDLOutput.Text);
+                    lblDDLStatus.Text = $"DDL saved to {dlg.FileName}";
+                    lblDDLStatus.ForeColor = Color.DarkGreen;
+                }
+            }
+        }
+
+        private int _martVersion = 0;
+        private string _martLocator = "";
+
+        /// <summary>
+        /// Populate Left/Right model version combo boxes.
+        /// Version is read from PU locator or erwin window title.
+        /// </summary>
+        private void PopulateVersionCombos()
+        {
+            cmbLeftModel.Items.Clear();
+            cmbRightModel.Items.Clear();
+
+            try
+            {
+                // Try PU locator first
+                string locator = "";
+                try { locator = _currentModel.PropertyBag().Value("Locator")?.ToString() ?? ""; } catch { }
+                _martLocator = locator;
+
+                int version = DdlGenerationService.ParseVersionFromLocator(locator);
+
+                // If locator didn't have version, try erwin window title
+                // Format: "erwin DM - [Mart://Mart/KKB/KKB_Demo : v4 : ER_Diagram_164 * ]"
+                if (version <= 1)
+                {
+                    try
+                    {
+                        var hWnd = Services.Win32Helper.GetErwinMainWindow();
+                        if (hWnd != IntPtr.Zero)
+                        {
+                            var sb = new System.Text.StringBuilder(512);
+                            Services.Win32Helper.GetWindowTextPublic(hWnd, sb, sb.Capacity);
+                            string title = sb.ToString();
+
+                            var match = System.Text.RegularExpressions.Regex.Match(title, @":\s*v(\d+)\s*:");
+                            if (match.Success && int.TryParse(match.Groups[1].Value, out int titleVer))
+                            {
+                                version = titleVer;
+                                Log($"DDL: Version from window title = v{version}");
+                            }
+                        }
+                    }
+                    catch { }
+                }
+
+                _martVersion = version;
+                string modelName = _connectedModelName ?? "Model";
+                Log($"DDL: Model='{modelName}', Version={version}, Locator='{locator}'");
+
+                // Left model: Active Model (current with possible unsaved changes)
+                cmbLeftModel.Items.Add($"Active Model (v{version})");
+                cmbLeftModel.SelectedIndex = 0;
+
+                // Right model: Mart baseline (last saved version)
+                cmbRightModel.Items.Add("Mart Baseline (last saved)");
+                cmbRightModel.SelectedIndex = 0;
+            }
+            catch (Exception ex)
+            {
+                Log($"PopulateVersionCombos error: {ex.Message}");
+                cmbLeftModel.Items.Add("Active Model");
+                cmbLeftModel.SelectedIndex = 0;
+                cmbRightModel.Items.Add("(Mart Baseline)");
+                cmbRightModel.SelectedIndex = 0;
             }
         }
 
@@ -2457,6 +2668,234 @@ namespace EliteSoft.Erwin.AddIn
                 var filtered = lines.Where(l => l.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0);
                 txtDebugLog.Text = string.Join("\r\n", filtered);
             }
+        }
+
+        private System.Windows.Forms.Timer _monitorTimer;
+        private HashSet<int> _monitoredProcessIds;
+        private HashSet<string> _monitoredWindowTitles;
+        private bool _monitorRunning;
+        private int _lastMonitoredPUCount;
+
+        private void BtnMonitor_Click(object sender, EventArgs e)
+        {
+            if (_monitorRunning)
+            {
+                StopMonitor();
+                return;
+            }
+
+            // Snapshot current state
+            _monitoredProcessIds = new HashSet<int>();
+            _monitoredWindowTitles = new HashSet<string>();
+
+            foreach (var p in System.Diagnostics.Process.GetProcesses())
+            {
+                try
+                {
+                    _monitoredProcessIds.Add(p.Id);
+                    string title = p.MainWindowTitle;
+                    if (!string.IsNullOrEmpty(title))
+                        _monitoredWindowTitles.Add(title);
+                }
+                catch { }
+            }
+
+            // Also track PU count
+            int puCount = 0;
+            try { puCount = _scapi.PersistenceUnits.Count; } catch { }
+            _lastMonitoredPUCount = puCount;
+
+            Log($"[MONITOR] Started. Tracking {_monitoredProcessIds.Count} processes, {_monitoredWindowTitles.Count} windows, {puCount} PU(s)");
+            Log("[MONITOR] Now perform the action in erwin and watch the log...");
+
+            _monitorTimer = new System.Windows.Forms.Timer();
+            _monitorTimer.Interval = 500; // 500ms polling
+            _monitorTimer.Tick += MonitorTimer_Tick;
+            _monitorTimer.Start();
+
+            _monitorRunning = true;
+            btnMonitor.Text = "Stop Monitor";
+            btnMonitor.BackColor = Color.MistyRose;
+        }
+
+        private void StopMonitor()
+        {
+            if (_monitorTimer != null)
+            {
+                _monitorTimer.Stop();
+                _monitorTimer.Dispose();
+                _monitorTimer = null;
+            }
+            _monitorRunning = false;
+            btnMonitor.Text = "Start Monitor";
+            btnMonitor.BackColor = Color.White;
+            Log("[MONITOR] Stopped.");
+        }
+
+        private void MonitorTimer_Tick(object sender, EventArgs e)
+        {
+            try
+            {
+                foreach (var p in System.Diagnostics.Process.GetProcesses())
+                {
+                    try
+                    {
+                        // New process detected
+                        if (!_monitoredProcessIds.Contains(p.Id))
+                        {
+                            _monitoredProcessIds.Add(p.Id);
+                            string procName = p.ProcessName;
+                            string title = "";
+                            try { title = p.MainWindowTitle; } catch { }
+                            string mainModule = "";
+                            try { mainModule = p.MainModule?.FileName ?? ""; } catch { }
+
+                            if (!string.IsNullOrEmpty(title) || !string.IsNullOrEmpty(mainModule))
+                            {
+                                Log($"[MONITOR] NEW PROCESS: PID={p.Id}, Name='{procName}', Title='{title}', Path='{mainModule}'");
+                            }
+                        }
+
+                        // New window title on existing process
+                        string winTitle = "";
+                        try { winTitle = p.MainWindowTitle; } catch { }
+                        if (!string.IsNullOrEmpty(winTitle) && !_monitoredWindowTitles.Contains(winTitle))
+                        {
+                            _monitoredWindowTitles.Add(winTitle);
+                            Log($"[MONITOR] NEW WINDOW: PID={p.Id}, Process='{p.ProcessName}', Title='{winTitle}'");
+                        }
+                    }
+                    catch { }
+                }
+
+                // Check for closed processes (detect process exits)
+                var currentIds = new HashSet<int>();
+                foreach (var p in System.Diagnostics.Process.GetProcesses())
+                {
+                    try { currentIds.Add(p.Id); } catch { }
+                }
+
+                var closedIds = _monitoredProcessIds.Where(id => !currentIds.Contains(id)).ToList();
+                foreach (var id in closedIds)
+                {
+                    Log($"[MONITOR] PROCESS CLOSED: PID={id}");
+                    _monitoredProcessIds.Remove(id);
+                }
+
+                // Monitor PU count changes
+                try
+                {
+                    int currentPUCount = _scapi.PersistenceUnits.Count;
+                    if (currentPUCount != _lastMonitoredPUCount)
+                    {
+                        Log($"[MONITOR] PU COUNT CHANGED: {_lastMonitoredPUCount} -> {currentPUCount}");
+                        for (int i = 0; i < currentPUCount; i++)
+                        {
+                            try
+                            {
+                                dynamic pu = _scapi.PersistenceUnits.Item(i);
+                                string puName = pu.Name?.ToString() ?? "";
+                                string locator = "";
+                                try { locator = pu.PropertyBag().Value("Locator")?.ToString() ?? ""; } catch { }
+                                Log($"[MONITOR]   PU[{i}]: '{puName}' -> {locator}");
+                            }
+                            catch { }
+                        }
+                        _lastMonitoredPUCount = currentPUCount;
+                    }
+                }
+                catch { }
+            }
+            catch (Exception ex)
+            {
+                Log($"[MONITOR] Error: {ex.Message}");
+            }
+        }
+
+        private void BtnScanMenu_Click(object sender, EventArgs e)
+        {
+            // 0. List all erwin top-level windows first
+            Log("[SCAN] === erwin Top-Level Windows ===");
+            var erwinWindows = Services.Win32Helper.EnumErwinWindows();
+            if (erwinWindows.Count == 0)
+            {
+                Log("[SCAN] No erwin windows found!");
+                return;
+            }
+            foreach (var w in erwinWindows)
+            {
+                Log($"[WINDOW] {w}");
+            }
+
+            var hWnd = Services.Win32Helper.GetErwinMainWindow();
+            if (hWnd == IntPtr.Zero)
+            {
+                Log("[SCAN] erwin DM main window not found (no window with 'erwin DM' title)!");
+                return;
+            }
+
+            Log($"[SCAN] erwin DM main HWND={hWnd}");
+
+            // 1. Try standard Win32 menu
+            Log("[SCAN] === Win32 HMENU Scan ===");
+            var menuItems = Services.Win32Helper.ScanMenuStructure(hWnd);
+            if (menuItems.Count > 0)
+            {
+                Log($"[SCAN] Found {menuItems.Count} Win32 menu items:");
+                foreach (var item in menuItems)
+                {
+                    string indent = new string(' ', item.Depth * 2);
+                    string idStr = item.Id == 0xFFFFFFFF ? "(submenu)" : $"ID={item.Id}";
+                    Log($"[MENU] {indent}{item.Text} [{idStr}]");
+                }
+            }
+            else
+            {
+                Log("[SCAN] No Win32 menu found.");
+            }
+
+            // 2. Scan child windows - find those with real menus and scan them
+            Log("[SCAN] === Child Windows with Menus ===");
+            var childMenuResults = Services.Win32Helper.ScanChildWindowMenus(hWnd);
+            foreach (var entry in childMenuResults)
+            {
+                Log(entry);
+            }
+
+            // 3. UI Automation scan
+            Log("[SCAN] === UI Automation Scan ===");
+            var uiElements = Services.Win32Helper.ScanUIAutomation(hWnd, Log);
+            if (uiElements.Count > 0)
+            {
+                Log($"[SCAN] Found {uiElements.Count} UI elements:");
+                foreach (var el in uiElements)
+                {
+                    string indent = new string(' ', el.Depth * 2);
+                    string autoIdStr = string.IsNullOrEmpty(el.AutomationId) ? "" : $" AutoId='{el.AutomationId}'";
+                    Log($"[UI] {indent}{el.Name} [{el.ControlType}]{autoIdStr}");
+                }
+
+                // Highlight Compare/Review items
+                var compareItems = uiElements.FindAll(i =>
+                    i.Name.IndexOf("Compare", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    i.Name.IndexOf("Review", StringComparison.OrdinalIgnoreCase) >= 0
+                );
+
+                if (compareItems.Count > 0)
+                {
+                    Log("[SCAN] === Compare/Review UI elements ===");
+                    foreach (var item in compareItems)
+                    {
+                        Log($"[SCAN] >>> {item.Path} [{item.ControlType}]");
+                    }
+                }
+            }
+            else
+            {
+                Log("[SCAN] No UI Automation elements found.");
+            }
+
+            Log("[SCAN] Done.");
         }
 
         #endregion
@@ -2804,6 +3243,8 @@ namespace EliteSoft.Erwin.AddIn
             }
 
             Log("Model closed - session lost. Cleaning up services.");
+            CompleteCompareService.Cleanup();
+            DdlGenerationService.ClearBaseline();
 
             try
             {

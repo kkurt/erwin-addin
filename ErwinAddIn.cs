@@ -4,8 +4,8 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Forms;
-using xHardwareLicensing;
-using xHardwareLicensing.Core;
+using xLicense;
+using xLicense.Core;
 
 namespace EliteSoft.Erwin.AddIn
 {

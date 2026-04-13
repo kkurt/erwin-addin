@@ -100,7 +100,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             _monitorTimer.Tick += MonitorTimer_Tick;
 
             _windowMonitorTimer = new Timer();
-            _windowMonitorTimer.Interval = 2000;
+            _windowMonitorTimer.Interval = 500;
             _windowMonitorTimer.Tick += WindowMonitorTimer_Tick;
         }
 
@@ -563,7 +563,7 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         private void WindowMonitorTimer_Tick(object sender, EventArgs e)
         {
-            if (_sessionLost || !_isMonitoring || _disposed) return;
+            if (_sessionLost || !_isMonitoring || _disposed || _validationSuspended) return;
 
             // Safety: check if model is still open BEFORE touching the session.
             if (!IsModelStillOpen()) { HandleSessionLost(); return; }
