@@ -419,7 +419,8 @@ namespace EliteSoft.Erwin.AddIn
             PopulateVersionCombos();
 
             // Save baseline DDL at connect time (FEModel_DDL does NOT corrupt PU)
-            DdlGenerationService.SaveBaselineDDL((object)_currentModel, "", (Action<string>)Log);
+            try { DdlGenerationService.SaveBaselineDDL((object)_currentModel, "", (Action<string>)Log); }
+            catch (Exception ex) { Log($"Baseline DDL save skipped: {ex.Message}"); }
 
         }
 
