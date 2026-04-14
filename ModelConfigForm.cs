@@ -2214,35 +2214,46 @@ namespace EliteSoft.Erwin.AddIn
                 else
                     DdlGenerationService.SetSelectedVersion(0);
 
-                // Check if selected version is already open as PU
-                try { puCount = _scapi.PersistenceUnits.Count; } catch { }
-
                 var verMatch2 = System.Text.RegularExpressions.Regex.Match(selectedVersion, @"v(\d+)");
                 int selVer = verMatch2.Success ? int.Parse(verMatch2.Groups[1].Value) : 0;
-
-                bool versionAlreadyOpen = false;
-                if (puCount >= 2 && selVer > 0)
-                {
-                    for (int i = 0; i < puCount; i++)
-                    {
-                        try
-                        {
-                            dynamic pu = _scapi.PersistenceUnits.Item(i);
-                            int puVer = DdlGenerationService.ParseVersionFromLocator(
-                                pu.PropertyBag().Value("Locator")?.ToString() ?? "");
-                            if (puVer == selVer) { versionAlreadyOpen = true; break; }
-                        }
-                        catch { }
-                    }
-                }
 
                 lblDDLStatus.Text = $"Generating DDL diff (v{_martVersion} vs v{selVer})...";
                 lblDDLStatus.ForeColor = Color.Gray;
                 Application.DoEvents();
 
+                // Show "Please wait" dialog during DDL generation
+                Form waitDialog = null;
+                try
+                {
+                    waitDialog = new Form
+                    {
+                        Text = "DDL Generation",
+                        Size = new System.Drawing.Size(350, 120),
+                        FormBorderStyle = FormBorderStyle.FixedDialog,
+                        StartPosition = FormStartPosition.CenterScreen,
+                        MinimizeBox = false, MaximizeBox = false, ControlBox = false,
+                        TopMost = true,
+                        ShowInTaskbar = false
+                    };
+                    var waitLabel = new Label
+                    {
+                        Text = $"Generating DDL diff (v{_martVersion} vs v{selVer})...\nPlease wait.",
+                        Dock = DockStyle.Fill,
+                        TextAlign = System.Drawing.ContentAlignment.MiddleCenter,
+                        Font = new System.Drawing.Font("Segoe UI", 10f)
+                    };
+                    waitDialog.Controls.Add(waitLabel);
+                    waitDialog.Show(this);
+                    Application.DoEvents();
+                }
+                catch { }
+
                 // Try direct open + DDL diff
                 string diff = DdlGenerationService.GenerateDiffWithDuplicate(
                     _scapi, _currentModel, feOptionXml, (Action<string>)Log);
+
+                // Close wait dialog
+                try { waitDialog?.Close(); waitDialog?.Dispose(); } catch { }
 
                 if (diff != null)
                 {
@@ -2269,8 +2280,12 @@ namespace EliteSoft.Erwin.AddIn
             {
                 _validationCoordinatorService?.ResumeValidation();
                 btnGenerateDDL.Enabled = true;
+
+                // Force focus back to add-in (DdlHelper may have shifted focus)
+                this.TopMost = true;
                 this.Activate();
                 this.BringToFront();
+                this.TopMost = false;
             }
         }
 
@@ -3648,7 +3663,6 @@ namespace EliteSoft.Erwin.AddIn
             }
 
             Log("Model closed - session lost. Cleaning up services.");
-            CompleteCompareService.Cleanup();
             DdlGenerationService.ClearBaseline();
 
             try

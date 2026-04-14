@@ -28,7 +28,6 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         // Baseline DDL saved at connect time (before user makes changes)
         private static string _baselineDdl;
-        private static string _lastCCOutput;
 
         public static bool HasBaseline => !string.IsNullOrEmpty(_baselineDdl);
 
