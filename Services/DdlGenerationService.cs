@@ -131,6 +131,150 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// Try to open a Mart version directly via SCAPI with multiple locator/disposition combos.
+        /// Admin project uses: PersistenceUnits.Add(martUrl, "OVM=Yes")
+        /// </summary>
+        private static readonly string LogFile = Path.Combine(
+            Path.GetTempPath(), "erwin-addin-ddl", "ddl_attempts.log");
+
+        private static void FileLog(string message)
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(LogFile));
+                File.AppendAllText(LogFile, $"[{DateTime.Now:HH:mm:ss.fff}] {message}\r\n");
+            }
+            catch { }
+        }
+
+        private static string TryOpenMartVersionDirectly(dynamic scapi, dynamic currentPU, int version, string feOptionXml, Action<string> log)
+        {
+            Directory.CreateDirectory(TempDir);
+            string ddlFile = Path.Combine(TempDir, $"direct_v{version}.sql");
+
+            // Clear log file
+            try { File.WriteAllText(LogFile, $"=== DDL Attempt Log {DateTime.Now} ===\r\n"); } catch { }
+
+            var martInfo = GetMartConnectionInfo(log);
+
+            string locator = "";
+            try { locator = currentPU.PropertyBag().Value("Locator")?.ToString() ?? ""; } catch { }
+            string modelPath = "";
+            var pathMatch = Regex.Match(locator, @"Mart://Mart/(.+?)(\?|$)");
+            if (pathMatch.Success) modelPath = pathMatch.Groups[1].Value;
+            else modelPath = currentPU.Name?.ToString() ?? "";
+
+            FileLog($"Model: {modelPath}, Version: {version}");
+            FileLog($"Current locator: {locator}");
+            log?.Invoke($"DDL: Attempts logged to: {LogFile}");
+
+            // Get modelLongId from locator
+            string modelLongId = "";
+            var longIdMatch = Regex.Match(locator, @"modelLongId=([^;]+)");
+            if (longIdMatch.Success) modelLongId = longIdMatch.Groups[1].Value;
+            FileLog($"modelLongId: {modelLongId}");
+
+            // Build attempts - SAFEST FIRST, RISKIEST LAST
+            var attempts = new List<(string url, string disposition, string desc)>();
+
+            // GROUP 1: Known safe (return errors, don't crash)
+            attempts.Add(($"mart://Mart/{modelPath}?VNO={version}", "", "mart VNO + empty"));
+            attempts.Add(($"mart://Mart/{modelPath}?VNO={version}", "RDO=Yes", "mart VNO + RDO"));
+            attempts.Add(($"mart://Mart/{modelPath}?VNO={version}", "OVM=Yes", "mart VNO + OVM"));
+
+            // GROUP 2: Add Mart ModelDirectory FIRST, then open model
+            // Admin project does: ModelDirectories.Add(martLocator) THEN PersistenceUnits.Add
+            // We never tried this! ModelDirectories only has FileSystem, not Mart.
+            if (martInfo != null)
+            {
+                string martDirLocator = $"mart://Mart?TRC=NO;SRV={martInfo.Value.host};PRT={martInfo.Value.port};ASR=MartServer;UID={martInfo.Value.username};PSW={martInfo.Value.password}";
+                string martModelUrl = $"mart://Mart/{modelPath}?TRC=NO;SRV={martInfo.Value.host};PRT={martInfo.Value.port};ASR=MartServer;UID={martInfo.Value.username};PSW={martInfo.Value.password};VNO={version}";
+
+                // Try adding Mart directory first
+                try
+                {
+                    string maskedDir = Regex.Replace(martDirLocator, @"PSW=[^;]*", "PSW=***");
+                    FileLog($"Adding Mart ModelDirectory: {maskedDir}");
+                    log?.Invoke($"DDL: Adding Mart directory...");
+                    scapi.ModelDirectories.Add(martDirLocator, "");
+                    FileLog("Mart ModelDirectory added!");
+
+                    // Now try opening model
+                    string maskedModel = Regex.Replace(martModelUrl, @"PSW=[^;]*", "PSW=***");
+                    attempts.Add((martModelUrl, "OVM=Yes", "After MartDir + OVM"));
+                    attempts.Add((martModelUrl, "RDO=Yes", "After MartDir + RDO"));
+                    attempts.Add((martModelUrl, "", "After MartDir + empty"));
+                }
+                catch (Exception ex)
+                {
+                    FileLog($"ModelDirectories.Add failed: {ex.Message}");
+                    log?.Invoke($"DDL: ModelDirectories.Add failed: {ex.Message}");
+                }
+            }
+
+            dynamic versionPU = null;
+            int attemptNum = 0;
+
+            foreach (var (url, disp, desc) in attempts)
+            {
+                attemptNum++;
+                string maskedUrl = Regex.Replace(url, @"PSW=[^;]*", "PSW=***");
+                string msg = $"Attempt {attemptNum}/{attempts.Count} [{desc}]: {maskedUrl} disp='{disp}'";
+
+                FileLog($">>> {msg}");
+                log?.Invoke($"DDL: {msg}");
+
+                try
+                {
+                    versionPU = scapi.PersistenceUnits.Add(url, disp);
+
+                    string successMsg = $"SUCCESS! v{version} opened with [{desc}]";
+                    FileLog(successMsg);
+                    log?.Invoke($"DDL: {successMsg}");
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    string errMsg = $"FAILED: {ex.Message}";
+                    FileLog(errMsg);
+                    log?.Invoke($"DDL: {errMsg}");
+                    versionPU = null;
+                }
+            }
+
+            if (versionPU == null)
+            {
+                FileLog("All attempts failed.");
+                log?.Invoke("DDL: All direct open attempts failed. See: " + LogFile);
+                return null;
+            }
+
+            try
+            {
+                CleanupFile(ddlFile);
+                FileLog("Generating DDL via FEModel_DDL...");
+                versionPU.FEModel_DDL(ddlFile, string.IsNullOrEmpty(feOptionXml) ? "" : feOptionXml);
+
+                if (File.Exists(ddlFile))
+                {
+                    string ddl = File.ReadAllText(ddlFile);
+                    FileLog($"DDL generated: {ddl.Length} chars");
+                    return ddl;
+                }
+                return null;
+            }
+            finally
+            {
+                if (versionPU != null)
+                {
+                    try { scapi.PersistenceUnits.Remove(versionPU, false); }
+                    catch (Exception ex) { FileLog($"PU cleanup: {ex.Message}"); }
+                }
+                CleanupFile(ddlFile);
+            }
+        }
+
+        /// <summary>
         /// Load a specific Mart version's DDL via a SEPARATE process (VBScript + cscript.exe).
         /// Separate process = separate SCAPI instance = own Mart connection = no "UI active" error.
         /// erwin's own FEModel_DDL generates the DDL.
@@ -578,11 +722,10 @@ WScript.Quit 0
                         }
                     }
 
-                    // Not open as PU: load via external process (VBScript)
+                    // Try opening from Mart directly (multiple formats/dispositions)
                     if (string.IsNullOrEmpty(versionDdl))
                     {
-                        log?.Invoke($"DDL: Loading v{selectedVer} via external process...");
-                        versionDdl = LoadVersionDDLExternal(selectedVer, currentPU, optionArg, log);
+                        versionDdl = TryOpenMartVersionDirectly(scapi, currentPU, selectedVer, optionArg, log);
                     }
                 }
 
@@ -596,7 +739,7 @@ WScript.Quit 0
                 }
 
                 log?.Invoke("DDL: Could not get version DDL.");
-                return "-- Could not load selected version. Check Debug Log for details.";
+                return null; // Return null to trigger PU watcher fallback
             }
             catch (Exception ex)
             {

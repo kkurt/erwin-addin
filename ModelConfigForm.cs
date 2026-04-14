@@ -2236,38 +2236,28 @@ namespace EliteSoft.Erwin.AddIn
                     }
                 }
 
-                if (selVer > 0 && selVer != _martVersion && !versionAlreadyOpen)
-                {
-                    // Version not open - trigger erwin's Mart Open and wait for PU change
-                    Log($"DDL: v{selVer} not open. Triggering Mart Open + auto-detect...");
-                    lblDDLStatus.Text = $"Opening v{selVer}... Select it from erwin's Mart dialog.";
-                    lblDDLStatus.ForeColor = Color.DarkOrange;
-                    Application.DoEvents();
-
-                    // Store pending DDL request
-                    _pendingDDLVersion = selVer;
-                    _pendingDDLFeOption = feOptionXml;
-
-                    // Start watching for PU count change
-                    StartPUWatcher();
-
-                    // Trigger erwin's Open from Mart
-                    var hWnd = Services.Win32Helper.GetErwinMainWindow();
-                    if (hWnd != IntPtr.Zero)
-                        Services.Win32Helper.InvokeToolbarButton(hWnd, "Open", (Action<string>)Log);
-
-                    btnGenerateDDL.Enabled = true;
-                    _validationCoordinatorService?.ResumeValidation();
-                    return;
-                }
-
-                lblDDLStatus.Text = "Generating DDL diff...";
+                lblDDLStatus.Text = $"Generating DDL diff (v{_martVersion} vs v{selVer})...";
                 lblDDLStatus.ForeColor = Color.Gray;
                 Application.DoEvents();
 
+                // Try direct open + DDL diff
                 string diff = DdlGenerationService.GenerateDiffWithDuplicate(
                     _scapi, _currentModel, feOptionXml, (Action<string>)Log);
-                ShowDDLResult(diff, "DDL Diff");
+
+                if (diff != null)
+                {
+                    ShowDDLResult(diff, "DDL Diff");
+                }
+                else
+                {
+                    // Direct open failed - fall back to PU watcher
+                    _pendingDDLVersion = selVer;
+                    _pendingDDLFeOption = feOptionXml;
+                    StartPUWatcher();
+
+                    lblDDLStatus.Text = $"Please open v{selVer} from erwin Mart. DDL will generate automatically.";
+                    lblDDLStatus.ForeColor = Color.DarkOrange;
+                }
             }
             catch (Exception ex)
             {
@@ -2782,6 +2772,100 @@ namespace EliteSoft.Erwin.AddIn
                         ProbeMethod(_session, "Session", name);
                 }
 
+                // 8. ModelDirectories deep probe
+                Log("--- ModelDirectories Deep Probe ---");
+                try
+                {
+                    dynamic dirs = _scapi.ModelDirectories;
+                    Log($"ModelDirectories count: {dirs.Count}");
+                    DumpComMembers(dirs, "ModelDirs");
+
+                    // Try different index patterns (0-based, 1-based)
+                    int[] indices = { 0, 1 };
+                    foreach (int i in indices)
+                    {
+                        try
+                        {
+                            dynamic dir = dirs.Item(i);
+                            Log($"--- ModelDirectory[{i}] (success!) ---");
+                            DumpComMembers(dir, $"Dir[{i}]");
+
+                            // Try PropertyBag
+                            try
+                            {
+                                dynamic pb = dir.PropertyBag();
+                                int pbCount = pb.Count;
+                                Log($"  Dir[{i}] PropertyBag ({pbCount} entries):");
+                                for (int j = 0; j < pbCount; j++)
+                                {
+                                    try
+                                    {
+                                        string pn = pb.Name(j)?.ToString() ?? "";
+                                        string pv = pb.Value(pn)?.ToString() ?? "";
+                                        Log($"    {pn} = {pv}");
+                                    }
+                                    catch { }
+                                }
+                            }
+                            catch (Exception ex) { Log($"  Dir[{i}] PropertyBag error: {ex.Message}"); }
+
+                            // Try LocateDirectoryUnit for current model
+                            try
+                            {
+                                string modelName = _connectedModelName ?? "KKB_Demo";
+                                Log($"  Trying LocateDirectoryUnit for '{modelName}'...");
+                                dynamic locResult = dir.LocateDirectoryUnit($"mart://Mart/{modelName}", "");
+                                if (locResult != null)
+                                {
+                                    int lrCount = locResult.Count;
+                                    Log($"  LocateDirectoryUnit result: {lrCount} entries");
+                                    for (int j = 0; j < lrCount; j++)
+                                    {
+                                        try
+                                        {
+                                            string ln = locResult.Name(j)?.ToString() ?? "";
+                                            string lv = locResult.Value(ln)?.ToString() ?? "";
+                                            Log($"    {ln} = {lv}");
+                                        }
+                                        catch { }
+                                    }
+                                }
+                            }
+                            catch (Exception ex) { Log($"  LocateDirectoryUnit error: {ex.Message}"); }
+
+                            // Probe for undocumented methods
+                            string[] dirProbes = { "OpenModel", "LoadModel", "GetModel",
+                                "Connect", "Disconnect", "IsConnected",
+                                "Name", "Type", "Path", "Locator",
+                                "ResolvePath", "ResolveModel" };
+                            foreach (var probe in dirProbes)
+                                ProbeMethod(dir, $"Dir[{i}]", probe);
+                        }
+                        catch (Exception ex) { Log($"Dir[{i}] error: {ex.Message}"); }
+                    }
+
+                    // Also try foreach enumeration
+                    try
+                    {
+                        Log("--- ModelDirectories foreach ---");
+                        int idx = 0;
+                        foreach (dynamic dir in dirs)
+                        {
+                            Log($"  foreach Dir[{idx}]: {dir}");
+                            DumpComMembers(dir, $"foreach_Dir[{idx}]");
+                            try
+                            {
+                                dynamic pb = dir.PropertyBag();
+                                Log($"  foreach Dir[{idx}] PropertyBag count: {pb.Count}");
+                            }
+                            catch (Exception ex) { Log($"  foreach Dir[{idx}] PB error: {ex.Message}"); }
+                            idx++;
+                        }
+                    }
+                    catch (Exception ex) { Log($"ModelDirectories foreach error: {ex.Message}"); }
+                }
+                catch (Exception ex) { Log($"ModelDirectories probe error: {ex.Message}"); }
+
                 Log("=== SCAPI Discovery Complete ===");
             }
             catch (Exception ex)
@@ -2927,10 +3011,47 @@ namespace EliteSoft.Erwin.AddIn
                 catch { }
             }
 
-            // Also track PU count
+            // Track PU count + ModelDirectories + Sessions
             int puCount = 0;
             try { puCount = _scapi.PersistenceUnits.Count; } catch { }
             _lastMonitoredPUCount = puCount;
+
+            // Log ModelDirectories state at start
+            try
+            {
+                int dirCount = _scapi.ModelDirectories.Count;
+                Log($"[MONITOR] ModelDirectories count: {dirCount}");
+                for (int i = 0; i < dirCount; i++)
+                {
+                    try
+                    {
+                        dynamic dir = _scapi.ModelDirectories.Item(i);
+                        dynamic dirPb = dir.PropertyBag();
+                        int pbCount = dirPb.Count;
+                        Log($"[MONITOR]   Dir[{i}]: {pbCount} properties");
+                        for (int j = 0; j < pbCount; j++)
+                        {
+                            try
+                            {
+                                string pn = dirPb.Name(j)?.ToString() ?? "";
+                                string pv = dirPb.Value(pn)?.ToString() ?? "";
+                                Log($"[MONITOR]     {pn}: {pv}");
+                            }
+                            catch { }
+                        }
+                    }
+                    catch { }
+                }
+            }
+            catch (Exception ex) { Log($"[MONITOR] ModelDirectories error: {ex.Message}"); }
+
+            // Log Sessions state
+            try
+            {
+                int sessCount = _scapi.Sessions.Count;
+                Log($"[MONITOR] Sessions count: {sessCount}");
+            }
+            catch { }
 
             Log($"[MONITOR] Started. Tracking {_monitoredProcessIds.Count} processes, {_monitoredWindowTitles.Count} windows, {puCount} PU(s)");
             Log("[MONITOR] Now perform the action in erwin and watch the log...");
@@ -3058,6 +3179,33 @@ namespace EliteSoft.Erwin.AddIn
                             catch { }
                         }
                         _lastMonitoredPUCount = currentPUCount;
+
+                        // Log Sessions + ModelDirectories when PU changes
+                        try { Log($"[MONITOR] Sessions: {_scapi.Sessions.Count}"); } catch { }
+                        try { Log($"[MONITOR] ModelDirectories: {_scapi.ModelDirectories.Count}"); } catch { }
+
+                        // Log SCAPI app-level state
+                        try { Log($"[MONITOR] SCAPI.Version: {_scapi.Version}"); } catch { }
+                        try { Log($"[MONITOR] SCAPI.Name: {_scapi.Name}"); } catch { }
+
+                        // Try to read ApplicationEnvironment state
+                        try
+                        {
+                            dynamic appEnv = _scapi.ApplicationEnvironment();
+                            dynamic envPb = appEnv.PropertyBag("Application.Persistence.Mart");
+                            int envCount = envPb.Count;
+                            for (int ei = 0; ei < envCount; ei++)
+                            {
+                                try
+                                {
+                                    string en = envPb.Name(ei)?.ToString() ?? "";
+                                    string ev = envPb.Value(en)?.ToString() ?? "";
+                                    Log($"[MONITOR] Mart.{en}: {ev}");
+                                }
+                                catch { }
+                            }
+                        }
+                        catch { }
                     }
 
                 }
