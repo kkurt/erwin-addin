@@ -58,6 +58,16 @@ $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
     exit 1
 }
 
+# Build and publish DdlHelper tool
+$ddlHelperProject = Join-Path $scriptDir "tools\DdlHelper\DdlHelper.csproj"
+if (Test-Path $ddlHelperProject) {
+    Write-Host "  Publishing DdlHelper..." -ForegroundColor Gray
+    $ddlHelperOutput = Join-Path $publishDir "tools\DdlHelper"
+    dotnet publish $ddlHelperProject -c Release -r win-x64 --self-contained false -o $ddlHelperOutput 2>&1 | Out-Null
+    if ($?) { Write-Host "  DdlHelper published!" -ForegroundColor Green }
+    else { Write-Host "  DdlHelper publish failed (non-critical)" -ForegroundColor Yellow }
+}
+
 $fileCount = (Get-ChildItem -Path $publishDir -Recurse -File).Count
 Write-Host "  Published $fileCount files" -ForegroundColor Green
 
