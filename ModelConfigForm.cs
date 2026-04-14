@@ -2805,7 +2805,7 @@ namespace EliteSoft.Erwin.AddIn
                 cmbLeftModel.SelectedIndex = 0;
 
                 // Right model: list versions from Mart DB
-                var versions = DdlGenerationService.GetMartVersions(modelName, (Action<string>)Log);
+                var versions = DdlGenerationService.GetMartVersions(modelName, (object)_currentModel, (Action<string>)Log);
 
                 if (versions.Count > 0)
                 {

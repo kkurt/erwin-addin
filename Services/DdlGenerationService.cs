@@ -682,30 +682,14 @@ WScript.Quit 0
             }
         }
 
+        /// <summary>
+        /// Get Mart Server connection info from CONNECTION_DEF ID=4.
+        /// No Portal DB dependency - reads from MetaRepo only.
+        /// </summary>
         private static (string host, string port, string username, string password)? GetMartConnectionInfo(Action<string> log)
         {
             try
             {
-                string connStr = GetMartConnectionString(log);
-                if (string.IsNullOrEmpty(connStr)) return null;
-
-                // Parse connection string to extract host, port, user, password
-                var parts = connStr.Split(';');
-                string host = "", port = "", user = "", pass = "";
-
-                foreach (var part in parts)
-                {
-                    var kv = part.Split(new[] { '=' }, 2);
-                    if (kv.Length < 2) continue;
-                    string key = kv[0].Trim().ToLower();
-                    string val = kv[1].Trim();
-
-                    if (key == "server") { var hp = val.Split(','); host = hp[0]; port = hp.Length > 1 ? hp[1] : ""; }
-                    else if (key == "user id") user = val;
-                    else if (key == "password") pass = val;
-                }
-
-                // We need Mart Server port (not SQL port). Read from CONNECTION_DEF directly.
                 if (!DatabaseService.Instance.IsConfigured) return null;
 
                 var config = new RegistryBootstrapService().GetConfig();
@@ -714,7 +698,7 @@ WScript.Quit 0
                 using (var conn = DatabaseService.Instance.CreateConnection())
                 {
                     conn.Open();
-                    // CONNECTION_DEF ID=4 = Mart Server connection (not DB, not Portal)
+                    // CONNECTION_DEF ID=4 = Mart Server connection
                     string query = config.DbType?.ToUpper() switch
                     {
                         "POSTGRESQL" => @"SELECT ""HOST"", ""PORT"", ""USERNAME"", ""PASSWORD"" FROM ""CONNECTION_DEF"" WHERE ""ID"" = 4",
@@ -726,13 +710,13 @@ WScript.Quit 0
                     {
                         if (reader.Read())
                         {
-                            host = reader["HOST"]?.ToString()?.Trim() ?? "";
-                            port = reader["PORT"]?.ToString()?.Trim() ?? "";
+                            string host = reader["HOST"]?.ToString()?.Trim() ?? "";
+                            string port = reader["PORT"]?.ToString()?.Trim() ?? "";
                             string encUser = reader["USERNAME"]?.ToString()?.Trim() ?? "";
                             string encPass = reader["PASSWORD"]?.ToString()?.Trim() ?? "";
 
-                            user = PasswordEncryptionService.Decrypt(encUser);
-                            pass = PasswordEncryptionService.Decrypt(encPass);
+                            string user = PasswordEncryptionService.Decrypt(encUser);
+                            string pass = PasswordEncryptionService.Decrypt(encPass);
 
                             if (string.IsNullOrEmpty(user) || (user.Length > 50 && user == encUser))
                             {
@@ -1063,78 +1047,28 @@ WScript.Quit 0
         /// Get list of model versions from Mart DB (m9Catalog).
         /// Returns list of (version number, version name) tuples.
         /// </summary>
-        public static List<(int Version, string Name, int CatalogId)> GetMartVersions(string modelName, Action<string> log)
+        /// <summary>
+        /// Get version list from PU locator (no Portal DB needed).
+        /// Current PU locator contains version=N, so we list 1..N.
+        /// </summary>
+        public static List<(int Version, string Name, int CatalogId)> GetMartVersions(string modelName, dynamic currentPU, Action<string> log)
         {
             var versions = new List<(int Version, string Name, int CatalogId)>();
 
             try
             {
-                // Get Mart DB connection string from CONNECTION_DEF
-                string martConnStr = GetMartConnectionString(log);
-                if (string.IsNullOrEmpty(martConnStr)) return versions;
+                string locator = "";
+                try { locator = currentPU.PropertyBag().Value("Locator")?.ToString() ?? ""; } catch { }
 
-                using (var conn = DatabaseService.Instance.CreateConnection("MSSQL", martConnStr))
+                int currentVer = ParseVersionFromLocator(locator);
+                log?.Invoke($"DDL: Current version from locator = v{currentVer}");
+
+                if (currentVer > 0)
                 {
-                    conn.Open();
-
-                    // Step 1: Find the main model entry (Type='D' = directory/model group)
-                    string mainQuery = @"
-                        SELECT TOP 1 C_Id
-                        FROM m9Catalog
-                        WHERE C_Name = @ModelName AND C_Type = 'D'
-                        ORDER BY C_Id DESC";
-
-                    int mainId = 0;
-                    using (var cmd = conn.CreateCommand())
+                    for (int v = 1; v <= currentVer; v++)
                     {
-                        cmd.CommandText = mainQuery;
-                        var p = cmd.CreateParameter();
-                        p.ParameterName = "@ModelName";
-                        p.Value = modelName;
-                        cmd.Parameters.Add(p);
-                        var result = cmd.ExecuteScalar();
-                        if (result != null) mainId = Convert.ToInt32(result);
+                        versions.Add((v, $"Version {v}", 0));
                     }
-
-                    if (mainId == 0)
-                    {
-                        log?.Invoke($"DDL: Model '{modelName}' not found in m9Catalog (Type='D')");
-                        return versions;
-                    }
-                    log?.Invoke($"DDL: Model directory C_Id={mainId}");
-
-                    // Step 2: Find all versions (Type='V') under this model using C_Container_Id
-                    string versionQuery = @"
-                        SELECT C_Id, C_Name, C_Version
-                        FROM m9Catalog
-                        WHERE C_Container_Id = @MainId AND C_Type = 'V'
-                        ORDER BY C_Version ASC";
-
-                    using (var cmd = conn.CreateCommand())
-                    {
-                        cmd.CommandText = versionQuery;
-                        var p = cmd.CreateParameter();
-                        p.ParameterName = "@MainId";
-                        p.Value = mainId;
-                        cmd.Parameters.Add(p);
-
-                        using (var reader = cmd.ExecuteReader())
-                        {
-                            while (reader.Read())
-                            {
-                                int cId = Convert.ToInt32(reader["C_Id"]);
-                                string name = reader["C_Name"]?.ToString()?.Trim() ?? "";
-                                int ver = 0;
-                                try { ver = Convert.ToInt32(reader["C_Version"]); } catch { }
-
-                                if (ver == 0) ver = versions.Count + 1;
-                                versions.Add((ver, name, cId));
-                                log?.Invoke($"DDL:   v{ver}: C_Id={cId}, Name='{name}'");
-                            }
-                        }
-                    }
-
-                    log?.Invoke($"DDL: Found {versions.Count} version(s) for '{modelName}'");
                 }
             }
             catch (Exception ex)
@@ -1142,65 +1076,8 @@ WScript.Quit 0
                 log?.Invoke($"DDL: GetMartVersions error: {ex.Message}");
             }
 
+            log?.Invoke($"DDL: Found {versions.Count} version(s) for '{modelName}'");
             return versions;
-        }
-
-        private static string GetMartConnectionString(Action<string> log)
-        {
-            try
-            {
-                if (!DatabaseService.Instance.IsConfigured) return null;
-
-                var config = new RegistryBootstrapService().GetConfig();
-                if (config == null) return null;
-
-                string repoDbType = config.DbType;
-
-                using (var conn = DatabaseService.Instance.CreateConnection())
-                {
-                    conn.Open();
-
-                    string query = repoDbType?.ToUpper() switch
-                    {
-                        "POSTGRESQL" => @"SELECT ""ID"", ""DB_TYPE"", ""HOST"", ""PORT"", ""DB_SCHEMA"", ""USERNAME"", ""PASSWORD""
-                                         FROM ""CONNECTION_DEF"" WHERE ""DB_SCHEMA"" LIKE '%Portal%'
-                                         ORDER BY ""ID"" LIMIT 1",
-                        _ => @"SELECT TOP 1 [ID], [DB_TYPE], [HOST], [PORT], [DB_SCHEMA], [USERNAME], [PASSWORD]
-                               FROM [dbo].[CONNECTION_DEF] WHERE [DB_SCHEMA] LIKE '%Portal%'
-                               ORDER BY [ID]"
-                    };
-
-                    using (var cmd = DatabaseService.Instance.CreateCommand(query, conn))
-                    using (var reader = cmd.ExecuteReader())
-                    {
-                        if (reader.Read())
-                        {
-                            string host = reader["HOST"]?.ToString()?.Trim() ?? "";
-                            string port = reader["PORT"]?.ToString()?.Trim() ?? "";
-                            string schema = reader["DB_SCHEMA"]?.ToString()?.Trim() ?? "";
-                            string encUser = reader["USERNAME"]?.ToString()?.Trim() ?? "";
-                            string encPass = reader["PASSWORD"]?.ToString()?.Trim() ?? "";
-
-                            string username = PasswordEncryptionService.Decrypt(encUser);
-                            string password = PasswordEncryptionService.Decrypt(encPass);
-
-                            if (string.IsNullOrEmpty(username) || (username.Length > 50 && username == encUser))
-                            {
-                                username = config.Username;
-                                password = config.Password;
-                            }
-
-                            return $"Server={host},{port};Database={schema};User Id={username};Password={password};TrustServerCertificate=True;Connection Timeout=10;";
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                log?.Invoke($"DDL: GetMartConnectionString error: {ex.Message}");
-            }
-
-            return null;
         }
 
         #endregion
