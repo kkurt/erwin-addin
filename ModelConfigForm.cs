@@ -2643,11 +2643,25 @@ namespace EliteSoft.Erwin.AddIn
                     inSelectedBlock = selected.Contains(key);
                     if (!inSelectedBlock)
                     {
-                        // Check parent: CONSTRAINT:Members.XPK -> check TABLE:Members
+                        // Check parent: CONSTRAINT:Members.XPKMembers -> TABLE:Members
+                        // Extract table name from key (TYPE:TableName or TYPE:TableName.SubName)
+                        string keyTable = "";
+                        if (key.Contains(":"))
+                        {
+                            string afterColon = key.Split(':')[1];
+                            keyTable = afterColon.Contains(".") ? afterColon.Split('.')[0] : afterColon;
+                        }
+
                         foreach (var sel in selected)
                         {
-                            string selName = sel.Contains(":") ? sel.Split(':')[1] : sel;
-                            if (key.Contains(selName)) { inSelectedBlock = true; break; }
+                            string selTable = sel.Contains(":") ? sel.Split(':')[1] : sel;
+                            // Exact table name match (not substring)
+                            if (!string.IsNullOrEmpty(keyTable) &&
+                                keyTable.Equals(selTable, StringComparison.OrdinalIgnoreCase))
+                            {
+                                inSelectedBlock = true;
+                                break;
+                            }
                         }
                     }
                 }
