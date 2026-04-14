@@ -2548,34 +2548,65 @@ namespace EliteSoft.Erwin.AddIn
             clbObjects.Items.Clear();
             _fullDiffResult = diff;
 
-            if (string.IsNullOrEmpty(diff)) return;
+            // Get ALL model objects from SCAPI (not just changed ones)
+            var allObjects = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
 
-            // Extract object names from diff markers (-- NEW:, -- DROPPED:, -- CHANGED:)
-            var objects = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var line in diff.Split('\n'))
+            if (_session != null)
             {
-                string trimmed = line.Trim();
-                if (trimmed.StartsWith("-- NEW:") || trimmed.StartsWith("-- DROPPED:") || trimmed.StartsWith("-- CHANGED:"))
+                try
                 {
-                    // Extract key: "-- NEW: TABLE:E_13" -> "TABLE:E_13"
-                    int colonIdx = trimmed.IndexOf(':', 3);
-                    if (colonIdx > 0)
-                    {
-                        string key = trimmed.Substring(colonIdx + 1).Trim();
-                        // Get the primary object name (TABLE:X, VIEW:X, TRIGGER:X)
-                        // For CONSTRAINT:Table.Constraint -> extract Table
-                        string primaryObj = key;
-                        if (key.Contains("."))
-                            primaryObj = key.Split(':')[0] + ":" + key.Split('.')[0].Split(':').Last();
+                    dynamic modelObjects = _session.ModelObjects;
+                    dynamic root = modelObjects.Root;
 
-                        objects.Add(key);
+                    // Collect entities (tables)
+                    try
+                    {
+                        dynamic entities = modelObjects.Collect(root, "Entity");
+                        if (entities != null)
+                        {
+                            foreach (dynamic e in entities)
+                            {
+                                try
+                                {
+                                    string physName = "";
+                                    try { physName = e.Properties("Physical_Name").Value?.ToString() ?? ""; } catch { }
+                                    if (string.IsNullOrEmpty(physName)) physName = e.Name ?? "";
+                                    if (!string.IsNullOrEmpty(physName))
+                                        allObjects.Add(physName);
+                                }
+                                catch { }
+                            }
+                        }
                     }
+                    catch { }
+
+                    // Collect views
+                    try
+                    {
+                        dynamic views = modelObjects.Collect(root, "View");
+                        if (views != null)
+                        {
+                            foreach (dynamic v in views)
+                            {
+                                try
+                                {
+                                    string name = v.Name ?? "";
+                                    if (!string.IsNullOrEmpty(name))
+                                        allObjects.Add(name);
+                                }
+                                catch { }
+                            }
+                        }
+                    }
+                    catch { }
                 }
+                catch { }
             }
 
-            foreach (var obj in objects.OrderBy(o => o))
+            // Add all objects to CheckedListBox (all checked = show all)
+            foreach (var obj in allObjects)
             {
-                clbObjects.Items.Add(obj, true); // All checked by default
+                clbObjects.Items.Add(obj, true);
             }
         }
 
@@ -2639,30 +2670,27 @@ namespace EliteSoft.Erwin.AddIn
                     int colonIdx = trimmed.IndexOf(':', 3);
                     string key = colonIdx > 0 ? trimmed.Substring(colonIdx + 1).Trim() : "";
 
-                    // Check if this key or its parent table is selected
-                    inSelectedBlock = selected.Contains(key);
-                    if (!inSelectedBlock)
+                    // Extract table/object name from key
+                    // TABLE:Members -> Members
+                    // CONSTRAINT:Members.XPKMembers -> Members
+                    // TRIGGER:tD_Members -> Members (after tD_ prefix)
+                    string objName = "";
+                    if (key.Contains(":"))
                     {
-                        // Check parent: CONSTRAINT:Members.XPKMembers -> TABLE:Members
-                        // Extract table name from key (TYPE:TableName or TYPE:TableName.SubName)
-                        string keyTable = "";
-                        if (key.Contains(":"))
-                        {
-                            string afterColon = key.Split(':')[1];
-                            keyTable = afterColon.Contains(".") ? afterColon.Split('.')[0] : afterColon;
-                        }
+                        string afterColon = key.Split(':')[1];
+                        objName = afterColon.Contains(".") ? afterColon.Split('.')[0] : afterColon;
+                    }
 
-                        foreach (var sel in selected)
-                        {
-                            string selTable = sel.Contains(":") ? sel.Split(':')[1] : sel;
-                            // Exact table name match (not substring)
-                            if (!string.IsNullOrEmpty(keyTable) &&
-                                keyTable.Equals(selTable, StringComparison.OrdinalIgnoreCase))
-                            {
-                                inSelectedBlock = true;
-                                break;
-                            }
-                        }
+                    // Check if this object's table is in selected list
+                    inSelectedBlock = selected.Contains(objName);
+
+                    // Also check for trigger naming: tD_TableName, tU_TableName
+                    if (!inSelectedBlock && !string.IsNullOrEmpty(objName))
+                    {
+                        string triggerTable = objName;
+                        if (triggerTable.StartsWith("tD_") || triggerTable.StartsWith("tU_") || triggerTable.StartsWith("tI_"))
+                            triggerTable = triggerTable.Substring(3);
+                        inSelectedBlock = selected.Contains(triggerTable);
                     }
                 }
 
