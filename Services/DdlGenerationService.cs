@@ -116,7 +116,9 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
 
                 log?.Invoke($"DDL: Files differ ({Math.Abs(currentDdl.Length - _baselineDdl.Length)} chars difference). Computing diff...");
-                return ComputeDDLDiff(currentDdl, _baselineDdl, log);
+                string modelName = currentPU.Name?.ToString() ?? "Model";
+                return ComputeDDLDiff(currentDdl, _baselineDdl, log,
+                    $"{modelName} (current)", $"{modelName} (connect-time baseline)");
             }
             catch (Exception ex)
             {
@@ -841,8 +843,10 @@ WScript.Quit 0
                 {
                     log?.Invoke($"DDL: v{selectedVer} DDL = {versionDdl.Length} chars");
                     if (currentDdl == versionDdl)
-                        return $"-- No differences between current and v{selectedVer}.";
-                    return ComputeDDLDiff(currentDdl, versionDdl, log);
+                        return $"-- No differences between v{currentVer} and v{selectedVer}.";
+                    string mName = currentPU.Name?.ToString() ?? "Model";
+                    return ComputeDDLDiff(currentDdl, versionDdl, log,
+                        $"{mName} v{currentVer} (current)", $"{mName} v{selectedVer} (Mart)");
                 }
 
                 log?.Invoke("DDL: Could not get version DDL.");
@@ -900,20 +904,24 @@ WScript.Quit 0
 
         #region DDL Diff
 
-        private static string ComputeDDLDiff(string leftDdl, string rightDdl, Action<string> log)
+        private static string ComputeDDLDiff(string leftDdl, string rightDdl, Action<string> log,
+            string leftLabel = null, string rightLabel = null)
         {
             var leftStatements = ParseStatements(leftDdl);
             var rightStatements = ParseStatements(rightDdl);
 
-            log?.Invoke($"DDL: Left (current) has {leftStatements.Count} statements, Right (baseline) has {rightStatements.Count} statements");
+            string lbl = leftLabel ?? "Current";
+            string rbl = rightLabel ?? "Baseline";
+
+            log?.Invoke($"DDL: {lbl} has {leftStatements.Count} statements, {rbl} has {rightStatements.Count} statements");
 
             var leftByKey = BuildStatementMap(leftStatements);
             var rightByKey = BuildStatementMap(rightStatements);
 
             var result = new System.Text.StringBuilder();
-            result.AppendLine("-- DDL Diff: Current Model vs Mart Baseline");
+            result.AppendLine($"-- DDL Diff: {lbl} vs {rbl}");
             result.AppendLine($"-- Generated: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
-            result.AppendLine($"-- Current: {leftStatements.Count} statements, Baseline: {rightStatements.Count} statements");
+            result.AppendLine($"-- {lbl}: {leftStatements.Count} statements, {rbl}: {rightStatements.Count} statements");
 
             int addedCount = 0, droppedCount = 0, changedCount = 0;
 
