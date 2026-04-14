@@ -716,11 +716,31 @@ namespace EliteSoft.Erwin.AddIn
             this.lblDDLStatus.ForeColor = clrTextSecondary;
             this.tabApproval.Controls.Add(this.lblDDLStatus);
 
+            // Object filter checkbox + list
+            this.chkFilterObjects = new System.Windows.Forms.CheckBox();
+            this.chkFilterObjects.Location = new System.Drawing.Point(15, 105);
+            this.chkFilterObjects.Size = new System.Drawing.Size(170, 20);
+            this.chkFilterObjects.Text = "Only selected objects";
+            this.chkFilterObjects.Font = fontCaption;
+            this.chkFilterObjects.CheckedChanged += (s, ev) => ApplyObjectFilter();
+            this.tabApproval.Controls.Add(this.chkFilterObjects);
+
+            this.clbObjects = new System.Windows.Forms.CheckedListBox();
+            this.clbObjects.Location = new System.Drawing.Point(190, 103);
+            this.clbObjects.Size = new System.Drawing.Size(645, 22);
+            this.clbObjects.Font = fontCaption;
+            this.clbObjects.CheckOnClick = true;
+            this.clbObjects.MultiColumn = true;
+            this.clbObjects.ColumnWidth = 160;
+            this.clbObjects.Visible = false;
+            this.clbObjects.ItemCheck += (s, ev) => BeginInvoke(new System.Action(ApplyObjectFilter));
+            this.tabApproval.Controls.Add(this.clbObjects);
+
             // DDL output RichTextBox (read-only, monospace, SQL highlighting)
             this.rtbDDLOutput = new System.Windows.Forms.RichTextBox();
             this.rtbDDLOutput.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right | System.Windows.Forms.AnchorStyles.Bottom;
-            this.rtbDDLOutput.Location = new System.Drawing.Point(15, 108);
-            this.rtbDDLOutput.Size = new System.Drawing.Size(830, 335);
+            this.rtbDDLOutput.Location = new System.Drawing.Point(15, 128);
+            this.rtbDDLOutput.Size = new System.Drawing.Size(830, 315);
             this.rtbDDLOutput.ReadOnly = true;
             this.rtbDDLOutput.WordWrap = false;
             this.rtbDDLOutput.Font = new System.Drawing.Font("Consolas", 9.5f);
@@ -922,6 +942,8 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.Button btnCopyDDL;
         private System.Windows.Forms.Button btnSaveDDL;
         private System.Windows.Forms.Label lblDDLStatus;
+        private System.Windows.Forms.CheckBox chkFilterObjects;
+        private System.Windows.Forms.CheckedListBox clbObjects;
         private System.Windows.Forms.RichTextBox rtbDDLOutput;
         private System.Windows.Forms.TabPage tabDebug;
 

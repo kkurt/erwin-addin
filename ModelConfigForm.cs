@@ -2318,23 +2318,19 @@ namespace EliteSoft.Erwin.AddIn
                 return;
             }
 
-            // Check if content is HTML (from CompleteCompare) or SQL (from DDL diff)
+            string displayContent = content;
+
+            // Check if content is HTML (from CompleteCompare) - parse to text
             if (content.TrimStart().StartsWith("<html", StringComparison.OrdinalIgnoreCase))
-            {
-                // Parse CompleteCompare HTML output into readable text
-                string parsed = ParseCompleteCompareHtml(content);
-                ApplySqlHighlighting(parsed);
-                int lineCount = parsed.Split('\n').Length;
-                lblDDLStatus.Text = $"{label}: {lineCount} lines (CompleteCompare).";
-                lblDDLStatus.ForeColor = Color.DarkGreen;
-            }
-            else
-            {
-                ApplySqlHighlighting(content);
-                int lineCount = content.Split('\n').Length;
-                lblDDLStatus.Text = $"{label}: {lineCount} lines.";
-                lblDDLStatus.ForeColor = Color.DarkGreen;
-            }
+                displayContent = ParseCompleteCompareHtml(content);
+
+            // Populate object filter from diff results
+            PopulateObjectFilter(displayContent);
+
+            ApplySqlHighlighting(displayContent);
+            int lineCount = displayContent.Split('\n').Length;
+            lblDDLStatus.Text = $"{label}: {lineCount} lines.";
+            lblDDLStatus.ForeColor = Color.DarkGreen;
         }
 
         private string ParseCompleteCompareHtml(string html)
@@ -2542,6 +2538,128 @@ namespace EliteSoft.Erwin.AddIn
             {
                 // Simple timeout: stop after 120 ticks (60s at 500ms)
             }
+        }
+
+        private string _fullDiffResult; // Unfiltered diff for re-filtering
+
+        private void PopulateObjectFilter(string diff)
+        {
+            clbObjects.Items.Clear();
+            _fullDiffResult = diff;
+
+            if (string.IsNullOrEmpty(diff)) return;
+
+            // Extract object names from diff markers (-- NEW:, -- DROPPED:, -- CHANGED:)
+            var objects = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var line in diff.Split('\n'))
+            {
+                string trimmed = line.Trim();
+                if (trimmed.StartsWith("-- NEW:") || trimmed.StartsWith("-- DROPPED:") || trimmed.StartsWith("-- CHANGED:"))
+                {
+                    // Extract key: "-- NEW: TABLE:E_13" -> "TABLE:E_13"
+                    int colonIdx = trimmed.IndexOf(':', 3);
+                    if (colonIdx > 0)
+                    {
+                        string key = trimmed.Substring(colonIdx + 1).Trim();
+                        // Get the primary object name (TABLE:X, VIEW:X, TRIGGER:X)
+                        // For CONSTRAINT:Table.Constraint -> extract Table
+                        string primaryObj = key;
+                        if (key.Contains("."))
+                            primaryObj = key.Split(':')[0] + ":" + key.Split('.')[0].Split(':').Last();
+
+                        objects.Add(key);
+                    }
+                }
+            }
+
+            foreach (var obj in objects.OrderBy(o => o))
+            {
+                clbObjects.Items.Add(obj, true); // All checked by default
+            }
+        }
+
+        private void ApplyObjectFilter()
+        {
+            if (!chkFilterObjects.Checked)
+            {
+                clbObjects.Visible = false;
+                // Show full diff
+                if (!string.IsNullOrEmpty(_fullDiffResult))
+                    ApplySqlHighlighting(_fullDiffResult);
+                return;
+            }
+
+            clbObjects.Visible = true;
+
+            if (string.IsNullOrEmpty(_fullDiffResult)) return;
+
+            // Get selected objects
+            var selected = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < clbObjects.Items.Count; i++)
+            {
+                if (clbObjects.GetItemChecked(i))
+                    selected.Add(clbObjects.Items[i].ToString());
+            }
+
+            if (selected.Count == 0 || selected.Count == clbObjects.Items.Count)
+            {
+                ApplySqlHighlighting(_fullDiffResult);
+                return;
+            }
+
+            // Filter diff: keep header + only sections for selected objects
+            var sb = new System.Text.StringBuilder();
+            bool inSelectedBlock = false;
+            bool inHeader = true;
+
+            foreach (var line in _fullDiffResult.Split('\n'))
+            {
+                string trimmed = line.Trim();
+
+                // Keep header lines (start with --)
+                if (inHeader && trimmed.StartsWith("--") && !trimmed.StartsWith("-- NEW:") &&
+                    !trimmed.StartsWith("-- DROPPED:") && !trimmed.StartsWith("-- CHANGED:") &&
+                    !trimmed.StartsWith("-- ===="))
+                {
+                    sb.AppendLine(line.TrimEnd());
+                    continue;
+                }
+
+                if (trimmed.StartsWith("-- ===="))
+                {
+                    inHeader = false;
+                    sb.AppendLine(line.TrimEnd());
+                    continue;
+                }
+
+                // Check if this is a diff marker line
+                if (trimmed.StartsWith("-- NEW:") || trimmed.StartsWith("-- DROPPED:") || trimmed.StartsWith("-- CHANGED:"))
+                {
+                    int colonIdx = trimmed.IndexOf(':', 3);
+                    string key = colonIdx > 0 ? trimmed.Substring(colonIdx + 1).Trim() : "";
+
+                    // Check if this key or its parent table is selected
+                    inSelectedBlock = selected.Contains(key);
+                    if (!inSelectedBlock)
+                    {
+                        // Check parent: CONSTRAINT:Members.XPK -> check TABLE:Members
+                        foreach (var sel in selected)
+                        {
+                            string selName = sel.Contains(":") ? sel.Split(':')[1] : sel;
+                            if (key.Contains(selName)) { inSelectedBlock = true; break; }
+                        }
+                    }
+                }
+
+                if (inSelectedBlock)
+                    sb.AppendLine(line.TrimEnd());
+
+                // End of block at "go" line
+                if (trimmed.Equals("go", StringComparison.OrdinalIgnoreCase) && inSelectedBlock)
+                    inSelectedBlock = true; // keep going until next marker
+            }
+
+            ApplySqlHighlighting(sb.ToString());
         }
 
         private void BtnBrowseFEOption_Click(object sender, EventArgs e)
