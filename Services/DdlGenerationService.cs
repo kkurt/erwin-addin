@@ -134,6 +134,108 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// Try to open a Mart version directly via SCAPI with multiple locator/disposition combos.
         /// Admin project uses: PersistenceUnits.Add(martUrl, "OVM=Yes")
         /// </summary>
+        /// <summary>
+        /// Load version DDL via DdlHelper.exe (separate .NET process with own SCAPI instance).
+        /// </summary>
+        private static string LoadVersionViaDdlHelper(dynamic currentPU, int version, string feOptionXml, Action<string> log)
+        {
+            string outputFile = Path.Combine(TempDir, $"helper_v{version}.sql");
+
+            try
+            {
+                var martInfo = GetMartConnectionInfo(log);
+                if (martInfo == null) { log?.Invoke("DDL: No Mart connection info."); return null; }
+
+                string locator = "";
+                try { locator = currentPU.PropertyBag().Value("Locator")?.ToString() ?? ""; } catch { }
+                string modelPath = "";
+                var pathMatch = Regex.Match(locator, @"Mart://Mart/(.+?)(\?|$)");
+                if (pathMatch.Success) modelPath = pathMatch.Groups[1].Value;
+                else modelPath = currentPU.Name?.ToString() ?? "";
+
+                // Find DdlHelper.exe (search multiple locations)
+                string asmDir = Path.GetDirectoryName(typeof(DdlGenerationService).Assembly.Location) ?? "";
+                string helperExe = "";
+
+                string[] searchPaths = {
+                    Path.Combine(asmDir, "tools", "DdlHelper", "DdlHelper.exe"),
+                    Path.Combine(AppContext.BaseDirectory, "tools", "DdlHelper", "DdlHelper.exe"),
+                    Path.Combine(asmDir, "..", "tools", "DdlHelper", "DdlHelper.exe"),
+                };
+
+                foreach (var p in searchPaths)
+                {
+                    string full = Path.GetFullPath(p);
+                    if (File.Exists(full)) { helperExe = full; break; }
+                }
+
+                if (string.IsNullOrEmpty(helperExe))
+                {
+                    log?.Invoke($"DDL: DdlHelper.exe not found. Searched in: {asmDir}");
+                    return null;
+                }
+
+                CleanupFile(outputFile);
+
+                string args = $"--server={martInfo.Value.host} --port={martInfo.Value.port} " +
+                    $"--user={martInfo.Value.username} --pass={martInfo.Value.password} " +
+                    $"--model={modelPath} --version={version} --output=\"{outputFile}\"";
+
+                // FE Option XML is NOT passed to helper - it uses erwin defaults
+                // CC Option XML != FE Option XML (different formats, causes "not compatible" error)
+
+                log?.Invoke($"DDL: Running DdlHelper (separate process)...");
+                log?.Invoke($"DDL: {helperExe}");
+
+                var psi = new ProcessStartInfo
+                {
+                    FileName = helperExe,
+                    Arguments = args,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+
+                using (var proc = Process.Start(psi))
+                {
+                    string stdout = proc.StandardOutput.ReadToEnd();
+                    string stderr = proc.StandardError.ReadToEnd();
+                    proc.WaitForExit(120000);
+
+                    foreach (var line in (stdout ?? "").Split('\n'))
+                        if (!string.IsNullOrWhiteSpace(line))
+                            log?.Invoke($"DDL: [Helper] {line.Trim()}");
+                    if (!string.IsNullOrEmpty(stderr))
+                        log?.Invoke($"DDL: [Helper ERR] {stderr.Trim()}");
+
+                    if (proc.ExitCode != 0)
+                    {
+                        log?.Invoke($"DDL: DdlHelper exit code = {proc.ExitCode}");
+                        return null;
+                    }
+                }
+
+                if (File.Exists(outputFile))
+                {
+                    string ddl = File.ReadAllText(outputFile);
+                    log?.Invoke($"DDL: v{version} DDL via helper = {ddl.Length} chars");
+                    return ddl;
+                }
+
+                return null;
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"DDL: DdlHelper error: {ex.Message}");
+                return null;
+            }
+            finally
+            {
+                CleanupFile(outputFile);
+            }
+        }
+
         private static readonly string LogFile = Path.Combine(
             Path.GetTempPath(), "erwin-addin-ddl", "ddl_attempts.log");
 
@@ -722,7 +824,13 @@ WScript.Quit 0
                         }
                     }
 
-                    // Try opening from Mart directly (multiple formats/dispositions)
+                    // Try: DdlHelper external process (.NET, own SCAPI instance)
+                    if (string.IsNullOrEmpty(versionDdl))
+                    {
+                        versionDdl = LoadVersionViaDdlHelper(currentPU, selectedVer, optionArg, log);
+                    }
+
+                    // Fallback: Try SCAPI directly (usually fails with "Mart UI active")
                     if (string.IsNullOrEmpty(versionDdl))
                     {
                         versionDdl = TryOpenMartVersionDirectly(scapi, currentPU, selectedVer, optionArg, log);
