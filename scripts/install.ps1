@@ -159,11 +159,21 @@ if (-not (Test-Path $installDir)) {
     New-Item -ItemType Directory -Path $installDir -Force | Out-Null
 }
 
-$filesToCopy = Get-ChildItem -Path $SourceDir -Include "*.dll","*.tlb","*.pdb","*.config" -Recurse
+# Copy main files (dll, exe, pdb, config, json)
+$filesToCopy = Get-ChildItem -Path $SourceDir -Include "*.dll","*.exe","*.tlb","*.pdb","*.config","*.json" -File
 foreach ($file in $filesToCopy) {
     Copy-Item -Path $file.FullName -Destination $installDir -Force
 }
-Write-Host "  Copied $($filesToCopy.Count) files" -ForegroundColor Green
+Write-Host "  Copied $($filesToCopy.Count) main files" -ForegroundColor Green
+
+# Copy tools subdirectory (DdlHelper etc.)
+$toolsSource = Join-Path $SourceDir "tools"
+if (Test-Path $toolsSource) {
+    $toolsDest = Join-Path $installDir "tools"
+    Copy-Item -Path $toolsSource -Destination $toolsDest -Recurse -Force
+    $toolsCount = (Get-ChildItem -Path $toolsDest -Recurse -File).Count
+    Write-Host "  Copied $toolsCount tool files" -ForegroundColor Green
+}
 
 # Set read permissions for all users
 $acl = Get-Acl $installDir
