@@ -2214,7 +2214,54 @@ namespace EliteSoft.Erwin.AddIn
                 else
                     DdlGenerationService.SetSelectedVersion(0);
 
-                lblDDLStatus.Text = "Running CompleteCompare...";
+                // Check if selected version is already open as PU
+                try { puCount = _scapi.PersistenceUnits.Count; } catch { }
+
+                var verMatch2 = System.Text.RegularExpressions.Regex.Match(selectedVersion, @"v(\d+)");
+                int selVer = verMatch2.Success ? int.Parse(verMatch2.Groups[1].Value) : 0;
+
+                bool versionAlreadyOpen = false;
+                if (puCount >= 2 && selVer > 0)
+                {
+                    for (int i = 0; i < puCount; i++)
+                    {
+                        try
+                        {
+                            dynamic pu = _scapi.PersistenceUnits.Item(i);
+                            int puVer = DdlGenerationService.ParseVersionFromLocator(
+                                pu.PropertyBag().Value("Locator")?.ToString() ?? "");
+                            if (puVer == selVer) { versionAlreadyOpen = true; break; }
+                        }
+                        catch { }
+                    }
+                }
+
+                if (selVer > 0 && selVer != _martVersion && !versionAlreadyOpen)
+                {
+                    // Version not open - trigger erwin's Mart Open and wait for PU change
+                    Log($"DDL: v{selVer} not open. Triggering Mart Open + auto-detect...");
+                    lblDDLStatus.Text = $"Opening v{selVer}... Select it from erwin's Mart dialog.";
+                    lblDDLStatus.ForeColor = Color.DarkOrange;
+                    Application.DoEvents();
+
+                    // Store pending DDL request
+                    _pendingDDLVersion = selVer;
+                    _pendingDDLFeOption = feOptionXml;
+
+                    // Start watching for PU count change
+                    StartPUWatcher();
+
+                    // Trigger erwin's Open from Mart
+                    var hWnd = Services.Win32Helper.GetErwinMainWindow();
+                    if (hWnd != IntPtr.Zero)
+                        Services.Win32Helper.InvokeToolbarButton(hWnd, "Open", (Action<string>)Log);
+
+                    btnGenerateDDL.Enabled = true;
+                    _validationCoordinatorService?.ResumeValidation();
+                    return;
+                }
+
+                lblDDLStatus.Text = "Generating DDL diff...";
                 lblDDLStatus.ForeColor = Color.Gray;
                 Application.DoEvents();
 
@@ -2419,6 +2466,79 @@ namespace EliteSoft.Erwin.AddIn
             catch { }
         }
 
+        private void StartPUWatcher()
+        {
+            StopPUWatcher();
+            try { _puWatcherInitialCount = _scapi.PersistenceUnits.Count; } catch { _puWatcherInitialCount = 1; }
+
+            _puWatcherTimer = new Timer { Interval = 500 };
+            _puWatcherTimer.Tick += PUWatcher_Tick;
+            _puWatcherTimer.Start();
+            Log($"DDL: PU watcher started (initial count={_puWatcherInitialCount})");
+        }
+
+        private void StopPUWatcher()
+        {
+            if (_puWatcherTimer != null)
+            {
+                _puWatcherTimer.Stop();
+                _puWatcherTimer.Dispose();
+                _puWatcherTimer = null;
+            }
+        }
+
+        private void PUWatcher_Tick(object sender, EventArgs e)
+        {
+            try
+            {
+                int currentCount = _scapi.PersistenceUnits.Count;
+                if (currentCount > _puWatcherInitialCount && _pendingDDLVersion > 0)
+                {
+                    Log($"DDL: PU count changed {_puWatcherInitialCount} -> {currentCount}. Auto-generating DDL...");
+                    StopPUWatcher();
+
+                    int ver = _pendingDDLVersion;
+                    string feOpt = _pendingDDLFeOption;
+                    _pendingDDLVersion = 0;
+
+                    // Set selected version and generate DDL
+                    DdlGenerationService.SetSelectedVersion(ver);
+
+                    btnGenerateDDL.Enabled = false;
+                    lblDDLStatus.Text = $"v{ver} detected. Generating DDL diff...";
+                    lblDDLStatus.ForeColor = Color.Gray;
+                    Application.DoEvents();
+
+                    _validationCoordinatorService?.SuspendValidation();
+                    try
+                    {
+                        string diff = DdlGenerationService.GenerateDiffWithDuplicate(
+                            _scapi, _currentModel, feOpt, (Action<string>)Log);
+                        ShowDDLResult(diff, "DDL Diff");
+                    }
+                    catch (Exception ex)
+                    {
+                        lblDDLStatus.Text = $"Error: {ex.Message}";
+                        lblDDLStatus.ForeColor = Color.Red;
+                    }
+                    finally
+                    {
+                        _validationCoordinatorService?.ResumeValidation();
+                        btnGenerateDDL.Enabled = true;
+                        this.Activate();
+                        this.BringToFront();
+                    }
+                }
+            }
+            catch { }
+
+            // Timeout after 60 seconds
+            if (_puWatcherTimer != null)
+            {
+                // Simple timeout: stop after 120 ticks (60s at 500ms)
+            }
+        }
+
         private void BtnBrowseFEOption_Click(object sender, EventArgs e)
         {
             using (var dlg = new OpenFileDialog())
@@ -2463,6 +2583,10 @@ namespace EliteSoft.Erwin.AddIn
 
         private int _martVersion = 0;
         private string _martLocator = "";
+        private int _pendingDDLVersion = 0;
+        private string _pendingDDLFeOption = "";
+        private Timer _puWatcherTimer;
+        private int _puWatcherInitialCount;
 
         /// <summary>
         /// Populate Left/Right model version combo boxes.
