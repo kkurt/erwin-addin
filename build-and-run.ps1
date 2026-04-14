@@ -67,6 +67,15 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host "  Build successful!" -ForegroundColor Green
 
+# Build DdlHelper tool
+Write-Host "  Building DdlHelper..." -ForegroundColor Gray
+$ddlHelperDir = Join-Path $scriptDir "tools\DdlHelper"
+if (Test-Path $ddlHelperDir) {
+    dotnet publish "$ddlHelperDir\DdlHelper.csproj" -c Release -o (Join-Path $scriptDir "bin\Release\net10.0-windows\tools\DdlHelper") 2>&1 | Out-Null
+    if ($?) { Write-Host "  DdlHelper built!" -ForegroundColor Green }
+    else { Write-Host "  DdlHelper build failed (non-critical)" -ForegroundColor Yellow }
+}
+
 $buildOutputDir = Join-Path $scriptDir "bin\Release\net10.0-windows"
 if (-not (Test-Path (Join-Path $buildOutputDir "EliteSoft.Erwin.AddIn.dll"))) {
     Write-Host "DLL not found in build output!" -ForegroundColor Red

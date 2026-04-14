@@ -799,13 +799,24 @@ WScript.Quit 0
                                 {
                                     log?.Invoke($"DDL: v{selectedVer} already open as PU[{i}]. Generating DDL...");
                                     CleanupFile(versionDdlFile);
-                                    pu.FEModel_DDL(versionDdlFile, optionArg);
-                                    if (File.Exists(versionDdlFile))
-                                        versionDdl = File.ReadAllText(versionDdlFile);
+                                    try
+                                    {
+                                        bool feResult = pu.FEModel_DDL(versionDdlFile, optionArg);
+                                        log?.Invoke($"DDL: FEModel_DDL on PU[{i}] returned {feResult}");
+                                        if (feResult && File.Exists(versionDdlFile))
+                                        {
+                                            versionDdl = File.ReadAllText(versionDdlFile);
+                                            log?.Invoke($"DDL: v{selectedVer} DDL from PU = {versionDdl.Length} chars");
+                                        }
+                                    }
+                                    catch (Exception feEx)
+                                    {
+                                        log?.Invoke($"DDL: FEModel_DDL on PU[{i}] error: {feEx.Message}");
+                                    }
                                     break;
                                 }
                             }
-                            catch { }
+                            catch (Exception puEx) { log?.Invoke($"DDL: PU[{i}] access error: {puEx.Message}"); }
                         }
                     }
 
