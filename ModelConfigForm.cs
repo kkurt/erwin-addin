@@ -2202,7 +2202,19 @@ namespace EliteSoft.Erwin.AddIn
 
             try
             {
-                lblDDLStatus.Text = "Generating DDL diff (current vs Mart baseline)...";
+                int puCount = 0;
+                try { puCount = _scapi.PersistenceUnits.Count; } catch { }
+
+                string selectedVersion = cmbRightModel.SelectedItem?.ToString() ?? "";
+
+                // Parse version number from combo selection (e.g., "v3 (Version 3)" -> 3)
+                var verMatch = System.Text.RegularExpressions.Regex.Match(selectedVersion, @"v(\d+)");
+                if (verMatch.Success)
+                    DdlGenerationService.SetSelectedVersion(int.Parse(verMatch.Groups[1].Value));
+                else
+                    DdlGenerationService.SetSelectedVersion(0);
+
+                lblDDLStatus.Text = "Running CompleteCompare...";
                 lblDDLStatus.ForeColor = Color.Gray;
                 Application.DoEvents();
 
@@ -2245,20 +2257,94 @@ namespace EliteSoft.Erwin.AddIn
             catch { return false; }
         }
 
-        private void ShowDDLResult(string ddl, string label)
+        private void ShowDDLResult(string content, string label)
         {
-            if (!string.IsNullOrEmpty(ddl))
+            if (string.IsNullOrEmpty(content))
             {
-                ApplySqlHighlighting(ddl);
-                int lineCount = ddl.Split('\n').Length;
-                lblDDLStatus.Text = $"{label}: {lineCount} lines.";
+                lblDDLStatus.Text = "No output generated.";
+                lblDDLStatus.ForeColor = Color.OrangeRed;
+                return;
+            }
+
+            // Check if content is HTML (from CompleteCompare) or SQL (from DDL diff)
+            if (content.TrimStart().StartsWith("<html", StringComparison.OrdinalIgnoreCase))
+            {
+                // Parse CompleteCompare HTML output into readable text
+                string parsed = ParseCompleteCompareHtml(content);
+                ApplySqlHighlighting(parsed);
+                int lineCount = parsed.Split('\n').Length;
+                lblDDLStatus.Text = $"{label}: {lineCount} lines (CompleteCompare).";
                 lblDDLStatus.ForeColor = Color.DarkGreen;
             }
             else
             {
-                lblDDLStatus.Text = "No DDL output generated.";
-                lblDDLStatus.ForeColor = Color.OrangeRed;
+                ApplySqlHighlighting(content);
+                int lineCount = content.Split('\n').Length;
+                lblDDLStatus.Text = $"{label}: {lineCount} lines.";
+                lblDDLStatus.ForeColor = Color.DarkGreen;
             }
+        }
+
+        private string ParseCompleteCompareHtml(string html)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("-- CompleteCompare Results");
+            sb.AppendLine($"-- Generated: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+            sb.AppendLine();
+
+            // Parse HTML table rows
+            int pos = 0;
+            int diffCount = 0;
+
+            while (true)
+            {
+                int trStart = html.IndexOf("<tr>", pos, StringComparison.OrdinalIgnoreCase);
+                if (trStart < 0) break;
+                int trEnd = html.IndexOf("</tr>", trStart, StringComparison.OrdinalIgnoreCase);
+                if (trEnd < 0) break;
+
+                string trContent = html.Substring(trStart, trEnd - trStart + 5);
+                pos = trEnd + 5;
+
+                var cells = new List<string>();
+                int tdPos = 0;
+                while (true)
+                {
+                    int tdStart = trContent.IndexOf("<td", tdPos, StringComparison.OrdinalIgnoreCase);
+                    if (tdStart < 0) break;
+                    int tdContentStart = trContent.IndexOf(">", tdStart) + 1;
+                    int tdEnd = trContent.IndexOf("</td>", tdContentStart, StringComparison.OrdinalIgnoreCase);
+                    if (tdEnd < 0) break;
+                    string cellText = trContent.Substring(tdContentStart, tdEnd - tdContentStart)
+                        .Replace("&nbsp;", " ").Replace("&amp;", "&").Trim();
+                    cells.Add(cellText);
+                    tdPos = tdEnd + 5;
+                }
+
+                if (cells.Count < 3) continue;
+
+                string type = cells[0];
+                string leftVal = cells.Count > 1 ? cells[1] : "";
+                string status = cells.Count > 2 ? cells[2] : "";
+                string rightVal = cells.Count > 3 ? cells[3] : "";
+
+                if (status.Equals("Equal", StringComparison.OrdinalIgnoreCase)) continue;
+                if (string.IsNullOrEmpty(status) && string.IsNullOrEmpty(leftVal) && string.IsNullOrEmpty(rightVal)) continue;
+
+                string marker = "";
+                if (!string.IsNullOrEmpty(leftVal) && string.IsNullOrEmpty(rightVal))
+                    marker = "-- NEW: ";
+                else if (string.IsNullOrEmpty(leftVal) && !string.IsNullOrEmpty(rightVal))
+                    marker = "-- DROPPED: ";
+                else if (status.Contains("Not Equal"))
+                    marker = "-- CHANGED: ";
+
+                sb.AppendLine($"{marker}{type}: {leftVal} | {status} | {rightVal}");
+                diffCount++;
+            }
+
+            sb.Insert(sb.ToString().IndexOf('\n') + 1, $"-- {diffCount} difference(s) found\r\n");
+            return sb.ToString();
         }
 
         private void ApplySqlHighlighting(string sql)
@@ -2428,9 +2514,28 @@ namespace EliteSoft.Erwin.AddIn
                 cmbLeftModel.Items.Add($"Active Model (v{version})");
                 cmbLeftModel.SelectedIndex = 0;
 
-                // Right model: Mart baseline (last saved version)
-                cmbRightModel.Items.Add("Mart Baseline (last saved)");
-                cmbRightModel.SelectedIndex = 0;
+                // Right model: list versions from Mart DB
+                var versions = DdlGenerationService.GetMartVersions(modelName, (Action<string>)Log);
+
+                if (versions.Count > 0)
+                {
+                    foreach (var v in versions)
+                    {
+                        string label = $"v{v.Version}" + (!string.IsNullOrEmpty(v.Name) ? $" ({v.Name})" : "");
+                        cmbRightModel.Items.Add(label);
+                    }
+
+                    // Default: select the version before current
+                    if (versions.Count > 1)
+                        cmbRightModel.SelectedIndex = 0; // Most recent after current
+                    else
+                        cmbRightModel.SelectedIndex = 0;
+                }
+                else
+                {
+                    cmbRightModel.Items.Add("Mart Baseline (connect-time)");
+                    cmbRightModel.SelectedIndex = 0;
+                }
             }
             catch (Exception ex)
             {
@@ -2524,8 +2629,7 @@ namespace EliteSoft.Erwin.AddIn
                     "IsLocked", "LockedBy", "MartURI", "MartPath", "MartURL",
                     "Version", "VersionNumber", "VersionId", "VersionLabel",
                     "Status", "State", "ObjectId", "ClassName",
-                    "Save", "SaveAs", "Close", "Open",
-                    "Review", "CheckIn", "CheckOut", "Lock", "Unlock" };
+                    "IsLocked", "LockedBy", "MartURI" };
                 try
                 {
                     dynamic pu2 = _scapi.PersistenceUnits.Item(0);
@@ -2547,8 +2651,7 @@ namespace EliteSoft.Erwin.AddIn
                 // 7. Probe Session for script/review
                 Log("--- Session Script/Review methods ---");
                 string[] sessionProbes = { "Review", "Compare", "Merge",
-                    "ExecuteScript", "RunScript", "ModelDirectories",
-                    "Open", "Close", "Save", "SaveAs" };
+                    "ExecuteScript", "RunScript", "ModelDirectories" };
                 if (_session != null)
                 {
                     foreach (var name in sessionProbes)
@@ -2782,9 +2885,10 @@ namespace EliteSoft.Erwin.AddIn
                     _monitoredProcessIds.Remove(id);
                 }
 
-                // Monitor PU count changes
+                // Monitor SCAPI state changes
                 try
                 {
+                    // PU count + locator changes
                     int currentPUCount = _scapi.PersistenceUnits.Count;
                     if (currentPUCount != _lastMonitoredPUCount)
                     {
@@ -2797,12 +2901,41 @@ namespace EliteSoft.Erwin.AddIn
                                 string puName = pu.Name?.ToString() ?? "";
                                 string locator = "";
                                 try { locator = pu.PropertyBag().Value("Locator")?.ToString() ?? ""; } catch { }
-                                Log($"[MONITOR]   PU[{i}]: '{puName}' -> {locator}");
+
+                                // Log ALL PropertyBag values for deep analysis
+                                Log($"[MONITOR]   PU[{i}]: '{puName}'");
+                                Log($"[MONITOR]     Locator: {locator}");
+                                try
+                                {
+                                    dynamic pb = pu.PropertyBag();
+                                    int pbCount = pb.Count;
+                                    for (int j = 0; j < pbCount; j++)
+                                    {
+                                        try
+                                        {
+                                            string pName = pb.Name(j)?.ToString() ?? "";
+                                            string pVal = pb.Value(pName)?.ToString() ?? "";
+                                            if (pName != "Locator") // Already logged
+                                                Log($"[MONITOR]     {pName}: {pVal}");
+                                        }
+                                        catch { }
+                                    }
+                                }
+                                catch { }
+
+                                // Check session state
+                                try
+                                {
+                                    bool hasSession = pu.HasSession();
+                                    Log($"[MONITOR]     HasSession: {hasSession}");
+                                }
+                                catch { }
                             }
                             catch { }
                         }
                         _lastMonitoredPUCount = currentPUCount;
                     }
+
                 }
                 catch { }
             }
