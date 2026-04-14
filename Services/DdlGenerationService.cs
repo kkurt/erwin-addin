@@ -131,6 +131,137 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// Load a specific Mart version's DDL via a SEPARATE process (VBScript + cscript.exe).
+        /// Separate process = separate SCAPI instance = own Mart connection = no "UI active" error.
+        /// erwin's own FEModel_DDL generates the DDL.
+        /// </summary>
+        private static string LoadVersionDDLExternal(int version, dynamic currentPU, string feOptionXml, Action<string> log)
+        {
+            string outputFile = Path.Combine(TempDir, $"v{version}.sql");
+            string vbsFile = Path.Combine(TempDir, "load_version.vbs");
+
+            try
+            {
+                var martInfo = GetMartConnectionInfo(log);
+                if (martInfo == null) { log?.Invoke("DDL: No Mart connection info."); return null; }
+
+                string locator = "";
+                try { locator = currentPU.PropertyBag().Value("Locator")?.ToString() ?? ""; } catch { }
+
+                string modelPath = "";
+                var pathMatch = Regex.Match(locator, @"Mart://Mart/(.+?)(\?|$)");
+                if (pathMatch.Success) modelPath = pathMatch.Groups[1].Value;
+                else modelPath = currentPU.Name?.ToString() ?? "";
+
+                string martUrl = $"mart://Mart/{modelPath}?TRC=NO;SRV={martInfo.Value.host};PRT={martInfo.Value.port};ASR=MartServer;UID={martInfo.Value.username};PSW={martInfo.Value.password};VER={version}";
+
+                CleanupFile(outputFile);
+                CleanupFile(vbsFile);
+
+                string feArg = string.IsNullOrEmpty(feOptionXml) ? "\"\"" : $"\"{feOptionXml.Replace("\\", "\\\\")}\"";
+                string outputVbs = outputFile.Replace("\\", "\\\\");
+
+                string vbs = $@"
+On Error Resume Next
+
+WScript.Echo ""SCAPI: Creating instance...""
+Dim oApi
+Set oApi = CreateObject(""ERwin9.SCAPI.9.0"")
+If Err.Number <> 0 Then
+    WScript.Echo ""ERROR: SCAPI create failed: "" & Err.Number & "" "" & Err.Description
+    WScript.Quit 1
+End If
+WScript.Echo ""SCAPI: OK. Version="" & oApi.Version
+
+WScript.Echo ""MART: Connecting...""
+WScript.Echo ""URL: {martUrl.Replace("PSW=" + martInfo.Value.password, "PSW=***")}""
+
+Dim oPU
+Set oPU = oApi.PersistenceUnits.Add(""{martUrl}"", ""OVM=Yes"")
+If Err.Number <> 0 Then
+    WScript.Echo ""ERROR: PU.Add failed: "" & Err.Number & "" "" & Err.Description
+    WScript.Quit 2
+End If
+WScript.Echo ""MODEL: Opened "" & oPU.Name
+
+WScript.Echo ""DDL: Generating to {outputVbs}""
+Call oPU.FEModel_DDL(""{outputVbs}"", {feArg})
+If Err.Number <> 0 Then
+    WScript.Echo ""ERROR: FEModel_DDL failed: "" & Err.Number & "" "" & Err.Description
+    oApi.PersistenceUnits.Remove oPU, False
+    WScript.Quit 3
+End If
+
+WScript.Echo ""CLEANUP: Removing PU...""
+oApi.PersistenceUnits.Remove oPU, False
+WScript.Echo ""DONE""
+WScript.Quit 0
+";
+
+                File.WriteAllText(vbsFile, vbs);
+                log?.Invoke($"DDL: VBScript created. Mart={martInfo.Value.host}:{martInfo.Value.port}, Path={modelPath}");
+
+                // Log the mart URL (mask password) for debugging
+                string maskedUrl = Regex.Replace(martUrl, @"PSW=[^;]*", "PSW=***");
+                log?.Invoke($"DDL: Mart URL = {maskedUrl}");
+
+                // Use 64-bit cscript (erwin SCAPI is 64-bit)
+                string cscriptPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "cscript.exe");
+                if (!File.Exists(cscriptPath)) cscriptPath = "cscript.exe";
+
+                var psi = new ProcessStartInfo
+                {
+                    FileName = cscriptPath,
+                    Arguments = $"//NoLogo \"{vbsFile}\"",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+
+                log?.Invoke($"DDL: Running: {cscriptPath} //NoLogo \"{vbsFile}\"");
+
+                using (var proc = Process.Start(psi))
+                {
+                    string stdout = proc.StandardOutput.ReadToEnd();
+                    string stderr = proc.StandardError.ReadToEnd();
+                    proc.WaitForExit(120000);
+
+                    foreach (var line in (stdout ?? "").Split('\n'))
+                        if (!string.IsNullOrWhiteSpace(line))
+                            log?.Invoke($"DDL: [VBS] {line.Trim()}");
+                    if (!string.IsNullOrEmpty(stderr))
+                        log?.Invoke($"DDL: [VBS ERR] {stderr.Trim()}");
+
+                    if (proc.ExitCode != 0)
+                    {
+                        log?.Invoke($"DDL: VBScript exit code = {proc.ExitCode} (0x{((uint)proc.ExitCode):X8})");
+                        return null;
+                    }
+                }
+
+                if (File.Exists(outputFile))
+                {
+                    string ddl = File.ReadAllText(outputFile);
+                    log?.Invoke($"DDL: v{version} DDL loaded ({ddl.Length} chars, {ddl.Split('\n').Length} lines)");
+                    return ddl;
+                }
+
+                return null;
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"DDL: LoadVersionDDLExternal error: {ex.Message}");
+                return null;
+            }
+            finally
+            {
+                CleanupFile(vbsFile);
+                CleanupFile(outputFile);
+            }
+        }
+
+        /// <summary>
         /// Run erwin's CompleteCompare between two Mart versions using a SEPARATE process.
         /// Each process creates its own SCAPI instance with its own Mart connection,
         /// bypassing the "Mart user interface is active" restriction.
@@ -336,10 +467,11 @@ WScript.Quit 0
                 using (var conn = DatabaseService.Instance.CreateConnection())
                 {
                     conn.Open();
+                    // CONNECTION_DEF ID=4 = Mart Server connection (not DB, not Portal)
                     string query = config.DbType?.ToUpper() switch
                     {
-                        "POSTGRESQL" => @"SELECT ""HOST"", ""PORT"", ""USERNAME"", ""PASSWORD"" FROM ""CONNECTION_DEF"" WHERE ""DB_SCHEMA"" LIKE '%Portal%' ORDER BY ""ID"" LIMIT 1",
-                        _ => @"SELECT TOP 1 [HOST], [PORT], [USERNAME], [PASSWORD] FROM [dbo].[CONNECTION_DEF] WHERE [DB_SCHEMA] LIKE '%Portal%' ORDER BY [ID]"
+                        "POSTGRESQL" => @"SELECT ""HOST"", ""PORT"", ""USERNAME"", ""PASSWORD"" FROM ""CONNECTION_DEF"" WHERE ""ID"" = 4",
+                        _ => @"SELECT [HOST], [PORT], [USERNAME], [PASSWORD] FROM [dbo].[CONNECTION_DEF] WHERE [ID] = 4"
                     };
 
                     using (var cmd = DatabaseService.Instance.CreateCommand(query, conn))
@@ -393,8 +525,8 @@ WScript.Quit 0
         public static string GenerateDiffWithDuplicate(dynamic scapi, dynamic currentPU, string feOptionXml, Action<string> log)
         {
             Directory.CreateDirectory(TempDir);
-            string leftDdlFile = Path.Combine(TempDir, "left.sql");
-            string rightDdlFile = Path.Combine(TempDir, "right.sql");
+            string currentDdlFile = Path.Combine(TempDir, "current.sql");
+            string versionDdlFile = Path.Combine(TempDir, "version.sql");
             string optionArg = string.IsNullOrEmpty(feOptionXml) ? "" : feOptionXml;
 
             try
@@ -403,65 +535,68 @@ WScript.Quit 0
                 int currentVer = ParseVersionFromLocator(
                     currentPU.PropertyBag().Value("Locator")?.ToString() ?? "");
 
-                // PRIORITY 1: CompleteCompare via external process (erwin's own engine)
-                if (selectedVer > 0 && currentVer > 0 && selectedVer != currentVer)
+                log?.Invoke($"DDL: Current version = v{currentVer}, Selected version = v{selectedVer}");
+
+                // Step 1: Generate DDL for current model (in-process, safe)
+                CleanupFile(currentDdlFile);
+                log?.Invoke("DDL: Generating current model DDL (FEModel_DDL)...");
+                bool r1 = currentPU.FEModel_DDL(currentDdlFile, optionArg);
+                if (!r1 || !File.Exists(currentDdlFile))
                 {
-                    log?.Invoke($"DDL: Running CompleteCompare v{currentVer} vs v{selectedVer} via external process...");
+                    log?.Invoke("DDL: FEModel_DDL failed for current model.");
+                    return null;
+                }
+                string currentDdl = File.ReadAllText(currentDdlFile);
+                log?.Invoke($"DDL: Current DDL = {currentDdl.Length} chars, {currentDdl.Split('\n').Length} lines");
 
-                    string ccOutput = RunCompleteCompareViaExternalProcess(
-                        currentVer, selectedVer, currentPU, optionArg, log);
+                // Step 2: Get selected version's DDL
+                string versionDdl = null;
 
-                    if (!string.IsNullOrEmpty(ccOutput))
+                if (selectedVer > 0 && selectedVer != currentVer)
+                {
+                    // Try: version already open as PU?
+                    int puCount = scapi.PersistenceUnits.Count;
+                    if (puCount >= 2)
                     {
-                        _lastCCOutput = ccOutput;
-                        return ccOutput; // HTML content - parsed by UI
+                        for (int i = 0; i < puCount; i++)
+                        {
+                            try
+                            {
+                                dynamic pu = scapi.PersistenceUnits.Item(i);
+                                int puVer = ParseVersionFromLocator(pu.PropertyBag().Value("Locator")?.ToString() ?? "");
+                                if (puVer == selectedVer)
+                                {
+                                    log?.Invoke($"DDL: v{selectedVer} already open as PU[{i}]. Generating DDL...");
+                                    CleanupFile(versionDdlFile);
+                                    pu.FEModel_DDL(versionDdlFile, optionArg);
+                                    if (File.Exists(versionDdlFile))
+                                        versionDdl = File.ReadAllText(versionDdlFile);
+                                    break;
+                                }
+                            }
+                            catch { }
+                        }
                     }
 
-                    log?.Invoke("DDL: External CompleteCompare failed. Trying FEModel_DDL fallback...");
-                }
-
-                // PRIORITY 2: Two PUs open - FEModel_DDL diff
-                int puCount = scapi.PersistenceUnits.Count;
-                if (puCount >= 2)
-                {
-                    log?.Invoke($"DDL: Fallback - {puCount} PUs open, using FEModel_DDL diff.");
-                    dynamic pu0 = scapi.PersistenceUnits.Item(0);
-                    dynamic pu1 = scapi.PersistenceUnits.Item(1);
-
-                    int ver0 = ParseVersionFromLocator(pu0.PropertyBag().Value("Locator")?.ToString() ?? "");
-                    int ver1 = ParseVersionFromLocator(pu1.PropertyBag().Value("Locator")?.ToString() ?? "");
-
-                    dynamic leftPU = ver0 >= ver1 ? pu0 : pu1;
-                    dynamic rightPU = ver0 >= ver1 ? pu1 : pu0;
-
-                    CleanupFile(leftDdlFile);
-                    CleanupFile(rightDdlFile);
-                    leftPU.FEModel_DDL(leftDdlFile, optionArg);
-                    rightPU.FEModel_DDL(rightDdlFile, optionArg);
-
-                    if (File.Exists(leftDdlFile) && File.Exists(rightDdlFile))
+                    // Not open as PU: load via external process (VBScript)
+                    if (string.IsNullOrEmpty(versionDdl))
                     {
-                        string l = File.ReadAllText(leftDdlFile);
-                        string r = File.ReadAllText(rightDdlFile);
-                        return ComputeDDLDiff(l, r, log);
-                    }
-                }
-
-                // PRIORITY 3: Connect-time baseline
-                if (HasBaseline)
-                {
-                    CleanupFile(leftDdlFile);
-                    log?.Invoke("DDL: Using connect-time baseline diff.");
-                    currentPU.FEModel_DDL(leftDdlFile, optionArg);
-                    if (File.Exists(leftDdlFile))
-                    {
-                        string cur = File.ReadAllText(leftDdlFile);
-                        if (cur == _baselineDdl) return "-- No differences since connect.";
-                        return ComputeDDLDiff(cur, _baselineDdl, log);
+                        log?.Invoke($"DDL: Loading v{selectedVer} via external process...");
+                        versionDdl = LoadVersionDDLExternal(selectedVer, currentPU, optionArg, log);
                     }
                 }
 
-                return "-- Could not compare versions.";
+                // Step 3: Diff
+                if (!string.IsNullOrEmpty(versionDdl))
+                {
+                    log?.Invoke($"DDL: v{selectedVer} DDL = {versionDdl.Length} chars");
+                    if (currentDdl == versionDdl)
+                        return $"-- No differences between current and v{selectedVer}.";
+                    return ComputeDDLDiff(currentDdl, versionDdl, log);
+                }
+
+                log?.Invoke("DDL: Could not get version DDL.");
+                return "-- Could not load selected version. Check Debug Log for details.";
             }
             catch (Exception ex)
             {
@@ -470,8 +605,8 @@ WScript.Quit 0
             }
             finally
             {
-                CleanupFile(leftDdlFile);
-                CleanupFile(rightDdlFile);
+                CleanupFile(currentDdlFile);
+                CleanupFile(versionDdlFile);
             }
         }
 
