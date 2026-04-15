@@ -702,9 +702,26 @@ WScript.Quit 0
                     string dbType = config.DbType?.ToUpper() ?? "UNKNOWN";
                     log?.Invoke($"DDL: GetMartConnectionInfo dbType={dbType}");
 
+                    // Debug: list all CONNECTION_DEF entries
+                    try
+                    {
+                        string listQuery = dbType.Contains("POSTGRES")
+                            ? @"SELECT ""ID"", ""DB_TYPE"", ""HOST"", ""PORT"" FROM ""CONNECTION_DEF"" ORDER BY ""ID"""
+                            : @"SELECT ID, DB_TYPE, HOST, PORT FROM CONNECTION_DEF ORDER BY ID";
+                        using (var listCmd = DatabaseService.Instance.CreateCommand(listQuery, conn))
+                        using (var listReader = listCmd.ExecuteReader())
+                        {
+                            while (listReader.Read())
+                            {
+                                log?.Invoke($"DDL: CONNECTION_DEF ID={listReader["ID"]}, DB_TYPE='{listReader["DB_TYPE"]}', HOST='{listReader["HOST"]}', PORT='{listReader["PORT"]}'");
+                            }
+                        }
+                    }
+                    catch (Exception ex) { log?.Invoke($"DDL: CONNECTION_DEF list error: {ex.Message}"); }
+
                     string query = dbType.Contains("POSTGRES")
-                        ? @"SELECT ""HOST"", ""PORT"", ""USERNAME"", ""PASSWORD"" FROM ""CONNECTION_DEF"" WHERE ""DB_TYPE"" = 'MART' ORDER BY ""ID"" LIMIT 1"
-                        : @"SELECT TOP 1 HOST, PORT, USERNAME, PASSWORD FROM CONNECTION_DEF WHERE DB_TYPE = 'MART' ORDER BY ID";
+                        ? @"SELECT ""HOST"", ""PORT"", ""USERNAME"", ""PASSWORD"" FROM ""CONNECTION_DEF"" WHERE ""DB_TYPE"" = 'MART_API' ORDER BY ""ID"" LIMIT 1"
+                        : @"SELECT TOP 1 HOST, PORT, USERNAME, PASSWORD FROM CONNECTION_DEF WHERE DB_TYPE = 'MART_API' ORDER BY ID";
 
                     log?.Invoke($"DDL: Query = {query}");
                     using (var cmd = DatabaseService.Instance.CreateCommand(query, conn))
