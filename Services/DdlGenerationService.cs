@@ -702,10 +702,9 @@ WScript.Quit 0
                     string dbType = config.DbType?.ToUpper() ?? "UNKNOWN";
                     log?.Invoke($"DDL: GetMartConnectionInfo dbType={dbType}");
 
-                    // Find Mart Server connection by DB_TYPE = 'MART' or NAME containing 'Mart'
                     string query = dbType.Contains("POSTGRES")
-                        ? @"SELECT ""HOST"", ""PORT"", ""USERNAME"", ""PASSWORD"" FROM ""CONNECTION_DEF"" WHERE ""DB_TYPE"" = 'MART' OR UPPER(""DB_SCHEMA"") LIKE '%MART%' ORDER BY ""ID"" LIMIT 1"
-                        : @"SELECT TOP 1 HOST, PORT, USERNAME, PASSWORD FROM CONNECTION_DEF WHERE DB_TYPE = 'MART' OR UPPER(DB_SCHEMA) LIKE '%MART%' ORDER BY ID";
+                        ? @"SELECT ""HOST"", ""PORT"", ""USERNAME"", ""PASSWORD"" FROM ""CONNECTION_DEF"" WHERE ""DB_TYPE"" = 'MART' ORDER BY ""ID"" LIMIT 1"
+                        : @"SELECT TOP 1 HOST, PORT, USERNAME, PASSWORD FROM CONNECTION_DEF WHERE DB_TYPE = 'MART' ORDER BY ID";
 
                     log?.Invoke($"DDL: Query = {query}");
                     using (var cmd = DatabaseService.Instance.CreateCommand(query, conn))
