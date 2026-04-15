@@ -783,11 +783,11 @@ WScript.Quit 0
                 // Step 2: Get selected version's DDL
                 string versionDdl = null;
 
-                if (selectedVer > 0 && selectedVer != currentVer)
+                if (selectedVer > 0)
                 {
-                    // Try: version already open as PU?
+                    // Try: version already open as a DIFFERENT PU? (skip if same version = active model)
                     int puCount = scapi.PersistenceUnits.Count;
-                    if (puCount >= 2)
+                    if (puCount >= 2 && selectedVer != currentVer)
                     {
                         for (int i = 0; i < puCount; i++)
                         {
