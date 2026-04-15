@@ -726,12 +726,13 @@ namespace EliteSoft.Erwin.AddIn
             this.tabApproval.Controls.Add(this.chkFilterObjects);
 
             this.clbObjects = new System.Windows.Forms.CheckedListBox();
-            this.clbObjects.Location = new System.Drawing.Point(190, 103);
-            this.clbObjects.Size = new System.Drawing.Size(645, 22);
+            this.clbObjects.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
+            this.clbObjects.Location = new System.Drawing.Point(15, 125);
+            this.clbObjects.Size = new System.Drawing.Size(830, 80);
             this.clbObjects.Font = fontCaption;
             this.clbObjects.CheckOnClick = true;
             this.clbObjects.MultiColumn = true;
-            this.clbObjects.ColumnWidth = 160;
+            this.clbObjects.ColumnWidth = 200;
             this.clbObjects.Visible = false;
             this.clbObjects.ItemCheck += (s, ev) => BeginInvoke(new System.Action(ApplyObjectFilter));
             this.tabApproval.Controls.Add(this.clbObjects);

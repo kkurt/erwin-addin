@@ -2606,7 +2606,7 @@ namespace EliteSoft.Erwin.AddIn
             // Add all objects to CheckedListBox (all checked = show all)
             foreach (var obj in allObjects)
             {
-                clbObjects.Items.Add(obj, true);
+                clbObjects.Items.Add(obj, false); // Unchecked by default - user selects what to filter
             }
         }
 
@@ -2615,13 +2615,16 @@ namespace EliteSoft.Erwin.AddIn
             if (!chkFilterObjects.Checked)
             {
                 clbObjects.Visible = false;
-                // Show full diff
+                rtbDDLOutput.Location = new System.Drawing.Point(15, 128);
+                rtbDDLOutput.Height = this.tabControl.Height - 170;
                 if (!string.IsNullOrEmpty(_fullDiffResult))
                     ApplySqlHighlighting(_fullDiffResult);
                 return;
             }
 
             clbObjects.Visible = true;
+            rtbDDLOutput.Location = new System.Drawing.Point(15, 210);
+            rtbDDLOutput.Height = this.tabControl.Height - 250;
 
             if (string.IsNullOrEmpty(_fullDiffResult)) return;
 
@@ -2633,8 +2636,9 @@ namespace EliteSoft.Erwin.AddIn
                     selected.Add(clbObjects.Items[i].ToString());
             }
 
-            if (selected.Count == 0 || selected.Count == clbObjects.Items.Count)
+            if (selected.Count == 0)
             {
+                // Nothing selected = show all
                 ApplySqlHighlighting(_fullDiffResult);
                 return;
             }
