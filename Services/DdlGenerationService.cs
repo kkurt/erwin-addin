@@ -698,13 +698,16 @@ WScript.Quit 0
                 using (var conn = DatabaseService.Instance.CreateConnection())
                 {
                     conn.Open();
-                    // CONNECTION_DEF ID=4 = Mart Server connection
-                    string query = config.DbType?.ToUpper() switch
-                    {
-                        "POSTGRESQL" => @"SELECT ""HOST"", ""PORT"", ""USERNAME"", ""PASSWORD"" FROM ""CONNECTION_DEF"" WHERE ""ID"" = 4",
-                        _ => @"SELECT [HOST], [PORT], [USERNAME], [PASSWORD] FROM [dbo].[CONNECTION_DEF] WHERE [ID] = 4"
-                    };
 
+                    string dbType = config.DbType?.ToUpper() ?? "UNKNOWN";
+                    log?.Invoke($"DDL: GetMartConnectionInfo dbType={dbType}");
+
+                    // Find Mart Server connection by DB_TYPE = 'MART' or NAME containing 'Mart'
+                    string query = dbType.Contains("POSTGRES")
+                        ? @"SELECT ""HOST"", ""PORT"", ""USERNAME"", ""PASSWORD"" FROM ""CONNECTION_DEF"" WHERE ""DB_TYPE"" = 'MART' OR UPPER(""DB_SCHEMA"") LIKE '%MART%' ORDER BY ""ID"" LIMIT 1"
+                        : @"SELECT TOP 1 HOST, PORT, USERNAME, PASSWORD FROM CONNECTION_DEF WHERE DB_TYPE = 'MART' OR UPPER(DB_SCHEMA) LIKE '%MART%' ORDER BY ID";
+
+                    log?.Invoke($"DDL: Query = {query}");
                     using (var cmd = DatabaseService.Instance.CreateCommand(query, conn))
                     using (var reader = cmd.ExecuteReader())
                     {
@@ -712,6 +715,7 @@ WScript.Quit 0
                         {
                             string host = reader["HOST"]?.ToString()?.Trim() ?? "";
                             string port = reader["PORT"]?.ToString()?.Trim() ?? "";
+                            log?.Invoke($"DDL: Mart Server = {host}:{port}");
                             string encUser = reader["USERNAME"]?.ToString()?.Trim() ?? "";
                             string encPass = reader["PASSWORD"]?.ToString()?.Trim() ?? "";
 
@@ -845,7 +849,7 @@ WScript.Quit 0
                 }
 
                 log?.Invoke("DDL: Could not get version DDL.");
-                return null; // Return null to trigger PU watcher fallback
+                return "-- ERROR: Mart Server connection not found in CONNECTION_DEF.\n-- Please configure Mart Server connection in Admin panel (Connections section).\n-- DB_TYPE should be 'MART' or DB_SCHEMA should contain 'Mart'.";
             }
             catch (Exception ex)
             {
