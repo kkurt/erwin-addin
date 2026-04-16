@@ -237,6 +237,429 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
         }
 
+        /// <summary>
+        /// Generate DDL diff between current model and a live database.
+        /// Uses DdlHelper --action=redb for Reverse Engineering from DB.
+        /// </summary>
+        public static string GenerateDiffWithDatabase(
+            dynamic scapi, dynamic currentModel,
+            string dbConnectionString, string dbPassword,
+            string feOptionXml, string schemaFilter,
+            long targetServerCode, int targetServerVersion,
+            Action<string> log)
+        {
+            log?.Invoke("DDL: Starting Model vs DB diff...");
+
+            try
+            {
+                dynamic currentPU = scapi.PersistenceUnits.Item(0);
+                string modelName = currentPU.Name?.ToString() ?? "Model";
+
+                // Log model info
+                string modelTS = "";
+                try { modelTS = currentPU.PropertyBag().Value("Target_Server")?.ToString() ?? ""; } catch { }
+                string modelType = "";
+                try { modelType = currentPU.PropertyBag().Value("Model_Type")?.ToString() ?? ""; } catch { }
+                log?.Invoke($"DDL: Model='{modelName}', Target_Server={modelTS}, Model_Type={modelType}");
+
+                // FEModel_DB compares model vs DB, then FEModel_DDL generates ALTER script
+                log?.Invoke($"DDL: Comparing '{modelName}' vs database...");
+                string alterScript = ForwardEngineerViaHelper(
+                    currentPU, dbConnectionString, dbPassword, feOptionXml, log);
+
+                if (string.IsNullOrEmpty(alterScript))
+                {
+                    log?.Invoke("DDL: No ALTER script generated.");
+                    return null;
+                }
+
+                string header = $"-- erwin ALTER Script: {modelName} vs Database\n" +
+                    $"-- Generated: {DateTime.Now:yyyy-MM-dd HH:mm}\n" +
+                    $"-- Shows differences between model and live database\n\n";
+
+                return header + alterScript;
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"DDL: DB diff error: {ex.Message}");
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Forward Engineer via DdlHelper (separate process).
+        /// DdlHelper opens model from Mart, calls FEModel_DB + FEModel_DDL.
+        /// Separate process bypasses "Mart UI active" restriction.
+        /// </summary>
+        private static string ForwardEngineerViaHelper(
+            dynamic currentPU, string connStr, string password,
+            string feOptionXml, Action<string> log)
+        {
+            string outputFile = Path.Combine(TempDir, "fedb_output.sql");
+
+            try
+            {
+                CleanupFile(outputFile);
+
+                var martInfo = GetMartConnectionInfo(log);
+                if (martInfo == null) { log?.Invoke("DDL: No Mart connection info."); return null; }
+
+                string locator = "";
+                try { locator = currentPU.PropertyBag().Value("Locator")?.ToString() ?? ""; } catch { }
+                string modelPath = "";
+                var pathMatch = Regex.Match(locator, @"Mart://Mart/(.+?)(\?|$)");
+                if (pathMatch.Success) modelPath = pathMatch.Groups[1].Value;
+                else modelPath = currentPU.Name?.ToString() ?? "";
+
+                int version = ParseVersionFromLocator(locator);
+
+                string helperExe = FindDdlHelperExe(log);
+                if (string.IsNullOrEmpty(helperExe)) return null;
+
+                string args = $"--action=fedb --server={martInfo.Value.host} --port={martInfo.Value.port} " +
+                    $"--user={martInfo.Value.username} --pass={martInfo.Value.password} " +
+                    $"--model={modelPath} --version={version} --output=\"{outputFile}\" " +
+                    $"--connstr=\"{connStr}\"";
+
+                if (!string.IsNullOrEmpty(password))
+                    args += $" --dbpass=\"{password}\"";
+
+                log?.Invoke($"DDL: Running DdlHelper --action=fedb...");
+
+                var psi = new ProcessStartInfo
+                {
+                    FileName = helperExe,
+                    Arguments = args,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+
+                using (var proc = Process.Start(psi))
+                {
+                    var stdoutBuilder = new System.Text.StringBuilder();
+                    var stderrBuilder = new System.Text.StringBuilder();
+                    proc.OutputDataReceived += (s, ev) => { if (ev.Data != null) stdoutBuilder.AppendLine(ev.Data); };
+                    proc.ErrorDataReceived += (s, ev) => { if (ev.Data != null) stderrBuilder.AppendLine(ev.Data); };
+                    proc.BeginOutputReadLine();
+                    proc.BeginErrorReadLine();
+
+                    bool exited = proc.WaitForExit(120000);
+                    if (!exited)
+                    {
+                        log?.Invoke("DDL: DdlHelper FEDB timed out. Killing.");
+                        try { proc.Kill(); } catch { }
+                        return null;
+                    }
+
+                    foreach (var line in stdoutBuilder.ToString().Split('\n'))
+                        if (!string.IsNullOrWhiteSpace(line))
+                            log?.Invoke($"DDL: [FEDB] {line.Trim()}");
+                    string stderr = stderrBuilder.ToString();
+                    if (!string.IsNullOrEmpty(stderr))
+                        log?.Invoke($"DDL: [FEDB ERR] {stderr.Trim()}");
+                }
+
+                if (File.Exists(outputFile))
+                {
+                    string ddl = File.ReadAllText(outputFile);
+                    log?.Invoke($"DDL: FEDB DDL = {ddl.Length} chars");
+                    return ddl.Length > 0 ? ddl : null;
+                }
+
+                return null;
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"DDL: FEDB error: {ex.Message}");
+                return null;
+            }
+            finally
+            {
+                CleanupFile(outputFile);
+            }
+        }
+
+        /// <summary>
+        /// Generates CREATE TABLE DDL from database via ODBC INFORMATION_SCHEMA.
+        /// </summary>
+        private static void GenerateDbDdlViaOdbc(string odbcConnStr, string outputFile, Action<string> log)
+        {
+            try
+            {
+                using var conn = new System.Data.Odbc.OdbcConnection(odbcConnStr);
+                conn.Open();
+                var sb = new System.Text.StringBuilder();
+
+                // Get all tables
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = @"
+                        SELECT t.TABLE_NAME, c.COLUMN_NAME, c.DATA_TYPE,
+                               c.CHARACTER_MAXIMUM_LENGTH, c.NUMERIC_PRECISION, c.NUMERIC_SCALE,
+                               c.IS_NULLABLE, c.COLUMN_DEFAULT, c.ORDINAL_POSITION
+                        FROM INFORMATION_SCHEMA.TABLES t
+                        JOIN INFORMATION_SCHEMA.COLUMNS c ON t.TABLE_NAME = c.TABLE_NAME AND t.TABLE_SCHEMA = c.TABLE_SCHEMA
+                        WHERE t.TABLE_TYPE = 'BASE TABLE' AND t.TABLE_SCHEMA = 'dbo'
+                        ORDER BY t.TABLE_NAME, c.ORDINAL_POSITION";
+
+                    string currentTable = "";
+                    bool firstCol = true;
+
+                    using var rdr = cmd.ExecuteReader();
+                    while (rdr.Read())
+                    {
+                        string tableName = rdr.GetString(0);
+                        string colName = rdr.GetString(1);
+                        string dataType = rdr.GetString(2);
+                        int? maxLen = rdr.IsDBNull(3) ? null : (int?)rdr.GetInt32(3);
+                        int? numPrec = rdr.IsDBNull(4) ? null : (int?)Convert.ToInt32(rdr.GetValue(4));
+                        int? numScale = rdr.IsDBNull(5) ? null : (int?)Convert.ToInt32(rdr.GetValue(5));
+                        string nullable = rdr.GetString(6);
+                        string defVal = rdr.IsDBNull(7) ? null : rdr.GetString(7);
+
+                        if (tableName != currentTable)
+                        {
+                            if (!string.IsNullOrEmpty(currentTable))
+                                sb.AppendLine(")\ngo\n");
+
+                            sb.AppendLine($"CREATE TABLE [{tableName}]");
+                            sb.AppendLine("(");
+                            currentTable = tableName;
+                            firstCol = true;
+                        }
+
+                        if (!firstCol) sb.AppendLine(",");
+                        firstCol = false;
+
+                        // Build column definition
+                        string colType = dataType.ToUpper();
+                        if (maxLen.HasValue && maxLen.Value > 0 && (dataType.Contains("char") || dataType.Contains("binary")))
+                            colType = maxLen.Value == -1 ? $"{dataType}(max)" : $"{dataType}({maxLen.Value})";
+                        else if (numPrec.HasValue && (dataType == "decimal" || dataType == "numeric"))
+                            colType = $"{dataType}({numPrec.Value},{numScale ?? 0})";
+
+                        string nullStr = nullable == "YES" ? "NULL" : "NOT NULL";
+                        sb.Append($"\t[{colName}]\t\t{colType} {nullStr}");
+                    }
+
+                    if (!string.IsNullOrEmpty(currentTable))
+                        sb.AppendLine("\n)\ngo\n");
+                }
+
+                // Get primary keys
+                using (var cmd2 = conn.CreateCommand())
+                {
+                    cmd2.CommandText = @"
+                        SELECT tc.TABLE_NAME, tc.CONSTRAINT_NAME, kcu.COLUMN_NAME
+                        FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+                        JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
+                            ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME AND tc.TABLE_SCHEMA = kcu.TABLE_SCHEMA
+                        WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY' AND tc.TABLE_SCHEMA = 'dbo'
+                        ORDER BY tc.TABLE_NAME, kcu.ORDINAL_POSITION";
+
+                    string curConst = "";
+                    var pkCols = new System.Collections.Generic.List<string>();
+                    string pkTable = "";
+
+                    using var rdr2 = cmd2.ExecuteReader();
+                    while (rdr2.Read())
+                    {
+                        string tbl = rdr2.GetString(0);
+                        string cName = rdr2.GetString(1);
+                        string col = rdr2.GetString(2);
+
+                        if (cName != curConst)
+                        {
+                            if (!string.IsNullOrEmpty(curConst))
+                            {
+                                sb.AppendLine($"ALTER TABLE [{pkTable}]");
+                                sb.AppendLine($"ADD CONSTRAINT [{curConst}] PRIMARY KEY ({string.Join(", ", pkCols.Select(c => $"[{c}]"))})");
+                                sb.AppendLine("go\n");
+                            }
+                            curConst = cName;
+                            pkTable = tbl;
+                            pkCols.Clear();
+                        }
+                        pkCols.Add(col);
+                    }
+                    if (!string.IsNullOrEmpty(curConst))
+                    {
+                        sb.AppendLine($"ALTER TABLE [{pkTable}]");
+                        sb.AppendLine($"ADD CONSTRAINT [{curConst}] PRIMARY KEY ({string.Join(", ", pkCols.Select(c => $"[{c}]"))})");
+                        sb.AppendLine("go\n");
+                    }
+                }
+
+                File.WriteAllText(outputFile, sb.ToString());
+                log?.Invoke($"DDL: Generated {sb.Length} chars of DDL from DB");
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"DDL: ODBC schema extraction error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Creates a minimal .erwin XML file with correct Target_Server.
+        /// This bypasses PersistenceUnits.Create which rejects Target_Server on erwin r10.
+        /// Format based on meta-sync ErwinXmlService.
+        /// </summary>
+        private static void CreateBlankErwinModel(string filePath, long targetServerCode, int targetServerVersion, Action<string> log)
+        {
+            // erwin DM r10 binary format header + XML model data
+            // The simplest approach: create XML-based .erwin file
+            string modelId = $"{{{Guid.NewGuid().ToString().ToUpperInvariant()}}}+00000000";
+            string diagramId = $"{{{Guid.NewGuid().ToString().ToUpperInvariant()}}}+00000002";
+
+            string xml = $@"<?xml version=""1.0"" encoding=""utf-8""?>
+<erwin xmlns=""http://www.erwin.com/dm/EMXdata""
+       xmlns:EMX=""http://www.erwin.com/dm/EMXdata""
+       xmlns:EM2=""http://www.erwin.com/dm/EM2data""
+       FileVersion=""10.10.38109"">
+  <EMX:Model id=""{modelId}"" name=""RE_Model"" xmlns=""http://www.erwin.com/dm/EMXdata"">
+    <ModelEnvProps>
+      <Model_Type>2</Model_Type>
+      <Persistence_Unit_Id>{modelId}</Persistence_Unit_Id>
+      <Target_Server>{targetServerCode}</Target_Server>
+      <Target_Server_Version>{targetServerVersion}</Target_Server_Version>
+      <Target_Server_Minor_Version>0</Target_Server_Minor_Version>
+      <Active_Model>-1</Active_Model>
+      <Hidden_Model>0</Hidden_Model>
+      <Storage_Format>4012</Storage_Format>
+    </ModelEnvProps>
+    <ModelProps>
+      <Name>RE_Model</Name>
+      <Long_Id>{modelId}</Long_Id>
+      <Type>Physical</Type>
+    </ModelProps>
+  </EMX:Model>
+</erwin>";
+
+            Directory.CreateDirectory(Path.GetDirectoryName(filePath));
+            File.WriteAllText(filePath, xml, System.Text.Encoding.UTF8);
+            log?.Invoke($"DDL: Template .erwin created ({new FileInfo(filePath).Length} bytes, TS={targetServerCode})");
+        }
+
+        /// <summary>
+        /// Load DDL from a database via DdlHelper --action=redb (Reverse Engineering).
+        /// </summary>
+        private static string LoadDbDdlViaDdlHelper(
+            string connStr, string password, string feOptionXml,
+            string targetServer, string targetVersion, string schemaFilter,
+            Action<string> log)
+        {
+            string outputFile = Path.Combine(TempDir, "db_redb.sql");
+
+            try
+            {
+                string helperExe = FindDdlHelperExe(log);
+                if (string.IsNullOrEmpty(helperExe)) return null;
+
+                CleanupFile(outputFile);
+
+                string args = $"--action=redb --connstr=\"{connStr}\" --output=\"{outputFile}\"";
+
+                if (!string.IsNullOrEmpty(password))
+                    args += $" --dbpass=\"{password}\"";
+                if (!string.IsNullOrEmpty(targetServer))
+                    args += $" --targetserver={targetServer}";
+                if (!string.IsNullOrEmpty(targetVersion))
+                    args += $" --targetversion={targetVersion}";
+                if (!string.IsNullOrEmpty(feOptionXml))
+                    args += $" --feoption=\"{feOptionXml}\"";
+                if (!string.IsNullOrEmpty(schemaFilter))
+                    args += $" --schemafilter={schemaFilter}";
+
+                log?.Invoke("DDL: Running DdlHelper --action=redb (Reverse Engineering)...");
+
+                var psi = new ProcessStartInfo
+                {
+                    FileName = helperExe,
+                    Arguments = args,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+
+                using (var proc = Process.Start(psi))
+                {
+                    // Read stdout/stderr async to avoid deadlock
+                    var stdoutBuilder = new System.Text.StringBuilder();
+                    var stderrBuilder = new System.Text.StringBuilder();
+                    proc.OutputDataReceived += (s, ev) => { if (ev.Data != null) stdoutBuilder.AppendLine(ev.Data); };
+                    proc.ErrorDataReceived += (s, ev) => { if (ev.Data != null) stderrBuilder.AppendLine(ev.Data); };
+                    proc.BeginOutputReadLine();
+                    proc.BeginErrorReadLine();
+
+                    bool exited = proc.WaitForExit(120000); // 2 min timeout
+                    if (!exited)
+                    {
+                        log?.Invoke("DDL: DdlHelper REDB timed out after 2 minutes. Killing process.");
+                        try { proc.Kill(); } catch { }
+                        return null;
+                    }
+
+                    string stdout = stdoutBuilder.ToString();
+                    string stderr = stderrBuilder.ToString();
+
+                    foreach (var line in (stdout ?? "").Split('\n'))
+                        if (!string.IsNullOrWhiteSpace(line))
+                            log?.Invoke($"DDL: [REDB] {line.Trim()}");
+                    if (!string.IsNullOrEmpty(stderr))
+                        log?.Invoke($"DDL: [REDB ERR] {stderr.Trim()}");
+
+                    if (proc.ExitCode != 0)
+                    {
+                        log?.Invoke($"DDL: DdlHelper REDB exit code = {proc.ExitCode}");
+                        return null;
+                    }
+                }
+
+                if (File.Exists(outputFile))
+                {
+                    string ddl = File.ReadAllText(outputFile);
+                    log?.Invoke($"DDL: DB DDL via REDB = {ddl.Length} chars");
+                    return ddl;
+                }
+
+                return null;
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"DDL: REDB helper error: {ex.Message}");
+                return null;
+            }
+            finally
+            {
+                CleanupFile(outputFile);
+            }
+        }
+
+        /// <summary>
+        /// Finds DdlHelper.exe in known locations.
+        /// </summary>
+        private static string FindDdlHelperExe(Action<string> log)
+        {
+            string asmDir = Path.GetDirectoryName(typeof(DdlGenerationService).Assembly.Location) ?? "";
+            string[] searchPaths = {
+                Path.Combine(asmDir, "tools", "DdlHelper", "DdlHelper.exe"),
+                Path.Combine(AppContext.BaseDirectory, "tools", "DdlHelper", "DdlHelper.exe"),
+                Path.Combine(asmDir, "..", "tools", "DdlHelper", "DdlHelper.exe"),
+            };
+
+            foreach (var p in searchPaths)
+            {
+                string full = Path.GetFullPath(p);
+                if (File.Exists(full)) return full;
+            }
+
+            log?.Invoke($"DDL: DdlHelper.exe not found. Searched in: {asmDir}");
+            return null;
+        }
+
         private static readonly string LogFile = Path.Combine(
             Path.GetTempPath(), "erwin-addin-ddl", "ddl_attempts.log");
 

@@ -31,6 +31,14 @@ if ($Help) {
 
 $ErrorActionPreference = "Stop"
 
+trap {
+    Write-Host "`n[ERROR] $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "At line: $($_.InvocationInfo.ScriptLineNumber)" -ForegroundColor Red
+    Write-Host "`nPress any key to exit..." -ForegroundColor Gray
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    exit 1
+}
+
 # --- Auto-elevate to Administrator ---
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
@@ -54,6 +62,15 @@ if ($erwinProcess) {
     $erwinProcess | Stop-Process -Force
     Start-Sleep -Seconds 2
     Write-Host "  erwin closed." -ForegroundColor Green
+}
+
+# --- Step 1b: Kill DdlHelper if running ---
+$ddlHelperProc = Get-Process -Name "DdlHelper" -ErrorAction SilentlyContinue
+if ($ddlHelperProc) {
+    Write-Host "Killing stuck DdlHelper process..." -ForegroundColor Yellow
+    $ddlHelperProc | Stop-Process -Force
+    Start-Sleep -Seconds 1
+    Write-Host "  DdlHelper killed." -ForegroundColor Green
 }
 
 # --- Step 2: Build ---

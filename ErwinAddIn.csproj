@@ -24,6 +24,7 @@
     <PackageReference Include="Microsoft.Data.SqlClient" Version="6.1.4" />
     <PackageReference Include="Npgsql" Version="10.0.2" />
     <PackageReference Include="Oracle.ManagedDataAccess.Core" Version="23.26.100" />
+    <PackageReference Include="System.Data.Odbc" Version="10.0.6" />
 
   </ItemGroup>
 

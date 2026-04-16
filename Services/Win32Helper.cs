@@ -623,6 +623,113 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         #endregion
 
+        #region IAccessible
+
+        [DllImport("oleacc.dll")]
+        private static extern int AccessibleObjectFromWindow(IntPtr hwnd, uint dwId, ref Guid riid, out dynamic ppvObject);
+
+        private static readonly Guid IID_IAccessible = new Guid("618736E0-3C3D-11CF-810C-00AA00389B71");
+
+        public static dynamic GetAccessibleObject(IntPtr hWnd)
+        {
+            Guid guid = IID_IAccessible;
+            int hr = AccessibleObjectFromWindow(hWnd, 0, ref guid, out dynamic acc);
+            return hr == 0 ? acc : null;
+        }
+
+        public static void EnumChildWindowsByClass(IntPtr hWndParent, string className, List<IntPtr> results)
+        {
+            EnumChildWindows(hWndParent, (hWnd, lParam) =>
+            {
+                var sb = new StringBuilder(256);
+                GetClassName(hWnd, sb, sb.Capacity);
+                if (sb.ToString().Contains(className))
+                    results.Add(hWnd);
+                return true;
+            }, IntPtr.Zero);
+        }
+
+        /// <summary>
+        /// Information about a child window.
+        /// </summary>
+        public class ChildWindowInfo
+        {
+            public IntPtr Handle { get; set; }
+            public string ClassName { get; set; }
+            public string Text { get; set; }
+        }
+
+        /// <summary>
+        /// Enumerates ALL child windows recursively with their class names and text.
+        /// </summary>
+        public static List<ChildWindowInfo> EnumAllChildWindows(IntPtr hWndParent)
+        {
+            var results = new List<ChildWindowInfo>();
+            EnumChildWindows(hWndParent, (hWnd, lParam) =>
+            {
+                var sbClass = new StringBuilder(256);
+                GetClassName(hWnd, sbClass, sbClass.Capacity);
+                var sbText = new StringBuilder(512);
+                GetWindowText(hWnd, sbText, sbText.Capacity);
+                results.Add(new ChildWindowInfo
+                {
+                    Handle = hWnd,
+                    ClassName = sbClass.ToString(),
+                    Text = sbText.ToString()
+                });
+                return true;
+            }, IntPtr.Zero);
+            return results;
+        }
+
+        /// <summary>
+        /// Finds child windows by class name (exact contains match).
+        /// </summary>
+        public static List<IntPtr> FindChildWindowsByClass(IntPtr hWndParent, string className)
+        {
+            var results = new List<IntPtr>();
+            EnumChildWindowsByClass(hWndParent, className, results);
+            return results;
+        }
+
+        /// <summary>
+        /// Gets window text safely.
+        /// </summary>
+        public static string GetWindowTextSafe(IntPtr hWnd)
+        {
+            var sb = new StringBuilder(512);
+            GetWindowText(hWnd, sb, sb.Capacity);
+            return sb.ToString();
+        }
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, StringBuilder lParam);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+        private const uint SB_GETTEXT = 0x040D;
+        private const uint SB_GETTEXTLENGTH = 0x040C;
+        private const uint SB_GETPARTS = 0x0406;
+
+        /// <summary>
+        /// Reads text from a specific part of a Win32 status bar control.
+        /// </summary>
+        public static string GetStatusBarText(IntPtr hWndStatusBar, int partIndex)
+        {
+            try
+            {
+                int len = (int)SendMessage(hWndStatusBar, SB_GETTEXTLENGTH, (IntPtr)partIndex, IntPtr.Zero);
+                if ((len & 0xFFFF) == 0) return "";
+                var sb = new StringBuilder((len & 0xFFFF) + 1);
+                SendMessage(hWndStatusBar, SB_GETTEXT, (IntPtr)partIndex, sb);
+                return sb.ToString();
+            }
+            catch { return ""; }
+        }
+
+        #endregion
+
         #region Helpers
 
         public static MenuItemInfo FindMenuItemByText(IntPtr hWnd, string searchText)
@@ -643,6 +750,72 @@ namespace EliteSoft.Erwin.AddIn.Services
 
             SetForegroundWindow(hWnd);
             return PostMessage(hWnd, WM_COMMAND, (IntPtr)menuId, IntPtr.Zero);
+        }
+
+        #endregion
+
+        #region Diagram Selection Detection
+
+        /// <summary>
+        /// Reads the currently selected entity name(s) from erwin's Overview pane.
+        /// When an entity is selected in the diagram, the Overview pane shows:
+        /// "MODELNAME (ENTITY_NAME)" for single selection.
+        /// Returns empty list if nothing is selected.
+        /// </summary>
+        public static List<string> GetDiagramSelectedEntities(IntPtr erwinHwnd, string modelName)
+        {
+            var result = new List<string>();
+            if (erwinHwnd == IntPtr.Zero || string.IsNullOrEmpty(modelName))
+                return result;
+
+            // Enumerate all Static child windows looking for the model info display
+            // Pattern: "MODELNAME (ENTITY_NAME)" when an entity is selected
+            string modelUpper = modelName.ToUpperInvariant();
+            var childWindows = EnumAllChildWindows(erwinHwnd);
+
+            foreach (var cw in childWindows)
+            {
+                if (cw.ClassName != "Static" || string.IsNullOrEmpty(cw.Text))
+                    continue;
+
+                string text = cw.Text.Trim();
+
+                // Check if this Static window starts with the model name
+                if (!text.StartsWith(modelUpper, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                // If text has parentheses, extract the entity name
+                int parenStart = text.IndexOf('(');
+                int parenEnd = text.LastIndexOf(')');
+                if (parenStart > 0 && parenEnd > parenStart)
+                {
+                    string inside = text.Substring(parenStart + 1, parenEnd - parenStart - 1).Trim();
+                    if (!string.IsNullOrEmpty(inside))
+                    {
+                        // Could be comma-separated for multi-select (needs testing)
+                        // For now, handle single entity and "N objects" format
+                        if (inside.EndsWith("objects", StringComparison.OrdinalIgnoreCase) ||
+                            inside.EndsWith("object", StringComparison.OrdinalIgnoreCase))
+                        {
+                            // Multi-select shows count only - cannot determine individual names
+                            // Return empty to indicate "multiple selected but unknown"
+                            return result;
+                        }
+
+                        // Split by comma in case of multi-select list format
+                        var parts = inside.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+                        foreach (var part in parts)
+                        {
+                            string trimmed = part.Trim();
+                            if (!string.IsNullOrEmpty(trimmed))
+                                result.Add(trimmed);
+                        }
+                    }
+                }
+                break; // Found the model info window
+            }
+
+            return result;
         }
 
         #endregion

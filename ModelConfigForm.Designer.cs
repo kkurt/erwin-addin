@@ -614,18 +614,48 @@ namespace EliteSoft.Erwin.AddIn
 
             var lblRightModel = new System.Windows.Forms.Label();
             lblRightModel.Location = new System.Drawing.Point(380, 18);
-            lblRightModel.Size = new System.Drawing.Size(80, 20);
-            lblRightModel.Text = "Right Model:";
+            lblRightModel.Size = new System.Drawing.Size(40, 20);
+            lblRightModel.Text = "Right:";
             lblRightModel.Font = fontCaption;
             lblRightModel.ForeColor = clrTextSecondary;
             this.tabApproval.Controls.Add(lblRightModel);
 
+            this.rbFromMart = new System.Windows.Forms.RadioButton();
+            this.rbFromMart.Location = new System.Drawing.Point(420, 16);
+            this.rbFromMart.Size = new System.Drawing.Size(85, 20);
+            this.rbFromMart.Text = "From Mart";
+            this.rbFromMart.Font = fontCaption;
+            this.rbFromMart.Checked = true;
+            this.rbFromMart.CheckedChanged += (s, ev) => OnRightSourceChanged();
+            this.tabApproval.Controls.Add(this.rbFromMart);
+
             this.cmbRightModel = new System.Windows.Forms.ComboBox();
-            this.cmbRightModel.Location = new System.Drawing.Point(460, 15);
-            this.cmbRightModel.Size = new System.Drawing.Size(280, 24);
+            this.cmbRightModel.Location = new System.Drawing.Point(508, 15);
+            this.cmbRightModel.Size = new System.Drawing.Size(175, 24);
             this.cmbRightModel.DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList;
             this.cmbRightModel.Font = fontCaption;
             this.tabApproval.Controls.Add(this.cmbRightModel);
+
+            this.rbFromDB = new System.Windows.Forms.RadioButton();
+            this.rbFromDB.Location = new System.Drawing.Point(690, 16);
+            this.rbFromDB.Size = new System.Drawing.Size(70, 20);
+            this.rbFromDB.Text = "From DB";
+            this.rbFromDB.Font = fontCaption;
+            this.rbFromDB.CheckedChanged += (s, ev) => OnRightSourceChanged();
+            this.tabApproval.Controls.Add(this.rbFromDB);
+
+            this.btnConfigureDB = new System.Windows.Forms.Button();
+            this.btnConfigureDB.Location = new System.Drawing.Point(762, 13);
+            this.btnConfigureDB.Size = new System.Drawing.Size(78, 24);
+            this.btnConfigureDB.Text = "Configure...";
+            this.btnConfigureDB.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnConfigureDB.BackColor = System.Drawing.Color.White;
+            this.btnConfigureDB.FlatAppearance.BorderColor = clrBorder;
+            this.btnConfigureDB.Font = fontCaption;
+            this.btnConfigureDB.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnConfigureDB.Visible = false;
+            this.btnConfigureDB.Click += new System.EventHandler(this.BtnConfigureDB_Click);
+            this.tabApproval.Controls.Add(this.btnConfigureDB);
 
             // Row 2: Buttons + FE Option XML
             this.btnGenerateDDL = new System.Windows.Forms.Button();
@@ -695,18 +725,6 @@ namespace EliteSoft.Erwin.AddIn
             this.btnCopyDDL.Click += new System.EventHandler(this.BtnCopyDDL_Click);
             this.tabApproval.Controls.Add(this.btnCopyDDL);
 
-            this.btnSaveDDL = new System.Windows.Forms.Button();
-            this.btnSaveDDL.Location = new System.Drawing.Point(755, 49);
-            this.btnSaveDDL.Size = new System.Drawing.Size(75, 24);
-            this.btnSaveDDL.Text = "Save As";
-            this.btnSaveDDL.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnSaveDDL.BackColor = System.Drawing.Color.White;
-            this.btnSaveDDL.FlatAppearance.BorderColor = clrBorder;
-            this.btnSaveDDL.Font = fontCaption;
-            this.btnSaveDDL.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnSaveDDL.Click += new System.EventHandler(this.BtnSaveDDL_Click);
-            this.tabApproval.Controls.Add(this.btnSaveDDL);
-
             // Status label
             this.lblDDLStatus = new System.Windows.Forms.Label();
             this.lblDDLStatus.Location = new System.Drawing.Point(15, 85);
@@ -716,26 +734,13 @@ namespace EliteSoft.Erwin.AddIn
             this.lblDDLStatus.ForeColor = clrTextSecondary;
             this.tabApproval.Controls.Add(this.lblDDLStatus);
 
-            // Object filter checkbox + list
+            // "Only Selected Objects" checkbox - reads diagram selection at DDL generation time
             this.chkFilterObjects = new System.Windows.Forms.CheckBox();
             this.chkFilterObjects.Location = new System.Drawing.Point(15, 105);
-            this.chkFilterObjects.Size = new System.Drawing.Size(170, 20);
-            this.chkFilterObjects.Text = "Only selected objects";
+            this.chkFilterObjects.Size = new System.Drawing.Size(200, 20);
+            this.chkFilterObjects.Text = "Only Selected Objects";
             this.chkFilterObjects.Font = fontCaption;
-            this.chkFilterObjects.CheckedChanged += (s, ev) => ApplyObjectFilter();
             this.tabApproval.Controls.Add(this.chkFilterObjects);
-
-            this.clbObjects = new System.Windows.Forms.CheckedListBox();
-            this.clbObjects.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
-            this.clbObjects.Location = new System.Drawing.Point(15, 125);
-            this.clbObjects.Size = new System.Drawing.Size(830, 80);
-            this.clbObjects.Font = fontCaption;
-            this.clbObjects.CheckOnClick = true;
-            this.clbObjects.MultiColumn = true;
-            this.clbObjects.ColumnWidth = 200;
-            this.clbObjects.Visible = false;
-            this.clbObjects.ItemCheck += (s, ev) => BeginInvoke(new System.Action(ApplyObjectFilter));
-            this.tabApproval.Controls.Add(this.clbObjects);
 
             // DDL output RichTextBox (read-only, monospace, SQL highlighting)
             this.rtbDDLOutput = new System.Windows.Forms.RichTextBox();
@@ -777,8 +782,21 @@ namespace EliteSoft.Erwin.AddIn
             this.btnMonitor.Click += new System.EventHandler(this.BtnMonitor_Click);
             this.grpDebugLog.Controls.Add(this.btnMonitor);
 
+            this.btnCaptureRE = new System.Windows.Forms.Button();
+            this.btnCaptureRE.Location = new System.Drawing.Point(386, 24);
+            this.btnCaptureRE.Size = new System.Drawing.Size(100, 28);
+            this.btnCaptureRE.Text = "Capture RE";
+            this.btnCaptureRE.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnCaptureRE.BackColor = System.Drawing.Color.FromArgb(255, 200, 200);
+            this.btnCaptureRE.ForeColor = clrTextSecondary;
+            this.btnCaptureRE.FlatAppearance.BorderColor = clrBorder;
+            this.btnCaptureRE.Font = fontCaption;
+            this.btnCaptureRE.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnCaptureRE.Click += new System.EventHandler(this.BtnCaptureRE_Click);
+            this.grpDebugLog.Controls.Add(this.btnCaptureRE);
+
             this.btnScanMenu = new System.Windows.Forms.Button();
-            this.btnScanMenu.Location = new System.Drawing.Point(386, 24);
+            this.btnScanMenu.Location = new System.Drawing.Point(494, 24);
             this.btnScanMenu.Size = new System.Drawing.Size(100, 28);
             this.btnScanMenu.Text = "Scan Menu";
             this.btnScanMenu.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
@@ -941,10 +959,11 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.TextBox txtFEOptionXml;
         private System.Windows.Forms.Button btnBrowseFEOption;
         private System.Windows.Forms.Button btnCopyDDL;
-        private System.Windows.Forms.Button btnSaveDDL;
+        private System.Windows.Forms.RadioButton rbFromMart;
+        private System.Windows.Forms.RadioButton rbFromDB;
+        private System.Windows.Forms.Button btnConfigureDB;
         private System.Windows.Forms.Label lblDDLStatus;
         private System.Windows.Forms.CheckBox chkFilterObjects;
-        private System.Windows.Forms.CheckedListBox clbObjects;
         private System.Windows.Forms.RichTextBox rtbDDLOutput;
         private System.Windows.Forms.TabPage tabDebug;
 
@@ -990,6 +1009,7 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.Button btnDumpScapi;
         private System.Windows.Forms.Button btnMonitor;
         private System.Windows.Forms.Button btnScanMenu;
+        private System.Windows.Forms.Button btnCaptureRE;
         private System.Windows.Forms.TextBox txtLogSearch;
         private System.Windows.Forms.Label lblLogSearch;
 
