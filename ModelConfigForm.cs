@@ -2210,24 +2210,15 @@ namespace EliteSoft.Erwin.AddIn
             string feOptionXml = txtFEOptionXml.Text.Trim();
             bool isFromDB = rbFromDB.Checked;
 
-            // Validate DB mode has connection configured
-            // Always open Configure if not yet configured or connection string looks invalid
             if (isFromDB)
             {
-                bool needsConfigure = string.IsNullOrEmpty(_dbConnectionString)
-                    || _dbConnectionString.Contains("|5=\n") || _dbConnectionString.EndsWith("|5=");
-
-                if (needsConfigure)
-                {
-                    _dbConnectionString = ""; // Clear invalid
-                    BtnConfigureDB_Click(sender, e);
-                    if (string.IsNullOrEmpty(_dbConnectionString)) return;
-                }
+                RunFromDbCompare(feOptionXml);
+                return;
             }
 
             // Check if model has unsaved changes (asterisk in erwin window title)
             bool hasUnsavedChanges = HasModelUnsavedChanges();
-            bool isDiffMode = !isFromDB && cmbRightModel.Items.Count > 0 && cmbRightModel.SelectedIndex >= 0;
+            bool isDiffMode = cmbRightModel.Items.Count > 0 && cmbRightModel.SelectedIndex >= 0;
 
             btnGenerateDDL.Enabled = false;
             rtbDDLOutput.Text = "";
@@ -2240,28 +2231,18 @@ namespace EliteSoft.Erwin.AddIn
                 int puCount = 0;
                 try { puCount = _scapi.PersistenceUnits.Count; } catch { }
 
-                string waitMessage;
                 int selVer = 0;
-
-                if (isFromDB)
-                {
-                    waitMessage = $"Reverse engineering from database...\n{_dbLabel}\nPlease wait.";
-                }
+                string selectedVersion = cmbRightModel.SelectedItem?.ToString() ?? "";
+                var verMatch = System.Text.RegularExpressions.Regex.Match(selectedVersion, @"v(\d+)");
+                if (verMatch.Success)
+                    DdlGenerationService.SetSelectedVersion(int.Parse(verMatch.Groups[1].Value));
                 else
-                {
-                    string selectedVersion = cmbRightModel.SelectedItem?.ToString() ?? "";
-                    var verMatch = System.Text.RegularExpressions.Regex.Match(selectedVersion, @"v(\d+)");
-                    if (verMatch.Success)
-                        DdlGenerationService.SetSelectedVersion(int.Parse(verMatch.Groups[1].Value));
-                    else
-                        DdlGenerationService.SetSelectedVersion(0);
+                    DdlGenerationService.SetSelectedVersion(0);
 
-                    var verMatch2 = System.Text.RegularExpressions.Regex.Match(selectedVersion, @"v(\d+)");
-                    selVer = verMatch2.Success ? int.Parse(verMatch2.Groups[1].Value) : 0;
-                    waitMessage = $"Generating DDL diff (v{_martVersion} vs v{selVer})...\nPlease wait.";
-                }
+                selVer = verMatch.Success ? int.Parse(verMatch.Groups[1].Value) : 0;
+                string waitMessage = $"Generating DDL diff (v{_martVersion} vs v{selVer})...\nPlease wait.";
 
-                lblDDLStatus.Text = isFromDB ? "Reverse engineering..." : $"Generating DDL diff (v{_martVersion} vs v{selVer})...";
+                lblDDLStatus.Text = $"Generating DDL diff (v{_martVersion} vs v{selVer})...";
                 lblDDLStatus.ForeColor = Color.Gray;
                 Application.DoEvents();
 
@@ -2314,53 +2295,12 @@ namespace EliteSoft.Erwin.AddIn
                 }
                 catch { }
 
-                string diff = null;
-                Exception bgError = null;
-
-                if (isFromDB)
-                {
-                    // From DB: Run on background thread to keep UI responsive
-                    string connStr = _dbConnectionString;
-                    string dbPass = _dbPassword;
-                    long targetSrv = _dbTargetServer;
-                    int targetVer = _dbTargetVersion;
-                    var task = System.Threading.Tasks.Task.Run(() =>
-                    {
-                        try
-                        {
-                            return DdlGenerationService.GenerateDiffWithDatabase(
-                                _scapi, _currentModel, connStr, dbPass,
-                                feOptionXml, "",
-                                targetSrv, targetVer,
-                                (Action<string>)((msg) => BeginInvoke(new Action(() => Log(msg)))));
-                        }
-                        catch (Exception ex) { bgError = ex; return null; }
-                    });
-
-                    // Keep UI alive while waiting
-                    while (!task.IsCompleted)
-                    {
-                        Application.DoEvents();
-                        System.Threading.Thread.Sleep(100);
-                    }
-                    diff = task.Result;
-                }
-                else
-                {
-                    // From Mart: existing version diff
-                    diff = DdlGenerationService.GenerateDiffWithDuplicate(
-                        _scapi, _currentModel, feOptionXml, (Action<string>)Log);
-                }
+                // From Mart: existing version diff
+                string diff = DdlGenerationService.GenerateDiffWithDuplicate(
+                    _scapi, _currentModel, feOptionXml, (Action<string>)Log);
 
                 // Close wait dialog
                 try { waitDialog?.Close(); waitDialog?.Dispose(); } catch { }
-
-                if (bgError != null)
-                {
-                    lblDDLStatus.Text = $"Error: {bgError.Message}";
-                    lblDDLStatus.ForeColor = Color.Red;
-                    Log($"DDL DB error: {bgError.Message}");
-                }
 
                 if (diff != null)
                 {
@@ -2780,12 +2720,221 @@ namespace EliteSoft.Erwin.AddIn
         private string _dbLabel = "";
         private long _dbTargetServer = 0;
         private int _dbTargetVersion = 0;
+        private string _dbSchema = "";
+        private List<string> _dbSelectedTables = new List<string>();
+        // Raw fields for in-process RE pipeline (DSN created at runtime).
+        private string _dbHost = "";
+        private string _dbName = "";
+        private string _dbUser = "";
+        private bool _dbUseWindowsAuth = false;
+        private int _dbTypeCode = 0;
+
+        /// <summary>
+        /// "From DB" path: compare active model DDL against a DDL reverse-engineered
+        /// from a live database by DdlHelper (separate process, silent, no manual prompts).
+        /// Mirrors the Mart flow: validate -> wait dialog -> background call -> ShowDDLResult.
+        /// </summary>
+        private void RunFromDbCompare(string feOptionXml)
+        {
+            // Validation: connection
+            bool needsConfigure = string.IsNullOrEmpty(_dbConnectionString)
+                || _dbConnectionString.Contains("|5=\n") || _dbConnectionString.EndsWith("|5=");
+            if (needsConfigure)
+            {
+                _dbConnectionString = "";
+                BtnConfigureDB_Click(null, EventArgs.Empty);
+                if (string.IsNullOrEmpty(_dbConnectionString)) return;
+            }
+
+            // Tables: default to ALL model tables when user hasn't picked explicitly
+            var tableList = new List<string>(_dbSelectedTables ?? new List<string>());
+            if (tableList.Count == 0)
+            {
+                tableList = CollectModelTablePhysicalNames();
+                if (tableList.Count == 0)
+                {
+                    ErwinAddIn.ShowTopMostMessage("Active model has no tables to compare.", "From DB");
+                    return;
+                }
+                Log($"DDL: From DB using default (all {tableList.Count} model tables).");
+            }
+
+            // Schema validation: RE returns empty if no schema/owner filter
+            if (string.IsNullOrWhiteSpace(_dbSchema))
+            {
+                ErwinAddIn.ShowTopMostMessage(
+                    "DB schema/owner is required for reverse engineering.\n\n" +
+                    "Open 'Configure...' and set the schema filter (e.g. dbo).",
+                    "From DB", isError: false);
+                BtnConfigureDB_Click(null, EventArgs.Empty);
+                if (string.IsNullOrWhiteSpace(_dbSchema)) return;
+            }
+
+            btnGenerateDDL.Enabled = false;
+            rtbDDLOutput.Text = "";
+            lblDDLStatus.Text = $"Reverse engineering {tableList.Count} table(s) from DB...";
+            lblDDLStatus.ForeColor = Color.Gray;
+            Application.DoEvents();
+
+            _validationCoordinatorService?.SuspendValidation();
+
+            Form waitDialog = null;
+            try
+            {
+                try
+                {
+                    waitDialog = new Form
+                    {
+                        Size = new System.Drawing.Size(380, 120),
+                        FormBorderStyle = FormBorderStyle.None,
+                        StartPosition = FormStartPosition.CenterScreen,
+                        TopMost = true,
+                        ShowInTaskbar = false,
+                        BackColor = Color.White
+                    };
+                    var titlePanel = new Panel { Dock = DockStyle.Top, Height = 30, BackColor = Color.FromArgb(0, 122, 204) };
+                    titlePanel.Controls.Add(new Label
+                    {
+                        Text = "DDL Generation",
+                        ForeColor = Color.White,
+                        Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+                        Location = new Point(10, 5),
+                        AutoSize = true
+                    });
+                    waitDialog.Controls.Add(titlePanel);
+                    waitDialog.Controls.Add(new Label
+                    {
+                        Text = $"Reverse engineering from DB\n({tableList.Count} table(s))...\nPlease wait.",
+                        Dock = DockStyle.Fill,
+                        TextAlign = System.Drawing.ContentAlignment.MiddleCenter,
+                        Font = new Font("Segoe UI", 10f)
+                    });
+                    waitDialog.Paint += (s2, e2) =>
+                    {
+                        using (var pen = new Pen(Color.FromArgb(0, 122, 204), 1))
+                            e2.Graphics.DrawRectangle(pen, 0, 0, waitDialog.Width - 1, waitDialog.Height - 1);
+                    };
+                    waitDialog.Show();
+                    Application.DoEvents();
+                }
+                catch { }
+
+                string diff = DdlGenerationService.GenerateDiffWithDatabase(
+                    _scapi,
+                    _currentModel,
+                    _dbHost,
+                    _dbName,
+                    _dbUser,
+                    _dbPassword,
+                    _dbUseWindowsAuth,
+                    _dbTypeCode,
+                    _dbTargetServer,
+                    _dbTargetVersion,
+                    _dbSchema,
+                    tableList,
+                    _dbLabel,
+                    feOptionXml,
+                    (Action<string>)Log);
+
+                try { waitDialog?.Close(); waitDialog?.Dispose(); } catch { }
+
+                if (!string.IsNullOrEmpty(diff))
+                {
+                    ShowDDLResult(diff, $"DDL Diff vs {_dbLabel}");
+                    lblDDLStatus.Text = $"Diff computed vs {_dbLabel}.";
+                    lblDDLStatus.ForeColor = Color.DarkGreen;
+                }
+                else
+                {
+                    lblDDLStatus.Text = "From DB comparison failed. See log.";
+                    lblDDLStatus.ForeColor = Color.Red;
+                }
+            }
+            catch (Exception ex)
+            {
+                try { waitDialog?.Close(); waitDialog?.Dispose(); } catch { }
+                lblDDLStatus.Text = $"Error: {ex.Message}";
+                lblDDLStatus.ForeColor = Color.Red;
+                Log($"DDL From DB error: {ex.Message}");
+            }
+            finally
+            {
+                _validationCoordinatorService?.ResumeValidation();
+                btnGenerateDDL.Enabled = true;
+                this.TopMost = true;
+                this.Activate();
+                this.BringToFront();
+                this.TopMost = false;
+            }
+        }
+
+        /// <summary>
+        /// Returns the physical_name of every entity in the active model. Empty if no session.
+        /// </summary>
+        private List<string> CollectModelTablePhysicalNames()
+        {
+            var result = new List<string>();
+            if (_currentModel == null) return result;
+            dynamic sess = null;
+            bool ownSess = false;
+            try
+            {
+                bool hasSess = false;
+                try { hasSess = _currentModel.HasSession(); } catch { }
+                if (hasSess)
+                {
+                    int sc = 0; try { sc = _scapi.Sessions.Count; } catch { }
+                    for (int i = 0; i < sc; i++)
+                    {
+                        try
+                        {
+                            dynamic s = _scapi.Sessions.Item(i);
+                            bool open = false; try { open = s.IsOpen(); } catch { }
+                            string puN = ""; try { puN = s.PersistenceUnit?.Name?.ToString() ?? ""; } catch { }
+                            string curN = ""; try { curN = _currentModel.Name?.ToString() ?? ""; } catch { }
+                            if (open && puN == curN) { sess = s; break; }
+                        }
+                        catch { }
+                    }
+                }
+                if (sess == null)
+                {
+                    sess = _scapi.Sessions.Add();
+                    sess.Open(_currentModel, 0, 0);
+                    ownSess = true;
+                }
+                dynamic mo = sess.ModelObjects;
+                dynamic ents = mo.Collect(mo.Root, "Entity");
+                foreach (dynamic ent in ents)
+                {
+                    try
+                    {
+                        string phys = "";
+                        try { phys = ent.Properties("Physical_Name")?.Value?.ToString() ?? ""; } catch { }
+                        if (string.IsNullOrWhiteSpace(phys))
+                            try { phys = ent.Name?.ToString() ?? ""; } catch { }
+                        if (!string.IsNullOrWhiteSpace(phys) && !result.Contains(phys))
+                            result.Add(phys);
+                    }
+                    catch { }
+                }
+            }
+            catch (Exception ex) { Log($"DDL: CollectModelTablePhysicalNames error: {ex.Message}"); }
+            finally
+            {
+                if (ownSess && sess != null) { try { sess.Close(); } catch { } }
+            }
+            return result;
+        }
 
         private void OnRightSourceChanged()
         {
             bool fromMart = rbFromMart.Checked;
             cmbRightModel.Visible = fromMart;
             btnConfigureDB.Visible = !fromMart;
+            btnSelectDbTables.Visible = !fromMart;
+            lblSelectedTableCount.Visible = !fromMart;
+            UpdateSelectedTableCountLabel();
 
             if (!fromMart)
             {
@@ -2813,10 +2962,209 @@ namespace EliteSoft.Erwin.AddIn
                     _dbLabel = dlg.DisplayLabel;
                     _dbTargetServer = dlg.TargetServerCode;
                     _dbTargetVersion = dlg.TargetServerVersion;
+                    _dbSchema = dlg.SchemaFilter;
+                    _dbHost = dlg.ServerHost;
+                    _dbName = dlg.DatabaseName;
+                    _dbUser = dlg.UserName;
+                    _dbUseWindowsAuth = dlg.UseWindowsAuth;
+                    _dbTypeCode = dlg.DbTypeCode;
                     lblDDLStatus.Text = $"DB configured: {_dbLabel}";
                     lblDDLStatus.ForeColor = Color.DarkGreen;
-                    Log($"DDL: DB configured: {_dbLabel}, TargetServer={_dbTargetServer}");
+                    Log($"DDL: DB configured: {_dbLabel}, host={_dbHost}, db={_dbName}, user={_dbUser}, winAuth={_dbUseWindowsAuth}, schema='{_dbSchema}'");
                 }
+            }
+        }
+
+        private void UpdateSelectedTableCountLabel()
+        {
+            if (_dbSelectedTables != null && _dbSelectedTables.Count > 0)
+                lblSelectedTableCount.Text = $"{_dbSelectedTables.Count} table(s) selected";
+            else
+                lblSelectedTableCount.Text = "(defaults to ALL model tables)";
+        }
+
+        /// <summary>
+        /// Collect entity physical names from the active model, show a CheckedListBox picker.
+        /// User can narrow the RE scope before running Generate DDL.
+        /// </summary>
+        private void BtnSelectDbTables_Click(object sender, EventArgs e)
+        {
+            if (!_isConnected || _currentModel == null)
+            {
+                ErwinAddIn.ShowTopMostMessage("No model connected.", "Select DB Tables");
+                return;
+            }
+
+            // Pull physical names from the active model
+            var modelTables = new List<string>();
+            dynamic tempSess = null;
+            bool ownSession = false;
+            try
+            {
+                // Reuse existing session if possible
+                bool hasSess = false;
+                try { hasSess = _currentModel.HasSession(); } catch { }
+
+                if (hasSess)
+                {
+                    int sessCount = 0;
+                    try { sessCount = _scapi.Sessions.Count; } catch { }
+                    for (int si = 0; si < sessCount; si++)
+                    {
+                        try
+                        {
+                            dynamic s = _scapi.Sessions.Item(si);
+                            bool open = false; try { open = s.IsOpen(); } catch { }
+                            string puN = ""; try { puN = s.PersistenceUnit?.Name?.ToString() ?? ""; } catch { }
+                            string curN = ""; try { curN = _currentModel.Name?.ToString() ?? ""; } catch { }
+                            if (open && puN == curN) { tempSess = s; break; }
+                        }
+                        catch { }
+                    }
+                }
+                if (tempSess == null)
+                {
+                    tempSess = _scapi.Sessions.Add();
+                    tempSess.Open(_currentModel, 0, 0);
+                    ownSession = true;
+                }
+
+                dynamic mo = tempSess.ModelObjects;
+                dynamic root = mo.Root;
+                dynamic ents = mo.Collect(root, "Entity");
+                foreach (dynamic ent in ents)
+                {
+                    try
+                    {
+                        string phys = "";
+                        try { phys = ent.Properties("Physical_Name")?.Value?.ToString() ?? ""; } catch { }
+                        if (string.IsNullOrWhiteSpace(phys))
+                            try { phys = ent.Name?.ToString() ?? ""; } catch { }
+                        if (!string.IsNullOrWhiteSpace(phys) && !modelTables.Contains(phys))
+                            modelTables.Add(phys);
+                    }
+                    catch { }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"DDL: Failed to enumerate model tables: {ex.Message}");
+                ErwinAddIn.ShowTopMostMessage($"Could not enumerate model tables: {ex.Message}", "Select DB Tables");
+                return;
+            }
+            finally
+            {
+                if (ownSession && tempSess != null) { try { tempSess.Close(); } catch { } }
+            }
+
+            if (modelTables.Count == 0)
+            {
+                ErwinAddIn.ShowTopMostMessage("Active model has no tables.", "Select DB Tables");
+                return;
+            }
+
+            modelTables.Sort(StringComparer.OrdinalIgnoreCase);
+
+            // Default: if user hasn't selected before, all are checked
+            var preChecked = new HashSet<string>(
+                (_dbSelectedTables != null && _dbSelectedTables.Count > 0)
+                    ? _dbSelectedTables
+                    : modelTables,
+                StringComparer.OrdinalIgnoreCase);
+
+            var result = ShowTableSelectionDialog(modelTables, preChecked);
+            if (result != null)
+            {
+                _dbSelectedTables = result;
+                UpdateSelectedTableCountLabel();
+                Log($"DDL: {result.Count} table(s) selected for From DB compare.");
+            }
+        }
+
+        /// <summary>
+        /// Lightweight inline dialog: CheckedListBox + Select All/None + OK/Cancel.
+        /// Returns selected table list or null on cancel.
+        /// </summary>
+        private List<string> ShowTableSelectionDialog(List<string> tables, HashSet<string> preChecked)
+        {
+            using (var dlg = new Form())
+            {
+                dlg.Text = "Select DB Tables to Compare";
+                dlg.StartPosition = FormStartPosition.CenterParent;
+                dlg.Size = new System.Drawing.Size(420, 520);
+                dlg.FormBorderStyle = FormBorderStyle.FixedDialog;
+                dlg.MaximizeBox = false;
+                dlg.MinimizeBox = false;
+                dlg.TopMost = true;
+
+                var lbl = new Label
+                {
+                    Text = $"Model tables ({tables.Count}). Checked = include in DB reverse engineer.",
+                    Location = new System.Drawing.Point(12, 10),
+                    Size = new System.Drawing.Size(380, 30)
+                };
+                dlg.Controls.Add(lbl);
+
+                var clb = new CheckedListBox
+                {
+                    Location = new System.Drawing.Point(12, 45),
+                    Size = new System.Drawing.Size(378, 380),
+                    CheckOnClick = true,
+                    IntegralHeight = false
+                };
+                foreach (var t in tables)
+                    clb.Items.Add(t, preChecked.Contains(t));
+                dlg.Controls.Add(clb);
+
+                var btnAll = new Button
+                {
+                    Text = "Select All",
+                    Location = new System.Drawing.Point(12, 432),
+                    Size = new System.Drawing.Size(90, 26)
+                };
+                btnAll.Click += (s, e) =>
+                {
+                    for (int i = 0; i < clb.Items.Count; i++) clb.SetItemChecked(i, true);
+                };
+                dlg.Controls.Add(btnAll);
+
+                var btnNone = new Button
+                {
+                    Text = "Select None",
+                    Location = new System.Drawing.Point(108, 432),
+                    Size = new System.Drawing.Size(90, 26)
+                };
+                btnNone.Click += (s, e) =>
+                {
+                    for (int i = 0; i < clb.Items.Count; i++) clb.SetItemChecked(i, false);
+                };
+                dlg.Controls.Add(btnNone);
+
+                var btnOk = new Button
+                {
+                    Text = "OK",
+                    DialogResult = DialogResult.OK,
+                    Location = new System.Drawing.Point(208, 432),
+                    Size = new System.Drawing.Size(85, 26)
+                };
+                dlg.Controls.Add(btnOk);
+                dlg.AcceptButton = btnOk;
+
+                var btnCancel = new Button
+                {
+                    Text = "Cancel",
+                    DialogResult = DialogResult.Cancel,
+                    Location = new System.Drawing.Point(300, 432),
+                    Size = new System.Drawing.Size(85, 26)
+                };
+                dlg.Controls.Add(btnCancel);
+                dlg.CancelButton = btnCancel;
+
+                if (dlg.ShowDialog(this) != DialogResult.OK) return null;
+
+                var selected = new List<string>();
+                foreach (var item in clb.CheckedItems) selected.Add(item.ToString());
+                return selected;
             }
         }
 
@@ -2941,1045 +3289,6 @@ namespace EliteSoft.Erwin.AddIn
 
         private string _fullLogText = "";
 
-        private void BtnDumpScapi_Click(object sender, EventArgs e)
-        {
-            Log("=== SCAPI COM Interface Discovery ===");
-            try
-            {
-                // 1. ISCApplication (_scapi)
-                Log("--- ISCApplication (SCAPI root) ---");
-                DumpComMembers(_scapi, "SCAPI");
-
-                // 2. ISCSession (_session)
-                if (_session != null)
-                {
-                    Log("--- ISCSession ---");
-                    DumpComMembers(_session, "Session");
-                }
-
-                // 3. PersistenceUnit
-                try
-                {
-                    dynamic pus = _scapi.PersistenceUnits;
-                    Log($"--- PersistenceUnits (count={pus.Count}) ---");
-                    DumpComMembers(pus, "PersistenceUnits");
-
-                    if (pus.Count > 0)
-                    {
-                        dynamic pu = pus.Item(0);
-                        Log("--- ISCPersistenceUnit (first model) ---");
-                        DumpComMembers(pu, "PU");
-                    }
-                }
-                catch (Exception ex) { Log($"PU dump error: {ex.Message}"); }
-
-                // 4. ModelObjects
-                if (_session != null)
-                {
-                    try
-                    {
-                        dynamic mo = _session.ModelObjects;
-                        Log("--- ISCModelObjects ---");
-                        DumpComMembers(mo, "ModelObjects");
-                    }
-                    catch (Exception ex) { Log($"ModelObjects dump error: {ex.Message}"); }
-                }
-
-                // 5. Probe PU properties (Mart info)
-                Log("--- PU Properties (Mart detection) ---");
-                try
-                {
-                    dynamic pu2 = _scapi.PersistenceUnits.Item(0);
-                    ProbeMethod(pu2, "PU", "Name");
-                    ProbeMethod(pu2, "PU", "ObjectId");
-
-                    // Dump ALL PU PropertyBag entries
-                    Log("--- PU PropertyBag (ALL entries) ---");
-                    try
-                    {
-                        dynamic pb = pu2.PropertyBag();
-                        int pbCount = pb.Count;
-                        Log($"  PropertyBag entries: {pbCount}");
-                        for (int pbi = 0; pbi < pbCount; pbi++)
-                        {
-                            try
-                            {
-                                string pbName = pb.Name(pbi)?.ToString() ?? "";
-                                string pbVal = pb.Value(pbName)?.ToString() ?? "";
-                                if (pbVal.Length > 100) pbVal = pbVal.Substring(0, 100) + "...";
-                                Log($"  {pbName} = {pbVal}");
-                            }
-                            catch { }
-                        }
-                    }
-                    catch (Exception ex) { Log($"  PropertyBag error: {ex.Message}"); }
-
-                    // Dump ALL PU model root properties (Target_Server, etc.)
-                    Log("--- Model Root Properties ---");
-                    try
-                    {
-                        dynamic mo = _session.ModelObjects;
-                        dynamic root = mo.Root;
-                        dynamic rootProps = root.CollectProperties();
-                        int rpCount = rootProps.Count;
-                        Log($"  Root properties: {rpCount}");
-                        int rpShown = 0;
-                        foreach (dynamic rp in rootProps)
-                        {
-                            try
-                            {
-                                string rpName = rp.ClassName ?? "";
-                                string rpVal = "";
-                                try { rpVal = rp.FormatAsString() ?? ""; } catch { }
-                                if (rpVal.Length > 100) rpVal = rpVal.Substring(0, 100) + "...";
-                                // Show all Target/Server/Platform + first 20
-                                if (rpName.Contains("Target") || rpName.Contains("Server") ||
-                                    rpName.Contains("Platform") || rpName.Contains("DB_") ||
-                                    rpShown < 20)
-                                {
-                                    Log($"  {rpName} = {rpVal}");
-                                    rpShown++;
-                                }
-                            }
-                            catch { }
-                        }
-                        if (rpShown < rpCount) Log($"  ... {rpCount - rpShown} more properties");
-                    }
-                    catch (Exception ex) { Log($"  Root props error: {ex.Message}"); }
-
-                    // Count model objects
-                    Log("--- Model Object Counts ---");
-                    try
-                    {
-                        dynamic mo2 = _session.ModelObjects;
-                        dynamic root2 = mo2.Root;
-                        string[] objTypes = { "Entity", "Relationship", "View", "Key_Group", "Attribute" };
-                        foreach (var ot in objTypes)
-                        {
-                            try
-                            {
-                                dynamic objs = mo2.Collect(root2, ot);
-                                int cnt = objs.Count;
-                                Log($"  {ot}: {cnt}");
-                                if (cnt > 0 && cnt <= 10)
-                                {
-                                    foreach (dynamic obj in objs)
-                                    {
-                                        try { Log($"    - {obj.Name}"); } catch { }
-                                    }
-                                }
-                            }
-                            catch { }
-                        }
-                    }
-                    catch { }
-                }
-                catch { }
-
-                // 6. Probe SCAPI for script execution
-                Log("--- SCAPI Script/Macro methods ---");
-                string[] scriptProbes = { "ExecuteScript", "RunScript", "RunMacro",
-                    "ExecuteMacro", "DoScript", "Eval", "Execute",
-                    "ScriptEngine", "Macros", "Scripts",
-                    "SendKeys", "DoMenuItem", "RunCommand",
-                    "Review", "CompareModels", "ModelDirectories" };
-                foreach (var name in scriptProbes)
-                    ProbeMethod(_scapi, "SCAPI", name);
-
-                // 7. Probe Session for script/review
-                Log("--- Session Script/Review methods ---");
-                string[] sessionProbes = { "Review", "Compare", "Merge",
-                    "ExecuteScript", "RunScript", "ModelDirectories" };
-                if (_session != null)
-                {
-                    foreach (var name in sessionProbes)
-                        ProbeMethod(_session, "Session", name);
-                }
-
-                // 8. ModelDirectories deep probe
-                Log("--- ModelDirectories Deep Probe ---");
-                try
-                {
-                    dynamic dirs = _scapi.ModelDirectories;
-                    Log($"ModelDirectories count: {dirs.Count}");
-                    DumpComMembers(dirs, "ModelDirs");
-
-                    // Try different index patterns (0-based, 1-based)
-                    int[] indices = { 0, 1 };
-                    foreach (int i in indices)
-                    {
-                        try
-                        {
-                            dynamic dir = dirs.Item(i);
-                            Log($"--- ModelDirectory[{i}] (success!) ---");
-                            DumpComMembers(dir, $"Dir[{i}]");
-
-                            // Try PropertyBag
-                            try
-                            {
-                                dynamic pb = dir.PropertyBag();
-                                int pbCount = pb.Count;
-                                Log($"  Dir[{i}] PropertyBag ({pbCount} entries):");
-                                for (int j = 0; j < pbCount; j++)
-                                {
-                                    try
-                                    {
-                                        string pn = pb.Name(j)?.ToString() ?? "";
-                                        string pv = pb.Value(pn)?.ToString() ?? "";
-                                        Log($"    {pn} = {pv}");
-                                    }
-                                    catch { }
-                                }
-                            }
-                            catch (Exception ex) { Log($"  Dir[{i}] PropertyBag error: {ex.Message}"); }
-
-                            // Try LocateDirectoryUnit for current model
-                            try
-                            {
-                                string modelName = _connectedModelName ?? "KKB_Demo";
-                                Log($"  Trying LocateDirectoryUnit for '{modelName}'...");
-                                dynamic locResult = dir.LocateDirectoryUnit($"mart://Mart/{modelName}", "");
-                                if (locResult != null)
-                                {
-                                    int lrCount = locResult.Count;
-                                    Log($"  LocateDirectoryUnit result: {lrCount} entries");
-                                    for (int j = 0; j < lrCount; j++)
-                                    {
-                                        try
-                                        {
-                                            string ln = locResult.Name(j)?.ToString() ?? "";
-                                            string lv = locResult.Value(ln)?.ToString() ?? "";
-                                            Log($"    {ln} = {lv}");
-                                        }
-                                        catch { }
-                                    }
-                                }
-                            }
-                            catch (Exception ex) { Log($"  LocateDirectoryUnit error: {ex.Message}"); }
-
-                            // Probe for undocumented methods
-                            string[] dirProbes = { "OpenModel", "LoadModel", "GetModel",
-                                "Connect", "Disconnect", "IsConnected",
-                                "Name", "Type", "Path", "Locator",
-                                "ResolvePath", "ResolveModel" };
-                            foreach (var probe in dirProbes)
-                                ProbeMethod(dir, $"Dir[{i}]", probe);
-                        }
-                        catch (Exception ex) { Log($"Dir[{i}] error: {ex.Message}"); }
-                    }
-
-                    // Also try foreach enumeration
-                    try
-                    {
-                        Log("--- ModelDirectories foreach ---");
-                        int idx = 0;
-                        foreach (dynamic dir in dirs)
-                        {
-                            Log($"  foreach Dir[{idx}]: {dir}");
-                            DumpComMembers(dir, $"foreach_Dir[{idx}]");
-                            try
-                            {
-                                dynamic pb = dir.PropertyBag();
-                                Log($"  foreach Dir[{idx}] PropertyBag count: {pb.Count}");
-                            }
-                            catch (Exception ex) { Log($"  foreach Dir[{idx}] PB error: {ex.Message}"); }
-                            idx++;
-                        }
-                    }
-                    catch (Exception ex) { Log($"ModelDirectories foreach error: {ex.Message}"); }
-                }
-                catch (Exception ex) { Log($"ModelDirectories probe error: {ex.Message}"); }
-
-                // 9. Diagram selection probe - find selected entities
-                Log("--- Diagram Selection Probe v2 ---");
-                if (_session != null)
-                {
-                    try
-                    {
-                        dynamic mo = _session.ModelObjects;
-                        dynamic root = mo.Root;
-
-                        // 9a. ER_Diagram properties (not shapes, the diagram itself)
-                        try
-                        {
-                            dynamic diagrams = mo.Collect(root, "ER_Diagram");
-                            Log($"ER_Diagrams: {diagrams.Count}");
-                            foreach (dynamic diag in diagrams)
-                            {
-                                try
-                                {
-                                    string dName = diag.Name ?? "";
-                                    Log($"  Diagram: '{dName}'");
-
-                                    // List ALL diagram properties
-                                    try
-                                    {
-                                        dynamic diagProps = diag.CollectProperties();
-                                        Log($"  Diagram properties ({diagProps.Count}):");
-                                        foreach (dynamic dp in diagProps)
-                                        {
-                                            try
-                                            {
-                                                string dpName = dp.ClassName ?? "";
-                                                string dpVal = "";
-                                                try { dpVal = dp.FormatAsString() ?? ""; } catch { }
-                                                Log($"    {dpName} = {dpVal}");
-                                            }
-                                            catch { }
-                                        }
-                                    }
-                                    catch (Exception ex) { Log($"  Diagram props error: {ex.Message}"); }
-
-                                    // 9b. Drawing_Object_Entity - UNTRIED TYPE
-                                    Log("--- Drawing_Object_Entity probe ---");
-                                    string[] drawObjTypes = {
-                                        "Drawing_Object_Entity",
-                                        "Drawing_Object_Relationship",
-                                        "Drawing_Object_Key_Group",
-                                        "Drawing_Object_Attribute",
-                                        "Drawing_Object"
-                                    };
-                                    foreach (string doType in drawObjTypes)
-                                    {
-                                        try
-                                        {
-                                            dynamic drawObjs = mo.Collect(diag, doType);
-                                            int doCount = 0;
-                                            try { doCount = drawObjs.Count; } catch { }
-                                            Log($"  {doType}: {doCount} objects");
-
-                                            if (doCount > 0)
-                                            {
-                                                int doIdx = 0;
-                                                foreach (dynamic dObj in drawObjs)
-                                                {
-                                                    if (doIdx >= 2) { Log($"    ... and {doCount - 2} more"); break; }
-                                                    try
-                                                    {
-                                                        string doName = "";
-                                                        try { doName = dObj.Name ?? ""; } catch { }
-                                                        int doFlags = -1;
-                                                        try { doFlags = dObj.Flags(); } catch { }
-                                                        string doClass = "";
-                                                        try { doClass = dObj.ClassName ?? ""; } catch { }
-                                                        Log($"    [{doIdx}] Name='{doName}', Class='{doClass}', Flags={doFlags}");
-
-                                                        // List ALL properties of first object of each type
-                                                        if (doIdx == 0)
-                                                        {
-                                                            try
-                                                            {
-                                                                dynamic doProps = dObj.CollectProperties();
-                                                                int dpCount = 0;
-                                                                try { dpCount = doProps.Count; } catch { }
-                                                                Log($"    Properties ({dpCount}):");
-                                                                int dpIdx = 0;
-                                                                foreach (dynamic dp in doProps)
-                                                                {
-                                                                    if (dpIdx >= 30) { Log($"      ... {dpCount - 30} more"); break; }
-                                                                    try
-                                                                    {
-                                                                        string dpName = dp.ClassName ?? "";
-                                                                        string dpVal = "";
-                                                                        try { dpVal = dp.FormatAsString() ?? ""; } catch { }
-                                                                        Log($"      {dpName} = {dpVal}");
-                                                                    }
-                                                                    catch { }
-                                                                    dpIdx++;
-                                                                }
-                                                            }
-                                                            catch (Exception ex) { Log($"    Props error: {ex.Message}"); }
-
-                                                            // COM TypeInfo on Drawing_Object
-                                                            DumpComTypeInfo(dObj, $"{doType}[0]", 30);
-                                                        }
-                                                    }
-                                                    catch { }
-                                                    doIdx++;
-                                                }
-                                            }
-                                        }
-                                        catch (Exception ex) { Log($"  {doType}: {ex.Message}"); }
-                                    }
-
-                                    // 9c. ER_Model_Shape with ALL properties (no limit)
-                                    Log("--- ER_Model_Shape ALL props ---");
-                                    try
-                                    {
-                                        dynamic shapes = mo.Collect(diag, "ER_Model_Shape");
-                                        Log($"  Shapes: {shapes.Count}");
-                                        int sIdx = 0;
-                                        foreach (dynamic shape in shapes)
-                                        {
-                                            if (sIdx >= 2) break;
-                                            try
-                                            {
-                                                string sName = shape.Name ?? "";
-                                                int sFlags = -1;
-                                                try { sFlags = shape.Flags(); } catch { }
-                                                Log($"  Shape[{sIdx}]: '{sName}', Flags={sFlags}");
-
-                                                // ALL properties, no limit
-                                                try
-                                                {
-                                                    dynamic sProps = shape.CollectProperties();
-                                                    foreach (dynamic sp in sProps)
-                                                    {
-                                                        try
-                                                        {
-                                                            string spName = sp.ClassName ?? "";
-                                                            string spVal = "";
-                                                            try { spVal = sp.FormatAsString() ?? ""; } catch { }
-                                                            Log($"    {spName} = {spVal}");
-                                                        }
-                                                        catch { }
-                                                    }
-                                                }
-                                                catch { }
-                                            }
-                                            catch { }
-                                            sIdx++;
-                                        }
-                                    }
-                                    catch (Exception ex) { Log($"  Shape error: {ex.Message}"); }
-
-                                    // 9d. Collect with MustBeOn flags on Drawing_Object_Entity
-                                    Log("--- Collect Drawing_Object_Entity with flags ---");
-                                    int[] flagsToTry = { 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096 };
-                                    foreach (int flag in flagsToTry)
-                                    {
-                                        try
-                                        {
-                                            dynamic filtered = mo.Collect(diag, "Drawing_Object_Entity", -1, flag);
-                                            int fCount = 0;
-                                            try { fCount = filtered.Count; } catch { }
-                                            if (fCount > 0)
-                                            {
-                                                Log($"  DOE MustBeOn=0x{flag:X}: {fCount} objects");
-                                                if (fCount < 10)
-                                                {
-                                                    foreach (dynamic fe in filtered)
-                                                    {
-                                                        try { Log($"    - {fe.Name}"); } catch { }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        catch { }
-                                    }
-
-                                    // Also try on ER_Model_Shape
-                                    Log("--- Collect ER_Model_Shape with flags ---");
-                                    foreach (int flag in flagsToTry)
-                                    {
-                                        try
-                                        {
-                                            dynamic filtered = mo.Collect(diag, "ER_Model_Shape", -1, flag);
-                                            int fCount = 0;
-                                            try { fCount = filtered.Count; } catch { }
-                                            if (fCount > 0)
-                                            {
-                                                Log($"  Shape MustBeOn=0x{flag:X}: {fCount} shapes");
-                                                if (fCount < 10)
-                                                {
-                                                    foreach (dynamic fe in filtered)
-                                                    {
-                                                        try { Log($"    - {fe.Name}"); } catch { }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        catch { }
-                                    }
-                                }
-                                catch { }
-                                break; // Only first diagram
-                            }
-                        }
-                        catch (Exception ex) { Log($"ER_Diagram error: {ex.Message}"); }
-
-                        // 9e. Win32: Enumerate ALL child windows of erwin with text
-                        Log("--- Win32: All erwin child windows ---");
-                        try
-                        {
-                            var hWnd = Services.Win32Helper.GetErwinMainWindow();
-                            if (hWnd != IntPtr.Zero)
-                            {
-                                var childWindows = Services.Win32Helper.EnumAllChildWindows(hWnd);
-                                Log($"  Total child windows: {childWindows.Count}");
-                                foreach (var cw in childWindows)
-                                {
-                                    if (!string.IsNullOrWhiteSpace(cw.Text) || cw.ClassName.Contains("Prop") ||
-                                        cw.ClassName.Contains("XTP") || cw.ClassName.Contains("Grid"))
-                                    {
-                                        string text = cw.Text.Length > 80 ? cw.Text.Substring(0, 80) + "..." : cw.Text;
-                                        Log($"  [{cw.ClassName}] HWND=0x{cw.Handle.ToInt64():X} Text='{text}'");
-                                    }
-                                }
-
-                                // Also check erwin status bar
-                                var statusBars = Services.Win32Helper.FindChildWindowsByClass(hWnd, "msctls_statusbar32");
-                                foreach (var sb in statusBars)
-                                {
-                                    var sbText = Services.Win32Helper.GetWindowTextSafe(sb);
-                                    Log($"  StatusBar: '{sbText}'");
-                                    // Read status bar parts via SB_GETTEXT
-                                    for (int part = 0; part < 8; part++)
-                                    {
-                                        string partText = Services.Win32Helper.GetStatusBarText(sb, part);
-                                        if (!string.IsNullOrEmpty(partText))
-                                            Log($"  StatusBar[{part}]: '{partText}'");
-                                    }
-                                }
-                            }
-                        }
-                        catch (Exception ex) { Log($"Win32 enum error: {ex.Message}"); }
-                    }
-                    catch (Exception ex) { Log($"Diagram probe error: {ex.Message}"); }
-                }
-
-                // 10. COM Type Library probe - discover ALL real methods
-                Log("--- COM TypeLib: Real Method Discovery ---");
-                try
-                {
-                    // Probe SCAPI Application for all COM methods
-                    Log("  ISCApplication methods:");
-                    DumpComTypeInfo(_scapi, "SCAPI", 20);
-
-                    // Probe Session
-                    if (_session != null)
-                    {
-                        Log("  ISCSession methods:");
-                        DumpComTypeInfo(_session, "Session", 20);
-                    }
-
-                    // Probe PU
-                    try
-                    {
-                        dynamic pu = _scapi.PersistenceUnits.Item(0);
-                        Log("  ISCPersistenceUnit methods:");
-                        DumpComTypeInfo(pu, "PU", 30);
-                    }
-                    catch { }
-
-                    // Probe ModelObjects collection
-                    if (_session != null)
-                    {
-                        try
-                        {
-                            dynamic moCol = _session.ModelObjects;
-                            Log("  ISCModelObjectCollection methods:");
-                            DumpComTypeInfo(moCol, "ModelObjects", 20);
-                        }
-                        catch { }
-                    }
-
-                    // Probe NEW undocumented properties!
-                    Log("  --- ApplicationWindows probe ---");
-                    try
-                    {
-                        dynamic appWindows = _scapi.ApplicationWindows;
-                        Log($"  ApplicationWindows = {appWindows}");
-                        DumpComTypeInfo(appWindows, "AppWindows", 30);
-
-                        try
-                        {
-                            int wCount = appWindows.Count;
-                            Log($"  AppWindows.Count = {wCount}");
-                            for (int w = 0; w < Math.Min(wCount, 5); w++)
-                            {
-                                try
-                                {
-                                    dynamic win = appWindows.Item(w);
-                                    Log($"  AppWindow[{w}]: {win}");
-                                    DumpComTypeInfo(win, $"Win[{w}]", 30);
-
-                                    // Try to get window properties
-                                    string[] winProbes = { "Name", "Title", "Type", "Selection",
-                                        "SelectedObjects", "ActiveObject", "DiagramName" };
-                                    foreach (var p in winProbes)
-                                        ProbeMethod(win, $"Win[{w}]", p);
-                                }
-                                catch (Exception ex) { Log($"  AppWindow[{w}] error: {ex.Message}"); }
-                            }
-                        }
-                        catch (Exception ex) { Log($"  AppWindows enumerate: {ex.Message}"); }
-                    }
-                    catch (Exception ex) { Log($"  ApplicationWindows: {ex.Message}"); }
-
-                    Log("  --- ApplicationServices probe ---");
-                    try
-                    {
-                        dynamic appServices = _scapi.ApplicationServices;
-                        Log($"  ApplicationServices = {appServices}");
-                        DumpComTypeInfo(appServices, "AppServices", 30);
-
-                        // Try to enumerate services
-                        try
-                        {
-                            int sCount = appServices.Count;
-                            Log($"  AppServices.Count = {sCount}");
-                        }
-                        catch { }
-
-                        // Try known service names
-                        string[] svcProbes = { "Selection", "DiagramService", "UIService",
-                            "SelectionService", "ModelService", "WindowService" };
-                        foreach (var svc in svcProbes)
-                            ProbeMethod(appServices, "AppServices", svc);
-                    }
-                    catch (Exception ex) { Log($"  ApplicationServices: {ex.Message}"); }
-                }
-                catch (Exception ex) { Log($"COM TypeLib error: {ex.Message}"); }
-
-                // 10b. Selection Change Detector - compare state before/after user selection
-                Log("--- Selection Change Detector (15 seconds) ---");
-                Log("--- SELECT OR DESELECT entities in erwin NOW! ---");
-                try
-                {
-                    var hWnd = Services.Win32Helper.GetErwinMainWindow();
-
-                    // Take BEFORE snapshot of all child window texts
-                    var beforeWindows = Services.Win32Helper.EnumAllChildWindows(hWnd);
-                    var beforeTexts = new Dictionary<IntPtr, string>();
-                    foreach (var cw in beforeWindows)
-                        beforeTexts[cw.Handle] = cw.Text;
-                    string beforeTitle = Services.Win32Helper.GetWindowTextSafe(hWnd);
-
-                    // Take BEFORE snapshot of Drawing_Object_Entity flags
-                    var beforeDOEFlags = new Dictionary<string, int>();
-                    var beforeShapeFlags = new Dictionary<string, int>();
-                    if (_session != null)
-                    {
-                        try
-                        {
-                            dynamic moSnap = _session.ModelObjects;
-                            dynamic rootSnap = moSnap.Root;
-                            dynamic diags = moSnap.Collect(rootSnap, "ER_Diagram");
-                            foreach (dynamic dg in diags)
-                            {
-                                try
-                                {
-                                    dynamic does = moSnap.Collect(dg, "Drawing_Object_Entity");
-                                    foreach (dynamic doe in does)
-                                    {
-                                        try
-                                        {
-                                            string n = doe.Name ?? "";
-                                            int f = -1;
-                                            try { f = doe.Flags(); } catch { }
-                                            beforeDOEFlags[n] = f;
-                                        }
-                                        catch { }
-                                    }
-                                }
-                                catch { }
-
-                                try
-                                {
-                                    dynamic shs = moSnap.Collect(dg, "ER_Model_Shape");
-                                    foreach (dynamic sh in shs)
-                                    {
-                                        try
-                                        {
-                                            string n = sh.Name ?? "";
-                                            int f = -1;
-                                            try { f = sh.Flags(); } catch { }
-                                            beforeShapeFlags[n] = f;
-                                        }
-                                        catch { }
-                                    }
-                                }
-                                catch { }
-                                break;
-                            }
-                        }
-                        catch { }
-                    }
-                    Log($"  Snapshot taken: {beforeTexts.Count} windows, {beforeDOEFlags.Count} DOEs, {beforeShapeFlags.Count} shapes");
-                    Log($"  Title: '{beforeTitle}'");
-
-                    // Wait 15 seconds for user to select/deselect
-                    for (int tick = 0; tick < 30; tick++)
-                    {
-                        System.Threading.Thread.Sleep(500);
-                        Application.DoEvents();
-                        if (tick % 6 == 0) Log($"  Waiting... {15 - tick / 2}s remaining");
-                    }
-
-                    // Take AFTER snapshot and compare
-                    Log("--- Comparing BEFORE vs AFTER ---");
-
-                    string afterTitle = Services.Win32Helper.GetWindowTextSafe(hWnd);
-                    if (afterTitle != beforeTitle)
-                        Log($"  TITLE CHANGED: '{beforeTitle}' -> '{afterTitle}'");
-
-                    var afterWindows = Services.Win32Helper.EnumAllChildWindows(hWnd);
-                    foreach (var cw in afterWindows)
-                    {
-                        string beforeText = "";
-                        beforeTexts.TryGetValue(cw.Handle, out beforeText);
-                        if (cw.Text != beforeText && (!string.IsNullOrEmpty(cw.Text) || !string.IsNullOrEmpty(beforeText)))
-                        {
-                            string bt = (beforeText ?? "").Length > 60 ? beforeText.Substring(0, 60) + "..." : (beforeText ?? "");
-                            string at = cw.Text.Length > 60 ? cw.Text.Substring(0, 60) + "..." : cw.Text;
-                            Log($"  WIN CHANGED [{cw.ClassName}] '{bt}' -> '{at}'");
-                        }
-                    }
-
-                    // Compare DOE flags
-                    if (_session != null)
-                    {
-                        try
-                        {
-                            dynamic moSnap2 = _session.ModelObjects;
-                            dynamic rootSnap2 = moSnap2.Root;
-                            dynamic diags2 = moSnap2.Collect(rootSnap2, "ER_Diagram");
-                            foreach (dynamic dg2 in diags2)
-                            {
-                                try
-                                {
-                                    dynamic does2 = moSnap2.Collect(dg2, "Drawing_Object_Entity");
-                                    foreach (dynamic doe2 in does2)
-                                    {
-                                        try
-                                        {
-                                            string n = doe2.Name ?? "";
-                                            int f = -1;
-                                            try { f = doe2.Flags(); } catch { }
-                                            int bf = -1;
-                                            beforeDOEFlags.TryGetValue(n, out bf);
-                                            if (f != bf)
-                                                Log($"  DOE FLAG CHANGED: '{n}' {bf} -> {f}");
-                                        }
-                                        catch { }
-                                    }
-                                }
-                                catch { }
-
-                                try
-                                {
-                                    dynamic shs2 = moSnap2.Collect(dg2, "ER_Model_Shape");
-                                    foreach (dynamic sh2 in shs2)
-                                    {
-                                        try
-                                        {
-                                            string n = sh2.Name ?? "";
-                                            int f = -1;
-                                            try { f = sh2.Flags(); } catch { }
-                                            int bf = -1;
-                                            beforeShapeFlags.TryGetValue(n, out bf);
-                                            if (f != bf)
-                                                Log($"  SHAPE FLAG CHANGED: '{n}' {bf} -> {f}");
-                                        }
-                                        catch { }
-                                    }
-                                }
-                                catch { }
-                                break;
-                            }
-                        }
-                        catch { }
-                    }
-
-                    // Also check status bar after selection
-                    var statusBars = Services.Win32Helper.FindChildWindowsByClass(hWnd, "msctls_statusbar32");
-                    foreach (var sb in statusBars)
-                    {
-                        for (int part = 0; part < 8; part++)
-                        {
-                            string partText = Services.Win32Helper.GetStatusBarText(sb, part);
-                            if (!string.IsNullOrEmpty(partText))
-                                Log($"  StatusBar[{part}] after: '{partText}'");
-                        }
-                    }
-
-                    Log("--- Selection Change Detector complete ---");
-                }
-                catch (Exception ex) { Log($"Selection detector error: {ex.Message}"); }
-
-                // 11. UI Automation - diagram selected objects
-                Log("--- UI Automation: Diagram Selection ---");
-                try
-                {
-                    var hWnd = Services.Win32Helper.GetErwinMainWindow();
-                    if (hWnd != IntPtr.Zero)
-                    {
-                        var rootEl = System.Windows.Automation.AutomationElement.FromHandle(hWnd);
-
-                        // Find all elements with "Selected" state
-                        var selectedElements = rootEl.FindAll(
-                            System.Windows.Automation.TreeScope.Descendants,
-                            new System.Windows.Automation.PropertyCondition(
-                                System.Windows.Automation.AutomationElement.HasKeyboardFocusProperty, true));
-
-                        Log($"  Focused elements: {selectedElements.Count}");
-                        foreach (System.Windows.Automation.AutomationElement el in selectedElements)
-                        {
-                            try
-                            {
-                                Log($"  Focused: '{el.Current.Name}' Type={el.Current.ControlType.ProgrammaticName} AutoId={el.Current.AutomationId}");
-                            }
-                            catch { }
-                        }
-
-                        // Find elements with SelectionPattern
-                        var allElements = rootEl.FindAll(
-                            System.Windows.Automation.TreeScope.Descendants,
-                            System.Windows.Automation.Condition.TrueCondition);
-
-                        int selCount = 0;
-                        foreach (System.Windows.Automation.AutomationElement el in allElements)
-                        {
-                            try
-                            {
-                                // Check SelectionItemPattern (selected state)
-                                if (el.TryGetCurrentPattern(System.Windows.Automation.SelectionItemPattern.Pattern, out object pattern))
-                                {
-                                    var selItem = (System.Windows.Automation.SelectionItemPattern)pattern;
-                                    if (selItem.Current.IsSelected)
-                                    {
-                                        Log($"  SELECTED: '{el.Current.Name}' Type={el.Current.ControlType.ProgrammaticName}");
-                                        selCount++;
-                                    }
-                                }
-
-                                // Check if element name matches entity names and has selection state
-                                string elName = el.Current.Name ?? "";
-                                if (!string.IsNullOrEmpty(elName))
-                                {
-                                    try
-                                    {
-                                        var states = el.Current.ItemStatus;
-                                        if (!string.IsNullOrEmpty(states) && states.Contains("select"))
-                                        {
-                                            Log($"  ItemStatus='{states}': '{elName}'");
-                                        }
-                                    }
-                                    catch { }
-                                }
-                            }
-                            catch { }
-                        }
-                        Log($"  Total selected via UI Automation: {selCount}");
-                    }
-                }
-                catch (Exception ex) { Log($"UI Automation selection error: {ex.Message}"); }
-
-                // 11. IAccessible (MSAA) - try diagram canvas
-                Log("--- IAccessible: Diagram Canvas ---");
-                try
-                {
-                    var hWnd = Services.Win32Helper.GetErwinMainWindow();
-                    if (hWnd != IntPtr.Zero)
-                    {
-                        // Find AfxFrameOrView140 (diagram canvas) child windows
-                        var canvasWindows = new List<IntPtr>();
-                        Services.Win32Helper.EnumChildWindowsByClass(hWnd, "AfxFrameOrView140", canvasWindows);
-                        Log($"  AfxFrameOrView140 windows: {canvasWindows.Count}");
-
-                        foreach (var canvasHwnd in canvasWindows)
-                        {
-                            try
-                            {
-                                var acc = Services.Win32Helper.GetAccessibleObject(canvasHwnd);
-                                if (acc != null)
-                                {
-                                    string accName = "";
-                                    try { accName = acc.accName[0] ?? ""; } catch { }
-                                    int childCount = 0;
-                                    try { childCount = acc.accChildCount; } catch { }
-                                    Log($"  Canvas HWND={canvasHwnd}: Name='{accName}', Children={childCount}");
-
-                                    // Check selected children
-                                    try
-                                    {
-                                        dynamic selection = acc.accSelection;
-                                        if (selection != null)
-                                        {
-                                            Log($"  accSelection type: {selection.GetType().Name}");
-                                            Log($"  accSelection: {selection}");
-                                        }
-                                    }
-                                    catch (Exception ex) { Log($"  accSelection: {ex.Message}"); }
-
-                                    // Enumerate children
-                                    for (int c = 1; c <= Math.Min(childCount, 5); c++)
-                                    {
-                                        try
-                                        {
-                                            string cName = acc.accName[c]?.ToString() ?? "";
-                                            int cState = 0;
-                                            try { cState = (int)acc.accState[c]; } catch { }
-                                            bool isSelected = (cState & 0x2) != 0; // STATE_SYSTEM_SELECTED = 0x2
-                                            bool isFocused = (cState & 0x4) != 0;  // STATE_SYSTEM_FOCUSED = 0x4
-
-                                            Log($"  Child[{c}]: '{cName}', State=0x{cState:X}, Selected={isSelected}, Focused={isFocused}");
-                                        }
-                                        catch { }
-                                    }
-                                }
-                            }
-                            catch (Exception ex) { Log($"  IAccessible error: {ex.Message}"); }
-                        }
-                    }
-                }
-                catch (Exception ex) { Log($"IAccessible error: {ex.Message}"); }
-
-                Log("=== SCAPI Discovery Complete ===");
-            }
-            catch (Exception ex)
-            {
-                Log($"SCAPI dump error: {ex.Message}");
-            }
-        }
-
-        private void DumpComMembers(dynamic comObj, string label)
-        {
-            try
-            {
-                Type type = comObj.GetType();
-                Log($"  [{label}] COM Type: {type.FullName}");
-
-                // Get IDispatch type info
-                var members = type.GetMembers(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
-                foreach (var member in members)
-                {
-                    if (member.DeclaringType == typeof(object)) continue;
-                    string kind = member.MemberType.ToString();
-                    Log($"  [{label}] {kind}: {member.Name}");
-                }
-
-            }
-            catch (Exception ex)
-            {
-                Log($"  [{label}] Reflection error: {ex.Message}");
-            }
-        }
-
-        [DllImport("oleaut32.dll")]
-        private static extern int DispGetIDsOfNames(IntPtr ptinfo, [MarshalAs(UnmanagedType.LPArray, ArraySubType = UnmanagedType.LPWStr)] string[] names, int count, [Out] int[] dispids);
-
-        private void DumpComTypeInfo(object comObj, string label, int maxMethods)
-        {
-            try
-            {
-                // Get IDispatch pointer
-                IntPtr pDisp = Marshal.GetIDispatchForObject(comObj);
-                try
-                {
-                    // Call IDispatch::GetTypeInfo(0, LOCALE_SYSTEM_DEFAULT, &pTypeInfo)
-                    IntPtr pTypeInfo = IntPtr.Zero;
-                    int hr = Marshal.QueryInterface(pDisp, in _iidITypeInfo, out pTypeInfo);
-
-                    // Alternative: use GetTypeInfo via vtable
-                    // IDispatch vtable: [QI, AddRef, Release, GetTypeInfoCount, GetTypeInfo, GetIDsOfNames, Invoke]
-                    // GetTypeInfo is at offset 4 (index 4)
-                    IntPtr vtable = Marshal.ReadIntPtr(pDisp);
-                    IntPtr getTypeInfoPtr = Marshal.ReadIntPtr(vtable, 4 * IntPtr.Size); // GetTypeInfo
-
-                    // Call GetTypeInfo(0, 0, &typeInfo)
-                    var getTypeInfo = Marshal.GetDelegateForFunctionPointer<GetTypeInfoDelegate>(getTypeInfoPtr);
-                    hr = getTypeInfo(pDisp, 0, 0, out IntPtr typeInfoResult);
-
-                    if (hr == 0 && typeInfoResult != IntPtr.Zero)
-                    {
-                        var typeInfo = (System.Runtime.InteropServices.ComTypes.ITypeInfo)Marshal.GetObjectForIUnknown(typeInfoResult);
-
-                        typeInfo.GetTypeAttr(out IntPtr pTypeAttr);
-                        var typeAttr = Marshal.PtrToStructure<System.Runtime.InteropServices.ComTypes.TYPEATTR>(pTypeAttr);
-                        Log($"    [{label}] COM Interface: {typeAttr.cFuncs} functions, {typeAttr.cVars} vars");
-
-                        for (int f = 0; f < Math.Min(typeAttr.cFuncs, maxMethods); f++)
-                        {
-                            typeInfo.GetFuncDesc(f, out IntPtr pFuncDesc);
-                            var funcDesc = Marshal.PtrToStructure<System.Runtime.InteropServices.ComTypes.FUNCDESC>(pFuncDesc);
-
-                            string[] names = new string[1];
-                            typeInfo.GetNames(funcDesc.memid, names, 1, out int nameCount);
-                            string funcName = nameCount > 0 ? names[0] : $"(memid={funcDesc.memid})";
-
-                            Log($"    [{label}] {funcName} (params={funcDesc.cParams}, kind={funcDesc.invkind})");
-                            typeInfo.ReleaseFuncDesc(pFuncDesc);
-                        }
-
-                        typeInfo.ReleaseTypeAttr(pTypeAttr);
-                        Marshal.Release(typeInfoResult);
-                    }
-                    else
-                    {
-                        Log($"    [{label}] GetTypeInfo failed: hr=0x{hr:X}");
-                    }
-                }
-                finally
-                {
-                    Marshal.Release(pDisp);
-                }
-            }
-            catch (Exception ex)
-            {
-                Log($"    [{label}] TypeInfo error: {ex.Message}");
-            }
-        }
-
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-        private delegate int GetTypeInfoDelegate(IntPtr pDisp, uint iTInfo, uint lcid, out IntPtr ppTInfo);
-
-        private static Guid _iidITypeInfo = new Guid("00020401-0000-0000-C000-000000000046");
-
-        private void ProbeMethod(dynamic obj, string label, string methodName)
-        {
-            try
-            {
-                Type type = obj.GetType();
-                var method = type.GetMethod(methodName);
-                var prop = type.GetProperty(methodName);
-
-                if (method != null)
-                    Log($"  [{label}] FOUND METHOD: {methodName}({string.Join(", ", method.GetParameters().Select(p => p.ParameterType.Name))})");
-                else if (prop != null)
-                    Log($"  [{label}] FOUND PROPERTY: {methodName} ({prop.PropertyType.Name})");
-            }
-            catch { }
-
-            // Try as property via IDispatch
-            try
-            {
-                var result = obj.GetType().InvokeMember(methodName,
-                    System.Reflection.BindingFlags.GetProperty | System.Reflection.BindingFlags.IgnoreCase,
-                    null, obj, null);
-                string valStr = result?.ToString() ?? "(null)";
-                if (valStr.Length > 80) valStr = valStr.Substring(0, 80) + "...";
-                Log($"  [{label}] PROP '{methodName}' = {valStr}");
-                return;
-            }
-            catch (Exception ex)
-            {
-                string msg = ex.InnerException?.Message ?? ex.Message;
-                if (!msg.Contains("not found") && !msg.Contains("Unknown name") && !msg.Contains("DISP_E_UNKNOWNNAME"))
-                {
-                    Log($"  [{label}] '{methodName}' RECOGNIZED: {msg}");
-                    return;
-                }
-            }
-
-            // Try as method with no args
-            try
-            {
-                var result = obj.GetType().InvokeMember(methodName,
-                    System.Reflection.BindingFlags.InvokeMethod | System.Reflection.BindingFlags.IgnoreCase,
-                    null, obj, null);
-                Log($"  [{label}] METHOD '{methodName}()' = {result}");
-            }
-            catch (Exception ex)
-            {
-                string msg = ex.InnerException?.Message ?? ex.Message;
-                if (!msg.Contains("not found") && !msg.Contains("Unknown name") && !msg.Contains("DISP_E_UNKNOWNNAME"))
-                {
-                    Log($"  [{label}] '{methodName}()' RECOGNIZED: {msg}");
-                }
-            }
-        }
 
         private void BtnClearLog_Click(object sender, EventArgs e)
         {
@@ -4012,707 +3321,592 @@ namespace EliteSoft.Erwin.AddIn
         }
 
         /// <summary>
-        /// Deep RE Capture: takes before/after snapshot of ALL SCAPI state when user does manual RE.
-        /// Captures PropertyBag, root properties, sessions, model objects for the NEW PU.
+        /// Manual snapshot of ALL PUs (PropertyBag, model objects, FEModel_DDL).
+        /// Press this AFTER manually completing RE in erwin to dump the resulting state.
+        /// SAFE MODE: dumps Active_Model PU first, never opens temp Session on already-open PU,
+        /// FEModel_DDL is OPT-IN (Ctrl held while clicking) to avoid erwin crashes.
         /// </summary>
-        private async void BtnCaptureRE_Click(object sender, EventArgs e)
+        private void BtnCaptureNow_Click(object sender, EventArgs e)
         {
-            btnCaptureRE.Enabled = false;
-            btnCaptureRE.Text = "Listening...";
-            Log("========================================");
-            Log("=== DEEP RE LISTENER ===");
-            Log("========================================");
-            Log("Do RE in erwin now. Listening for 5 minutes...");
-            Log("");
-
-            // BEFORE snapshot
-            var beforePUs = new Dictionary<string, Dictionary<string, string>>();
-            int beforePUCount = 0;
+            btnCaptureNow.Enabled = false;
+            bool includeDdl = (Control.ModifierKeys & Keys.Control) == Keys.Control;
             try
             {
-                beforePUCount = _scapi.PersistenceUnits.Count;
-                Log($"BEFORE: {beforePUCount} PU(s)");
-                for (int i = 0; i < beforePUCount; i++)
+                Log("");
+                Log("========================================");
+                Log("=== CAPTURE NOW: All PUs Snapshot ===");
+                Log("========================================");
+                Log($"Timestamp: {DateTime.Now:HH:mm:ss.fff}");
+                Log($"Include FEModel_DDL: {includeDdl} (hold Ctrl while clicking to enable)");
+
+                int puCount = 0;
+                try { puCount = _scapi.PersistenceUnits.Count; } catch (Exception ex) { Log($"PU count error: {ex.Message}"); }
+                int sessCount = 0;
+                try { sessCount = _scapi.Sessions.Count; } catch { }
+                Log($"PUs: {puCount}, Sessions: {sessCount}");
+                Log("");
+
+                // Build session-by-PU map (for safe model inspection without opening NEW sessions)
+                var sessionByPuName = new Dictionary<string, dynamic>(StringComparer.OrdinalIgnoreCase);
+                Log("--- Sessions Overview ---");
+                for (int si = 0; si < sessCount; si++)
                 {
+                    try
+                    {
+                        dynamic sess = _scapi.Sessions.Item(si);
+                        string sName = ""; try { sName = sess.Name?.ToString() ?? ""; } catch { }
+                        bool isOpen = false; try { isOpen = sess.IsOpen(); } catch { }
+                        string sPU = ""; try { sPU = sess.PersistenceUnit?.Name?.ToString() ?? ""; } catch { }
+                        Log($"  Session[{si}]: '{sName}' isOpen={isOpen} PU='{sPU}'");
+                        if (isOpen && !string.IsNullOrEmpty(sPU) && !sessionByPuName.ContainsKey(sPU))
+                            sessionByPuName[sPU] = sess;
+                    }
+                    catch (Exception ex) { Log($"  Session[{si}]: error={ex.Message}"); }
+                }
+                Log("");
+
+                // Build dump order: Active_Model PUs FIRST, then others
+                var order = new List<int>();
+                var activeIdx = new List<int>();
+                var inactiveIdx = new List<int>();
+                for (int i = 0; i < puCount; i++)
+                {
+                    bool active = false;
                     try
                     {
                         dynamic pu = _scapi.PersistenceUnits.Item(i);
-                        string puName = pu.Name?.ToString() ?? $"PU_{i}";
-                        var props = new Dictionary<string, string>();
-                        try
-                        {
-                            dynamic pb = pu.PropertyBag();
-                            int cnt = pb.Count;
-                            for (int j = 0; j < cnt; j++)
-                            {
-                                try
-                                {
-                                    string n = pb.Name(j)?.ToString() ?? "";
-                                    string v = pb.Value(n)?.ToString() ?? "";
-                                    props[n] = v;
-                                }
-                                catch { }
-                            }
-                        }
-                        catch { }
-                        beforePUs[puName] = props;
-                        Log($"  PU[{i}]: '{puName}' ({props.Count} props)");
+                        string v = pu.PropertyBag().Value("Active_Model")?.ToString() ?? "";
+                        active = v.Equals("True", StringComparison.OrdinalIgnoreCase) || v == "1";
                     }
                     catch { }
+                    if (active) activeIdx.Add(i); else inactiveIdx.Add(i);
                 }
-            }
-            catch (Exception ex) { Log($"BEFORE snapshot error: {ex.Message}"); }
+                order.AddRange(activeIdx);
+                order.AddRange(inactiveIdx);
+                Log($"Dump order (Active first): [{string.Join(",", order)}]");
+                Log("");
 
-            int beforeSessCount = 0;
-            try { beforeSessCount = _scapi.Sessions.Count; } catch { }
-            Log($"BEFORE: {beforeSessCount} session(s)");
-
-            Log("=== NOW DO REVERSE ENGINEER IN ERWIN! (120 seconds) ===");
-            Log("=== File > New > SQL Server > Tools > Reverse Engineer ===");
-
-            // Poll for new PU every 2 seconds for 120 seconds
-            bool newPUFound = false;
-            for (int tick = 0; tick < 60; tick++)
-            {
-                await System.Threading.Tasks.Task.Delay(2000);
-
-                int currentPUCount = 0;
-                try { currentPUCount = _scapi.PersistenceUnits.Count; } catch { }
-
-                if (currentPUCount != beforePUCount)
+                foreach (int i in order)
                 {
-                    Log($"  [t={tick * 2}s] PU count changed: {beforePUCount} -> {currentPUCount}");
+                    try { DumpPUFull(i, sessionByPuName, includeDdl); }
+                    catch (Exception ex) { Log($"  PU[{i}] DUMP CRASH: {ex.Message}"); }
+                    Log("");
                 }
 
-                // Check for new PU names
-                try
-                {
-                    for (int i = 0; i < currentPUCount; i++)
-                    {
-                        try
-                        {
-                            dynamic pu = _scapi.PersistenceUnits.Item(i);
-                            string puName = pu.Name?.ToString() ?? "";
-                            if (!beforePUs.ContainsKey(puName))
-                            {
-                                Log($"  [t={tick * 2}s] NEW PU DETECTED: '{puName}'");
-                                newPUFound = true;
-
-                                // Save empty model as template (correct Target_Server)
-                                string templatePath = System.IO.Path.Combine(
-                                    System.IO.Path.GetDirectoryName(typeof(DdlGenerationService).Assembly.Location) ?? "",
-                                    "tools", "sqlserver_template.erwin");
-                                try
-                                {
-                                    System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(templatePath));
-                                    pu.Save(templatePath, "OVF=Yes");
-                                    long tplSize = new System.IO.FileInfo(templatePath).Length;
-                                    string actualTS = pu.PropertyBag().Value("Target_Server")?.ToString() ?? "";
-                                    Log($"  TEMPLATE SAVED: {templatePath} ({tplSize} bytes, TS={actualTS})");
-                                }
-                                catch (Exception ex) { Log($"  Template save: {ex.Message}"); }
-
-                                // RE creates a DIFFERENT model (Model_2)!
-                                // Poll ALL PUs for entities, not just Model_1
-                                Log("=== DO RE NOW! Scanning ALL PUs for entities... ===");
-                                dynamic rePU = null;
-                                for (int wait = 0; wait < 40; wait++)
-                                {
-                                    await System.Threading.Tasks.Task.Delay(3000);
-                                    int puCount = 0;
-                                    try { puCount = _scapi.PersistenceUnits.Count; } catch { }
-
-                                    for (int pi = 0; pi < puCount; pi++)
-                                    {
-                                        try
-                                        {
-                                            dynamic checkPU = _scapi.PersistenceUnits.Item(pi);
-                                            string checkName = checkPU.Name?.ToString() ?? "";
-                                            if (beforePUs.ContainsKey(checkName)) continue; // skip known PUs
-
-                                            dynamic chkSess = _scapi.Sessions.Add();
-                                            chkSess.Open(checkPU, 0, 0);
-                                            dynamic chkMo = chkSess.ModelObjects;
-                                            dynamic chkEnts = chkMo.Collect(chkMo.Root, "Entity");
-                                            int entCount = chkEnts.Count;
-                                            try { chkSess.Close(); } catch { }
-
-                                            Log($"  [{wait * 3}s] PU '{checkName}': {entCount} entities");
-                                            if (entCount > 0)
-                                            {
-                                                rePU = checkPU;
-                                                puName = checkName;
-                                                Log($"  *** FOUND RE MODEL: '{checkName}' with {entCount} entities! ***");
-                                                break;
-                                            }
-                                        }
-                                        catch { }
-                                    }
-                                    if (rePU != null) break;
-                                    if (wait % 5 == 0) Log($"  Waiting... {120 - wait * 3}s (PUs={puCount})");
-                                }
-
-                                // Wait for model to fully load, then capture DDL
-                                // Wait for model to stabilize (poll FEModel_DDL)
-                                Log("--- Waiting for model to stabilize... ---");
-                                for (int stab = 0; stab < 30; stab++) // max 30s
-                                {
-                                    await System.Threading.Tasks.Task.Delay(1000);
-                                    try
-                                    {
-                                        string probe = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "stab_probe.sql");
-                                        (rePU ?? pu).FEModel_DDL(probe, "");
-                                        if (System.IO.File.Exists(probe) && new System.IO.FileInfo(probe).Length > 0)
-                                        {
-                                            Log($"  Stable after {stab + 1}s");
-                                            try { System.IO.File.Delete(probe); } catch { }
-                                            break;
-                                        }
-                                        try { System.IO.File.Delete(probe); } catch { }
-                                    }
-                                    catch { }
-                                }
-
-                                Log("--- FINAL CAPTURE ---");
-                                dynamic targetPU = rePU ?? pu;
-                                dynamic capturedSession = null;
-                                try
-                                {
-                                    capturedSession = _scapi.Sessions.Add();
-                                    capturedSession.Open(targetPU, 0, 0);
-
-                                    dynamic cMo = capturedSession.ModelObjects;
-                                    dynamic cRoot = cMo.Root;
-                                    dynamic cEntities = cMo.Collect(cRoot, "Entity");
-                                    Log($"  Entities: {cEntities.Count}");
-                                    int ei = 0;
-                                    foreach (dynamic ent in cEntities)
-                                    {
-                                        if (ei >= 20) { Log("    ..."); break; }
-                                        try { Log($"    - {ent.Name}"); } catch { }
-                                        ei++;
-                                    }
-
-                                    // Try FEModel_DDL with retries
-                                    string testDdl2 = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "capture_re_ddl.sql");
-                                    for (int retry = 0; retry < 3; retry++)
-                                    {
-                                        try
-                                        {
-                                            targetPU.FEModel_DDL(testDdl2, "");
-                                            if (System.IO.File.Exists(testDdl2))
-                                            {
-                                                long sz = new System.IO.FileInfo(testDdl2).Length;
-                                                Log($"  FEModel_DDL (try {retry + 1}): {sz} bytes");
-                                                if (sz > 0)
-                                                {
-                                                    string ddlSample = System.IO.File.ReadAllText(testDdl2);
-                                                    var lines = ddlSample.Split('\n');
-                                                    for (int li = 0; li < Math.Min(20, lines.Length); li++)
-                                                        if (!string.IsNullOrWhiteSpace(lines[li]))
-                                                            Log($"  | {lines[li].TrimEnd()}");
-                                                    if (lines.Length > 20) Log($"  | ... ({lines.Length} lines)");
-                                                    break; // success
-                                                }
-                                            }
-                                        }
-                                        catch (Exception ex)
-                                        {
-                                            Log($"  FEModel_DDL try {retry + 1}: {ex.Message}");
-                                            if (retry < 2)
-                                            {
-                                                Log($"  Waiting 10s before retry...");
-                                                try { capturedSession.Close(); } catch { }
-                                                await System.Threading.Tasks.Task.Delay(10000);
-                                                capturedSession = _scapi.Sessions.Add();
-                                                capturedSession.Open(targetPU, 0, 0);
-                                            }
-                                        }
-                                    }
-                                    try { System.IO.File.Delete(testDdl2); } catch { }
-                                    try { capturedSession.Close(); } catch { }
-                                }
-                                catch (Exception ex) { Log($"  Final capture: {ex.Message}"); }
-
-                                // DEEP DUMP of the new PU
-                                Log($"=== DEEP DUMP: New PU '{puName}' ===");
-
-                                // 1. PropertyBag
-                                Log("--- PropertyBag ---");
-                                try
-                                {
-                                    dynamic pb = pu.PropertyBag();
-                                    int cnt = pb.Count;
-                                    for (int j = 0; j < cnt; j++)
-                                    {
-                                        try
-                                        {
-                                            string n = pb.Name(j)?.ToString() ?? "";
-                                            string v = pb.Value(n)?.ToString() ?? "";
-                                            Log($"  {n} = {v}");
-                                        }
-                                        catch { }
-                                    }
-                                }
-                                catch (Exception ex) { Log($"  PB error: {ex.Message}"); }
-
-                                // 2. HasSession
-                                bool hasSess = false;
-                                try { hasSess = pu.HasSession(); } catch { }
-                                Log($"--- HasSession: {hasSess} ---");
-
-                                // 3. Session details
-                                int sessCount = 0;
-                                try { sessCount = _scapi.Sessions.Count; } catch { }
-                                Log($"--- Sessions: {sessCount} (was {beforeSessCount}) ---");
-
-                                for (int si = 0; si < sessCount; si++)
-                                {
-                                    try
-                                    {
-                                        dynamic sess = _scapi.Sessions.Item(si);
-                                        string sName = sess.Name?.ToString() ?? "";
-                                        bool isOpen = false;
-                                        try { isOpen = sess.IsOpen(); } catch { }
-                                        string sPU = "";
-                                        try { sPU = sess.PersistenceUnit?.Name?.ToString() ?? ""; } catch { }
-                                        Log($"  Session[{si}]: name='{sName}', isOpen={isOpen}, PU='{sPU}'");
-
-                                        // If this session belongs to the new PU, dump model objects
-                                        if (isOpen && (sPU == puName || si >= beforeSessCount))
-                                        {
-                                            Log($"  --- Session[{si}] ModelObjects ---");
-                                            try
-                                            {
-                                                dynamic mo = sess.ModelObjects;
-                                                dynamic root = mo.Root;
-                                                Log($"  Root: {root.Name}");
-
-                                                // Root properties (ALL)
-                                                Log($"  --- Root Properties ---");
-                                                try
-                                                {
-                                                    dynamic rootProps = root.CollectProperties();
-                                                    foreach (dynamic rp in rootProps)
-                                                    {
-                                                        try
-                                                        {
-                                                            string rpN = rp.ClassName ?? "";
-                                                            string rpV = "";
-                                                            try { rpV = rp.FormatAsString() ?? ""; } catch { }
-                                                            if (rpV.Length > 120) rpV = rpV.Substring(0, 120) + "...";
-                                                            Log($"    {rpN} = {rpV}");
-                                                        }
-                                                        catch { }
-                                                    }
-                                                }
-                                                catch (Exception ex) { Log($"    Props error: {ex.Message}"); }
-
-                                                // Model objects count
-                                                Log($"  --- Object Counts ---");
-                                                string[] types = { "Entity", "Attribute", "Relationship", "Key_Group", "View" };
-                                                foreach (var t in types)
-                                                {
-                                                    try
-                                                    {
-                                                        dynamic objs = mo.Collect(root, t);
-                                                        int cnt2 = objs.Count;
-                                                        Log($"    {t}: {cnt2}");
-                                                        if (t == "Entity" && cnt2 > 0 && cnt2 <= 30)
-                                                        {
-                                                            foreach (dynamic obj in objs)
-                                                            {
-                                                                try
-                                                                {
-                                                                    string eName = obj.Name ?? "";
-                                                                    string ePhys = "";
-                                                                    try { ePhys = obj.Properties("Physical_Name")?.Value?.ToString() ?? ""; } catch { }
-                                                                    Log($"      - {eName} (Physical: {ePhys})");
-                                                                }
-                                                                catch { }
-                                                            }
-                                                        }
-                                                    }
-                                                    catch { }
-                                                }
-
-                                                // Try FEModel_DDL
-                                                Log($"  --- FEModel_DDL test ---");
-                                                string testDdl = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "capture_re_test.sql");
-                                                try
-                                                {
-                                                    pu.FEModel_DDL(testDdl, "");
-                                                    if (System.IO.File.Exists(testDdl))
-                                                    {
-                                                        long sz = new System.IO.FileInfo(testDdl).Length;
-                                                        Log($"    DDL output: {sz} bytes");
-                                                        if (sz > 0 && sz < 5000)
-                                                        {
-                                                            string content = System.IO.File.ReadAllText(testDdl);
-                                                            foreach (var line in content.Split('\n'))
-                                                            {
-                                                                if (!string.IsNullOrWhiteSpace(line))
-                                                                    Log($"    | {line.TrimEnd()}");
-                                                            }
-                                                        }
-                                                    }
-                                                    else { Log("    No DDL file produced"); }
-                                                }
-                                                catch (Exception ex) { Log($"    DDL error: {ex.Message}"); }
-                                                try { System.IO.File.Delete(testDdl); } catch { }
-                                            }
-                                            catch (Exception ex) { Log($"  ModelObjects error: {ex.Message}"); }
-                                        }
-                                    }
-                                    catch (Exception ex) { Log($"  Session[{si}] error: {ex.Message}"); }
-                                }
-
-                                // 4. COM TypeInfo on the new PU
-                                Log("--- COM TypeInfo on new PU ---");
-                                DumpComTypeInfo(pu, "NewPU", 30);
-
-                                Log("=== RE CAPTURE COMPLETE ===");
-                                goto captureEnd;
-                            }
-                        }
-                        catch { }
-                    }
-                }
-                catch { }
-
-                if (tick % 10 == 0)
-                    Log($"  Waiting... {120 - tick * 2}s remaining");
-            }
-
-            captureEnd:
-            if (!newPUFound)
-                Log("=== No new PU detected after 120 seconds ===");
-
-            btnCaptureRE.Enabled = true;
-            btnCaptureRE.Text = "Capture RE";
-        }
-
-        private System.Windows.Forms.Timer _monitorTimer;
-        private HashSet<int> _monitoredProcessIds;
-        private HashSet<string> _monitoredWindowTitles;
-        private bool _monitorRunning;
-        private int _lastMonitoredPUCount;
-
-        private void BtnMonitor_Click(object sender, EventArgs e)
-        {
-            if (_monitorRunning)
-            {
-                StopMonitor();
-                return;
-            }
-
-            // Snapshot current state
-            _monitoredProcessIds = new HashSet<int>();
-            _monitoredWindowTitles = new HashSet<string>();
-
-            foreach (var p in System.Diagnostics.Process.GetProcesses())
-            {
-                try
-                {
-                    _monitoredProcessIds.Add(p.Id);
-                    string title = p.MainWindowTitle;
-                    if (!string.IsNullOrEmpty(title))
-                        _monitoredWindowTitles.Add(title);
-                }
-                catch { }
-            }
-
-            // Track PU count + ModelDirectories + Sessions
-            int puCount = 0;
-            try { puCount = _scapi.PersistenceUnits.Count; } catch { }
-            _lastMonitoredPUCount = puCount;
-
-            // Log ModelDirectories state at start
-            try
-            {
-                int dirCount = _scapi.ModelDirectories.Count;
-                Log($"[MONITOR] ModelDirectories count: {dirCount}");
-                for (int i = 0; i < dirCount; i++)
-                {
-                    try
-                    {
-                        dynamic dir = _scapi.ModelDirectories.Item(i);
-                        dynamic dirPb = dir.PropertyBag();
-                        int pbCount = dirPb.Count;
-                        Log($"[MONITOR]   Dir[{i}]: {pbCount} properties");
-                        for (int j = 0; j < pbCount; j++)
-                        {
-                            try
-                            {
-                                string pn = dirPb.Name(j)?.ToString() ?? "";
-                                string pv = dirPb.Value(pn)?.ToString() ?? "";
-                                Log($"[MONITOR]     {pn}: {pv}");
-                            }
-                            catch { }
-                        }
-                    }
-                    catch { }
-                }
-            }
-            catch (Exception ex) { Log($"[MONITOR] ModelDirectories error: {ex.Message}"); }
-
-            // Log Sessions state
-            try
-            {
-                int sessCount = _scapi.Sessions.Count;
-                Log($"[MONITOR] Sessions count: {sessCount}");
-            }
-            catch { }
-
-            Log($"[MONITOR] Started. Tracking {_monitoredProcessIds.Count} processes, {_monitoredWindowTitles.Count} windows, {puCount} PU(s)");
-            Log("[MONITOR] Now perform the action in erwin and watch the log...");
-
-            _monitorTimer = new System.Windows.Forms.Timer();
-            _monitorTimer.Interval = 500; // 500ms polling
-            _monitorTimer.Tick += MonitorTimer_Tick;
-            _monitorTimer.Start();
-
-            _monitorRunning = true;
-            btnMonitor.Text = "Stop Monitor";
-            btnMonitor.BackColor = Color.MistyRose;
-        }
-
-        private void StopMonitor()
-        {
-            if (_monitorTimer != null)
-            {
-                _monitorTimer.Stop();
-                _monitorTimer.Dispose();
-                _monitorTimer = null;
-            }
-            _monitorRunning = false;
-            btnMonitor.Text = "Start Monitor";
-            btnMonitor.BackColor = Color.White;
-            Log("[MONITOR] Stopped.");
-        }
-
-        private void MonitorTimer_Tick(object sender, EventArgs e)
-        {
-            try
-            {
-                foreach (var p in System.Diagnostics.Process.GetProcesses())
-                {
-                    try
-                    {
-                        // New process detected
-                        if (!_monitoredProcessIds.Contains(p.Id))
-                        {
-                            _monitoredProcessIds.Add(p.Id);
-                            string procName = p.ProcessName;
-                            string title = "";
-                            try { title = p.MainWindowTitle; } catch { }
-                            string mainModule = "";
-                            try { mainModule = p.MainModule?.FileName ?? ""; } catch { }
-
-                            if (!string.IsNullOrEmpty(title) || !string.IsNullOrEmpty(mainModule))
-                            {
-                                Log($"[MONITOR] NEW PROCESS: PID={p.Id}, Name='{procName}', Title='{title}', Path='{mainModule}'");
-                            }
-                        }
-
-                        // New window title on existing process
-                        string winTitle = "";
-                        try { winTitle = p.MainWindowTitle; } catch { }
-                        if (!string.IsNullOrEmpty(winTitle) && !_monitoredWindowTitles.Contains(winTitle))
-                        {
-                            _monitoredWindowTitles.Add(winTitle);
-                            Log($"[MONITOR] NEW WINDOW: PID={p.Id}, Process='{p.ProcessName}', Title='{winTitle}'");
-                        }
-                    }
-                    catch { }
-                }
-
-                // Check for closed processes (detect process exits)
-                var currentIds = new HashSet<int>();
-                foreach (var p in System.Diagnostics.Process.GetProcesses())
-                {
-                    try { currentIds.Add(p.Id); } catch { }
-                }
-
-                var closedIds = _monitoredProcessIds.Where(id => !currentIds.Contains(id)).ToList();
-                foreach (var id in closedIds)
-                {
-                    Log($"[MONITOR] PROCESS CLOSED: PID={id}");
-                    _monitoredProcessIds.Remove(id);
-                }
-
-                // Monitor SCAPI state changes
-                try
-                {
-                    // PU count + locator changes
-                    int currentPUCount = _scapi.PersistenceUnits.Count;
-                    if (currentPUCount != _lastMonitoredPUCount)
-                    {
-                        Log($"[MONITOR] PU COUNT CHANGED: {_lastMonitoredPUCount} -> {currentPUCount}");
-                        for (int i = 0; i < currentPUCount; i++)
-                        {
-                            try
-                            {
-                                dynamic pu = _scapi.PersistenceUnits.Item(i);
-                                string puName = pu.Name?.ToString() ?? "";
-                                string locator = "";
-                                try { locator = pu.PropertyBag().Value("Locator")?.ToString() ?? ""; } catch { }
-
-                                // Log ALL PropertyBag values for deep analysis
-                                Log($"[MONITOR]   PU[{i}]: '{puName}'");
-                                Log($"[MONITOR]     Locator: {locator}");
-                                try
-                                {
-                                    dynamic pb = pu.PropertyBag();
-                                    int pbCount = pb.Count;
-                                    for (int j = 0; j < pbCount; j++)
-                                    {
-                                        try
-                                        {
-                                            string pName = pb.Name(j)?.ToString() ?? "";
-                                            string pVal = pb.Value(pName)?.ToString() ?? "";
-                                            if (pName != "Locator") // Already logged
-                                                Log($"[MONITOR]     {pName}: {pVal}");
-                                        }
-                                        catch { }
-                                    }
-                                }
-                                catch { }
-
-                                // Check session state
-                                try
-                                {
-                                    bool hasSession = pu.HasSession();
-                                    Log($"[MONITOR]     HasSession: {hasSession}");
-                                }
-                                catch { }
-                            }
-                            catch { }
-                        }
-                        _lastMonitoredPUCount = currentPUCount;
-
-                        // Log Sessions + ModelDirectories when PU changes
-                        try { Log($"[MONITOR] Sessions: {_scapi.Sessions.Count}"); } catch { }
-                        try { Log($"[MONITOR] ModelDirectories: {_scapi.ModelDirectories.Count}"); } catch { }
-
-                        // Log SCAPI app-level state
-                        try { Log($"[MONITOR] SCAPI.Version: {_scapi.Version}"); } catch { }
-                        try { Log($"[MONITOR] SCAPI.Name: {_scapi.Name}"); } catch { }
-
-                        // Try to read ApplicationEnvironment state
-                        try
-                        {
-                            dynamic appEnv = _scapi.ApplicationEnvironment();
-                            dynamic envPb = appEnv.PropertyBag("Application.Persistence.Mart");
-                            int envCount = envPb.Count;
-                            for (int ei = 0; ei < envCount; ei++)
-                            {
-                                try
-                                {
-                                    string en = envPb.Name(ei)?.ToString() ?? "";
-                                    string ev = envPb.Value(en)?.ToString() ?? "";
-                                    Log($"[MONITOR] Mart.{en}: {ev}");
-                                }
-                                catch { }
-                            }
-                        }
-                        catch { }
-                    }
-
-                }
-                catch { }
+                Log("========================================");
+                Log("=== CAPTURE NOW: COMPLETE ===");
+                Log("========================================");
+                Log("");
             }
             catch (Exception ex)
             {
-                Log($"[MONITOR] Error: {ex.Message}");
+                Log($"CAPTURE NOW error: {ex.Message}");
+                Log(ex.StackTrace ?? "");
+            }
+            finally
+            {
+                btnCaptureNow.Enabled = true;
             }
         }
 
-        private void BtnScanMenu_Click(object sender, EventArgs e)
+
+        // === Live RE Monitor: high-frequency PropertyBag diff ===
+        private System.Windows.Forms.Timer _liveMonTimer;
+        private Dictionary<string, Dictionary<string, string>> _liveMonLastBags;
+        private int _liveMonLastPuCount = -1;
+        private int _liveMonLastSessCount = -1;
+        private int _liveMonLastMsgLogCount = -1;
+        private int _liveMonLastDirCount = -1;
+        private Dictionary<int, int> _liveMonLastSessEntCounts = new Dictionary<int, int>();
+        private int _liveMonTickNo = 0;
+        private bool _liveMonRunning = false;
+        private HashSet<string> _liveMonLoggedErrors = new HashSet<string>();
+
+        /// <summary>
+        /// Log a caught exception once per (source, type, message) tuple within this monitor session.
+        /// Satisfies the "no silent error swallowing" rule without flooding the 100ms tick loop.
+        /// </summary>
+        private void MonLogOnce(string source, Exception ex)
         {
-            // 0. List all erwin top-level windows first
-            Log("[SCAN] === erwin Top-Level Windows ===");
-            var erwinWindows = Services.Win32Helper.EnumErwinWindows();
-            if (erwinWindows.Count == 0)
+            string key = $"{source}|{ex.GetType().Name}|{ex.Message}";
+            if (_liveMonLoggedErrors.Add(key))
+                Log($"  [silent err] {source}: {ex.GetType().Name}: {ex.Message}");
+        }
+
+        /// <summary>
+        /// Toggle a 100ms poll loop that snapshots every PU's PropertyBag and logs every diff.
+        /// Intended to capture exactly which keys/values erwin writes when the USER manually
+        /// runs Reverse Engineer through erwin's own wizard.
+        /// </summary>
+        private void BtnLiveReMon_Click(object sender, EventArgs e)
+        {
+            if (_liveMonRunning)
             {
-                Log("[SCAN] No erwin windows found!");
+                try { _liveMonTimer?.Stop(); _liveMonTimer?.Dispose(); } catch { }
+                _liveMonTimer = null;
+                _liveMonRunning = false;
+                btnLiveReMon.Text = "Live RE Mon";
+                btnLiveReMon.BackColor = System.Drawing.Color.FromArgb(255, 220, 100);
+                Log("=== LIVE RE MON STOPPED ===");
                 return;
             }
-            foreach (var w in erwinWindows)
-            {
-                Log($"[WINDOW] {w}");
-            }
 
-            var hWnd = Services.Win32Helper.GetErwinMainWindow();
-            if (hWnd == IntPtr.Zero)
-            {
-                Log("[SCAN] erwin DM main window not found (no window with 'erwin DM' title)!");
-                return;
-            }
+            _liveMonLastBags = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+            _liveMonLastPuCount = -1;
+            _liveMonLastSessCount = -1;
+            _liveMonLastMsgLogCount = -1;
+            _liveMonLastDirCount = -1;
+            _liveMonLastSessEntCounts = new Dictionary<int, int>();
+            _liveMonLoggedErrors = new HashSet<string>();
+            _liveMonTickNo = 0;
+            _liveMonRunning = true;
+            btnLiveReMon.Text = "STOP Monitor";
+            btnLiveReMon.BackColor = System.Drawing.Color.FromArgb(255, 150, 150);
 
-            Log($"[SCAN] erwin DM main HWND={hWnd}");
+            Log("");
+            Log("========================================");
+            Log("=== LIVE RE MONITOR STARTED (100ms) ===");
+            Log("========================================");
+            Log("Now run Reverse Engineer in erwin. Every PropertyBag change will be logged.");
+            Log("Press the button again to STOP.");
+            Log("");
 
-            // 1. Try standard Win32 menu
-            Log("[SCAN] === Win32 HMENU Scan ===");
-            var menuItems = Services.Win32Helper.ScanMenuStructure(hWnd);
-            if (menuItems.Count > 0)
+            _liveMonTimer = new System.Windows.Forms.Timer { Interval = 100 };
+            _liveMonTimer.Tick += (s, ev) => LiveMonTick();
+            _liveMonTimer.Start();
+        }
+
+        private void LiveMonTick()
+        {
+            _liveMonTickNo++;
+            long t = _liveMonTickNo * 100;
+            try
             {
-                Log($"[SCAN] Found {menuItems.Count} Win32 menu items:");
-                foreach (var item in menuItems)
+                // ----- PU count -----
+                int puCount = 0;
+                try { puCount = _scapi.PersistenceUnits.Count; }
+                catch (Exception ex) { MonLogOnce("PU.Count", ex); }
+                if (puCount != _liveMonLastPuCount)
                 {
-                    string indent = new string(' ', item.Depth * 2);
-                    string idStr = item.Id == 0xFFFFFFFF ? "(submenu)" : $"ID={item.Id}";
-                    Log($"[MENU] {indent}{item.Text} [{idStr}]");
-                }
-            }
-            else
-            {
-                Log("[SCAN] No Win32 menu found.");
-            }
-
-            // 2. Scan child windows - find those with real menus and scan them
-            Log("[SCAN] === Child Windows with Menus ===");
-            var childMenuResults = Services.Win32Helper.ScanChildWindowMenus(hWnd);
-            foreach (var entry in childMenuResults)
-            {
-                Log(entry);
-            }
-
-            // 3. UI Automation scan
-            Log("[SCAN] === UI Automation Scan ===");
-            var uiElements = Services.Win32Helper.ScanUIAutomation(hWnd, Log);
-            if (uiElements.Count > 0)
-            {
-                Log($"[SCAN] Found {uiElements.Count} UI elements:");
-                foreach (var el in uiElements)
-                {
-                    string indent = new string(' ', el.Depth * 2);
-                    string autoIdStr = string.IsNullOrEmpty(el.AutomationId) ? "" : $" AutoId='{el.AutomationId}'";
-                    Log($"[UI] {indent}{el.Name} [{el.ControlType}]{autoIdStr}");
+                    if (_liveMonLastPuCount != -1)
+                        Log($"[{t}ms] *** PU count: {_liveMonLastPuCount} -> {puCount} ***");
+                    _liveMonLastPuCount = puCount;
                 }
 
-                // Highlight Compare/Review items
-                var compareItems = uiElements.FindAll(i =>
-                    i.Name.IndexOf("Compare", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    i.Name.IndexOf("Review", StringComparison.OrdinalIgnoreCase) >= 0
-                );
-
-                if (compareItems.Count > 0)
+                // ----- Session count -----
+                int sessCount = 0;
+                try { sessCount = _scapi.Sessions.Count; }
+                catch (Exception ex) { MonLogOnce("Sessions.Count", ex); }
+                if (sessCount != _liveMonLastSessCount)
                 {
-                    Log("[SCAN] === Compare/Review UI elements ===");
-                    foreach (var item in compareItems)
+                    if (_liveMonLastSessCount != -1)
+                        Log($"[{t}ms] *** Session count: {_liveMonLastSessCount} -> {sessCount} ***");
+                    _liveMonLastSessCount = sessCount;
+                }
+
+                // ----- ModelDirectories diff (DB/Mart connections live here) -----
+                int dirCount = 0;
+                try { dirCount = _scapi.ModelDirectories.Count; }
+                catch (Exception ex) { MonLogOnce("ModelDirectories.Count", ex); }
+                if (dirCount != _liveMonLastDirCount)
+                {
+                    if (_liveMonLastDirCount != -1)
                     {
-                        Log($"[SCAN] >>> {item.Path} [{item.ControlType}]");
+                        Log($"[{t}ms] *** ModelDirectories count: {_liveMonLastDirCount} -> {dirCount} ***");
+                        for (int di = 0; di < dirCount; di++)
+                        {
+                            try
+                            {
+                                dynamic dir = _scapi.ModelDirectories.Item(di);
+                                Log($"  Dir[{di}] PropertyBag:");
+                                DumpPropertyBagInline(dir.PropertyBag(), "    ");
+                            }
+                            catch (Exception ex) { MonLogOnce($"Dir[{di}].dump", ex); }
+                        }
+                    }
+                    _liveMonLastDirCount = dirCount;
+                }
+
+                // ----- PUs by Persistence_Unit_Id (stable across re-ordering) -----
+                var currentBags = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+                for (int i = 0; i < puCount; i++)
+                {
+                    dynamic pu;
+                    try { pu = _scapi.PersistenceUnits.Item(i); }
+                    catch (Exception ex) { MonLogOnce($"PU[{i}].Item", ex); continue; }
+
+                    string name = "";
+                    try { name = pu.Name?.ToString() ?? $"PU_{i}"; }
+                    catch (Exception ex) { MonLogOnce($"PU[{i}].Name", ex); name = $"PU_{i}"; }
+
+                    var current = SnapshotPropertyBag(pu, $"PU[{i}].PB");
+
+                    string puId = current.TryGetValue("Persistence_Unit_Id", out string pid) ? pid : $"NOID_{i}_{name}";
+                    string label = $"PU#{i}({name},id={puId.Substring(0, Math.Min(12, puId.Length))})";
+                    currentBags[puId] = current;
+
+                    if (!_liveMonLastBags.TryGetValue(puId, out Dictionary<string, string> prev))
+                    {
+                        if (current.Count > 0)
+                        {
+                            Log($"[{t}ms] +NEW PU {label} INITIAL BAG ({current.Count} props):");
+                            foreach (var kv in current)
+                            {
+                                string v = kv.Value; if (v.Length > 220) v = v.Substring(0, 220) + "...";
+                                Log($"  + {kv.Key} = {v}");
+                            }
+                        }
+                    }
+                    else
+                    {
+                        foreach (var kv in current)
+                        {
+                            if (!prev.TryGetValue(kv.Key, out string oldVal))
+                            {
+                                string v = kv.Value; if (v.Length > 220) v = v.Substring(0, 220) + "...";
+                                Log($"[{t}ms] +{label}.{kv.Key} = {v}");
+                            }
+                            else if (oldVal != kv.Value)
+                            {
+                                string oV = oldVal; if (oV.Length > 120) oV = oV.Substring(0, 120) + "...";
+                                string nV = kv.Value; if (nV.Length > 120) nV = nV.Substring(0, 120) + "...";
+                                Log($"[{t}ms] *{label}.{kv.Key}: '{oV}' -> '{nV}'");
+                            }
+                        }
+                        foreach (var kv in prev)
+                        {
+                            if (!current.ContainsKey(kv.Key))
+                                Log($"[{t}ms] -{label}.{kv.Key} (removed)");
+                        }
+                    }
+                }
+
+                foreach (var oldId in _liveMonLastBags.Keys)
+                {
+                    if (!currentBags.ContainsKey(oldId))
+                        Log($"[{t}ms] -PU id={oldId.Substring(0, Math.Min(12, oldId.Length))} REMOVED");
+                }
+                _liveMonLastBags = currentBags;
+
+                // ----- Sessions: per-session entity count (RE drops entities here) -----
+                var sessSnapshot = new Dictionary<int, int>();
+                for (int si = 0; si < sessCount; si++)
+                {
+                    int entCount = -1;
+                    bool open = false;
+                    string puN = "";
+                    try
+                    {
+                        dynamic sess = _scapi.Sessions.Item(si);
+                        try { open = sess.IsOpen(); }
+                        catch (Exception ex) { MonLogOnce($"Sess[{si}].IsOpen", ex); }
+
+                        try { puN = sess.PersistenceUnit?.Name?.ToString() ?? ""; }
+                        catch (Exception ex) { MonLogOnce($"Sess[{si}].PUName", ex); }
+
+                        if (open)
+                        {
+                            try
+                            {
+                                dynamic mo = sess.ModelObjects;
+                                dynamic ents = mo.Collect(mo.Root, "Entity");
+                                entCount = ents.Count;
+                            }
+                            catch (Exception ex) { MonLogOnce($"Sess[{si}].EntityCount", ex); }
+                        }
+                    }
+                    catch (Exception ex) { MonLogOnce($"Sess[{si}].Item", ex); continue; }
+
+                    sessSnapshot[si] = entCount;
+
+                    if (_liveMonLastSessEntCounts.TryGetValue(si, out int prevEnt))
+                    {
+                        if (prevEnt != entCount)
+                            Log($"[{t}ms] *** Session[{si}] entity count: {prevEnt} -> {entCount} (PU='{puN}', open={open}) ***");
+                    }
+                    else if (open && entCount >= 0)
+                    {
+                        Log($"[{t}ms] +NEW Session[{si}] open={open} PU='{puN}' entities={entCount}");
+                    }
+                }
+                _liveMonLastSessEntCounts = sessSnapshot;
+
+                // ----- erwin internal MessageLog -----
+                dynamic msgBag = null;
+                try { msgBag = _scapi.ApplicationEnvironment.PropertyBag("Application.API.MessageLog"); }
+                catch (Exception ex) { MonLogOnce("MessageLog.fetch", ex); }
+
+                if (msgBag != null)
+                {
+                    bool isEmpty = true;
+                    try { isEmpty = Convert.ToBoolean(msgBag.Value("Is_Empty")); }
+                    catch (Exception ex) { MonLogOnce("MessageLog.Is_Empty", ex); }
+
+                    dynamic logArr = null;
+                    try { logArr = msgBag.Value("Log"); }
+                    catch (Exception ex) { MonLogOnce("MessageLog.Log", ex); }
+
+                    int arrLen = (logArr is Array a0) ? a0.Length : -1;
+
+                    if (!isEmpty && arrLen != _liveMonLastMsgLogCount)
+                    {
+                        if (_liveMonLastMsgLogCount == -1)
+                            Log($"[{t}ms] MessageLog INITIAL: Is_Empty={isEmpty}, Log.Length={arrLen}");
+                        else
+                            Log($"[{t}ms] MessageLog growth: len {_liveMonLastMsgLogCount} -> {arrLen} (Is_Empty={isEmpty})");
+
+                        if (logArr is Array arr && arr.Length > 0)
+                        {
+                            int start = Math.Max(0, _liveMonLastMsgLogCount > 0 ? _liveMonLastMsgLogCount : 0);
+                            for (int mi = start; mi < arr.Length; mi++)
+                            {
+                                try { Log($"  MSG[{mi}]: {arr.GetValue(mi)}"); }
+                                catch (Exception mvex) { Log($"  MSG[{mi}]: <err: {mvex.Message}>"); }
+                            }
+                        }
+                        _liveMonLastMsgLogCount = arrLen;
+                    }
+                    else if (_liveMonLastMsgLogCount == -1)
+                    {
+                        _liveMonLastMsgLogCount = arrLen;
                     }
                 }
             }
-            else
+            catch (Exception ex)
             {
-                Log("[SCAN] No UI Automation elements found.");
+                Log($"[{t}ms] Monitor tick error: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Snapshot a COM PropertyBag into a Dictionary, logging any read errors via MonLogOnce.
+        /// </summary>
+        private Dictionary<string, string> SnapshotPropertyBag(dynamic objWithPropertyBag, string source)
+        {
+            var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            dynamic pb;
+            try { pb = objWithPropertyBag.PropertyBag(); }
+            catch (Exception ex) { MonLogOnce($"{source}.get", ex); return result; }
+
+            int cnt = 0;
+            try { cnt = pb.Count; }
+            catch (Exception ex) { MonLogOnce($"{source}.Count", ex); return result; }
+
+            for (int j = 0; j < cnt; j++)
+            {
+                string pn = "";
+                try { pn = pb.Name(j)?.ToString() ?? ""; }
+                catch (Exception ex) { MonLogOnce($"{source}.Name[{j}]", ex); continue; }
+
+                string pv = "";
+                try { pv = pb.Value(pn)?.ToString() ?? ""; }
+                catch (Exception ex) { pv = $"<err: {ex.Message}>"; }
+                result[pn] = pv;
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// Inline-dump a PropertyBag (already obtained) line by line. Used for ModelDirectories.
+        /// </summary>
+        private void DumpPropertyBagInline(dynamic pb, string indent)
+        {
+            int cnt = 0;
+            try { cnt = pb.Count; }
+            catch (Exception ex) { MonLogOnce("InlineDump.Count", ex); return; }
+            for (int j = 0; j < cnt; j++)
+            {
+                try
+                {
+                    string pn = pb.Name(j)?.ToString() ?? "";
+                    string pv = "";
+                    try { pv = pb.Value(pn)?.ToString() ?? ""; }
+                    catch (Exception vex) { pv = $"<err: {vex.Message}>"; }
+                    if (pv.Length > 220) pv = pv.Substring(0, 220) + "...";
+                    Log($"{indent}{pn} = {pv}");
+                }
+                catch (Exception ex) { MonLogOnce($"InlineDump[{j}]", ex); }
+            }
+        }
+
+        /// <summary>
+        /// Safe full dump of one PU. Reuses existing Session if PU.HasSession()=true (NEVER opens new).
+        /// FEModel_DDL is opt-in via includeDdl flag.
+        /// </summary>
+        private void DumpPUFull(int index, Dictionary<string, dynamic> sessionByPuName, bool includeDdl)
+        {
+            Log($"=== PU[{index}] ===");
+            dynamic pu = null;
+            try { pu = _scapi.PersistenceUnits.Item(index); }
+            catch (Exception ex) { Log($"  Item({index}) error: {ex.Message}"); return; }
+
+            string puName = ""; try { puName = pu.Name?.ToString() ?? ""; } catch { }
+            Log($"  Name: '{puName}'");
+
+            foreach (var prop in new[] { "FullName", "Path", "Source", "URL", "Type", "Modified", "ReadOnly" })
+            {
+                try
+                {
+                    object v = pu.GetType().InvokeMember(prop,
+                        System.Reflection.BindingFlags.GetProperty | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public,
+                        null, pu, null);
+                    if (v != null) Log($"  {prop}: {v}");
+                }
+                catch { }
             }
 
-            Log("[SCAN] Done.");
+            bool hasSess = false; try { hasSess = pu.HasSession(); } catch { }
+            Log($"  HasSession: {hasSess}");
+
+            // PropertyBag full dump (always safe)
+            Log("  --- PropertyBag ---");
+            try
+            {
+                dynamic pb = pu.PropertyBag();
+                int cnt = 0; try { cnt = pb.Count; } catch { }
+                Log($"    Count: {cnt}");
+                for (int j = 0; j < cnt; j++)
+                {
+                    try
+                    {
+                        string n = pb.Name(j)?.ToString() ?? "";
+                        string v = "";
+                        try { v = pb.Value(n)?.ToString() ?? ""; }
+                        catch (Exception vex) { v = "<err: " + vex.Message + ">"; }
+                        if (v.Length > 250) v = v.Substring(0, 250) + "...(+" + (v.Length - 250) + ")";
+                        Log($"    [{j}] {n} = {v}");
+                    }
+                    catch { }
+                }
+            }
+            catch (Exception ex) { Log($"    PB error: {ex.Message}"); }
+
+            // Model inspection: REUSE existing session if available, NEVER open new on already-open PU
+            Log("  --- Model Inspection ---");
+            dynamic sess = null;
+            bool ownSession = false;
+            try
+            {
+                if (hasSess && sessionByPuName.TryGetValue(puName, out dynamic existing))
+                {
+                    sess = existing;
+                    Log("    Using existing open session for this PU");
+                }
+                else if (!hasSess)
+                {
+                    sess = _scapi.Sessions.Add();
+                    sess.Open(pu, 0, 0);
+                    ownSession = true;
+                    Log("    Opened temp session (PU had no session)");
+                }
+                else
+                {
+                    Log("    SKIP: PU has session but none found in Sessions collection (cannot inspect safely)");
+                }
+
+                if (sess != null)
+                {
+                    dynamic mo = sess.ModelObjects;
+                    dynamic root = mo.Root;
+                    string rootName = ""; try { rootName = root.Name?.ToString() ?? ""; } catch { }
+                    Log($"    Root: '{rootName}'");
+
+                    string[] types = { "Entity", "Attribute", "Relationship", "Key_Group", "View", "Schema", "Index", "Domain", "Subject_Area" };
+                    foreach (var t in types)
+                    {
+                        try
+                        {
+                            dynamic objs = mo.Collect(root, t);
+                            int cnt2 = 0; try { cnt2 = objs.Count; } catch { }
+                            Log($"    {t}: {cnt2}");
+                            if (t == "Entity" && cnt2 > 0)
+                            {
+                                int li = 0;
+                                foreach (dynamic obj in objs)
+                                {
+                                    if (li >= 30) { Log("      ... (+" + (cnt2 - 30) + " more)"); break; }
+                                    string eName = ""; try { eName = obj.Name?.ToString() ?? ""; } catch { }
+                                    string ePhys = ""; try { ePhys = obj.Properties("Physical_Name")?.Value?.ToString() ?? ""; } catch { }
+                                    string eOwner = ""; try { eOwner = obj.Properties("Owner")?.Value?.ToString() ?? ""; } catch { }
+                                    Log($"      - {eName} (Physical: {ePhys}, Owner: {eOwner})");
+                                    li++;
+                                }
+                            }
+                        }
+                        catch (Exception ex) { Log($"    {t}: error={ex.Message}"); }
+                    }
+
+                    Log("    --- Root Properties (key ones) ---");
+                    string[] rootProps = {
+                        "Target_Server", "Target_Server_Version", "Target_Server_Type",
+                        "Database_Name", "Schema_Name", "DBMS",
+                        "Author", "Default_Owner", "Connect_String"
+                    };
+                    foreach (var rp in rootProps)
+                    {
+                        try
+                        {
+                            dynamic prop = root.Properties(rp);
+                            if (prop == null) continue;
+                            string v = ""; try { v = prop?.Value?.ToString() ?? ""; } catch { }
+                            Log($"      {rp} = {v}");
+                        }
+                        catch { }
+                    }
+                }
+            }
+            catch (Exception ex) { Log($"    Inspection error: {ex.Message}"); }
+            finally
+            {
+                if (ownSession && sess != null)
+                {
+                    try { sess.Close(); } catch { }
+                }
+            }
+
+            // FEModel_DDL: OPT-IN only (caused GDM-1001 crash on Mart PU)
+            if (includeDdl)
+            {
+                Log("  --- FEModel_DDL (opt-in) ---");
+                string ddlPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"capture_now_{index}_{Guid.NewGuid():N}.sql");
+                try
+                {
+                    pu.FEModel_DDL(ddlPath, "");
+                    if (System.IO.File.Exists(ddlPath))
+                    {
+                        long sz = new System.IO.FileInfo(ddlPath).Length;
+                        Log($"    File: {ddlPath} ({sz} bytes)");
+                        if (sz > 0)
+                        {
+                            string content = System.IO.File.ReadAllText(ddlPath);
+                            var lines = content.Split('\n');
+                            int max = Math.Min(120, lines.Length);
+                            Log($"    Showing first {max} of {lines.Length} lines:");
+                            for (int li = 0; li < max; li++)
+                            {
+                                if (!string.IsNullOrWhiteSpace(lines[li]))
+                                    Log($"    | {lines[li].TrimEnd()}");
+                            }
+                            if (lines.Length > max) Log($"    | ... (+" + (lines.Length - max) + " more lines)");
+                        }
+                    }
+                    else
+                    {
+                        Log("    No DDL file produced");
+                    }
+                }
+                catch (Exception ex) { Log($"    DDL error: {ex.Message}"); }
+                finally
+                {
+                    try { System.IO.File.Delete(ddlPath); } catch { }
+                }
+            }
+            else
+            {
+                Log("  --- FEModel_DDL: SKIPPED (hold Ctrl while clicking Capture Now to enable) ---");
+            }
         }
+
 
         #endregion
 

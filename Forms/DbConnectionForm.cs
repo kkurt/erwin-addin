@@ -18,15 +18,26 @@ namespace EliteSoft.Erwin.AddIn.Forms
         public long TargetServerCode { get; private set; }
         public int TargetServerVersion { get; private set; }
 
-        // DB type mapping: display name, RE conn code, default major version, erwin Target_Server constant
-        // Target_Server constants from erwin API Reference Guide 15.0 (PersistenceUnits.Create PropertyBag)
+        // Raw fields used by the in-process RE pipeline (DSN is created at runtime).
+        public string ServerHost { get; private set; } = "";
+        public string DatabaseName { get; private set; } = "";
+        public string UserName { get; private set; } = "";
+        /// <summary>True if the user picked Windows Authentication.</summary>
+        public bool UseWindowsAuth { get; private set; }
+        /// <summary>The DB type code shown in connStr's SERVER=&lt;Code&gt;:... e.g. 16 for SQL Server.</summary>
+        public int DbTypeCode { get; private set; }
+
+        // DB type mapping: display name, RE conn code, default major version, erwin Target_Server constant.
+        // MajorVer must be a value the installed erwin accepts at PersistenceUnits.Create() time —
+        // doc samples show older numbers but our r10.10 install rejects them with "Key Target_Server
+        // has wrong value". Verified working: SQL Server v15. Adjust per DBMS as needed.
         private static readonly (string Name, int Code, int MajorVer, long TargetServer)[] DbTypes =
         {
-            ("SQL Server", 16, 10, 1075859016),
+            ("SQL Server", 16, 15, 1075859016),
             ("PostgreSQL", 35, 16, 1075859493),
             ("Oracle", 10, 12, 1075859011),
             ("DB2", 2, 11, 1075859009),
-            ("SQL Azure", 18, 10, 1075859016),
+            ("SQL Azure", 18, 15, 1075859016),
             ("MySQL", 8, 8, 1075859030),
             ("Snowflake", 21, 1, 1075859495),
         };
@@ -487,8 +498,11 @@ namespace EliteSoft.Erwin.AddIn.Forms
             int authCode = rbWinAuth.Checked ? 8 : 4;
             string user = rbSqlAuth.Checked ? txtUsername.Text.Trim() : "";
 
-            // SERVERR (double R!) per erwin API Reference - single R silently fails
-            string connStr = $"SERVERR={dbType.Code}:{dbType.MajorVer}:0|AUTHENTICATION={authCode}|USER={user}";
+            // SERVER= (single R) per erwin API Reference 15.0 HTML version (bookshelf).
+            // A prior note claimed double-R was required, but that came from a PDF-to-text
+            // conversion glitch where "SERVER-\nR=..." word-wrap was joined into "SERVERR=".
+            // HTML source verified single R is correct.
+            string connStr = $"SERVER={dbType.Code}:{dbType.MajorVer}:0|AUTHENTICATION={authCode}|USER={user}";
 
             if (rbNative.Checked)
             {
@@ -514,6 +528,13 @@ namespace EliteSoft.Erwin.AddIn.Forms
             SchemaFilter = txtSchemaFilter.Text.Trim();
             TargetServerCode = dbType.TargetServer;
             TargetServerVersion = dbType.MajorVer;
+
+            // Raw values for the in-process RE pipeline (DSN is created at runtime).
+            ServerHost = txtServer.Text.Trim();
+            DatabaseName = txtDatabase.Text.Trim();
+            UserName = user;
+            UseWindowsAuth = rbWinAuth.Checked;
+            DbTypeCode = dbType.Code;
 
             this.DialogResult = DialogResult.OK;
         }

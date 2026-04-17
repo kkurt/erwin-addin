@@ -238,407 +238,6 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// Generate DDL diff between current model and a live database.
-        /// Uses DdlHelper --action=redb for Reverse Engineering from DB.
-        /// </summary>
-        public static string GenerateDiffWithDatabase(
-            dynamic scapi, dynamic currentModel,
-            string dbConnectionString, string dbPassword,
-            string feOptionXml, string schemaFilter,
-            long targetServerCode, int targetServerVersion,
-            Action<string> log)
-        {
-            log?.Invoke("DDL: Starting Model vs DB diff...");
-
-            try
-            {
-                dynamic currentPU = scapi.PersistenceUnits.Item(0);
-                string modelName = currentPU.Name?.ToString() ?? "Model";
-
-                // Log model info
-                string modelTS = "";
-                try { modelTS = currentPU.PropertyBag().Value("Target_Server")?.ToString() ?? ""; } catch { }
-                string modelType = "";
-                try { modelType = currentPU.PropertyBag().Value("Model_Type")?.ToString() ?? ""; } catch { }
-                log?.Invoke($"DDL: Model='{modelName}', Target_Server={modelTS}, Model_Type={modelType}");
-
-                // FEModel_DB compares model vs DB, then FEModel_DDL generates ALTER script
-                log?.Invoke($"DDL: Comparing '{modelName}' vs database...");
-                string alterScript = ForwardEngineerViaHelper(
-                    currentPU, dbConnectionString, dbPassword, feOptionXml, log);
-
-                if (string.IsNullOrEmpty(alterScript))
-                {
-                    log?.Invoke("DDL: No ALTER script generated.");
-                    return null;
-                }
-
-                string header = $"-- erwin ALTER Script: {modelName} vs Database\n" +
-                    $"-- Generated: {DateTime.Now:yyyy-MM-dd HH:mm}\n" +
-                    $"-- Shows differences between model and live database\n\n";
-
-                return header + alterScript;
-            }
-            catch (Exception ex)
-            {
-                log?.Invoke($"DDL: DB diff error: {ex.Message}");
-                return null;
-            }
-        }
-
-        /// <summary>
-        /// Forward Engineer via DdlHelper (separate process).
-        /// DdlHelper opens model from Mart, calls FEModel_DB + FEModel_DDL.
-        /// Separate process bypasses "Mart UI active" restriction.
-        /// </summary>
-        private static string ForwardEngineerViaHelper(
-            dynamic currentPU, string connStr, string password,
-            string feOptionXml, Action<string> log)
-        {
-            string outputFile = Path.Combine(TempDir, "fedb_output.sql");
-
-            try
-            {
-                CleanupFile(outputFile);
-
-                var martInfo = GetMartConnectionInfo(log);
-                if (martInfo == null) { log?.Invoke("DDL: No Mart connection info."); return null; }
-
-                string locator = "";
-                try { locator = currentPU.PropertyBag().Value("Locator")?.ToString() ?? ""; } catch { }
-                string modelPath = "";
-                var pathMatch = Regex.Match(locator, @"Mart://Mart/(.+?)(\?|$)");
-                if (pathMatch.Success) modelPath = pathMatch.Groups[1].Value;
-                else modelPath = currentPU.Name?.ToString() ?? "";
-
-                int version = ParseVersionFromLocator(locator);
-
-                string helperExe = FindDdlHelperExe(log);
-                if (string.IsNullOrEmpty(helperExe)) return null;
-
-                string args = $"--action=fedb --server={martInfo.Value.host} --port={martInfo.Value.port} " +
-                    $"--user={martInfo.Value.username} --pass={martInfo.Value.password} " +
-                    $"--model={modelPath} --version={version} --output=\"{outputFile}\" " +
-                    $"--connstr=\"{connStr}\"";
-
-                if (!string.IsNullOrEmpty(password))
-                    args += $" --dbpass=\"{password}\"";
-
-                log?.Invoke($"DDL: Running DdlHelper --action=fedb...");
-
-                var psi = new ProcessStartInfo
-                {
-                    FileName = helperExe,
-                    Arguments = args,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true
-                };
-
-                using (var proc = Process.Start(psi))
-                {
-                    var stdoutBuilder = new System.Text.StringBuilder();
-                    var stderrBuilder = new System.Text.StringBuilder();
-                    proc.OutputDataReceived += (s, ev) => { if (ev.Data != null) stdoutBuilder.AppendLine(ev.Data); };
-                    proc.ErrorDataReceived += (s, ev) => { if (ev.Data != null) stderrBuilder.AppendLine(ev.Data); };
-                    proc.BeginOutputReadLine();
-                    proc.BeginErrorReadLine();
-
-                    bool exited = proc.WaitForExit(120000);
-                    if (!exited)
-                    {
-                        log?.Invoke("DDL: DdlHelper FEDB timed out. Killing.");
-                        try { proc.Kill(); } catch { }
-                        return null;
-                    }
-
-                    foreach (var line in stdoutBuilder.ToString().Split('\n'))
-                        if (!string.IsNullOrWhiteSpace(line))
-                            log?.Invoke($"DDL: [FEDB] {line.Trim()}");
-                    string stderr = stderrBuilder.ToString();
-                    if (!string.IsNullOrEmpty(stderr))
-                        log?.Invoke($"DDL: [FEDB ERR] {stderr.Trim()}");
-                }
-
-                if (File.Exists(outputFile))
-                {
-                    string ddl = File.ReadAllText(outputFile);
-                    log?.Invoke($"DDL: FEDB DDL = {ddl.Length} chars");
-                    return ddl.Length > 0 ? ddl : null;
-                }
-
-                return null;
-            }
-            catch (Exception ex)
-            {
-                log?.Invoke($"DDL: FEDB error: {ex.Message}");
-                return null;
-            }
-            finally
-            {
-                CleanupFile(outputFile);
-            }
-        }
-
-        /// <summary>
-        /// Generates CREATE TABLE DDL from database via ODBC INFORMATION_SCHEMA.
-        /// </summary>
-        private static void GenerateDbDdlViaOdbc(string odbcConnStr, string outputFile, Action<string> log)
-        {
-            try
-            {
-                using var conn = new System.Data.Odbc.OdbcConnection(odbcConnStr);
-                conn.Open();
-                var sb = new System.Text.StringBuilder();
-
-                // Get all tables
-                using (var cmd = conn.CreateCommand())
-                {
-                    cmd.CommandText = @"
-                        SELECT t.TABLE_NAME, c.COLUMN_NAME, c.DATA_TYPE,
-                               c.CHARACTER_MAXIMUM_LENGTH, c.NUMERIC_PRECISION, c.NUMERIC_SCALE,
-                               c.IS_NULLABLE, c.COLUMN_DEFAULT, c.ORDINAL_POSITION
-                        FROM INFORMATION_SCHEMA.TABLES t
-                        JOIN INFORMATION_SCHEMA.COLUMNS c ON t.TABLE_NAME = c.TABLE_NAME AND t.TABLE_SCHEMA = c.TABLE_SCHEMA
-                        WHERE t.TABLE_TYPE = 'BASE TABLE' AND t.TABLE_SCHEMA = 'dbo'
-                        ORDER BY t.TABLE_NAME, c.ORDINAL_POSITION";
-
-                    string currentTable = "";
-                    bool firstCol = true;
-
-                    using var rdr = cmd.ExecuteReader();
-                    while (rdr.Read())
-                    {
-                        string tableName = rdr.GetString(0);
-                        string colName = rdr.GetString(1);
-                        string dataType = rdr.GetString(2);
-                        int? maxLen = rdr.IsDBNull(3) ? null : (int?)rdr.GetInt32(3);
-                        int? numPrec = rdr.IsDBNull(4) ? null : (int?)Convert.ToInt32(rdr.GetValue(4));
-                        int? numScale = rdr.IsDBNull(5) ? null : (int?)Convert.ToInt32(rdr.GetValue(5));
-                        string nullable = rdr.GetString(6);
-                        string defVal = rdr.IsDBNull(7) ? null : rdr.GetString(7);
-
-                        if (tableName != currentTable)
-                        {
-                            if (!string.IsNullOrEmpty(currentTable))
-                                sb.AppendLine(")\ngo\n");
-
-                            sb.AppendLine($"CREATE TABLE [{tableName}]");
-                            sb.AppendLine("(");
-                            currentTable = tableName;
-                            firstCol = true;
-                        }
-
-                        if (!firstCol) sb.AppendLine(",");
-                        firstCol = false;
-
-                        // Build column definition
-                        string colType = dataType.ToUpper();
-                        if (maxLen.HasValue && maxLen.Value > 0 && (dataType.Contains("char") || dataType.Contains("binary")))
-                            colType = maxLen.Value == -1 ? $"{dataType}(max)" : $"{dataType}({maxLen.Value})";
-                        else if (numPrec.HasValue && (dataType == "decimal" || dataType == "numeric"))
-                            colType = $"{dataType}({numPrec.Value},{numScale ?? 0})";
-
-                        string nullStr = nullable == "YES" ? "NULL" : "NOT NULL";
-                        sb.Append($"\t[{colName}]\t\t{colType} {nullStr}");
-                    }
-
-                    if (!string.IsNullOrEmpty(currentTable))
-                        sb.AppendLine("\n)\ngo\n");
-                }
-
-                // Get primary keys
-                using (var cmd2 = conn.CreateCommand())
-                {
-                    cmd2.CommandText = @"
-                        SELECT tc.TABLE_NAME, tc.CONSTRAINT_NAME, kcu.COLUMN_NAME
-                        FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
-                        JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
-                            ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME AND tc.TABLE_SCHEMA = kcu.TABLE_SCHEMA
-                        WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY' AND tc.TABLE_SCHEMA = 'dbo'
-                        ORDER BY tc.TABLE_NAME, kcu.ORDINAL_POSITION";
-
-                    string curConst = "";
-                    var pkCols = new System.Collections.Generic.List<string>();
-                    string pkTable = "";
-
-                    using var rdr2 = cmd2.ExecuteReader();
-                    while (rdr2.Read())
-                    {
-                        string tbl = rdr2.GetString(0);
-                        string cName = rdr2.GetString(1);
-                        string col = rdr2.GetString(2);
-
-                        if (cName != curConst)
-                        {
-                            if (!string.IsNullOrEmpty(curConst))
-                            {
-                                sb.AppendLine($"ALTER TABLE [{pkTable}]");
-                                sb.AppendLine($"ADD CONSTRAINT [{curConst}] PRIMARY KEY ({string.Join(", ", pkCols.Select(c => $"[{c}]"))})");
-                                sb.AppendLine("go\n");
-                            }
-                            curConst = cName;
-                            pkTable = tbl;
-                            pkCols.Clear();
-                        }
-                        pkCols.Add(col);
-                    }
-                    if (!string.IsNullOrEmpty(curConst))
-                    {
-                        sb.AppendLine($"ALTER TABLE [{pkTable}]");
-                        sb.AppendLine($"ADD CONSTRAINT [{curConst}] PRIMARY KEY ({string.Join(", ", pkCols.Select(c => $"[{c}]"))})");
-                        sb.AppendLine("go\n");
-                    }
-                }
-
-                File.WriteAllText(outputFile, sb.ToString());
-                log?.Invoke($"DDL: Generated {sb.Length} chars of DDL from DB");
-            }
-            catch (Exception ex)
-            {
-                log?.Invoke($"DDL: ODBC schema extraction error: {ex.Message}");
-            }
-        }
-
-        /// <summary>
-        /// Creates a minimal .erwin XML file with correct Target_Server.
-        /// This bypasses PersistenceUnits.Create which rejects Target_Server on erwin r10.
-        /// Format based on meta-sync ErwinXmlService.
-        /// </summary>
-        private static void CreateBlankErwinModel(string filePath, long targetServerCode, int targetServerVersion, Action<string> log)
-        {
-            // erwin DM r10 binary format header + XML model data
-            // The simplest approach: create XML-based .erwin file
-            string modelId = $"{{{Guid.NewGuid().ToString().ToUpperInvariant()}}}+00000000";
-            string diagramId = $"{{{Guid.NewGuid().ToString().ToUpperInvariant()}}}+00000002";
-
-            string xml = $@"<?xml version=""1.0"" encoding=""utf-8""?>
-<erwin xmlns=""http://www.erwin.com/dm/EMXdata""
-       xmlns:EMX=""http://www.erwin.com/dm/EMXdata""
-       xmlns:EM2=""http://www.erwin.com/dm/EM2data""
-       FileVersion=""10.10.38109"">
-  <EMX:Model id=""{modelId}"" name=""RE_Model"" xmlns=""http://www.erwin.com/dm/EMXdata"">
-    <ModelEnvProps>
-      <Model_Type>2</Model_Type>
-      <Persistence_Unit_Id>{modelId}</Persistence_Unit_Id>
-      <Target_Server>{targetServerCode}</Target_Server>
-      <Target_Server_Version>{targetServerVersion}</Target_Server_Version>
-      <Target_Server_Minor_Version>0</Target_Server_Minor_Version>
-      <Active_Model>-1</Active_Model>
-      <Hidden_Model>0</Hidden_Model>
-      <Storage_Format>4012</Storage_Format>
-    </ModelEnvProps>
-    <ModelProps>
-      <Name>RE_Model</Name>
-      <Long_Id>{modelId}</Long_Id>
-      <Type>Physical</Type>
-    </ModelProps>
-  </EMX:Model>
-</erwin>";
-
-            Directory.CreateDirectory(Path.GetDirectoryName(filePath));
-            File.WriteAllText(filePath, xml, System.Text.Encoding.UTF8);
-            log?.Invoke($"DDL: Template .erwin created ({new FileInfo(filePath).Length} bytes, TS={targetServerCode})");
-        }
-
-        /// <summary>
-        /// Load DDL from a database via DdlHelper --action=redb (Reverse Engineering).
-        /// </summary>
-        private static string LoadDbDdlViaDdlHelper(
-            string connStr, string password, string feOptionXml,
-            string targetServer, string targetVersion, string schemaFilter,
-            Action<string> log)
-        {
-            string outputFile = Path.Combine(TempDir, "db_redb.sql");
-
-            try
-            {
-                string helperExe = FindDdlHelperExe(log);
-                if (string.IsNullOrEmpty(helperExe)) return null;
-
-                CleanupFile(outputFile);
-
-                string args = $"--action=redb --connstr=\"{connStr}\" --output=\"{outputFile}\"";
-
-                if (!string.IsNullOrEmpty(password))
-                    args += $" --dbpass=\"{password}\"";
-                if (!string.IsNullOrEmpty(targetServer))
-                    args += $" --targetserver={targetServer}";
-                if (!string.IsNullOrEmpty(targetVersion))
-                    args += $" --targetversion={targetVersion}";
-                if (!string.IsNullOrEmpty(feOptionXml))
-                    args += $" --feoption=\"{feOptionXml}\"";
-                if (!string.IsNullOrEmpty(schemaFilter))
-                    args += $" --schemafilter={schemaFilter}";
-
-                log?.Invoke("DDL: Running DdlHelper --action=redb (Reverse Engineering)...");
-
-                var psi = new ProcessStartInfo
-                {
-                    FileName = helperExe,
-                    Arguments = args,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true
-                };
-
-                using (var proc = Process.Start(psi))
-                {
-                    // Read stdout/stderr async to avoid deadlock
-                    var stdoutBuilder = new System.Text.StringBuilder();
-                    var stderrBuilder = new System.Text.StringBuilder();
-                    proc.OutputDataReceived += (s, ev) => { if (ev.Data != null) stdoutBuilder.AppendLine(ev.Data); };
-                    proc.ErrorDataReceived += (s, ev) => { if (ev.Data != null) stderrBuilder.AppendLine(ev.Data); };
-                    proc.BeginOutputReadLine();
-                    proc.BeginErrorReadLine();
-
-                    bool exited = proc.WaitForExit(120000); // 2 min timeout
-                    if (!exited)
-                    {
-                        log?.Invoke("DDL: DdlHelper REDB timed out after 2 minutes. Killing process.");
-                        try { proc.Kill(); } catch { }
-                        return null;
-                    }
-
-                    string stdout = stdoutBuilder.ToString();
-                    string stderr = stderrBuilder.ToString();
-
-                    foreach (var line in (stdout ?? "").Split('\n'))
-                        if (!string.IsNullOrWhiteSpace(line))
-                            log?.Invoke($"DDL: [REDB] {line.Trim()}");
-                    if (!string.IsNullOrEmpty(stderr))
-                        log?.Invoke($"DDL: [REDB ERR] {stderr.Trim()}");
-
-                    if (proc.ExitCode != 0)
-                    {
-                        log?.Invoke($"DDL: DdlHelper REDB exit code = {proc.ExitCode}");
-                        return null;
-                    }
-                }
-
-                if (File.Exists(outputFile))
-                {
-                    string ddl = File.ReadAllText(outputFile);
-                    log?.Invoke($"DDL: DB DDL via REDB = {ddl.Length} chars");
-                    return ddl;
-                }
-
-                return null;
-            }
-            catch (Exception ex)
-            {
-                log?.Invoke($"DDL: REDB helper error: {ex.Message}");
-                return null;
-            }
-            finally
-            {
-                CleanupFile(outputFile);
-            }
-        }
-
-        /// <summary>
         /// Finds DdlHelper.exe in known locations.
         /// </summary>
         private static string FindDdlHelperExe(Action<string> log)
@@ -1303,6 +902,246 @@ WScript.Quit 0
         }
 
         /// <summary>
+        /// Compare active model with a live database via IN-PROCESS silent ReverseEngineer.
+        /// Steps:
+        ///   1) FEModel_DDL on active PU -> currentDdl
+        ///   2) Create transient User ODBC DSN (HKCU) so SCAPI's RE can connect
+        ///   3) Resolve REoption XML from DB XML_OPTION (per-model -> All Projects -> embedded)
+        ///   4) PersistenceUnits.Create(propBag) + ClearAll + RE keys
+        ///   5) pu.ReverseEngineer(propBag, REoptionPath, connStr, password)
+        ///   6) FEModel_DDL on the RE'd PU -> reverseDdl
+        ///   7) ComputeDDLDiff(currentDdl, reverseDdl) — same engine as the Mart flow
+        ///   8) Cleanup: PU.Remove + DSN delete + temp XML delete
+        ///
+        /// Required by SCAPI r10 (verified): legacy "SQL Server" ODBC driver, AUTHENTICATION=4 (SQL)
+        /// or 8 (Windows), connStr `1=2|5=<DSN>`, REoption file path (not Type.Missing in production).
+        /// </summary>
+        public static string GenerateDiffWithDatabase(
+            dynamic scapi,
+            dynamic currentPU,
+            string host,
+            string database,
+            string user,
+            string password,
+            bool useWindowsAuth,
+            int dbTypeCode,
+            long targetServerCode,
+            int targetServerVersion,
+            string schema,
+            IEnumerable<string> selectedTables,
+            string dbLabel,
+            string feOptionXml,
+            Action<string> log)
+        {
+            Directory.CreateDirectory(TempDir);
+            string currentDdlFile = Path.Combine(TempDir, "current.sql");
+            string dbDdlFile = Path.Combine(TempDir, "db_re.sql");
+            string optionArg = string.IsNullOrEmpty(feOptionXml) ? "" : feOptionXml;
+
+            string tempDsn = null;
+            string tempReOptionXml = null;
+            string tempDdlOptionXml = null;
+            dynamic rePU = null;
+            System.Data.IDbConnection sqlConnLong = null;
+
+            try
+            {
+                // Validation
+                if (string.IsNullOrWhiteSpace(host) || string.IsNullOrWhiteSpace(database))
+                    return "-- ERROR: DB host/database missing. Click 'Configure DB' first.";
+                var tableList = (selectedTables ?? new string[0])
+                    .Where(t => !string.IsNullOrWhiteSpace(t))
+                    .Select(t => t.Trim())
+                    .ToList();
+                if (tableList.Count == 0)
+                    return "-- ERROR: No tables selected for comparison.";
+                if (targetServerCode == 0)
+                    return "-- ERROR: Target server code not provided.";
+
+                log?.Invoke($"DDL: From DB compare. {tableList.Count} table(s), schema='{schema}', target={targetServerCode} v{targetServerVersion}");
+                log?.Invoke($"DDL: DB = {dbLabel}, host={host}, db={database}, user={user}, winAuth={useWindowsAuth}");
+
+                // Step 0: open SQL connection ONCE for both XML_OPTION lookups (RE + DDL).
+                sqlConnLong = OpenSqlConnectionForXmlOption(host, database, user, password, useWindowsAuth, log);
+                int? activeModelId = null;
+                if (sqlConnLong != null)
+                {
+                    string modelPath = ActiveModelMetadataService.ReadModelPathUdp(null, currentPU, log);
+                    activeModelId = ActiveModelMetadataService.LookupModelIdByPath(sqlConnLong, modelPath, log);
+                }
+
+                // If user did NOT pass a feOption path, resolve TYPE='DDL' from XML_OPTION and use
+                // the SAME XML for BOTH active-model and RE-d model FEModel_DDL calls so triggers/options
+                // don't create false diffs (e.g. triggers on one side but not the other).
+                if (string.IsNullOrEmpty(optionArg))
+                {
+                    tempDdlOptionXml = XmlOptionLoaderService.LoadAndWriteToTempFile(sqlConnLong, activeModelId, "DDL", log);
+                    if (!string.IsNullOrEmpty(tempDdlOptionXml))
+                    {
+                        optionArg = tempDdlOptionXml;
+                        log?.Invoke($"DDL: using FE Option XML (TYPE='DDL') = {tempDdlOptionXml}");
+                    }
+                }
+
+                // Step 1: active model DDL (in-process)
+                CleanupFile(currentDdlFile);
+                log?.Invoke("DDL: Generating current model DDL (FEModel_DDL)...");
+                bool r1 = currentPU.FEModel_DDL(currentDdlFile, optionArg);
+                if (!r1 || !File.Exists(currentDdlFile))
+                {
+                    log?.Invoke("DDL: FEModel_DDL failed for current model.");
+                    return "-- ERROR: FEModel_DDL failed for current model.";
+                }
+                string currentDdl = File.ReadAllText(currentDdlFile);
+                log?.Invoke($"DDL: Current DDL = {currentDdl.Length} chars, {currentDdl.Split('\n').Length} lines");
+
+                // Step 2: ODBC driver preflight + transient DSN
+                var drvCheck = OdbcDsnHelper.CheckSqlServerDriver(log);
+                if (!drvCheck.IsOk)
+                    return $"-- ERROR: {drvCheck.UserMessage}";
+
+                OdbcDsnHelper.CleanupStale(log);
+                tempDsn = OdbcDsnHelper.CreateTempSqlServerDsn(host, database, user, log);
+                log?.Invoke($"DDL: created transient DSN '{tempDsn}'");
+
+                // Step 3: REoption XML from XML_OPTION (per-model -> ALL=1 -> embedded) — reuse open conn
+                tempReOptionXml = XmlOptionLoaderService.LoadAndWriteToTempFile(sqlConnLong, activeModelId, "RE", log);
+
+                // Step 4: build PropBag for Create
+                Type pbType = Type.GetTypeFromProgID("ERwin9.SCAPI.PropertyBag.9.0");
+                if (pbType == null)
+                    return "-- ERROR: SCAPI PropertyBag ProgID not registered.";
+
+                dynamic propBag = Activator.CreateInstance(pbType);
+                propBag.Add("Model_Type", "Combined");
+                propBag.Add("Target_Server", (int)targetServerCode);
+                propBag.Add("Target_Server_Version", targetServerVersion);
+
+                rePU = scapi.PersistenceUnits.Create(propBag);
+                log?.Invoke($"DDL: blank PU created for RE — {rePU.Name}");
+
+                // Step 5: ClearAll + RE keys (per r10 sample)
+                propBag.ClearAll();
+                propBag.Add("System_Objects", false);
+                propBag.Add("Oracle_Use_DBA_Views", false);
+                propBag.Add("Synch_Owned_Only", !string.IsNullOrEmpty(schema));
+                propBag.Add("Synch_Owned_Only_Name", schema ?? "");
+                propBag.Add("Case_Option", 25091);
+                propBag.Add("Logical_Case_Option", 25046);
+                propBag.Add("Infer_Primary_Keys", false);
+                propBag.Add("Infer_Relations", false);
+                propBag.Add("Infer_Relations_Indexes", false);
+                propBag.Add("Remove_ERwin_Generated_Triggers", false);
+                propBag.Add("Force_Physical_Name_Option", false);
+                propBag.Add("Synch_Table_Filter_By_Name", string.Join(",", tableList));
+
+                // Step 6: build connection string and call ReverseEngineer
+                int authCode = useWindowsAuth ? 8 : 4;
+                int connectionMode = 2; // ODBC
+                string connStr =
+                    $"SERVER={dbTypeCode}:{targetServerVersion}:0|" +
+                    $"AUTHENTICATION={authCode}|" +
+                    $"USER={user}|" +
+                    $"1={connectionMode}|" +
+                    $"5={tempDsn}";
+                string rePassword = useWindowsAuth ? "" : (password ?? "");
+                log?.Invoke($"DDL: connStr={connStr}");
+
+                object reOptArg = string.IsNullOrEmpty(tempReOptionXml) ? (object)Type.Missing : tempReOptionXml;
+                long t0 = Environment.TickCount64;
+                object reResult = rePU.ReverseEngineer(propBag, reOptArg, connStr, rePassword);
+                long elapsed = Environment.TickCount64 - t0;
+                log?.Invoke($"DDL: ReverseEngineer returned {(reResult ?? "<null>")} in {elapsed}ms");
+
+                // Step 7: FEModel_DDL on the RE'd PU
+                CleanupFile(dbDdlFile);
+                bool r2 = rePU.FEModel_DDL(dbDdlFile, optionArg);
+                if (!r2 || !File.Exists(dbDdlFile))
+                {
+                    log?.Invoke("DDL: FEModel_DDL on RE'd PU failed.");
+                    return "-- ERROR: Reverse engineered model produced no DDL. Check schema/tables/credentials.";
+                }
+                string dbDdl = File.ReadAllText(dbDdlFile);
+                if (dbDdl.Length == 0)
+                {
+                    log?.Invoke("DDL: RE'd PU DDL is empty (no tables imported).");
+                    return $"-- ERROR: No tables imported from {dbLabel}. Verify schema='{schema}' and table names.";
+                }
+                log?.Invoke($"DDL: RE'd DDL = {dbDdl.Length} chars, {dbDdl.Split('\n').Length} lines");
+
+                // Step 8: text diff (same engine as Mart)
+                if (currentDdl == dbDdl)
+                    return $"-- No differences between active model and {dbLabel}.";
+
+                string mName = currentPU.Name?.ToString() ?? "Model";
+                return ComputeDDLDiff(currentDdl, dbDdl, log,
+                    $"{mName} (current)", $"{dbLabel} (DB)");
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"DDL DB diff error: {ex.GetType().Name}: {ex.Message}");
+                return $"-- Error: {ex.Message}";
+            }
+            finally
+            {
+                if (rePU != null)
+                {
+                    try { scapi.PersistenceUnits.Remove(rePU, false); }
+                    catch (Exception ex) { log?.Invoke($"DDL: Remove RE PU error: {ex.Message}"); }
+                }
+                if (!string.IsNullOrEmpty(tempReOptionXml))
+                {
+                    try { File.Delete(tempReOptionXml); }
+                    catch (Exception ex) { log?.Invoke($"DDL: temp RE XML delete error: {ex.Message}"); }
+                }
+                if (!string.IsNullOrEmpty(tempDdlOptionXml))
+                {
+                    try { File.Delete(tempDdlOptionXml); }
+                    catch (Exception ex) { log?.Invoke($"DDL: temp DDL XML delete error: {ex.Message}"); }
+                }
+                if (sqlConnLong != null)
+                {
+                    try { sqlConnLong.Dispose(); }
+                    catch (Exception ex) { log?.Invoke($"DDL: sqlConn dispose error: {ex.Message}"); }
+                }
+                if (!string.IsNullOrEmpty(tempDsn))
+                {
+                    try { OdbcDsnHelper.DeleteDsn(tempDsn, log); }
+                    catch (Exception ex) { log?.Invoke($"DDL: DSN delete error: {ex.Message}"); }
+                }
+                CleanupFile(currentDdlFile);
+                CleanupFile(dbDdlFile);
+            }
+        }
+
+        /// <summary>
+        /// Open a Microsoft.Data.SqlClient connection used only to read XML_OPTION.
+        /// Returns null on failure (caller falls back to embedded XML).
+        /// </summary>
+        private static System.Data.IDbConnection OpenSqlConnectionForXmlOption(
+            string host, string database, string user, string password, bool useWindowsAuth, Action<string> log)
+        {
+            try
+            {
+                string sqlConn = useWindowsAuth
+                    ? $"Data Source={host};Initial Catalog={database};Integrated Security=True;TrustServerCertificate=True"
+                    : $"Data Source={host};Initial Catalog={database};User ID={user};Password={password};TrustServerCertificate=True";
+                var c = new Microsoft.Data.SqlClient.SqlConnection(sqlConn);
+                c.Open();
+                return c;
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"DDL: SQL connection for XML_OPTION lookup failed: {ex.Message}");
+                return null;
+            }
+        }
+
+        // Removed: out-of-process DdlHelper RE — superseded by in-process pattern in
+        // GenerateDiffWithDatabase (SCAPI r10 RE only works in-process with the live
+        // erwin SCAPI instance; out-of-process silently no-ops).
+
+        /// <summary>
         /// Generate DDL for the active model only (no diff, no reconnect).
         /// Safe operation - does not corrupt PU.
         /// </summary>
@@ -1362,32 +1201,41 @@ WScript.Quit 0
             result.AppendLine($"-- {lbl}: {leftStatements.Count} statements, {rbl}: {rightStatements.Count} statements");
 
             int addedCount = 0, droppedCount = 0, changedCount = 0;
+            int suppressedTriggerCount = 0;
+
+            // Built-in triggers (FK delete/update no-action) are auto-generated by erwin's
+            // FE depending on FE option toggles. They appear on one side and not the other
+            // when the active model and the RE'd model use slightly different defaults.
+            // Filter them out to avoid noise in the diff. Custom user triggers don't follow
+            // the tD_/tU_/tI_ erwin naming convention so they still surface.
+            bool IsBuiltInTrigger(string key) =>
+                key != null && key.StartsWith("TRIGGER:t", StringComparison.OrdinalIgnoreCase) &&
+                key.Length > "TRIGGER:t".Length &&
+                "DUI".IndexOf(char.ToUpperInvariant(key["TRIGGER:t".Length])) >= 0;
 
             // NEW: In current but not in baseline
             var addedSection = new System.Text.StringBuilder();
             foreach (var kvp in leftByKey)
             {
-                if (!rightByKey.ContainsKey(kvp.Key))
-                {
-                    addedSection.AppendLine();
-                    addedSection.AppendLine($"-- NEW: {kvp.Key}");
-                    addedSection.AppendLine(kvp.Value);
-                    addedSection.AppendLine("go");
-                    addedCount++;
-                }
+                if (rightByKey.ContainsKey(kvp.Key)) continue;
+                if (IsBuiltInTrigger(kvp.Key)) { suppressedTriggerCount++; continue; }
+                addedSection.AppendLine();
+                addedSection.AppendLine($"-- NEW: {kvp.Key}");
+                addedSection.AppendLine(kvp.Value);
+                addedSection.AppendLine("go");
+                addedCount++;
             }
 
             // DROPPED: In baseline but not in current
             var droppedSection = new System.Text.StringBuilder();
             foreach (var kvp in rightByKey)
             {
-                if (!leftByKey.ContainsKey(kvp.Key))
-                {
-                    droppedSection.AppendLine();
-                    droppedSection.AppendLine($"-- DROPPED: {kvp.Key}");
-                    droppedSection.AppendLine($"-- {GenerateDropStatement(kvp.Key)}");
-                    droppedCount++;
-                }
+                if (leftByKey.ContainsKey(kvp.Key)) continue;
+                if (IsBuiltInTrigger(kvp.Key)) { suppressedTriggerCount++; continue; }
+                droppedSection.AppendLine();
+                droppedSection.AppendLine($"-- DROPPED: {kvp.Key}");
+                droppedSection.AppendLine($"-- {GenerateDropStatement(kvp.Key)}");
+                droppedCount++;
             }
 
             // CHANGED: In both but different
@@ -1396,6 +1244,7 @@ WScript.Quit 0
             {
                 if (rightByKey.TryGetValue(kvp.Key, out string baselineStmt))
                 {
+                    if (IsBuiltInTrigger(kvp.Key)) { suppressedTriggerCount++; continue; }
                     if (!NormalizeForCompare(kvp.Value).Equals(NormalizeForCompare(baselineStmt), StringComparison.OrdinalIgnoreCase))
                     {
                         changedSection.AppendLine();
@@ -1407,7 +1256,8 @@ WScript.Quit 0
                 }
             }
 
-            result.AppendLine($"-- Summary: {addedCount} new, {droppedCount} dropped, {changedCount} changed");
+            result.AppendLine($"-- Summary: {addedCount} new, {droppedCount} dropped, {changedCount} changed" +
+                (suppressedTriggerCount > 0 ? $" ({suppressedTriggerCount} built-in triggers suppressed)" : ""));
             result.AppendLine();
 
             if (addedCount > 0)
@@ -1435,7 +1285,7 @@ WScript.Quit 0
                 result.AppendLine("-- No differences found.");
             }
 
-            log?.Invoke($"DDL: Diff complete - {addedCount} new, {droppedCount} dropped, {changedCount} changed");
+            log?.Invoke($"DDL: Diff complete - {addedCount} new, {droppedCount} dropped, {changedCount} changed (suppressed {suppressedTriggerCount} built-in triggers)");
             return result.ToString();
         }
 
@@ -1458,25 +1308,49 @@ WScript.Quit 0
             return map;
         }
 
+        /// <summary>
+        /// Take an identifier like "[dbo].[Name]", "dbo.Name", "[Name]" or "Name" and
+        /// return just the bare last segment without brackets.
+        /// </summary>
+        private static string StripSchema(string fullName)
+        {
+            if (string.IsNullOrEmpty(fullName)) return fullName;
+            // Cut at first whitespace / paren / comma / semicolon (in case the regex over-captured).
+            int cut = fullName.IndexOfAny(new[] { ' ', '\t', '(', ',', ';' });
+            if (cut > 0) fullName = fullName.Substring(0, cut);
+            var parts = fullName.Split('.');
+            return parts[parts.Length - 1].Trim('[', ']');
+        }
+
         private static string GetStatementKey(string statement)
         {
             string first = statement.Split('\n')[0].Trim();
 
-            var match = Regex.Match(first, @"CREATE\s+TABLE\s+\[?(\w+)\]?", RegexOptions.IgnoreCase);
-            if (match.Success) return $"TABLE:{match.Groups[1].Value}";
+            // Match "CREATE TABLE [schema].[name]" or "CREATE TABLE name" — capture the FULL ident,
+            // then strip schema/brackets in StripSchema.
+            var match = Regex.Match(first, @"CREATE\s+TABLE\s+([\[\]\w\.]+)", RegexOptions.IgnoreCase);
+            if (match.Success) return $"TABLE:{StripSchema(match.Groups[1].Value)}";
 
-            match = Regex.Match(first, @"ALTER\s+TABLE\s+\[?(\w+)\]?", RegexOptions.IgnoreCase);
+            match = Regex.Match(first, @"ALTER\s+TABLE\s+([\[\]\w\.]+)", RegexOptions.IgnoreCase);
             if (match.Success)
             {
-                var cm = Regex.Match(statement, @"CONSTRAINT\s+\[?(\w+)\]?", RegexOptions.IgnoreCase);
-                return cm.Success ? $"CONSTRAINT:{match.Groups[1].Value}.{cm.Groups[1].Value}" : $"ALTER:{match.Groups[1].Value}";
+                string tableName = StripSchema(match.Groups[1].Value);
+                var cm = Regex.Match(statement, @"CONSTRAINT\s+([\[\]\w\.]+)", RegexOptions.IgnoreCase);
+                return cm.Success ? $"CONSTRAINT:{tableName}.{StripSchema(cm.Groups[1].Value)}" : $"ALTER:{tableName}";
             }
 
-            match = Regex.Match(first, @"CREATE\s+(UNIQUE\s+)?INDEX\s+\[?(\w+)\]?", RegexOptions.IgnoreCase);
-            if (match.Success) return $"INDEX:{match.Groups[2].Value}";
+            match = Regex.Match(first, @"CREATE\s+(UNIQUE\s+)?INDEX\s+([\[\]\w\.]+)", RegexOptions.IgnoreCase);
+            if (match.Success) return $"INDEX:{StripSchema(match.Groups[2].Value)}";
 
-            match = Regex.Match(first, @"CREATE\s+(\w+)\s+\[?(\w+)\]?", RegexOptions.IgnoreCase);
-            if (match.Success) return $"{match.Groups[1].Value}:{match.Groups[2].Value}";
+            match = Regex.Match(first, @"CREATE\s+TRIGGER\s+([\[\]\w\.]+)", RegexOptions.IgnoreCase);
+            if (match.Success) return $"TRIGGER:{StripSchema(match.Groups[1].Value)}";
+
+            match = Regex.Match(first, @"CREATE\s+(VIEW|PROCEDURE|FUNCTION|SCHEMA|TYPE|SEQUENCE|SYNONYM)\s+([\[\]\w\.]+)", RegexOptions.IgnoreCase);
+            if (match.Success) return $"{match.Groups[1].Value.ToUpperInvariant()}:{StripSchema(match.Groups[2].Value)}";
+
+            // Generic catch-all (last resort) — schema-aware.
+            match = Regex.Match(first, @"CREATE\s+(\w+)\s+([\[\]\w\.]+)", RegexOptions.IgnoreCase);
+            if (match.Success) return $"{match.Groups[1].Value.ToUpperInvariant()}:{StripSchema(match.Groups[2].Value)}";
 
             return null;
         }

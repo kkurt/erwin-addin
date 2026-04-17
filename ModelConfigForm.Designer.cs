@@ -590,63 +590,85 @@ namespace EliteSoft.Erwin.AddIn
             this.tabDebug.Text = "Debug Log";
             this.tabDebug.UseVisualStyleBackColor = true;
 
-            // tabDDL (was tabApproval)
+            // ===== DDL Generation tab — redesigned =====
             this.tabApproval.Padding = new System.Windows.Forms.Padding(12);
             this.tabApproval.Size = new System.Drawing.Size(860, 460);
             this.tabApproval.Text = "DDL Generation";
             this.tabApproval.UseVisualStyleBackColor = true;
 
-            // Row 1: Left Model + Right Model selection
-            var lblLeftModel = new System.Windows.Forms.Label();
-            lblLeftModel.Location = new System.Drawing.Point(15, 18);
-            lblLeftModel.Size = new System.Drawing.Size(70, 20);
-            lblLeftModel.Text = "Left Model:";
-            lblLeftModel.Font = fontCaption;
-            lblLeftModel.ForeColor = clrTextSecondary;
-            this.tabApproval.Controls.Add(lblLeftModel);
+            // ----- Group: Source (left model = active model) -----
+            this.grpDdlSource = new System.Windows.Forms.GroupBox();
+            this.grpDdlSource.Location = new System.Drawing.Point(12, 12);
+            this.grpDdlSource.Size = new System.Drawing.Size(380, 78);
+            this.grpDdlSource.Text = "Source (Left)";
+            this.grpDdlSource.Font = fontCaption;
+            this.grpDdlSource.ForeColor = clrTextSecondary;
+            this.tabApproval.Controls.Add(this.grpDdlSource);
+
+            var lblSourceCaption = new System.Windows.Forms.Label();
+            lblSourceCaption.Location = new System.Drawing.Point(12, 22);
+            lblSourceCaption.Size = new System.Drawing.Size(80, 20);
+            lblSourceCaption.Text = "Active Model:";
+            lblSourceCaption.Font = fontCaption;
+            lblSourceCaption.ForeColor = clrTextSecondary;
+            this.grpDdlSource.Controls.Add(lblSourceCaption);
 
             this.cmbLeftModel = new System.Windows.Forms.ComboBox();
-            this.cmbLeftModel.Location = new System.Drawing.Point(85, 15);
-            this.cmbLeftModel.Size = new System.Drawing.Size(280, 24);
+            this.cmbLeftModel.Location = new System.Drawing.Point(95, 19);
+            this.cmbLeftModel.Size = new System.Drawing.Size(270, 24);
             this.cmbLeftModel.DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList;
             this.cmbLeftModel.Font = fontCaption;
-            this.tabApproval.Controls.Add(this.cmbLeftModel);
+            this.grpDdlSource.Controls.Add(this.cmbLeftModel);
 
-            var lblRightModel = new System.Windows.Forms.Label();
-            lblRightModel.Location = new System.Drawing.Point(380, 18);
-            lblRightModel.Size = new System.Drawing.Size(40, 20);
-            lblRightModel.Text = "Right:";
-            lblRightModel.Font = fontCaption;
-            lblRightModel.ForeColor = clrTextSecondary;
-            this.tabApproval.Controls.Add(lblRightModel);
+            this.btnMartReview = new System.Windows.Forms.Button();
+            this.btnMartReview.Location = new System.Drawing.Point(12, 48);
+            this.btnMartReview.Size = new System.Drawing.Size(110, 24);
+            this.btnMartReview.Text = "Mart Review";
+            this.btnMartReview.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnMartReview.BackColor = System.Drawing.Color.White;
+            this.btnMartReview.ForeColor = clrTextPrimary;
+            this.btnMartReview.FlatAppearance.BorderColor = clrBorder;
+            this.btnMartReview.Font = fontCaption;
+            this.btnMartReview.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnMartReview.Click += new System.EventHandler(this.BtnMartReview_Click);
+            this.grpDdlSource.Controls.Add(this.btnMartReview);
+
+            // ----- Group: Target (right side = Mart version OR DB) -----
+            this.grpDdlTarget = new System.Windows.Forms.GroupBox();
+            this.grpDdlTarget.Location = new System.Drawing.Point(400, 12);
+            this.grpDdlTarget.Size = new System.Drawing.Size(444, 78);
+            this.grpDdlTarget.Text = "Target (Right)";
+            this.grpDdlTarget.Font = fontCaption;
+            this.grpDdlTarget.ForeColor = clrTextSecondary;
+            this.tabApproval.Controls.Add(this.grpDdlTarget);
 
             this.rbFromMart = new System.Windows.Forms.RadioButton();
-            this.rbFromMart.Location = new System.Drawing.Point(420, 16);
-            this.rbFromMart.Size = new System.Drawing.Size(85, 20);
+            this.rbFromMart.Location = new System.Drawing.Point(12, 22);
+            this.rbFromMart.Size = new System.Drawing.Size(95, 20);
             this.rbFromMart.Text = "From Mart";
             this.rbFromMart.Font = fontCaption;
             this.rbFromMart.Checked = true;
             this.rbFromMart.CheckedChanged += (s, ev) => OnRightSourceChanged();
-            this.tabApproval.Controls.Add(this.rbFromMart);
+            this.grpDdlTarget.Controls.Add(this.rbFromMart);
 
             this.cmbRightModel = new System.Windows.Forms.ComboBox();
-            this.cmbRightModel.Location = new System.Drawing.Point(508, 15);
-            this.cmbRightModel.Size = new System.Drawing.Size(175, 24);
+            this.cmbRightModel.Location = new System.Drawing.Point(110, 20);
+            this.cmbRightModel.Size = new System.Drawing.Size(322, 24);
             this.cmbRightModel.DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList;
             this.cmbRightModel.Font = fontCaption;
-            this.tabApproval.Controls.Add(this.cmbRightModel);
+            this.grpDdlTarget.Controls.Add(this.cmbRightModel);
 
             this.rbFromDB = new System.Windows.Forms.RadioButton();
-            this.rbFromDB.Location = new System.Drawing.Point(690, 16);
-            this.rbFromDB.Size = new System.Drawing.Size(70, 20);
+            this.rbFromDB.Location = new System.Drawing.Point(12, 49);
+            this.rbFromDB.Size = new System.Drawing.Size(80, 20);
             this.rbFromDB.Text = "From DB";
             this.rbFromDB.Font = fontCaption;
             this.rbFromDB.CheckedChanged += (s, ev) => OnRightSourceChanged();
-            this.tabApproval.Controls.Add(this.rbFromDB);
+            this.grpDdlTarget.Controls.Add(this.rbFromDB);
 
             this.btnConfigureDB = new System.Windows.Forms.Button();
-            this.btnConfigureDB.Location = new System.Drawing.Point(762, 13);
-            this.btnConfigureDB.Size = new System.Drawing.Size(78, 24);
+            this.btnConfigureDB.Location = new System.Drawing.Point(95, 47);
+            this.btnConfigureDB.Size = new System.Drawing.Size(95, 24);
             this.btnConfigureDB.Text = "Configure...";
             this.btnConfigureDB.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
             this.btnConfigureDB.BackColor = System.Drawing.Color.White;
@@ -655,12 +677,78 @@ namespace EliteSoft.Erwin.AddIn
             this.btnConfigureDB.Cursor = System.Windows.Forms.Cursors.Hand;
             this.btnConfigureDB.Visible = false;
             this.btnConfigureDB.Click += new System.EventHandler(this.BtnConfigureDB_Click);
-            this.tabApproval.Controls.Add(this.btnConfigureDB);
+            this.grpDdlTarget.Controls.Add(this.btnConfigureDB);
 
-            // Row 2: Buttons + FE Option XML
+            this.btnSelectDbTables = new System.Windows.Forms.Button();
+            this.btnSelectDbTables.Location = new System.Drawing.Point(195, 47);
+            this.btnSelectDbTables.Size = new System.Drawing.Size(120, 24);
+            this.btnSelectDbTables.Text = "Select Tables...";
+            this.btnSelectDbTables.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnSelectDbTables.BackColor = System.Drawing.Color.White;
+            this.btnSelectDbTables.FlatAppearance.BorderColor = clrBorder;
+            this.btnSelectDbTables.Font = fontCaption;
+            this.btnSelectDbTables.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnSelectDbTables.Visible = false;
+            this.btnSelectDbTables.Click += new System.EventHandler(this.BtnSelectDbTables_Click);
+            this.grpDdlTarget.Controls.Add(this.btnSelectDbTables);
+
+            this.lblSelectedTableCount = new System.Windows.Forms.Label();
+            this.lblSelectedTableCount.Location = new System.Drawing.Point(320, 51);
+            this.lblSelectedTableCount.Size = new System.Drawing.Size(115, 20);
+            this.lblSelectedTableCount.Text = "";
+            this.lblSelectedTableCount.Font = fontCaption;
+            this.lblSelectedTableCount.ForeColor = clrTextSecondary;
+            this.lblSelectedTableCount.Visible = false;
+            this.grpDdlTarget.Controls.Add(this.lblSelectedTableCount);
+
+            // ----- Group: Options -----
+            this.grpDdlOptions = new System.Windows.Forms.GroupBox();
+            this.grpDdlOptions.Location = new System.Drawing.Point(12, 96);
+            this.grpDdlOptions.Size = new System.Drawing.Size(832, 56);
+            this.grpDdlOptions.Text = "Options";
+            this.grpDdlOptions.Font = fontCaption;
+            this.grpDdlOptions.ForeColor = clrTextSecondary;
+            this.tabApproval.Controls.Add(this.grpDdlOptions);
+
+            this.chkFilterObjects = new System.Windows.Forms.CheckBox();
+            this.chkFilterObjects.Location = new System.Drawing.Point(12, 24);
+            this.chkFilterObjects.Size = new System.Drawing.Size(190, 22);
+            this.chkFilterObjects.Text = "Only Selected Objects";
+            this.chkFilterObjects.Font = fontCaption;
+            this.grpDdlOptions.Controls.Add(this.chkFilterObjects);
+
+            var lblFEOption = new System.Windows.Forms.Label();
+            lblFEOption.Location = new System.Drawing.Point(220, 26);
+            lblFEOption.Size = new System.Drawing.Size(85, 20);
+            lblFEOption.Text = "FE Option XML:";
+            lblFEOption.Font = fontCaption;
+            lblFEOption.ForeColor = clrTextSecondary;
+            this.grpDdlOptions.Controls.Add(lblFEOption);
+
+            this.txtFEOptionXml = new System.Windows.Forms.TextBox();
+            this.txtFEOptionXml.Location = new System.Drawing.Point(305, 23);
+            this.txtFEOptionXml.Size = new System.Drawing.Size(450, 22);
+            this.txtFEOptionXml.Font = fontCaption;
+            this.txtFEOptionXml.Text = "";
+            this.txtFEOptionXml.ForeColor = clrTextSecondary;
+            this.grpDdlOptions.Controls.Add(this.txtFEOptionXml);
+
+            this.btnBrowseFEOption = new System.Windows.Forms.Button();
+            this.btnBrowseFEOption.Location = new System.Drawing.Point(758, 22);
+            this.btnBrowseFEOption.Size = new System.Drawing.Size(60, 24);
+            this.btnBrowseFEOption.Text = "Browse";
+            this.btnBrowseFEOption.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnBrowseFEOption.BackColor = System.Drawing.Color.White;
+            this.btnBrowseFEOption.FlatAppearance.BorderColor = clrBorder;
+            this.btnBrowseFEOption.Font = fontCaption;
+            this.btnBrowseFEOption.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnBrowseFEOption.Click += new System.EventHandler(this.BtnBrowseFEOption_Click);
+            this.grpDdlOptions.Controls.Add(this.btnBrowseFEOption);
+
+            // ----- Action row: Generate / Copy / Status -----
             this.btnGenerateDDL = new System.Windows.Forms.Button();
-            this.btnGenerateDDL.Location = new System.Drawing.Point(15, 47);
-            this.btnGenerateDDL.Size = new System.Drawing.Size(130, 32);
+            this.btnGenerateDDL.Location = new System.Drawing.Point(12, 162);
+            this.btnGenerateDDL.Size = new System.Drawing.Size(140, 32);
             this.btnGenerateDDL.Text = "Generate DDL";
             this.btnGenerateDDL.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
             this.btnGenerateDDL.BackColor = clrPrimary;
@@ -670,52 +758,9 @@ namespace EliteSoft.Erwin.AddIn
             this.btnGenerateDDL.Click += new System.EventHandler(this.BtnGenerateDDL_Click);
             this.tabApproval.Controls.Add(this.btnGenerateDDL);
 
-            this.btnMartReview = new System.Windows.Forms.Button();
-            this.btnMartReview.Location = new System.Drawing.Point(155, 47);
-            this.btnMartReview.Size = new System.Drawing.Size(100, 32);
-            this.btnMartReview.Text = "Mart Review";
-            this.btnMartReview.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnMartReview.BackColor = System.Drawing.Color.White;
-            this.btnMartReview.ForeColor = clrTextPrimary;
-            this.btnMartReview.FlatAppearance.BorderColor = clrBorder;
-            this.btnMartReview.Font = fontCaption;
-            this.btnMartReview.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnMartReview.Click += new System.EventHandler(this.BtnMartReview_Click);
-            this.tabApproval.Controls.Add(this.btnMartReview);
-
-            // FE Option XML
-            var lblFEOption = new System.Windows.Forms.Label();
-            lblFEOption.Location = new System.Drawing.Point(270, 53);
-            lblFEOption.Size = new System.Drawing.Size(65, 20);
-            lblFEOption.Text = "FE Option:";
-            lblFEOption.Font = fontCaption;
-            lblFEOption.ForeColor = clrTextSecondary;
-            this.tabApproval.Controls.Add(lblFEOption);
-
-            this.txtFEOptionXml = new System.Windows.Forms.TextBox();
-            this.txtFEOptionXml.Location = new System.Drawing.Point(335, 50);
-            this.txtFEOptionXml.Size = new System.Drawing.Size(310, 22);
-            this.txtFEOptionXml.Font = fontCaption;
-            this.txtFEOptionXml.Text = "";
-            this.txtFEOptionXml.ForeColor = clrTextSecondary;
-            this.tabApproval.Controls.Add(this.txtFEOptionXml);
-
-            this.btnBrowseFEOption = new System.Windows.Forms.Button();
-            this.btnBrowseFEOption.Location = new System.Drawing.Point(648, 49);
-            this.btnBrowseFEOption.Size = new System.Drawing.Size(28, 24);
-            this.btnBrowseFEOption.Text = "...";
-            this.btnBrowseFEOption.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnBrowseFEOption.BackColor = System.Drawing.Color.White;
-            this.btnBrowseFEOption.FlatAppearance.BorderColor = clrBorder;
-            this.btnBrowseFEOption.Font = fontCaption;
-            this.btnBrowseFEOption.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnBrowseFEOption.Click += new System.EventHandler(this.BtnBrowseFEOption_Click);
-            this.tabApproval.Controls.Add(this.btnBrowseFEOption);
-
-            // Copy + Save buttons
             this.btnCopyDDL = new System.Windows.Forms.Button();
-            this.btnCopyDDL.Location = new System.Drawing.Point(690, 49);
-            this.btnCopyDDL.Size = new System.Drawing.Size(60, 24);
+            this.btnCopyDDL.Location = new System.Drawing.Point(160, 165);
+            this.btnCopyDDL.Size = new System.Drawing.Size(80, 26);
             this.btnCopyDDL.Text = "Copy";
             this.btnCopyDDL.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
             this.btnCopyDDL.BackColor = System.Drawing.Color.White;
@@ -725,28 +770,19 @@ namespace EliteSoft.Erwin.AddIn
             this.btnCopyDDL.Click += new System.EventHandler(this.BtnCopyDDL_Click);
             this.tabApproval.Controls.Add(this.btnCopyDDL);
 
-            // Status label
             this.lblDDLStatus = new System.Windows.Forms.Label();
-            this.lblDDLStatus.Location = new System.Drawing.Point(15, 85);
-            this.lblDDLStatus.Size = new System.Drawing.Size(820, 20);
+            this.lblDDLStatus.Location = new System.Drawing.Point(252, 170);
+            this.lblDDLStatus.Size = new System.Drawing.Size(592, 20);
             this.lblDDLStatus.Text = "";
             this.lblDDLStatus.Font = fontCaption;
             this.lblDDLStatus.ForeColor = clrTextSecondary;
             this.tabApproval.Controls.Add(this.lblDDLStatus);
 
-            // "Only Selected Objects" checkbox - reads diagram selection at DDL generation time
-            this.chkFilterObjects = new System.Windows.Forms.CheckBox();
-            this.chkFilterObjects.Location = new System.Drawing.Point(15, 105);
-            this.chkFilterObjects.Size = new System.Drawing.Size(200, 20);
-            this.chkFilterObjects.Text = "Only Selected Objects";
-            this.chkFilterObjects.Font = fontCaption;
-            this.tabApproval.Controls.Add(this.chkFilterObjects);
-
-            // DDL output RichTextBox (read-only, monospace, SQL highlighting)
+            // ----- DDL output (anchor=All, fills remaining space) -----
             this.rtbDDLOutput = new System.Windows.Forms.RichTextBox();
             this.rtbDDLOutput.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right | System.Windows.Forms.AnchorStyles.Bottom;
-            this.rtbDDLOutput.Location = new System.Drawing.Point(15, 128);
-            this.rtbDDLOutput.Size = new System.Drawing.Size(830, 315);
+            this.rtbDDLOutput.Location = new System.Drawing.Point(12, 200);
+            this.rtbDDLOutput.Size = new System.Drawing.Size(832, 248);
             this.rtbDDLOutput.ReadOnly = true;
             this.rtbDDLOutput.WordWrap = false;
             this.rtbDDLOutput.Font = new System.Drawing.Font("Consolas", 9.5f);
@@ -754,64 +790,8 @@ namespace EliteSoft.Erwin.AddIn
             this.rtbDDLOutput.ForeColor = System.Drawing.Color.FromArgb(212, 212, 212);
             this.tabApproval.Controls.Add(this.rtbDDLOutput);
 
+            // ===== Debug Log tab — redesigned =====
             this.grpDebugLog.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right | System.Windows.Forms.AnchorStyles.Bottom;
-            this.grpDebugLog.Controls.Add(this.btnCopyLog);
-            this.btnDumpScapi = new System.Windows.Forms.Button();
-            this.btnDumpScapi.Location = new System.Drawing.Point(170, 24);
-            this.btnDumpScapi.Size = new System.Drawing.Size(100, 28);
-            this.btnDumpScapi.Text = "Dump SCAPI";
-            this.btnDumpScapi.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnDumpScapi.BackColor = System.Drawing.Color.White;
-            this.btnDumpScapi.ForeColor = clrTextSecondary;
-            this.btnDumpScapi.FlatAppearance.BorderColor = clrBorder;
-            this.btnDumpScapi.Font = fontCaption;
-            this.btnDumpScapi.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnDumpScapi.Click += new System.EventHandler(this.BtnDumpScapi_Click);
-            this.grpDebugLog.Controls.Add(this.btnDumpScapi);
-
-            this.btnMonitor = new System.Windows.Forms.Button();
-            this.btnMonitor.Location = new System.Drawing.Point(278, 24);
-            this.btnMonitor.Size = new System.Drawing.Size(100, 28);
-            this.btnMonitor.Text = "Start Monitor";
-            this.btnMonitor.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnMonitor.BackColor = System.Drawing.Color.White;
-            this.btnMonitor.ForeColor = clrTextSecondary;
-            this.btnMonitor.FlatAppearance.BorderColor = clrBorder;
-            this.btnMonitor.Font = fontCaption;
-            this.btnMonitor.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnMonitor.Click += new System.EventHandler(this.BtnMonitor_Click);
-            this.grpDebugLog.Controls.Add(this.btnMonitor);
-
-            this.btnCaptureRE = new System.Windows.Forms.Button();
-            this.btnCaptureRE.Location = new System.Drawing.Point(386, 24);
-            this.btnCaptureRE.Size = new System.Drawing.Size(100, 28);
-            this.btnCaptureRE.Text = "Capture RE";
-            this.btnCaptureRE.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnCaptureRE.BackColor = System.Drawing.Color.FromArgb(255, 200, 200);
-            this.btnCaptureRE.ForeColor = clrTextSecondary;
-            this.btnCaptureRE.FlatAppearance.BorderColor = clrBorder;
-            this.btnCaptureRE.Font = fontCaption;
-            this.btnCaptureRE.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnCaptureRE.Click += new System.EventHandler(this.BtnCaptureRE_Click);
-            this.grpDebugLog.Controls.Add(this.btnCaptureRE);
-
-            this.btnScanMenu = new System.Windows.Forms.Button();
-            this.btnScanMenu.Location = new System.Drawing.Point(494, 24);
-            this.btnScanMenu.Size = new System.Drawing.Size(100, 28);
-            this.btnScanMenu.Text = "Scan Menu";
-            this.btnScanMenu.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnScanMenu.BackColor = System.Drawing.Color.White;
-            this.btnScanMenu.ForeColor = clrTextSecondary;
-            this.btnScanMenu.FlatAppearance.BorderColor = clrBorder;
-            this.btnScanMenu.Font = fontCaption;
-            this.btnScanMenu.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnScanMenu.Click += new System.EventHandler(this.BtnScanMenu_Click);
-            this.grpDebugLog.Controls.Add(this.btnScanMenu);
-
-            this.grpDebugLog.Controls.Add(this.btnClearLog);
-            this.grpDebugLog.Controls.Add(this.lblLogSearch);
-            this.grpDebugLog.Controls.Add(this.txtLogSearch);
-            this.grpDebugLog.Controls.Add(this.txtDebugLog);
             this.grpDebugLog.Location = new System.Drawing.Point(12, 12);
             this.grpDebugLog.Name = "grpDebugLog";
             this.grpDebugLog.Size = new System.Drawing.Size(833, 432);
@@ -819,8 +799,36 @@ namespace EliteSoft.Erwin.AddIn
             this.grpDebugLog.TabStop = false;
             this.grpDebugLog.Text = "Debug Output";
 
-            // Toolbar row: Copy, Clear, Search
-            this.btnCopyLog.Location = new System.Drawing.Point(16, 24);
+            // Row 1: Diagnostic actions (left) + Log tools (right)
+            this.btnCaptureNow = new System.Windows.Forms.Button();
+            this.btnCaptureNow.Location = new System.Drawing.Point(16, 24);
+            this.btnCaptureNow.Size = new System.Drawing.Size(120, 28);
+            this.btnCaptureNow.Text = "Capture Now";
+            this.btnCaptureNow.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnCaptureNow.BackColor = System.Drawing.Color.White;
+            this.btnCaptureNow.ForeColor = clrTextPrimary;
+            this.btnCaptureNow.FlatAppearance.BorderColor = clrBorder;
+            this.btnCaptureNow.Font = fontCaption;
+            this.btnCaptureNow.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnCaptureNow.Click += new System.EventHandler(this.BtnCaptureNow_Click);
+            this.grpDebugLog.Controls.Add(this.btnCaptureNow);
+
+            this.btnLiveReMon = new System.Windows.Forms.Button();
+            this.btnLiveReMon.Location = new System.Drawing.Point(144, 24);
+            this.btnLiveReMon.Size = new System.Drawing.Size(120, 28);
+            this.btnLiveReMon.Text = "Live RE Monitor";
+            this.btnLiveReMon.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnLiveReMon.BackColor = System.Drawing.Color.White;
+            this.btnLiveReMon.ForeColor = clrTextPrimary;
+            this.btnLiveReMon.FlatAppearance.BorderColor = clrBorder;
+            this.btnLiveReMon.Font = fontCaption;
+            this.btnLiveReMon.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnLiveReMon.Click += new System.EventHandler(this.BtnLiveReMon_Click);
+            this.grpDebugLog.Controls.Add(this.btnLiveReMon);
+
+            // Right-side tools: Copy / Clear / Search
+            this.btnCopyLog.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right;
+            this.btnCopyLog.Location = new System.Drawing.Point(420, 24);
             this.btnCopyLog.Size = new System.Drawing.Size(70, 28);
             this.btnCopyLog.Text = "Copy";
             this.btnCopyLog.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
@@ -830,8 +838,10 @@ namespace EliteSoft.Erwin.AddIn
             this.btnCopyLog.Font = fontCaption;
             this.btnCopyLog.Cursor = System.Windows.Forms.Cursors.Hand;
             this.btnCopyLog.Click += new System.EventHandler(this.BtnCopyLog_Click);
+            this.grpDebugLog.Controls.Add(this.btnCopyLog);
 
-            this.btnClearLog.Location = new System.Drawing.Point(94, 24);
+            this.btnClearLog.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right;
+            this.btnClearLog.Location = new System.Drawing.Point(498, 24);
             this.btnClearLog.Size = new System.Drawing.Size(70, 28);
             this.btnClearLog.Text = "Clear";
             this.btnClearLog.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
@@ -841,20 +851,23 @@ namespace EliteSoft.Erwin.AddIn
             this.btnClearLog.Font = fontCaption;
             this.btnClearLog.Cursor = System.Windows.Forms.Cursors.Hand;
             this.btnClearLog.Click += new System.EventHandler(this.BtnClearLog_Click);
+            this.grpDebugLog.Controls.Add(this.btnClearLog);
 
             this.lblLogSearch.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right;
             this.lblLogSearch.AutoSize = true;
-            this.lblLogSearch.Location = new System.Drawing.Point(560, 30);
+            this.lblLogSearch.Location = new System.Drawing.Point(580, 30);
             this.lblLogSearch.Text = "Search:";
             this.lblLogSearch.ForeColor = clrTextSecondary;
             this.lblLogSearch.Font = fontCaption;
+            this.grpDebugLog.Controls.Add(this.lblLogSearch);
 
             this.txtLogSearch.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right;
-            this.txtLogSearch.Location = new System.Drawing.Point(610, 26);
-            this.txtLogSearch.Size = new System.Drawing.Size(207, 25);
+            this.txtLogSearch.Location = new System.Drawing.Point(630, 26);
+            this.txtLogSearch.Size = new System.Drawing.Size(187, 25);
             this.txtLogSearch.Font = fontCaption;
             this.txtLogSearch.PlaceholderText = "Filter log...";
             this.txtLogSearch.TextChanged += new System.EventHandler(this.TxtLogSearch_TextChanged);
+            this.grpDebugLog.Controls.Add(this.txtLogSearch);
 
             // Debug log — dark theme
             this.txtDebugLog.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right | System.Windows.Forms.AnchorStyles.Bottom;
@@ -867,6 +880,7 @@ namespace EliteSoft.Erwin.AddIn
             this.txtDebugLog.BackColor = System.Drawing.Color.FromArgb(30, 30, 30);
             this.txtDebugLog.ForeColor = System.Drawing.Color.FromArgb(212, 212, 212);
             this.txtDebugLog.WordWrap = false;
+            this.grpDebugLog.Controls.Add(this.txtDebugLog);
 
             // ================================================================
             // STATUS BAR (Bottom)
@@ -962,6 +976,11 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.RadioButton rbFromMart;
         private System.Windows.Forms.RadioButton rbFromDB;
         private System.Windows.Forms.Button btnConfigureDB;
+        private System.Windows.Forms.Button btnSelectDbTables;
+        private System.Windows.Forms.Label lblSelectedTableCount;
+        private System.Windows.Forms.GroupBox grpDdlSource;
+        private System.Windows.Forms.GroupBox grpDdlTarget;
+        private System.Windows.Forms.GroupBox grpDdlOptions;
         private System.Windows.Forms.Label lblDDLStatus;
         private System.Windows.Forms.CheckBox chkFilterObjects;
         private System.Windows.Forms.RichTextBox rtbDDLOutput;
@@ -1006,10 +1025,8 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.TextBox txtDebugLog;
         private System.Windows.Forms.Button btnCopyLog;
         private System.Windows.Forms.Button btnClearLog;
-        private System.Windows.Forms.Button btnDumpScapi;
-        private System.Windows.Forms.Button btnMonitor;
-        private System.Windows.Forms.Button btnScanMenu;
-        private System.Windows.Forms.Button btnCaptureRE;
+        private System.Windows.Forms.Button btnCaptureNow;
+        private System.Windows.Forms.Button btnLiveReMon;
         private System.Windows.Forms.TextBox txtLogSearch;
         private System.Windows.Forms.Label lblLogSearch;
 

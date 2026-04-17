@@ -55,19 +55,22 @@ Set-Location $scriptDir
 
 $installDir = Join-Path $env:LOCALAPPDATA "EliteSoft\ErwinAddIn"
 
-# --- Step 1: Close erwin if running ---
-$erwinProcess = Get-Process -Name "erwin" -ErrorAction SilentlyContinue
+# --- Step 1: Close erwin if running (CURRENT USER ONLY, never other sessions) ---
+$myUser = $env:USERNAME
+$erwinProcess = Get-Process -Name "erwin" -IncludeUserName -ErrorAction SilentlyContinue |
+    Where-Object { $_.UserName -and ($_.UserName -split '\\')[-1] -ieq $myUser }
 if ($erwinProcess) {
-    Write-Host "`nClosing erwin..." -ForegroundColor Yellow
+    Write-Host "`nClosing erwin (user=$myUser)..." -ForegroundColor Yellow
     $erwinProcess | Stop-Process -Force
     Start-Sleep -Seconds 2
     Write-Host "  erwin closed." -ForegroundColor Green
 }
 
-# --- Step 1b: Kill DdlHelper if running ---
-$ddlHelperProc = Get-Process -Name "DdlHelper" -ErrorAction SilentlyContinue
+# --- Step 1b: Kill DdlHelper if running (CURRENT USER ONLY) ---
+$ddlHelperProc = Get-Process -Name "DdlHelper" -IncludeUserName -ErrorAction SilentlyContinue |
+    Where-Object { $_.UserName -and ($_.UserName -split '\\')[-1] -ieq $myUser }
 if ($ddlHelperProc) {
-    Write-Host "Killing stuck DdlHelper process..." -ForegroundColor Yellow
+    Write-Host "Killing stuck DdlHelper process (user=$myUser)..." -ForegroundColor Yellow
     $ddlHelperProc | Stop-Process -Force
     Start-Sleep -Seconds 1
     Write-Host "  DdlHelper killed." -ForegroundColor Green

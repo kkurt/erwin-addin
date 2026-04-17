@@ -48,6 +48,8 @@
 
   <ItemGroup>
     <EmbeddedResource Include="erwin-addi-in-splash.png" />
+    <EmbeddedResource Include="Resources\DefaultReverseOptions.xml" />
+    <EmbeddedResource Include="Resources\DefaultGenerationOptions.xml" />
   </ItemGroup>
 
   <ItemGroup>

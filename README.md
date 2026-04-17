@@ -7,7 +7,8 @@ Bu add-in, erwin Data Modeler için geliştirilmiş bir COM bileşenidir. Model 
 ## Sistem Gereksinimleri
 
 - erwin Data Modeler 15.0 veya üzeri (64-bit)
-- .NET Framework 4.8
+- .NET 10 Runtime (Windows Desktop)
+- .NET 10 SDK (sadece build için)
 - Windows 10/11 veya Windows Server
 
 ## Dosya Yapısı
@@ -19,23 +20,41 @@ erwin-addin/
 ├── ModelConfigForm.Designer.cs      # Form tasarımcı kodu
 ├── ErwinUtilities.cs                # Yardımcı fonksiyonlar
 ├── DDLGenerator.cs                  # DDL oluşturma
-├── ErwinAddIn.csproj                # Proje dosyası
+├── ErwinAddIn.csproj                # Proje dosyası (net10.0-windows, EnableComHosting)
 ├── erwin-addin.sln                  # Solution dosyası
-├── build-and-register.ps1           # Build ve COM kayıt scripti
+├── build-and-run.ps1                # Build + install + COM register (dev workflow)
+├── package.ps1                      # Dağıtım için ZIP/EXE paketleme
 ├── References/
 │   └── EAL.dll                      # erwin API Library (SCAPI)
+├── Forms/
+│   ├── DbConnectionForm.cs              # DB bağlantı (From DB modu)
+│   └── QuestionWizardForm.cs            # Soru sihirbazı
 ├── Services/
 │   ├── ValidationCoordinatorService.cs  # Merkezi validasyon koordinatörü
 │   ├── ColumnValidationService.cs       # Glossary validasyon servisi
 │   ├── TableTypeMonitorService.cs       # TABLE_TYPE izleme servisi
 │   ├── DatabaseService.cs               # Multi-database bağlantı yönetimi
 │   ├── GlossaryService.cs               # Glossary veritabanı servisi
-│   ├── GlossaryConnectionService.cs     # Glossary bağlantı yönetimi
 │   ├── DomainDefService.cs              # Domain tanımları servisi
-│   ├── TableTypeService.cs              # TABLE_TYPE veritabanı servisi
-│   └── PredefinedColumnService.cs       # Önceden tanımlı kolon servisi
+│   ├── PredefinedColumnService.cs       # Önceden tanımlı kolon servisi
+│   ├── DdlGenerationService.cs          # DDL üretim ve karşılaştırma
+│   ├── DependencySetRuntimeService.cs   # Dependency set runtime
+│   ├── PropertyApplicatorService.cs     # Property uygulayıcı
+│   ├── UdpDefinitionService.cs / UdpRuntimeService.cs / UdpDependencyService.cs / UdpValidationEngine.cs
+│   ├── NamingStandardService.cs / NamingValidationEngine.cs
+│   ├── CorporateContextService.cs / RegistryBootstrapService.cs / PasswordEncryptionService.cs
+│   ├── AddInPropertyMetadataService.cs
+│   └── Win32Helper.cs                   # Win32/IAccessible yardımcıları
+├── tools/
+│   └── DdlHelper/                       # SCAPI'yi ayrı process'te çalıştıran yardımcı
 ├── scripts/
-│   └── insert_test_glossary.sql         # Test glossary verisi seed scripti
+│   ├── insert_test_glossary.sql         # Test glossary verisi seed scripti
+│   ├── install.ps1                      # Son kullanıcı kurulum scripti
+│   ├── erwin-launcher.ps1               # erwin launcher
+│   ├── autostart-watcher.ps1            # Otomatik başlatma watcher
+│   └── erwin-injector/                  # DLL injection auto-load (NativeAOT)
+├── installer/
+│   └── install.ps1                      # Paketlenmiş installer scripti
 └── README.md
 ```
 
@@ -81,15 +100,15 @@ PowerShell'den çalıştırın (script otomatik olarak Administrator yetkisi ist
 
 ```powershell
 cd c:\Users\Kursat\Repos\erwin-addin
-.\build-and-register.ps1
+.\build-and-run.ps1
 ```
 
 Script şunları yapar:
 1. Administrator yetkisi yoksa otomatik yükseltme yapar
-2. erwin çalışıyorsa kapatma seçeneği sunar
-3. Projeyi Release modunda build eder
-4. Eski COM kaydını siler (varsa)
-5. Yeni COM bileşenini Type Library ile kaydeder
+2. erwin (ve takılı kalmış DdlHelper) process'lerini kapatır
+3. Projeyi Release modunda build eder + DdlHelper publish eder
+4. `%LOCALAPPDATA%\EliteSoft\ErwinAddIn` altına kopyalar
+5. Eski COM host kaydını siler ve yeni `*.comhost.dll` dosyasını `regsvr32` ile kaydeder
 
 ### Manuel Build
 
@@ -97,17 +116,21 @@ Script şunları yapar:
 dotnet build erwin-addin.sln -c Release
 ```
 
+Çıktı: `bin\Release\net10.0-windows\EliteSoft.Erwin.AddIn.dll` ve `EliteSoft.Erwin.AddIn.comhost.dll`.
+
 ### Manuel COM Kayıt
+
+.NET 10 COM hosting kullanıldığı için kayıt `regsvr32` ile `comhost.dll` üzerinden yapılır (regasm DEĞİL):
 
 ```powershell
 # Administrator CMD/PowerShell gerekli
-C:\Windows\Microsoft.NET\Framework64\v4.0.30319\regasm.exe bin\Release\net48\EliteSoft.Erwin.AddIn.dll /codebase /tlb:bin\Release\net48\EliteSoft.Erwin.AddIn.tlb
+regsvr32.exe "%LOCALAPPDATA%\EliteSoft\ErwinAddIn\EliteSoft.Erwin.AddIn.comhost.dll"
 ```
 
 ### COM Kaydını Silme
 
 ```powershell
-C:\Windows\Microsoft.NET\Framework64\v4.0.30319\regasm.exe bin\Release\net48\EliteSoft.Erwin.AddIn.dll /unregister
+regsvr32.exe /u "%LOCALAPPDATA%\EliteSoft\ErwinAddIn\EliteSoft.Erwin.AddIn.comhost.dll"
 ```
 
 ## erwin'e Ekleme
@@ -148,9 +171,9 @@ DatabaseName=<değer>;SchemaName=<değer>;FullName=<değer>;Code=<değer>
 | **ProgID** | `EliteSoft.Erwin.AddIn` |
 | **GUID** | `A1B2C3D4-E5F6-7890-ABCD-EF1234567890` |
 | **Namespace** | `EliteSoft.Erwin.AddIn` |
-| **Assembly** | `EliteSoft.Erwin.AddIn.dll` |
+| **Assembly** | `EliteSoft.Erwin.AddIn.dll` (+ `EliteSoft.Erwin.AddIn.comhost.dll`) |
 | **Platform** | x64 |
-| **Framework** | .NET Framework 4.8 |
+| **Framework** | .NET 10 (windows desktop, COM hosting) |
 
 ### SCAPI Bağlantısı
 
@@ -193,9 +216,16 @@ Glossary ve yapılandırma verileri için:
 
 ## Bağımlılıklar
 
-### NuGet Paketleri
-- **Npgsql** v4.1.13 - PostgreSQL bağlantısı
-- **Oracle.ManagedDataAccess** v21.15.0 - Oracle bağlantısı
+### NuGet Paketleri (bkz. ErwinAddIn.csproj)
+- **Microsoft.Data.SqlClient** v6.1.4 - SQL Server bağlantısı
+- **Npgsql** v10.0.2 - PostgreSQL bağlantısı
+- **Oracle.ManagedDataAccess.Core** v23.26.100 - Oracle bağlantısı
+- **System.Data.Odbc** v10.0.6 - ODBC bağlantısı
+- **ExcelDataReader** v3.7.0 + **ExcelDataReader.DataSet** v3.7.0 - Excel okuma
+
+### Project References
+- `..\erwin-admin\MetaShared\MetaShared.csproj`
+- `..\x-hw-licensing\xLicense\xLicense.csproj` - lisans doğrulama
 
 ### Referanslar
 - **EAL.dll** - erwin API Library (SCAPI)
@@ -212,7 +242,7 @@ Glossary ve yapılandırma verileri için:
 
 ### "Cannot find ErwinAddIn.TableCreator Component"
 - ProgID yanlış girilmiş. Doğru ProgID: `EliteSoft.Erwin.AddIn`
-- COM kaydı yapılmamış olabilir, `build-and-register.ps1` çalıştırın
+- COM kaydı yapılmamış olabilir, `build-and-run.ps1` çalıştırın
 
 ### "Failed to invoke Execute Method"
 - Function Name doğru girilmemiş olabilir (`Execute` olmalı)
