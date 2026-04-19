@@ -1,0 +1,6 @@
+# Build artifacts (the final DLL is checked in for now; regenerate via build.ps1)
+*.obj
+*.exp
+*.lib
+*.pdb
+*.ilk

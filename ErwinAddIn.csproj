@@ -57,11 +57,16 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <Link>EAL.dll</Link>
     </None>
+    <None Include="scripts\native-bridge\ErwinNativeBridge.dll" Condition="Exists('scripts\native-bridge\ErwinNativeBridge.dll')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>ErwinNativeBridge.dll</Link>
+    </None>
   </ItemGroup>
 
   <!-- Copy EAL.dll directly to output directory (not in References subfolder) -->
   <Target Name="CopyEALToOutput" AfterTargets="Build">
     <Copy SourceFiles="$(ProjectDir)References\EAL.dll" DestinationFiles="$(OutputPath)EAL.dll" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(ProjectDir)scripts\native-bridge\ErwinNativeBridge.dll" DestinationFiles="$(OutputPath)ErwinNativeBridge.dll" SkipUnchangedFiles="true" Condition="Exists('$(ProjectDir)scripts\native-bridge\ErwinNativeBridge.dll')" />
     <Message Text="Copied EAL.dll to $(OutputPath)" Importance="high" />
   </Target>
 

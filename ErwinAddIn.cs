@@ -105,6 +105,11 @@ namespace EliteSoft.Erwin.AddIn
             {
                 EnsureExceptionHandler();
 
+                // Phase A spike: install native SyncModelCallback hook.
+                // Safe no-op if the bridge DLL is missing or EM_ECX can't be found.
+                Services.NativeBridgeService.Install(msg =>
+                    System.Diagnostics.Debug.WriteLine(msg));
+
                 // License check
                 if (!CheckLicense())
                     return;
