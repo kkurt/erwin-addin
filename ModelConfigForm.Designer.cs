@@ -599,7 +599,7 @@ namespace EliteSoft.Erwin.AddIn
             // ----- Group: Source (left model = active model) -----
             this.grpDdlSource = new System.Windows.Forms.GroupBox();
             this.grpDdlSource.Location = new System.Drawing.Point(12, 12);
-            this.grpDdlSource.Size = new System.Drawing.Size(380, 78);
+            this.grpDdlSource.Size = new System.Drawing.Size(380, 88);
             this.grpDdlSource.Text = "Source (Left)";
             this.grpDdlSource.Font = fontCaption;
             this.grpDdlSource.ForeColor = clrTextSecondary;
@@ -636,7 +636,7 @@ namespace EliteSoft.Erwin.AddIn
             // ----- Group: Target (right side = Mart version OR DB) -----
             this.grpDdlTarget = new System.Windows.Forms.GroupBox();
             this.grpDdlTarget.Location = new System.Drawing.Point(400, 12);
-            this.grpDdlTarget.Size = new System.Drawing.Size(444, 78);
+            this.grpDdlTarget.Size = new System.Drawing.Size(444, 88);
             this.grpDdlTarget.Text = "Target (Right)";
             this.grpDdlTarget.Font = fontCaption;
             this.grpDdlTarget.ForeColor = clrTextSecondary;
@@ -703,7 +703,7 @@ namespace EliteSoft.Erwin.AddIn
 
             // ----- Group: Options -----
             this.grpDdlOptions = new System.Windows.Forms.GroupBox();
-            this.grpDdlOptions.Location = new System.Drawing.Point(12, 96);
+            this.grpDdlOptions.Location = new System.Drawing.Point(12, 106);
             this.grpDdlOptions.Size = new System.Drawing.Size(832, 56);
             this.grpDdlOptions.Text = "Options";
             this.grpDdlOptions.Font = fontCaption;
@@ -746,20 +746,8 @@ namespace EliteSoft.Erwin.AddIn
             this.grpDdlOptions.Controls.Add(this.btnBrowseFEOption);
 
             // ----- Action row: Generate / Copy / Status -----
-            this.btnGenerateDDL = new System.Windows.Forms.Button();
-            this.btnGenerateDDL.Location = new System.Drawing.Point(12, 162);
-            this.btnGenerateDDL.Size = new System.Drawing.Size(140, 32);
-            this.btnGenerateDDL.Text = "Generate DDL";
-            this.btnGenerateDDL.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnGenerateDDL.BackColor = clrPrimary;
-            this.btnGenerateDDL.ForeColor = System.Drawing.Color.White;
-            this.btnGenerateDDL.Font = new System.Drawing.Font("Segoe UI", 9.5f, System.Drawing.FontStyle.Bold);
-            this.btnGenerateDDL.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnGenerateDDL.Click += new System.EventHandler(this.BtnGenerateDDL_Click);
-            this.tabApproval.Controls.Add(this.btnGenerateDDL);
-
             this.btnCopyDDL = new System.Windows.Forms.Button();
-            this.btnCopyDDL.Location = new System.Drawing.Point(160, 165);
+            this.btnCopyDDL.Location = new System.Drawing.Point(195, 175);
             this.btnCopyDDL.Size = new System.Drawing.Size(80, 26);
             this.btnCopyDDL.Text = "Copy";
             this.btnCopyDDL.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
@@ -770,9 +758,21 @@ namespace EliteSoft.Erwin.AddIn
             this.btnCopyDDL.Click += new System.EventHandler(this.BtnCopyDDL_Click);
             this.tabApproval.Controls.Add(this.btnCopyDDL);
 
+            this.btnAlterWizardProd = new System.Windows.Forms.Button();
+            this.btnAlterWizardProd.Location = new System.Drawing.Point(12, 172);
+            this.btnAlterWizardProd.Size = new System.Drawing.Size(175, 32);
+            this.btnAlterWizardProd.Text = "Generate DDL";
+            this.btnAlterWizardProd.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnAlterWizardProd.BackColor = clrSuccess;
+            this.btnAlterWizardProd.ForeColor = System.Drawing.Color.White;
+            this.btnAlterWizardProd.Font = new System.Drawing.Font("Segoe UI", 9.5f, System.Drawing.FontStyle.Bold);
+            this.btnAlterWizardProd.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnAlterWizardProd.Click += new System.EventHandler(this.BtnAlterWizardProd_Click);
+            this.tabApproval.Controls.Add(this.btnAlterWizardProd);
+
             this.lblDDLStatus = new System.Windows.Forms.Label();
-            this.lblDDLStatus.Location = new System.Drawing.Point(252, 170);
-            this.lblDDLStatus.Size = new System.Drawing.Size(592, 20);
+            this.lblDDLStatus.Location = new System.Drawing.Point(290, 180);
+            this.lblDDLStatus.Size = new System.Drawing.Size(555, 20);
             this.lblDDLStatus.Text = "";
             this.lblDDLStatus.Font = fontCaption;
             this.lblDDLStatus.ForeColor = clrTextSecondary;
@@ -781,8 +781,8 @@ namespace EliteSoft.Erwin.AddIn
             // ----- DDL output (anchor=All, fills remaining space) -----
             this.rtbDDLOutput = new System.Windows.Forms.RichTextBox();
             this.rtbDDLOutput.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right | System.Windows.Forms.AnchorStyles.Bottom;
-            this.rtbDDLOutput.Location = new System.Drawing.Point(12, 200);
-            this.rtbDDLOutput.Size = new System.Drawing.Size(832, 248);
+            this.rtbDDLOutput.Location = new System.Drawing.Point(12, 210);
+            this.rtbDDLOutput.Size = new System.Drawing.Size(832, 300);
             this.rtbDDLOutput.ReadOnly = true;
             this.rtbDDLOutput.WordWrap = false;
             this.rtbDDLOutput.Font = new System.Drawing.Font("Consolas", 9.5f);
@@ -813,10 +813,23 @@ namespace EliteSoft.Erwin.AddIn
             this.btnCaptureNow.Click += new System.EventHandler(this.BtnCaptureNow_Click);
             this.grpDebugLog.Controls.Add(this.btnCaptureNow);
 
+            this.btnTestAlterFE = new System.Windows.Forms.Button();
+            this.btnTestAlterFE.Location = new System.Drawing.Point(272, 24);
+            this.btnTestAlterFE.Size = new System.Drawing.Size(130, 28);
+            this.btnTestAlterFE.Text = "Test ActionConvertor";
+            this.btnTestAlterFE.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnTestAlterFE.BackColor = System.Drawing.Color.FromArgb(180, 220, 255);
+            this.btnTestAlterFE.ForeColor = clrTextPrimary;
+            this.btnTestAlterFE.FlatAppearance.BorderColor = clrBorder;
+            this.btnTestAlterFE.Font = fontCaption;
+            this.btnTestAlterFE.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnTestAlterFE.Click += new System.EventHandler(this.BtnTestAlterFE_Click);
+            this.grpDebugLog.Controls.Add(this.btnTestAlterFE);
+
             this.btnLiveReMon = new System.Windows.Forms.Button();
             this.btnLiveReMon.Location = new System.Drawing.Point(144, 24);
             this.btnLiveReMon.Size = new System.Drawing.Size(120, 28);
-            this.btnLiveReMon.Text = "Live RE Monitor";
+            this.btnLiveReMon.Text = "Live Monitor";
             this.btnLiveReMon.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
             this.btnLiveReMon.BackColor = System.Drawing.Color.White;
             this.btnLiveReMon.ForeColor = clrTextPrimary;
@@ -825,6 +838,45 @@ namespace EliteSoft.Erwin.AddIn
             this.btnLiveReMon.Cursor = System.Windows.Forms.Cursors.Hand;
             this.btnLiveReMon.Click += new System.EventHandler(this.BtnLiveReMon_Click);
             this.grpDebugLog.Controls.Add(this.btnLiveReMon);
+
+            this.btnDumpPropBag = new System.Windows.Forms.Button();
+            this.btnDumpPropBag.Location = new System.Drawing.Point(16, 56);
+            this.btnDumpPropBag.Size = new System.Drawing.Size(130, 28);
+            this.btnDumpPropBag.Text = "Dump PropBag";
+            this.btnDumpPropBag.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnDumpPropBag.BackColor = System.Drawing.Color.FromArgb(255, 240, 200);
+            this.btnDumpPropBag.ForeColor = clrTextPrimary;
+            this.btnDumpPropBag.FlatAppearance.BorderColor = clrBorder;
+            this.btnDumpPropBag.Font = fontCaption;
+            this.btnDumpPropBag.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnDumpPropBag.Click += new System.EventHandler(this.BtnDumpPropBag_Click);
+            this.grpDebugLog.Controls.Add(this.btnDumpPropBag);
+
+            this.btnDumpUiaTree = new System.Windows.Forms.Button();
+            this.btnDumpUiaTree.Location = new System.Drawing.Point(154, 56);
+            this.btnDumpUiaTree.Size = new System.Drawing.Size(130, 28);
+            this.btnDumpUiaTree.Text = "Dump UIA Tree";
+            this.btnDumpUiaTree.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnDumpUiaTree.BackColor = System.Drawing.Color.FromArgb(220, 200, 255);
+            this.btnDumpUiaTree.ForeColor = clrTextPrimary;
+            this.btnDumpUiaTree.FlatAppearance.BorderColor = clrBorder;
+            this.btnDumpUiaTree.Font = fontCaption;
+            this.btnDumpUiaTree.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnDumpUiaTree.Click += new System.EventHandler(this.BtnDumpUiaTree_Click);
+            this.grpDebugLog.Controls.Add(this.btnDumpUiaTree);
+
+            this.btnAlterWizard = new System.Windows.Forms.Button();
+            this.btnAlterWizard.Location = new System.Drawing.Point(292, 56);
+            this.btnAlterWizard.Size = new System.Drawing.Size(180, 28);
+            this.btnAlterWizard.Text = "Alter Script (0-click Wizard)";
+            this.btnAlterWizard.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnAlterWizard.BackColor = System.Drawing.Color.FromArgb(180, 255, 200);
+            this.btnAlterWizard.ForeColor = clrTextPrimary;
+            this.btnAlterWizard.FlatAppearance.BorderColor = clrBorder;
+            this.btnAlterWizard.Font = fontCaption;
+            this.btnAlterWizard.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnAlterWizard.Click += new System.EventHandler(this.BtnAlterWizard_Click);
+            this.grpDebugLog.Controls.Add(this.btnAlterWizard);
 
             // Right-side tools: Copy / Clear / Search
             this.btnCopyLog.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right;
@@ -967,7 +1019,7 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.TabPage tabValidation;
         private System.Windows.Forms.TabPage tabApproval;
         private System.Windows.Forms.Button btnMartReview;
-        private System.Windows.Forms.Button btnGenerateDDL;
+        private System.Windows.Forms.Button btnAlterWizardProd;
         private System.Windows.Forms.ComboBox cmbLeftModel;
         private System.Windows.Forms.ComboBox cmbRightModel;
         private System.Windows.Forms.TextBox txtFEOptionXml;
@@ -1027,6 +1079,10 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.Button btnClearLog;
         private System.Windows.Forms.Button btnCaptureNow;
         private System.Windows.Forms.Button btnLiveReMon;
+        private System.Windows.Forms.Button btnTestAlterFE;
+        private System.Windows.Forms.Button btnDumpPropBag;
+        private System.Windows.Forms.Button btnDumpUiaTree;
+        private System.Windows.Forms.Button btnAlterWizard;
         private System.Windows.Forms.TextBox txtLogSearch;
         private System.Windows.Forms.Label lblLogSearch;
 

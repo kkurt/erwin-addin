@@ -902,6 +902,107 @@ WScript.Quit 0
         }
 
         /// <summary>
+        /// Silently reverse-engineer a live database into a NEW persistence unit in the
+        /// current SCAPI session and keep it loaded. Returns the new PU, which becomes
+        /// available as a selectable right-side model (e.g. for the Alter Script Wizard).
+        /// </summary>
+        public static dynamic ReverseEngineerToSession(
+            dynamic scapi,
+            dynamic currentPU,
+            string host,
+            string database,
+            string user,
+            string password,
+            bool useWindowsAuth,
+            int dbTypeCode,
+            long targetServerCode,
+            int targetServerVersion,
+            string schema,
+            IEnumerable<string> selectedTables,
+            Action<string> log)
+        {
+            string tempDsn = null;
+            string tempReOptionXml = null;
+            System.Data.IDbConnection sqlConnLong = null;
+            try
+            {
+                if (string.IsNullOrWhiteSpace(host) || string.IsNullOrWhiteSpace(database))
+                    throw new InvalidOperationException("DB host/database missing. Click 'Configure DB' first.");
+                var tableList = (selectedTables ?? new string[0])
+                    .Where(t => !string.IsNullOrWhiteSpace(t))
+                    .Select(t => t.Trim()).ToList();
+                if (tableList.Count == 0)
+                    throw new InvalidOperationException("No tables selected for comparison.");
+                if (targetServerCode == 0)
+                    throw new InvalidOperationException("Target server code not provided.");
+
+                log?.Invoke($"RE: DB = {host}/{database}, {tableList.Count} table(s), schema='{schema}'");
+
+                // Open SQL connection for XML_OPTION lookup
+                sqlConnLong = OpenSqlConnectionForXmlOption(host, database, user, password, useWindowsAuth, log);
+                int? activeModelId = null;
+                if (sqlConnLong != null)
+                {
+                    string modelPath = ActiveModelMetadataService.ReadModelPathUdp(null, currentPU, log);
+                    activeModelId = ActiveModelMetadataService.LookupModelIdByPath(sqlConnLong, modelPath, log);
+                }
+
+                // ODBC driver preflight + transient DSN
+                var drvCheck = OdbcDsnHelper.CheckSqlServerDriver(log);
+                if (!drvCheck.IsOk) throw new InvalidOperationException(drvCheck.UserMessage);
+                OdbcDsnHelper.CleanupStale(log);
+                tempDsn = OdbcDsnHelper.CreateTempSqlServerDsn(host, database, user, log);
+
+                tempReOptionXml = XmlOptionLoaderService.LoadAndWriteToTempFile(sqlConnLong, activeModelId, "RE", log);
+
+                // Create blank PU for RE
+                Type pbType = Type.GetTypeFromProgID("ERwin9.SCAPI.PropertyBag.9.0");
+                if (pbType == null) throw new InvalidOperationException("SCAPI PropertyBag ProgID not registered.");
+                dynamic propBag = Activator.CreateInstance(pbType);
+                propBag.Add("Model_Type", "Combined");
+                propBag.Add("Target_Server", (int)targetServerCode);
+                propBag.Add("Target_Server_Version", targetServerVersion);
+                dynamic rePU = scapi.PersistenceUnits.Create(propBag);
+                log?.Invoke($"RE: blank PU created — {rePU.Name}");
+
+                // Set RE keys
+                propBag.ClearAll();
+                propBag.Add("System_Objects", false);
+                propBag.Add("Oracle_Use_DBA_Views", false);
+                propBag.Add("Synch_Owned_Only", !string.IsNullOrEmpty(schema));
+                propBag.Add("Synch_Owned_Only_Name", schema ?? "");
+                propBag.Add("Case_Option", 25091);
+                propBag.Add("Logical_Case_Option", 25046);
+                propBag.Add("Infer_Primary_Keys", false);
+                propBag.Add("Infer_Relations", false);
+                propBag.Add("Infer_Relations_Indexes", false);
+                propBag.Add("Remove_ERwin_Generated_Triggers", false);
+                propBag.Add("Force_Physical_Name_Option", false);
+                propBag.Add("Synch_Table_Filter_By_Name", string.Join(",", tableList));
+
+                int authCode = useWindowsAuth ? 8 : 4;
+                string connStr =
+                    $"SERVER={dbTypeCode}:{targetServerVersion}:0|" +
+                    $"AUTHENTICATION={authCode}|" +
+                    $"USER={user}|1=2|5={tempDsn}";
+                string rePassword = useWindowsAuth ? "" : (password ?? "");
+                object reOptArg = string.IsNullOrEmpty(tempReOptionXml) ? (object)Type.Missing : tempReOptionXml;
+
+                long t0 = Environment.TickCount64;
+                object reResult = rePU.ReverseEngineer(propBag, reOptArg, connStr, rePassword);
+                long elapsed = Environment.TickCount64 - t0;
+                log?.Invoke($"RE: ReverseEngineer returned {(reResult ?? "<null>")} in {elapsed}ms");
+                return rePU;
+            }
+            finally
+            {
+                try { sqlConnLong?.Close(); sqlConnLong?.Dispose(); } catch { }
+                try { if (tempDsn != null) OdbcDsnHelper.DeleteDsn(tempDsn, log); } catch { }
+                try { if (!string.IsNullOrEmpty(tempReOptionXml) && File.Exists(tempReOptionXml)) File.Delete(tempReOptionXml); } catch { }
+            }
+        }
+
+        /// <summary>
         /// Compare active model with a live database via IN-PROCESS silent ReverseEngineer.
         /// Steps:
         ///   1) FEModel_DDL on active PU -> currentDdl
