@@ -26,6 +26,8 @@
 #include <stdlib.h>
 #include <time.h>
 #include <stdint.h>
+#include <set>
+#include <string.h>
 
 static void GetLogPath(char* out, size_t outSize) {
     DWORD n = GetEnvironmentVariableA("TEMP", out, (DWORD)outSize);
@@ -155,7 +157,16 @@ static size_t InstrLen_x64(const BYTE* p) {
             if (mod != 3 && rm == 4) sz += 1;      // SIB
             if (mod == 1) sz += 1;                 // disp8
             else if (mod == 2) sz += 4;            // disp32
-            else if (mod == 0 && rm == 5) sz += 4; // RIP-relative disp32 (we don't relocate but can copy)
+            else if (mod == 0 && rm == 5) {
+                // RIP-relative disp32 — we CANNOT naively copy this to the
+                // trampoline because the disp32 is relative to RIP at the
+                // TRAMPOLINE address, not the original. Returning 0 here makes
+                // AlignedCopyLen bail out -> InstallInlineHook aborts rather
+                // than crashing erwin when the relocated MOV/LEA dereferences
+                // garbage. Relocating would require rewriting the disp32 which
+                // we don't implement. (Discovered the hard way via erwin crash.)
+                return 0;
+            }
             return sz;
         }
         // MOV [r/m], imm8  -> C6 /0 ib         (2 + sib/disp + 1)
@@ -984,6 +995,150 @@ static const char* kSetMsSym    = "?SetModelSet@CERwinFEData@@SAXPEAVGDMModelSet
 static const char* kGetASSym    = "?GetActionSummary@CERwinFEData@@SAPEAVGDMActionSummary@@XZ";
 static const char* kClearSym    = "?ClearERwinFEData@CERwinFEData@@SAXXZ";
 
+// ---------------------------------------------------------------------------
+// FEWPageOptions — the wizard "Options" page class.
+// Its InvokePreviewStringOnlyCommand() method returns the DDL string directly
+// when the user clicks Preview. No args other than `this`. If we capture a
+// valid `this` pointer and the wizard stays alive (hidden), we can call this
+// method ON DEMAND and get the DDL without navigating pages.
+//
+// x64 ABI notes:
+//   ctor (member, __thiscall):
+//     RCX=this, RDX=&WSFWizardBase, R8=&EouFEPARAM
+//   Invoke (member, returns CString):
+//     CString is non-trivially-copyable (has copy ctor, ref counted), so the
+//     x64 ABI uses a hidden first argument for the return. Effective signature:
+//     CString* Invoke(CString* retBuf /*RCX*/, void* self /*RDX*/);
+//   CString layout on x64: single pointer (8 bytes) to heap-allocated data.
+// ---------------------------------------------------------------------------
+static const char* kFEWPageOptionsCtorSym =
+    "??0FEWPageOptions@@QEAA@AEAVWSFWizardBase@@AEBUEouFEPARAM@@@Z";
+// FEWPagePreviewEx — the Preview tab's page class. Hypothesis: inherits from
+// FEWPageOptions so its `this` is what Invoke is called on when user clicks
+// Preview. Ctor signature: (WSFWizardBase&, EouFEPARAM const&, PreviewState2_s*)
+static const char* kFEWPagePreviewExCtorSym =
+    "??0FEWPagePreviewEx@@QEAA@AEAVWSFWizardBase@@AEBUEouFEPARAM@@PEAUPreviewState2_s@FEW@@@Z";
+static const char* kInvokePreviewSym =
+    "?InvokePreviewStringOnlyCommand@FEWPageOptions@@QEAA?AV?$CStringT@DV?$StrTraitMFC_DLL@DV?$ChTraitsCRT@D@ATL@@@@@ATL@@XZ";
+
+typedef void  (__cdecl* FEWCtorFn)(void* self, void* wsfBase, const void* feParam);
+typedef void  (__cdecl* FEWPreviewExCtorFn)(void* self, void* wsfBase, const void* feParam, void* previewState);
+typedef void* (__cdecl* InvokePreviewFn)(void* retBuf, void* self);
+
+static FEWCtorFn           g_origFEWCtor             = nullptr;
+static FEWPreviewExCtorFn  g_origFEWPreviewExCtor    = nullptr;
+static InvokePreviewFn     g_origInvokePreview       = nullptr;
+// Direct (un-hooked) address of InvokePreviewStringOnlyCommand - used by
+// CallInvokePreviewOnCaptured to call into erwin without a detour trampoline.
+static InvokePreviewFn     g_directInvokePreview     = nullptr;
+
+// Stashed feParam template + wsfBase from first wizard open. Used for the
+// GenerateAlterDdlStandalone experiment (construct FEWPageOptions without
+// opening the wizard). Populated in FEWCtorHook on first ctor firing.
+static BYTE g_stashedFeParam[128] = { 0 };
+static bool g_stashedFeParamValid = false;
+static void* g_stashedWsfBase = nullptr;
+
+// Set by FEWCtorHook when we're in the middle of an auto-open sequence.
+// Used to synchronize: the outer function polls this flag so it knows when
+// erwin has started constructing the wizard (after SendInput).
+static volatile LONG g_autoOpenCtorFired = 0;
+
+// Most-recent hidden-wizard HWND. Published by either the polling loop in
+// OpenAlterScriptWizardHidden OR (preferred, flash-free) the WinEvent hook
+// that fires as soon as erwin creates the window.
+static volatile LONG64 g_hiddenWizardHwnd = 0;
+
+// Typedef for Invoke call (single-arg ABI, return-in-RAX). We don't actually
+// use the return value — we just need the call to run so that erwin's
+// internal GenerateAlterScript fires, and our GA detour captures the DDL
+// into g_lastCapturedDdl. SEH after return is harmless.
+typedef void* (__cdecl* InvokeFn)(void* self);
+// Most-recent FEWPageOptions parametric instance (ctor hook). The "Options"
+// page of the wizard.
+static volatile LONG64 g_capturedFEWPO = 0;
+// Most-recent FEWPagePreviewEx instance (ctor hook). HYPOTHESIS: this is a
+// SUBCLASS of FEWPageOptions, so its `this` is the real argument to
+// InvokePreviewStringOnlyCommand when user clicks Preview.
+static volatile LONG64 g_capturedFEWPreviewEx = 0;
+
+static void __cdecl FEWPreviewExCtorHook(void* self, void* wsfBase, const void* feParam, void* previewState) {
+    InterlockedExchange64(&g_capturedFEWPreviewEx, (LONG64)self);
+    LogLine("[FEW-PREVEX-CTOR] self=%p wsfBase=%p feParam=%p prevState=%p (cached as PreviewEx)",
+        self, wsfBase, feParam, previewState);
+    if (g_origFEWPreviewExCtor) {
+        __try { g_origFEWPreviewExCtor(self, wsfBase, feParam, previewState); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[FEW-PREVEX-CTOR] trampoline SEH"); }
+    }
+}
+
+static void __cdecl FEWCtorHook(void* self, void* wsfBase, const void* feParam) {
+    InterlockedExchange64(&g_capturedFEWPO, (LONG64)self);
+    InterlockedExchange(&g_autoOpenCtorFired, 1);  // signal outer polling
+    // Stash the first 128 bytes of feParam + the wsfBase pointer so we can
+    // later construct FEWPageOptions standalone without opening the wizard.
+    if (feParam && !g_stashedFeParamValid) {
+        __try {
+            memcpy(g_stashedFeParam, feParam, sizeof(g_stashedFeParam));
+            g_stashedWsfBase = wsfBase;
+            g_stashedFeParamValid = true;
+            LogLine("[FEW-CTOR] stashed feParam + wsfBase for standalone reconstruction");
+        } __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[FEW-CTOR] stash SEH"); }
+    }
+    LogLine("[FEW-CTOR] self=%p wsfBase=%p feParam=%p (cached)", self, wsfBase, feParam);
+    // Peek first 40 bytes of feParam - might contain ModelSet / dirty flags
+    if (feParam) {
+        const BYTE* p = (const BYTE*)feParam;
+        __try {
+            LogLine("[FEW-CTOR] feParam[0..39]: "
+                "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X "
+                "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X "
+                "%02X%02X%02X%02X %02X%02X%02X%02X",
+                p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],
+                p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15],
+                p[16],p[17],p[18],p[19],p[20],p[21],p[22],p[23],
+                p[24],p[25],p[26],p[27],p[28],p[29],p[30],p[31],
+                p[32],p[33],p[34],p[35],p[36],p[37],p[38],p[39]);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[FEW-CTOR] feParam read SEH"); }
+    }
+    if (g_origFEWCtor) {
+        __try { g_origFEWCtor(self, wsfBase, feParam); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[FEW-CTOR] trampoline SEH"); }
+    }
+}
+
+static void* __cdecl InvokePreviewHook(void* retBuf, void* self) {
+    LogLine("[IPS] ENTER retBuf=%p self=%p", retBuf, self);
+    LogStack("[IPS]");
+    void* rv = nullptr;
+    if (g_origInvokePreview) {
+        __try { rv = g_origInvokePreview(retBuf, self); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[IPS] trampoline SEH"); }
+    }
+    // After call, retBuf should contain a CString (single 8-byte pointer to heap data).
+    if (retBuf) {
+        __try {
+            const char* dataPtr = *(const char**)retBuf;
+            if (dataPtr) {
+                size_t len = strlen(dataPtr);
+                LogLine("[IPS] retBuf dataPtr=%p len=%zu", dataPtr, len);
+                // First 250 chars preview
+                char buf[260];
+                size_t n = len < 250 ? len : 250;
+                memcpy(buf, dataPtr, n);
+                buf[n] = '\0';
+                // Replace newlines for single-line logging
+                for (size_t i = 0; i < n; i++) if (buf[i] == '\n' || buf[i] == '\r') buf[i] = ' ';
+                LogLine("[IPS] preview(first %zu): \"%s\"", n, buf);
+            } else {
+                LogLine("[IPS] retBuf dataPtr is null");
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[IPS] retBuf read SEH"); }
+    }
+    LogLine("[IPS] EXIT rv=%p", rv);
+    return rv;
+}
+
 static void InstallObserverHooks(void) {
     if (!ResolveFaz2Symbols()) {
         LogLine("[OBS] cannot install - Faz2 symbols not resolved");
@@ -1097,6 +1252,397 @@ static void InstallObserverHooks(void) {
             LogLine("[OBS] CERwinFEData::ClearERwinFEData hook ok");
         } else LogLine("[OBS] CERwinFEData::ClearERwinFEData hook FAILED");
     }
+
+    // ----- FEWPageOptions (wizard Options page) — key entry for Preview DDL -----
+    sym = GetProcAddress(eou, kFEWPageOptionsCtorSym);
+    if (sym) {
+        LogLine("[OBS] FEWPageOptions ctor @ %p", sym);
+        tramp = nullptr;
+        if (InstallInlineHook(sym, (void*)&FEWCtorHook, &tramp)) {
+            g_origFEWCtor = (FEWCtorFn)tramp;
+            LogLine("[OBS] FEWPageOptions ctor hook ok");
+        } else LogLine("[OBS] FEWPageOptions ctor hook FAILED");
+    } else LogLine("[OBS] FEWPageOptions ctor symbol missing");
+
+    sym = GetProcAddress(eou, kInvokePreviewSym);
+    if (sym) {
+        // Prolog: 48 89 5C 24 18  57  48 81 EC 90 03 00 00  48 8B 05 DC CC 2F 00
+        // Last instruction is mov rax,[rip+disp32] — RIP-relative, can't be
+        // copied to a trampoline naively (disp32 is wrong at trampoline addr).
+        // Our updated InstrLen_x64 now detects this and aborts hooks on it.
+        // We STILL need this address to call Invoke directly, so cache it
+        // without installing a detour.
+        g_directInvokePreview = (InvokePreviewFn)sym;
+        LogLine("[OBS] InvokePreviewStringOnlyCommand @ %p (direct-call, no detour)", sym);
+    } else LogLine("[OBS] InvokePreviewStringOnlyCommand symbol missing");
+
+    // FEWPagePreviewEx ctor — our hypothesis for the real Invoke target.
+    sym = GetProcAddress(eou, kFEWPagePreviewExCtorSym);
+    if (sym) {
+        LogLine("[OBS] FEWPagePreviewEx ctor @ %p", sym);
+        tramp = nullptr;
+        if (InstallInlineHook(sym, (void*)&FEWPreviewExCtorHook, &tramp)) {
+            g_origFEWPreviewExCtor = (FEWPreviewExCtorFn)tramp;
+            LogLine("[OBS] FEWPagePreviewEx ctor hook ok");
+        } else LogLine("[OBS] FEWPagePreviewEx ctor hook FAILED (unsafe prologue)");
+    } else LogLine("[OBS] FEWPagePreviewEx ctor symbol missing");
+}
+
+// Exported: returns the most-recently-captured FEWPageOptions this-pointer
+// (populated by the ctor hook). Null if no wizard has been opened yet.
+extern "C" __declspec(dllexport) void* __cdecl GetCapturedFEWPageOptions(void) {
+    return (void*)InterlockedCompareExchange64(&g_capturedFEWPO, 0, 0);
+}
+
+// Experimental: try to construct FEWPageOptions STANDALONE (without opening
+// the wizard UI) and call Invoke on it. Uses the stashed wsfBase + feParam
+// from a prior wizard session (captured in FEWCtorHook on first open).
+// The idea: if FEWPageOptions ctor itself builds ActionSummary from
+// feParam->modelSet, we can generate alter DDL purely programmatically.
+//
+// Caller supplies the CURRENT modelSet (our captured-via-FEModel_DDL pointer)
+// so the AS reflects current dirty state, not the state at the time the
+// feParam template was captured.
+// ---------------------------------------------------------------------------
+// Helpers for window enumeration (native C++ equivalents of the C# helpers
+// in WizardAutomationService).
+// ---------------------------------------------------------------------------
+
+struct FindMainCtx { HWND found; DWORD pid; };
+
+static BOOL CALLBACK FindMainEnumProc(HWND hwnd, LPARAM lp) {
+    auto ctx = (FindMainCtx*)lp;
+    if (!IsWindowVisible(hwnd)) return TRUE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != ctx->pid) return TRUE;
+    char cls[64];
+    if (GetClassNameA(hwnd, cls, sizeof(cls)) > 0 && strcmp(cls, "XTPMainFrame") == 0) {
+        ctx->found = hwnd;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static HWND FindErwinMain(void) {
+    FindMainCtx ctx = { nullptr, GetCurrentProcessId() };
+    EnumWindows(FindMainEnumProc, (LPARAM)&ctx);
+    return ctx.found;
+}
+
+struct EnumDlgCtx { std::set<HWND>* set; DWORD pid; };
+
+static BOOL CALLBACK EnumDlgProc(HWND hwnd, LPARAM lp) {
+    auto ctx = (EnumDlgCtx*)lp;
+    if (!IsWindowVisible(hwnd)) return TRUE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != ctx->pid) return TRUE;
+    ctx->set->insert(hwnd);
+    return TRUE;
+}
+
+static std::set<HWND> EnumerateVisibleDialogs(void) {
+    std::set<HWND> result;
+    EnumDlgCtx ctx = { &result, GetCurrentProcessId() };
+    EnumWindows(EnumDlgProc, (LPARAM)&ctx);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Auto-open the Alter Script wizard silently and hide it off-screen.
+//
+// How it works:
+//   1. Find erwin's XTPMainFrame HWND
+//   2. Snapshot currently-visible top-level dialogs
+//   3. SendInput Ctrl+Alt+T (erwin's own shortcut for Actions > Alter Script)
+//   4. Poll for a new top-level window whose title starts with
+//      "Forward Engineer Alter Script" (max 3 seconds)
+//   5. SetWindowPos to (-32000, -32000) the moment it's found — flash is
+//      minimized but may be perceptible
+//   6. Return the wizard HWND to the caller
+//
+// After this returns, the FEWCtor hook has fired and g_capturedFEWPO holds
+// a valid FEWPageOptions pointer. Subsequent CallInvokePreviewOnCaptured
+// calls produce alter DDL without any user interaction.
+// ---------------------------------------------------------------------------
+// Test whether a given HWND is our Alter Script wizard by title match.
+static bool LooksLikeAlterScriptWizard(HWND hwnd) {
+    char title[256];
+    int n = GetWindowTextA(hwnd, title, sizeof(title));
+    if (n <= 0) return false;
+    return (strstr(title, "Alter Script") != nullptr ||
+            strstr(title, "Schema Generation") != nullptr);
+}
+
+// Hide a wizard window aggressively: make it transparent (alpha=0) AND move
+// off-screen. Using WS_EX_LAYERED with alpha=0 ensures it's not drawn at all
+// even momentarily, so no flash is perceptible.
+static void HideWizardAggressive(HWND hwnd) {
+    LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED | WS_EX_TOOLWINDOW);
+    SetLayeredWindowAttributes(hwnd, 0, 0 /* fully transparent */, LWA_ALPHA);
+    SetWindowPos(hwnd, NULL, -32000, -32000, 0, 0,
+        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+// WinEvent callback: fires as soon as erwin creates a new window / shows one
+// / changes its title. We use it to catch the Alter Script wizard the moment
+// it's born, BEFORE the first paint - eliminating flash.
+static void CALLBACK WizardWinEventCb(
+    HWINEVENTHOOK /*hook*/, DWORD event, HWND hwnd,
+    LONG idObject, LONG /*idChild*/, DWORD /*eventThread*/, DWORD /*eventTime*/)
+{
+    if (!hwnd) return;
+    if (idObject != OBJID_WINDOW) return;
+    if (g_hiddenWizardHwnd != 0) return;    // already hid one - don't re-hide
+
+    // Must be same process
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != GetCurrentProcessId()) return;
+
+    // Check title. At OBJECT_CREATE it might still be empty; retry at
+    // OBJECT_SHOW / NAMECHANGE.
+    if (LooksLikeAlterScriptWizard(hwnd)) {
+        HideWizardAggressive(hwnd);
+        InterlockedExchange64(&g_hiddenWizardHwnd, (LONG64)hwnd);
+        LogLine("[WIN-EVT] hid wizard via WinEvent event=%lu hwnd=%p", event, hwnd);
+    }
+}
+
+extern "C" __declspec(dllexport) void* __cdecl OpenAlterScriptWizardHidden(void) {
+    HWND mainHwnd = FindErwinMain();
+    if (!mainHwnd) { LogLine("[OPEN-WIZ] erwin main window not found"); return nullptr; }
+    LogLine("[OPEN-WIZ] erwin main = %p", (void*)mainHwnd);
+
+    // Baseline: what dialogs exist BEFORE we trigger the shortcut?
+    auto before = EnumerateVisibleDialogs();
+    LogLine("[OPEN-WIZ] baseline: %zu visible dialogs", before.size());
+
+    // Reset signals so we can poll for the NEXT fire.
+    InterlockedExchange(&g_autoOpenCtorFired, 0);
+    InterlockedExchange64(&g_hiddenWizardHwnd, 0);
+
+    // Subscribe to erwin's window create/show/name-change events. The callback
+    // fires as soon as any matching window is born - faster than polling, and
+    // importantly BEFORE the wizard paints, eliminating flash.
+    HWINEVENTHOOK evHook = SetWinEventHook(
+        EVENT_OBJECT_CREATE, EVENT_OBJECT_NAMECHANGE,
+        nullptr, WizardWinEventCb,
+        GetCurrentProcessId(), 0,
+        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS /* includes our own pid anyway */);
+    // Note: WINEVENT_SKIPOWNPROCESS actually EXCLUDES same-process events; we
+    // WANT same-process since erwin is our host. Use 0 flag instead.
+    if (evHook) UnhookWinEvent(evHook);
+    evHook = SetWinEventHook(
+        EVENT_OBJECT_CREATE, EVENT_OBJECT_NAMECHANGE,
+        nullptr, WizardWinEventCb,
+        GetCurrentProcessId(), 0,
+        WINEVENT_OUTOFCONTEXT);
+    LogLine("[OPEN-WIZ] WinEvent hook = %p", (void*)evHook);
+
+    // Bring erwin to foreground so keyboard input is delivered there.
+    SetForegroundWindow(mainHwnd);
+    Sleep(80);
+
+    // Simulate Ctrl+Alt+T via SendInput.
+    INPUT inputs[6] = {};
+    inputs[0].type = INPUT_KEYBOARD; inputs[0].ki.wVk = VK_CONTROL;
+    inputs[1].type = INPUT_KEYBOARD; inputs[1].ki.wVk = VK_MENU;      // Alt
+    inputs[2].type = INPUT_KEYBOARD; inputs[2].ki.wVk = 'T';
+    inputs[3].type = INPUT_KEYBOARD; inputs[3].ki.wVk = 'T';          inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
+    inputs[4].type = INPUT_KEYBOARD; inputs[4].ki.wVk = VK_MENU;      inputs[4].ki.dwFlags = KEYEVENTF_KEYUP;
+    inputs[5].type = INPUT_KEYBOARD; inputs[5].ki.wVk = VK_CONTROL;   inputs[5].ki.dwFlags = KEYEVENTF_KEYUP;
+    UINT sent = SendInput(6, inputs, sizeof(INPUT));
+    LogLine("[OPEN-WIZ] SendInput sent=%u/6 (Ctrl+Alt+T)", sent);
+
+    // IMPORTANT: this function MUST be called from a background thread (e.g.
+    // Task.Run on the managed side). If called on erwin's UI thread, our
+    // Sleep loops block erwin's own message pump and it can't dispatch the
+    // keystroke through MFC's TranslateAccelerator. On a bg thread, we just
+    // sleep; erwin's UI thread runs normally and processes the keystroke.
+
+    // Phase 1: wait up to 15 seconds for the FEWCtor hook to fire. Ctor fires
+    // on erwin's UI thread, we poll the flag from our bg thread.
+    bool ctorFired = false;
+    DWORD start = GetTickCount();
+    while (GetTickCount() - start < 15000) {
+        if (InterlockedCompareExchange(&g_autoOpenCtorFired, 0, 0) != 0) {
+            ctorFired = true;
+            LogLine("[OPEN-WIZ] FEWCtor fired after %lu ms", GetTickCount() - start);
+            break;
+        }
+        Sleep(50);
+    }
+    if (!ctorFired) {
+        LogLine("[OPEN-WIZ] timeout - FEWCtor did not fire within 15s; wizard never opened");
+        UnhookWinEvent(evHook);
+        return nullptr;
+    }
+
+    // Phase 2: wait for either the WinEvent callback to hide the wizard, OR
+    // fall back to polling + hiding ourselves. Give the event hook 5s.
+    start = GetTickCount();
+    while (GetTickCount() - start < 5000) {
+        HWND h = (HWND)InterlockedCompareExchange64(&g_hiddenWizardHwnd, 0, 0);
+        if (h) {
+            LogLine("[OPEN-WIZ] wizard hidden by WinEvent hook, hwnd=%p", h);
+            UnhookWinEvent(evHook);
+            return (void*)h;
+        }
+        // Fallback polling in case WinEvent missed it.
+        auto nowList = EnumerateVisibleDialogs();
+        for (HWND x : nowList) {
+            if (before.find(x) != before.end()) continue;
+            if (LooksLikeAlterScriptWizard(x)) {
+                HideWizardAggressive(x);
+                InterlockedExchange64(&g_hiddenWizardHwnd, (LONG64)x);
+                LogLine("[OPEN-WIZ] fallback-hid wizard hwnd=%p", (void*)x);
+                UnhookWinEvent(evHook);
+                return (void*)x;
+            }
+        }
+        Sleep(50);
+    }
+    UnhookWinEvent(evHook);
+    LogLine("[OPEN-WIZ] ctor fired but could not find+hide wizard within 5s");
+    return nullptr;
+}
+
+// Politely close a previously-opened hidden wizard. Uses WM_COMMAND IDCANCEL
+// (Cancel button) which triggers the MFC CPropertySheet::OnCancel handler
+// and properly calls EndDialog to release the modal loop. Plain WM_CLOSE
+// is often ignored by modal dialogs.
+extern "C" __declspec(dllexport) void __cdecl CloseHiddenWizard(void* hwnd) {
+    if (!hwnd) return;
+    LogLine("[OPEN-WIZ] closing hwnd=%p (IDCANCEL)", hwnd);
+    PostMessage((HWND)hwnd, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
+    // Also post WM_CLOSE as a fallback in case IDCANCEL routes elsewhere.
+    PostMessage((HWND)hwnd, WM_CLOSE, 0, 0);
+    InterlockedExchange64(&g_hiddenWizardHwnd, 0);
+}
+
+extern "C" __declspec(dllexport) const char* __cdecl GenerateAlterDdlStandalone(void* clientMs) {
+    if (!g_stashedFeParamValid) {
+        LogLine("[STANDALONE] no stashed feParam - user must open Alter Script wizard ONCE first to seed the template");
+        return nullptr;
+    }
+    if (!clientMs) {
+        LogLine("[STANDALONE] clientMs is null");
+        return nullptr;
+    }
+
+    // Resolve ctor address.
+    HMODULE eou = GetModuleHandleW(L"EM_EOU.dll");
+    if (!eou) { LogLine("[STANDALONE] EM_EOU not loaded"); return nullptr; }
+    FEWCtorFn ctor = (FEWCtorFn)GetProcAddress(eou, kFEWPageOptionsCtorSym);
+    if (!ctor) { LogLine("[STANDALONE] ctor symbol missing"); return nullptr; }
+
+    if (!g_directInvokePreview) { LogLine("[STANDALONE] Invoke not resolved"); return nullptr; }
+
+    // Clone feParam template and OVERRIDE modelSet slot (offset 8).
+    BYTE feParam[128];
+    memcpy(feParam, g_stashedFeParam, sizeof(feParam));
+    *(void**)(feParam + 8) = clientMs;
+
+    // Allocate a generous heap buffer for FEWPageOptions (MFC class size
+    // unknown; use 8KB to be safe). Zero-init.
+    char* fewpoBuf = (char*)_aligned_malloc(8192, 16);
+    if (!fewpoBuf) { LogLine("[STANDALONE] buffer alloc failed"); return nullptr; }
+    memset(fewpoBuf, 0, 8192);
+
+    // Clear prior captured DDL so we read fresh output.
+    EnsureDdlLockInit();
+    EnterCriticalSection(&g_ddlLock);
+    if (g_lastCapturedDdl) { free(g_lastCapturedDdl); g_lastCapturedDdl = nullptr; }
+    LeaveCriticalSection(&g_ddlLock);
+
+    LogLine("[STANDALONE] constructing FEWPageOptions at %p with wsfBase=%p feParam=%p (modelSet=%p)",
+        fewpoBuf, g_stashedWsfBase, (void*)feParam, clientMs);
+
+    bool ctorOk = false;
+    __try {
+        ctor(fewpoBuf, g_stashedWsfBase, feParam);
+        ctorOk = true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        LogLine("[STANDALONE] ctor SEH 0x%08lX", GetExceptionCode());
+    }
+
+    if (ctorOk) {
+        LogLine("[STANDALONE] ctor succeeded - calling Invoke to trigger GA");
+        __try {
+            InvokeFn fn = (InvokeFn)g_directInvokePreview;
+            fn(fewpoBuf);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            LogLine("[STANDALONE] Invoke post-return SEH 0x%08lX (ignored if DDL captured)",
+                GetExceptionCode());
+        }
+    }
+
+    // Intentionally DO NOT call dtor on fewpoBuf - our synthetic WSFWizardBase
+    // is fake and dtor may crash trying to detach from it. Heap leak per call
+    // (~8KB) is acceptable for our use case; we can revisit if it matters.
+
+    // Read captured DDL from GA detour.
+    EnsureDdlLockInit();
+    char* ddl = nullptr;
+    EnterCriticalSection(&g_ddlLock);
+    ddl = g_lastCapturedDdl;
+    g_lastCapturedDdl = nullptr;
+    LeaveCriticalSection(&g_ddlLock);
+
+    if (ddl) LogLine("[STANDALONE] SUCCESS - %zu chars captured", strlen(ddl));
+    else     LogLine("[STANDALONE] no DDL captured (ctor/Invoke did not trigger GA)");
+    return ddl;
+}
+
+// Exported: calls InvokePreviewStringOnlyCommand on the captured FEWPageOptions
+// and returns the DDL string as a malloc'd UTF-8 buffer. Caller frees via
+// FreeDdlBuffer. Returns null if no wizard was previously opened or the call
+// fails.
+
+extern "C" __declspec(dllexport) const char* __cdecl CallInvokePreviewOnCaptured(void) {
+    // Use FEWPageOptions captured in its ctor. Empirically proven to produce
+    // the correct alter-script DDL (e.g. 331 chars for one ADD COLUMN change),
+    // whereas FEWPagePreviewEx yields the full schema (154216 chars, wrong
+    // for alter-script use case).
+    void* self = (void*)InterlockedCompareExchange64(&g_capturedFEWPO, 0, 0);
+    if (!self) { LogLine("[IPS-CALL] no captured FEWPageOptions"); return nullptr; }
+    if (!g_directInvokePreview) { LogLine("[IPS-CALL] Invoke address not resolved"); return nullptr; }
+
+    // Clear any stale DDL from prior runs so we pick up only THIS run's output.
+    EnsureDdlLockInit();
+    EnterCriticalSection(&g_ddlLock);
+    if (g_lastCapturedDdl) { free(g_lastCapturedDdl); g_lastCapturedDdl = nullptr; }
+    LeaveCriticalSection(&g_ddlLock);
+
+    LogLine("[IPS-CALL] triggering Invoke on FEWPageOptions=%p (DDL via GA-detour)", self);
+    __try {
+        // Call with RCX=self. We ignore the return value (ABI is non-trivial
+        // for CString — MSVC may use RAX or hidden ptr; both gave AV/SEH when
+        // we tried to read them). What matters is the SIDE EFFECT: Invoke
+        // runs, internally calls FEProcessor::GenerateAlterScript, our GA
+        // detour captures the DDL into g_lastCapturedDdl.
+        InvokeFn fn = (InvokeFn)g_directInvokePreview;
+        fn(self);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Expected: SEH may fire on the return-value path. Doesn't matter.
+        LogLine("[IPS-CALL] post-return SEH 0x%08lX (ignored - DDL already captured)",
+            GetExceptionCode());
+    }
+
+    // Read and consume whatever the GA detour captured.
+    EnsureDdlLockInit();
+    char* ddl = nullptr;
+    EnterCriticalSection(&g_ddlLock);
+    ddl = g_lastCapturedDdl;
+    g_lastCapturedDdl = nullptr;
+    LeaveCriticalSection(&g_ddlLock);
+
+    if (ddl) LogLine("[IPS-CALL] SUCCESS - %zu chars of DDL via GA detour", strlen(ddl));
+    else     LogLine("[IPS-CALL] no DDL captured (GA did not fire?)");
+    return ddl;
 }
 
 extern "C" __declspec(dllexport) int __cdecl InstallObserverHook(void) {

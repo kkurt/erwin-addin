@@ -53,6 +53,21 @@ namespace EliteSoft.Erwin.AddIn.Services
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate void ClearCapturedDdlFn();
 
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate IntPtr CallInvokePreviewFn();
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate IntPtr GenerateAlterDdlStandaloneFn(IntPtr clientMs);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate IntPtr OpenAlterScriptWizardHiddenFn();
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate void CloseHiddenWizardFn(IntPtr hwnd);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate IntPtr GetCapturedFEWPageOptionsFn();
+
         // Cached delegates, populated after Install() succeeds.
         private static GetLastCapturedModelSetFn _getLastCapturedModelSet;
         private static ResetCapturedModelSetFn _resetCapturedModelSet;
@@ -61,6 +76,12 @@ namespace EliteSoft.Erwin.AddIn.Services
         private static InstallObserverHookFn _installObserverHook;
         private static ConsumeLastCapturedDdlFn _consumeLastDdl;
         private static ClearCapturedDdlFn _clearCapturedDdl;
+        private static CallInvokePreviewFn _callInvokePreview;
+        private static GenerateAlterDdlStandaloneFn _generateAlterStandalone;
+        private static OpenAlterScriptWizardHiddenFn _openHiddenWizard;
+        private static CloseHiddenWizardFn _closeHiddenWizard;
+        private static GetCapturedFEWPageOptionsFn _getCapturedFEWPO;
+        private static IntPtr _hiddenWizardHwnd = IntPtr.Zero;
 
         /// <summary>
         /// Returns the absolute path where ErwinNativeBridge.dll is expected to live.
@@ -141,7 +162,25 @@ namespace EliteSoft.Erwin.AddIn.Services
                     if (clearProc != IntPtr.Zero)
                         _clearCapturedDdl = Marshal.GetDelegateForFunctionPointer<ClearCapturedDdlFn>(clearProc);
 
-                    log?.Invoke($"NativeBridge: capture API bound (get={getProc != IntPtr.Zero}, reset={resetProc != IntPtr.Zero}, gen={genProc != IntPtr.Zero}, free={freeProc != IntPtr.Zero}, obs={obsProc != IntPtr.Zero}, consume={consumeProc != IntPtr.Zero}, clear={clearProc != IntPtr.Zero}).");
+                    IntPtr invokeProc = GetProcAddress(_bridgeModule, "CallInvokePreviewOnCaptured");
+                    if (invokeProc != IntPtr.Zero)
+                        _callInvokePreview = Marshal.GetDelegateForFunctionPointer<CallInvokePreviewFn>(invokeProc);
+
+                    IntPtr standaloneProc = GetProcAddress(_bridgeModule, "GenerateAlterDdlStandalone");
+                    if (standaloneProc != IntPtr.Zero)
+                        _generateAlterStandalone = Marshal.GetDelegateForFunctionPointer<GenerateAlterDdlStandaloneFn>(standaloneProc);
+
+                    IntPtr openProc = GetProcAddress(_bridgeModule, "OpenAlterScriptWizardHidden");
+                    IntPtr closeProc = GetProcAddress(_bridgeModule, "CloseHiddenWizard");
+                    if (openProc != IntPtr.Zero)
+                        _openHiddenWizard = Marshal.GetDelegateForFunctionPointer<OpenAlterScriptWizardHiddenFn>(openProc);
+                    if (closeProc != IntPtr.Zero)
+                        _closeHiddenWizard = Marshal.GetDelegateForFunctionPointer<CloseHiddenWizardFn>(closeProc);
+                    IntPtr getCapProc = GetProcAddress(_bridgeModule, "GetCapturedFEWPageOptions");
+                    if (getCapProc != IntPtr.Zero)
+                        _getCapturedFEWPO = Marshal.GetDelegateForFunctionPointer<GetCapturedFEWPageOptionsFn>(getCapProc);
+
+                    log?.Invoke($"NativeBridge: capture API bound (get={getProc != IntPtr.Zero}, reset={resetProc != IntPtr.Zero}, gen={genProc != IntPtr.Zero}, free={freeProc != IntPtr.Zero}, obs={obsProc != IntPtr.Zero}, consume={consumeProc != IntPtr.Zero}, clear={clearProc != IntPtr.Zero}, invoke={invokeProc != IntPtr.Zero}).");
                 }
                 return _installed;
             }
@@ -198,6 +237,177 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// new wizard run to avoid reading stale data.
         /// </summary>
         public static void ClearCapturedDdl() => _clearCapturedDdl?.Invoke();
+
+        /// <summary>
+        /// Directly invokes FEWPageOptions::InvokePreviewStringOnlyCommand on
+        /// the most-recently-captured FEWPageOptions* pointer (populated when
+        /// the user opens the Alter Script wizard). Returns the DDL string,
+        /// or null if no wizard has been opened in this session or the call
+        /// fails. Caller must free via the bridge's FreeDdlBuffer (handled
+        /// here internally).
+        /// </summary>
+        /// <summary>
+        /// Experimental: generate alter DDL by constructing FEWPageOptions
+        /// standalone (no wizard UI). Requires that the user has opened the
+        /// Alter Script wizard at least ONCE during this erwin session to
+        /// seed the feParam + wsfBase template the native bridge clones.
+        /// After that, any number of calls can be made without re-opening.
+        /// Returns the DDL string or null if anything fails.
+        /// </summary>
+        public static string GenerateAlterDdlStandalone(dynamic currentPU, Action<string> log = null)
+        {
+            if (_generateAlterStandalone == null || _freeDdlBuffer == null)
+            {
+                log?.Invoke("NativeBridge: standalone export not bound.");
+                return null;
+            }
+            // Need the modelSet pointer for the current dirty PU.
+            IntPtr ms = EnsureActiveModelSetCaptured(currentPU, log);
+            if (ms == IntPtr.Zero)
+            {
+                log?.Invoke("NativeBridge: could not capture modelSet for standalone alter.");
+                return null;
+            }
+
+            IntPtr ptr = IntPtr.Zero;
+            try
+            {
+                log?.Invoke($"NativeBridge: invoking GenerateAlterDdlStandalone(ms=0x{ms.ToInt64():X})...");
+                ptr = _generateAlterStandalone(ms);
+                if (ptr == IntPtr.Zero)
+                {
+                    log?.Invoke("NativeBridge: standalone returned null. See bridge log.");
+                    return null;
+                }
+                string ddl = Marshal.PtrToStringAnsi(ptr);
+                log?.Invoke($"NativeBridge: standalone returned {ddl?.Length ?? 0} chars.");
+                return ddl;
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"NativeBridge: standalone threw: {ex.GetType().Name}: {ex.Message}");
+                return null;
+            }
+            finally
+            {
+                if (ptr != IntPtr.Zero)
+                {
+                    try { _freeDdlBuffer(ptr); } catch { }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Unified programmatic alter-DDL entry point. Orchestrates:
+        ///   1. If no wizard is currently hidden-alive, SendInput Ctrl+Alt+T
+        ///      to erwin to open the Alter Script wizard; immediately hides
+        ///      it off-screen. FEWPageOptions ctor hook captures `this`.
+        ///   2. Calls CallInvokePreviewOnCaptured which triggers
+        ///      FEProcessor::GenerateAlterScript internally. Our GA detour
+        ///      captures the DDL string.
+        ///   3. Returns the DDL. Hidden wizard stays alive for subsequent
+        ///      calls - no re-open cost until user/erwin closes it.
+        /// Returns null if anything fails.
+        /// </summary>
+        public static string GenerateAlterDdl(Action<string> log = null)
+        {
+            if (_callInvokePreview == null)
+            {
+                log?.Invoke("NativeBridge: InvokePreview export missing.");
+                return null;
+            }
+
+            // Step 1: ensure a FEWPageOptions is captured (wizard open).
+            if (GetCapturedFEWPageOptionsPtr() == IntPtr.Zero)
+            {
+                if (_openHiddenWizard == null)
+                {
+                    log?.Invoke("NativeBridge: no wizard open and OpenAlterScriptWizardHidden export missing.");
+                    return null;
+                }
+                log?.Invoke("NativeBridge: no wizard open - triggering Ctrl+Alt+T silently...");
+                _hiddenWizardHwnd = _openHiddenWizard();
+                if (_hiddenWizardHwnd == IntPtr.Zero)
+                {
+                    log?.Invoke("NativeBridge: failed to auto-open wizard.");
+                    return null;
+                }
+                log?.Invoke($"NativeBridge: hidden wizard opened at hwnd=0x{_hiddenWizardHwnd.ToInt64():X}");
+                // The FEW-CTOR hook fires synchronously during wizard creation,
+                // so g_capturedFEWPO should already be set by the time we get here.
+            }
+
+            // Step 2: call Invoke → GA detour captures DDL.
+            string ddl = CallInvokePreviewDirect(log);
+
+            // Step 3: always close the hidden wizard. It's a MODAL CPropertySheet,
+            // and leaving it alive locks the erwin main window (title shows
+            // "Read-Only"). Closing it has a small cost (next call re-opens
+            // in ~700ms) but keeps erwin usable between calls.
+            if (_hiddenWizardHwnd != IntPtr.Zero && _closeHiddenWizard != null)
+            {
+                log?.Invoke($"NativeBridge: closing hidden wizard hwnd=0x{_hiddenWizardHwnd.ToInt64():X}");
+                try { _closeHiddenWizard(_hiddenWizardHwnd); } catch (Exception ex)
+                { log?.Invoke($"NativeBridge: close wizard threw: {ex.Message}"); }
+                _hiddenWizardHwnd = IntPtr.Zero;
+            }
+            return ddl;
+        }
+
+        /// <summary>Closes the hidden wizard (if one was auto-opened). Normally
+        /// not needed during a session — the wizard is cheap to keep alive.</summary>
+        public static void CloseHiddenWizardIfAny()
+        {
+            if (_hiddenWizardHwnd != IntPtr.Zero && _closeHiddenWizard != null)
+            {
+                try { _closeHiddenWizard(_hiddenWizardHwnd); } catch { }
+                _hiddenWizardHwnd = IntPtr.Zero;
+            }
+        }
+
+        // Helper: IntPtr wrapper for native g_capturedFEWPO (we don't have a
+        // dedicated getter; piggy-back on the direct-invoke return path's
+        // implicit check by calling a no-op path). Actually, simplest: expose
+        // a dedicated getter. For now, rely on _callInvokePreview returning
+        // null when nothing captured.
+        private static IntPtr GetCapturedFEWPageOptionsPtr()
+        {
+            return _getCapturedFEWPO?.Invoke() ?? IntPtr.Zero;
+        }
+
+        public static string CallInvokePreviewDirect(Action<string> log = null)
+        {
+            if (_callInvokePreview == null || _freeDdlBuffer == null)
+            {
+                log?.Invoke("NativeBridge: CallInvokePreview export missing.");
+                return null;
+            }
+            IntPtr ptr = IntPtr.Zero;
+            try
+            {
+                ptr = _callInvokePreview();
+                if (ptr == IntPtr.Zero)
+                {
+                    log?.Invoke("NativeBridge: CallInvokePreviewOnCaptured returned null (no captured wizard / invoke failed).");
+                    return null;
+                }
+                string ddl = Marshal.PtrToStringAnsi(ptr);
+                log?.Invoke($"NativeBridge: direct-invoke returned {ddl?.Length ?? 0} chars.");
+                return ddl;
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"NativeBridge: CallInvokePreview threw: {ex.GetType().Name}: {ex.Message}");
+                return null;
+            }
+            finally
+            {
+                if (ptr != IntPtr.Zero)
+                {
+                    try { _freeDdlBuffer(ptr); } catch { }
+                }
+            }
+        }
 
         /// <summary>
         /// Faz A-spike: install observer detours on MCX internal entry points

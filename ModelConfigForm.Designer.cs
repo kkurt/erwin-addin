@@ -905,6 +905,36 @@ namespace EliteSoft.Erwin.AddIn
             this.btnCaptureModelSet.Click += new System.EventHandler(this.BtnCaptureModelSet_Click);
             this.grpDebugLog.Controls.Add(this.btnCaptureModelSet);
 
+            // Standalone experiment: construct FEWPageOptions without opening
+            // the wizard (uses stashed feParam template from a prior session).
+            this.btnStandaloneDdl = new System.Windows.Forms.Button();
+            this.btnStandaloneDdl.Location = new System.Drawing.Point(408, 88);
+            this.btnStandaloneDdl.Size = new System.Drawing.Size(200, 28);
+            this.btnStandaloneDdl.Text = "Standalone DDL (no wizard)";
+            this.btnStandaloneDdl.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnStandaloneDdl.BackColor = System.Drawing.Color.FromArgb(180, 255, 180);
+            this.btnStandaloneDdl.FlatAppearance.BorderColor = clrBorder;
+            this.btnStandaloneDdl.Font = fontCaption;
+            this.btnStandaloneDdl.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnStandaloneDdl.Click += new System.EventHandler(this.BtnStandaloneDdl_Click);
+            this.grpDebugLog.Controls.Add(this.btnStandaloneDdl);
+
+            // Direct invoke test: user opens wizard (stays on Overview), clicks
+            // this button, we call InvokePreviewStringOnlyCommand on the captured
+            // FEWPageOptions pointer. If it returns DDL, we've proved the
+            // programmatic-invoke path.
+            this.btnInvokePreviewDirect = new System.Windows.Forms.Button();
+            this.btnInvokePreviewDirect.Location = new System.Drawing.Point(182, 88);
+            this.btnInvokePreviewDirect.Size = new System.Drawing.Size(220, 28);
+            this.btnInvokePreviewDirect.Text = "Call Invoke Preview (direct)";
+            this.btnInvokePreviewDirect.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnInvokePreviewDirect.BackColor = System.Drawing.Color.FromArgb(255, 220, 180);
+            this.btnInvokePreviewDirect.FlatAppearance.BorderColor = clrBorder;
+            this.btnInvokePreviewDirect.Font = fontCaption;
+            this.btnInvokePreviewDirect.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnInvokePreviewDirect.Click += new System.EventHandler(this.BtnInvokePreviewDirect_Click);
+            this.grpDebugLog.Controls.Add(this.btnInvokePreviewDirect);
+
             // Observer hooks: install once, then user does a normal UI CC flow.
             this.btnInstallObservers = new System.Windows.Forms.Button();
             this.btnInstallObservers.Location = new System.Drawing.Point(16, 88);
@@ -1120,6 +1150,8 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.Button btnCaptureModelSet;
         private System.Windows.Forms.Button btnSilentAlterDdl;
         private System.Windows.Forms.Button btnInstallObservers;
+        private System.Windows.Forms.Button btnInvokePreviewDirect;
+        private System.Windows.Forms.Button btnStandaloneDdl;
         private System.Windows.Forms.Button btnLiveReMon;
         private System.Windows.Forms.Button btnTestAlterFE;
         private System.Windows.Forms.Button btnDumpPropBag;

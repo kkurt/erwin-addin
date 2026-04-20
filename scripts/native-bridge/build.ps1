@@ -51,7 +51,8 @@ $clArgs = @(
     "/Fe`"$outDll`"",
     "/link",
     "/IMPLIB:`"$outLib`"",
-    "/OUT:`"$outDll`""
+    "/OUT:`"$outDll`"",
+    "user32.lib"
 ) -join " "
 
 $cmd = "call `"$vcvars`" >nul && cl.exe $clArgs"

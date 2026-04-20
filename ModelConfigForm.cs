@@ -3468,6 +3468,79 @@ namespace EliteSoft.Erwin.AddIn
         }
 
         /// <summary>
+        /// Proof-of-concept: after user opens the Alter Script wizard manually
+        /// (but BEFORE they click Preview), press this button to directly invoke
+        /// FEWPageOptions::InvokePreviewStringOnlyCommand on the captured
+        /// pointer. If it returns DDL, we've proven the programmatic path works
+        /// while the wizard is alive.
+        /// </summary>
+        /// <summary>
+        /// Experimental: generate alter DDL by constructing FEWPageOptions
+        /// standalone, NO WIZARD NEEDED. User must have opened the Alter
+        /// Script wizard ONCE in this erwin session first (to seed the
+        /// feParam + wsfBase template). After that this call is fully
+        /// programmatic — no UI touched, no window flash.
+        /// </summary>
+        private void BtnStandaloneDdl_Click(object sender, EventArgs e)
+        {
+            if (!_isConnected || _currentModel == null)
+            {
+                Log("[STANDALONE] No model connected.");
+                return;
+            }
+            btnStandaloneDdl.Enabled = false;
+            try
+            {
+                Log("");
+                Log("=== Standalone alter DDL (no wizard) ===");
+                string ddl = Services.NativeBridgeService.GenerateAlterDdlStandalone(
+                    _currentModel, (Action<string>)Log);
+                if (string.IsNullOrEmpty(ddl))
+                {
+                    Log("[STANDALONE-UI] FAILED. Has the Alter Script wizard been opened at least once? See bridge log.");
+                }
+                else
+                {
+                    Log($"[STANDALONE-UI] SUCCESS: {ddl.Length} chars captured without wizard UI.");
+                    Log($"[STANDALONE-UI] first 200: {ddl.Substring(0, Math.Min(200, ddl.Length)).Replace("\n", "\\n")}");
+                    rtbDDLOutput.Text = ddl;
+                }
+            }
+            finally { btnStandaloneDdl.Enabled = true; }
+        }
+
+        private async void BtnInvokePreviewDirect_Click(object sender, EventArgs e)
+        {
+            btnInvokePreviewDirect.Enabled = false;
+            try
+            {
+                Log("");
+                Log("=== Generate DDL (auto-open wizard hidden + invoke) ===");
+                // CRITICAL: run on a background thread so the UI/main thread stays
+                // free to pump messages. Otherwise our SendInput Ctrl+Alt+T keystroke
+                // queues up but erwin can't dispatch it through MFC accelerator
+                // translation because we're blocking the message pump.
+                string ddl = await System.Threading.Tasks.Task.Run(() =>
+                    Services.NativeBridgeService.GenerateAlterDdl(msg =>
+                    {
+                        if (InvokeRequired) BeginInvoke(new Action(() => Log(msg)));
+                        else Log(msg);
+                    }));
+                if (string.IsNullOrEmpty(ddl))
+                {
+                    Log("[INVOKE-DIRECT] FAILED or no wizard open. See bridge log.");
+                }
+                else
+                {
+                    Log($"[INVOKE-DIRECT] SUCCESS: {ddl.Length} chars");
+                    Log($"[INVOKE-DIRECT] first 200: {ddl.Substring(0, Math.Min(200, ddl.Length)).Replace("\n", "\\n")}");
+                    rtbDDLOutput.Text = ddl;
+                }
+            }
+            finally { btnInvokePreviewDirect.Enabled = true; }
+        }
+
+        /// <summary>
         /// Faz 2 end-to-end test: runs the fully silent alter-DDL pipeline via native bridge
         /// (MCXInvokeCompleteCompare + FEProcessor) and prints the result length.
         /// Also writes the full DDL to the rich DDL output area on the DDL Generation tab.
