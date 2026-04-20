@@ -394,6 +394,39 @@ static int __cdecl GenerateAlterHook(void* self, void* modelSet, void* actionSum
     LogLine("[GA] ENTER self=%p modelSet=%p actionSummary=%p parent=%p show=%d",
         self, modelSet, actionSummary, parent, (int)showProgress);
 
+    // --- STACK TRACE: who called us? Whoever did is holding the actionSummary
+    // pointer, which means they built or received it. Following the chain up
+    // tells us where actionSummary originates. Log top 12 frames as
+    // module!RVA so we can dumpbin them later.
+    {
+        void* frames[12];
+        USHORT captured = CaptureStackBackTrace(0, 12, frames, nullptr);
+        for (USHORT i = 0; i < captured; i++) {
+            HMODULE h = nullptr;
+            if (GetModuleHandleExW(
+                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    (LPCWSTR)frames[i], &h) && h)
+            {
+                wchar_t path[MAX_PATH];
+                DWORD n = GetModuleFileNameW(h, path, MAX_PATH);
+                if (n > 0) {
+                    // Just the filename portion
+                    const wchar_t* name = wcsrchr(path, L'\\');
+                    name = name ? name + 1 : path;
+                    char ascii[MAX_PATH];
+                    WideCharToMultiByte(CP_ACP, 0, name, -1, ascii, MAX_PATH, nullptr, nullptr);
+                    uintptr_t rva = (uintptr_t)frames[i] - (uintptr_t)h;
+                    LogLine("[GA-STACK] #%u  %s + 0x%llX  (abs=%p)",
+                        (unsigned)i, ascii, (unsigned long long)rva, frames[i]);
+                } else {
+                    LogLine("[GA-STACK] #%u  <unnamed module>  abs=%p", (unsigned)i, frames[i]);
+                }
+            } else {
+                LogLine("[GA-STACK] #%u  <no module>  abs=%p", (unsigned)i, frames[i]);
+            }
+        }
+    }
+
     int rv = -1;
     if (g_origGenerateAlter) {
         __try {
@@ -871,6 +904,86 @@ static bool __cdecl EccExecASHook(void* self, void* as, void* obj, void* obj2, i
     return rv;
 }
 
+// Emit top-N caller frames (module+RVA) — for pinpointing AS builder.
+static void LogStack(const char* tag) {
+    void* frames[10];
+    USHORT captured = CaptureStackBackTrace(0, 10, frames, nullptr);
+    for (USHORT i = 0; i < captured; i++) {
+        HMODULE h = nullptr;
+        if (GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                (LPCWSTR)frames[i], &h) && h)
+        {
+            wchar_t path[MAX_PATH];
+            DWORD n = GetModuleFileNameW(h, path, MAX_PATH);
+            if (n > 0) {
+                const wchar_t* name = wcsrchr(path, L'\\');
+                name = name ? name + 1 : path;
+                char ascii[MAX_PATH];
+                WideCharToMultiByte(CP_ACP, 0, name, -1, ascii, MAX_PATH, nullptr, nullptr);
+                uintptr_t rva = (uintptr_t)frames[i] - (uintptr_t)h;
+                LogLine("%s #%u  %s + 0x%llX", tag, (unsigned)i, ascii, (unsigned long long)rva);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CERwinFEData global state observers
+//   ?SetActionSummary@CERwinFEData@@SAXPEAVGDMActionSummary@@@Z
+//   ?SetModelSet@CERwinFEData@@SAXPEAVGDMModelSetI@@@Z
+//   ?GetActionSummary@CERwinFEData@@SAPEAVGDMActionSummary@@XZ
+//   ?ClearERwinFEData@CERwinFEData@@SAXXZ
+// These four exports are the lifecycle hooks for the static globals that
+// FEProcessor::GenerateAlterScript ultimately reads from.
+// ---------------------------------------------------------------------------
+typedef void (__cdecl* SetASFn)(void* as);
+typedef void (__cdecl* SetMsFn)(void* ms);
+typedef void* (__cdecl* GetASFn)(void);
+typedef void (__cdecl* ClearAllFn)(void);
+
+static SetASFn   g_origSetAS   = nullptr;
+static SetMsFn   g_origSetMs   = nullptr;
+static GetASFn   g_origGetAS   = nullptr;
+static ClearAllFn g_origClear  = nullptr;
+
+static void __cdecl SetASHook(void* as) {
+    LogLine("[OBS-FED-SET-AS] called with as=%p", as);
+    LogStack("[OBS-FED-SET-AS]");
+    if (g_origSetAS) { __try { g_origSetAS(as); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[OBS-FED-SET-AS] SEH"); } }
+}
+static void __cdecl SetMsHook(void* ms) {
+    LogLine("[OBS-FED-SET-MS] called with ms=%p", ms);
+    LogStack("[OBS-FED-SET-MS]");
+    if (g_origSetMs) { __try { g_origSetMs(ms); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[OBS-FED-SET-MS] SEH"); } }
+}
+static void* __cdecl GetASHook(void) {
+    void* r = nullptr;
+    if (g_origGetAS) { __try { r = g_origGetAS(); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[OBS-FED-GET-AS] SEH"); } }
+    // Log sparingly - called potentially often. Log first 5 reads per run.
+    static LONG count = 0;
+    LONG c = InterlockedIncrement(&count);
+    if (c <= 5) {
+        LogLine("[OBS-FED-GET-AS] #%ld returned %p", c, r);
+        LogStack("[OBS-FED-GET-AS]");
+    }
+    return r;
+}
+static void __cdecl ClearHook(void) {
+    LogLine("[OBS-FED-CLEAR] called");
+    LogStack("[OBS-FED-CLEAR]");
+    if (g_origClear) { __try { g_origClear(); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[OBS-FED-CLEAR] SEH"); } }
+}
+
+static const char* kSetASSym    = "?SetActionSummary@CERwinFEData@@SAXPEAVGDMActionSummary@@@Z";
+static const char* kSetMsSym    = "?SetModelSet@CERwinFEData@@SAXPEAVGDMModelSetI@@@Z";
+static const char* kGetASSym    = "?GetActionSummary@CERwinFEData@@SAPEAVGDMActionSummary@@XZ";
+static const char* kClearSym    = "?ClearERwinFEData@CERwinFEData@@SAXXZ";
+
 static void InstallObserverHooks(void) {
     if (!ResolveFaz2Symbols()) {
         LogLine("[OBS] cannot install - Faz2 symbols not resolved");
@@ -943,6 +1056,47 @@ static void InstallObserverHooks(void) {
     // won't need this.
     void* silentCc = GetProcAddress(ecc, kApplyCCSilentSym);
     LogLine("[OBS] ApplyCCSilentMode addr = %p (not yet hooked)", silentCc);
+
+    // ----- CERwinFEData observers (EM_EOU.dll) -----
+    HMODULE eou = GetModuleHandleW(L"EM_EOU.dll");
+    if (!eou) eou = LoadLibraryW(L"EM_EOU.dll");
+    if (!eou) {
+        LogLine("[OBS] EM_EOU.dll not loaded - skipping FEData observers");
+        return;
+    }
+
+    void* sym = GetProcAddress(eou, kSetASSym);
+    if (sym) {
+        tramp = nullptr;
+        if (InstallInlineHook(sym, (void*)&SetASHook, &tramp)) {
+            g_origSetAS = (SetASFn)tramp;
+            LogLine("[OBS] CERwinFEData::SetActionSummary hook ok");
+        } else LogLine("[OBS] CERwinFEData::SetActionSummary hook FAILED");
+    }
+    sym = GetProcAddress(eou, kSetMsSym);
+    if (sym) {
+        tramp = nullptr;
+        if (InstallInlineHook(sym, (void*)&SetMsHook, &tramp)) {
+            g_origSetMs = (SetMsFn)tramp;
+            LogLine("[OBS] CERwinFEData::SetModelSet hook ok");
+        } else LogLine("[OBS] CERwinFEData::SetModelSet hook FAILED");
+    }
+    sym = GetProcAddress(eou, kGetASSym);
+    if (sym) {
+        tramp = nullptr;
+        if (InstallInlineHook(sym, (void*)&GetASHook, &tramp)) {
+            g_origGetAS = (GetASFn)tramp;
+            LogLine("[OBS] CERwinFEData::GetActionSummary hook ok");
+        } else LogLine("[OBS] CERwinFEData::GetActionSummary hook FAILED");
+    }
+    sym = GetProcAddress(eou, kClearSym);
+    if (sym) {
+        tramp = nullptr;
+        if (InstallInlineHook(sym, (void*)&ClearHook, &tramp)) {
+            g_origClear = (ClearAllFn)tramp;
+            LogLine("[OBS] CERwinFEData::ClearERwinFEData hook ok");
+        } else LogLine("[OBS] CERwinFEData::ClearERwinFEData hook FAILED");
+    }
 }
 
 extern "C" __declspec(dllexport) int __cdecl InstallObserverHook(void) {
