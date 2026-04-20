@@ -27,11 +27,24 @@
 #include <time.h>
 #include <stdint.h>
 
+static void GetLogPath(char* out, size_t outSize) {
+    DWORD n = GetEnvironmentVariableA("TEMP", out, (DWORD)outSize);
+    if (n == 0 || n >= outSize) strcpy_s(out, outSize, "C:\\tmp");
+    strcat_s(out, outSize, "\\erwin-native-bridge.log");
+}
+
+// Called once at DllMain-attach to truncate the log so each new erwin
+// process starts with a clean file.
+static void TruncateLog(void) {
+    char path[MAX_PATH];
+    GetLogPath(path, sizeof(path));
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "w") == 0 && f) fclose(f);
+}
+
 static void LogLine(const char* fmt, ...) {
     char path[MAX_PATH];
-    DWORD n = GetEnvironmentVariableA("TEMP", path, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) strcpy_s(path, "C:\\tmp");
-    strcat_s(path, "\\erwin-native-bridge.log");
+    GetLogPath(path, sizeof(path));
 
     FILE* f = nullptr;
     if (fopen_s(&f, path, "a") != 0 || !f) return;
@@ -94,55 +107,136 @@ static void WriteAbsJmp14(void* at, void* target) {
     *(uint64_t*)(p + 6) = (uint64_t)target;
 }
 
-// Returns true if the 14 bytes at `p` are "safe to copy" for a trampoline:
-// no relative jumps, no rip-relative addressing we can't relocate. This is
-// conservative - if we say false we just won't install the hook.
+// Forward declaration so PrologueSafe can walk instructions by length.
+static size_t InstrLen_x64(const BYTE* p);
+
+// Boundary-aware: only flags relative-branch opcodes at instruction START.
+// Mid-instruction ModR/M bytes like 0x74 (part of [rsp+0x18]) no longer
+// false-positive as "JE rel8".
 static bool PrologueSafe(const BYTE* p, size_t n) {
-    for (size_t i = 0; i < n; i++) {
+    size_t i = 0;
+    while (i < n) {
         BYTE b = p[i];
-        // short jmp/call rel8
-        if (b == 0xEB /*JMP rel8*/ || b == 0xE8 /*CALL rel32*/ || b == 0xE9 /*JMP rel32*/) return false;
-        // JCC short (70..7F)
-        if (b >= 0x70 && b <= 0x7F) return false;
-        // Two-byte JCC near (0F 80 .. 0F 8F)
+        if (b == 0xEB || b == 0xE8 || b == 0xE9) return false;   // JMP rel8/CALL/JMP rel32 at boundary
+        if (b >= 0x70 && b <= 0x7F) return false;                // JCC rel8 at boundary
         if (b == 0x0F && i + 1 < n) {
             BYTE b2 = p[i + 1];
-            if (b2 >= 0x80 && b2 <= 0x8F) return false;
+            if (b2 >= 0x80 && b2 <= 0x8F) return false;          // JCC rel32 at boundary
         }
-        // RIP-relative MOD R/M: MOD=00 R/M=101 appears as 0x05 / 0x0D / 0x15 / ... in modrm
-        // We can't easily distinguish modrm bytes from opcodes without a disassembler,
-        // so we skip this check. MFC-compiled member function prologues on x64
-        // typically don't contain rip-relative refs - they're sub rsp,X / mov [rsp],reg.
+        size_t len = InstrLen_x64(p + i);
+        if (len == 0) return false;    // unknown opcode -> unsafe
+        i += len;
     }
     return true;
 }
 
-// Install an inline detour:
-//   - Copies first 14 bytes of `target` into `trampolineOut` (allocated RWX)
-//   - Appends JMP abs target+14 to trampolineOut
-//   - Overwrites target's first 14 bytes with JMP abs to `hook`
-static bool InstallInlineHook(void* target, void* hook, void** trampolineOut) {
-    // Read target prologue for diagnostics
-    BYTE saved[14];
-    memcpy(saved, target, 14);
-    LogBytes("[HOOK] target prologue bytes", target, 14);
+// Minimal x64 instruction length disassembler for common MFC prologue ops.
+// Returns number of bytes for the instruction at `p`, or 0 on unknown.
+// Only handles the short list we've actually seen in erwin's FEProcessor
+// exports. If we hit an unknown byte we return 0 and the caller aborts.
+static size_t InstrLen_x64(const BYTE* p) {
+    BYTE b0 = p[0];
+    // REX prefix (0x40..0x4F) - consume and recurse
+    if (b0 >= 0x40 && b0 <= 0x4F) {
+        size_t sub = InstrLen_x64(p + 1);
+        return sub ? sub + 1 : 0;
+    }
+    switch (b0) {
+        // SUB r/m64, imm8   (REX.W + 83 /5 ib)  -> with REX = 4 bytes (REX already consumed)
+        // Without REX: 83 /r ib = 3 bytes; with REX we recursed so this branch is already +1.
+        case 0x83: return 3;                       // 83 /X ib (3 bytes)
+        case 0x81: return 6;                       // 81 /X id (6 bytes)
+        // MOV r, r/m or MOV r/m, r or LEA r, m (same ModR/M encoding)
+        case 0x89: case 0x8B: case 0x8D: {
+            BYTE modrm = p[1];
+            BYTE mod = modrm >> 6;
+            BYTE rm  = modrm & 7;
+            size_t sz = 2; // opcode + modrm
+            if (mod != 3 && rm == 4) sz += 1;      // SIB
+            if (mod == 1) sz += 1;                 // disp8
+            else if (mod == 2) sz += 4;            // disp32
+            else if (mod == 0 && rm == 5) sz += 4; // RIP-relative disp32 (we don't relocate but can copy)
+            return sz;
+        }
+        // MOV [r/m], imm8  -> C6 /0 ib         (2 + sib/disp + 1)
+        case 0xC6: {
+            BYTE modrm = p[1];
+            BYTE mod = modrm >> 6;
+            BYTE rm  = modrm & 7;
+            size_t sz = 2;
+            if (mod != 3 && rm == 4) sz += 1;      // SIB
+            if (mod == 1) sz += 1;                 // disp8
+            else if (mod == 2) sz += 4;
+            sz += 1;                               // imm8
+            return sz;
+        }
+        // XOR r32, r/m32 (33 /r)
+        case 0x33: case 0x31: {
+            BYTE modrm = p[1];
+            BYTE mod = modrm >> 6;
+            BYTE rm  = modrm & 7;
+            size_t sz = 2;
+            if (mod != 3 && rm == 4) sz += 1;
+            if (mod == 1) sz += 1;
+            else if (mod == 2) sz += 4;
+            return sz;
+        }
+        // PUSH r (50..57), POP r (58..5F)
+        case 0x50: case 0x51: case 0x52: case 0x53:
+        case 0x54: case 0x55: case 0x56: case 0x57:
+        case 0x58: case 0x59: case 0x5A: case 0x5B:
+        case 0x5C: case 0x5D: case 0x5E: case 0x5F:
+            return 1;
+        default:
+            return 0;   // unknown - caller aborts
+    }
+}
 
-    if (!PrologueSafe(saved, 14)) {
-        LogLine("[HOOK] ABORT: target prologue contains relative jump/call; need a real disassembler.");
+// Compute the smallest instruction-aligned prefix length >= minBytes.
+// Returns 0 if the disassembler hit an unknown opcode before reaching minBytes.
+static size_t AlignedCopyLen(const BYTE* p, size_t minBytes) {
+    size_t total = 0;
+    while (total < minBytes) {
+        size_t ilen = InstrLen_x64(p + total);
+        if (ilen == 0) return 0;
+        total += ilen;
+    }
+    return total;
+}
+
+// Install an inline detour. Computes instruction-boundary-aware copy size,
+// allocates a trampoline (saved bytes + JMP to target+copySize), then
+// overwrites target's first 14 bytes with JMP to hook. Returns false if
+// the prologue is unsafe or we can't decode enough bytes.
+static bool InstallInlineHook(void* target, void* hook, void** trampolineOut) {
+    BYTE* t = (BYTE*)target;
+    LogBytes("[HOOK] target prologue bytes", target, 20);
+
+    if (!PrologueSafe(t, 20)) {
+        LogLine("[HOOK] ABORT: prologue contains relative jump/call (need disassembler).");
         return false;
     }
 
-    // Allocate trampoline: 14 saved bytes + 14 byte abs JMP = 28 bytes
+    size_t copyLen = AlignedCopyLen(t, 14);
+    if (copyLen == 0) {
+        LogLine("[HOOK] ABORT: could not decode prologue to a 14-byte boundary.");
+        return false;
+    }
+    LogLine("[HOOK] aligned copy length = %zu bytes", copyLen);
+
     void* tramp = VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!tramp) {
         LogLine("[HOOK] VirtualAlloc failed 0x%lX", GetLastError());
         return false;
     }
-    memcpy(tramp, saved, 14);
-    WriteAbsJmp14((BYTE*)tramp + 14, (BYTE*)target + 14);
-    LogLine("[HOOK] trampoline at %p", tramp);
+    memcpy(tramp, t, copyLen);
+    WriteAbsJmp14((BYTE*)tramp + copyLen, t + copyLen);
+    LogLine("[HOOK] trampoline at %p (copy=%zu + 14 jmp)", tramp, copyLen);
 
-    // Overwrite target first 14 bytes with JMP abs to hook
+    // Overwrite target's first 14 bytes with JMP abs to hook.
+    // (copyLen may be >14; that's fine - we only overwrite the JMP area.
+    // Any bytes at target+14..target+copyLen are untouched, and the hook
+    // JMP will redirect before they're executed.)
     DWORD oldProt = 0;
     if (!VirtualProtect(target, 14, PAGE_EXECUTE_READWRITE, &oldProt)) {
         LogLine("[HOOK] VirtualProtect(RWX) failed 0x%lX", GetLastError());
@@ -179,8 +273,68 @@ static bool InstallInlineHook(void* target, void* hook, void** trampolineOut) {
 typedef int(__cdecl* GenerateAlterFn)(void* self, void* modelSet, void* actionSummary, void* parent, bool showProgress);
 typedef void*(__cdecl* GetScriptFn)(void* self);   // returns &vector<CString>
 
+// GenerateFEScript is the SCAPI-internal forward-engineer entry point
+//   eFEPResult FEProcessor::GenerateFEScript(GDMModelSetI* ms, CWnd* parent);
+// When our managed addin calls ISCPersistenceUnit.FEModel_DDL(...), erwin
+// ultimately lands here with the PU's GDMModelSetI* in RDX. We use that
+// to solve the "SCAPI -> GDMModelSetI*" opacity problem: one controlled
+// FEModel_DDL call, our detour captures the pointer, we cache it.
+typedef int(__cdecl* GenerateFeFn)(void* self, void* modelSet, void* parent);
+
 static GenerateAlterFn g_origGenerateAlter = nullptr;
 static GetScriptFn     g_getScript         = nullptr;
+static GenerateFeFn    g_origGenerateFe    = nullptr;
+
+// Thread-safe latest captured GDMModelSetI* pointer (from GenerateFEScript detour).
+static volatile LONG64 g_lastCapturedModelSet = 0;
+static volatile LONG   g_feCallCount          = 0;
+
+// Most-recent DDL captured from FEProcessor::GenerateAlterScript + GetScript.
+// Populated by GenerateAlterHook after a successful alter-script generation.
+// Ownership: malloc'd buffer, protected by g_ddlLock; consumers obtain it
+// via ConsumeLastCapturedDdl() which atomically swaps pointer out.
+static CRITICAL_SECTION g_ddlLock;
+static char*           g_lastCapturedDdl = nullptr;   // protected by g_ddlLock
+static bool            g_ddlLockInited   = false;
+
+static void EnsureDdlLockInit() {
+    if (!g_ddlLockInited) {
+        InitializeCriticalSection(&g_ddlLock);
+        g_ddlLockInited = true;
+    }
+}
+
+static void StoreCapturedDdl(char* ddl /* takes ownership */) {
+    EnsureDdlLockInit();
+    EnterCriticalSection(&g_ddlLock);
+    if (g_lastCapturedDdl) { free(g_lastCapturedDdl); g_lastCapturedDdl = nullptr; }
+    g_lastCapturedDdl = ddl;
+    LeaveCriticalSection(&g_ddlLock);
+}
+
+// Forward declaration - definition lives further down in FAZ 2 section.
+static char* ConcatScriptVector(void* vecPtr);
+
+// ---------------------------------------------------------------------------
+// FEProcessor::GenerateFEScript detour - silent pointer capture
+// ---------------------------------------------------------------------------
+static int __cdecl GenerateFeHook(void* self, void* modelSet, void* parent) {
+    LONG c = InterlockedIncrement(&g_feCallCount);
+    InterlockedExchange64(&g_lastCapturedModelSet, (LONG64)modelSet);
+    if (c <= 3) {
+        LogLine("[FE] GenerateFEScript #%ld: self=%p modelSet=%p parent=%p (captured)",
+            c, self, modelSet, parent);
+    }
+    int rv = -1;
+    if (g_origGenerateFe) {
+        __try {
+            rv = g_origGenerateFe(self, modelSet, parent);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            LogLine("[FE] trampoline SEH 0x%08lX", GetExceptionCode());
+        }
+    }
+    return rv;
+}
 
 // Write the captured DDL lines to a separate file next to the diag log.
 static void DumpScriptVector(void* vecPtr) {
@@ -230,6 +384,13 @@ static void DumpScriptVector(void* vecPtr) {
 }
 
 static int __cdecl GenerateAlterHook(void* self, void* modelSet, void* actionSummary, void* parent, bool showProgress) {
+    // Also serves as our ModelSet capture point - GA fires every time FEModel_DDL
+    // runs (internally it calls GenerateAlterScript with actionSummary=NULL).
+    // GenerateFEScript would be cleaner but its prologue contains a relative
+    // CALL we can't safely relocate without a full disassembler.
+    if (modelSet) {
+        InterlockedExchange64((volatile LONG64*)&g_lastCapturedModelSet, (LONG64)modelSet);
+    }
     LogLine("[GA] ENTER self=%p modelSet=%p actionSummary=%p parent=%p show=%d",
         self, modelSet, actionSummary, parent, (int)showProgress);
 
@@ -246,11 +407,21 @@ static int __cdecl GenerateAlterHook(void* self, void* modelSet, void* actionSum
     LogLine("[GA] EXIT rv=%d", rv);
 
     // Phase B: after erwin's GenerateAlterScript succeeded, read the vector.
+    // We write to two places:
+    //   1. %TEMP%\erwin-alter-ddl-captured.sql (for diagnostic)
+    //   2. g_lastCapturedDdl in-memory buffer (for ConsumeLastCapturedDdl)
     if (rv == 0 && g_getScript && self) {
         __try {
             void* vec = g_getScript(self);
             LogLine("[GA] GetScript(self) = %p", vec);
             DumpScriptVector(vec);
+            char* ddl = ConcatScriptVector(vec);
+            if (ddl) {
+                LogLine("[GA] stored captured DDL (%zu chars) for managed consumer", strlen(ddl));
+                StoreCapturedDdl(ddl);   // takes ownership
+            } else {
+                LogLine("[GA] ConcatScriptVector returned null - not storing");
+            }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             LogLine("[GA] GetScript SEH 0x%08lX", GetExceptionCode());
         }
@@ -267,6 +438,7 @@ static const char* kGetSyncSym     = "?SynchronizeModelCallback@ECX@@SAP6A_NPEAV
 static const char* kSetDisplaySym  = "?SetDisplayModelCallback@ECX@@SAXP6A_NPEAVGDMModelSetI@@@Z@Z";
 static const char* kGetDisplaySym  = "?DisplayModelCallback@ECX@@SAP6A_NPEAVGDMModelSetI@@@ZXZ";
 static const char* kGenAlterSym    = "?GenerateAlterScript@FEProcessor@@QEAA?AW4eFEPResult@@PEAVGDMModelSetI@@PEAVGDMActionSummary@@PEAVCWnd@@_N@Z";
+static const char* kGenFeSym       = "?GenerateFEScript@FEProcessor@@QEAA?AW4eFEPResult@@PEAVGDMModelSetI@@PEAVCWnd@@@Z";
 static const char* kGetScriptSym   = "?GetScript@FEProcessor@@QEAAAEAV?$vector@V?$CStringT@DV?$StrTraitMFC_DLL@DV?$ChTraitsCRT@D@ATL@@@@@ATL@@V?$allocator@V?$CStringT@DV?$StrTraitMFC_DLL@DV?$ChTraitsCRT@D@ATL@@@@@ATL@@@std@@@std@@XZ";
 
 extern "C" __declspec(dllexport) int __cdecl InstallHook(void) {
@@ -327,7 +499,493 @@ extern "C" __declspec(dllexport) int __cdecl InstallHook(void) {
     }
     g_origGenerateAlter = (GenerateAlterFn)tramp;
     LogLine("OK: GenerateAlterScript detour armed. trampoline=%p", tramp);
+
+    // ----- Faz 1: detour GenerateFEScript for silent ModelSet capture -----
+    void* genFe = GetProcAddress(fep, kGenFeSym);
+    if (!genFe) {
+        LogLine("WARN: GenerateFEScript export missing - pointer capture disabled");
+    } else {
+        LogLine("GenerateFEScript addr = %p", genFe);
+        void* trampFe = nullptr;
+        if (!InstallInlineHook(genFe, (void*)&GenerateFeHook, &trampFe)) {
+            LogLine("WARN: GenerateFEScript detour NOT installed (unsafe prologue)");
+        } else {
+            g_origGenerateFe = (GenerateFeFn)trampFe;
+            LogLine("OK: GenerateFEScript detour armed. trampoline=%p", trampFe);
+        }
+    }
+
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Faz 1 exports: ModelSet pointer access
+// ---------------------------------------------------------------------------
+extern "C" __declspec(dllexport) void* __cdecl GetLastCapturedModelSet(void) {
+    return (void*)InterlockedCompareExchange64(
+        (volatile LONG64*)&g_lastCapturedModelSet, 0, 0);
+}
+
+extern "C" __declspec(dllexport) void __cdecl ResetCapturedModelSet(void) {
+    InterlockedExchange64((volatile LONG64*)&g_lastCapturedModelSet, 0);
+    LogLine("[FE] capture reset");
+}
+
+// ===========================================================================
+// FAZ 2: Silent Alter DDL pipeline (no UI, pure native)
+//
+// Chain erwin's own natives:
+//   MCXMartModelUtilities::PrepareServerModelSet(clientMs, &as1)   -> serverMs
+//   MCXMartModelUtilities::InitializeClientActionSummary(clientMs, &as2)
+//   MCXInvokeCompleteCompare cc(serverMs, clientMs, as1, as2);     // stack buf
+//   cc.Execute(clientMs);                                          // populates as2
+//   FEProcessor fep;                                               // stack buf
+//   fep.GenerateAlterScript(clientMs, as2, null, false);
+//   ddlLines = fep.GetScript();                                    // vector<CString>&
+//
+// All pointers except the input clientMs are erwin-owned internals; we leave
+// them alone. Buffers for cc/fep are our own, so we ctor + use + dtor + free.
+// ===========================================================================
+
+// Mangled symbols (dumpbin verified in EM_MCX.dll and EM_FEP.dll)
+static const char* kPrepareServerSym =
+    "?PrepareServerModelSet@MCXMartModelUtilities@@SAPEAVGDMModelSetI@@PEAV2@AEAPEAVGDMActionSummary@@@Z";
+static const char* kInitClientAsSym  =
+    "?InitializeClientActionSummary@MCXMartModelUtilities@@SA_NPEAVGDMModelSetI@@AEAPEAVGDMActionSummary@@@Z";
+static const char* kMcxCtorSym       =
+    "??0MCXInvokeCompleteCompare@@QEAA@PEAVGDMModelSetI@@0PEAVGDMActionSummary@@1@Z";
+static const char* kMcxDtorSym       =
+    "??1MCXInvokeCompleteCompare@@UEAA@XZ";
+static const char* kMcxExecuteSym    =
+    "?Execute@MCXInvokeCompleteCompare@@UEAA_NPEAVGDMModelSetI@@@Z";
+static const char* kFepCtorSym       =
+    "??0FEProcessor@@QEAA@XZ";
+static const char* kFepDtorSym       =
+    "??1FEProcessor@@UEAA@XZ";
+// ECXAPIStatePack silent-mode toggles - suppress erwin dialogs during
+// internal Mart calls so our pipeline stays headless.
+static const char* kActivateSilentSym =
+    "?ActivateSilentMode@ECXAPIStatePack@@SAXH@Z";
+static const char* kIsSilentSym       =
+    "?IsSilentMode@ECXAPIStatePack@@SA_NXZ";
+// Mart-state diagnostics: tell us whether PrepareServerModelSet can possibly succeed.
+static const char* kDoesDirtySym      =
+    "?DoesModelHaveUnsavedChanges@MCXMartModelUtilities@@SA_NPEAVGDMModelSetI@@@Z";
+static const char* kGetMartVerIdSym   =
+    "?GetMartVersionId@MCXMartModelUtilities@@SAHPEAVGDMModelSetI@@@Z";
+
+typedef void* (__cdecl* PrepareServerFn)(void* clientMs, void** outAs);
+typedef bool  (__cdecl* InitClientAsFn)(void* clientMs, void** outAs);
+typedef void  (__cdecl* McxCtorFn)(void* self, void* serverMs, void* clientMs, void* as1, void* as2);
+typedef void  (__cdecl* McxDtorFn)(void* self);
+typedef bool  (__cdecl* McxExecuteFn)(void* self, void* clientMs);
+typedef void  (__cdecl* FepCtorFn)(void* self);
+typedef void  (__cdecl* FepDtorFn)(void* self);
+typedef void  (__cdecl* ActivateSilentFn)(int flag);
+typedef bool  (__cdecl* IsSilentFn)(void);
+typedef bool  (__cdecl* DoesDirtyFn)(void* ms);
+typedef int   (__cdecl* GetMartVerFn)(void* ms);
+
+static PrepareServerFn  g_prepareServer = nullptr;
+static InitClientAsFn   g_initClientAs  = nullptr;
+static McxCtorFn        g_mcxCtor       = nullptr;
+static McxDtorFn        g_mcxDtor       = nullptr;
+static McxExecuteFn     g_mcxExecute    = nullptr;
+static FepCtorFn        g_fepCtor       = nullptr;
+static FepDtorFn        g_fepDtor       = nullptr;
+static ActivateSilentFn g_activateSilent = nullptr;
+static IsSilentFn       g_isSilent       = nullptr;
+static DoesDirtyFn      g_doesDirty      = nullptr;
+static GetMartVerFn     g_getMartVer     = nullptr;
+static bool             g_faz2Ready      = false;
+
+static bool ResolveFaz2Symbols() {
+    if (g_faz2Ready) return true;
+    HMODULE mcx = GetModuleHandleW(L"EM_MCX.dll");
+    if (!mcx) mcx = LoadLibraryW(L"EM_MCX.dll");
+    HMODULE fep = GetModuleHandleW(L"EM_FEP.dll");
+    if (!fep) fep = LoadLibraryW(L"EM_FEP.dll");
+    HMODULE ecx = GetModuleHandleW(L"EM_ECX.dll");   // already loaded at InstallHook
+    if (!mcx || !fep || !ecx) {
+        LogLine("[F2] ResolveFaz2Symbols: EM_MCX=%p EM_FEP=%p EM_ECX=%p",
+            (void*)mcx, (void*)fep, (void*)ecx);
+        return false;
+    }
+    g_prepareServer = (PrepareServerFn)GetProcAddress(mcx, kPrepareServerSym);
+    g_initClientAs  = (InitClientAsFn)GetProcAddress(mcx, kInitClientAsSym);
+    g_mcxCtor       = (McxCtorFn)GetProcAddress(mcx, kMcxCtorSym);
+    g_mcxDtor       = (McxDtorFn)GetProcAddress(mcx, kMcxDtorSym);
+    g_mcxExecute    = (McxExecuteFn)GetProcAddress(mcx, kMcxExecuteSym);
+    g_fepCtor       = (FepCtorFn)GetProcAddress(fep, kFepCtorSym);
+    g_fepDtor       = (FepDtorFn)GetProcAddress(fep, kFepDtorSym);
+    g_activateSilent = (ActivateSilentFn)GetProcAddress(ecx, kActivateSilentSym);
+    g_isSilent       = (IsSilentFn)GetProcAddress(ecx, kIsSilentSym);
+    g_doesDirty      = (DoesDirtyFn)GetProcAddress(mcx, kDoesDirtySym);
+    g_getMartVer     = (GetMartVerFn)GetProcAddress(mcx, kGetMartVerIdSym);
+    LogLine("[F2] PrepareServer=%p InitClientAs=%p McxCtor=%p McxDtor=%p McxExec=%p FepCtor=%p FepDtor=%p SilentAct=%p SilentIs=%p",
+        (void*)g_prepareServer, (void*)g_initClientAs, (void*)g_mcxCtor,
+        (void*)g_mcxDtor, (void*)g_mcxExecute, (void*)g_fepCtor, (void*)g_fepDtor,
+        (void*)g_activateSilent, (void*)g_isSilent);
+    // g_getScript was already resolved at InstallHook time. Silent toggles are optional.
+    g_faz2Ready = g_prepareServer && g_initClientAs && g_mcxCtor && g_mcxDtor
+               && g_mcxExecute && g_fepCtor && g_fepDtor && g_getScript;
+    return g_faz2Ready;
+}
+
+// Concatenate a vector<CString>& (passed as void*) into a single malloc'd
+// UTF-8 null-terminated string. Caller must free via FreeDdlBuffer.
+static char* ConcatScriptVector(void* vecPtr) {
+    if (!vecPtr) return nullptr;
+    char** begin = *(char***)vecPtr;
+    char** end   = *(char***)((char*)vecPtr + 8);
+    if (!begin || !end || end < begin) return nullptr;
+    size_t count = (size_t)(end - begin);
+    size_t total = 1; // null terminator
+    for (size_t i = 0; i < count; i++) if (begin[i]) total += strlen(begin[i]);
+    char* buf = (char*)malloc(total);
+    if (!buf) return nullptr;
+    char* p = buf;
+    for (size_t i = 0; i < count; i++) {
+        if (!begin[i]) continue;
+        size_t len = strlen(begin[i]);
+        memcpy(p, begin[i], len);
+        p += len;
+    }
+    *p = '\0';
+    return buf;
+}
+
+// Internal worker - runs the full pipeline. Returns a malloc'd UTF-8 string
+// on success, or nullptr on failure. Logs liberally for diagnostic.
+static char* RunSilentAlterDdl(void* clientMs) {
+    LogLine("===== [F2] RunSilentAlterDdl(clientMs=%p) =====", clientMs);
+    if (!clientMs) { LogLine("[F2] clientMs is null"); return nullptr; }
+    if (!ResolveFaz2Symbols()) {
+        LogLine("[F2] symbol resolution failed");
+        return nullptr;
+    }
+
+    void* as1 = nullptr;
+    void* as2 = nullptr;
+    void* serverMs = nullptr;
+    char* ccBuf = (char*)_aligned_malloc(4096, 16);
+    char* fepBuf = (char*)_aligned_malloc(4096, 16);
+    char* result = nullptr;
+    bool ccConstructed = false;
+    bool fepConstructed = false;
+
+    if (!ccBuf || !fepBuf) { LogLine("[F2] buffer alloc failed"); goto cleanup; }
+    memset(ccBuf, 0, 4096);
+    memset(fepBuf, 0, 4096);
+
+    // Activate erwin's internal "silent mode" so utilities don't pop dialogs
+    // (without this PrepareServerModelSet showed an "Unknown Error" MessageBox
+    // when it hit an edge case).
+    if (g_activateSilent) {
+        __try { g_activateSilent(1); LogLine("[F2] silent mode ON"); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[F2] ActivateSilentMode(1) SEH"); }
+    }
+    if (g_isSilent) {
+        __try { LogLine("[F2] IsSilentMode() = %d", (int)g_isSilent()); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[F2] IsSilentMode SEH"); }
+    }
+
+    // Diagnostic: tell us whether the model is Mart-tracked and dirty BEFORE
+    // we attempt PrepareServerModelSet. If GetMartVersionId returns -1 or 0,
+    // the model isn't a Mart client and the call will likely error.
+    if (g_getMartVer) {
+        __try {
+            int vid = g_getMartVer(clientMs);
+            LogLine("[F2] diag: GetMartVersionId = %d  (negative/zero => not a Mart client)", vid);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[F2] diag: GetMartVersionId SEH"); }
+    }
+    if (g_doesDirty) {
+        __try {
+            bool d = g_doesDirty(clientMs);
+            LogLine("[F2] diag: DoesModelHaveUnsavedChanges = %d", (int)d);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[F2] diag: DoesModelHaveUnsavedChanges SEH"); }
+    }
+
+    __try {
+        LogLine("[F2] step 1: PrepareServerModelSet...");
+        serverMs = g_prepareServer(clientMs, &as1);
+        LogLine("[F2]   serverMs=%p  as1=%p", serverMs, as1);
+        if (!serverMs) { LogLine("[F2] PrepareServerModelSet returned null - Mart connection / version history missing?"); goto finally_block; }
+
+        LogLine("[F2] step 2: InitializeClientActionSummary...");
+        bool okInit = g_initClientAs(clientMs, &as2);
+        LogLine("[F2]   rc=%d as2=%p", (int)okInit, as2);
+        if (!okInit || !as2) { LogLine("[F2] InitializeClientActionSummary failed"); goto finally_block; }
+
+        LogLine("[F2] step 3: MCXInvokeCompleteCompare ctor...");
+        g_mcxCtor(ccBuf, serverMs, clientMs, as1, as2);
+        ccConstructed = true;
+
+        LogLine("[F2] step 4: MCXInvokeCompleteCompare::Execute...");
+        bool ccOk = g_mcxExecute(ccBuf, clientMs);
+        LogLine("[F2]   Execute -> %d", (int)ccOk);
+        if (!ccOk) { LogLine("[F2] Execute returned false"); goto finally_block; }
+
+        LogLine("[F2] step 5: FEProcessor ctor + GenerateAlterScript...");
+        g_fepCtor(fepBuf);
+        fepConstructed = true;
+        int feRv = g_origGenerateAlter
+            ? g_origGenerateAlter(fepBuf, clientMs, as2, nullptr, false)
+            : -1;
+        LogLine("[F2]   GenerateAlterScript rv=%d (0=OK)", feRv);
+        if (feRv != 0) goto finally_block;
+
+        LogLine("[F2] step 6: GetScript + concatenate...");
+        void* vec = g_getScript(fepBuf);
+        LogLine("[F2]   vec=%p", vec);
+        result = ConcatScriptVector(vec);
+        LogLine("[F2]   result=%p (len=%zu)", (void*)result, result ? strlen(result) : 0);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        LogLine("[F2] SEH 0x%08lX during pipeline", GetExceptionCode());
+    }
+
+finally_block:
+    if (fepConstructed) { __try { g_fepDtor(fepBuf); } __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[F2] fepDtor SEH"); } }
+    if (ccConstructed)  { __try { g_mcxDtor(ccBuf);  } __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[F2] mcxDtor SEH"); } }
+
+cleanup:
+    if (fepBuf) _aligned_free(fepBuf);
+    if (ccBuf)  _aligned_free(ccBuf);
+    // Restore silent mode so we don't leak state affecting other wizards.
+    if (g_activateSilent) {
+        __try { g_activateSilent(0); LogLine("[F2] silent mode OFF"); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[F2] ActivateSilentMode(0) SEH"); }
+    }
+    LogLine("===== [F2] done, result=%s =====", result ? "(text)" : "(null)");
+    return result;
+}
+
+// ----- Exports -----
+// ===========================================================================
+// FAZ A-SPIKE: observer detours on MCX internal entry points so we can see
+// what erwin's own CC wizard flow passes when the user triggers it from UI.
+// ===========================================================================
+
+// PrepareServerModelSet: GDMModelSetI*(GDMModelSetI* clientMs, GDMActionSummary** outAs)
+static PrepareServerFn g_origPrepareServer = nullptr;
+static void* __cdecl PrepareServerHook(void* clientMs, void** outAs) {
+    LogLine("[OBS-PSM] ENTER clientMs=%p outAs=%p (outAs value=%p)",
+        clientMs, (void*)outAs, outAs ? *outAs : nullptr);
+    void* rv = nullptr;
+    if (g_origPrepareServer) {
+        __try { rv = g_origPrepareServer(clientMs, outAs); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[OBS-PSM] trampoline SEH 0x%08lX", GetExceptionCode()); }
+    }
+    LogLine("[OBS-PSM] EXIT rv(serverMs)=%p outAs value=%p",
+        rv, outAs ? *outAs : nullptr);
+    return rv;
+}
+
+// InitializeClientActionSummary: bool(GDMModelSetI* clientMs, GDMActionSummary** outAs)
+static InitClientAsFn g_origInitClientAs = nullptr;
+static bool __cdecl InitClientAsHook(void* clientMs, void** outAs) {
+    LogLine("[OBS-ICA] ENTER clientMs=%p outAs=%p (in value=%p)",
+        clientMs, (void*)outAs, outAs ? *outAs : nullptr);
+    bool rv = false;
+    if (g_origInitClientAs) {
+        __try { rv = g_origInitClientAs(clientMs, outAs); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[OBS-ICA] trampoline SEH 0x%08lX", GetExceptionCode()); }
+    }
+    LogLine("[OBS-ICA] EXIT rv=%d outAs value=%p", (int)rv, outAs ? *outAs : nullptr);
+    return rv;
+}
+
+// MCXInvokeCompleteCompare ctor: void(this, serverMs, clientMs, as1, as2)
+static McxCtorFn g_origMcxCtor = nullptr;
+static void __cdecl McxCtorHook(void* self, void* serverMs, void* clientMs, void* as1, void* as2) {
+    LogLine("[OBS-MCX-CTOR] self=%p serverMs=%p clientMs=%p as1=%p as2=%p",
+        self, serverMs, clientMs, as1, as2);
+    if (g_origMcxCtor) {
+        __try { g_origMcxCtor(self, serverMs, clientMs, as1, as2); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[OBS-MCX-CTOR] trampoline SEH 0x%08lX", GetExceptionCode()); }
+    }
+    LogLine("[OBS-MCX-CTOR] EXIT");
+}
+
+// MCXInvokeCompleteCompare::Execute: bool(this, clientMs)
+static McxExecuteFn g_origMcxExecute = nullptr;
+static bool __cdecl McxExecuteHook(void* self, void* clientMs) {
+    LogLine("[OBS-MCX-EXEC] ENTER self=%p clientMs=%p", self, clientMs);
+    bool rv = false;
+    if (g_origMcxExecute) {
+        __try { rv = g_origMcxExecute(self, clientMs); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[OBS-MCX-EXEC] trampoline SEH 0x%08lX", GetExceptionCode()); }
+    }
+    LogLine("[OBS-MCX-EXEC] EXIT rv=%d", (int)rv);
+    return rv;
+}
+
+// Additional observer targets in EM_ECC.dll. These are the Resolve Differences
+// "Apply differences" handlers and the ActionSummary builders we suspect
+// erwin's real CC flow uses.
+static const char* kApplyDiffRightSym =
+    "?ApplyDifferencesToRight@CWizInterface@@SAHPEAVGDMModelSetI@@0@Z";
+static const char* kApplyCCSilentSym =
+    "?ApplyCCSilentMode@CWizInterface@@SAHPEAVGDMModelSetI@@0W4CCCompareLevelType_e@@W4CCOptionSetType_e@@V?$CStringT@DV?$StrTraitMFC_DLL@DV?$ChTraitsCRT@D@ATL@@@@@ATL@@@Z";
+static const char* kEccBuildASSym =
+    "?BuildActionSummary@EccClone@@AEAAPEAVGDMActionSummary@@AEAVGDMObject@@AEBV?$CStringT@DV?$StrTraitMFC_DLL@DV?$ChTraitsCRT@D@ATL@@@@@ATL@@W4EccClone_Action_e@1@@Z";
+static const char* kEccExecASSym =
+    "?ExecuteActionSummary@EccClone@@AEAA_NPEAVGDMActionSummary@@AEAVGDMObject@@1W4EccClone_Action_e@1@@Z";
+static const char* kEccBuildTargetASSym =
+    "?BuildTargetActionSummary@EccClipboard@@QEAAXPEAVGDMActionSummary@@PEAVGDMModelSetI@@VCPoint@@AEAVMCCBuilderIdMap@@1_N4@Z";
+
+// Generic observer hooks for these signatures.
+typedef int (__cdecl* ApplyDiffRightFn)(void* ms1, void* ms2);
+static ApplyDiffRightFn g_origApplyDiffRight = nullptr;
+static int __cdecl ApplyDiffRightHook(void* ms1, void* ms2) {
+    LogLine("[OBS-ADR] ENTER ms1=%p ms2=%p", ms1, ms2);
+    int rv = -1;
+    if (g_origApplyDiffRight) { __try { rv = g_origApplyDiffRight(ms1, ms2); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[OBS-ADR] SEH"); } }
+    LogLine("[OBS-ADR] EXIT rv=%d", rv);
+    return rv;
+}
+
+// EccClone::BuildActionSummary - instance method: (this, obj, str, action_e)
+typedef void* (__cdecl* EccBuildASFn)(void* self, void* obj, const void* str, int action);
+static EccBuildASFn g_origEccBuildAS = nullptr;
+static void* __cdecl EccBuildASHook(void* self, void* obj, const void* str, int action) {
+    LogLine("[OBS-ECCBAS] ENTER self=%p obj=%p str=%p action=%d", self, obj, str, action);
+    void* rv = nullptr;
+    if (g_origEccBuildAS) { __try { rv = g_origEccBuildAS(self, obj, str, action); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[OBS-ECCBAS] SEH"); } }
+    LogLine("[OBS-ECCBAS] EXIT rv(AS)=%p", rv);
+    return rv;
+}
+
+// EccClone::ExecuteActionSummary - instance: (this, as, obj, obj2, action_e)
+typedef bool (__cdecl* EccExecASFn)(void* self, void* as, void* obj, void* obj2, int action);
+static EccExecASFn g_origEccExecAS = nullptr;
+static bool __cdecl EccExecASHook(void* self, void* as, void* obj, void* obj2, int action) {
+    LogLine("[OBS-ECCEAS] ENTER self=%p as=%p obj=%p obj2=%p action=%d", self, as, obj, obj2, action);
+    bool rv = false;
+    if (g_origEccExecAS) { __try { rv = g_origEccExecAS(self, as, obj, obj2, action); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[OBS-ECCEAS] SEH"); } }
+    LogLine("[OBS-ECCEAS] EXIT rv=%d", (int)rv);
+    return rv;
+}
+
+static void InstallObserverHooks(void) {
+    if (!ResolveFaz2Symbols()) {
+        LogLine("[OBS] cannot install - Faz2 symbols not resolved");
+        return;
+    }
+    LogLine("[OBS] installing observer detours...");
+    void* tramp = nullptr;
+    if (InstallInlineHook((void*)g_prepareServer, (void*)&PrepareServerHook, &tramp)) {
+        g_origPrepareServer = (PrepareServerFn)tramp;
+        LogLine("[OBS] PrepareServerModelSet hook ok");
+    } else {
+        LogLine("[OBS] PrepareServerModelSet hook FAILED (unsafe prologue)");
+    }
+    tramp = nullptr;
+    if (InstallInlineHook((void*)g_initClientAs, (void*)&InitClientAsHook, &tramp)) {
+        g_origInitClientAs = (InitClientAsFn)tramp;
+        LogLine("[OBS] InitializeClientActionSummary hook ok");
+    } else {
+        LogLine("[OBS] InitializeClientActionSummary hook FAILED (unsafe prologue)");
+    }
+    tramp = nullptr;
+    if (InstallInlineHook((void*)g_mcxCtor, (void*)&McxCtorHook, &tramp)) {
+        g_origMcxCtor = (McxCtorFn)tramp;
+        LogLine("[OBS] MCXInvokeCompleteCompare ctor hook ok");
+    } else {
+        LogLine("[OBS] MCXInvokeCompleteCompare ctor hook FAILED (unsafe prologue)");
+    }
+    tramp = nullptr;
+    if (InstallInlineHook((void*)g_mcxExecute, (void*)&McxExecuteHook, &tramp)) {
+        g_origMcxExecute = (McxExecuteFn)tramp;
+        LogLine("[OBS] MCXInvokeCompleteCompare::Execute hook ok");
+    } else {
+        LogLine("[OBS] MCXInvokeCompleteCompare::Execute hook FAILED (unsafe prologue)");
+    }
+
+    // Additional observers in EM_ECC (Resolve Differences / clone helpers)
+    HMODULE ecc = GetModuleHandleW(L"EM_ECC.dll");
+    if (!ecc) ecc = LoadLibraryW(L"EM_ECC.dll");
+    if (!ecc) {
+        LogLine("[OBS] EM_ECC.dll not loaded - skipping RD observers");
+        return;
+    }
+
+    void* applyDiff = GetProcAddress(ecc, kApplyDiffRightSym);
+    if (applyDiff) {
+        tramp = nullptr;
+        if (InstallInlineHook(applyDiff, (void*)&ApplyDiffRightHook, &tramp)) {
+            g_origApplyDiffRight = (ApplyDiffRightFn)tramp;
+            LogLine("[OBS] ApplyDifferencesToRight hook ok");
+        } else LogLine("[OBS] ApplyDifferencesToRight hook FAILED");
+    }
+    void* eccBuildAs = GetProcAddress(ecc, kEccBuildASSym);
+    if (eccBuildAs) {
+        tramp = nullptr;
+        if (InstallInlineHook(eccBuildAs, (void*)&EccBuildASHook, &tramp)) {
+            g_origEccBuildAS = (EccBuildASFn)tramp;
+            LogLine("[OBS] EccClone::BuildActionSummary hook ok");
+        } else LogLine("[OBS] EccClone::BuildActionSummary hook FAILED");
+    }
+    void* eccExecAs = GetProcAddress(ecc, kEccExecASSym);
+    if (eccExecAs) {
+        tramp = nullptr;
+        if (InstallInlineHook(eccExecAs, (void*)&EccExecASHook, &tramp)) {
+            g_origEccExecAS = (EccExecASFn)tramp;
+            LogLine("[OBS] EccClone::ExecuteActionSummary hook ok");
+        } else LogLine("[OBS] EccClone::ExecuteActionSummary hook FAILED");
+    }
+    // ApplyCCSilentMode - just log the symbol presence for now (signature is
+    // more complex due to CString by-value). If the simpler hooks fire, we
+    // won't need this.
+    void* silentCc = GetProcAddress(ecc, kApplyCCSilentSym);
+    LogLine("[OBS] ApplyCCSilentMode addr = %p (not yet hooked)", silentCc);
+}
+
+extern "C" __declspec(dllexport) int __cdecl InstallObserverHook(void) {
+    InstallObserverHooks();
+    return 0;
+}
+
+extern "C" __declspec(dllexport) const char* __cdecl GenerateAlterDdlForActiveModel(void* clientMs) {
+    return (const char*)RunSilentAlterDdl(clientMs);
+}
+
+extern "C" __declspec(dllexport) const char* __cdecl GenerateAlterDdlFromCaptured(void) {
+    void* clientMs = (void*)InterlockedCompareExchange64(
+        (volatile LONG64*)&g_lastCapturedModelSet, 0, 0);
+    if (!clientMs) { LogLine("[F2] no captured modelSet; call EnsureActiveModelSetCaptured first"); return nullptr; }
+    return (const char*)RunSilentAlterDdl(clientMs);
+}
+
+extern "C" __declspec(dllexport) void __cdecl FreeDdlBuffer(const char* buf) {
+    if (buf) free((void*)buf);
+}
+
+// Consume the most-recent DDL captured from GenerateAlterScript. Returns a
+// malloc'd UTF-8 string that the caller must release via FreeDdlBuffer, or
+// nullptr if nothing has been captured yet. Consuming also clears the
+// internal buffer so subsequent reads return null until the next CC run.
+extern "C" __declspec(dllexport) const char* __cdecl ConsumeLastCapturedDdl(void) {
+    EnsureDdlLockInit();
+    char* out = nullptr;
+    EnterCriticalSection(&g_ddlLock);
+    out = g_lastCapturedDdl;
+    g_lastCapturedDdl = nullptr;
+    LeaveCriticalSection(&g_ddlLock);
+    return out;
+}
+
+// Clear the in-memory buffer without consuming it (used before triggering a
+// new CC run to ensure we read a fresh capture, not a stale one).
+extern "C" __declspec(dllexport) void __cdecl ClearCapturedDdl(void) {
+    EnsureDdlLockInit();
+    EnterCriticalSection(&g_ddlLock);
+    if (g_lastCapturedDdl) { free(g_lastCapturedDdl); g_lastCapturedDdl = nullptr; }
+    LeaveCriticalSection(&g_ddlLock);
 }
 
 extern "C" __declspec(dllexport) int __cdecl UninstallHook(void) {
@@ -340,6 +998,7 @@ extern "C" __declspec(dllexport) int __cdecl UninstallHook(void) {
 
 BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
+        TruncateLog();   // fresh log per erwin process
         LogLine("DllMain DLL_PROCESS_ATTACH in PID %lu", GetCurrentProcessId());
     } else if (reason == DLL_PROCESS_DETACH) {
         LogLine("DllMain DLL_PROCESS_DETACH");

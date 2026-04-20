@@ -15,8 +15,12 @@ namespace EliteSoft.Erwin.AddIn.Services
         public RightModelSource Right;
         /// <summary>For RightModelSource.OpenModel: display name of the loaded PU to pick.</summary>
         public string OpenModelName;
-        // Mart and Database sources rely on the last-session state erwin remembers.
-        // Full Mart/DB programmatic selection is a later enhancement.
+        /// <summary>For RightModelSource.Mart: the Mart version number to compare against
+        /// (parsed from the DDL Generation tab's cmbRightModel, e.g. "v2 (name)" -> 2).
+        /// When > 0 we UIA-drive the Right Model Selection dialog to click the
+        /// Mart radio and pick the matching version before pressing Load.</summary>
+        public int MartVersion;
+        // Database source relies on the last-session state erwin remembers.
     }
 
     /// <summary>
@@ -110,6 +114,33 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         [DllImport("user32.dll")]
         private static extern IntPtr GetParent(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+        private const uint SWP_NOSIZE    = 0x0001;
+        private const uint SWP_NOZORDER  = 0x0004;
+        private const uint SWP_NOACTIVATE = 0x0010;
+
+        // Toggle: when true, wizard + dialog windows are shoved off-screen so
+        // the user never sees them flicker. DDL capture still works because
+        // it's done via native detour on FEProcessor::GenerateAlterScript.
+        // Toggle OFF temporarily for debugging if the automation goes wrong.
+        public static bool HideWizards = true;
+
+        /// <summary>Move the given window off-screen so the user doesn't see it.
+        /// No-op if HideWizards is false or the handle is invalid.</summary>
+        private void HideOffscreen(IntPtr hwnd, string label)
+        {
+            if (!HideWizards || hwnd == IntPtr.Zero) return;
+            try
+            {
+                SetWindowPos(hwnd, IntPtr.Zero, -32000, -32000, 0, 0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                _log($"  hid {label} off-screen");
+            }
+            catch (Exception ex) { _log($"  hide {label} err: {ex.Message}"); }
+        }
 
         // Low-level mouse hook - captures clicks system-wide.
         [DllImport("user32.dll", SetLastError = true)]
@@ -565,6 +596,10 @@ namespace EliteSoft.Erwin.AddIn.Services
             if (mainHwnd == IntPtr.Zero) throw new InvalidOperationException("erwin XTPMainFrame window not found");
             _log($"erwin main HWND = 0x{mainHwnd.ToInt64():X}");
 
+            // Clear any stale DDL from a prior capture - we want to read the
+            // NEW one produced by this wizard run, not a leftover.
+            EliteSoft.Erwin.AddIn.Services.NativeBridgeService.ClearCapturedDdl();
+
             // Snapshot open dialogs BEFORE opening CC so we can find the new one
             var dialogsBefore = EnumerateVisibleDialogs();
 
@@ -579,6 +614,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             IntPtr ccWizard = WaitForNewDialog(dialogsBefore, 5000);
             if (ccWizard == IntPtr.Zero) throw new InvalidOperationException("CC wizard dialog did not appear after WM_COMMAND 1082");
             _log($"CC wizard HWND = 0x{ccWizard.ToInt64():X}  title='{GetWindowTitle(ccWizard)}'");
+            HideOffscreen(ccWizard, "CC wizard");
 
             // Phase-4a: Navigate to Right Model page and select a model different from Left.
             // Default selection on Right Model page is the ACTIVE model (same as Left),
@@ -617,6 +653,11 @@ namespace EliteSoft.Erwin.AddIn.Services
             IntPtr resolveDlg = WaitForDialog(new[] { "Resolve Differences" }, timeoutMs);
             if (resolveDlg == IntPtr.Zero) throw new InvalidOperationException("Resolve Differences did not appear");
             _log($"Resolve Differences HWND = 0x{resolveDlg.ToInt64():X}");
+            // NOTE: do NOT hide Resolve Differences. It contains a hot-track XTP
+            // "Copy to Left" arrow that only responds to a real mouse_event hit
+            // on a visible on-screen window. Hiding RD would break the apply-
+            // differences step. Everything else (CC wizard + Alter wizard) IS
+            // hidden because they're navigated purely via WM_COMMAND.
 
             // Step 5: Enumerate the Resolve Differences toolbar buttons to find the
             // actual command ID for "Alter Script". Each ToolbarWindow32 child sends
@@ -717,6 +758,7 @@ namespace EliteSoft.Erwin.AddIn.Services
 
             if (wizHwnd == IntPtr.Zero) throw new InvalidOperationException("Alter Script wizard did not open");
             _log($"Alter Script Wizard HWND = 0x{wizHwnd.ToInt64():X}");
+            HideOffscreen(wizHwnd, "Alter Script wizard");
 
             // Step 7: Press Next until the Next button is disabled (we are on the last page = Preview)
             //          There are typically 5-6 pages in this wizard.
@@ -735,9 +777,18 @@ namespace EliteSoft.Erwin.AddIn.Services
             // Final settle
             Thread.Sleep(800);
 
-            // Step 8: Extract text from CodejockSyntaxEditor
-            string script = ExtractPreviewText(wizHwnd);
-            _log($"Extracted {script?.Length ?? 0} chars from Preview");
+            // Step 8: Read the DDL from the native bridge (our detour on
+            // FEProcessor::GenerateAlterScript + GetScript captured it the
+            // moment erwin produced the Preview text). UIA scraping removed -
+            // see NativeBridgeService + scripts/native-bridge/native-bridge.cpp.
+            string script = EliteSoft.Erwin.AddIn.Services.NativeBridgeService.ConsumeLastCapturedDdl();
+            if (string.IsNullOrEmpty(script))
+            {
+                _log("  native-bridge DDL empty, falling back to UIA Preview scrape");
+                script = ExtractPreviewText(wizHwnd);
+            }
+            _log($"DDL length = {script?.Length ?? 0} chars (source = " +
+                 (!string.IsNullOrEmpty(script) ? "native bridge" : "none") + ")");
 
             // Step 9: Cleanup - Cancel all open dialogs in reverse order.
             // CC wizard stays behind Resolve Differences; close it too.
@@ -1099,8 +1150,125 @@ namespace EliteSoft.Erwin.AddIn.Services
                 return;
             }
 
-            // Mart / Database: let erwin's last-session selection stand
+            if (config.Right == RightModelSource.Mart && config.MartVersion > 0)
+            {
+                SelectMartVersion(wizardHwnd, config.MartVersion);
+                return;
+            }
+
+            // Mart (no version) / Database: let erwin's last-session selection stand
             _log($"  Right source = {config.Right} (using erwin's session state)");
+        }
+
+        /// <summary>
+        /// UIA-drives the Right Model Selection dialog:
+        ///  - Posts WM_COMMAND 1081 to pick the "From Mart" radio.
+        ///  - Enumerates the Mart version picker (listview/combo) and selects the
+        ///    item whose text matches "Version N" / "v N" / just "N".
+        ///  - Posts WM_COMMAND 1082 to press Load.
+        /// Logs the full control tree on first failure so we can refine.
+        /// </summary>
+        private void SelectMartVersion(IntPtr wizardHwnd, int targetVersion)
+        {
+            _log($"  SelectMartVersion(v{targetVersion}) entering...");
+
+            // Step 1: click the "From Mart" radio. WM_COMMAND 1081 is the documented
+            // control ID (older memory note; verified empirically in comment above).
+            PostMessage(wizardHwnd, WM_COMMAND, MakeWParam(1081, 0), IntPtr.Zero);
+            Thread.Sleep(300);
+            _log($"  posted WM_COMMAND 1081 (Mart radio). Title='{GetWindowTitle(wizardHwnd)}'");
+
+            var root = AutomationElement.FromHandle(wizardHwnd);
+            if (root == null) { _log("  [WARN] UIA root null on Right Model dialog"); return; }
+
+            // Step 2: look for any ListItem / ComboBoxItem / TreeItem child whose Name
+            // mentions the version. Erwin's version labels come in flavors:
+            //   "1" / "v1" / "Version 1" / "1 - 2026-04-18 ..."
+            var listCond = new OrCondition(
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ListItem),
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.TreeItem));
+            var items = root.FindAll(TreeScope.Descendants, listCond);
+            _log($"  found {items.Count} list/tree items in dialog");
+
+            AutomationElement target = null;
+            string vstr = targetVersion.ToString();
+            foreach (AutomationElement e in items)
+            {
+                string n = "";
+                try { n = e.Current.Name ?? ""; } catch { }
+                if (string.IsNullOrEmpty(n)) continue;
+                _log($"    item: '{n}'");
+                if (n == vstr
+                    || n.StartsWith($"v{vstr}", StringComparison.OrdinalIgnoreCase)
+                    || n.IndexOf($"Version {vstr}", StringComparison.OrdinalIgnoreCase) >= 0
+                    || n.StartsWith($"{vstr} ") || n.StartsWith($"{vstr}\t"))
+                {
+                    target = e;
+                    break;
+                }
+            }
+
+            if (target == null)
+            {
+                _log($"  [WARN] no list item matches target v{targetVersion} - dumping full control tree for diagnosis");
+                DumpUiaTree(root, 0, 80);
+                // Fall back to pressing Load anyway - erwin may have defaulted a sensible
+                // version (highest available). At worst we get a compare-to-itself popup
+                // which our existing code already handles.
+            }
+            else
+            {
+                try
+                {
+                    string n = target.Current.Name ?? "";
+                    _log($"  selecting version item '{n}'");
+                    if (target.TryGetCurrentPattern(SelectionItemPattern.Pattern, out object sip))
+                        ((SelectionItemPattern)sip).Select();
+                    else
+                        target.SetFocus();
+                    Thread.Sleep(150);
+                }
+                catch (Exception ex) { _log($"  select item err: {ex.Message}"); }
+            }
+
+            // Step 3: press Load (WM_COMMAND 1082)
+            PostMessage(wizardHwnd, WM_COMMAND, MakeWParam(1082, 0), IntPtr.Zero);
+            Thread.Sleep(500);
+            _log($"  posted WM_COMMAND 1082 (Load). Title='{GetWindowTitle(wizardHwnd)}'");
+        }
+
+        /// <summary>Walks the UIA subtree and logs each element's type/name/automationId.
+        /// Capped to `maxNodes` to keep the log manageable.</summary>
+        private void DumpUiaTree(AutomationElement el, int depth, int maxNodes)
+        {
+            if (el == null || depth > 10) return;
+            if (maxNodes <= 0) return;
+            int remaining = maxNodes;
+            try
+            {
+                string type = "";
+                try { type = el.Current.ControlType?.ProgrammaticName ?? ""; } catch { }
+                string name = "";
+                try { name = el.Current.Name ?? ""; } catch { }
+                string aid = "";
+                try { aid = el.Current.AutomationId ?? ""; } catch { }
+                string cls = "";
+                try { cls = el.Current.ClassName ?? ""; } catch { }
+                _log($"  {new string(' ', depth * 2)}[{type}] name='{name}' id='{aid}' cls='{cls}'");
+                remaining--;
+            }
+            catch { }
+            try
+            {
+                var children = el.FindAll(TreeScope.Children, Condition.TrueCondition);
+                foreach (AutomationElement c in children)
+                {
+                    if (remaining <= 0) return;
+                    DumpUiaTree(c, depth + 1, remaining);
+                    remaining -= 20;   // rough budget per subtree
+                }
+            }
+            catch { }
         }
 
         /// <summary>

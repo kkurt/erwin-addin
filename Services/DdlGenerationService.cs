@@ -1480,6 +1480,73 @@ WScript.Quit 0
         /// Get version list from PU locator (no Portal DB needed).
         /// Current PU locator contains version=N, so we list 1..N.
         /// </summary>
+        /// <summary>
+        /// Open a specific Mart version of the given model's family as a second
+        /// PersistenceUnit. Returns the opened PU (caller must close/remove it
+        /// when finished) or null on failure. Used by the CC pipeline to present
+        /// the baseline version as a "loaded model" that WizardAutomationService
+        /// can pick via SelectFromLoadedModels.
+        /// </summary>
+        public static dynamic OpenMartVersionPU(dynamic scapi, dynamic currentPU, int version, Action<string> log)
+        {
+            if (scapi == null || currentPU == null || version <= 0) return null;
+            try
+            {
+                string locator = "";
+                try { locator = currentPU.PropertyBag().Value("Locator")?.ToString() ?? ""; } catch { }
+
+                var pathMatch = Regex.Match(locator, @"Mart://Mart/(.+?)(\?|$)", RegexOptions.IgnoreCase);
+                string modelPath = pathMatch.Success ? pathMatch.Groups[1].Value
+                                                    : (currentPU.Name?.ToString() ?? "");
+                if (string.IsNullOrEmpty(modelPath))
+                {
+                    log?.Invoke("OpenMartVersionPU: could not derive model path from current PU locator.");
+                    return null;
+                }
+
+                // Candidates - short-form first (reuses existing Mart connection),
+                // then with explicit Mart credentials if we can fetch them.
+                var attempts = new List<(string url, string disp, string desc)>();
+                attempts.Add(($"mart://Mart/{modelPath}?VNO={version}", "RDO=Yes", "short + RDO"));
+                attempts.Add(($"mart://Mart/{modelPath}?VNO={version}", "OVM=Yes", "short + OVM"));
+                attempts.Add(($"mart://Mart/{modelPath}?VNO={version}", "", "short + empty"));
+
+                var martInfo = GetMartConnectionInfo(log);
+                if (martInfo != null)
+                {
+                    string fullUrl = $"mart://Mart/{modelPath}?TRC=NO;SRV={martInfo.Value.host};PRT={martInfo.Value.port};ASR=MartServer;UID={martInfo.Value.username};PSW={martInfo.Value.password};VNO={version}";
+                    attempts.Add((fullUrl, "RDO=Yes", "full + RDO"));
+                    attempts.Add((fullUrl, "OVM=Yes", "full + OVM"));
+                    attempts.Add((fullUrl, "", "full + empty"));
+                }
+
+                foreach (var (url, disp, desc) in attempts)
+                {
+                    string masked = Regex.Replace(url, @"PSW=[^;]*", "PSW=***");
+                    log?.Invoke($"OpenMartVersionPU: trying [{desc}] {masked} disp='{disp}'");
+                    try
+                    {
+                        dynamic pu = scapi.PersistenceUnits.Add(url, disp);
+                        string name = pu?.Name?.ToString() ?? "";
+                        log?.Invoke($"OpenMartVersionPU: success [{desc}] - PU.Name = '{name}'");
+                        return pu;
+                    }
+                    catch (Exception ex)
+                    {
+                        log?.Invoke($"OpenMartVersionPU: [{desc}] failed: {ex.Message}");
+                    }
+                }
+
+                log?.Invoke("OpenMartVersionPU: all attempts failed.");
+                return null;
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"OpenMartVersionPU: {ex.GetType().Name}: {ex.Message}");
+                return null;
+            }
+        }
+
         public static List<(int Version, string Name, int CatalogId)> GetMartVersions(string modelName, dynamic currentPU, Action<string> log)
         {
             var versions = new List<(int Version, string Name, int CatalogId)>();

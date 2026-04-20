@@ -892,6 +892,45 @@ namespace EliteSoft.Erwin.AddIn
             this.btnCopyLog.Click += new System.EventHandler(this.BtnCopyLog_Click);
             this.grpDebugLog.Controls.Add(this.btnCopyLog);
 
+            // Faz 1 test: force NativeBridge to capture GDMModelSetI* via FEModel_DDL call.
+            this.btnCaptureModelSet = new System.Windows.Forms.Button();
+            this.btnCaptureModelSet.Location = new System.Drawing.Point(414, 56);
+            this.btnCaptureModelSet.Size = new System.Drawing.Size(160, 28);
+            this.btnCaptureModelSet.Text = "Capture ModelSet";
+            this.btnCaptureModelSet.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnCaptureModelSet.BackColor = System.Drawing.Color.FromArgb(200, 240, 200);
+            this.btnCaptureModelSet.FlatAppearance.BorderColor = clrBorder;
+            this.btnCaptureModelSet.Font = fontCaption;
+            this.btnCaptureModelSet.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnCaptureModelSet.Click += new System.EventHandler(this.BtnCaptureModelSet_Click);
+            this.grpDebugLog.Controls.Add(this.btnCaptureModelSet);
+
+            // Observer hooks: install once, then user does a normal UI CC flow.
+            this.btnInstallObservers = new System.Windows.Forms.Button();
+            this.btnInstallObservers.Location = new System.Drawing.Point(16, 88);
+            this.btnInstallObservers.Size = new System.Drawing.Size(160, 28);
+            this.btnInstallObservers.Text = "Install MCX Observers";
+            this.btnInstallObservers.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnInstallObservers.BackColor = System.Drawing.Color.FromArgb(220, 220, 255);
+            this.btnInstallObservers.FlatAppearance.BorderColor = clrBorder;
+            this.btnInstallObservers.Font = fontCaption;
+            this.btnInstallObservers.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnInstallObservers.Click += new System.EventHandler(this.BtnInstallObservers_Click);
+            this.grpDebugLog.Controls.Add(this.btnInstallObservers);
+
+            // Faz 2 test: end-to-end silent alter DDL via native bridge.
+            this.btnSilentAlterDdl = new System.Windows.Forms.Button();
+            this.btnSilentAlterDdl.Location = new System.Drawing.Point(580, 56);
+            this.btnSilentAlterDdl.Size = new System.Drawing.Size(170, 28);
+            this.btnSilentAlterDdl.Text = "Silent Alter DDL (F2)";
+            this.btnSilentAlterDdl.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnSilentAlterDdl.BackColor = System.Drawing.Color.FromArgb(255, 230, 200);
+            this.btnSilentAlterDdl.FlatAppearance.BorderColor = clrBorder;
+            this.btnSilentAlterDdl.Font = fontCaption;
+            this.btnSilentAlterDdl.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnSilentAlterDdl.Click += new System.EventHandler(this.BtnSilentAlterDdl_Click);
+            this.grpDebugLog.Controls.Add(this.btnSilentAlterDdl);
+
             this.btnClearLog.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right;
             this.btnClearLog.Location = new System.Drawing.Point(498, 24);
             this.btnClearLog.Size = new System.Drawing.Size(70, 28);
@@ -1078,6 +1117,9 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.Button btnCopyLog;
         private System.Windows.Forms.Button btnClearLog;
         private System.Windows.Forms.Button btnCaptureNow;
+        private System.Windows.Forms.Button btnCaptureModelSet;
+        private System.Windows.Forms.Button btnSilentAlterDdl;
+        private System.Windows.Forms.Button btnInstallObservers;
         private System.Windows.Forms.Button btnLiveReMon;
         private System.Windows.Forms.Button btnTestAlterFE;
         private System.Windows.Forms.Button btnDumpPropBag;

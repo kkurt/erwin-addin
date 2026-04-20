@@ -2282,8 +2282,25 @@ namespace EliteSoft.Erwin.AddIn
 
             // Build the right-model config from the UI radios/pickers
             var cfg = new Services.AlterWizardConfig();
-            dynamic rePUToCleanup = null;   // track RE'd PU so we can remove it after capture
-            if (rbFromMart.Checked) cfg.Right = Services.RightModelSource.Mart;
+            dynamic rePUToCleanup = null;   // track Mart/RE'd PU so we can remove it after capture
+            if (rbFromMart.Checked)
+            {
+                // Parse "v2 (Name)" -> 2 from cmbRightModel selection.
+                // Erwin refuses to open a second Mart PU via SCAPI when Mart UI
+                // is already active ("Mart user interface is active..."), so we
+                // let WizardAutomationService drive the Right Model Selection
+                // dialog via UIA: click the Mart radio, pick the version,
+                // press Load.
+                int targetVersion = 0;
+                string selText = cmbRightModel.SelectedItem?.ToString() ?? "";
+                var vm = System.Text.RegularExpressions.Regex.Match(selText, @"^v(\d+)");
+                if (vm.Success) int.TryParse(vm.Groups[1].Value, out targetVersion);
+                cfg.Right = Services.RightModelSource.Mart;
+                cfg.MartVersion = targetVersion;
+                Log(targetVersion > 0
+                    ? $"-- From Mart: will UIA-pick v{targetVersion} in Right Model Selection"
+                    : $"-- From Mart: no version parsed from '{selText}', using erwin session state.");
+            }
             else if (rbFromDB.Checked)
             {
                 // Pre-step: silently RE the live DB into a new PU so the wizard
@@ -3398,6 +3415,93 @@ namespace EliteSoft.Erwin.AddIn
         /// SAFE MODE: dumps Active_Model PU first, never opens temp Session on already-open PU,
         /// FEModel_DDL is OPT-IN (Ctrl held while clicking) to avoid erwin crashes.
         /// </summary>
+        /// <summary>
+        /// Faz 1 diagnostic: force NativeBridge to capture the active PU's
+        /// GDMModelSetI* via a one-shot FEModel_DDL trigger. Logs the captured
+        /// pointer (or zero if capture failed). Used to verify the pointer
+        /// pipeline before Faz 2 (MCXInvokeCompleteCompare + GenerateAlterScript).
+        /// </summary>
+        private void BtnCaptureModelSet_Click(object sender, EventArgs e)
+        {
+            if (!_isConnected || _currentModel == null)
+            {
+                Log("[CAPTURE] No model connected.");
+                return;
+            }
+            btnCaptureModelSet.Enabled = false;
+            try
+            {
+                Log("");
+                Log("=== Faz 1: Capture ModelSet pointer ===");
+                IntPtr ms = Services.NativeBridgeService.EnsureActiveModelSetCaptured(_currentModel, (Action<string>)Log);
+                if (ms == IntPtr.Zero)
+                    Log("[CAPTURE] FAILED: modelSet pointer is still null. Check erwin-native-bridge.log.");
+                else
+                    Log($"[CAPTURE] SUCCESS: modelSet = 0x{ms.ToInt64():X}");
+            }
+            finally
+            {
+                btnCaptureModelSet.Enabled = true;
+            }
+        }
+
+        /// <summary>
+        /// Faz A-spike diagnostic: install observer detours on MCX internals
+        /// (PrepareServerModelSet, InitializeClientActionSummary, ctor, Execute)
+        /// so a subsequent user-triggered UI CC flow is traced. After clicking
+        /// this, run a normal Complete Compare + alter-script cycle in erwin's
+        /// UI, then share %TEMP%\erwin-native-bridge.log.
+        /// </summary>
+        private void BtnInstallObservers_Click(object sender, EventArgs e)
+        {
+            btnInstallObservers.Enabled = false;
+            try
+            {
+                Log("");
+                Log("=== Faz A-spike: installing MCX observer detours ===");
+                bool ok = Services.NativeBridgeService.InstallObserverHooks(Log);
+                Log(ok
+                    ? "Observers installed. Now trigger a normal Complete Compare in erwin's UI (Actions menu). When done, share the bridge log."
+                    : "Observer install failed. See log.");
+            }
+            finally { btnInstallObservers.Enabled = true; }
+        }
+
+        /// <summary>
+        /// Faz 2 end-to-end test: runs the fully silent alter-DDL pipeline via native bridge
+        /// (MCXInvokeCompleteCompare + FEProcessor) and prints the result length.
+        /// Also writes the full DDL to the rich DDL output area on the DDL Generation tab.
+        /// </summary>
+        private void BtnSilentAlterDdl_Click(object sender, EventArgs e)
+        {
+            if (!_isConnected || _currentModel == null)
+            {
+                Log("[F2-UI] No model connected.");
+                return;
+            }
+            btnSilentAlterDdl.Enabled = false;
+            try
+            {
+                Log("");
+                Log("=== Faz 2: Silent Alter DDL pipeline ===");
+                string ddl = Services.NativeBridgeService.GenerateAlterDdl(_currentModel, (Action<string>)Log);
+                if (string.IsNullOrEmpty(ddl))
+                {
+                    Log("[F2-UI] FAILED: bridge returned no DDL. See bridge log.");
+                }
+                else
+                {
+                    Log($"[F2-UI] SUCCESS: {ddl.Length} chars captured.");
+                    Log($"[F2-UI] First 120 chars: {ddl.Substring(0, Math.Min(120, ddl.Length)).Replace("\n", "\\n")}");
+                    rtbDDLOutput.Text = ddl;
+                }
+            }
+            finally
+            {
+                btnSilentAlterDdl.Enabled = true;
+            }
+        }
+
         private void BtnCaptureNow_Click(object sender, EventArgs e)
         {
             btnCaptureNow.Enabled = false;
