@@ -2293,6 +2293,23 @@ namespace EliteSoft.Erwin.AddIn
             }
 
             btnAlterWizardProd.Enabled = true;
+
+            // Bring the add-in form back to the foreground. The Ctrl+Alt+T
+            // path pushes erwin's main window up, and the brief
+            // wizard-open/close cycle leaves focus on erwin. The TopMost
+            // flip is Windows' sanctioned way to jump past the foreground
+            // lock owned by another window in the same process.
+            try
+            {
+                this.TopMost = true;
+                this.Activate();
+                this.BringToFront();
+                this.TopMost = false;
+            }
+            catch (Exception focusEx)
+            {
+                Log($"Restore focus failed: {focusEx.Message}");
+            }
         }
 
 

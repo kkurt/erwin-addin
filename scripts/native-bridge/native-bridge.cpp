@@ -1531,6 +1531,12 @@ extern "C" __declspec(dllexport) void __cdecl CloseHiddenWizard(void* hwnd) {
     // Also post WM_CLOSE as a fallback in case IDCANCEL routes elsewhere.
     PostMessage((HWND)hwnd, WM_CLOSE, 0, 0);
     InterlockedExchange64(&g_hiddenWizardHwnd, 0);
+    // Invalidate the cached FEWPageOptions / FEWPagePreviewEx 'this' pointers.
+    // The C++ objects are destroyed when the CPropertySheet modal loop exits;
+    // if we kept the stale ptrs, the next GenerateAlterDdl call would try to
+    // Invoke on a dangling address (SEH 0xC0000005) and return no DDL.
+    InterlockedExchange64(&g_capturedFEWPO, 0);
+    InterlockedExchange64(&g_capturedFEWPreviewEx, 0);
 }
 
 extern "C" __declspec(dllexport) const char* __cdecl GenerateAlterDdlStandalone(void* clientMs) {
