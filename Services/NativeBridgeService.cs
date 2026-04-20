@@ -209,8 +209,6 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <summary>
         /// Reads and clears the most-recent alter DDL captured by the
         /// GenerateAlterScript detour. Returns null if nothing captured.
-        /// This is how WizardAutomationService gets the DDL without scraping
-        /// UIA on the Preview page.
         /// </summary>
         public static string ConsumeLastCapturedDdl()
         {

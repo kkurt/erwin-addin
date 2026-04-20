@@ -865,19 +865,6 @@ namespace EliteSoft.Erwin.AddIn
             this.btnDumpUiaTree.Click += new System.EventHandler(this.BtnDumpUiaTree_Click);
             this.grpDebugLog.Controls.Add(this.btnDumpUiaTree);
 
-            this.btnAlterWizard = new System.Windows.Forms.Button();
-            this.btnAlterWizard.Location = new System.Drawing.Point(292, 56);
-            this.btnAlterWizard.Size = new System.Drawing.Size(180, 28);
-            this.btnAlterWizard.Text = "Alter Script (0-click Wizard)";
-            this.btnAlterWizard.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnAlterWizard.BackColor = System.Drawing.Color.FromArgb(180, 255, 200);
-            this.btnAlterWizard.ForeColor = clrTextPrimary;
-            this.btnAlterWizard.FlatAppearance.BorderColor = clrBorder;
-            this.btnAlterWizard.Font = fontCaption;
-            this.btnAlterWizard.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnAlterWizard.Click += new System.EventHandler(this.BtnAlterWizard_Click);
-            this.grpDebugLog.Controls.Add(this.btnAlterWizard);
-
             // Right-side tools: Copy / Clear / Search
             this.btnCopyLog.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right;
             this.btnCopyLog.Location = new System.Drawing.Point(420, 24);
@@ -1156,7 +1143,6 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.Button btnTestAlterFE;
         private System.Windows.Forms.Button btnDumpPropBag;
         private System.Windows.Forms.Button btnDumpUiaTree;
-        private System.Windows.Forms.Button btnAlterWizard;
         private System.Windows.Forms.TextBox txtLogSearch;
         private System.Windows.Forms.Label lblLogSearch;
 

@@ -1484,8 +1484,7 @@ WScript.Quit 0
         /// Open a specific Mart version of the given model's family as a second
         /// PersistenceUnit. Returns the opened PU (caller must close/remove it
         /// when finished) or null on failure. Used by the CC pipeline to present
-        /// the baseline version as a "loaded model" that WizardAutomationService
-        /// can pick via SelectFromLoadedModels.
+        /// the baseline version as a "loaded model" for the compare pipeline.
         /// </summary>
         public static dynamic OpenMartVersionPU(dynamic scapi, dynamic currentPU, int version, Action<string> log)
         {

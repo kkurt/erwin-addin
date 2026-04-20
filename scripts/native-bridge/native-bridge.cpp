@@ -485,6 +485,9 @@ static const char* kGenAlterSym    = "?GenerateAlterScript@FEProcessor@@QEAA?AW4
 static const char* kGenFeSym       = "?GenerateFEScript@FEProcessor@@QEAA?AW4eFEPResult@@PEAVGDMModelSetI@@PEAVCWnd@@@Z";
 static const char* kGetScriptSym   = "?GetScript@FEProcessor@@QEAAAEAV?$vector@V?$CStringT@DV?$StrTraitMFC_DLL@DV?$ChTraitsCRT@D@ATL@@@@@ATL@@V?$allocator@V?$CStringT@DV?$StrTraitMFC_DLL@DV?$ChTraitsCRT@D@ATL@@@@@ATL@@@std@@@std@@XZ";
 
+// Forward decl so InstallHook() can call it before its definition further down.
+static void InstallObserverHooks(void);
+
 extern "C" __declspec(dllexport) int __cdecl InstallHook(void) {
     LogLine("====== InstallHook() v3 in PID %lu ======", GetCurrentProcessId());
 
@@ -558,6 +561,14 @@ extern "C" __declspec(dllexport) int __cdecl InstallHook(void) {
             LogLine("OK: GenerateFEScript detour armed. trampoline=%p", trampFe);
         }
     }
+
+    // ----- Faz A: install observer detours eagerly -----
+    // Critical: FEWPageOptions ctor hook lives in InstallObserverHooks() and is
+    // required for OpenAlterScriptWizardHidden to detect that the wizard has
+    // been constructed. Without it, the wizard opens visibly and our 15s
+    // ctor-wait times out. Install at startup instead of waiting for a manual
+    // trigger from the debug panel.
+    InstallObserverHooks();
 
     return 0;
 }
@@ -1304,8 +1315,7 @@ extern "C" __declspec(dllexport) void* __cdecl GetCapturedFEWPageOptions(void) {
 // so the AS reflects current dirty state, not the state at the time the
 // feParam template was captured.
 // ---------------------------------------------------------------------------
-// Helpers for window enumeration (native C++ equivalents of the C# helpers
-// in WizardAutomationService).
+// Helpers for window enumeration.
 // ---------------------------------------------------------------------------
 
 struct FindMainCtx { HWND found; DWORD pid; };
