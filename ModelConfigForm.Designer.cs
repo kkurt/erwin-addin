@@ -799,73 +799,7 @@ namespace EliteSoft.Erwin.AddIn
             this.grpDebugLog.TabStop = false;
             this.grpDebugLog.Text = "Debug Output";
 
-            // Row 1: Diagnostic actions (left) + Log tools (right)
-            this.btnCaptureNow = new System.Windows.Forms.Button();
-            this.btnCaptureNow.Location = new System.Drawing.Point(16, 24);
-            this.btnCaptureNow.Size = new System.Drawing.Size(120, 28);
-            this.btnCaptureNow.Text = "Capture Now";
-            this.btnCaptureNow.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnCaptureNow.BackColor = System.Drawing.Color.White;
-            this.btnCaptureNow.ForeColor = clrTextPrimary;
-            this.btnCaptureNow.FlatAppearance.BorderColor = clrBorder;
-            this.btnCaptureNow.Font = fontCaption;
-            this.btnCaptureNow.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnCaptureNow.Click += new System.EventHandler(this.BtnCaptureNow_Click);
-            this.grpDebugLog.Controls.Add(this.btnCaptureNow);
-
-            this.btnTestAlterFE = new System.Windows.Forms.Button();
-            this.btnTestAlterFE.Location = new System.Drawing.Point(272, 24);
-            this.btnTestAlterFE.Size = new System.Drawing.Size(130, 28);
-            this.btnTestAlterFE.Text = "Test ActionConvertor";
-            this.btnTestAlterFE.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnTestAlterFE.BackColor = System.Drawing.Color.FromArgb(180, 220, 255);
-            this.btnTestAlterFE.ForeColor = clrTextPrimary;
-            this.btnTestAlterFE.FlatAppearance.BorderColor = clrBorder;
-            this.btnTestAlterFE.Font = fontCaption;
-            this.btnTestAlterFE.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnTestAlterFE.Click += new System.EventHandler(this.BtnTestAlterFE_Click);
-            this.grpDebugLog.Controls.Add(this.btnTestAlterFE);
-
-            this.btnLiveReMon = new System.Windows.Forms.Button();
-            this.btnLiveReMon.Location = new System.Drawing.Point(144, 24);
-            this.btnLiveReMon.Size = new System.Drawing.Size(120, 28);
-            this.btnLiveReMon.Text = "Live Monitor";
-            this.btnLiveReMon.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnLiveReMon.BackColor = System.Drawing.Color.White;
-            this.btnLiveReMon.ForeColor = clrTextPrimary;
-            this.btnLiveReMon.FlatAppearance.BorderColor = clrBorder;
-            this.btnLiveReMon.Font = fontCaption;
-            this.btnLiveReMon.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnLiveReMon.Click += new System.EventHandler(this.BtnLiveReMon_Click);
-            this.grpDebugLog.Controls.Add(this.btnLiveReMon);
-
-            this.btnDumpPropBag = new System.Windows.Forms.Button();
-            this.btnDumpPropBag.Location = new System.Drawing.Point(16, 56);
-            this.btnDumpPropBag.Size = new System.Drawing.Size(130, 28);
-            this.btnDumpPropBag.Text = "Dump PropBag";
-            this.btnDumpPropBag.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnDumpPropBag.BackColor = System.Drawing.Color.FromArgb(255, 240, 200);
-            this.btnDumpPropBag.ForeColor = clrTextPrimary;
-            this.btnDumpPropBag.FlatAppearance.BorderColor = clrBorder;
-            this.btnDumpPropBag.Font = fontCaption;
-            this.btnDumpPropBag.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnDumpPropBag.Click += new System.EventHandler(this.BtnDumpPropBag_Click);
-            this.grpDebugLog.Controls.Add(this.btnDumpPropBag);
-
-            this.btnDumpUiaTree = new System.Windows.Forms.Button();
-            this.btnDumpUiaTree.Location = new System.Drawing.Point(154, 56);
-            this.btnDumpUiaTree.Size = new System.Drawing.Size(130, 28);
-            this.btnDumpUiaTree.Text = "Dump UIA Tree";
-            this.btnDumpUiaTree.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnDumpUiaTree.BackColor = System.Drawing.Color.FromArgb(220, 200, 255);
-            this.btnDumpUiaTree.ForeColor = clrTextPrimary;
-            this.btnDumpUiaTree.FlatAppearance.BorderColor = clrBorder;
-            this.btnDumpUiaTree.Font = fontCaption;
-            this.btnDumpUiaTree.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnDumpUiaTree.Click += new System.EventHandler(this.BtnDumpUiaTree_Click);
-            this.grpDebugLog.Controls.Add(this.btnDumpUiaTree);
-
-            // Right-side tools: Copy / Clear / Search
+            // Row 1 (y=24): log tools on the right.
             this.btnCopyLog.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right;
             this.btnCopyLog.Location = new System.Drawing.Point(420, 24);
             this.btnCopyLog.Size = new System.Drawing.Size(70, 28);
@@ -879,41 +813,13 @@ namespace EliteSoft.Erwin.AddIn
             this.btnCopyLog.Click += new System.EventHandler(this.BtnCopyLog_Click);
             this.grpDebugLog.Controls.Add(this.btnCopyLog);
 
-            // Faz 1 test: force NativeBridge to capture GDMModelSetI* via FEModel_DDL call.
-            this.btnCaptureModelSet = new System.Windows.Forms.Button();
-            this.btnCaptureModelSet.Location = new System.Drawing.Point(414, 56);
-            this.btnCaptureModelSet.Size = new System.Drawing.Size(160, 28);
-            this.btnCaptureModelSet.Text = "Capture ModelSet";
-            this.btnCaptureModelSet.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnCaptureModelSet.BackColor = System.Drawing.Color.FromArgb(200, 240, 200);
-            this.btnCaptureModelSet.FlatAppearance.BorderColor = clrBorder;
-            this.btnCaptureModelSet.Font = fontCaption;
-            this.btnCaptureModelSet.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnCaptureModelSet.Click += new System.EventHandler(this.BtnCaptureModelSet_Click);
-            this.grpDebugLog.Controls.Add(this.btnCaptureModelSet);
-
-            // Standalone experiment: construct FEWPageOptions without opening
-            // the wizard (uses stashed feParam template from a prior session).
-            this.btnStandaloneDdl = new System.Windows.Forms.Button();
-            this.btnStandaloneDdl.Location = new System.Drawing.Point(408, 88);
-            this.btnStandaloneDdl.Size = new System.Drawing.Size(200, 28);
-            this.btnStandaloneDdl.Text = "Standalone DDL (no wizard)";
-            this.btnStandaloneDdl.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnStandaloneDdl.BackColor = System.Drawing.Color.FromArgb(180, 255, 180);
-            this.btnStandaloneDdl.FlatAppearance.BorderColor = clrBorder;
-            this.btnStandaloneDdl.Font = fontCaption;
-            this.btnStandaloneDdl.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnStandaloneDdl.Click += new System.EventHandler(this.BtnStandaloneDdl_Click);
-            this.grpDebugLog.Controls.Add(this.btnStandaloneDdl);
-
-            // Direct invoke test: user opens wizard (stays on Overview), clicks
-            // this button, we call InvokePreviewStringOnlyCommand on the captured
-            // FEWPageOptions pointer. If it returns DDL, we've proved the
-            // programmatic-invoke path.
+            // Row 2 (y=56): known-working normal-alter path. Also seeds the
+            // GA-captured modelSet pointer as a side effect so subsequent
+            // Mart-Mart spike buttons have something to work with.
             this.btnInvokePreviewDirect = new System.Windows.Forms.Button();
-            this.btnInvokePreviewDirect.Location = new System.Drawing.Point(182, 88);
+            this.btnInvokePreviewDirect.Location = new System.Drawing.Point(16, 56);
             this.btnInvokePreviewDirect.Size = new System.Drawing.Size(220, 28);
-            this.btnInvokePreviewDirect.Text = "Call Invoke Preview (direct)";
+            this.btnInvokePreviewDirect.Text = "Normal Alter DDL (dirty vs save)";
             this.btnInvokePreviewDirect.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
             this.btnInvokePreviewDirect.BackColor = System.Drawing.Color.FromArgb(255, 220, 180);
             this.btnInvokePreviewDirect.FlatAppearance.BorderColor = clrBorder;
@@ -922,31 +828,42 @@ namespace EliteSoft.Erwin.AddIn
             this.btnInvokePreviewDirect.Click += new System.EventHandler(this.BtnInvokePreviewDirect_Click);
             this.grpDebugLog.Controls.Add(this.btnInvokePreviewDirect);
 
-            // Observer hooks: install once, then user does a normal UI CC flow.
-            this.btnInstallObservers = new System.Windows.Forms.Button();
-            this.btnInstallObservers.Location = new System.Drawing.Point(16, 88);
-            this.btnInstallObservers.Size = new System.Drawing.Size(160, 28);
-            this.btnInstallObservers.Text = "Install MCX Observers";
-            this.btnInstallObservers.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnInstallObservers.BackColor = System.Drawing.Color.FromArgb(220, 220, 255);
-            this.btnInstallObservers.FlatAppearance.BorderColor = clrBorder;
-            this.btnInstallObservers.Font = fontCaption;
-            this.btnInstallObservers.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnInstallObservers.Click += new System.EventHandler(this.BtnInstallObservers_Click);
-            this.grpDebugLog.Controls.Add(this.btnInstallObservers);
+            this.btnDumpCCState = new System.Windows.Forms.Button();
+            this.btnDumpCCState.Location = new System.Drawing.Point(244, 56);
+            this.btnDumpCCState.Size = new System.Drawing.Size(160, 28);
+            this.btnDumpCCState.Text = "Dump CC State";
+            this.btnDumpCCState.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnDumpCCState.BackColor = System.Drawing.Color.FromArgb(255, 225, 180);
+            this.btnDumpCCState.FlatAppearance.BorderColor = clrBorder;
+            this.btnDumpCCState.Font = fontCaption;
+            this.btnDumpCCState.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnDumpCCState.Click += new System.EventHandler(this.BtnDumpCCState_Click);
+            this.grpDebugLog.Controls.Add(this.btnDumpCCState);
 
-            // Faz 2 test: end-to-end silent alter DDL via native bridge.
-            this.btnSilentAlterDdl = new System.Windows.Forms.Button();
-            this.btnSilentAlterDdl.Location = new System.Drawing.Point(580, 56);
-            this.btnSilentAlterDdl.Size = new System.Drawing.Size(170, 28);
-            this.btnSilentAlterDdl.Text = "Silent Alter DDL (F2)";
-            this.btnSilentAlterDdl.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnSilentAlterDdl.BackColor = System.Drawing.Color.FromArgb(255, 230, 200);
-            this.btnSilentAlterDdl.FlatAppearance.BorderColor = clrBorder;
-            this.btnSilentAlterDdl.Font = fontCaption;
-            this.btnSilentAlterDdl.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnSilentAlterDdl.Click += new System.EventHandler(this.BtnSilentAlterDdl_Click);
-            this.grpDebugLog.Controls.Add(this.btnSilentAlterDdl);
+            // Row 3 (y=88): Mart-Mart exploration.
+            this.btnMartMartSpike = new System.Windows.Forms.Button();
+            this.btnMartMartSpike.Location = new System.Drawing.Point(16, 88);
+            this.btnMartMartSpike.Size = new System.Drawing.Size(220, 28);
+            this.btnMartMartSpike.Text = "Mart-Mart DDL Spike (Ctrl+Alt+T)";
+            this.btnMartMartSpike.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnMartMartSpike.BackColor = System.Drawing.Color.FromArgb(200, 230, 255);
+            this.btnMartMartSpike.FlatAppearance.BorderColor = clrBorder;
+            this.btnMartMartSpike.Font = fontCaption;
+            this.btnMartMartSpike.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnMartMartSpike.Click += new System.EventHandler(this.BtnMartMartSpike_Click);
+            this.grpDebugLog.Controls.Add(this.btnMartMartSpike);
+
+            this.btnCallOnFE = new System.Windows.Forms.Button();
+            this.btnCallOnFE.Location = new System.Drawing.Point(244, 88);
+            this.btnCallOnFE.Size = new System.Drawing.Size(220, 28);
+            this.btnCallOnFE.Text = "Mart-Mart via ELA::OnFE";
+            this.btnCallOnFE.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnCallOnFE.BackColor = System.Drawing.Color.FromArgb(160, 210, 255);
+            this.btnCallOnFE.FlatAppearance.BorderColor = clrBorder;
+            this.btnCallOnFE.Font = fontCaption;
+            this.btnCallOnFE.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnCallOnFE.Click += new System.EventHandler(this.BtnCallOnFE_Click);
+            this.grpDebugLog.Controls.Add(this.btnCallOnFE);
 
             this.btnClearLog.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right;
             this.btnClearLog.Location = new System.Drawing.Point(498, 24);
@@ -1133,16 +1050,10 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.TextBox txtDebugLog;
         private System.Windows.Forms.Button btnCopyLog;
         private System.Windows.Forms.Button btnClearLog;
-        private System.Windows.Forms.Button btnCaptureNow;
-        private System.Windows.Forms.Button btnCaptureModelSet;
-        private System.Windows.Forms.Button btnSilentAlterDdl;
-        private System.Windows.Forms.Button btnInstallObservers;
+        private System.Windows.Forms.Button btnDumpCCState;
+        private System.Windows.Forms.Button btnMartMartSpike;
+        private System.Windows.Forms.Button btnCallOnFE;
         private System.Windows.Forms.Button btnInvokePreviewDirect;
-        private System.Windows.Forms.Button btnStandaloneDdl;
-        private System.Windows.Forms.Button btnLiveReMon;
-        private System.Windows.Forms.Button btnTestAlterFE;
-        private System.Windows.Forms.Button btnDumpPropBag;
-        private System.Windows.Forms.Button btnDumpUiaTree;
         private System.Windows.Forms.TextBox txtLogSearch;
         private System.Windows.Forms.Label lblLogSearch;
 

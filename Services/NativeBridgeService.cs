@@ -68,6 +68,37 @@ namespace EliteSoft.Erwin.AddIn.Services
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate IntPtr GetCapturedFEWPageOptionsFn();
 
+        // D1-spike: CC state inspection
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate IntPtr CCInspGetPtrFn();   // shared signature for all 3 getters
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int CCInspCallApplyCCSilentFn(IntPtr leftMs, IntPtr rightMs, int level);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int CCInspArmAsWriteWatchFn();
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate IntPtr CCInspGetTrasactionSummaryFn(uint flags, IntPtr ms);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int CCInspSetGlobalPxAsFn(IntPtr asPtr);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int CCInspCallOnFeFn(IntPtr ms, int boolFlag, uint flags);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate IntPtr CCInspGenerateMartMartDdlViaOnFEFn(IntPtr ms);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int CCInspInstallOnFeHookFn();
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate IntPtr CCInspGetLastOnFeMsFn();
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate IntPtr CCInspGetLastEdrMsFn();
+
         // Cached delegates, populated after Install() succeeds.
         private static GetLastCapturedModelSetFn _getLastCapturedModelSet;
         private static ResetCapturedModelSetFn _resetCapturedModelSet;
@@ -82,6 +113,20 @@ namespace EliteSoft.Erwin.AddIn.Services
         private static CloseHiddenWizardFn _closeHiddenWizard;
         private static GetCapturedFEWPageOptionsFn _getCapturedFEWPO;
         private static IntPtr _hiddenWizardHwnd = IntPtr.Zero;
+
+        // D1-spike: CC state inspection delegates
+        private static CCInspGetPtrFn _ccInspGetFEDataAs;
+        private static CCInspGetPtrFn _ccInspGetFEDataMs;
+        private static CCInspGetPtrFn _ccInspGetELC2As;
+        private static CCInspCallApplyCCSilentFn _ccInspCallApplyCCSilent;
+        private static CCInspArmAsWriteWatchFn _ccInspArmAsWriteWatch;
+        private static CCInspGetTrasactionSummaryFn _ccInspGetTrasactionSummary;
+        private static CCInspSetGlobalPxAsFn _ccInspSetGlobalPxAs;
+        private static CCInspCallOnFeFn _ccInspCallOnFe;
+        private static CCInspGenerateMartMartDdlViaOnFEFn _ccInspGenerateMartMartDdlViaOnFE;
+        private static CCInspInstallOnFeHookFn _ccInspInstallOnFeHook;
+        private static CCInspGetLastOnFeMsFn _ccInspGetLastOnFeMs;
+        private static CCInspGetLastEdrMsFn _ccInspGetLastEdrMs;
 
         /// <summary>
         /// Returns the absolute path where ErwinNativeBridge.dll is expected to live.
@@ -180,6 +225,47 @@ namespace EliteSoft.Erwin.AddIn.Services
                     if (getCapProc != IntPtr.Zero)
                         _getCapturedFEWPO = Marshal.GetDelegateForFunctionPointer<GetCapturedFEWPageOptionsFn>(getCapProc);
 
+                    // D1-spike: CC state inspection
+                    IntPtr ccAs  = GetProcAddress(_bridgeModule, "CCInsp_GetFEDataActionSummary");
+                    IntPtr ccMs  = GetProcAddress(_bridgeModule, "CCInsp_GetFEDataModelSet");
+                    IntPtr ccE2  = GetProcAddress(_bridgeModule, "CCInsp_GetELC2GlobalAs");
+                    if (ccAs != IntPtr.Zero) _ccInspGetFEDataAs = Marshal.GetDelegateForFunctionPointer<CCInspGetPtrFn>(ccAs);
+                    if (ccMs != IntPtr.Zero) _ccInspGetFEDataMs = Marshal.GetDelegateForFunctionPointer<CCInspGetPtrFn>(ccMs);
+                    if (ccE2 != IntPtr.Zero) _ccInspGetELC2As  = Marshal.GetDelegateForFunctionPointer<CCInspGetPtrFn>(ccE2);
+
+                    IntPtr ccSilent = GetProcAddress(_bridgeModule, "CCInsp_CallApplyCCSilent");
+                    if (ccSilent != IntPtr.Zero)
+                        _ccInspCallApplyCCSilent = Marshal.GetDelegateForFunctionPointer<CCInspCallApplyCCSilentFn>(ccSilent);
+
+                    IntPtr ccArm = GetProcAddress(_bridgeModule, "CCInsp_ArmAsWriteWatch");
+                    if (ccArm != IntPtr.Zero)
+                        _ccInspArmAsWriteWatch = Marshal.GetDelegateForFunctionPointer<CCInspArmAsWriteWatchFn>(ccArm);
+
+                    IntPtr ccGTS = GetProcAddress(_bridgeModule, "CCInsp_GetTrasactionSummary");
+                    IntPtr ccSAs = GetProcAddress(_bridgeModule, "CCInsp_SetGlobalPxAs");
+                    if (ccGTS != IntPtr.Zero) _ccInspGetTrasactionSummary = Marshal.GetDelegateForFunctionPointer<CCInspGetTrasactionSummaryFn>(ccGTS);
+                    if (ccSAs != IntPtr.Zero) _ccInspSetGlobalPxAs = Marshal.GetDelegateForFunctionPointer<CCInspSetGlobalPxAsFn>(ccSAs);
+
+                    IntPtr ccOnFe = GetProcAddress(_bridgeModule, "CCInsp_CallOnFE");
+                    if (ccOnFe != IntPtr.Zero)
+                        _ccInspCallOnFe = Marshal.GetDelegateForFunctionPointer<CCInspCallOnFeFn>(ccOnFe);
+
+                    IntPtr ccMMOrch = GetProcAddress(_bridgeModule, "CCInsp_GenerateMartMartDdlViaOnFE");
+                    if (ccMMOrch != IntPtr.Zero)
+                        _ccInspGenerateMartMartDdlViaOnFE = Marshal.GetDelegateForFunctionPointer<CCInspGenerateMartMartDdlViaOnFEFn>(ccMMOrch);
+
+                    IntPtr ccOnFeHk = GetProcAddress(_bridgeModule, "CCInsp_InstallOnFeHook");
+                    if (ccOnFeHk != IntPtr.Zero)
+                        _ccInspInstallOnFeHook = Marshal.GetDelegateForFunctionPointer<CCInspInstallOnFeHookFn>(ccOnFeHk);
+
+                    IntPtr ccGetLastOnFe = GetProcAddress(_bridgeModule, "CCInsp_GetLastOnFeMs");
+                    if (ccGetLastOnFe != IntPtr.Zero)
+                        _ccInspGetLastOnFeMs = Marshal.GetDelegateForFunctionPointer<CCInspGetLastOnFeMsFn>(ccGetLastOnFe);
+
+                    IntPtr ccGetLastEdr = GetProcAddress(_bridgeModule, "CCInsp_GetLastEdrMs");
+                    if (ccGetLastEdr != IntPtr.Zero)
+                        _ccInspGetLastEdrMs = Marshal.GetDelegateForFunctionPointer<CCInspGetLastEdrMsFn>(ccGetLastEdr);
+
                     log?.Invoke($"NativeBridge: capture API bound (get={getProc != IntPtr.Zero}, reset={resetProc != IntPtr.Zero}, gen={genProc != IntPtr.Zero}, free={freeProc != IntPtr.Zero}, obs={obsProc != IntPtr.Zero}, consume={consumeProc != IntPtr.Zero}, clear={clearProc != IntPtr.Zero}, invoke={invokeProc != IntPtr.Zero}).");
                 }
                 return _installed;
@@ -204,6 +290,180 @@ namespace EliteSoft.Erwin.AddIn.Services
         public static void ResetCapturedModelSet()
         {
             _resetCapturedModelSet?.Invoke();
+        }
+
+        /// <summary>
+        /// D1-spike: calls EM_ECC!CWizInterface::ApplyCCSilentMode. Returns the
+        /// int from the engine (or a negative sentinel if the call couldn't
+        /// happen). Caller is expected to DumpCCState() before and after to
+        /// see whether gbl_pxActionSummary gets populated as a side effect.
+        /// </summary>
+        public static int CallApplyCCSilent(IntPtr leftMs, IntPtr rightMs, int level)
+        {
+            if (_ccInspCallApplyCCSilent == null) return -10000;
+            return _ccInspCallApplyCCSilent(leftMs, rightMs, level);
+        }
+
+        /// <summary>
+        /// D1-spike: arm a one-shot write-watch on ELC2's gbl_pxActionSummary.
+        /// Call this right before triggering the action expected to populate
+        /// the global (e.g., clicking 'Right Alter Script' in Resolve Diff).
+        /// Returns 0 on success. Captured writer RIP + stack goes to the
+        /// native bridge log under [AS-WATCH]* tags.
+        /// </summary>
+        public static int ArmAsWriteWatch()
+        {
+            return _ccInspArmAsWriteWatch?.Invoke() ?? -10000;
+        }
+
+        /// <summary>
+        /// D1-spike: call EDRAlterNameCaching::GetTrasactionSummary(flags, ms).
+        /// Returns the AS representing recorded transactions on `ms`. Expected
+        /// to be non-null after user has done a manual CC + Apply-to-Right.
+        /// </summary>
+        public static IntPtr GetTrasactionSummary(uint flags, IntPtr ms)
+        {
+            return _ccInspGetTrasactionSummary?.Invoke(flags, ms) ?? IntPtr.Zero;
+        }
+
+        /// <summary>D1-spike: directly write ELC2!gbl_pxActionSummary.</summary>
+        public static int SetGlobalPxAs(IntPtr asPtr)
+        {
+            return _ccInspSetGlobalPxAs?.Invoke(asPtr) ?? -10000;
+        }
+
+        /// <summary>
+        /// D1-spike: calls ELA::OnFE(ms, false, flags). This is the exact handler
+        /// fired by the 'Right Alter Script' toolbar button in Resolve Differences.
+        /// Internally computes the CC-context AS, writes gbl_pxActionSummary,
+        /// and opens the alter wizard modally.
+        /// </summary>
+        public static int CallOnFE(IntPtr ms, bool flag, uint flags)
+        {
+            return _ccInspCallOnFe?.Invoke(ms, flag ? 1 : 0, flags) ?? -10000;
+        }
+
+        /// <summary>D1-spike: install inline detour on ELA::OnFE to log args
+        /// every time it fires. Lets us discover which flags value the
+        /// 'Right Alter Script' button actually passes.</summary>
+        public static int InstallOnFeHook()
+        {
+            return _ccInspInstallOnFeHook?.Invoke() ?? -10000;
+        }
+
+        /// <summary>
+        /// D1-spike variant: Mart-Mart DDL via direct ELA::OnFE call. No
+        /// keystrokes. OnFE itself opens the alter wizard and writes gbl_pxAs;
+        /// our FEW-CTOR hook + auto-hide + InvokePreview chain then captures
+        /// the DDL and closes the wizard. Prereq: user has done manual
+        /// CC + Apply-to-Right in Resolve Differences.
+        /// </summary>
+        public static string GenerateMartMartDdlViaOnFE(Action<string> log = null)
+        {
+            if (_ccInspGenerateMartMartDdlViaOnFE == null || _freeDdlBuffer == null)
+            {
+                log?.Invoke("GenerateMartMartDdlViaOnFE: native orchestrator export missing.");
+                return null;
+            }
+            // MS selection fallback chain:
+            //   1. EDR hook capture (fires during CC + Apply-to-Right on the RIGHT side)
+            //   2. OnFE hook capture (fires when user clicks 'Right Alter Script')
+            //   3. GA-detour active-PU MS (LEFT side - likely wrong for Mart-Mart)
+            IntPtr edrMs   = _ccInspGetLastEdrMs?.Invoke() ?? IntPtr.Zero;
+            IntPtr onFeMs  = _ccInspGetLastOnFeMs?.Invoke() ?? IntPtr.Zero;
+            IntPtr activeMs = GetLastCapturedModelSet();
+
+            IntPtr ms;
+            string source;
+            if (edrMs != IntPtr.Zero)        { ms = edrMs;    source = "EDR hook (right-side transaction target)"; }
+            else if (onFeMs != IntPtr.Zero)  { ms = onFeMs;   source = "OnFE hook (right-side from manual click)"; }
+            else                              { ms = activeMs; source = "active-PU fallback (LEFT side - result may be empty)"; }
+
+            if (ms == IntPtr.Zero)
+            {
+                log?.Invoke("GenerateMartMartDdlViaOnFE: no MS available.");
+                log?.Invoke("  Do: Complete Compare + Apply-to-Right in Resolve Differences, then retry.");
+                return null;
+            }
+            log?.Invoke($"Using MS = 0x{ms.ToInt64():X} (source: {source})");
+            log?.Invoke("Native orchestrator spawns worker + calls OnFE; bg thread blocks until worker closes wizard.");
+
+            IntPtr buf = IntPtr.Zero;
+            try
+            {
+                buf = _ccInspGenerateMartMartDdlViaOnFE(ms);
+                if (buf == IntPtr.Zero)
+                {
+                    log?.Invoke("Native orchestrator returned null. Check [ONFE-ORCH] / [ONFE-WORKER] / [GA] lines in bridge log.");
+                    return null;
+                }
+                string ddl = Marshal.PtrToStringAnsi(buf);
+                log?.Invoke($"Native orchestrator returned {ddl?.Length ?? 0} chars.");
+                return ddl;
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"GenerateMartMartDdlViaOnFE threw: {ex.GetType().Name}: {ex.Message}");
+                return null;
+            }
+            finally
+            {
+                if (buf != IntPtr.Zero) { try { _freeDdlBuffer(buf); } catch { } }
+            }
+        }
+
+        /// <summary>
+        /// D1-spike end-to-end: after user has done a manual CC + Apply-to-Right
+        /// in the Resolve Differences dialog (but NOT yet clicked Right Alter
+        /// Script), this wires the last mile: pull AS via GetTrasactionSummary,
+        /// write it to gbl_pxAs, open the alter wizard hidden, invoke preview,
+        /// capture DDL, close wizard. Returns the DDL string or null on
+        /// failure.
+        /// </summary>
+        public static string GenerateMartMartDdl(Action<string> log = null)
+        {
+            IntPtr ms = GetLastCapturedModelSet();
+            if (ms == IntPtr.Zero)
+            {
+                log?.Invoke("GenerateMartMartDdl: no captured modelSet. Click 'Generate DDL' once first.");
+                return null;
+            }
+            log?.Invoke($"GenerateMartMartDdl: using captured MS = 0x{ms.ToInt64():X}");
+
+            IntPtr asPtr = GetTrasactionSummary(0, ms);
+            if (asPtr == IntPtr.Zero)
+            {
+                log?.Invoke("GenerateMartMartDdl: GetTrasactionSummary returned null. Did you do CC + Apply-to-Right first?");
+                return null;
+            }
+            log?.Invoke($"GenerateMartMartDdl: AS = 0x{asPtr.ToInt64():X}");
+
+            int sw = SetGlobalPxAs(asPtr);
+            if (sw != 0) { log?.Invoke($"GenerateMartMartDdl: SetGlobalPxAs rc={sw}"); return null; }
+
+            // Now open the alter wizard hidden. WARNING: the Ctrl+Alt+T path
+            // triggers the NORMAL alter script handler which may overwrite
+            // gbl_pxAs with a dirty-vs-save AS. If so, this spike fails and
+            // we need a different invocation method.
+            return GenerateAlterDdl(log);
+        }
+
+        /// <summary>
+        /// D1-spike: snapshot of CC-related global state. Returns a formatted
+        /// multi-line report so the caller can log it directly.
+        /// </summary>
+        public static string DumpCCState()
+        {
+            IntPtr fedAs = _ccInspGetFEDataAs?.Invoke() ?? IntPtr.Zero;
+            IntPtr fedMs = _ccInspGetFEDataMs?.Invoke() ?? IntPtr.Zero;
+            IntPtr elc2As = _ccInspGetELC2As?.Invoke() ?? IntPtr.Zero;
+            IntPtr capMs = GetLastCapturedModelSet();
+            return
+                $"CC state snapshot:\n" +
+                $"  CERwinFEData.ActionSummary = 0x{fedAs.ToInt64():X16}\n" +
+                $"  CERwinFEData.ModelSet      = 0x{fedMs.ToInt64():X16}\n" +
+                $"  EM_ELC2.gbl_pxActionSummary = 0x{elc2As.ToInt64():X16}\n" +
+                $"  GA-detour captured MS      = 0x{capMs.ToInt64():X16}";
         }
 
         /// <summary>

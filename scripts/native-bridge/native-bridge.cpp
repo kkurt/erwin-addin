@@ -223,14 +223,19 @@ static bool InstallInlineHook(void* target, void* hook, void** trampolineOut) {
     BYTE* t = (BYTE*)target;
     LogBytes("[HOOK] target prologue bytes", target, 20);
 
-    if (!PrologueSafe(t, 20)) {
-        LogLine("[HOOK] ABORT: prologue contains relative jump/call (need disassembler).");
-        return false;
-    }
-
+    // Compute the instruction-aligned copy size first (smallest prefix >= 14
+    // bytes). We only need the copied bytes to be free of relative branches;
+    // anything past copyLen stays at the original site and is reached via the
+    // trampoline's terminating jmp. Scanning too far (e.g. the full 20 bytes
+    // of prologue dump) used to false-reject safe detours where a `call
+    // rel32` lives AFTER the copy boundary.
     size_t copyLen = AlignedCopyLen(t, 14);
     if (copyLen == 0) {
         LogLine("[HOOK] ABORT: could not decode prologue to a 14-byte boundary.");
+        return false;
+    }
+    if (!PrologueSafe(t, copyLen)) {
+        LogLine("[HOOK] ABORT: prologue contains relative jump/call within copy window (copyLen=%zu).", copyLen);
         return false;
     }
     LogLine("[HOOK] aligned copy length = %zu bytes", copyLen);
@@ -487,6 +492,10 @@ static const char* kGetScriptSym   = "?GetScript@FEProcessor@@QEAAAEAV?$vector@V
 
 // Forward decl so InstallHook() can call it before its definition further down.
 static void InstallObserverHooks(void);
+static void ResolveCCInspectionSymbols(void);
+extern "C" __declspec(dllexport) int __cdecl CCInsp_StartPoller(void);
+extern "C" __declspec(dllexport) int __cdecl CCInsp_InstallOnFeHook(void);
+extern "C" __declspec(dllexport) int __cdecl CCInsp_InstallEdrHooks(void);
 
 extern "C" __declspec(dllexport) int __cdecl InstallHook(void) {
     LogLine("====== InstallHook() v3 in PID %lu ======", GetCurrentProcessId());
@@ -569,6 +578,9 @@ extern "C" __declspec(dllexport) int __cdecl InstallHook(void) {
     // ctor-wait times out. Install at startup instead of waiting for a manual
     // trigger from the debug panel.
     InstallObserverHooks();
+
+    // ----- D1-spike: resolve CC inspection symbols (no hooks, just addresses)
+    ResolveCCInspectionSymbols();
 
     return 0;
 }
@@ -1709,6 +1721,728 @@ extern "C" __declspec(dllexport) int __cdecl UninstallHook(void) {
     // lifetime. Restoring the original bytes mid-flight risks a race if erwin
     // is currently in GenerateAlterScript. A rebuild/inject cycle is cheap.
     LogLine("UninstallHook: no-op (detour intentionally left armed).");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// D1-spike: CC inspection exports
+// Purpose: observe what CERwinFEData and ELC2 globals contain during a manual
+// Complete Compare flow, to determine whether we can programmatically drive
+// ApplyCCSilentMode + read the resulting ActionSummary + feed it to the
+// GenerateAlterScript path we already intercept.
+// ---------------------------------------------------------------------------
+
+// CERwinFEData static accessors (EM_EOU). No args, return pointer.
+typedef void* (__cdecl* FEData_GetASFn)(void);
+typedef void* (__cdecl* FEData_GetMsFn)(void);
+typedef void  (__cdecl* FEData_SetASFn)(void* as);
+typedef void  (__cdecl* FEData_SetMsFn)(void* ms);
+typedef void  (__cdecl* FEData_ClearFn)(void);
+
+static FEData_GetASFn     g_feDataGetAs    = nullptr;
+static FEData_GetMsFn     g_feDataGetMs    = nullptr;
+static FEData_SetASFn     g_feDataSetAs    = nullptr;
+static FEData_SetMsFn     g_feDataSetMs    = nullptr;
+static FEData_ClearFn     g_feDataClear    = nullptr;
+
+// EM_ELC2 data export — pointer variable's address (dereference to read).
+static void** g_elc2GblAsPtrAddr = nullptr;
+
+// EM_EOU CERwinFEData static member addresses (data exports). Reading these
+// directly is safer than calling the getters from a background thread.
+static void** g_eou_m_xAs        = nullptr;   // m_xActionSummary
+static void** g_eou_m_modelSet   = nullptr;   // m_modelSet
+static void** g_eou_m_pxItem     = nullptr;   // m_pxItem (AS item)
+
+// EM_ECC CWizInterface::ApplyCCSilentMode — 4-arg variant.
+//   int ApplyCCSilentMode(GDMModelSetI* left, GDMModelSetI* right,
+//                         CCCompareLevelType_e level, CString outFile);
+// CString on x64 is a single 8-byte pointer to internal heap data.
+typedef int (__cdecl* ApplyCCSilentFn)(void* left, void* right, int level, void* cstrOut);
+static ApplyCCSilentFn g_applyCCSilent = nullptr;
+
+static const char* kCERwinFED_GetAsSym      = "?GetActionSummary@CERwinFEData@@SAPEAVGDMActionSummary@@XZ";
+static const char* kCERwinFED_GetMsSym      = "?GetModelSet@CERwinFEData@@SAPEAVGDMModelSetI@@XZ";
+static const char* kCERwinFED_SetAsSym      = "?SetActionSummary@CERwinFEData@@SAXPEAVGDMActionSummary@@@Z";
+static const char* kCERwinFED_SetMsSym      = "?SetModelSet@CERwinFEData@@SAXPEAVGDMModelSetI@@@Z";
+static const char* kCERwinFED_ClearSym      = "?ClearERwinFEData@CERwinFEData@@SAXXZ";
+static const char* kELC2_GblAsSym           = "?gbl_pxActionSummary@@3PEAVGDMActionSummary@@EA";
+static const char* kApplyCCSilent4Sym       = "?ApplyCCSilentMode@CWizInterface@@SAHPEAVGDMModelSetI@@0W4CCCompareLevelType_e@@V?$CStringT@DV?$StrTraitMFC_DLL@DV?$ChTraitsCRT@D@ATL@@@@@ATL@@@Z";
+static const char* kEOU_m_xAsSym            = "?m_xActionSummary@CERwinFEData@@0PEAVGDMActionSummary@@EA";
+static const char* kEOU_m_modelSetSym       = "?m_modelSet@CERwinFEData@@0PEAVGDMModelSetI@@EA";
+static const char* kEOU_m_pxItemSym         = "?m_pxItem@CERwinFEData@@0PEAVGDMActionSummaryItem@@EA";
+
+static void ResolveCCInspectionSymbols(void) {
+    HMODULE eou  = GetModuleHandleW(L"EM_EOU.dll");
+    HMODULE elc2 = GetModuleHandleW(L"EM_ELC2.DLL");
+    if (!elc2) elc2 = GetModuleHandleW(L"EM_ELC2.dll");
+    HMODULE ecc  = GetModuleHandleW(L"EM_ECC.dll");
+
+    if (eou) {
+        g_feDataGetAs = (FEData_GetASFn)GetProcAddress(eou, kCERwinFED_GetAsSym);
+        g_feDataGetMs = (FEData_GetMsFn)GetProcAddress(eou, kCERwinFED_GetMsSym);
+        g_feDataSetAs = (FEData_SetASFn)GetProcAddress(eou, kCERwinFED_SetAsSym);
+        g_feDataSetMs = (FEData_SetMsFn)GetProcAddress(eou, kCERwinFED_SetMsSym);
+        g_feDataClear = (FEData_ClearFn)GetProcAddress(eou, kCERwinFED_ClearSym);
+        LogLine("[CC-INSP] EOU getAs=%p getMs=%p setAs=%p setMs=%p clear=%p",
+            (void*)g_feDataGetAs, (void*)g_feDataGetMs,
+            (void*)g_feDataSetAs, (void*)g_feDataSetMs, (void*)g_feDataClear);
+    } else {
+        LogLine("[CC-INSP] EM_EOU.dll not loaded");
+    }
+    if (elc2) {
+        g_elc2GblAsPtrAddr = (void**)GetProcAddress(elc2, kELC2_GblAsSym);
+        LogLine("[CC-INSP] ELC2 gbl_pxActionSummary addr=%p", (void*)g_elc2GblAsPtrAddr);
+    } else {
+        LogLine("[CC-INSP] EM_ELC2.DLL not loaded");
+    }
+    if (eou) {
+        g_eou_m_xAs      = (void**)GetProcAddress(eou, kEOU_m_xAsSym);
+        g_eou_m_modelSet = (void**)GetProcAddress(eou, kEOU_m_modelSetSym);
+        g_eou_m_pxItem   = (void**)GetProcAddress(eou, kEOU_m_pxItemSym);
+        LogLine("[CC-INSP] EOU data addrs: m_xAs=%p m_modelSet=%p m_pxItem=%p",
+            (void*)g_eou_m_xAs, (void*)g_eou_m_modelSet, (void*)g_eou_m_pxItem);
+    }
+    if (ecc) {
+        g_applyCCSilent = (ApplyCCSilentFn)GetProcAddress(ecc, kApplyCCSilent4Sym);
+        LogLine("[CC-INSP] ECC ApplyCCSilentMode(4) addr=%p", (void*)g_applyCCSilent);
+    } else {
+        LogLine("[CC-INSP] EM_ECC.dll not loaded");
+    }
+
+    // Auto-start the CC-state poller so user doesn't need to click anything.
+    // It runs for the entire erwin session and emits one log line per change.
+    CCInsp_StartPoller();
+    LogLine("[CC-INSP] CC-state poller started (100ms interval)");
+
+    // Auto-install the ELA::OnFE detour so we can log every alter-script
+    // entry (whether programmatic or via the 'Right Alter Script' button).
+    int rcHook = CCInsp_InstallOnFeHook();
+    LogLine("[CC-INSP] OnFE hook install rc=%d", rcHook);
+
+    // Auto-install EDR transaction-tracker hooks so we can capture the
+    // RIGHT-side modelSet during CC + Apply-to-Right without requiring
+    // the user to click 'Right Alter Script' manually first.
+    int rcEdr = CCInsp_InstallEdrHooks();
+    LogLine("[CC-INSP] EDR hooks install rc=%d", rcEdr);
+}
+
+// Exported: returns CERwinFEData::GetActionSummary() or null.
+extern "C" __declspec(dllexport) void* __cdecl CCInsp_GetFEDataActionSummary(void) {
+    if (!g_feDataGetAs) return nullptr;
+    __try { return g_feDataGetAs(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[CC-INSP] GetActionSummary SEH"); return nullptr; }
+}
+
+// Exported: returns CERwinFEData::GetModelSet() or null.
+extern "C" __declspec(dllexport) void* __cdecl CCInsp_GetFEDataModelSet(void) {
+    if (!g_feDataGetMs) return nullptr;
+    __try { return g_feDataGetMs(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[CC-INSP] GetModelSet SEH"); return nullptr; }
+}
+
+// Exported: dereferences ELC2's gbl_pxActionSummary and returns the pointer.
+extern "C" __declspec(dllexport) void* __cdecl CCInsp_GetELC2GlobalAs(void) {
+    if (!g_elc2GblAsPtrAddr) return nullptr;
+    __try { return *g_elc2GblAsPtrAddr; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[CC-INSP] read gbl_pxAs SEH"); return nullptr; }
+}
+
+// ---------------------------------------------------------------------------
+// gbl_pxActionSummary write-watch via guard page + vectored exception handler.
+// Purpose: catch the FIRST write to gbl_pxAs and log the writer's RIP + stack
+// so we can identify the function that populates it. Once caught, the guard
+// is removed (one-shot) so normal execution resumes.
+// ---------------------------------------------------------------------------
+static volatile LONG g_asWatchActive = 0;
+static PVOID g_asWatchHandle = nullptr;
+static DWORD g_asWatchOldProt = 0;
+
+static LONG CALLBACK AsWriteWatchVEH(PEXCEPTION_POINTERS ep) {
+    if (!ep || !ep->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+        return EXCEPTION_CONTINUE_SEARCH;
+    // ExceptionInformation[0]=1 means write, [1]=faulting address.
+    if (ep->ExceptionRecord->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+    ULONG_PTR isWrite = ep->ExceptionRecord->ExceptionInformation[0];
+    ULONG_PTR faultAddr = ep->ExceptionRecord->ExceptionInformation[1];
+    if (!g_elc2GblAsPtrAddr) return EXCEPTION_CONTINUE_SEARCH;
+
+    // Is the fault anywhere on our guarded page? If not, it's someone else's AV.
+    ULONG_PTR pageMask = ~((ULONG_PTR)0xFFF);
+    if ((faultAddr & pageMask) != ((ULONG_PTR)g_elc2GblAsPtrAddr & pageMask))
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    bool isOurTarget = (faultAddr == (ULONG_PTR)g_elc2GblAsPtrAddr);
+    void* rip = (void*)ep->ContextRecord->Rip;
+    if (!isOurTarget) {
+        LogLine("[AS-WATCH] collateral AV on watched page: faultAddr=%p (not gbl_pxAs) - disarming",
+            (void*)faultAddr);
+        // Fall through to disarm & continue; we'll miss the real write but avoid deadlock.
+    }
+    if (isOurTarget) {
+        LogLine("[AS-WATCH] HIT isWrite=%lu faultAddr=%p RIP=%p RAX=%p RCX=%p RDX=%p R8=%p R9=%p",
+            (unsigned long)isWrite, (void*)faultAddr, rip,
+            (void*)ep->ContextRecord->Rax, (void*)ep->ContextRecord->Rcx,
+            (void*)ep->ContextRecord->Rdx, (void*)ep->ContextRecord->R8,
+            (void*)ep->ContextRecord->R9);
+        // Dump a short stack using the ContextRecord's RBP chain. x64 compilers
+        // may omit RBP frames in optimized code - best-effort only.
+        ULONG_PTR* rbp = (ULONG_PTR*)ep->ContextRecord->Rbp;
+        for (int i = 0; i < 10 && rbp; ++i) {
+            __try {
+                ULONG_PTR retAddr = rbp[1];
+                LogLine("[AS-WATCH-STK] #%d  retAddr=%p  rbp=%p", i, (void*)retAddr, (void*)rbp);
+                rbp = (ULONG_PTR*)rbp[0];
+                if (!rbp) break;
+            } __except (EXCEPTION_EXECUTE_HANDLER) { break; }
+        }
+        // Also dump RSP-based return addresses (more reliable for x64 /Oy).
+        ULONG_PTR* rsp = (ULONG_PTR*)ep->ContextRecord->Rsp;
+        for (int i = 0; i < 12; ++i) {
+            __try {
+                LogLine("[AS-WATCH-RSP] +0x%02X  val=%p", i*8, (void*)rsp[i]);
+            } __except (EXCEPTION_EXECUTE_HANDLER) { break; }
+        }
+    }
+
+    // Remove protection so the write succeeds and we don't re-fire forever.
+    DWORD prevProt = 0;
+    VirtualProtect(g_elc2GblAsPtrAddr, sizeof(void*), PAGE_READWRITE, &prevProt);
+    InterlockedExchange(&g_asWatchActive, 0);
+    if (g_asWatchHandle) {
+        RemoveVectoredExceptionHandler(g_asWatchHandle);
+        g_asWatchHandle = nullptr;
+    }
+    LogLine("[AS-WATCH] protection removed, VEH uninstalled - resuming write");
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+// Exported: arm the one-shot write-watch on gbl_pxActionSummary. Call this
+// right before you trigger the action that should populate the global.
+extern "C" __declspec(dllexport) int __cdecl CCInsp_ArmAsWriteWatch(void) {
+    if (!g_elc2GblAsPtrAddr) { LogLine("[AS-WATCH] gbl_pxAs addr not resolved"); return -1; }
+    if (InterlockedCompareExchange(&g_asWatchActive, 1, 0) != 0) {
+        LogLine("[AS-WATCH] already armed");
+        return 1;
+    }
+    g_asWatchHandle = AddVectoredExceptionHandler(1 /*first*/, AsWriteWatchVEH);
+    if (!g_asWatchHandle) { LogLine("[AS-WATCH] AddVectoredExceptionHandler failed"); InterlockedExchange(&g_asWatchActive, 0); return -2; }
+    DWORD prev = 0;
+    if (!VirtualProtect(g_elc2GblAsPtrAddr, sizeof(void*), PAGE_READONLY, &prev)) {
+        LogLine("[AS-WATCH] VirtualProtect failed err=0x%lX", GetLastError());
+        RemoveVectoredExceptionHandler(g_asWatchHandle);
+        g_asWatchHandle = nullptr;
+        InterlockedExchange(&g_asWatchActive, 0);
+        return -3;
+    }
+    g_asWatchOldProt = prev;
+    LogLine("[AS-WATCH] armed - gbl_pxAs @ %p now PAGE_READONLY (was 0x%lX)",
+        (void*)g_elc2GblAsPtrAddr, prev);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// CC-state polling thread.
+// Every 100ms reads the 4 pointer-sized globals we care about, and emits a log
+// line whenever any of them changes. Cheap: no calls into erwin code, just
+// naked memory loads from already-exported data addresses.
+// ---------------------------------------------------------------------------
+static volatile LONG g_ccPollerStop = 0;
+static HANDLE g_ccPollerThread = nullptr;
+
+static DWORD WINAPI CCStatePollerProc(LPVOID) {
+    LogLine("[CC-POLL] thread started");
+    void* last_elc2_as = nullptr;
+    void* last_fed_as  = nullptr;
+    void* last_fed_ms  = nullptr;
+    void* last_fed_item = nullptr;
+    void* last_cap_ms  = nullptr;
+
+    // Prime: read once without logging so we only log *changes* after start.
+    __try {
+        if (g_elc2GblAsPtrAddr) last_elc2_as = *g_elc2GblAsPtrAddr;
+        if (g_eou_m_xAs)        last_fed_as  = *g_eou_m_xAs;
+        if (g_eou_m_modelSet)   last_fed_ms  = *g_eou_m_modelSet;
+        if (g_eou_m_pxItem)     last_fed_item = *g_eou_m_pxItem;
+        last_cap_ms = (void*)InterlockedCompareExchange64(&g_lastCapturedModelSet, 0, 0);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+    while (InterlockedCompareExchange(&g_ccPollerStop, 0, 0) == 0) {
+        Sleep(100);
+        void* cur_elc2_as = nullptr;
+        void* cur_fed_as  = nullptr;
+        void* cur_fed_ms  = nullptr;
+        void* cur_fed_item = nullptr;
+        void* cur_cap_ms  = nullptr;
+        __try {
+            if (g_elc2GblAsPtrAddr) cur_elc2_as = *g_elc2GblAsPtrAddr;
+            if (g_eou_m_xAs)        cur_fed_as  = *g_eou_m_xAs;
+            if (g_eou_m_modelSet)   cur_fed_ms  = *g_eou_m_modelSet;
+            if (g_eou_m_pxItem)     cur_fed_item = *g_eou_m_pxItem;
+            cur_cap_ms = (void*)InterlockedCompareExchange64(&g_lastCapturedModelSet, 0, 0);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+
+        if (cur_elc2_as != last_elc2_as) {
+            LogLine("[CC-POLL] ELC2.gbl_pxActionSummary CHANGED %p -> %p", last_elc2_as, cur_elc2_as);
+            last_elc2_as = cur_elc2_as;
+        }
+        if (cur_fed_as != last_fed_as) {
+            LogLine("[CC-POLL] CERwinFEData.m_xActionSummary CHANGED %p -> %p", last_fed_as, cur_fed_as);
+            last_fed_as = cur_fed_as;
+        }
+        if (cur_fed_ms != last_fed_ms) {
+            LogLine("[CC-POLL] CERwinFEData.m_modelSet CHANGED %p -> %p", last_fed_ms, cur_fed_ms);
+            last_fed_ms = cur_fed_ms;
+        }
+        if (cur_fed_item != last_fed_item) {
+            LogLine("[CC-POLL] CERwinFEData.m_pxItem CHANGED %p -> %p", last_fed_item, cur_fed_item);
+            last_fed_item = cur_fed_item;
+        }
+        if (cur_cap_ms != last_cap_ms) {
+            LogLine("[CC-POLL] g_lastCapturedModelSet CHANGED %p -> %p", last_cap_ms, cur_cap_ms);
+            last_cap_ms = cur_cap_ms;
+        }
+    }
+    LogLine("[CC-POLL] thread stopping");
+    return 0;
+}
+
+// Exported: start/stop the CC state poller. Idempotent.
+extern "C" __declspec(dllexport) int __cdecl CCInsp_StartPoller(void) {
+    if (g_ccPollerThread) return 0;   // already running
+    InterlockedExchange(&g_ccPollerStop, 0);
+    g_ccPollerThread = CreateThread(nullptr, 0, CCStatePollerProc, nullptr, 0, nullptr);
+    return g_ccPollerThread ? 0 : -1;
+}
+
+extern "C" __declspec(dllexport) void __cdecl CCInsp_StopPoller(void) {
+    InterlockedExchange(&g_ccPollerStop, 1);
+    if (g_ccPollerThread) {
+        WaitForSingleObject(g_ccPollerThread, 2000);
+        CloseHandle(g_ccPollerThread);
+        g_ccPollerThread = nullptr;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EDRAlterNameCaching::GetTrasactionSummary  (note typo: "Trasaction")
+// Signature: static GDMActionSummary* GetTrasactionSummary(uint flags, GDMModelSetI* ms)
+// This is the function ELA::OnFE (the Right Alter Script handler) calls to
+// obtain the ActionSummary that then gets written to gbl_pxActionSummary.
+// Captured via write-watch at EM_ELA+0xB2256.
+// ---------------------------------------------------------------------------
+typedef void* (__cdecl* GetTrasactionSummaryFn)(unsigned int flags, void* ms);
+static GetTrasactionSummaryFn g_getTrasactionSummary = nullptr;
+
+static const char* kEdrGetTrasactionSummarySym =
+    "?GetTrasactionSummary@EDRAlterNameCaching@@SAPEAVGDMActionSummary@@IPEAVGDMModelSetI@@@Z";
+
+// Exported: call EDRAlterNameCaching::GetTrasactionSummary(flags, ms). The
+// returned pointer is the AS reflecting transactions recorded on `ms` since
+// the last Register() / RegisterStartTransactionId() call. After the user
+// has done a manual CC + Apply-to-Right, this should return the Mart-Mart
+// alter AS.
+extern "C" __declspec(dllexport) void* __cdecl CCInsp_GetTrasactionSummary(
+    unsigned int flags, void* ms)
+{
+    if (!g_getTrasactionSummary) {
+        HMODULE edr = GetModuleHandleW(L"EM_EDR.dll");
+        if (!edr) edr = LoadLibraryW(L"EM_EDR.dll");
+        if (edr) {
+            g_getTrasactionSummary = (GetTrasactionSummaryFn)GetProcAddress(edr, kEdrGetTrasactionSummarySym);
+            LogLine("[CC-INSP] EDR GetTrasactionSummary addr=%p", (void*)g_getTrasactionSummary);
+        }
+    }
+    if (!g_getTrasactionSummary) { LogLine("[CC-INSP] GetTrasactionSummary unresolved"); return nullptr; }
+    if (!ms) { LogLine("[CC-INSP] GetTrasactionSummary: ms is null"); return nullptr; }
+    void* rv = nullptr;
+    __try { rv = g_getTrasactionSummary(flags, ms); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        LogLine("[CC-INSP] GetTrasactionSummary SEH 0x%08lX", GetExceptionCode());
+        return nullptr;
+    }
+    LogLine("[CC-INSP] GetTrasactionSummary(flags=%u, ms=%p) = %p", flags, ms, rv);
+    return rv;
+}
+
+// ---------------------------------------------------------------------------
+// ELA::OnFE - the "Right Alter Script" button handler in Resolve Differences.
+// Signature: Success_e OnFE(GDMModelSetI* ms, bool, unsigned int flags)
+// Internally calls EDRAlterNameCaching::GetTrasactionSummary, writes
+// gbl_pxActionSummary, and opens the Alter Script wizard (modal). Our
+// FEW-CTOR hook + hide + InvokePreview chain then captures the DDL.
+// ---------------------------------------------------------------------------
+typedef int (__cdecl* ElaOnFeFn)(void* ms, bool flag, unsigned int flags);
+static ElaOnFeFn g_elaOnFe = nullptr;
+static ElaOnFeFn g_origElaOnFe = nullptr;   // trampoline after hook install
+// Most-recent GDMModelSetI* passed to ELA::OnFE. Set by every call through
+// our detour, including the user's manual 'Right Alter Script' click. The
+// Mart-Mart orchestrator uses this pointer to pass the RIGHT-side model to
+// OnFE (the side being altered), rather than the LEFT-side pointer we
+// normally capture via FEModel_DDL or GA-detour on the active PU.
+static volatile LONG64 g_lastOnFeMs = 0;
+
+// ---------------------------------------------------------------------------
+// EDRAlterNameCaching transaction-tracker hooks.
+// When the user does Resolve Diff -> Apply-to-Right, erwin records the
+// resulting transactions on the RIGHT modelSet via EDRAlterNameCaching's
+// static helpers. Hooking them captures v1 (the right model) WITHOUT
+// requiring the user to click 'Right Alter Script' once manually first.
+// ---------------------------------------------------------------------------
+typedef void (__cdecl* EdrRegisterFn)(void* ms, bool b);
+typedef void (__cdecl* EdrRegisterStartFn)(void* ms, unsigned int id);
+static EdrRegisterFn g_origEdrRegister = nullptr;
+static EdrRegisterStartFn g_origEdrRegisterStart = nullptr;
+// Last ms seen by either EDR hook (the CC/Apply-to-Right target model).
+static volatile LONG64 g_lastEdrMs = 0;
+
+static const char* kEdrRegisterSym         =
+    "?Register@EDRAlterNameCaching@@SAXPEAVGDMModelSetI@@_N@Z";
+static const char* kEdrRegisterStartSym    =
+    "?RegsiterStartTransactionId@EDRAlterNameCaching@@SAXPEAVGDMModelSetI@@I@Z";
+
+static void __cdecl EdrRegisterHook(void* ms, bool b) {
+    LogLine("[EDR-REG] Register ms=%p bool=%d", ms, (int)b);
+    InterlockedExchange64(&g_lastEdrMs, (LONG64)ms);
+    if (g_origEdrRegister) {
+        __try { g_origEdrRegister(ms, b); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[EDR-REG] trampoline SEH"); }
+    }
+}
+
+static void __cdecl EdrRegisterStartHook(void* ms, unsigned int id) {
+    LogLine("[EDR-REG-START] RegsiterStartTransactionId ms=%p id=%u", ms, id);
+    InterlockedExchange64(&g_lastEdrMs, (LONG64)ms);
+    if (g_origEdrRegisterStart) {
+        __try { g_origEdrRegisterStart(ms, id); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[EDR-REG-START] trampoline SEH"); }
+    }
+}
+
+extern "C" __declspec(dllexport) int __cdecl CCInsp_InstallEdrHooks(void) {
+    HMODULE edr = GetModuleHandleW(L"EM_EDR.dll");
+    if (!edr) edr = LoadLibraryW(L"EM_EDR.dll");
+    if (!edr) return -1;
+
+    void* tgt1 = GetProcAddress(edr, kEdrRegisterSym);
+    if (tgt1 && !g_origEdrRegister) {
+        void* tramp = nullptr;
+        if (InstallInlineHook(tgt1, (void*)&EdrRegisterHook, &tramp)) {
+            g_origEdrRegister = (EdrRegisterFn)tramp;
+            LogLine("[EDR-HOOK] Register installed: target=%p tramp=%p", tgt1, tramp);
+        } else LogLine("[EDR-HOOK] Register install FAILED");
+    }
+    void* tgt2 = GetProcAddress(edr, kEdrRegisterStartSym);
+    if (tgt2 && !g_origEdrRegisterStart) {
+        void* tramp = nullptr;
+        if (InstallInlineHook(tgt2, (void*)&EdrRegisterStartHook, &tramp)) {
+            g_origEdrRegisterStart = (EdrRegisterStartFn)tramp;
+            LogLine("[EDR-HOOK] RegsiterStartTransactionId installed: target=%p tramp=%p", tgt2, tramp);
+        } else LogLine("[EDR-HOOK] RegsiterStartTransactionId install FAILED");
+    }
+    return 0;
+}
+
+extern "C" __declspec(dllexport) void* __cdecl CCInsp_GetLastEdrMs(void) {
+    return (void*)InterlockedCompareExchange64(&g_lastEdrMs, 0, 0);
+}
+
+static const char* kElaOnFeSym =
+    "?OnFE@ELA@@YA?AW4Success_e@@PEAVGDMModelSetI@@_NI@Z";
+
+// Detour hook: log every OnFE call's args. Lets us see what flags value the
+// 'Right Alter Script' button handler actually passes, vs our programmatic
+// call which currently passes 0 (producing full-schema DDL instead of alter).
+static int __cdecl ElaOnFeHook(void* ms, bool flag, unsigned int flags) {
+    LogLine("[ONFE-HOOK] ENTER ms=%p bool=%d flags=%u (0x%X)", ms, (int)flag, flags, flags);
+    // Record the ms so the Mart-Mart orchestrator can later reuse it as
+    // the RIGHT-side model for a programmatic OnFE call.
+    InterlockedExchange64(&g_lastOnFeMs, (LONG64)ms);
+    int rv = -1;
+    if (g_origElaOnFe) {
+        __try { rv = g_origElaOnFe(ms, flag, flags); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[ONFE-HOOK] trampoline SEH 0x%08lX", GetExceptionCode()); }
+    }
+    LogLine("[ONFE-HOOK] EXIT rv=%d", rv);
+    return rv;
+}
+
+// Exported: return the most-recent GDMModelSetI* that was passed to ELA::OnFE
+// (captured by our detour). Null until at least one OnFE call has happened.
+extern "C" __declspec(dllexport) void* __cdecl CCInsp_GetLastOnFeMs(void) {
+    return (void*)InterlockedCompareExchange64(&g_lastOnFeMs, 0, 0);
+}
+
+extern "C" __declspec(dllexport) int __cdecl CCInsp_InstallOnFeHook(void) {
+    HMODULE ela = GetModuleHandleW(L"EM_ELA.dll");
+    if (!ela) ela = LoadLibraryW(L"EM_ELA.dll");
+    if (!ela) return -1;
+    void* target = GetProcAddress(ela, kElaOnFeSym);
+    if (!target) { LogLine("[ONFE-HOOK] OnFE symbol not found"); return -2; }
+    if (g_origElaOnFe) { LogLine("[ONFE-HOOK] already installed"); return 1; }
+    void* tramp = nullptr;
+    if (!InstallInlineHook(target, (void*)&ElaOnFeHook, &tramp)) {
+        LogLine("[ONFE-HOOK] InstallInlineHook failed");
+        return -3;
+    }
+    g_origElaOnFe = (ElaOnFeFn)tramp;
+    // Replace g_elaOnFe with the trampoline so our own CallOnFE paths
+    // bypass the hook (avoid infinite recursion).
+    g_elaOnFe = (ElaOnFeFn)tramp;
+    LogLine("[ONFE-HOOK] installed: target=%p tramp=%p", target, tramp);
+    return 0;
+}
+
+extern "C" __declspec(dllexport) int __cdecl CCInsp_CallOnFE(
+    void* ms, int boolFlag, unsigned int flags)
+{
+    if (!g_elaOnFe) {
+        HMODULE ela = GetModuleHandleW(L"EM_ELA.dll");
+        if (!ela) ela = LoadLibraryW(L"EM_ELA.dll");
+        if (ela) {
+            g_elaOnFe = (ElaOnFeFn)GetProcAddress(ela, kElaOnFeSym);
+            LogLine("[CC-INSP] ELA OnFE addr=%p", (void*)g_elaOnFe);
+        }
+    }
+    if (!g_elaOnFe) { LogLine("[CC-INSP] ELA::OnFE unresolved"); return -9998; }
+    if (!ms) { LogLine("[CC-INSP] ELA::OnFE: ms is null"); return -9997; }
+    LogLine("[CC-INSP] ELA::OnFE(ms=%p, bool=%d, flags=%u) ENTER", ms, boolFlag, flags);
+    int rv = -9999;
+    __try { rv = g_elaOnFe(ms, boolFlag != 0, flags); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        LogLine("[CC-INSP] ELA::OnFE SEH 0x%08lX", GetExceptionCode());
+        return -9996;
+    }
+    LogLine("[CC-INSP] ELA::OnFE EXIT rv=%d", rv);
+    return rv;
+}
+
+// Worker thread context for the OnFE+InvokePreview orchestration.
+struct OnFeWorkerCtx {
+    HWND mainHwnd;
+};
+
+// SEH-guarded helper so OnFeWorkerProc (which uses C++ destructors/new/delete)
+// can still call the unsafe Invoke without tripping C2712.
+static void InvokePreviewSeh(void* fewpo) {
+    __try {
+        typedef void (__cdecl* InvokeSingleArgFn)(void* self);
+        ((InvokeSingleArgFn)g_directInvokePreview)(fewpo);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        LogLine("[ONFE-WORKER] Invoke post-return SEH 0x%08lX (ignored, DDL already captured)", GetExceptionCode());
+    }
+}
+
+// Similar SEH-guarded helper for OnFE itself.
+static int CallOnFeSeh(ElaOnFeFn fn, void* ms, bool b, unsigned int f) {
+    __try { return fn(ms, b, f); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        LogLine("[ONFE-ORCH] OnFE SEH 0x%08lX", GetExceptionCode());
+        return -1;
+    }
+}
+
+static DWORD WINAPI OnFeWorkerProc(LPVOID lp) {
+    OnFeWorkerCtx* ctx = (OnFeWorkerCtx*)lp;
+    LogLine("[ONFE-WORKER] started");
+
+    // Phase 1: wait for FEWPageOptions ctor to fire (signals wizard opened).
+    DWORD start = GetTickCount();
+    void* fewpo = nullptr;
+    while (GetTickCount() - start < 15000) {
+        fewpo = (void*)InterlockedCompareExchange64(&g_capturedFEWPO, 0, 0);
+        if (fewpo) break;
+        Sleep(20);
+    }
+    if (!fewpo) {
+        LogLine("[ONFE-WORKER] timeout - FEW-CTOR never fired");
+        delete ctx;
+        return 1;
+    }
+    LogLine("[ONFE-WORKER] FEWPO captured = %p", fewpo);
+
+    // Phase 2: give the wizard a moment to finish init (FEWPagePreviewEx ctor,
+    // OnInitDialog, gbl_pxAs write). 100ms is generous.
+    Sleep(100);
+
+    // Phase 3: call InvokePreviewStringOnlyCommand on captured FEWPO. This
+    // internally drives the CC-context Preview, calls GenerateAlterScript,
+    // our GA detour captures the DDL into g_lastCapturedDdl.
+    if (!g_directInvokePreview) {
+        LogLine("[ONFE-WORKER] g_directInvokePreview not resolved");
+        delete ctx;
+        return 2;
+    }
+    LogLine("[ONFE-WORKER] calling Invoke on FEWPO=%p", fewpo);
+    InvokePreviewSeh(fewpo);
+    LogLine("[ONFE-WORKER] Invoke returned");
+
+    // Phase 4: close the wizard so OnFE returns. Enumerate top-level windows
+    // belonging to erwin, find the Alter Script wizard, send WM_COMMAND IDCANCEL.
+    auto dialogs = EnumerateVisibleDialogs();
+    for (HWND h : dialogs) {
+        if (LooksLikeAlterScriptWizard(h)) {
+            LogLine("[ONFE-WORKER] posting IDCANCEL to wizard hwnd=%p", h);
+            PostMessage(h, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
+            PostMessage(h, WM_CLOSE, 0, 0);
+        }
+    }
+    LogLine("[ONFE-WORKER] done");
+    delete ctx;
+    return 0;
+}
+
+// Orchestrated Mart-Mart DDL via ELA::OnFE.
+// Arms FEW-CTOR watcher in a worker thread, calls OnFE (blocks on modal on
+// this thread), worker drives wizard to Preview and closes it, OnFE returns,
+// we return whatever DDL was captured.
+extern "C" __declspec(dllexport) const char* __cdecl CCInsp_GenerateMartMartDdlViaOnFE(void* ms) {
+    // Prefer the MS captured from a prior OnFE call (the RIGHT-side model)
+    // over whatever the caller passed (usually the LEFT-side active PU MS).
+    void* onFeMs = (void*)InterlockedCompareExchange64(&g_lastOnFeMs, 0, 0);
+    if (onFeMs) {
+        LogLine("[ONFE-ORCH] using captured g_lastOnFeMs=%p (overrides caller ms=%p)", onFeMs, ms);
+        ms = onFeMs;
+    }
+    if (!ms) { LogLine("[ONFE-ORCH] ms is null (no g_lastOnFeMs and caller passed null)"); return nullptr; }
+    if (!g_elaOnFe) {
+        HMODULE ela = GetModuleHandleW(L"EM_ELA.dll");
+        if (!ela) ela = LoadLibraryW(L"EM_ELA.dll");
+        if (ela) g_elaOnFe = (ElaOnFeFn)GetProcAddress(ela, kElaOnFeSym);
+    }
+    if (!g_elaOnFe) { LogLine("[ONFE-ORCH] OnFE unresolved"); return nullptr; }
+    if (!g_directInvokePreview) { LogLine("[ONFE-ORCH] InvokePreview unresolved"); return nullptr; }
+
+    HWND mainHwnd = FindErwinMain();
+    LogLine("[ONFE-ORCH] starting - erwin main=%p ms=%p", (void*)mainHwnd, ms);
+
+    // Reset state so the worker sees a fresh ctor fire.
+    InterlockedExchange64(&g_capturedFEWPO, 0);
+    InterlockedExchange64(&g_capturedFEWPreviewEx, 0);
+    InterlockedExchange(&g_autoOpenCtorFired, 0);
+    ClearCapturedDdl();   // drop any prior DDL
+
+    // Install WinEvent hook so the wizard window is hidden as soon as it's
+    // created (flash-free, same mechanism as OpenAlterScriptWizardHidden).
+    InterlockedExchange64(&g_hiddenWizardHwnd, 0);
+    HWINEVENTHOOK evHook = SetWinEventHook(
+        EVENT_OBJECT_CREATE, EVENT_OBJECT_NAMECHANGE,
+        nullptr, WizardWinEventCb,
+        GetCurrentProcessId(), 0,
+        WINEVENT_OUTOFCONTEXT);
+    LogLine("[ONFE-ORCH] WinEvent hook = %p", (void*)evHook);
+
+    // Spawn worker BEFORE OnFE so it's ready when ctor fires.
+    OnFeWorkerCtx* ctx = new OnFeWorkerCtx{ mainHwnd };
+    HANDLE worker = CreateThread(nullptr, 0, OnFeWorkerProc, ctx, 0, nullptr);
+    if (!worker) {
+        LogLine("[ONFE-ORCH] CreateThread failed");
+        if (evHook) UnhookWinEvent(evHook);
+        delete ctx;
+        return nullptr;
+    }
+
+    // Call OnFE. This blocks on CPropertySheet::DoModal until the worker
+    // closes the wizard via IDCANCEL.
+    // Manual 'Right Alter Script' button calls OnFE(ms, true, 0x13). These
+    // args were captured via our ElaOnFeHook. With (false, 0) the flags
+    // fallback kicks in and the wizard builds a full-schema CREATE DDL
+    // instead of the alter/diff DDL we want.
+    const unsigned int kAlterFlags = 0x13;
+    const bool kAlterBool = true;
+    LogLine("[ONFE-ORCH] calling ELA::OnFE(ms=%p, true, 0x13) - will block until worker closes wizard", ms);
+    int rv = CallOnFeSeh(g_elaOnFe, ms, kAlterBool, kAlterFlags);
+    LogLine("[ONFE-ORCH] OnFE returned rv=%d", rv);
+
+    // Wait briefly for worker to finish cleanup.
+    WaitForSingleObject(worker, 2000);
+    CloseHandle(worker);
+    if (evHook) UnhookWinEvent(evHook);
+
+    // Read captured DDL. Returns heap-allocated UTF-8 string; caller must
+    // free via FreeDdlBuffer.
+    return (const char*)ConsumeLastCapturedDdl();
+}
+
+// Exported: write to ELC2!gbl_pxActionSummary. Use this immediately before
+// invoking the Alter Script wizard (hidden or otherwise) so the wizard
+// consumes our chosen AS instead of whatever the native flow would compute.
+extern "C" __declspec(dllexport) int __cdecl CCInsp_SetGlobalPxAs(void* as) {
+    if (!g_elc2GblAsPtrAddr) { LogLine("[CC-INSP] gbl_pxAs addr not resolved"); return -1; }
+    DWORD oldProt = 0;
+    if (!VirtualProtect(g_elc2GblAsPtrAddr, sizeof(void*), PAGE_READWRITE, &oldProt)) {
+        LogLine("[CC-INSP] VirtualProtect for SetGlobalPxAs failed err=0x%lX", GetLastError());
+        return -2;
+    }
+    __try { *g_elc2GblAsPtrAddr = as; }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        VirtualProtect(g_elc2GblAsPtrAddr, sizeof(void*), oldProt, &oldProt);
+        LogLine("[CC-INSP] SetGlobalPxAs SEH");
+        return -3;
+    }
+    VirtualProtect(g_elc2GblAsPtrAddr, sizeof(void*), oldProt, &oldProt);
+    LogLine("[CC-INSP] gbl_pxActionSummary = %p (written)", as);
+    return 0;
+}
+
+// Exported: calls CWizInterface::ApplyCCSilentMode(leftMs, rightMs, level, cstr)
+// with a throwaway empty CString for the output file. Returns the function's
+// int return value, or -9999 on SEH. Caller pre-dumps globals, we dump again.
+// Identity-compare test: passing left==right tests whether the call path is
+// viable without requiring us to own a second Mart PU's GDMModelSetI*.
+extern "C" __declspec(dllexport) int __cdecl CCInsp_CallApplyCCSilent(
+    void* leftMs, void* rightMs, int level)
+{
+    if (!g_applyCCSilent) {
+        LogLine("[CC-SILENT] ApplyCCSilentMode symbol not resolved");
+        return -9998;
+    }
+    if (!leftMs || !rightMs) {
+        LogLine("[CC-SILENT] left or right ms is null");
+        return -9997;
+    }
+    // MFC CStringT x64 layout: single pointer to a heap-allocated header +
+    // char data. An empty string in MFC can be represented by a pointer to
+    // the special "empty string" internal sentinel — but we don't have that.
+    // Safer: construct a local buffer that looks like CString for "", which
+    // is actually just a 16-bit NUL on the heap with ref-count -1. Too
+    // fragile. Instead we pass the address of a 16-byte zeroed buffer — if
+    // ApplyCCSilentMode reads the CString's internal pointer and dereferences
+    // it, it'll find a NUL char. Worst case: SEH, which we catch.
+    char emptyCStringSlot[16] = {0};
+    // The typical CString x64 layout: emptyCStringSlot[0] is a ptr-to-data.
+    // We want that ptr to point at a NUL byte. Set it to a static NUL.
+    static const char kEmptyChar = '\0';
+    *(const char**)emptyCStringSlot = &kEmptyChar;
+
+    LogLine("[CC-SILENT] ENTER leftMs=%p rightMs=%p level=%d", leftMs, rightMs, level);
+    int rv = -9999;
+    __try { rv = g_applyCCSilent(leftMs, rightMs, level, (void*)emptyCStringSlot); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        LogLine("[CC-SILENT] SEH 0x%08lX during call", GetExceptionCode());
+        return -9996;
+    }
+    LogLine("[CC-SILENT] EXIT rv=%d", rv);
+    return rv;
+}
+
+// Exported: dumps all three CC-state globals to the bridge log + returns a
+// composite snapshot in a caller-allocated 96-byte buffer (three 8-byte
+// pointers: [0]=FED.AS, [1]=FED.MS, [2]=ELC2.gbl_pxAs; rest zero).
+extern "C" __declspec(dllexport) int __cdecl CCInsp_SnapshotState(void* outBuf) {
+    if (!outBuf) return -1;
+    void* fedAs = CCInsp_GetFEDataActionSummary();
+    void* fedMs = CCInsp_GetFEDataModelSet();
+    void* elc2As = CCInsp_GetELC2GlobalAs();
+    void* capMs = (void*)InterlockedCompareExchange64(&g_lastCapturedModelSet, 0, 0);
+    LogLine("[CC-INSP-SNAP] CERwinFEData.AS=%p CERwinFEData.MS=%p ELC2.gbl_pxAs=%p GA.capturedMs=%p",
+        fedAs, fedMs, elc2As, capMs);
+    void** out = (void**)outBuf;
+    out[0] = fedAs;
+    out[1] = fedMs;
+    out[2] = elc2As;
+    out[3] = capMs;
     return 0;
 }
 
