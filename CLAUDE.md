@@ -71,3 +71,5 @@ Hiçbir yerde emdash kullanma! Scriptlerde ve dökümantasyonda!
 
 Her zaman benim söylediğim doğru olmayabilir, yanlış analiz etmiş olabilirim.
 Söylediklerimi sorgula, ayrıca senin de çözüm için bulduğun  mantıklarını  da sorgula. Bunları unutma!
+
+Çalışan kodu, tam kanıtlanana kadar temizleme, ilgili yere implemente edince gerekirse sorarak temizle!

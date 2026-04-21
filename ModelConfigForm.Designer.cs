@@ -785,6 +785,7 @@ namespace EliteSoft.Erwin.AddIn
             this.rtbDDLOutput.Size = new System.Drawing.Size(832, 300);
             this.rtbDDLOutput.ReadOnly = true;
             this.rtbDDLOutput.WordWrap = false;
+            this.rtbDDLOutput.ScrollBars = System.Windows.Forms.RichTextBoxScrollBars.Both;
             this.rtbDDLOutput.Font = new System.Drawing.Font("Consolas", 9.5f);
             this.rtbDDLOutput.BackColor = System.Drawing.Color.FromArgb(30, 30, 30);
             this.rtbDDLOutput.ForeColor = System.Drawing.Color.FromArgb(212, 212, 212);
@@ -852,6 +853,66 @@ namespace EliteSoft.Erwin.AddIn
             this.btnMartMartSpike.Cursor = System.Windows.Forms.Cursors.Hand;
             this.btnMartMartSpike.Click += new System.EventHandler(this.BtnMartMartSpike_Click);
             this.grpDebugLog.Controls.Add(this.btnMartMartSpike);
+
+            this.btnMMDiscovery = new System.Windows.Forms.Button();
+            this.btnMMDiscovery.Location = new System.Drawing.Point(16, 184);
+            this.btnMMDiscovery.Size = new System.Drawing.Size(420, 28);
+            this.btnMMDiscovery.Text = "Mart-Mart Auto Discovery (drive CC + dump RD UIA)";
+            this.btnMMDiscovery.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnMMDiscovery.BackColor = System.Drawing.Color.FromArgb(200, 255, 240);
+            this.btnMMDiscovery.FlatAppearance.BorderColor = clrBorder;
+            this.btnMMDiscovery.Font = fontCaption;
+            this.btnMMDiscovery.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnMMDiscovery.Click += new System.EventHandler(this.BtnMMDiscovery_Click);
+            this.grpDebugLog.Controls.Add(this.btnMMDiscovery);
+
+            this.btnToggleEdrST = new System.Windows.Forms.Button();
+            this.btnToggleEdrST.Location = new System.Drawing.Point(244, 152);
+            this.btnToggleEdrST.Size = new System.Drawing.Size(200, 28);
+            this.btnToggleEdrST.Text = "Toggle EDR stack-trace";
+            this.btnToggleEdrST.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnToggleEdrST.BackColor = System.Drawing.Color.FromArgb(245, 245, 200);
+            this.btnToggleEdrST.FlatAppearance.BorderColor = clrBorder;
+            this.btnToggleEdrST.Font = fontCaption;
+            this.btnToggleEdrST.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnToggleEdrST.Click += new System.EventHandler(this.BtnToggleEdrST_Click);
+            this.grpDebugLog.Controls.Add(this.btnToggleEdrST);
+
+            this.btnCaptureApplyStack = new System.Windows.Forms.Button();
+            this.btnCaptureApplyStack.Location = new System.Drawing.Point(16, 216);
+            this.btnCaptureApplyStack.Size = new System.Drawing.Size(420, 28);
+            this.btnCaptureApplyStack.Text = "Diag: Capture Apply-to-Right stack (click arrow manually)";
+            this.btnCaptureApplyStack.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnCaptureApplyStack.BackColor = System.Drawing.Color.FromArgb(255, 230, 200);
+            this.btnCaptureApplyStack.FlatAppearance.BorderColor = clrBorder;
+            this.btnCaptureApplyStack.Font = fontCaption;
+            this.btnCaptureApplyStack.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnCaptureApplyStack.Click += new System.EventHandler(this.BtnCaptureApplyStack_Click);
+            this.grpDebugLog.Controls.Add(this.btnCaptureApplyStack);
+
+            this.btnSpikeShowCCWiz = new System.Windows.Forms.Button();
+            this.btnSpikeShowCCWiz.Location = new System.Drawing.Point(16, 152);
+            this.btnSpikeShowCCWiz.Size = new System.Drawing.Size(220, 28);
+            this.btnSpikeShowCCWiz.Text = "Spike: ShowERwinCCWiz(v3, v1)";
+            this.btnSpikeShowCCWiz.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnSpikeShowCCWiz.BackColor = System.Drawing.Color.FromArgb(255, 200, 220);
+            this.btnSpikeShowCCWiz.FlatAppearance.BorderColor = clrBorder;
+            this.btnSpikeShowCCWiz.Font = fontCaption;
+            this.btnSpikeShowCCWiz.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnSpikeShowCCWiz.Click += new System.EventHandler(this.BtnSpikeShowCCWiz_Click);
+            this.grpDebugLog.Controls.Add(this.btnSpikeShowCCWiz);
+
+            this.btnSpikeOpenMartV1 = new System.Windows.Forms.Button();
+            this.btnSpikeOpenMartV1.Location = new System.Drawing.Point(16, 120);
+            this.btnSpikeOpenMartV1.Size = new System.Drawing.Size(220, 28);
+            this.btnSpikeOpenMartV1.Text = "Spike: Open Mart v1 PU";
+            this.btnSpikeOpenMartV1.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnSpikeOpenMartV1.BackColor = System.Drawing.Color.FromArgb(210, 255, 200);
+            this.btnSpikeOpenMartV1.FlatAppearance.BorderColor = clrBorder;
+            this.btnSpikeOpenMartV1.Font = fontCaption;
+            this.btnSpikeOpenMartV1.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnSpikeOpenMartV1.Click += new System.EventHandler(this.BtnSpikeOpenMartV1_Click);
+            this.grpDebugLog.Controls.Add(this.btnSpikeOpenMartV1);
 
             this.btnCallOnFE = new System.Windows.Forms.Button();
             this.btnCallOnFE.Location = new System.Drawing.Point(244, 88);
@@ -1053,6 +1114,12 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.Button btnDumpCCState;
         private System.Windows.Forms.Button btnMartMartSpike;
         private System.Windows.Forms.Button btnCallOnFE;
+        private System.Windows.Forms.Button btnSpikeOpenMartV1;
+        private System.Windows.Forms.Button btnSpikeShowCCWiz;
+        private System.Windows.Forms.Button btnToggleEdrST;
+        private System.Windows.Forms.Button btnMMDiscovery;
+        private System.Windows.Forms.Button btnCaptureApplyStack;
+        private bool _edrStOn = false;
         private System.Windows.Forms.Button btnInvokePreviewDirect;
         private System.Windows.Forms.TextBox txtLogSearch;
         private System.Windows.Forms.Label lblLogSearch;

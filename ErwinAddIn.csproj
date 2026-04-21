@@ -33,6 +33,11 @@
       <HintPath>References\EAL.dll</HintPath>
       <Private>True</Private>
     </Reference>
+    <!-- UI Automation: used by MartMartAutomation for DPI/resolution-safe
+         element invocation. UseWPF=true already bundles these into the
+         Microsoft.WindowsDesktop.App framework - no explicit Reference
+         needed; System.Windows.Automation types resolve from WPF. -->
+
   </ItemGroup>
 
   <ItemGroup>

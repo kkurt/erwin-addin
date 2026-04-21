@@ -198,6 +198,29 @@ static size_t InstrLen_x64(const BYTE* p) {
         case 0x58: case 0x59: case 0x5A: case 0x5B:
         case 0x5C: case 0x5D: case 0x5E: case 0x5F:
             return 1;
+        // Two-byte opcodes starting with 0x0F.
+        case 0x0F: {
+            BYTE b1 = p[1];
+            switch (b1) {
+                // MOVZX r32/64, r/m8   (0F B6 /r)
+                // MOVZX r32/64, r/m16  (0F B7 /r)
+                // MOVSX r32/64, r/m8   (0F BE /r)
+                // MOVSX r32/64, r/m16  (0F BF /r)
+                case 0xB6: case 0xB7: case 0xBE: case 0xBF: {
+                    BYTE modrm = p[2];
+                    BYTE mod = modrm >> 6;
+                    BYTE rm  = modrm & 7;
+                    size_t sz = 3; // 0F + opcode + modrm
+                    if (mod != 3 && rm == 4) sz += 1;
+                    if (mod == 1) sz += 1;
+                    else if (mod == 2) sz += 4;
+                    else if (mod == 0 && rm == 5) return 0;  // RIP-relative
+                    return sz;
+                }
+                default:
+                    return 0;
+            }
+        }
         default:
             return 0;   // unknown - caller aborts
     }
@@ -496,6 +519,7 @@ static void ResolveCCInspectionSymbols(void);
 extern "C" __declspec(dllexport) int __cdecl CCInsp_StartPoller(void);
 extern "C" __declspec(dllexport) int __cdecl CCInsp_InstallOnFeHook(void);
 extern "C" __declspec(dllexport) int __cdecl CCInsp_InstallEdrHooks(void);
+static void InstallEccPipelineHooks(void);
 
 extern "C" __declspec(dllexport) int __cdecl InstallHook(void) {
     LogLine("====== InstallHook() v3 in PID %lu ======", GetCurrentProcessId());
@@ -938,10 +962,12 @@ static bool __cdecl EccExecASHook(void* self, void* as, void* obj, void* obj2, i
     return rv;
 }
 
-// Emit top-N caller frames (module+RVA) — for pinpointing AS builder.
+// Emit top-N caller frames (module+RVA) - for pinpointing AS builder.
+// Increased from 10 to 30 frames so dispatcher/WndProc call chains are
+// visible above the low-level GDM/EDR frames.
 static void LogStack(const char* tag) {
-    void* frames[10];
-    USHORT captured = CaptureStackBackTrace(0, 10, frames, nullptr);
+    void* frames[30];
+    USHORT captured = CaptureStackBackTrace(0, 30, frames, nullptr);
     for (USHORT i = 0; i < captured; i++) {
         HMODULE h = nullptr;
         if (GetModuleHandleExW(
@@ -1825,6 +1851,10 @@ static void ResolveCCInspectionSymbols(void) {
     // the user to click 'Right Alter Script' manually first.
     int rcEdr = CCInsp_InstallEdrHooks();
     LogLine("[CC-INSP] EDR hooks install rc=%d", rcEdr);
+
+    // Auto-install CC pipeline hooks in EM_ECC to observe which CWizInterface
+    // entry point the Complete Compare + Apply-to-Right flow actually uses.
+    InstallEccPipelineHooks();
 }
 
 // Exported: returns CERwinFEData::GetActionSummary() or null.
@@ -2096,6 +2126,38 @@ static EdrRegisterFn g_origEdrRegister = nullptr;
 static EdrRegisterStartFn g_origEdrRegisterStart = nullptr;
 // Last ms seen by either EDR hook (the CC/Apply-to-Right target model).
 static volatile LONG64 g_lastEdrMs = 0;
+// Counter of RegsiterStartTransactionId invocations. Used by managed code
+// to wait for the Apply-to-Right deferred XTP cascade to finish firing
+// transactions before calling OnFE (which empties the ActionSummary if
+// called too early).
+static volatile LONG g_edrTxCount = 0;
+// Chronological list of distinct ms pointers seen by our various hooks.
+// Used by the Mart-Mart spike to identify v3 (first/left) and v1 (second/right).
+// Simple fixed-size; we don't expect more than a few MSs per session.
+static const size_t kMaxSeenMs = 16;
+static volatile LONG64 g_seenMs[kMaxSeenMs] = { 0 };
+static volatile LONG g_seenMsCount = 0;
+static CRITICAL_SECTION g_seenMsLock;
+static LONG g_seenMsLockInit = 0;
+
+static void TrackMsSeen(void* ms) {
+    if (!ms) return;
+    if (InterlockedCompareExchange(&g_seenMsLockInit, 1, 0) == 0) {
+        InitializeCriticalSection(&g_seenMsLock);
+    }
+    EnterCriticalSection(&g_seenMsLock);
+    LONG n = g_seenMsCount;
+    bool found = false;
+    for (LONG i = 0; i < n; ++i) {
+        if ((LONG64)ms == g_seenMs[i]) { found = true; break; }
+    }
+    if (!found && n < (LONG)kMaxSeenMs) {
+        g_seenMs[n] = (LONG64)ms;
+        g_seenMsCount = n + 1;
+        LogLine("[MS-TRACK] new ms[%ld] = %p", n, ms);
+    }
+    LeaveCriticalSection(&g_seenMsLock);
+}
 
 static const char* kEdrRegisterSym         =
     "?Register@EDRAlterNameCaching@@SAXPEAVGDMModelSetI@@_N@Z";
@@ -2105,19 +2167,191 @@ static const char* kEdrRegisterStartSym    =
 static void __cdecl EdrRegisterHook(void* ms, bool b) {
     LogLine("[EDR-REG] Register ms=%p bool=%d", ms, (int)b);
     InterlockedExchange64(&g_lastEdrMs, (LONG64)ms);
+    TrackMsSeen(ms);
     if (g_origEdrRegister) {
         __try { g_origEdrRegister(ms, b); }
         __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[EDR-REG] trampoline SEH"); }
     }
 }
 
+// When true, the EDR hook dumps its call stack every time it fires. Used to
+// identify which ELC2 internal function triggers Apply-to-Right transactions.
+static volatile LONG g_edrStackTrace = 0;
+
 static void __cdecl EdrRegisterStartHook(void* ms, unsigned int id) {
     LogLine("[EDR-REG-START] RegsiterStartTransactionId ms=%p id=%u", ms, id);
     InterlockedExchange64(&g_lastEdrMs, (LONG64)ms);
+    InterlockedIncrement(&g_edrTxCount);
+    TrackMsSeen(ms);
+    if (InterlockedCompareExchange(&g_edrStackTrace, 0, 0) != 0) {
+        LogStack("[EDR-REG-START-STK]");
+    }
     if (g_origEdrRegisterStart) {
         __try { g_origEdrRegisterStart(ms, id); }
         __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[EDR-REG-START] trampoline SEH"); }
     }
+}
+
+// ---------------------------------------------------------------------------
+// CC pipeline hooks in EM_ECC - discover which CWizInterface entry point
+// the Complete Compare + Apply-to-Right flow actually uses.
+// ---------------------------------------------------------------------------
+typedef int (__cdecl* EccWiz2MsBoolFn)(void* ms1, void* ms2, bool b1, bool b2, const void* cstr);
+typedef int (__cdecl* EccWiz2MsFn)(void* ms1, void* ms2);
+static EccWiz2MsBoolFn g_origShowERwinCCWiz   = nullptr;
+static EccWiz2MsFn     g_origShowConflictRes  = nullptr;
+static EccWiz2MsFn     g_origVSDBInteractive  = nullptr;
+static EccWiz2MsFn     g_origVSDBSilentUpdate = nullptr;
+
+// Captured CString pointer from a prior real ShowERwinCCWiz call. MFC CString
+// is passed as a hidden-pointer arg; the pointed-to 8 bytes hold m_pszData
+// (points to heap-allocated char buffer prefixed by a CStringData header).
+// By grabbing this pointer we can re-use a valid CString for programmatic
+// invocation without constructing MFC internals from scratch.
+static volatile LONG64 g_capturedCStrPtr = 0;
+// MFC's static empty-CString data pointer (lives in mfc140.dll; always valid).
+// Captured from ShowERwinCCWiz hook when cstr.data points at the sentinel.
+static volatile LONG64 g_mfcEmptyCStrData = 0;
+
+static int __cdecl ShowERwinCCWizHook(void* ms1, void* ms2, bool b1, bool b2, const void* cstr) {
+    LogLine("[CC-PIPE] ShowERwinCCWiz ENTER ms1=%p ms2=%p b1=%d b2=%d cstr=%p", ms1, ms2, (int)b1, (int)b2, cstr);
+    if (cstr) {
+        __try {
+            const char* data = *(const char**)cstr;
+            LogLine("[CC-PIPE] cstr->data=%p '%.64s'", data, data ? data : "(null)");
+            // Save the inner data pointer. If it's empty, it's probably the
+            // MFC static sentinel at an mfc140.dll address (always valid).
+            if (data && data[0] == '\0') {
+                InterlockedExchange64(&g_mfcEmptyCStrData, (LONG64)data);
+                LogLine("[CC-PIPE] captured MFC empty-CString sentinel @ %p", data);
+            }
+            if (data) {
+                // Raw 24-byte dump of the CStringData header.
+                const BYTE* hp = (const BYTE*)data - 24;
+                LogLine("[CC-PIPE] cstr hdr[-24..]: "
+                    "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X "
+                    "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X",
+                    hp[0],hp[1],hp[2],hp[3],hp[4],hp[5],hp[6],hp[7],
+                    hp[8],hp[9],hp[10],hp[11],hp[12],hp[13],hp[14],hp[15],
+                    hp[16],hp[17],hp[18],hp[19],hp[20],hp[21],hp[22],hp[23]);
+            }
+            InterlockedExchange64(&g_capturedCStrPtr, (LONG64)cstr);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[CC-PIPE] cstr decode SEH"); }
+    }
+    int rv = -1;
+    if (g_origShowERwinCCWiz) {
+        __try { rv = g_origShowERwinCCWiz(ms1, ms2, b1, b2, cstr); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[CC-PIPE] ShowERwinCCWiz SEH"); }
+    }
+    LogLine("[CC-PIPE] ShowERwinCCWiz EXIT rv=%d", rv);
+    return rv;
+}
+static int __cdecl ShowConflictResolutionUIHook(void* ms1, void* ms2) {
+    LogLine("[CC-PIPE] ShowConflictResolutionUI ENTER ms1=%p ms2=%p", ms1, ms2);
+    int rv = -1;
+    if (g_origShowConflictRes) {
+        __try { rv = g_origShowConflictRes(ms1, ms2); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[CC-PIPE] ShowConflictRes SEH"); }
+    }
+    LogLine("[CC-PIPE] ShowConflictResolutionUI EXIT rv=%d", rv);
+    return rv;
+}
+static int __cdecl VSDBInteractiveMergeHook(void* ms1, void* ms2) {
+    LogLine("[CC-PIPE] VSDBInteractiveMerge ENTER ms1=%p ms2=%p", ms1, ms2);
+    int rv = -1;
+    if (g_origVSDBInteractive) {
+        __try { rv = g_origVSDBInteractive(ms1, ms2); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[CC-PIPE] VSDBInteractive SEH"); }
+    }
+    LogLine("[CC-PIPE] VSDBInteractiveMerge EXIT rv=%d", rv);
+    return rv;
+}
+static int __cdecl VSDBSilentUpdateHook(void* ms1, void* ms2) {
+    LogLine("[CC-PIPE] VSDBSilentUpdate ENTER ms1=%p ms2=%p", ms1, ms2);
+    int rv = -1;
+    if (g_origVSDBSilentUpdate) {
+        __try { rv = g_origVSDBSilentUpdate(ms1, ms2); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[CC-PIPE] VSDBSilentUpdate SEH"); }
+    }
+    LogLine("[CC-PIPE] VSDBSilentUpdate EXIT rv=%d", rv);
+    return rv;
+}
+
+// Exported: directly call ShowERwinCCWiz with caller-supplied args. Use the
+// trampoline (g_origShowERwinCCWiz) to bypass our own hook and avoid
+// recursion. Goal: test if (ms1=v3, ms2=v1, ...) runs the CC engine
+// silently / without further UI clicks.
+extern "C" __declspec(dllexport) int __cdecl CCInsp_CallShowERwinCCWiz(
+    void* ms1, void* ms2, int b1, int b2)
+{
+    if (!g_origShowERwinCCWiz) {
+        LogLine("[CC-PIPE-CALL] ShowERwinCCWiz trampoline not installed yet");
+        return -9999;
+    }
+    if (!ms1 || !ms2) {
+        LogLine("[CC-PIPE-CALL] ms1 or ms2 is null");
+        return -9998;
+    }
+    // Build a valid-looking CString by reusing MFC's static empty-string
+    // sentinel (captured from a prior real ShowERwinCCWiz hook fire).
+    // m_pszData must point to a char buffer that is preceded by a valid
+    // CStringData header; MFC's sentinel satisfies both conditions because
+    // it lives inside mfc140.dll with a proper header.
+    void* sentinel = (void*)InterlockedCompareExchange64(&g_mfcEmptyCStrData, 0, 0);
+    if (!sentinel) {
+        LogLine("[CC-PIPE-CALL] no MFC empty-CString sentinel captured yet");
+        LogLine("[CC-PIPE-CALL]   Fire ShowERwinCCWiz once via Actions -> Complete Compare");
+        LogLine("[CC-PIPE-CALL]   so the hook captures a valid sentinel, then retry.");
+        return -9995;
+    }
+    struct { void* p; } cstr; cstr.p = sentinel;
+
+    LogLine("[CC-PIPE-CALL] ShowERwinCCWiz(ms1=%p, ms2=%p, b1=%d, b2=%d, cstr=%p) ENTER",
+        ms1, ms2, b1, b2, (void*)&cstr);
+    int rv = -9997;
+    __try { rv = g_origShowERwinCCWiz(ms1, ms2, b1 != 0, b2 != 0, &cstr); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        LogLine("[CC-PIPE-CALL] SEH 0x%08lX", GetExceptionCode());
+        return -9996;
+    }
+    LogLine("[CC-PIPE-CALL] ShowERwinCCWiz returned rv=%d", rv);
+    return rv;
+}
+
+static void InstallEccPipelineHooks(void) {
+    HMODULE ecc = GetModuleHandleW(L"EM_ECC.dll");
+    if (!ecc) ecc = LoadLibraryW(L"EM_ECC.dll");
+    if (!ecc) { LogLine("[CC-PIPE] EM_ECC not loaded"); return; }
+
+    struct { const char* sym; void* hook; void** origSlot; const char* name; } hooks[] = {
+        { "?ShowERwinCCWiz@CWizInterface@@SAHPEAVGDMModelSetI@@0_N1V?$CStringT@DV?$StrTraitMFC_DLL@DV?$ChTraitsCRT@D@ATL@@@@@ATL@@@Z",
+          (void*)&ShowERwinCCWizHook, (void**)&g_origShowERwinCCWiz, "ShowERwinCCWiz" },
+        { "?ShowConflictResolutionUI@CWizInterface@@SAHPEAVGDMModelSetI@@0@Z",
+          (void*)&ShowConflictResolutionUIHook, (void**)&g_origShowConflictRes, "ShowConflictResolutionUI" },
+        { "?VSDBInteractiveMerge@CWizInterface@@SAHPEAVGDMModelSetI@@0@Z",
+          (void*)&VSDBInteractiveMergeHook, (void**)&g_origVSDBInteractive, "VSDBInteractiveMerge" },
+        { "?VSDBSilentUpdate@CWizInterface@@SAHPEAVGDMModelSetI@@0@Z",
+          (void*)&VSDBSilentUpdateHook, (void**)&g_origVSDBSilentUpdate, "VSDBSilentUpdate" },
+    };
+    for (const auto& h : hooks) {
+        void* target = GetProcAddress(ecc, h.sym);
+        if (!target) { LogLine("[CC-PIPE] %s symbol NOT FOUND", h.name); continue; }
+        void* tramp = nullptr;
+        if (InstallInlineHook(target, h.hook, &tramp)) {
+            *h.origSlot = tramp;
+            LogLine("[CC-PIPE] %s installed: target=%p tramp=%p", h.name, target, tramp);
+        } else {
+            LogLine("[CC-PIPE] %s install FAILED", h.name);
+        }
+    }
+}
+
+// Exported: toggle EDR stack-trace logging. Turn ON just before pressing
+// Apply-to-Right manually, so we can see which ELC2 function is calling
+// EDRAlterNameCaching::RegsiterStartTransactionId.
+extern "C" __declspec(dllexport) void __cdecl CCInsp_SetEdrStackTrace(int enable) {
+    InterlockedExchange(&g_edrStackTrace, enable ? 1 : 0);
+    LogLine("[EDR-REG-START] stack-trace mode = %s", enable ? "ON" : "OFF");
 }
 
 extern "C" __declspec(dllexport) int __cdecl CCInsp_InstallEdrHooks(void) {
@@ -2144,8 +2378,48 @@ extern "C" __declspec(dllexport) int __cdecl CCInsp_InstallEdrHooks(void) {
     return 0;
 }
 
+extern "C" __declspec(dllexport) int __cdecl CCInsp_GetEdrTxCount(void) {
+    return (int)InterlockedCompareExchange(&g_edrTxCount, 0, 0);
+}
+
+// Directly invoke CWizInterface::ApplyDifferencesToRight(leftMs, rightMs).
+// Bypasses the XTP custom listview click synthesis entirely - calls the
+// exported EM_ECC function through its trampoline (i.e. the original,
+// un-hooked entry). Returns the int result of the original function, or
+// -9999 if the trampoline isn't available. SEH-safe.
+extern "C" __declspec(dllexport) int __cdecl CCInsp_CallApplyDifferencesToRight(void* leftMs, void* rightMs) {
+    if (!g_origApplyDiffRight) {
+        LogLine("[ADR-CALL] g_origApplyDiffRight not bound - hook may have failed");
+        return -9999;
+    }
+    LogLine("[ADR-CALL] invoking ApplyDifferencesToRight(ms1=%p, ms2=%p) directly", leftMs, rightMs);
+    int rv = -1;
+    __try {
+        rv = g_origApplyDiffRight(leftMs, rightMs);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        LogLine("[ADR-CALL] SEH 0x%08X", GetExceptionCode());
+        return -8888;
+    }
+    LogLine("[ADR-CALL] returned rv=%d", rv);
+    return rv;
+}
+
 extern "C" __declspec(dllexport) void* __cdecl CCInsp_GetLastEdrMs(void) {
     return (void*)InterlockedCompareExchange64(&g_lastEdrMs, 0, 0);
+}
+
+// Exported: return the Nth distinct ms seen (0-based). N=0 gives the first
+// ms (usually the active / left model, v3). N=1 gives the second (v1 from
+// Mart -> Open). Returns null if N >= count.
+extern "C" __declspec(dllexport) void* __cdecl CCInsp_GetSeenMs(int index) {
+    if (index < 0 || index >= (int)kMaxSeenMs) return nullptr;
+    if (index >= InterlockedCompareExchange(&g_seenMsCount, 0, 0)) return nullptr;
+    return (void*)InterlockedCompareExchange64(&g_seenMs[index], 0, 0);
+}
+
+extern "C" __declspec(dllexport) int __cdecl CCInsp_GetSeenMsCount(void) {
+    return InterlockedCompareExchange(&g_seenMsCount, 0, 0);
 }
 
 static const char* kElaOnFeSym =
@@ -2424,6 +2698,366 @@ extern "C" __declspec(dllexport) int __cdecl CCInsp_CallApplyCCSilent(
         return -9996;
     }
     LogLine("[CC-SILENT] EXIT rv=%d", rv);
+    return rv;
+}
+
+// ---------------------------------------------------------------------------
+// ECC Apply-to-Right direct hook + replay.
+//
+// Stack-trace diagnosis established that a manual click on the Resolve-
+// Differences Model-row arrow ultimately invokes a chain:
+//   EM_CMP.dll + 0x13920   (XTP listview click handler)
+//     -> EM_ECC.dll + 0x42F4A  (Apply dispatcher)
+//       -> EM_ECC.dll + 0x42A83 (Apply inner)
+//         -> EM_GBC.dll + 0x6A77F (bridge)
+//           -> EM_GBC.dll + 0x6A5B3
+//             -> EM_GDM + ... + EDR Register
+//
+// 0x42F4A is a RETURN address, so the enclosing function starts earlier.
+// We use RtlLookupFunctionEntry (PDATA unwind table) to resolve the
+// function's BeginAddress, then install an inline hook there. On entry
+// the hook stashes RCX/RDX/R8/R9 for later replay via
+// CCInsp_ReplayEccApply().
+// ---------------------------------------------------------------------------
+
+// Latched arguments from the first hit of EccApplyHook. 0 => not yet captured.
+// The target is resolved via RtlLookupFunctionEntry against EM_ECC+0x42F4A
+// (return-address seen in manual-click stack traces). The enclosing
+// function starts at EM_ECC+0x42EA0 in the tested r10 binary. Hooking
+// this dispatcher caused 0xC0000005 AV in the trampoline path - likely
+// because the function takes more than 4 register args / reads stack
+// locals that our extra frames disturbed. The alternative hook at
+// EM_CMP.dll + 0x13920 (one frame higher - XTP listview click handler)
+// is installed instead; see CCInsp_HookCmpApply below.
+static volatile LONG64 g_eccApplyArg1 = 0;   // RCX
+static volatile LONG64 g_eccApplyArg2 = 0;   // RDX
+static volatile LONG64 g_eccApplyArg3 = 0;   // R8
+static volatile LONG64 g_eccApplyArg4 = 0;   // R9
+static volatile LONG   g_eccApplyHookCount = 0;
+static void* g_eccApplyTarget = nullptr;     // function start (for logging)
+
+// CMP hook: EM_CMP.dll + 0x13920 (return address in manual-click stack).
+// Function containing that RA is the XTP listview click dispatcher - one
+// frame above the ECC handler. Args should be higher-level / heap-stable.
+static volatile LONG64 g_cmpApplyArg1 = 0;
+static volatile LONG64 g_cmpApplyArg2 = 0;
+static volatile LONG64 g_cmpApplyArg3 = 0;
+static volatile LONG64 g_cmpApplyArg4 = 0;
+static volatile LONG   g_cmpApplyHookCount = 0;
+static void* g_cmpApplyTarget = nullptr;
+typedef LONG64 (__fastcall* CmpApplyFn)(void*, void*, void*, void*);
+static CmpApplyFn g_origCmpApply = nullptr;
+
+static LONG64 __fastcall CmpApplyHook(void* a1, void* a2, void* a3, void* a4) {
+    LONG count = InterlockedIncrement(&g_cmpApplyHookCount);
+    LogLine("[CMP-APPLY-HOOK] #%ld ENTER rcx=%p rdx=%p r8=%p r9=%p",
+        count, a1, a2, a3, a4);
+    if (count == 1) {
+        InterlockedExchange64(&g_cmpApplyArg1, (LONG64)a1);
+        InterlockedExchange64(&g_cmpApplyArg2, (LONG64)a2);
+        InterlockedExchange64(&g_cmpApplyArg3, (LONG64)a3);
+        InterlockedExchange64(&g_cmpApplyArg4, (LONG64)a4);
+        LogLine("[CMP-APPLY-HOOK] args LATCHED for replay");
+    }
+    LONG64 rv = 0;
+    if (g_origCmpApply) {
+        __try { rv = g_origCmpApply(a1, a2, a3, a4); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            LogLine("[CMP-APPLY-HOOK] trampoline SEH 0x%08lX", GetExceptionCode());
+        }
+    }
+    LogLine("[CMP-APPLY-HOOK] #%ld EXIT rv=0x%llX", count, (unsigned long long)rv);
+    return rv;
+}
+
+// int __fastcall F(rcx, rdx, r8, r9)  - we don't know the real signature,
+// but capturing 4 pointer-sized args covers the x64 fastcall register set.
+typedef LONG64 (__fastcall* EccApplyFn)(void*, void*, void*, void*);
+static EccApplyFn g_origEccApply = nullptr;
+
+static LONG64 __fastcall EccApplyHook(void* a1, void* a2, void* a3, void* a4) {
+    LONG count = InterlockedIncrement(&g_eccApplyHookCount);
+    LogLine("[ECC-APPLY-HOOK] #%ld ENTER rcx=%p rdx=%p r8=%p r9=%p",
+        count, a1, a2, a3, a4);
+    // Only stash on the FIRST hit - subsequent hits would clobber the
+    // latched replay context.
+    if (count == 1) {
+        InterlockedExchange64(&g_eccApplyArg1, (LONG64)a1);
+        InterlockedExchange64(&g_eccApplyArg2, (LONG64)a2);
+        InterlockedExchange64(&g_eccApplyArg3, (LONG64)a3);
+        InterlockedExchange64(&g_eccApplyArg4, (LONG64)a4);
+        LogLine("[ECC-APPLY-HOOK] args LATCHED for replay");
+    }
+    LONG64 rv = 0;
+    if (g_origEccApply) {
+        __try { rv = g_origEccApply(a1, a2, a3, a4); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            LogLine("[ECC-APPLY-HOOK] trampoline SEH 0x%08lX", GetExceptionCode());
+        }
+    }
+    LogLine("[ECC-APPLY-HOOK] #%ld EXIT rv=0x%llX", count, (unsigned long long)rv);
+    return rv;
+}
+
+// Uses RtlLookupFunctionEntry to find the function containing `addr` and
+// returns its start. Returns nullptr if no unwind info covers the address.
+static void* ResolveFunctionStart(void* addr) {
+    DWORD64 imageBase = 0;
+    PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry((DWORD64)addr, &imageBase, nullptr);
+    if (!rf || !imageBase) return nullptr;
+    return (void*)(imageBase + rf->BeginAddress);
+}
+
+// Install the hook on the function containing EM_ECC.dll + 0x42F4A.
+// Returns 0 on success, negative on failure. Idempotent.
+extern "C" __declspec(dllexport) int __cdecl CCInsp_HookEccApply(void) {
+    if (g_eccApplyTarget != nullptr) {
+        LogLine("[ECC-APPLY-HOOK] already installed at %p", g_eccApplyTarget);
+        return 0;
+    }
+    HMODULE ecc = GetModuleHandleW(L"EM_ECC.dll");
+    if (!ecc) {
+        LogLine("[ECC-APPLY-HOOK] EM_ECC.dll not loaded");
+        return -1;
+    }
+    void* returnAddr = (BYTE*)ecc + 0x42F4A;
+    // RtlLookupFunctionEntry wants an address WITHIN the function. The
+    // return address 0x42F4A is inside the enclosing function, so this is
+    // the right pointer to query.
+    void* fnStart = ResolveFunctionStart(returnAddr);
+    if (!fnStart) {
+        LogLine("[ECC-APPLY-HOOK] RtlLookupFunctionEntry returned null for EM_ECC+0x42F4A (%p)", returnAddr);
+        return -2;
+    }
+    LogLine("[ECC-APPLY-HOOK] target function start resolved: %p (EM_ECC+0x%llX)",
+        fnStart, (unsigned long long)((BYTE*)fnStart - (BYTE*)ecc));
+
+    void* tramp = nullptr;
+    if (!InstallInlineHook(fnStart, (void*)&EccApplyHook, &tramp)) {
+        LogLine("[ECC-APPLY-HOOK] InstallInlineHook FAILED");
+        return -3;
+    }
+    g_origEccApply = (EccApplyFn)tramp;
+    g_eccApplyTarget = fnStart;
+    LogLine("[ECC-APPLY-HOOK] installed ok. trampoline=%p", tramp);
+    return 0;
+}
+
+// Returns 1 if args have been latched by the hook, 0 otherwise. Out-params
+// receive the latched a1..a4 (may be null-ish if no hit). Safe to poll.
+extern "C" __declspec(dllexport) int __cdecl CCInsp_GetEccApplyArgs(
+    void** out1, void** out2, void** out3, void** out4)
+{
+    if (out1) *out1 = (void*)InterlockedCompareExchange64(&g_eccApplyArg1, 0, 0);
+    if (out2) *out2 = (void*)InterlockedCompareExchange64(&g_eccApplyArg2, 0, 0);
+    if (out3) *out3 = (void*)InterlockedCompareExchange64(&g_eccApplyArg3, 0, 0);
+    if (out4) *out4 = (void*)InterlockedCompareExchange64(&g_eccApplyArg4, 0, 0);
+    return (InterlockedCompareExchange(&g_eccApplyHookCount, 0, 0) > 0) ? 1 : 0;
+}
+
+// Replay: call the original Apply function with previously-latched args
+// (or explicit args if any supplied are non-null; nullptr means "use
+// latched value"). Returns the function's result, or sentinel on error.
+extern "C" __declspec(dllexport) LONG64 __cdecl CCInsp_ReplayEccApply(
+    void* overrideA1, void* overrideA2, void* overrideA3, void* overrideA4)
+{
+    if (!g_origEccApply) {
+        LogLine("[ECC-APPLY-REPLAY] no trampoline - hook not installed");
+        return (LONG64)-9999;
+    }
+    void* a1 = overrideA1 ? overrideA1 : (void*)InterlockedCompareExchange64(&g_eccApplyArg1, 0, 0);
+    void* a2 = overrideA2 ? overrideA2 : (void*)InterlockedCompareExchange64(&g_eccApplyArg2, 0, 0);
+    void* a3 = overrideA3 ? overrideA3 : (void*)InterlockedCompareExchange64(&g_eccApplyArg3, 0, 0);
+    void* a4 = overrideA4 ? overrideA4 : (void*)InterlockedCompareExchange64(&g_eccApplyArg4, 0, 0);
+    LogLine("[ECC-APPLY-REPLAY] invoking with a1=%p a2=%p a3=%p a4=%p", a1, a2, a3, a4);
+    LONG64 rv = 0;
+    __try { rv = g_origEccApply(a1, a2, a3, a4); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        LogLine("[ECC-APPLY-REPLAY] SEH 0x%08lX", GetExceptionCode());
+        return (LONG64)-8888;
+    }
+    LogLine("[ECC-APPLY-REPLAY] returned rv=0x%llX", (unsigned long long)rv);
+    return rv;
+}
+
+// --- MSGMAP variant: hook at EM_CMP.dll + 0x1EA11's enclosing function
+// (MFC AFX_MSGMAP_ENTRY handler - highest erwin frame, called directly by
+// mfc140's dispatcher). Args here are MFC-handler-style (this, wp, lp,
+// pResult) or notification-style (this, NMHDR*, pResult) - both heap-
+// backed, more likely to survive replay than ECC's stack-pointer args. ---
+
+static volatile LONG64 g_msgMapArg1 = 0;
+static volatile LONG64 g_msgMapArg2 = 0;
+static volatile LONG64 g_msgMapArg3 = 0;
+static volatile LONG64 g_msgMapArg4 = 0;
+static volatile LONG   g_msgMapHookCount = 0;
+static void* g_msgMapTarget = nullptr;
+typedef LONG64 (__fastcall* MsgMapFn)(void*, void*, void*, void*);
+static MsgMapFn g_origMsgMap = nullptr;
+
+// Hex-dump up to 32 bytes at `addr`, gracefully handling bad pointers.
+static void DumpAt(const char* label, void* addr) {
+    if (!addr) { LogLine("  %s: (null)", label); return; }
+    __try {
+        BYTE* p = (BYTE*)addr;
+        LogLine("  %s @ %p: %02X %02X %02X %02X %02X %02X %02X %02X  %02X %02X %02X %02X %02X %02X %02X %02X",
+            label, addr,
+            p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
+            p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
+        LogLine("  %s @ %p: %02X %02X %02X %02X %02X %02X %02X %02X  %02X %02X %02X %02X %02X %02X %02X %02X",
+            label, (BYTE*)addr + 16,
+            p[16], p[17], p[18], p[19], p[20], p[21], p[22], p[23],
+            p[24], p[25], p[26], p[27], p[28], p[29], p[30], p[31]);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("  %s @ %p: AV on read", label, addr); }
+}
+
+static LONG64 __fastcall MsgMapHook(void* a1, void* a2, void* a3, void* a4) {
+    LONG count = InterlockedIncrement(&g_msgMapHookCount);
+    LogLine("[MSGMAP-HOOK] #%ld ENTER rcx=%p rdx=%p r8=%p r9=%p",
+        count, a1, a2, a3, a4);
+    if (count == 1) {
+        InterlockedExchange64(&g_msgMapArg1, (LONG64)a1);
+        InterlockedExchange64(&g_msgMapArg2, (LONG64)a2);
+        InterlockedExchange64(&g_msgMapArg3, (LONG64)a3);
+        InterlockedExchange64(&g_msgMapArg4, (LONG64)a4);
+        LogLine("[MSGMAP-HOOK] args LATCHED for replay");
+        // Dump 32 bytes at each pointer - args appear to be refs to caller's
+        // stack locals (likely CWnd*, WPARAM, LPARAM, LRESULT* layout used by
+        // MFC's AfxDispatchCall). The data at these addresses should include
+        // an NMHDR (hwndFrom, idFrom, code) we can replay via WM_NOTIFY.
+        DumpAt("*rcx", a1);
+        DumpAt("*rdx", a2);
+        DumpAt("*r8 ", a3);
+        DumpAt("*r9 ", a4);
+    }
+    LONG64 rv = 0;
+    if (g_origMsgMap) {
+        __try { rv = g_origMsgMap(a1, a2, a3, a4); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            LogLine("[MSGMAP-HOOK] trampoline SEH 0x%08lX", GetExceptionCode());
+        }
+    }
+    LogLine("[MSGMAP-HOOK] #%ld EXIT rv=0x%llX", count, (unsigned long long)rv);
+    return rv;
+}
+
+extern "C" __declspec(dllexport) int __cdecl CCInsp_HookMsgMap(void) {
+    if (g_msgMapTarget != nullptr) {
+        LogLine("[MSGMAP-HOOK] already installed at %p", g_msgMapTarget);
+        return 0;
+    }
+    HMODULE cmp = GetModuleHandleW(L"EM_CMP.dll");
+    if (!cmp) { LogLine("[MSGMAP-HOOK] EM_CMP.dll not loaded"); return -1; }
+    void* returnAddr = (BYTE*)cmp + 0x1EA11;
+    void* fnStart = ResolveFunctionStart(returnAddr);
+    if (!fnStart) {
+        LogLine("[MSGMAP-HOOK] RtlLookupFunctionEntry null for EM_CMP+0x1EA11 (%p)", returnAddr);
+        return -2;
+    }
+    LogLine("[MSGMAP-HOOK] target function start resolved: %p (EM_CMP+0x%llX)",
+        fnStart, (unsigned long long)((BYTE*)fnStart - (BYTE*)cmp));
+    void* tramp = nullptr;
+    if (!InstallInlineHook(fnStart, (void*)&MsgMapHook, &tramp)) {
+        LogLine("[MSGMAP-HOOK] InstallInlineHook FAILED");
+        return -3;
+    }
+    g_origMsgMap = (MsgMapFn)tramp;
+    g_msgMapTarget = fnStart;
+    LogLine("[MSGMAP-HOOK] installed ok. trampoline=%p", tramp);
+    return 0;
+}
+
+extern "C" __declspec(dllexport) int __cdecl CCInsp_GetMsgMapArgs(
+    void** out1, void** out2, void** out3, void** out4)
+{
+    if (out1) *out1 = (void*)InterlockedCompareExchange64(&g_msgMapArg1, 0, 0);
+    if (out2) *out2 = (void*)InterlockedCompareExchange64(&g_msgMapArg2, 0, 0);
+    if (out3) *out3 = (void*)InterlockedCompareExchange64(&g_msgMapArg3, 0, 0);
+    if (out4) *out4 = (void*)InterlockedCompareExchange64(&g_msgMapArg4, 0, 0);
+    return (InterlockedCompareExchange(&g_msgMapHookCount, 0, 0) > 0) ? 1 : 0;
+}
+
+extern "C" __declspec(dllexport) LONG64 __cdecl CCInsp_ReplayMsgMap(
+    void* a1, void* a2, void* a3, void* a4)
+{
+    if (!g_origMsgMap) { LogLine("[MSGMAP-REPLAY] no trampoline"); return -9999; }
+    void* x1 = a1 ? a1 : (void*)InterlockedCompareExchange64(&g_msgMapArg1, 0, 0);
+    void* x2 = a2 ? a2 : (void*)InterlockedCompareExchange64(&g_msgMapArg2, 0, 0);
+    void* x3 = a3 ? a3 : (void*)InterlockedCompareExchange64(&g_msgMapArg3, 0, 0);
+    void* x4 = a4 ? a4 : (void*)InterlockedCompareExchange64(&g_msgMapArg4, 0, 0);
+    LogLine("[MSGMAP-REPLAY] invoking with a1=%p a2=%p a3=%p a4=%p", x1, x2, x3, x4);
+    LONG64 rv = 0;
+    __try { rv = g_origMsgMap(x1, x2, x3, x4); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        LogLine("[MSGMAP-REPLAY] SEH 0x%08lX", GetExceptionCode());
+        return -8888;
+    }
+    LogLine("[MSGMAP-REPLAY] returned rv=0x%llX", (unsigned long long)rv);
+    return rv;
+}
+
+// --- CMP variant: hook at EM_CMP.dll + 0x13920's enclosing function. ---
+
+extern "C" __declspec(dllexport) int __cdecl CCInsp_HookCmpApply(void) {
+    if (g_cmpApplyTarget != nullptr) {
+        LogLine("[CMP-APPLY-HOOK] already installed at %p", g_cmpApplyTarget);
+        return 0;
+    }
+    HMODULE cmp = GetModuleHandleW(L"EM_CMP.dll");
+    if (!cmp) {
+        LogLine("[CMP-APPLY-HOOK] EM_CMP.dll not loaded");
+        return -1;
+    }
+    void* returnAddr = (BYTE*)cmp + 0x13920;
+    void* fnStart = ResolveFunctionStart(returnAddr);
+    if (!fnStart) {
+        LogLine("[CMP-APPLY-HOOK] RtlLookupFunctionEntry returned null for EM_CMP+0x13920 (%p)", returnAddr);
+        return -2;
+    }
+    LogLine("[CMP-APPLY-HOOK] target function start resolved: %p (EM_CMP+0x%llX)",
+        fnStart, (unsigned long long)((BYTE*)fnStart - (BYTE*)cmp));
+
+    void* tramp = nullptr;
+    if (!InstallInlineHook(fnStart, (void*)&CmpApplyHook, &tramp)) {
+        LogLine("[CMP-APPLY-HOOK] InstallInlineHook FAILED");
+        return -3;
+    }
+    g_origCmpApply = (CmpApplyFn)tramp;
+    g_cmpApplyTarget = fnStart;
+    LogLine("[CMP-APPLY-HOOK] installed ok. trampoline=%p", tramp);
+    return 0;
+}
+
+extern "C" __declspec(dllexport) int __cdecl CCInsp_GetCmpApplyArgs(
+    void** out1, void** out2, void** out3, void** out4)
+{
+    if (out1) *out1 = (void*)InterlockedCompareExchange64(&g_cmpApplyArg1, 0, 0);
+    if (out2) *out2 = (void*)InterlockedCompareExchange64(&g_cmpApplyArg2, 0, 0);
+    if (out3) *out3 = (void*)InterlockedCompareExchange64(&g_cmpApplyArg3, 0, 0);
+    if (out4) *out4 = (void*)InterlockedCompareExchange64(&g_cmpApplyArg4, 0, 0);
+    return (InterlockedCompareExchange(&g_cmpApplyHookCount, 0, 0) > 0) ? 1 : 0;
+}
+
+extern "C" __declspec(dllexport) LONG64 __cdecl CCInsp_ReplayCmpApply(
+    void* overrideA1, void* overrideA2, void* overrideA3, void* overrideA4)
+{
+    if (!g_origCmpApply) {
+        LogLine("[CMP-APPLY-REPLAY] no trampoline - hook not installed");
+        return (LONG64)-9999;
+    }
+    void* a1 = overrideA1 ? overrideA1 : (void*)InterlockedCompareExchange64(&g_cmpApplyArg1, 0, 0);
+    void* a2 = overrideA2 ? overrideA2 : (void*)InterlockedCompareExchange64(&g_cmpApplyArg2, 0, 0);
+    void* a3 = overrideA3 ? overrideA3 : (void*)InterlockedCompareExchange64(&g_cmpApplyArg3, 0, 0);
+    void* a4 = overrideA4 ? overrideA4 : (void*)InterlockedCompareExchange64(&g_cmpApplyArg4, 0, 0);
+    LogLine("[CMP-APPLY-REPLAY] invoking with a1=%p a2=%p a3=%p a4=%p", a1, a2, a3, a4);
+    LONG64 rv = 0;
+    __try { rv = g_origCmpApply(a1, a2, a3, a4); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        LogLine("[CMP-APPLY-REPLAY] SEH 0x%08lX", GetExceptionCode());
+        return (LONG64)-8888;
+    }
+    LogLine("[CMP-APPLY-REPLAY] returned rv=0x%llX", (unsigned long long)rv);
     return rv;
 }
 

@@ -55,26 +55,40 @@ Set-Location $scriptDir
 
 $installDir = Join-Path $env:LOCALAPPDATA "EliteSoft\ErwinAddIn"
 
-# --- Step 1: Close erwin if running (CURRENT USER ONLY, never other sessions) ---
+# --- Step 1: Close processes that might hold our DLLs (CURRENT USER ONLY) ---
+# Use WMI GetOwner so we catch processes whose UserName PowerShell can't
+# inline-resolve (happens for cross-session or stale processes started on a
+# different desktop). A lingering erwin.exe from a prior session can hold
+# System.Management.dll and make step 3 (Copy-Item) fail with 'file in use'.
 $myUser = $env:USERNAME
-$erwinProcess = Get-Process -Name "erwin" -IncludeUserName -ErrorAction SilentlyContinue |
-    Where-Object { $_.UserName -and ($_.UserName -split '\\')[-1] -ieq $myUser }
-if ($erwinProcess) {
-    Write-Host "`nClosing erwin (user=$myUser)..." -ForegroundColor Yellow
-    $erwinProcess | Stop-Process -Force
-    Start-Sleep -Seconds 2
-    Write-Host "  erwin closed." -ForegroundColor Green
+function Stop-UserProcesses {
+    param([string]$name)
+    $procs = Get-WmiObject Win32_Process -Filter "Name='$name.exe'" -ErrorAction SilentlyContinue
+    if (-not $procs) { return }
+    foreach ($p in $procs) {
+        $owner = $null
+        try { $owner = $p.GetOwner() } catch { $owner = $null }
+        $ownerUser = if ($owner -and $owner.ReturnValue -eq 0) { $owner.User } else { $null }
+        if ($ownerUser -and $ownerUser -ieq $myUser) {
+            Write-Host "  Killing ${name}.exe PID=$($p.ProcessId) (user=$ownerUser, started $($p.ConvertToDateTime($p.CreationDate)))" -ForegroundColor Yellow
+            Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+        } elseif (-not $ownerUser) {
+            # Ambiguous ownership - treat as ours if there's no cleaner signal.
+            # Running elevated, so we have the rights. A stale process left
+            # over from a prior login will otherwise hold our install dir.
+            Write-Host "  Killing ${name}.exe PID=$($p.ProcessId) (owner unknown, started $($p.ConvertToDateTime($p.CreationDate)))" -ForegroundColor DarkYellow
+            Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+        } else {
+            Write-Host "  Skipping ${name}.exe PID=$($p.ProcessId) (owner=$ownerUser, not ours)" -ForegroundColor Gray
+        }
+    }
 }
 
-# --- Step 1b: Kill DdlHelper if running (CURRENT USER ONLY) ---
-$ddlHelperProc = Get-Process -Name "DdlHelper" -IncludeUserName -ErrorAction SilentlyContinue |
-    Where-Object { $_.UserName -and ($_.UserName -split '\\')[-1] -ieq $myUser }
-if ($ddlHelperProc) {
-    Write-Host "Killing stuck DdlHelper process (user=$myUser)..." -ForegroundColor Yellow
-    $ddlHelperProc | Stop-Process -Force
-    Start-Sleep -Seconds 1
-    Write-Host "  DdlHelper killed." -ForegroundColor Green
-}
+Write-Host "`nClosing erwin / DdlHelper / ErwinInjector (user=$myUser)..." -ForegroundColor Yellow
+Stop-UserProcesses "erwin"
+Stop-UserProcesses "DdlHelper"
+Stop-UserProcesses "ErwinInjector"
+Start-Sleep -Seconds 2
 
 # --- Step 2: Build ---
 Write-Host "`n[1/5] Building project..." -ForegroundColor Yellow

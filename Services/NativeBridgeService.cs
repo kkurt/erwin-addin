@@ -99,6 +99,51 @@ namespace EliteSoft.Erwin.AddIn.Services
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate IntPtr CCInspGetLastEdrMsFn();
 
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int CCInspGetEdrTxCountFn();
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int CCInspCallApplyDiffRightFn(IntPtr leftMs, IntPtr rightMs);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int CCInspHookEccApplyFn();
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int CCInspGetEccApplyArgsFn(out IntPtr a1, out IntPtr a2, out IntPtr a3, out IntPtr a4);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate long CCInspReplayEccApplyFn(IntPtr a1, IntPtr a2, IntPtr a3, IntPtr a4);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int CCInspHookCmpApplyFn();
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int CCInspGetCmpApplyArgsFn(out IntPtr a1, out IntPtr a2, out IntPtr a3, out IntPtr a4);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate long CCInspReplayCmpApplyFn(IntPtr a1, IntPtr a2, IntPtr a3, IntPtr a4);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int CCInspHookMsgMapFn();
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int CCInspGetMsgMapArgsFn(out IntPtr a1, out IntPtr a2, out IntPtr a3, out IntPtr a4);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate long CCInspReplayMsgMapFn(IntPtr a1, IntPtr a2, IntPtr a3, IntPtr a4);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int CCInspCallShowERwinCCWizFn(IntPtr ms1, IntPtr ms2, int b1, int b2);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate IntPtr CCInspGetSeenMsFn(int index);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int CCInspGetSeenMsCountFn();
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate void CCInspSetEdrStackTraceFn(int enable);
+
         // Cached delegates, populated after Install() succeeds.
         private static GetLastCapturedModelSetFn _getLastCapturedModelSet;
         private static ResetCapturedModelSetFn _resetCapturedModelSet;
@@ -127,6 +172,21 @@ namespace EliteSoft.Erwin.AddIn.Services
         private static CCInspInstallOnFeHookFn _ccInspInstallOnFeHook;
         private static CCInspGetLastOnFeMsFn _ccInspGetLastOnFeMs;
         private static CCInspGetLastEdrMsFn _ccInspGetLastEdrMs;
+        private static CCInspGetEdrTxCountFn _ccInspGetEdrTxCount;
+        private static CCInspCallApplyDiffRightFn _ccInspCallApplyDiffRight;
+        private static CCInspHookEccApplyFn _ccInspHookEccApply;
+        private static CCInspGetEccApplyArgsFn _ccInspGetEccApplyArgs;
+        private static CCInspReplayEccApplyFn _ccInspReplayEccApply;
+        private static CCInspHookCmpApplyFn _ccInspHookCmpApply;
+        private static CCInspGetCmpApplyArgsFn _ccInspGetCmpApplyArgs;
+        private static CCInspReplayCmpApplyFn _ccInspReplayCmpApply;
+        private static CCInspHookMsgMapFn _ccInspHookMsgMap;
+        private static CCInspGetMsgMapArgsFn _ccInspGetMsgMapArgs;
+        private static CCInspReplayMsgMapFn _ccInspReplayMsgMap;
+        private static CCInspCallShowERwinCCWizFn _ccInspCallShowERwinCCWiz;
+        private static CCInspGetSeenMsFn _ccInspGetSeenMs;
+        private static CCInspGetSeenMsCountFn _ccInspGetSeenMsCount;
+        private static CCInspSetEdrStackTraceFn _ccInspSetEdrStackTrace;
 
         /// <summary>
         /// Returns the absolute path where ErwinNativeBridge.dll is expected to live.
@@ -266,6 +326,62 @@ namespace EliteSoft.Erwin.AddIn.Services
                     if (ccGetLastEdr != IntPtr.Zero)
                         _ccInspGetLastEdrMs = Marshal.GetDelegateForFunctionPointer<CCInspGetLastEdrMsFn>(ccGetLastEdr);
 
+                    IntPtr ccGetEdrTxCount = GetProcAddress(_bridgeModule, "CCInsp_GetEdrTxCount");
+                    if (ccGetEdrTxCount != IntPtr.Zero)
+                        _ccInspGetEdrTxCount = Marshal.GetDelegateForFunctionPointer<CCInspGetEdrTxCountFn>(ccGetEdrTxCount);
+
+                    IntPtr ccCallAdr = GetProcAddress(_bridgeModule, "CCInsp_CallApplyDifferencesToRight");
+                    if (ccCallAdr != IntPtr.Zero)
+                        _ccInspCallApplyDiffRight = Marshal.GetDelegateForFunctionPointer<CCInspCallApplyDiffRightFn>(ccCallAdr);
+
+                    IntPtr ccHookEcc = GetProcAddress(_bridgeModule, "CCInsp_HookEccApply");
+                    if (ccHookEcc != IntPtr.Zero)
+                        _ccInspHookEccApply = Marshal.GetDelegateForFunctionPointer<CCInspHookEccApplyFn>(ccHookEcc);
+
+                    IntPtr ccGetEccArgs = GetProcAddress(_bridgeModule, "CCInsp_GetEccApplyArgs");
+                    if (ccGetEccArgs != IntPtr.Zero)
+                        _ccInspGetEccApplyArgs = Marshal.GetDelegateForFunctionPointer<CCInspGetEccApplyArgsFn>(ccGetEccArgs);
+
+                    IntPtr ccReplayEcc = GetProcAddress(_bridgeModule, "CCInsp_ReplayEccApply");
+                    if (ccReplayEcc != IntPtr.Zero)
+                        _ccInspReplayEccApply = Marshal.GetDelegateForFunctionPointer<CCInspReplayEccApplyFn>(ccReplayEcc);
+
+                    IntPtr ccHookCmp = GetProcAddress(_bridgeModule, "CCInsp_HookCmpApply");
+                    if (ccHookCmp != IntPtr.Zero)
+                        _ccInspHookCmpApply = Marshal.GetDelegateForFunctionPointer<CCInspHookCmpApplyFn>(ccHookCmp);
+
+                    IntPtr ccGetCmpArgs = GetProcAddress(_bridgeModule, "CCInsp_GetCmpApplyArgs");
+                    if (ccGetCmpArgs != IntPtr.Zero)
+                        _ccInspGetCmpApplyArgs = Marshal.GetDelegateForFunctionPointer<CCInspGetCmpApplyArgsFn>(ccGetCmpArgs);
+
+                    IntPtr ccReplayCmp = GetProcAddress(_bridgeModule, "CCInsp_ReplayCmpApply");
+                    if (ccReplayCmp != IntPtr.Zero)
+                        _ccInspReplayCmpApply = Marshal.GetDelegateForFunctionPointer<CCInspReplayCmpApplyFn>(ccReplayCmp);
+
+                    IntPtr ccHookMsgMap = GetProcAddress(_bridgeModule, "CCInsp_HookMsgMap");
+                    if (ccHookMsgMap != IntPtr.Zero)
+                        _ccInspHookMsgMap = Marshal.GetDelegateForFunctionPointer<CCInspHookMsgMapFn>(ccHookMsgMap);
+
+                    IntPtr ccGetMsgMapArgs = GetProcAddress(_bridgeModule, "CCInsp_GetMsgMapArgs");
+                    if (ccGetMsgMapArgs != IntPtr.Zero)
+                        _ccInspGetMsgMapArgs = Marshal.GetDelegateForFunctionPointer<CCInspGetMsgMapArgsFn>(ccGetMsgMapArgs);
+
+                    IntPtr ccReplayMsgMap = GetProcAddress(_bridgeModule, "CCInsp_ReplayMsgMap");
+                    if (ccReplayMsgMap != IntPtr.Zero)
+                        _ccInspReplayMsgMap = Marshal.GetDelegateForFunctionPointer<CCInspReplayMsgMapFn>(ccReplayMsgMap);
+
+                    IntPtr ccCCWiz = GetProcAddress(_bridgeModule, "CCInsp_CallShowERwinCCWiz");
+                    if (ccCCWiz != IntPtr.Zero)
+                        _ccInspCallShowERwinCCWiz = Marshal.GetDelegateForFunctionPointer<CCInspCallShowERwinCCWizFn>(ccCCWiz);
+
+                    IntPtr ccSeenMs = GetProcAddress(_bridgeModule, "CCInsp_GetSeenMs");
+                    IntPtr ccSeenMsCount = GetProcAddress(_bridgeModule, "CCInsp_GetSeenMsCount");
+                    if (ccSeenMs != IntPtr.Zero) _ccInspGetSeenMs = Marshal.GetDelegateForFunctionPointer<CCInspGetSeenMsFn>(ccSeenMs);
+                    if (ccSeenMsCount != IntPtr.Zero) _ccInspGetSeenMsCount = Marshal.GetDelegateForFunctionPointer<CCInspGetSeenMsCountFn>(ccSeenMsCount);
+
+                    IntPtr ccEdrST = GetProcAddress(_bridgeModule, "CCInsp_SetEdrStackTrace");
+                    if (ccEdrST != IntPtr.Zero) _ccInspSetEdrStackTrace = Marshal.GetDelegateForFunctionPointer<CCInspSetEdrStackTraceFn>(ccEdrST);
+
                     log?.Invoke($"NativeBridge: capture API bound (get={getProc != IntPtr.Zero}, reset={resetProc != IntPtr.Zero}, gen={genProc != IntPtr.Zero}, free={freeProc != IntPtr.Zero}, obs={obsProc != IntPtr.Zero}, consume={consumeProc != IntPtr.Zero}, clear={clearProc != IntPtr.Zero}, invoke={invokeProc != IntPtr.Zero}).");
                 }
                 return _installed;
@@ -330,6 +446,156 @@ namespace EliteSoft.Erwin.AddIn.Services
         public static int SetGlobalPxAs(IntPtr asPtr)
         {
             return _ccInspSetGlobalPxAs?.Invoke(asPtr) ?? -10000;
+        }
+
+        /// <summary>D4-spike: returns the MS captured by the EDR hook (right
+        /// side in Mart-Mart). Zero if no EDR call has been observed yet.</summary>
+        public static IntPtr GetLastEdrMs()
+        {
+            return _ccInspGetLastEdrMs?.Invoke() ?? IntPtr.Zero;
+        }
+
+        /// <summary>
+        /// Returns the cumulative number of <c>RegsiterStartTransactionId</c>
+        /// calls observed by the native bridge since startup. Used by managed
+        /// code to wait for Apply-to-Right's deferred XTP cascade to finish
+        /// firing transactions before invoking OnFE.
+        /// </summary>
+        public static int GetEdrTxCount()
+        {
+            return _ccInspGetEdrTxCount?.Invoke() ?? -1;
+        }
+
+        /// <summary>
+        /// Invokes <c>CWizInterface::ApplyDifferencesToRight(leftMs, rightMs)</c>
+        /// directly through the native bridge trampoline, bypassing the
+        /// XTP listview click UI path entirely. Returns the int result from
+        /// the exported EM_ECC function, <c>-9999</c> if the trampoline is not
+        /// bound, or <c>-8888</c> on SEH.
+        /// </summary>
+        public static int CallApplyDifferencesToRight(IntPtr leftMs, IntPtr rightMs)
+        {
+            return _ccInspCallApplyDiffRight?.Invoke(leftMs, rightMs) ?? -9999;
+        }
+
+        /// <summary>
+        /// Installs an inline hook on the function containing
+        /// <c>EM_ECC.dll + 0x42F4A</c> (the Apply-to-Right dispatcher that the
+        /// XTP listview arrow click invokes). First call stashes its 4 args
+        /// for later <see cref="ReplayEccApply"/>. Idempotent.
+        /// </summary>
+        public static int HookEccApply()
+        {
+            return _ccInspHookEccApply?.Invoke() ?? -1;
+        }
+
+        /// <summary>
+        /// Returns the 4 args latched by the first invocation of the
+        /// ECC-Apply hook. Returns 1 if args are valid (hook fired at least
+        /// once), 0 if no capture has happened yet.
+        /// </summary>
+        public static bool GetEccApplyArgs(out IntPtr a1, out IntPtr a2, out IntPtr a3, out IntPtr a4)
+        {
+            a1 = a2 = a3 = a4 = IntPtr.Zero;
+            if (_ccInspGetEccApplyArgs == null) return false;
+            int rc = _ccInspGetEccApplyArgs(out a1, out a2, out a3, out a4);
+            return rc == 1;
+        }
+
+        /// <summary>
+        /// Replays the captured ECC-Apply call with either latched args (pass
+        /// <see cref="IntPtr.Zero"/> for each) or caller-supplied overrides.
+        /// Returns the function's raw 64-bit result.
+        /// </summary>
+        public static long ReplayEccApply(IntPtr a1, IntPtr a2, IntPtr a3, IntPtr a4)
+        {
+            return _ccInspReplayEccApply?.Invoke(a1, a2, a3, a4) ?? -9999;
+        }
+
+        /// <summary>
+        /// Installs an inline hook at the XTP listview click handler
+        /// <c>EM_CMP.dll + 0x13920</c>'s enclosing function entry. One frame
+        /// above the ECC dispatcher - args are expected to be more stable
+        /// (MFC-style this+notif pointers, heap-resident).
+        /// </summary>
+        public static int HookCmpApply()
+        {
+            return _ccInspHookCmpApply?.Invoke() ?? -1;
+        }
+
+        public static bool GetCmpApplyArgs(out IntPtr a1, out IntPtr a2, out IntPtr a3, out IntPtr a4)
+        {
+            a1 = a2 = a3 = a4 = IntPtr.Zero;
+            if (_ccInspGetCmpApplyArgs == null) return false;
+            return _ccInspGetCmpApplyArgs(out a1, out a2, out a3, out a4) == 1;
+        }
+
+        public static long ReplayCmpApply(IntPtr a1, IntPtr a2, IntPtr a3, IntPtr a4)
+        {
+            return _ccInspReplayCmpApply?.Invoke(a1, a2, a3, a4) ?? -9999;
+        }
+
+        /// <summary>
+        /// Installs inline hook at <c>EM_CMP.dll + 0x1EA11</c>'s enclosing
+        /// function - the highest erwin frame called directly by mfc140's
+        /// message map dispatcher. First call's 4 args are latched.
+        /// </summary>
+        public static int HookMsgMap()
+        {
+            return _ccInspHookMsgMap?.Invoke() ?? -1;
+        }
+
+        public static bool GetMsgMapArgs(out IntPtr a1, out IntPtr a2, out IntPtr a3, out IntPtr a4)
+        {
+            a1 = a2 = a3 = a4 = IntPtr.Zero;
+            if (_ccInspGetMsgMapArgs == null) return false;
+            return _ccInspGetMsgMapArgs(out a1, out a2, out a3, out a4) == 1;
+        }
+
+        public static long ReplayMsgMap(IntPtr a1, IntPtr a2, IntPtr a3, IntPtr a4)
+        {
+            return _ccInspReplayMsgMap?.Invoke(a1, a2, a3, a4) ?? -9999;
+        }
+
+        /// <summary>D4-spike: list of distinct modelSets seen by any hook.
+        /// Order is chronological: index 0 is the first MS seen, index 1 the
+        /// second, etc. Max 16 entries.</summary>
+        /// <summary>Toggle stack-trace logging on EDR RegsiterStartTransactionId
+        /// so we can identify the ELC2 internal function that triggers Apply-to-Right
+        /// transactions.</summary>
+        public static void SetEdrStackTrace(bool enable)
+        {
+            _ccInspSetEdrStackTrace?.Invoke(enable ? 1 : 0);
+        }
+
+        public static IntPtr[] GetSeenModelSets()
+        {
+            int count = _ccInspGetSeenMsCount?.Invoke() ?? 0;
+            var result = new IntPtr[count];
+            for (int i = 0; i < count; ++i)
+                result[i] = _ccInspGetSeenMs?.Invoke(i) ?? IntPtr.Zero;
+            return result;
+        }
+
+        /// <summary>
+        /// Returns the i'th model-set pointer captured by the bridge's EDR
+        /// hook, or <see cref="IntPtr.Zero"/> if <paramref name="index"/> is
+        /// out of range.
+        /// </summary>
+        public static IntPtr GetSeenModelSet(int index)
+        {
+            int count = _ccInspGetSeenMsCount?.Invoke() ?? 0;
+            if (index < 0 || index >= count) return IntPtr.Zero;
+            return _ccInspGetSeenMs?.Invoke(index) ?? IntPtr.Zero;
+        }
+
+        /// <summary>D4-spike: call EM_ECC!CWizInterface::ShowERwinCCWiz
+        /// with pre-populated ms2 (right model) and both bools. If erwin
+        /// interprets this as a silent / auto-apply path we get full
+        /// automation; otherwise it just opens the CC wizard UI.</summary>
+        public static int CallShowERwinCCWiz(IntPtr ms1, IntPtr ms2, bool b1, bool b2)
+        {
+            return _ccInspCallShowERwinCCWiz?.Invoke(ms1, ms2, b1 ? 1 : 0, b2 ? 1 : 0) ?? -10000;
         }
 
         /// <summary>

@@ -2241,12 +2241,6 @@ namespace EliteSoft.Erwin.AddIn
                 Log("-- From-DB mode is not wired to the new programmatic pipeline yet.");
                 Log("   Falling back to 'current model vs last save' alter.");
             }
-            if (martMode)
-            {
-                Log("-- Mart version compare: relies on EDR transaction tracker capture.");
-                Log("   Prereq: Actions -> Complete Compare -> Right=Mart version -> Compare -> Apply-to-Right.");
-                Log("   If you haven't done that yet, cancel and do it first.");
-            }
 
             Action<string> log = msg =>
             {
@@ -2258,9 +2252,67 @@ namespace EliteSoft.Erwin.AddIn
             string err = null;
             try
             {
-                script = await System.Threading.Tasks.Task.Run(() => martMode
-                    ? Services.NativeBridgeService.GenerateMartMartDdlViaOnFE(log)
-                    : Services.NativeBridgeService.GenerateAlterDdl(log));
+                if (martMode)
+                {
+                    // Production Mart-Mart zero-click flow:
+                    //   1. Drive CC wizard + Apply-to-Right programmatically
+                    //      (hidden dialogs), honoring cmbRightModel selection.
+                    //   2. After EDR state is populated, call native
+                    //      GenerateMartMartDdlViaOnFE to produce the alter DDL.
+                    //   3. Close the CC/RD session regardless of outcome.
+                    int v = ParseRightVersion();
+                    string catalog = ParseActivePuCatalog();
+                    if (v <= 0 || string.IsNullOrEmpty(catalog))
+                    {
+                        err = "Could not derive right-version or Mart catalog path " +
+                              "(need a Mart-opened model + valid right selection).";
+                    }
+                    else
+                    {
+                        Services.MartMartAutomation.CCSession sess = null;
+                        var overlay = ShowBusyOverlay("Generating DDL, please wait...");
+                        Action<bool> toggle = visible =>
+                        {
+                            try
+                            {
+                                // Invoke is SYNCHRONOUS - we MUST wait for the
+                                // UI thread to finish hiding the windows
+                                // before returning; otherwise the click that
+                                // immediately follows lands on our still-
+                                // visible form instead of the RD dialog.
+                                if (InvokeRequired)
+                                    Invoke(new Action(() => ToggleBusyOverlay(overlay, visible)));
+                                else
+                                    ToggleBusyOverlay(overlay, visible);
+                            }
+                            catch { }
+                        };
+                        try
+                        {
+                            sess = await Services.MartMartAutomation.DriveCCAndApplyAsync(v, catalog, log, toggle);
+                            if (sess == null || !sess.Applied)
+                            {
+                                err = "Programmatic CC + Apply-to-Right failed. See Debug Log.";
+                            }
+                            else
+                            {
+                                script = await System.Threading.Tasks.Task.Run(() =>
+                                    Services.NativeBridgeService.GenerateMartMartDdlViaOnFE(log));
+                            }
+                        }
+                        finally
+                        {
+                            Services.MartMartAutomation.CloseSession(sess, log);
+                            try { overlay?.Close(); } catch { }
+                        }
+                    }
+                }
+                else
+                {
+                    // From-DB / fallback: existing Ctrl+Alt+T Hybrid B pipeline.
+                    script = await System.Threading.Tasks.Task.Run(() =>
+                        Services.NativeBridgeService.GenerateAlterDdl(log));
+                }
             }
             catch (Exception ex)
             {
@@ -2277,11 +2329,11 @@ namespace EliteSoft.Erwin.AddIn
             {
                 if (martMode)
                 {
-                    lblDDLStatus.Text = "Mart compare not ready: do CC + Apply-to-Right first.";
+                    lblDDLStatus.Text = "Mart-Mart automation failed (see Debug Log).";
                     lblDDLStatus.ForeColor = Color.Red;
-                    rtbDDLOutput.Text = "-- FAILED: no right-side modelSet captured yet.\n" +
-                                        "-- Do: Actions > Complete Compare > Right = Mart vN > Compare > Apply-to-Right\n" +
-                                        "-- Then press Generate DDL again.\n";
+                    rtbDDLOutput.Text = "-- FAILED: programmatic CC + Apply-to-Right did not produce DDL.\n" +
+                                        "-- Check Debug Log for the step that failed (CC wizard open, \n" +
+                                        "-- Mart picker navigation, Apply-to-Right click, or native DDL capture).\n";
                 }
                 else
                 {
@@ -2301,18 +2353,7 @@ namespace EliteSoft.Erwin.AddIn
             else
             {
                 ShowDDLResult(script, "Alter DDL");
-                try
-                {
-                    string outPath = System.IO.Path.Combine(@"c:\tmp",
-                        $"alter_wizard_{DateTime.Now:yyyyMMdd_HHmmss}.sql");
-                    System.IO.Directory.CreateDirectory(@"c:\tmp");
-                    System.IO.File.WriteAllText(outPath, script);
-                    Log($"Saved: {outPath}");
-                }
-                catch (Exception saveEx)
-                {
-                    Log($"Save failed: {saveEx.Message}");
-                }
+                Log($"DDL produced ({script.Length} chars). Use Copy button to grab it.");
             }
 
             btnAlterWizardProd.Enabled = true;
@@ -2449,7 +2490,10 @@ namespace EliteSoft.Erwin.AddIn
         {
             rtbDDLOutput.SuspendLayout();
             rtbDDLOutput.Clear();
-            rtbDDLOutput.Text = sql;
+            // Pad with trailing blank lines so the last real line isn't
+            // clipped at the bottom of the RichTextBox viewport when the
+            // user scrolls all the way down (common RTB rendering issue).
+            rtbDDLOutput.Text = sql + "\n\n\n";
 
             // Set default color
             rtbDDLOutput.SelectAll();
@@ -3354,6 +3398,211 @@ namespace EliteSoft.Erwin.AddIn
         /// Alter Script wizard. Our FEW-CTOR hook + hide + InvokePreview
         /// chain then captures the DDL and closes the wizard.
         /// </summary>
+        /// <summary>
+        /// D3-spike: try to open Mart v1 as a 2nd PU while v3 is active. Tests
+        /// whether SCAPI.PersistenceUnits.Add works despite 'Mart UI is active'
+        /// restriction. If successful, logs PU name and we have a starting
+        /// point for full Mart-Mart automation.
+        /// </summary>
+        /// <summary>
+        /// D4-spike: call ShowERwinCCWiz(ms1=v3, ms2=v1, true, true) and see if
+        /// erwin runs CC + Apply silently. If so, Mart-Mart becomes fully
+        /// programmatic. Otherwise the CC wizard will open as usual and we
+        /// have to go with UI automation for the last mile.
+        ///
+        /// Prereq: user must have opened v1 via Mart -> Open already, so our
+        /// EDR hook captured v1's modelSet.
+        /// </summary>
+        /// <summary>
+        /// Toggle stack-trace logging on EDR RegsiterStartTransactionId.
+        /// Turn ON just before pressing Apply-to-Right so we can see which
+        /// ELC2 internal function triggers the transaction recording.
+        /// </summary>
+        /// <summary>
+        /// Phase 1 discovery: programmatically drive CC wizard up to Resolve
+        /// Differences, dump its UIA tree, then cancel. Target: find the
+        /// 'Copy to Right' arrow's AutomationId/Name so we can invoke it in
+        /// Phase 2 without pixel math.
+        /// </summary>
+        /// <summary>
+        /// Parses the right-side Mart version number from the cmbRightModel
+        /// selection (e.g. "v1 (Version 1)" -> 1). Returns -1 if not parseable.
+        /// </summary>
+        private int ParseRightVersion()
+        {
+            try
+            {
+                string sel = cmbRightModel.SelectedItem?.ToString() ?? "";
+                var m = System.Text.RegularExpressions.Regex.Match(sel, @"^v(\d+)");
+                if (m.Success && int.TryParse(m.Groups[1].Value, out int v)) return v;
+            }
+            catch { }
+            return -1;
+        }
+
+        /// <summary>
+        /// Extracts the Mart catalog path (folder/model) from the active PU's
+        /// locator, e.g. "Mart://Mart/Kursat/MetaRepo?..." -> "Kursat/MetaRepo".
+        /// Returns "" if the active PU is not a Mart-opened model.
+        /// </summary>
+        private string ParseActivePuCatalog()
+        {
+            try
+            {
+                string locator = _currentModel?.PropertyBag()?.Value("Locator")?.ToString() ?? "";
+                var mm = System.Text.RegularExpressions.Regex.Match(locator, @"Mart://Mart/([^?&]+)",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                if (mm.Success) return mm.Groups[1].Value;
+            }
+            catch { }
+            return "";
+        }
+
+        /// <summary>
+        /// Reads the active PU's version number from its locator
+        /// (<c>...?version=N</c>). Returns -1 if not determinable.
+        /// </summary>
+        private int ParseActivePuVersion()
+        {
+            try
+            {
+                string locator = _currentModel?.PropertyBag()?.Value("Locator")?.ToString() ?? "";
+                var mm = System.Text.RegularExpressions.Regex.Match(locator, @"[?&]version=(\d+)",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                if (mm.Success && int.TryParse(mm.Groups[1].Value, out int v)) return v;
+            }
+            catch { }
+            return -1;
+        }
+
+        private async void BtnCaptureApplyStack_Click(object sender, EventArgs e)
+        {
+            btnCaptureApplyStack.Enabled = false;
+            try
+            {
+                int v = ParseRightVersion();
+                if (v <= 0) v = 1;
+                string catalogPath = ParseActivePuCatalog();
+                Log("");
+                Log("=== DIAG: Capture Apply-to-Right stack trace ===");
+                Log("Instructions:");
+                Log("  1. When Resolve Differences opens and becomes visible,");
+                Log("     manually click the RIGHT-pointing arrow on the Model row.");
+                Log("  2. You have 45 seconds to click. After that we auto-close.");
+                Log("  3. Bridge log (erwin-native-bridge.log) will capture the");
+                Log("     call stack. Send that log back for analysis.");
+                Log("");
+                await Services.MartMartAutomation.CaptureApplyStackAsync(v, catalogPath, msg =>
+                {
+                    if (InvokeRequired) BeginInvoke(new Action(() => Log(msg)));
+                    else Log(msg);
+                });
+                Log("=== DIAG done. Share erwin-native-bridge.log contents. ===");
+            }
+            finally { btnCaptureApplyStack.Enabled = true; }
+        }
+
+        private async void BtnMMDiscovery_Click(object sender, EventArgs e)
+        {
+            btnMMDiscovery.Enabled = false;
+            try
+            {
+                int v = ParseRightVersion();
+                if (v <= 0) v = 1;
+                string catalogPath = ParseActivePuCatalog();
+                Log("");
+                Log($"=== Mart-Mart Auto: discovery for v{v}, catalog='{catalogPath}' ===");
+                await Services.MartMartAutomation.RunDiscoveryAsync(v, catalogPath, msg =>
+                {
+                    if (InvokeRequired) BeginInvoke(new Action(() => Log(msg)));
+                    else Log(msg);
+                });
+                Log("Discovery complete. Search the output above for ControlType + AutomationId of the 'Copy to Right' arrow on the Model row.");
+            }
+            finally { btnMMDiscovery.Enabled = true; }
+        }
+
+        private void BtnToggleEdrST_Click(object sender, EventArgs e)
+        {
+            _edrStOn = !_edrStOn;
+            Services.NativeBridgeService.SetEdrStackTrace(_edrStOn);
+            btnToggleEdrST.Text = _edrStOn ? "EDR stack-trace: ON" : "Toggle EDR stack-trace";
+            btnToggleEdrST.BackColor = _edrStOn
+                ? System.Drawing.Color.FromArgb(255, 210, 140)
+                : System.Drawing.Color.FromArgb(245, 245, 200);
+            Log($"");
+            Log($"EDR stack-trace mode: {(_edrStOn ? "ON" : "OFF")}");
+            if (_edrStOn)
+                Log("  Now: do CC + click Apply-to-Right in Resolve Differences.");
+        }
+
+        private void BtnSpikeShowCCWiz_Click(object sender, EventArgs e)
+        {
+            btnSpikeShowCCWiz.Enabled = false;
+            try
+            {
+                Log("");
+                Log("=== Spike: CWizInterface::ShowERwinCCWiz(v3, v1) ===");
+                var seen = Services.NativeBridgeService.GetSeenModelSets();
+                Log($"Distinct MSs seen so far: {seen.Length}");
+                for (int i = 0; i < seen.Length; ++i)
+                    Log($"  [{i}] 0x{seen[i].ToInt64():X}");
+                if (seen.Length < 2)
+                {
+                    Log("  Need at least 2 distinct modelSets (v3 + v1).");
+                    Log("  Do: Mart -> Open the second version (v1), then retry this spike.");
+                    return;
+                }
+                IntPtr ms1 = seen[0];   // first seen: usually v3 (active model)
+                IntPtr ms2 = seen[seen.Length - 1];   // last seen distinct: likely v1
+                if (ms1 == ms2)
+                {
+                    Log("  Distinct-pick collapsed; retry with more hook fires.");
+                    return;
+                }
+                Log($"Picking ms1={ms1.ToInt64():X16} (first) ms2={ms2.ToInt64():X16} (last)");
+                int rv = Services.NativeBridgeService.CallShowERwinCCWiz(ms1, ms2, true, true);
+                Log($"ShowERwinCCWiz returned {rv}");
+                Log("Now observe: did a CC wizard dialog open? Did EDR transactions fire on v1?");
+                Log("Check bridge log for [CC-PIPE-CALL] + subsequent [EDR-REG*] lines.");
+            }
+            finally { btnSpikeShowCCWiz.Enabled = true; }
+        }
+
+        private void BtnSpikeOpenMartV1_Click(object sender, EventArgs e)
+        {
+            if (!_isConnected || _currentModel == null)
+            {
+                Log("[SPIKE] No model connected.");
+                return;
+            }
+            btnSpikeOpenMartV1.Enabled = false;
+            try
+            {
+                Log("");
+                Log("=== Spike: Open Mart v1 as 2nd PU ===");
+                dynamic v1Pu = Services.DdlGenerationService.OpenMartVersionPU(
+                    _scapi, _currentModel, 1, (Action<string>)Log);
+                if (v1Pu == null)
+                {
+                    Log("[SPIKE] OpenMartVersionPU returned null. See attempts above.");
+                    return;
+                }
+                string name = "";
+                try { name = v1Pu.Name?.ToString() ?? ""; } catch { }
+                Log($"[SPIKE] v1 PU opened. Name='{name}'");
+                // Read its Locator for verification.
+                try
+                {
+                    string loc = v1Pu.PropertyBag().Value("Locator")?.ToString() ?? "";
+                    Log($"[SPIKE] v1 PU Locator: {loc}");
+                }
+                catch (Exception ex) { Log($"[SPIKE] Locator read failed: {ex.Message}"); }
+                Log("[SPIKE] PU is now in session. Native MS capture is the next step.");
+            }
+            finally { btnSpikeOpenMartV1.Enabled = true; }
+        }
+
         private async void BtnCallOnFE_Click(object sender, EventArgs e)
         {
             btnCallOnFE.Enabled = false;
@@ -3489,6 +3738,193 @@ namespace EliteSoft.Erwin.AddIn
         {
             _allowClose = true;
             Close();
+        }
+
+        /// <summary>
+        /// Closes the SELECTED RIGHT-SIDE version PU (e.g. v1) that CC loaded,
+        /// leaving the active v3 model untouched. This evicts erwin's CC
+        /// engine cache of the dirtied v1 so subsequent Generate DDL runs
+        /// don't see "compare-to-itself". Iterates SCAPI.PersistenceUnits,
+        /// finds the one whose locator matches the target catalog+version,
+        /// closes it.
+        /// </summary>
+        private void CloseSelectedVersionPU(int rightVersion, string catalog, Action<string> log)
+        {
+            try
+            {
+                dynamic pus = _scapi?.PersistenceUnits;
+                if (pus == null)
+                {
+                    log?.Invoke("close right PU: no SCAPI session");
+                    return;
+                }
+                int count = (int)pus.Count;
+                log?.Invoke($"close right PU: scanning {count} open PU(s) for v{rightVersion} of '{catalog}'");
+                for (int i = count - 1; i >= 0; i--)
+                {
+                    dynamic pu = null;
+                    try { pu = pus.Item(i); } catch { continue; }
+                    if (pu == null) continue;
+                    string locator = "";
+                    try { locator = pu.PropertyBag()?.Value("Locator")?.ToString() ?? ""; } catch { }
+                    string name = "";
+                    try { name = pu.Name?.ToString() ?? ""; } catch { }
+                    // Match the right-side PU: same catalog, and Locator
+                    // carries version info like "...?version=1" or similar.
+                    bool looksRight = !string.IsNullOrEmpty(locator)
+                        && locator.IndexOf(catalog, StringComparison.OrdinalIgnoreCase) >= 0
+                        && locator.IndexOf($"version={rightVersion}", StringComparison.OrdinalIgnoreCase) >= 0;
+                    log?.Invoke($"  PU[{i}] name='{name}' locator='{locator}' {(looksRight ? "<-- TARGET" : "")}");
+                    if (looksRight)
+                    {
+                        try
+                        {
+                            pu.Close();
+                            log?.Invoke($"  closed right-side PU[{i}]");
+                        }
+                        catch (Exception cex)
+                        {
+                            log?.Invoke($"  Close() err: {cex.Message}");
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"CloseSelectedVersionPU err: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Modern, borderless "please wait" overlay shown during the
+        /// Mart-Mart automation. Drop shadow + accent bar + primary/
+        /// secondary text. Toggled via <see cref="ToggleBusyOverlay"/>.
+        /// </summary>
+        private Form ShowBusyOverlay(string message)
+        {
+            var accent = Color.FromArgb(46, 125, 50);       // Elite Soft green
+            var dark   = Color.FromArgb(40, 42, 54);
+            var subtle = Color.FromArgb(100, 110, 130);
+
+            var f = new Form
+            {
+                Text = "",
+                ClientSize = new Size(840, 360),
+                StartPosition = FormStartPosition.CenterScreen,
+                FormBorderStyle = FormBorderStyle.None,
+                ShowInTaskbar = false,
+                TopMost = true,
+                BackColor = Color.FromArgb(180, 180, 180),  // acts as 1px border
+                Padding = new Padding(1),
+            };
+
+            // Main panel (content area).
+            var inner = new Panel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = Color.White,
+                Padding = new Padding(0),
+            };
+            f.Controls.Add(inner);
+
+            // Accent stripe at the top (visual interest).
+            var stripe = new Panel
+            {
+                Dock = DockStyle.Top,
+                Height = 6,
+                BackColor = accent,
+            };
+            inner.Controls.Add(stripe);
+
+            // Spinner dots - centred vertically in upper third.
+            var spinner = new Label
+            {
+                Text = "• • •",
+                AutoSize = false,
+                Size = new Size(160, 60),
+                Location = new Point((f.ClientSize.Width - 160) / 2, 90),
+                Font = new Font("Segoe UI", 28F, FontStyle.Bold),
+                TextAlign = ContentAlignment.MiddleCenter,
+                ForeColor = accent,
+                BackColor = Color.Transparent,
+            };
+            inner.Controls.Add(spinner);
+
+            // Primary message - centred middle.
+            var lbl = new Label
+            {
+                Text = message,
+                AutoSize = false,
+                Size = new Size(f.ClientSize.Width - 40, 60),
+                Location = new Point(20, 180),
+                TextAlign = ContentAlignment.MiddleCenter,
+                Font = new Font("Segoe UI Semibold", 17F, FontStyle.Regular),
+                ForeColor = dark,
+                BackColor = Color.Transparent,
+            };
+            inner.Controls.Add(lbl);
+
+            // Secondary hint - lower third.
+            var hint = new Label
+            {
+                Text = "Please do not interact with erwin during this operation.",
+                AutoSize = false,
+                Size = new Size(f.ClientSize.Width - 40, 40),
+                Location = new Point(20, 260),
+                TextAlign = ContentAlignment.MiddleCenter,
+                Font = new Font("Segoe UI", 10.5F, FontStyle.Regular),
+                ForeColor = subtle,
+                BackColor = Color.Transparent,
+            };
+            inner.Controls.Add(hint);
+
+            // Animated dots: cycle "•    ", "• •  ", "• • •", ...
+            int step = 0;
+            var timer = new System.Windows.Forms.Timer { Interval = 350 };
+            timer.Tick += (s, e) =>
+            {
+                step = (step + 1) % 4;
+                spinner.Text = step switch
+                {
+                    0 => "•",
+                    1 => "• •",
+                    2 => "• • •",
+                    _ => "• • • •",
+                };
+            };
+            f.FormClosed += (s, e) => timer.Stop();
+            timer.Start();
+
+            f.Show(this);
+            f.BringToFront();
+            Application.DoEvents();
+            return f;
+        }
+
+        [DllImport("user32.dll")]
+        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+        private const int SW_HIDE = 0;
+        private const int SW_SHOW = 5;
+
+        /// <summary>
+        /// Hides/shows both the overlay and the main ModelConfigForm
+        /// SYNCHRONOUSLY via ShowWindow (not Form.Visible which is async and
+        /// can leave the window on screen during RDP redraw delays). This
+        /// ensures our synthesized click lands on RD, not on our own UI.
+        /// </summary>
+        private void ToggleBusyOverlay(Form overlay, bool visible)
+        {
+            try
+            {
+                int cmd = visible ? SW_SHOW : SW_HIDE;
+                if (overlay != null && !overlay.IsDisposed && overlay.Handle != IntPtr.Zero)
+                    ShowWindow(overlay.Handle, cmd);
+                if (this.Handle != IntPtr.Zero)
+                    ShowWindow(this.Handle, cmd);
+                // Force synchronous paint of whatever is now revealed.
+                Application.DoEvents();
+            }
+            catch { }
         }
 
         private Form ShowLoadingDialog(string message)
