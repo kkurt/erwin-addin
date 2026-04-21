@@ -2235,22 +2235,32 @@ namespace EliteSoft.Erwin.AddIn
             rtbDDLOutput.Text = "";
             Application.DoEvents();
 
-            if (rbFromMart.Checked || rbFromDB.Checked)
+            bool martMode = rbFromMart.Checked;
+            if (rbFromDB.Checked)
             {
-                Log("-- Note: Mart-version / From-DB baseline compare is not wired to the new");
-                Log("         programmatic pipeline yet. Producing 'current model vs last save' alter.");
+                Log("-- From-DB mode is not wired to the new programmatic pipeline yet.");
+                Log("   Falling back to 'current model vs last save' alter.");
             }
+            if (martMode)
+            {
+                Log("-- Mart version compare: relies on EDR transaction tracker capture.");
+                Log("   Prereq: Actions -> Complete Compare -> Right=Mart version -> Compare -> Apply-to-Right.");
+                Log("   If you haven't done that yet, cancel and do it first.");
+            }
+
+            Action<string> log = msg =>
+            {
+                if (InvokeRequired) BeginInvoke(new Action(() => Log(msg)));
+                else Log(msg);
+            };
 
             string script = null;
             string err = null;
             try
             {
-                script = await System.Threading.Tasks.Task.Run(() =>
-                    Services.NativeBridgeService.GenerateAlterDdl(msg =>
-                    {
-                        if (InvokeRequired) BeginInvoke(new Action(() => Log(msg)));
-                        else Log(msg);
-                    }));
+                script = await System.Threading.Tasks.Task.Run(() => martMode
+                    ? Services.NativeBridgeService.GenerateMartMartDdlViaOnFE(log)
+                    : Services.NativeBridgeService.GenerateAlterDdl(log));
             }
             catch (Exception ex)
             {
@@ -2265,15 +2275,28 @@ namespace EliteSoft.Erwin.AddIn
             }
             else if (script == null)
             {
-                lblDDLStatus.Text = "erwin did not return a DDL buffer (see Debug Log).";
-                lblDDLStatus.ForeColor = Color.Red;
-                rtbDDLOutput.Text = "-- FAILED: native bridge returned null. Check Debug Log for 'NativeBridge:' / '[OPEN-WIZ]' lines.\n";
+                if (martMode)
+                {
+                    lblDDLStatus.Text = "Mart compare not ready: do CC + Apply-to-Right first.";
+                    lblDDLStatus.ForeColor = Color.Red;
+                    rtbDDLOutput.Text = "-- FAILED: no right-side modelSet captured yet.\n" +
+                                        "-- Do: Actions > Complete Compare > Right = Mart vN > Compare > Apply-to-Right\n" +
+                                        "-- Then press Generate DDL again.\n";
+                }
+                else
+                {
+                    lblDDLStatus.Text = "erwin did not return a DDL buffer (see Debug Log).";
+                    lblDDLStatus.ForeColor = Color.Red;
+                    rtbDDLOutput.Text = "-- FAILED: native bridge returned null. Check Debug Log.\n";
+                }
             }
             else if (script.Length == 0)
             {
                 lblDDLStatus.Text = "No differences detected.";
                 lblDDLStatus.ForeColor = Color.OrangeRed;
-                rtbDDLOutput.Text = "-- No differences between model and last save.\n";
+                rtbDDLOutput.Text = martMode
+                    ? "-- No differences between current model and Mart baseline.\n"
+                    : "-- No differences between model and last save.\n";
             }
             else
             {
