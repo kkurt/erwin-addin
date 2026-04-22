@@ -1,19 +1,47 @@
 # Elite Soft Erwin Add-In - Install Script
 # Usage:
-#   .\install.ps1                                                    Install (User scope, default)
-#   .\install.ps1 -Scope Machine                                     Install (Machine scope, all users)
+#   .\install.ps1                                                    Install (Machine scope, default - HKLM, needs Admin)
+#   .\install.ps1 -Scope User                                        Install (User scope - HKCU, current user only)
 #   .\install.ps1 -Uninstall                                         Uninstall
+#   .\install.ps1 -?                                                 Show this help
 #
 param(
     [switch]$Uninstall,
     [ValidateSet("User", "Machine")]
-    [string]$Scope = "User"
+    [string]$Scope = "Machine",
+    [Alias("?")]
+    [switch]$Help
 )
 
 $ErrorActionPreference = "Stop"
 
-# Install to user-local directory (no admin needed)
-$installDir = Join-Path $env:LOCALAPPDATA "EliteSoft\ErwinAddIn"
+if ($Help) {
+    Write-Host ""
+    Write-Host "Elite Soft Erwin Add-In - Installer" -ForegroundColor Cyan
+    Write-Host "===================================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "Usage:" -ForegroundColor Yellow
+    Write-Host "  .\install.ps1                     " -NoNewline; Write-Host "Install machine-wide (HKLM, default, requires Admin)" -ForegroundColor Gray
+    Write-Host "  .\install.ps1 -Scope User         " -NoNewline; Write-Host "Install for current user only (HKCU)" -ForegroundColor Gray
+    Write-Host "  .\install.ps1 -Uninstall          " -NoNewline; Write-Host "Uninstall (auto-detects scope from registry.scope file)" -ForegroundColor Gray
+    Write-Host "  .\install.ps1 -?                  " -NoNewline; Write-Host "Show this help" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "Notes:" -ForegroundColor Yellow
+    Write-Host "  - Default is -Scope Machine (production install for all users)" -ForegroundColor Gray
+    Write-Host "  - -Scope Machine writes to HKLM\SOFTWARE\erwin\... (all users)" -ForegroundColor Gray
+    Write-Host "  - -Scope User writes to HKCU\SOFTWARE\erwin\... (current user only)" -ForegroundColor Gray
+    Write-Host "  - Stale entries in the opposite hive are cleaned automatically" -ForegroundColor Gray
+    Write-Host "  - Machine scope requires Admin privileges and erwin to be installed machine-wide" -ForegroundColor Gray
+    Write-Host ""
+    exit 0
+}
+
+# Install dir depends on scope:
+#   User    -> %LOCALAPPDATA%\EliteSoft\ErwinAddIn  (current user only, no admin)
+#   Machine -> %ProgramFiles%\EliteSoft\ErwinAddIn  (all users, Admin required)
+$userInstallDir    = Join-Path $env:LOCALAPPDATA "EliteSoft\ErwinAddIn"
+$machineInstallDir = Join-Path $env:ProgramFiles "EliteSoft\ErwinAddIn"
+$installDir = if ($Scope -eq "Machine") { $machineInstallDir } else { $userInstallDir }
 $comHostDll = "EliteSoft.Erwin.AddIn.comhost.dll"
 $progId = "EliteSoft.Erwin.AddIn"
 $erwinRegBase = "SOFTWARE\erwin\Data Modeler"
@@ -21,14 +49,30 @@ $erwinRegBase = "SOFTWARE\erwin\Data Modeler"
 if ($Uninstall) {
     Write-Host "=== Uninstalling Elite Soft Erwin Add-In ===" -ForegroundColor Cyan
 
-    # Detect scope from installed registry.scope file
+    # Detect actual install location: prefer dir with registry.scope file;
+    # fall back to whichever dir exists. Machine installs write registry.scope=HKLM,
+    # User installs omit the file.
+    $detectedInstallDir = $null
+    if (Test-Path (Join-Path $machineInstallDir "registry.scope")) {
+        $detectedInstallDir = $machineInstallDir
+    } elseif (Test-Path (Join-Path $userInstallDir "registry.scope")) {
+        $detectedInstallDir = $userInstallDir
+    } elseif (Test-Path $machineInstallDir) {
+        $detectedInstallDir = $machineInstallDir
+    } elseif (Test-Path $userInstallDir) {
+        $detectedInstallDir = $userInstallDir
+    }
+    if ($detectedInstallDir) { $installDir = $detectedInstallDir }
+    else { Write-Host "  No existing install found at $machineInstallDir or $userInstallDir" -ForegroundColor Yellow }
+
+    # Detect scope from installed registry.scope file (present only for Machine installs)
     $scopeFile = Join-Path $installDir "registry.scope"
     $uninstallHive = "HKCU"
     if (Test-Path $scopeFile) {
         $content = (Get-Content $scopeFile -Raw).Trim()
         if ($content -eq "HKLM") { $uninstallHive = "HKLM" }
     }
-    Write-Host "  Detected scope: $uninstallHive" -ForegroundColor Gray
+    Write-Host "  Detected scope: $uninstallHive (installDir: $installDir)" -ForegroundColor Gray
 
     # Unregister COM
     $comHost = Join-Path $installDir $comHostDll
@@ -38,14 +82,22 @@ if ($Uninstall) {
         Write-Host "  COM unregistered" -ForegroundColor Green
     }
 
-    # Remove erwin Add-In registry
-    $base = "${uninstallHive}:\$erwinRegBase"
-    if (Test-Path $base) {
-        Get-ChildItem $base -ErrorAction SilentlyContinue | ForEach-Object {
-            $addInPath = "$($_.PSPath)\Add-Ins\Elite Soft Erwin Addin"
-            if (Test-Path $addInPath) {
-                Remove-Item $addInPath -Recurse -Force
-                Write-Host "  Removed erwin Add-In entry from $uninstallHive\$($_.PSChildName)" -ForegroundColor Green
+    # Remove erwin Add-In registry from BOTH hives to avoid stale entries after scope changes.
+    # (Primary scope is $uninstallHive but we clean both for safety.)
+    $oppositeUninstallHive = if ($uninstallHive -eq "HKLM") { "HKCU" } else { "HKLM" }
+    foreach ($hive in @($uninstallHive, $oppositeUninstallHive)) {
+        $base = "${hive}:\$erwinRegBase"
+        if (Test-Path $base) {
+            Get-ChildItem $base -ErrorAction SilentlyContinue | ForEach-Object {
+                $addInPath = "$($_.PSPath)\Add-Ins\Elite Soft Erwin Addin"
+                if (Test-Path $addInPath) {
+                    try {
+                        Remove-Item $addInPath -Recurse -Force -ErrorAction Stop
+                        Write-Host "  Removed erwin Add-In entry from $hive\$($_.PSChildName)" -ForegroundColor Green
+                    } catch {
+                        Write-Host "  WARNING: Could not remove $hive\$($_.PSChildName) Add-In entry: $($_.Exception.Message)" -ForegroundColor Yellow
+                    }
+                }
             }
         }
     }
@@ -63,10 +115,25 @@ if ($Uninstall) {
         if (Test-Path $extPath) { Remove-Item $extPath -Recurse -Force; Write-Host "  Removed Extension config ($hive)" -ForegroundColor Green }
     }
 
-    # Remove files
-    if (Test-Path $installDir) {
-        Remove-Item $installDir -Recurse -Force
-        Write-Host "  Removed $installDir" -ForegroundColor Green
+    # Remove files from BOTH possible install dirs (safety for scope transitions / stale installs)
+    foreach ($dir in @($machineInstallDir, $userInstallDir) | Select-Object -Unique) {
+        if (Test-Path $dir) {
+            try {
+                Remove-Item $dir -Recurse -Force -ErrorAction Stop
+                Write-Host "  Removed $dir" -ForegroundColor Green
+            } catch {
+                Write-Host "  WARNING: Could not remove ${dir}: $($_.Exception.Message)" -ForegroundColor Yellow
+                if ($dir -eq $machineInstallDir) {
+                    Write-Host "           Re-run uninstall as Admin to clean Program Files." -ForegroundColor Gray
+                }
+            }
+        }
+    }
+
+    # Remove per-user watcher logs (current user only; other users' logs stay)
+    $watcherLogDir = Join-Path $env:LOCALAPPDATA "EliteSoft\ErwinAddIn-Logs"
+    if (Test-Path $watcherLogDir) {
+        Remove-Item $watcherLogDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 
     Write-Host "`nUninstall complete!" -ForegroundColor Green
@@ -76,8 +143,26 @@ if ($Uninstall) {
 }
 
 # === INSTALL ===
-Write-Host "=== Installing Elite Soft Erwin Add-In ===" -ForegroundColor Cyan
+Write-Host "=== Installing Elite Soft Erwin Add-In (Scope: $Scope) ===" -ForegroundColor Cyan
 $sourceDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# Enforce admin for Machine scope (HKLM writes require elevation)
+$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if ($Scope -eq "Machine" -and -not $isAdmin) {
+    Write-Host ""
+    Write-Host "  ERROR: -Scope Machine requires Administrator privileges." -ForegroundColor Red
+    Write-Host "         HKLM registry writes will fail without elevation." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  Right-click PowerShell, 'Run as administrator', then re-run:" -ForegroundColor Yellow
+    Write-Host "    .\install.ps1 -Scope Machine" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  Or install for the current user only:" -ForegroundColor Yellow
+    Write-Host "    .\install.ps1                  # default -Scope User" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "Press any key to exit..." -ForegroundColor Gray
+    $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+    exit 1
+}
 
 # Check .NET 10 Desktop Runtime
 $dotnetOk = $false
@@ -167,7 +252,7 @@ if ($Scope -eq "Machine") {
 # Step 2: Register COM component (requires admin for regsvr32)
 Write-Host "`n[2/3] Registering COM component..." -ForegroundColor Yellow
 $comHost = Join-Path $installDir $comHostDll
-$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+# $isAdmin already computed at script start
 if ($isAdmin) {
     regsvr32.exe /s $comHost
 } else {
@@ -188,9 +273,40 @@ if ($LASTEXITCODE -eq 0) {
 
 # Step 3: Register in erwin Add-In Manager
 $regHive = if ($Scope -eq "Machine") { "HKLM" } else { "HKCU" }
+$oppositeHive = if ($regHive -eq "HKLM") { "HKCU" } else { "HKLM" }
 Write-Host "`n[3/3] Registering in erwin Add-In Manager ($regHive)..." -ForegroundColor Yellow
+
+# Step 3a: Clean stale add-in entries in the OPPOSITE hive (prevents old HKCU/HKLM
+# registrations from masking the new scope — this is the root cause of "I chose
+# Machine but it loads from HKCU" bugs).
+$oppositeBase = "${oppositeHive}:\$erwinRegBase"
+if (Test-Path $oppositeBase) {
+    $cleaned = 0
+    Get-ChildItem $oppositeBase -ErrorAction SilentlyContinue | ForEach-Object {
+        $stalePath = "$($_.PSPath)\Add-Ins\Elite Soft Erwin Addin"
+        if (Test-Path $stalePath) {
+            try {
+                Remove-Item $stalePath -Recurse -Force -ErrorAction Stop
+                Write-Host "  Removed stale $oppositeHive\$($_.PSChildName) entry" -ForegroundColor Gray
+                $cleaned++
+            } catch {
+                if ($oppositeHive -eq "HKLM") {
+                    Write-Host "  WARNING: Could not remove stale HKLM entry (needs Admin). Run 'install.ps1 -Scope Machine' as Admin once to clean it, or delete manually." -ForegroundColor Yellow
+                } else {
+                    Write-Host "  WARNING: Could not remove stale ${oppositeHive} entry: $($_.Exception.Message)" -ForegroundColor Yellow
+                }
+            }
+        }
+    }
+    if ($cleaned -gt 0) {
+        Write-Host "  Cleaned $cleaned stale $oppositeHive add-in entr$(if ($cleaned -eq 1) {'y'} else {'ies'})" -ForegroundColor Green
+    }
+}
+
+# Step 3b: Write to target hive
 $base = "${regHive}:\$erwinRegBase"
 if (Test-Path $base) {
+    $registered = 0
     Get-ChildItem $base -ErrorAction SilentlyContinue | ForEach-Object {
         $addInPath = "$($_.PSPath)\Add-Ins\Elite Soft Erwin Addin"
         if (-not (Test-Path $addInPath)) {
@@ -201,9 +317,48 @@ if (Test-Path $base) {
         Set-ItemProperty $addInPath -Name "Invoke Method" -Value "Execute" -Type String
         Set-ItemProperty $addInPath -Name "Invoke EXE" -Value 0 -Type DWord
         Write-Host "  erwin $($_.PSChildName) ($regHive) - OK" -ForegroundColor Green
+        $registered++
+    }
+    if ($registered -eq 0) {
+        Write-Host "  WARNING: erwin root $base exists but has no version subkeys; add-in not registered." -ForegroundColor Yellow
+    }
+
+    # Step 3c: For Machine scope, ALSO write to the installing Admin's HKCU.
+    # erwin DM r10 requires a per-user HKCU Add-In entry to show the add-in in
+    # its Tools menu; HKLM entries alone are not sufficient (empirically
+    # verified). Admin gets their HKCU populated here; every other interactive
+    # user's HKCU is populated by the watcher script (autostart-watcher.ps1)
+    # on their first logon (via the Scheduled Task machine-wide trigger).
+    if ($Scope -eq "Machine") {
+        Get-ChildItem $base -ErrorAction SilentlyContinue | ForEach-Object {
+            $ver = $_.PSChildName
+            $hkcuAddIn = "HKCU:\SOFTWARE\erwin\Data Modeler\$ver\Add-Ins\Elite Soft Erwin Addin"
+            if (-not (Test-Path $hkcuAddIn)) {
+                New-Item -Path $hkcuAddIn -Force | Out-Null
+            }
+            Set-ItemProperty $hkcuAddIn -Name "Menu Identifier" -Value 1 -Type DWord
+            Set-ItemProperty $hkcuAddIn -Name "ProgID" -Value $progId -Type String
+            Set-ItemProperty $hkcuAddIn -Name "Invoke Method" -Value "Execute" -Type String
+            Set-ItemProperty $hkcuAddIn -Name "Invoke EXE" -Value 0 -Type DWord
+            Write-Host "  erwin $ver (HKCU - Admin's user) - OK" -ForegroundColor Green
+        }
     }
 } else {
-    Write-Host "  erwin not found in registry, skipping" -ForegroundColor Yellow
+    # Target hive has no erwin at all — this is a user mistake (wrong scope).
+    Write-Host ""
+    Write-Host "  ERROR: erwin is not installed in $regHive." -ForegroundColor Red
+    Write-Host "         Path not found: $base" -ForegroundColor Gray
+    if ($Scope -eq "Machine") {
+        Write-Host "         erwin seems to be user-installed only. Re-run without -Scope Machine:" -ForegroundColor Yellow
+        Write-Host "           .\install.ps1" -ForegroundColor Cyan
+    } else {
+        Write-Host "         erwin seems to be machine-installed only. Re-run with -Scope Machine (as Admin):" -ForegroundColor Yellow
+        Write-Host "           .\install.ps1 -Scope Machine" -ForegroundColor Cyan
+    }
+    Write-Host ""
+    Write-Host "Press any key to exit..." -ForegroundColor Gray
+    $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+    exit 1
 }
 
 # Configure auto-start watcher (DLL injection based)
@@ -231,17 +386,36 @@ if (Test-Path $watcherSource) {
     # Create Scheduled Task - runs at logon, hidden
     $action = New-ScheduledTaskAction -Execute "powershell.exe" `
         -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watcherTarget`""
-    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-        -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)
 
-    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
-        -Settings $settings -Description "Auto-starts Elite Soft Erwin Add-In when erwin opens (DLL injection)" | Out-Null
-
-    Write-Host "  Scheduled Task '$taskName' created" -ForegroundColor Green
+    if ($Scope -eq "Machine") {
+        # Machine scope: fire for ANY interactive user at their logon, run in that user's session.
+        # Group SID S-1-5-4 = NT AUTHORITY\INTERACTIVE.
+        # MultipleInstances=Parallel is CRITICAL: each user's logon spawns its own watcher
+        # instance in that user's session. With the default IgnoreNew, a stale instance
+        # from a previous logon (whose watcher died but TS hasn't noticed) blocks new
+        # users' logon-triggered instances.
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+            -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) `
+            -MultipleInstances Parallel
+        $trigger = New-ScheduledTaskTrigger -AtLogOn
+        $principal = New-ScheduledTaskPrincipal -GroupId "S-1-5-4" -RunLevel Limited
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal `
+            -Settings $settings -Description "Auto-starts Elite Soft Erwin Add-In for any logged-on user (Machine scope)" | Out-Null
+        Write-Host "  Scheduled Task '$taskName' created (Machine: all interactive users, Parallel instances)" -ForegroundColor Green
+    } else {
+        # User scope: fire only for the installing user. Single instance is fine.
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+            -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)
+        $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
+            -Settings $settings -Description "Auto-starts Elite Soft Erwin Add-In when erwin opens (User scope)" | Out-Null
+        Write-Host "  Scheduled Task '$taskName' created (User: $env:USERNAME)" -ForegroundColor Green
+    }
     Write-Host "  Add-in will auto-load when erwin starts" -ForegroundColor Gray
 
-    # Start watcher immediately (don't wait for next logon)
+    # Start watcher immediately (don't wait for next logon). For Machine scope
+    # this starts the watcher in the installing Admin's session; other users'
+    # watchers start automatically at their next logon.
     Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
 } else {
     Write-Host "  autostart-watcher.ps1 not found in package, skipping" -ForegroundColor Yellow

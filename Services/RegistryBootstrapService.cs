@@ -34,7 +34,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                 {
                     try
                     {
-                        var scopeFile = Path.Combine(AppContext.BaseDirectory, "registry.scope");
+                        // CANNOT use AppContext.BaseDirectory: for a COM-hosted DLL
+                        // loaded into erwin.exe, that returns erwin's install dir,
+                        // not ours. Use this assembly's own location instead so the
+                        // scope file next to our DLL (written by install.ps1) is found.
+                        var asmDir = Path.GetDirectoryName(typeof(RegistryBootstrapService).Assembly.Location);
+                        var scopeFile = Path.Combine(asmDir ?? string.Empty, "registry.scope");
                         if (File.Exists(scopeFile))
                         {
                             var content = File.ReadAllText(scopeFile).Trim();

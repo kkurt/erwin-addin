@@ -49,7 +49,7 @@ Write-Host "=== Elite Soft Erwin Add-In - Package ($format) ===" -ForegroundColo
 # STEP 1: Publish
 Write-Host "`n[1] Publishing release build..." -ForegroundColor Yellow
 dotnet clean ErwinAddIn.csproj -c Release 2>&1 | Out-Null
-dotnet publish ErwinAddIn.csproj -c Release -r win-x64 --self-contained false -o $publishDir
+dotnet publish ErwinAddIn.csproj -c Release -r win-x64 --self-contained false -p:PackagedBuild=true -o $publishDir
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Publish failed!" -ForegroundColor Red

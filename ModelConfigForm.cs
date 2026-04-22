@@ -503,8 +503,23 @@ namespace EliteSoft.Erwin.AddIn
             };
             lblCopyright.MouseDown += (s, e) =>
             {
-                if (e.Button == MouseButtons.Right && Control.ModifierKeys == (Keys.Control | Keys.Shift))
+                if (Control.ModifierKeys != (Keys.Control | Keys.Shift)) return;
+
+                if (e.Button == MouseButtons.Right)
+                {
                     ForceClose();
+                }
+                else if (e.Button == MouseButtons.Left)
+                {
+                    // Hidden reveal: in packaged builds the Debug Log tab is
+                    // removed from the TabControl. Ctrl+Shift+LeftClick on the
+                    // copyright label restores it for the current session.
+                    if (tabDebug != null && !tabControl.TabPages.Contains(tabDebug))
+                    {
+                        tabControl.TabPages.Add(tabDebug);
+                        tabControl.SelectedTab = tabDebug;
+                    }
+                }
             };
             tabGeneral.Controls.Add(lblCopyright);
 
@@ -519,6 +534,13 @@ namespace EliteSoft.Erwin.AddIn
             _lblCorporateValue.Text = "(not loaded)";
             _lblDbValue.Text = "(not loaded)";
             _lblRegistryValue.Text = "(not loaded)";
+
+#if PACKAGED
+            // Packaged distribution: hide Debug Log tab from end users.
+            // Revealed at runtime via Ctrl+Shift+LeftClick on the copyright label above.
+            if (tabDebug != null && tabControl.TabPages.Contains(tabDebug))
+                tabControl.TabPages.Remove(tabDebug);
+#endif
         }
 
         private Panel CreateInfoCard(string title, int x, int y, int w, int h, Color bgColor)
@@ -2269,6 +2291,9 @@ namespace EliteSoft.Erwin.AddIn
                     }
                     else
                     {
+                        // DIAG: dump session PUs to pinpoint stale dirty
+                        // right-version PUs left over from previous runs.
+                        LogSessionPUs("PRE-RUN", log);
                         Services.MartMartAutomation.CCSession sess = null;
                         var overlay = ShowBusyOverlay("Generating DDL, please wait...");
                         Action<bool> toggle = visible =>
@@ -2354,6 +2379,10 @@ namespace EliteSoft.Erwin.AddIn
             {
                 ShowDDLResult(script, "Alter DDL");
                 Log($"DDL produced ({script.Length} chars). Use Copy button to grab it.");
+                // DIAG: dump session PUs AFTER successful DDL so we can
+                // compare to PRE-RUN state and see what stale PUs linger.
+                if (martMode)
+                    LogSessionPUs("POST-RUN", log);
             }
 
             btnAlterWizardProd.Enabled = true;
@@ -3748,6 +3777,72 @@ namespace EliteSoft.Erwin.AddIn
         /// finds the one whose locator matches the target catalog+version,
         /// closes it.
         /// </summary>
+        /// <summary>
+        /// DIAG: enumerates SCAPI.PersistenceUnits and logs each one's
+        /// Name / Locator / Modified flag so we can see exactly which PUs
+        /// survive across DDL-generate runs and whether they are dirty.
+        /// </summary>
+        private void LogSessionPUs(string phase, Action<string> log)
+        {
+            try
+            {
+                dynamic pus = _scapi?.PersistenceUnits;
+                if (pus == null)
+                {
+                    log?.Invoke($"  [DIAG {phase}] no SCAPI session");
+                    return;
+                }
+                int count = 0;
+                try { count = (int)pus.Count; } catch { }
+                log?.Invoke($"  [DIAG {phase}] SCAPI session has {count} PU(s):");
+                for (int i = 0; i < count; i++)
+                {
+                    dynamic pu = null;
+                    try { pu = pus.Item(i); } catch { continue; }
+                    if (pu == null) continue;
+
+                    string name = "?";
+                    try { name = (pu.Name?.ToString()) ?? "?"; } catch { }
+
+                    string locator = "?";
+                    try { locator = pu.PropertyBag()?.Value("Locator")?.ToString() ?? "?"; } catch { }
+
+                    // Try several property names; SCAPI docs are inconsistent.
+                    string dirty = "?";
+                    foreach (var prop in new[] { "Modified", "IsModified", "IsDirty", "Dirty", "HasChanges" })
+                    {
+                        try
+                        {
+                            var val = pu.PropertyBag()?.Value(prop);
+                            if (val != null) { dirty = $"{prop}={val}"; break; }
+                        }
+                        catch { }
+                    }
+                    // Some impls expose Modified as an object property too.
+                    if (dirty == "?")
+                    {
+                        try { dirty = $"pu.Modified={pu.Modified}"; }
+                        catch { }
+                    }
+                    if (dirty == "?")
+                    {
+                        try { dirty = $"pu.IsModified={pu.IsModified}"; }
+                        catch { }
+                    }
+
+                    bool isActive = false;
+                    try { isActive = object.ReferenceEquals(pu, _currentModel); } catch { }
+
+                    log?.Invoke($"    PU[{i}]{(isActive ? " *ACTIVE*" : "")} name='{name}' {dirty}");
+                    log?.Invoke($"           locator='{locator}'");
+                }
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"  [DIAG {phase}] err: {ex.Message}");
+            }
+        }
+
         private void CloseSelectedVersionPU(int rightVersion, string catalog, Action<string> log)
         {
             try

@@ -9,23 +9,60 @@ $modelCheckIntervalSec = 1
 $modelTimeoutSec = 300  # Give up after 5 minutes if no model opened
 $fallbackPollSec = 30
 
-$installDir = Join-Path $env:LOCALAPPDATA "EliteSoft\ErwinAddIn"
-$logFile = Join-Path $installDir "autostart.log"
+# Install dir = watcher's own directory.
+# Works for both User scope (%LOCALAPPDATA%\EliteSoft\ErwinAddIn) and
+# Machine scope (%ProgramFiles%\EliteSoft\ErwinAddIn) without modification.
+$installDir = $PSScriptRoot
 $injectorExe = Join-Path $installDir "ErwinInjector.exe"
 $triggerDll = Join-Path $installDir "TriggerDll.dll"
+
+# Log goes to per-user LOCALAPPDATA so each user on a Machine-scope install
+# has their own log (and Program Files is read-only at runtime anyway).
+$logDir = Join-Path $env:LOCALAPPDATA "EliteSoft\ErwinAddIn-Logs"
+$logFile = Join-Path $logDir "autostart.log"
 
 function Write-Log([string]$msg) {
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $line = "[$ts] $msg"
     try {
-        $dir = Split-Path $logFile -Parent
-        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
         Add-Content -Path $logFile -Value $line -ErrorAction SilentlyContinue
     } catch { }
 }
 
 function Get-MyErwin {
     return Get-Process -Name "erwin" -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $mySessionId }
+}
+
+# erwin DM r10 Add-In discovery requires HKCU entries; HKLM alone is NOT
+# sufficient (empirically verified). On Machine-scope installs the admin writes
+# HKLM + their own HKCU, but every OTHER interactive user has empty HKCU for
+# erwin, so the add-in never appears in their Tools menu. This function
+# mirrors HKLM add-in entries to the CURRENT user's HKCU at watcher startup,
+# making auto-registration first-logon-and-done per user.
+function Register-HKCUAddIn {
+    try {
+        $erwinHKLM = "HKLM:\SOFTWARE\erwin\Data Modeler"
+        if (-not (Test-Path $erwinHKLM)) { return }
+
+        Get-ChildItem $erwinHKLM -ErrorAction SilentlyContinue | ForEach-Object {
+            $version = $_.PSChildName
+            $hklmAddIn = "$($_.PSPath)\Add-Ins\Elite Soft Erwin Addin"
+            if (Test-Path $hklmAddIn) {
+                $hkcuAddIn = "HKCU:\SOFTWARE\erwin\Data Modeler\$version\Add-Ins\Elite Soft Erwin Addin"
+                if (-not (Test-Path $hkcuAddIn)) {
+                    New-Item -Path $hkcuAddIn -Force -ErrorAction Stop | Out-Null
+                    Set-ItemProperty -Path $hkcuAddIn -Name "Menu Identifier" -Value 1 -Type DWord
+                    Set-ItemProperty -Path $hkcuAddIn -Name "ProgID" -Value "EliteSoft.Erwin.AddIn" -Type String
+                    Set-ItemProperty -Path $hkcuAddIn -Name "Invoke Method" -Value "Execute" -Type String
+                    Set-ItemProperty -Path $hkcuAddIn -Name "Invoke EXE" -Value 0 -Type DWord
+                    Write-Log "HKCU add-in entry written for erwin $version (first-time per-user registration)"
+                }
+            }
+        }
+    } catch {
+        Write-Log "HKCU add-in registration failed: $($_.Exception.Message)"
+    }
 }
 
 function Wait-ForModel {
@@ -52,6 +89,10 @@ function Wait-ForModel {
 }
 
 Write-Log "Watcher started (PID=$PID, Session=$mySessionId)"
+
+# Mirror HKLM add-in entries to this user's HKCU if missing (erwin DM r10
+# requires per-user HKCU entry; HKLM alone does NOT make the add-in appear).
+Register-HKCUAddIn
 
 # Kill other watcher instances (prevent duplicates)
 try {

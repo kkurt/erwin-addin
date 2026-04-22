@@ -17,6 +17,13 @@
     <DefaultItemExcludes>$(DefaultItemExcludes);scripts\**\*.cs;tools\**\*.cs</DefaultItemExcludes>
   </PropertyGroup>
 
+  <!-- Packaged distribution build: set via `dotnet publish -p:PackagedBuild=true`.
+       Defines PACKAGED symbol so end-user-facing features (e.g. Debug Log tab)
+       are hidden unless revealed via Ctrl+Shift+LeftClick on the copyright label. -->
+  <PropertyGroup Condition="'$(PackagedBuild)' == 'true'">
+    <DefineConstants>$(DefineConstants);PACKAGED</DefineConstants>
+  </PropertyGroup>
+
   <ItemGroup>
     <!-- ADO.NET providers for multi-database support -->
     <PackageReference Include="ExcelDataReader" Version="3.7.0" />
