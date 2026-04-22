@@ -454,10 +454,194 @@ namespace EliteSoft.Erwin.AddIn.Services
                 {
                     log?.Invoke("  cleanup: Close CC wizard");
                     PostMessage(s.CCWizard, WM_COMMAND, MakeWParam(CC_CLOSE, 0), IntPtr.Zero);
-                    Thread.Sleep(200);
+                    // CC wizard's Close button pops up the "Close Model"
+                    // dialog when it has dirty models opened by the wizard
+                    // (e.g. the right-side Mart PU that got dirtied by
+                    // Apply-to-Right). We must drive that dialog and the
+                    // potential "Mart Offline" sub-dialog to avoid leaving
+                    // a stale dirty PU in erwin's session (which causes the
+                    // 2nd-run "compare-to-itself" cache issue).
+                    HandleCloseModelDialogChain(log);
                 }
             }
             catch (Exception ex) { log?.Invoke($"  CloseSession err: {ex.Message}"); }
+        }
+
+        /// <summary>
+        /// Drives the two-step dialog chain that erwin shows when closing a
+        /// wizard that has dirty opened models: (1) "Close Model" dialog with
+        /// a ListView of dirty models - uncheck the Mart-opened row whose
+        /// name ends in '*' so it's discarded instead of saved, then OK.
+        /// (2) "Mart Offline" dialog (may be skipped if user has previously
+        /// ticked "don't show this in future") - switch the "Save to" combo
+        /// to "Close" and OK. Mirrors the exact manual user flow verified by
+        /// screenshots so there's no hidden erwin-internal state divergence.
+        /// </summary>
+        private static void HandleCloseModelDialogChain(Action<string> log)
+        {
+            try
+            {
+                IntPtr closeDlg = WaitForDialog("Close Model", 3000);
+                if (closeDlg == IntPtr.Zero)
+                {
+                    log?.Invoke("  cleanup: no 'Close Model' dialog appeared (wizard closed directly)");
+                    return;
+                }
+                log?.Invoke($"  cleanup: 'Close Model' dialog = 0x{closeDlg.ToInt64():X}");
+
+                var root = AutomationElement.FromHandle(closeDlg);
+                if (root == null)
+                {
+                    log?.Invoke("  cleanup: UIA FromHandle returned null on Close Model dialog");
+                    return;
+                }
+
+                int uncheckedCount = 0;
+                try
+                {
+                    // Find DataItems under the dialog - each is a row in the
+                    // Close Model ListView. The row's TogglePattern is on
+                    // the row itself (not on a child checkbox cell).
+                    var itemsCond = new OrCondition(
+                        new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.DataItem),
+                        new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ListItem));
+                    var items = root.FindAll(TreeScope.Descendants, itemsCond);
+                    log?.Invoke($"  cleanup: Close Model has {items.Count} row(s)");
+                    foreach (AutomationElement row in items)
+                    {
+                        string rowName = "";
+                        try { rowName = row.Current.Name ?? ""; } catch { }
+                        log?.Invoke($"    row name='{rowName}'");
+
+                        // Target: Mart-opened model whose name contains '*'
+                        // (dirty indicator). The Name property of the row
+                        // usually concatenates all column texts, so it
+                        // carries both the model-name asterisk and the
+                        // Mart path.
+                        bool isMart = rowName.IndexOf("Mart://", StringComparison.OrdinalIgnoreCase) >= 0
+                                   || rowName.IndexOf("Mart:\\", StringComparison.OrdinalIgnoreCase) >= 0;
+                        bool isDirty = rowName.Contains("*");
+                        if (!(isMart && isDirty))
+                        {
+                            log?.Invoke("    (skip: not a Mart-opened dirty row)");
+                            continue;
+                        }
+
+                        if (row.TryGetCurrentPattern(TogglePattern.Pattern, out object togObj))
+                        {
+                            var tog = (TogglePattern)togObj;
+                            var st = tog.Current.ToggleState;
+                            log?.Invoke($"    current ToggleState={st}");
+                            if (st == ToggleState.On)
+                            {
+                                tog.Toggle();
+                                uncheckedCount++;
+                                log?.Invoke("    unchecked via row TogglePattern");
+                            }
+                            else
+                            {
+                                log?.Invoke("    already off - skipping toggle");
+                            }
+                            continue;
+                        }
+
+                        // Fallback: search for a child CheckBox and toggle it.
+                        var cbCond = new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.CheckBox);
+                        var cb = row.FindFirst(TreeScope.Descendants, cbCond);
+                        if (cb != null && cb.TryGetCurrentPattern(TogglePattern.Pattern, out object cbTog))
+                        {
+                            var tog = (TogglePattern)cbTog;
+                            if (tog.Current.ToggleState == ToggleState.On)
+                            {
+                                tog.Toggle();
+                                uncheckedCount++;
+                                log?.Invoke("    unchecked via child CheckBox TogglePattern");
+                            }
+                        }
+                        else
+                        {
+                            log?.Invoke("    WARN: no TogglePattern on row or child CheckBox");
+                        }
+                    }
+                }
+                catch (Exception ex) { log?.Invoke($"  cleanup: iterate rows err: {ex.Message}"); }
+
+                log?.Invoke($"  cleanup: unchecked {uncheckedCount} Mart-dirty row(s), clicking OK");
+                if (!ClickButtonByName(root, new[] { "OK", "Tamam" }))
+                    log?.Invoke("  cleanup: WARN could not find OK button on Close Model dialog");
+
+                // Step 2: optional "Mart Offline" dialog.
+                Thread.Sleep(400);
+                IntPtr martOffline = WaitForDialog("Mart Offline", 2000);
+                if (martOffline == IntPtr.Zero)
+                {
+                    log?.Invoke("  cleanup: 'Mart Offline' dialog did not appear (may be suppressed)");
+                    return;
+                }
+                log?.Invoke($"  cleanup: 'Mart Offline' dialog = 0x{martOffline.ToInt64():X}");
+                var offRoot = AutomationElement.FromHandle(martOffline);
+                if (offRoot == null)
+                {
+                    log?.Invoke("  cleanup: UIA FromHandle returned null on Mart Offline dialog");
+                    return;
+                }
+
+                try
+                {
+                    // "Save to" ComboBox - set to "Close".
+                    var comboCond = new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ComboBox);
+                    var combos = offRoot.FindAll(TreeScope.Descendants, comboCond);
+                    log?.Invoke($"  cleanup: Mart Offline has {combos.Count} combo(s)");
+                    bool setCombo = false;
+                    foreach (AutomationElement combo in combos)
+                    {
+                        // Prefer ValuePattern.SetValue("Close") - simplest
+                        // path and mimics typing the option name.
+                        if (combo.TryGetCurrentPattern(ValuePattern.Pattern, out object vp))
+                        {
+                            try
+                            {
+                                ((ValuePattern)vp).SetValue("Close");
+                                log?.Invoke("    combo set via ValuePattern -> 'Close'");
+                                setCombo = true;
+                                break;
+                            }
+                            catch { /* fall through to expand-and-select */ }
+                        }
+
+                        // Fallback: expand + find SelectionItem named "Close".
+                        if (combo.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out object ec))
+                        {
+                            try
+                            {
+                                ((ExpandCollapsePattern)ec).Expand();
+                                Thread.Sleep(150);
+                                var itemCond = new AndCondition(
+                                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ListItem),
+                                    new PropertyCondition(AutomationElement.NameProperty, "Close"));
+                                var item = combo.FindFirst(TreeScope.Descendants, itemCond);
+                                if (item != null && item.TryGetCurrentPattern(SelectionItemPattern.Pattern, out object sip))
+                                {
+                                    ((SelectionItemPattern)sip).Select();
+                                    log?.Invoke("    combo set via Expand+Select -> 'Close'");
+                                    setCombo = true;
+                                    break;
+                                }
+                                ((ExpandCollapsePattern)ec).Collapse();
+                            }
+                            catch { }
+                        }
+                    }
+                    if (!setCombo) log?.Invoke("  cleanup: WARN could not set 'Save to' combo to 'Close'");
+                }
+                catch (Exception ex) { log?.Invoke($"  cleanup: combo err: {ex.Message}"); }
+
+                Thread.Sleep(200);
+                if (!ClickButtonByName(offRoot, new[] { "OK", "Tamam" }))
+                    log?.Invoke("  cleanup: WARN could not find OK button on Mart Offline dialog");
+                log?.Invoke("  cleanup: Mart Offline dismissed with Close+OK");
+            }
+            catch (Exception ex) { log?.Invoke($"  HandleCloseModelDialogChain err: {ex.Message}"); }
         }
 
         /// <summary>
@@ -977,6 +1161,48 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
             log?.Invoke($"  [{label}] did not appear within {timeoutMs}ms");
             return IntPtr.Zero;
+        }
+
+        /// <summary>
+        /// Spawns a background worker that polls for an "erwin Data Modeler"
+        /// popup for up to <paramref name="timeoutMs"/> milliseconds. When
+        /// the popup shows up, it clicks No/Hayır/Cancel/İptal via UIA,
+        /// logs it, then terminates. Used around a blocking
+        /// <c>pu.Close()</c> call that can raise a "Save changes?" prompt
+        /// for a dirty PU: caller starts the watcher, invokes Close() on
+        /// the UI thread, then awaits the watcher Task to settle.
+        /// </summary>
+        public static Task DismissErwinPopupInBackground(int timeoutMs, Action<string> log)
+        {
+            return Task.Run(() =>
+            {
+                int deadline = Environment.TickCount + timeoutMs;
+                while (unchecked(Environment.TickCount - deadline) < 0)
+                {
+                    try
+                    {
+                        IntPtr popup = WaitForDialog("erwin Data Modeler", 200);
+                        if (popup != IntPtr.Zero)
+                        {
+                            string title = GetTitle(popup);
+                            log?.Invoke($"  [CLEANUP] popup '{title}' detected - dismissing with No");
+                            try
+                            {
+                                var pop = AutomationElement.FromHandle(popup);
+                                if (pop != null)
+                                    ClickButtonByName(pop, new[] { "No", "Hayır", "Cancel", "İptal" });
+                            }
+                            catch (Exception ex)
+                            {
+                                log?.Invoke($"  [CLEANUP] dismiss err: {ex.Message}");
+                            }
+                            return;
+                        }
+                    }
+                    catch { }
+                    Thread.Sleep(100);
+                }
+            });
         }
 
         private static IntPtr WaitForDialog(string titleContains, int timeoutMs)

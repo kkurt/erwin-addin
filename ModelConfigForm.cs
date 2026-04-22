@@ -2381,6 +2381,10 @@ namespace EliteSoft.Erwin.AddIn
                 Log($"DDL produced ({script.Length} chars). Use Copy button to grab it.");
                 // DIAG: dump session PUs AFTER successful DDL so we can
                 // compare to PRE-RUN state and see what stale PUs linger.
+                // NOTE: we deliberately do NOT auto-remove the stale v1 PU
+                // here: PersistenceUnits.Remove(pu,false) crashes erwin
+                // (CC engine still holds internal references to v1 after
+                // cleanup). Needs a different strategy.
                 if (martMode)
                     LogSessionPUs("POST-RUN", log);
             }
@@ -3864,22 +3868,41 @@ namespace EliteSoft.Erwin.AddIn
                     try { locator = pu.PropertyBag()?.Value("Locator")?.ToString() ?? ""; } catch { }
                     string name = "";
                     try { name = pu.Name?.ToString() ?? ""; } catch { }
+                    // Skip the active model; we only want to evict the right-
+                    // side stale PU that CC loaded, never the active left.
+                    bool isActive = false;
+                    try { isActive = object.ReferenceEquals(pu, _currentModel); } catch { }
                     // Match the right-side PU: same catalog, and Locator
                     // carries version info like "...?version=1" or similar.
-                    bool looksRight = !string.IsNullOrEmpty(locator)
+                    bool looksRight = !isActive
+                        && !string.IsNullOrEmpty(locator)
                         && locator.IndexOf(catalog, StringComparison.OrdinalIgnoreCase) >= 0
                         && locator.IndexOf($"version={rightVersion}", StringComparison.OrdinalIgnoreCase) >= 0;
-                    log?.Invoke($"  PU[{i}] name='{name}' locator='{locator}' {(looksRight ? "<-- TARGET" : "")}");
+                    log?.Invoke($"  PU[{i}] name='{name}'{(isActive ? " *ACTIVE*" : "")} locator='{locator}' {(looksRight ? "<-- TARGET" : "")}");
                     if (looksRight)
                     {
+                        // Per SCAPI reference guide 15.0 p.267:
+                        //   Application.PersistenceUnits.Remove(pu, False)
+                        // The 2nd arg is "save before remove" - False means
+                        // drop the in-memory dirty state without prompting
+                        // a save dialog. Directly invoking pu.Close() does
+                        // NOT exist on the COM object (no-such-member error);
+                        // the collection's Remove is the right API.
                         try
                         {
-                            pu.Close();
-                            log?.Invoke($"  closed right-side PU[{i}]");
+                            pus.Remove(pu, false);
+                            log?.Invoke($"  removed right-side PU[{i}] (save=false)");
                         }
                         catch (Exception cex)
                         {
-                            log?.Invoke($"  Close() err: {cex.Message}");
+                            log?.Invoke($"  Remove() err: {cex.Message}");
+                            // Belt-and-braces fallback with the save-prompt
+                            // watcher in case another SCAPI build exposes
+                            // Close() instead.
+                            var watcher = Services.MartMartAutomation.DismissErwinPopupInBackground(4000, log);
+                            try { pu.Close(); log?.Invoke($"  fallback Close() ok"); }
+                            catch (Exception cex2) { log?.Invoke($"  fallback Close() err: {cex2.Message}"); }
+                            try { watcher?.Wait(500); } catch { }
                         }
                     }
                 }
