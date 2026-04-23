@@ -4,6 +4,8 @@ using System.Text.Json.Serialization;
 
 using EliteSoft.Erwin.AlterDdl.ComInterop;
 using EliteSoft.Erwin.AlterDdl.Core.Abstractions;
+using EliteSoft.Erwin.AlterDdl.Core.Emitting;
+using EliteSoft.Erwin.AlterDdl.Core.Emitting.Dialect;
 using EliteSoft.Erwin.AlterDdl.Core.Models;
 using EliteSoft.Erwin.AlterDdl.Core.Pipeline;
 
@@ -52,10 +54,13 @@ public static class Program
         var includeDdlOption = new Option<bool>(
             aliases: ["--include-create-ddl"],
             description: "Also run FEModel_DDL on each side and attach DdlArtifact to the result");
+        var emitSqlOption = new Option<FileInfo?>(
+            aliases: ["--emit-sql"],
+            description: "Emit alter SQL for the target server into this file (MSSQL in Phase 3.C; Oracle + Db2 in 3.E)");
 
         var root = new RootCommand("erwin-ddl-diff: produce a typed Change list for two .erwin models")
         {
-            leftOption, rightOption, outOption, levelOption, optionSetOption, sessionMode, artifactsDir, verboseOption, includeDdlOption,
+            leftOption, rightOption, outOption, levelOption, optionSetOption, sessionMode, artifactsDir, verboseOption, includeDdlOption, emitSqlOption,
         };
 
         root.SetHandler(async ctx =>
@@ -69,9 +74,10 @@ public static class Program
             var artifacts = ctx.ParseResult.GetValueForOption(artifactsDir);
             var verbose = ctx.ParseResult.GetValueForOption(verboseOption);
             var includeDdl = ctx.ParseResult.GetValueForOption(includeDdlOption);
+            var emitSql = ctx.ParseResult.GetValueForOption(emitSqlOption);
 
             ctx.ExitCode = await RunAsync(
-                left, right, outFile, level, preset, mode, artifacts, verbose, includeDdl, ctx.GetCancellationToken());
+                left, right, outFile, level, preset, mode, artifacts, verbose, includeDdl, emitSql, ctx.GetCancellationToken());
         });
 
         return await root.InvokeAsync(args);
@@ -80,7 +86,7 @@ public static class Program
     private static async Task<int> RunAsync(
         FileInfo left, FileInfo right, FileInfo outFile,
         string level, string preset, string sessionMode, DirectoryInfo? artifactsDir,
-        bool verbose, bool includeDdl, CancellationToken ct)
+        bool verbose, bool includeDdl, FileInfo? emitSql, CancellationToken ct)
     {
         ConfigureLogging(verbose);
         var logger = CreateLogger();
@@ -140,6 +146,35 @@ public static class Program
             {
                 logger.LogError(ex, "failed to write JSON result");
                 return ExitCodes.DiffParsingFailed;
+            }
+
+            if (emitSql is not null)
+            {
+                try
+                {
+                    var registry = new SqlEmitterRegistry()
+                        .Register(new MssqlEmitter(), "SQL Server", "MSSQL", "SQLServer");
+                    if (!registry.TryResolve(result.RightMetadata.TargetServer, out var emitter))
+                    {
+                        logger.LogWarning(
+                            "no SQL emitter for Target_Server '{Target}'; skipping --emit-sql (Phase 3.E adds Oracle + Db2)",
+                            result.RightMetadata.TargetServer);
+                    }
+                    else
+                    {
+                        var script = emitter.Emit(result);
+                        await File.WriteAllTextAsync(emitSql.FullName, script.ToScript(),
+                            new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false), ct);
+                        logger.LogInformation(
+                            "OK: emitted {N} {Dialect} statements to {Path}",
+                            script.Statements.Count, script.Dialect, emitSql.FullName);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex, "failed to emit alter SQL");
+                    return ExitCodes.AlterDdlFailed;
+                }
             }
 
             logger.LogInformation(
