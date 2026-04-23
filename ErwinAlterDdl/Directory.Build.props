@@ -8,4 +8,23 @@
     <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
   </PropertyGroup>
+
+  <!-- NuGet package metadata shared by all packable projects.
+       Individual csprojs opt in with <IsPackable>true</IsPackable> and
+       override Description / PackageTags where appropriate. -->
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <Version>0.1.0-alpha</Version>
+    <Authors>EliteSoft</Authors>
+    <Company>EliteSoft</Company>
+    <Copyright>Copyright (c) 2026 EliteSoft</Copyright>
+    <RepositoryUrl>https://github.com/kkurt/erwin-addin</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageProjectUrl>https://github.com/kkurt/erwin-addin</PackageProjectUrl>
+    <PackageTags>erwin;data-modeler;alter-ddl;schema-diff;mssql;oracle;db2</PackageTags>
+    <PackageReleaseNotes>See PACKAGE_RELEASE_NOTES.md in the repository.</PackageReleaseNotes>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
 </Project>

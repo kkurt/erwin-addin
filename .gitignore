@@ -5,6 +5,11 @@ bin/
 obj/
 tmpclaude-*
 
+# NuGet pack output (ErwinAlterDdl.slnx)
+ErwinAlterDdl/artifacts/
+*.nupkg
+*.snupkg
+
 .claude/*/
 .claude-flow/
 dist/

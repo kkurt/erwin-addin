@@ -4,10 +4,17 @@
     <PlatformTarget>x64</PlatformTarget>
     <RootNamespace>EliteSoft.Erwin.AlterDdl.ComInterop</RootNamespace>
     <AssemblyName>EliteSoft.Erwin.AlterDdl.ComInterop</AssemblyName>
+    <!-- Packaged alongside Core for consumers that need SCAPI integration. -->
+    <IsPackable>true</IsPackable>
     <PackageId>EliteSoft.Erwin.AlterDdl.ComInterop</PackageId>
-    <Version>0.1.0-alpha</Version>
+    <Description>erwin Data Modeler alter-DDL COM integration: in-process and out-of-process ISCPersistenceUnit sessions (SCAPI r10.10) feeding the ErwinAlterDdl.Core correlation engine.</Description>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\ErwinAlterDdl.Core\ErwinAlterDdl.Core.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 </Project>

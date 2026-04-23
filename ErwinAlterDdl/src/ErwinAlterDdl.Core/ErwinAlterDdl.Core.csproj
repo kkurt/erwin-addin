@@ -3,14 +3,19 @@
     <TargetFramework>net10.0</TargetFramework>
     <RootNamespace>EliteSoft.Erwin.AlterDdl.Core</RootNamespace>
     <AssemblyName>EliteSoft.Erwin.AlterDdl.Core</AssemblyName>
-    <!-- Publishable as NuGet package for downstream consumers (internal or OSS) -->
+    <!-- Publishable as NuGet package for downstream consumers (internal or OSS). -->
+    <IsPackable>true</IsPackable>
     <PackageId>EliteSoft.Erwin.AlterDdl.Core</PackageId>
-    <Version>0.1.0-alpha</Version>
-    <Authors>EliteSoft</Authors>
-    <Description>Erwin Data Modeler alter-DDL generation core: SCAPI-agnostic XLS+XML correlation engine.</Description>
+    <Description>erwin Data Modeler alter-DDL generation core: SCAPI-agnostic correlation of CompleteCompare XLS, .erwin XML ObjectId maps, and FEModel_DDL CREATE scripts into a typed Change list + MSSQL / Oracle / Db2 alter SQL.</Description>
+    <!-- Enable IntelliSense XML in the package -->
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="HtmlAgilityPack" Version="1.11.72" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="9.0.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 </Project>
