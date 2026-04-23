@@ -49,6 +49,15 @@ public sealed class MssqlEmitter : ISqlEmitter
                 ForeignKeyAdded fa => EmitForeignKeyAdded(fa),
                 ForeignKeyDropped fd => EmitForeignKeyDropped(fd),
                 ForeignKeyRenamed fr => EmitForeignKeyRenamed(fr),
+                ViewAdded va => new($"-- TODO: CREATE VIEW {Quote(va.Target.Name)} AS <body from v2 DDL>", $"add view {va.Target.Name}"),
+                ViewDropped vd => new($"DROP VIEW {Quote(vd.Target.Name)};", $"drop view {vd.Target.Name}"),
+                ViewRenamed vr => new($"EXEC sp_rename '{vr.OldName}', '{vr.Target.Name}';", $"rename view {vr.OldName} -> {vr.Target.Name}"),
+                TriggerAdded ta => new($"-- TODO: CREATE TRIGGER {Quote(ta.Target.Name)} body from v2 model", $"add trigger {ta.Target.Name}"),
+                TriggerDropped td => new($"DROP TRIGGER {Quote(td.Target.Name)};", $"drop trigger {td.Target.Name}"),
+                TriggerRenamed tr => new($"EXEC sp_rename '{tr.OldName}', '{tr.Target.Name}';", $"rename trigger {tr.OldName} -> {tr.Target.Name}"),
+                SequenceAdded sa => new($"-- TODO: CREATE SEQUENCE {Quote(sa.Target.Name)} <options from v2 model>", $"add sequence {sa.Target.Name}"),
+                SequenceDropped sd => new($"DROP SEQUENCE {Quote(sd.Target.Name)};", $"drop sequence {sd.Target.Name}"),
+                SequenceRenamed sr => new($"EXEC sp_rename '{sr.OldName}', '{sr.Target.Name}';", $"rename sequence {sr.OldName} -> {sr.Target.Name}"),
                 _ => null,
             };
             if (emitted is not null) stmts.Add(emitted);

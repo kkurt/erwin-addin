@@ -25,6 +25,15 @@ namespace EliteSoft.Erwin.AlterDdl.Core.Models;
 [JsonDerivedType(typeof(ForeignKeyAdded), nameof(ForeignKeyAdded))]
 [JsonDerivedType(typeof(ForeignKeyDropped), nameof(ForeignKeyDropped))]
 [JsonDerivedType(typeof(ForeignKeyRenamed), nameof(ForeignKeyRenamed))]
+[JsonDerivedType(typeof(ViewAdded), nameof(ViewAdded))]
+[JsonDerivedType(typeof(ViewDropped), nameof(ViewDropped))]
+[JsonDerivedType(typeof(ViewRenamed), nameof(ViewRenamed))]
+[JsonDerivedType(typeof(TriggerAdded), nameof(TriggerAdded))]
+[JsonDerivedType(typeof(TriggerDropped), nameof(TriggerDropped))]
+[JsonDerivedType(typeof(TriggerRenamed), nameof(TriggerRenamed))]
+[JsonDerivedType(typeof(SequenceAdded), nameof(SequenceAdded))]
+[JsonDerivedType(typeof(SequenceDropped), nameof(SequenceDropped))]
+[JsonDerivedType(typeof(SequenceRenamed), nameof(SequenceRenamed))]
 public abstract record Change(ObjectRef Target);
 
 // ---------- Entity-level ----------
@@ -92,6 +101,20 @@ public sealed record ForeignKeyAdded(ObjectRef Target) : Change(Target);
 public sealed record ForeignKeyDropped(ObjectRef Target) : Change(Target);
 
 public sealed record ForeignKeyRenamed(ObjectRef Target, string OldName) : Change(Target);
+
+// ---------- View / Trigger / Sequence ----------
+
+public sealed record ViewAdded(ObjectRef Target) : Change(Target);
+public sealed record ViewDropped(ObjectRef Target) : Change(Target);
+public sealed record ViewRenamed(ObjectRef Target, string OldName) : Change(Target);
+
+public sealed record TriggerAdded(ObjectRef Target, ObjectRef? OwningEntity = null) : Change(Target);
+public sealed record TriggerDropped(ObjectRef Target, ObjectRef? OwningEntity = null) : Change(Target);
+public sealed record TriggerRenamed(ObjectRef Target, string OldName, ObjectRef? OwningEntity = null) : Change(Target);
+
+public sealed record SequenceAdded(ObjectRef Target) : Change(Target);
+public sealed record SequenceDropped(ObjectRef Target) : Change(Target);
+public sealed record SequenceRenamed(ObjectRef Target, string OldName) : Change(Target);
 
 /// <summary>
 /// NULL / NOT NULL flip on an attribute. The XLS row is "Null Option" with

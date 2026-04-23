@@ -27,6 +27,9 @@ public static class ChangeCorrelator
         CorrelateAttributePropertyChanges(leftMap, rightMap, xlsRows, changes);
         CorrelateKeyGroups(leftMap, rightMap, changes);
         CorrelateRelationships(leftMap, rightMap, changes);
+        CorrelateViews(leftMap, rightMap, changes);
+        CorrelateTriggers(leftMap, rightMap, changes);
+        CorrelateSequences(leftMap, rightMap, changes);
 
         // Deterministic order: stable by (Target.Class, Target.Name, kind name).
         return changes
@@ -348,6 +351,71 @@ public static class ChangeCorrelator
         if (name.StartsWith("XAK", StringComparison.OrdinalIgnoreCase)) return KeyGroupKind.UniqueConstraint;
         if (name.StartsWith("XIE", StringComparison.OrdinalIgnoreCase)) return KeyGroupKind.InversionEntry;
         return KeyGroupKind.Index;
+    }
+
+    private static void CorrelateViews(ErwinModelMap left, ErwinModelMap right, List<Change> sink)
+    {
+        // erwin represents views under class "View" in its metamodel.
+        var lv = left.ObjectsOfClass("View").ToDictionary(o => o.ObjectId, o => o, StringComparer.Ordinal);
+        var rv = right.ObjectsOfClass("View").ToDictionary(o => o.ObjectId, o => o, StringComparer.Ordinal);
+
+        foreach (var id in rv.Keys.Except(lv.Keys)) sink.Add(new ViewAdded(rv[id]));
+        foreach (var id in lv.Keys.Except(rv.Keys)) sink.Add(new ViewDropped(lv[id]));
+        foreach (var id in lv.Keys.Intersect(rv.Keys))
+        {
+            if (!string.Equals(lv[id].Name, rv[id].Name, StringComparison.Ordinal))
+                sink.Add(new ViewRenamed(rv[id], lv[id].Name));
+        }
+    }
+
+    private static void CorrelateTriggers(ErwinModelMap left, ErwinModelMap right, List<Change> sink)
+    {
+        // erwin's Trigger_Template class holds user-defined triggers.
+        // Built-in RI trigger templates (Default_Trigger_Template) are excluded
+        // to avoid noise from erwin's referential-integrity generators.
+        var lt = left.ObjectsOfClass("Trigger_Template").ToDictionary(o => o.ObjectId, o => o, StringComparer.Ordinal);
+        var rt = right.ObjectsOfClass("Trigger_Template").ToDictionary(o => o.ObjectId, o => o, StringComparer.Ordinal);
+
+        foreach (var id in rt.Keys.Except(lt.Keys))
+        {
+            var trg = rt[id];
+            var owner = (trg.ParentObjectId is not null && right.TryGetById(trg.ParentObjectId, out var p) && p.Class == "Entity") ? p : null;
+            sink.Add(new TriggerAdded(trg, owner));
+        }
+        foreach (var id in lt.Keys.Except(rt.Keys))
+        {
+            var trg = lt[id];
+            var owner = (trg.ParentObjectId is not null && left.TryGetById(trg.ParentObjectId, out var p) && p.Class == "Entity") ? p : null;
+            sink.Add(new TriggerDropped(trg, owner));
+        }
+        foreach (var id in lt.Keys.Intersect(rt.Keys))
+        {
+            if (!string.Equals(lt[id].Name, rt[id].Name, StringComparison.Ordinal))
+            {
+                var trg = rt[id];
+                var owner = (trg.ParentObjectId is not null && right.TryGetById(trg.ParentObjectId, out var p) && p.Class == "Entity") ? p : null;
+                sink.Add(new TriggerRenamed(trg, lt[id].Name, owner));
+            }
+        }
+    }
+
+    private static void CorrelateSequences(ErwinModelMap left, ErwinModelMap right, List<Change> sink)
+    {
+        // Oracle / Db2 sequences show up under class "Sequence" in the
+        // erwin metamodel (name may vary by DBMS adapter; we include common
+        // candidates to stay tolerant).
+        foreach (var cls in new[] { "Sequence", "ER_Sequence", "Oracle_Sequence" })
+        {
+            var ls = left.ObjectsOfClass(cls).ToDictionary(o => o.ObjectId, o => o, StringComparer.Ordinal);
+            var rs = right.ObjectsOfClass(cls).ToDictionary(o => o.ObjectId, o => o, StringComparer.Ordinal);
+            foreach (var id in rs.Keys.Except(ls.Keys)) sink.Add(new SequenceAdded(rs[id]));
+            foreach (var id in ls.Keys.Except(rs.Keys)) sink.Add(new SequenceDropped(ls[id]));
+            foreach (var id in ls.Keys.Intersect(rs.Keys))
+            {
+                if (!string.Equals(ls[id].Name, rs[id].Name, StringComparison.Ordinal))
+                    sink.Add(new SequenceRenamed(rs[id], ls[id].Name));
+            }
+        }
     }
 
     private static ObjectRef? ResolveParentEntity(ErwinModelMap map, ObjectRef child)
