@@ -301,9 +301,28 @@ public static class ChangeCorrelator
         var lk = left.ObjectsOfClass("Key_Group").ToDictionary(o => o.ObjectId, o => o, StringComparer.Ordinal);
         var rk = right.ObjectsOfClass("Key_Group").ToDictionary(o => o.ObjectId, o => o, StringComparer.Ordinal);
 
+        // Dedup guard: erwin sometimes reassigns a KeyGroup's ObjectId across
+        // exports even though its parent entity and name are unchanged. A naive
+        // set-diff would emit DROP of the old id plus ADD of the new id, which
+        // the DBA would have to manually deduplicate. Collapse those pairs by
+        // (parentObjectId, name) so identity churn stays silent.
+        var rightByParentAndName = rk.Values
+            .Where(kg => kg.ParentObjectId is not null)
+            .ToLookup(kg => KeyOf(kg.ParentObjectId!, kg.Name), StringComparer.Ordinal);
+        var leftByParentAndName = lk.Values
+            .Where(kg => kg.ParentObjectId is not null)
+            .ToLookup(kg => KeyOf(kg.ParentObjectId!, kg.Name), StringComparer.Ordinal);
+
         foreach (var id in rk.Keys.Except(lk.Keys))
         {
             var kg = rk[id];
+            if (kg.ParentObjectId is not null
+                && leftByParentAndName.Contains(KeyOf(kg.ParentObjectId, kg.Name)))
+            {
+                // matching (parent, name) exists on the left side under a
+                // different ObjectId -> identity churn, not a real add
+                continue;
+            }
             var parent = (kg.ParentObjectId is not null && right.TryGetById(kg.ParentObjectId, out var p))
                 ? p : UnknownParent();
             sink.Add(new KeyGroupAdded(kg, parent, GuessKind(kg.Name)));
@@ -311,6 +330,11 @@ public static class ChangeCorrelator
         foreach (var id in lk.Keys.Except(rk.Keys))
         {
             var kg = lk[id];
+            if (kg.ParentObjectId is not null
+                && rightByParentAndName.Contains(KeyOf(kg.ParentObjectId, kg.Name)))
+            {
+                continue;
+            }
             var parent = (kg.ParentObjectId is not null && left.TryGetById(kg.ParentObjectId, out var p))
                 ? p : UnknownParent();
             sink.Add(new KeyGroupDropped(kg, parent, GuessKind(kg.Name)));
@@ -326,6 +350,9 @@ public static class ChangeCorrelator
             }
         }
     }
+
+    private static string KeyOf(string parentObjectId, string name) =>
+        parentObjectId + "\0" + name;
 
     private static void CorrelateRelationships(ErwinModelMap left, ErwinModelMap right, List<Change> sink)
     {

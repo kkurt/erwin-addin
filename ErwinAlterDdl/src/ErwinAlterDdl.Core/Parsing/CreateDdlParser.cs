@@ -3,15 +3,13 @@ using System.Text.RegularExpressions;
 namespace EliteSoft.Erwin.AlterDdl.Core.Parsing;
 
 /// <summary>
-/// Minimal column-level CREATE TABLE parser. Input: the full CREATE DDL
-/// produced by <c>FEModel_DDL</c>. Output: a lookup of each table's column
-/// list with raw datatype strings. Intended to feed the SQL emitter when it
-/// needs an AttributeAdded's target datatype that is not present in the CC
-/// XLS (the Physical Data Type row only appears for changed columns).
+/// CREATE DDL parser. Extracts column datatypes, constraint column lists
+/// (PK / Unique / FK), and standalone CREATE INDEX definitions from the
+/// FEModel_DDL output so the SQL emitter can fill in concrete column lists
+/// instead of TODO placeholders.
 ///
-/// Intentionally permissive - we strip just enough syntax to pair a column
-/// name with its datatype. Anything beyond (constraints, defaults, identity
-/// clauses) is ignored at this phase. Phase 3.D can evolve it further.
+/// The parser is intentionally permissive: we skip rows we cannot classify
+/// rather than failing, since the input varies across MSSQL / Oracle / Db2.
 /// </summary>
 public static class CreateDdlParser
 {
@@ -19,16 +17,43 @@ public static class CreateDdlParser
         @"CREATE\s+TABLE\s+(?:(?<schema>[\[""]?[\w]+[\]""]?)\s*\.\s*)?(?<table>[\[""]?[\w]+[\]""]?)\s*\(",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
+    private static readonly Regex CreateIndexStmt = new(
+        @"CREATE\s+(?<unique>UNIQUE\s+)?INDEX\s+(?<name>[\[""]?[\w]+[\]""]?)\s+ON\s+(?:(?<schema>[\[""]?[\w]+[\]""]?)\s*\.\s*)?(?<table>[\[""]?[\w]+[\]""]?)\s*\(",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static readonly Regex AlterTableAddConstraint = new(
+        @"ALTER\s+TABLE\s+(?:(?<schema>[\[""]?[\w]+[\]""]?)\s*\.\s*)?(?<table>[\[""]?[\w]+[\]""]?)\s+ADD\s+\(?\s*CONSTRAINT\s+(?<name>[\[""]?[\w]+[\]""]?)\s+(?<kind>PRIMARY\s+KEY|UNIQUE|FOREIGN\s+KEY)\s*\(",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static readonly Regex ReferencesFragment = new(
+        @"REFERENCES\s+(?:(?<pschema>[\[""]?[\w]+[\]""]?)\s*\.\s*)?(?<ptable>[\[""]?[\w]+[\]""]?)\s*\(",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
     /// <summary>
-    /// Parse all CREATE TABLE statements in <paramref name="ddl"/>. Uses a
-    /// paren-aware walk for the body so datatypes containing commas
-    /// (DECIMAL(18,4)) do not confuse the splitter.
+    /// Parse the full DDL. All lookups on the returned
+    /// <see cref="DdlColumnMap"/> are case-insensitive on identifiers.
     /// </summary>
     public static DdlColumnMap Parse(string ddl)
     {
         ArgumentNullException.ThrowIfNull(ddl);
-        var map = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
 
+        var columnsByTable = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+        var keyGroupColumns = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+        var foreignKeys = new Dictionary<string, ForeignKeyInfo>(StringComparer.OrdinalIgnoreCase);
+
+        ParseCreateTables(ddl, columnsByTable, keyGroupColumns, foreignKeys);
+        ParseCreateIndexes(ddl, keyGroupColumns);
+        ParseAlterTableAddConstraints(ddl, keyGroupColumns, foreignKeys);
+
+        return new DdlColumnMap(columnsByTable, keyGroupColumns, foreignKeys);
+    }
+
+    private static void ParseCreateTables(
+        string ddl,
+        Dictionary<string, Dictionary<string, string>> columnsByTable,
+        Dictionary<string, string[]> keyGroupColumns,
+        Dictionary<string, ForeignKeyInfo> foreignKeys)
+    {
         int searchStart = 0;
         while (searchStart < ddl.Length)
         {
@@ -36,7 +61,7 @@ public static class CreateDdlParser
             if (!headerMatch.Success) break;
 
             var table = StripQuoting(headerMatch.Groups["table"].Value);
-            int bodyStart = headerMatch.Index + headerMatch.Length; // first char inside the outer `(`
+            int bodyStart = headerMatch.Index + headerMatch.Length;
             int bodyEnd = FindMatchingCloseParen(ddl, bodyStart);
             if (bodyEnd < 0) break;
 
@@ -46,12 +71,70 @@ public static class CreateDdlParser
             if (string.IsNullOrWhiteSpace(table) || string.IsNullOrWhiteSpace(body)) continue;
 
             var columns = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var (name, type) in SplitColumns(body))
-                columns.TryAdd(name, type);
-            if (columns.Count > 0) map.TryAdd(table, columns);
-        }
+            foreach (var piece in SplitBodyPieces(body))
+            {
+                if (TryParseConstraint(piece, table, out var kgName, out var kgCols, out var fk))
+                {
+                    if (fk is not null && !string.IsNullOrEmpty(kgName))
+                        foreignKeys.TryAdd(kgName, fk);
+                    else if (!string.IsNullOrEmpty(kgName) && kgCols.Length > 0)
+                        keyGroupColumns.TryAdd(kgName, kgCols);
+                    continue;
+                }
 
-        return new DdlColumnMap(map);
+                if (TryParseColumn(piece, out var name, out var type))
+                    columns.TryAdd(name, type);
+            }
+            if (columns.Count > 0) columnsByTable.TryAdd(table, columns);
+        }
+    }
+
+    private static void ParseCreateIndexes(string ddl, Dictionary<string, string[]> keyGroupColumns)
+    {
+        foreach (Match m in CreateIndexStmt.Matches(ddl))
+        {
+            var name = StripQuoting(m.Groups["name"].Value);
+            int bodyStart = m.Index + m.Length;
+            int bodyEnd = FindMatchingCloseParen(ddl, bodyStart);
+            if (bodyEnd < 0) continue;
+            var cols = ExtractColumnNames(ddl[bodyStart..bodyEnd]);
+            if (cols.Length > 0) keyGroupColumns.TryAdd(name, cols);
+        }
+    }
+
+    private static void ParseAlterTableAddConstraints(
+        string ddl,
+        Dictionary<string, string[]> keyGroupColumns,
+        Dictionary<string, ForeignKeyInfo> foreignKeys)
+    {
+        foreach (Match m in AlterTableAddConstraint.Matches(ddl))
+        {
+            var childTable = StripQuoting(m.Groups["table"].Value);
+            var name = StripQuoting(m.Groups["name"].Value);
+            var kind = Regex.Replace(m.Groups["kind"].Value, @"\s+", " ").ToUpperInvariant();
+            int bodyStart = m.Index + m.Length;
+            int bodyEnd = FindMatchingCloseParen(ddl, bodyStart);
+            if (bodyEnd < 0) continue;
+            var childCols = ExtractColumnNames(ddl[bodyStart..bodyEnd]);
+            if (childCols.Length == 0) continue;
+
+            if (kind == "FOREIGN KEY")
+            {
+                var tail = ddl[(bodyEnd + 1)..Math.Min(ddl.Length, bodyEnd + 400)];
+                var refMatch = ReferencesFragment.Match(tail);
+                if (!refMatch.Success) continue;
+                int refBodyStart = bodyEnd + 1 + refMatch.Index + refMatch.Length;
+                int refBodyEnd = FindMatchingCloseParen(ddl, refBodyStart);
+                if (refBodyEnd < 0) continue;
+                var parentTable = StripQuoting(refMatch.Groups["ptable"].Value);
+                var parentCols = ExtractColumnNames(ddl[refBodyStart..refBodyEnd]);
+                foreignKeys.TryAdd(name, new ForeignKeyInfo(childTable, childCols, parentTable, parentCols));
+            }
+            else
+            {
+                keyGroupColumns.TryAdd(name, childCols);
+            }
+        }
     }
 
     /// <summary>
@@ -74,11 +157,8 @@ public static class CreateDdlParser
         return -1;
     }
 
-    private static IEnumerable<(string Name, string Type)> SplitColumns(string body)
+    private static IEnumerable<string> SplitBodyPieces(string body)
     {
-        // A CREATE TABLE body has columns separated by commas, but commas
-        // also appear inside datatype parens (VARCHAR(100), DECIMAL(18,4)).
-        // Walk char-by-char tracking paren depth.
         int depth = 0;
         int start = 0;
         for (int i = 0; i <= body.Length; i++)
@@ -89,11 +169,78 @@ public static class CreateDdlParser
             else if (c == ',' && depth == 0)
             {
                 var piece = body[start..i].Trim();
-                if (TryParseColumn(piece, out var name, out var type))
-                    yield return (name, type);
+                if (piece.Length > 0) yield return piece;
                 start = i + 1;
             }
         }
+    }
+
+    private static string[] ExtractColumnNames(string colList)
+    {
+        var cols = new List<string>();
+        foreach (var piece in SplitBodyPieces(colList))
+        {
+            var tokens = Tokenize(piece);
+            if (tokens.Count == 0) continue;
+            var name = StripQuoting(tokens[0]);
+            if (!string.IsNullOrWhiteSpace(name)) cols.Add(name);
+        }
+        return cols.ToArray();
+    }
+
+    private static bool TryParseConstraint(
+        string piece,
+        string tableName,
+        out string name,
+        out string[] columns,
+        out ForeignKeyInfo? foreignKey)
+    {
+        name = string.Empty;
+        columns = Array.Empty<string>();
+        foreignKey = null;
+
+        var upper = piece.TrimStart().ToUpperInvariant();
+        if (upper.StartsWith("CONSTRAINT", StringComparison.Ordinal))
+        {
+            var m = Regex.Match(
+                piece,
+                @"^\s*CONSTRAINT\s+(?<name>[\[""]?[\w]+[\]""]?)\s+(?<kind>PRIMARY\s+KEY|UNIQUE|FOREIGN\s+KEY)\s*\((?<cols>[^)]*)\)(?<tail>.*)$",
+                RegexOptions.IgnoreCase | RegexOptions.Singleline);
+            if (!m.Success) return false;
+            name = StripQuoting(m.Groups["name"].Value);
+            var cols = ExtractColumnNames(m.Groups["cols"].Value);
+            columns = cols;
+            var kind = Regex.Replace(m.Groups["kind"].Value, @"\s+", " ").ToUpperInvariant();
+            if (kind == "FOREIGN KEY")
+            {
+                var tail = m.Groups["tail"].Value;
+                var refM = ReferencesFragment.Match(tail);
+                if (refM.Success)
+                {
+                    int refBodyStart = refM.Index + refM.Length; // right after '('
+                    int refBodyEnd = FindMatchingCloseParen(tail, refBodyStart);
+                    if (refBodyEnd >= 0)
+                    {
+                        var parentCols = ExtractColumnNames(tail[refBodyStart..refBodyEnd]);
+                        var parentTable = StripQuoting(refM.Groups["ptable"].Value);
+                        foreignKey = new ForeignKeyInfo(tableName, cols, parentTable, parentCols);
+                    }
+                }
+                return true;
+            }
+            return true;
+        }
+
+        // Bare "PRIMARY KEY (cols)" or "UNIQUE (cols)" (no CONSTRAINT keyword, unnamed).
+        if (upper.StartsWith("PRIMARY KEY", StringComparison.Ordinal)
+            || upper.StartsWith("UNIQUE", StringComparison.Ordinal)
+            || upper.StartsWith("FOREIGN KEY", StringComparison.Ordinal)
+            || upper.StartsWith("CHECK", StringComparison.Ordinal))
+        {
+            return true; // recognized-but-unnamed; caller skips it
+        }
+
+        return false;
     }
 
     private static bool TryParseColumn(string piece, out string name, out string type)
@@ -102,7 +249,6 @@ public static class CreateDdlParser
         type = string.Empty;
         if (string.IsNullOrWhiteSpace(piece)) return false;
 
-        // Skip table-level constraints (PRIMARY KEY, FOREIGN KEY, CONSTRAINT, UNIQUE, CHECK).
         var upper = piece.TrimStart().ToUpperInvariant();
         if (upper.StartsWith("PRIMARY KEY", StringComparison.Ordinal)
             || upper.StartsWith("FOREIGN KEY", StringComparison.Ordinal)
@@ -111,13 +257,10 @@ public static class CreateDdlParser
             || upper.StartsWith("CHECK", StringComparison.Ordinal))
             return false;
 
-        // First token = column name (possibly bracketed / quoted).
         var tokens = Tokenize(piece);
         if (tokens.Count < 2) return false;
         name = StripQuoting(tokens[0]);
 
-        // Everything up to NULL / NOT NULL / DEFAULT / IDENTITY / COLLATE /
-        // FOR BIT DATA is the datatype expression.
         var typeBuf = new System.Text.StringBuilder();
         foreach (var tok in tokens.Skip(1))
         {
@@ -134,7 +277,6 @@ public static class CreateDdlParser
 
     private static List<string> Tokenize(string s)
     {
-        // Whitespace-delimited tokens, but keep parenthesized groups together.
         var tokens = new List<string>();
         var cur = new System.Text.StringBuilder();
         int depth = 0;
@@ -157,17 +299,42 @@ public static class CreateDdlParser
         s.Trim().Trim('[', ']', '"', '\'');
 }
 
-/// <summary>Read-only per-table column-name -> datatype-string lookup.</summary>
+/// <summary>
+/// Info captured for a foreign-key constraint parsed from the DDL.
+/// </summary>
+public sealed record ForeignKeyInfo(
+    string ChildTable,
+    string[] ChildColumns,
+    string ParentTable,
+    string[] ParentColumns);
+
+/// <summary>
+/// Read-only lookups derived from a CREATE DDL script:
+///   - (table, column) -> datatype
+///   - key-group name (PK / UNIQUE / Index) -> column list
+///   - FK name -> child / parent table + columns
+/// </summary>
 public sealed class DdlColumnMap
 {
     private readonly Dictionary<string, Dictionary<string, string>> _tables;
+    private readonly Dictionary<string, string[]> _keyGroupColumns;
+    private readonly Dictionary<string, ForeignKeyInfo> _foreignKeys;
 
-    internal DdlColumnMap(Dictionary<string, Dictionary<string, string>> tables)
+    internal DdlColumnMap(
+        Dictionary<string, Dictionary<string, string>> tables,
+        Dictionary<string, string[]> keyGroupColumns,
+        Dictionary<string, ForeignKeyInfo> foreignKeys)
     {
         _tables = tables;
+        _keyGroupColumns = keyGroupColumns;
+        _foreignKeys = foreignKeys;
     }
 
     public int TableCount => _tables.Count;
+
+    public int KeyGroupCount => _keyGroupColumns.Count;
+
+    public int ForeignKeyCount => _foreignKeys.Count;
 
     public bool TryGetType(string tableName, string columnName, out string type)
     {
@@ -177,6 +344,28 @@ public sealed class DdlColumnMap
             return true;
         }
         type = string.Empty;
+        return false;
+    }
+
+    public bool TryGetKeyGroupColumns(string keyGroupName, out string[] columns)
+    {
+        if (_keyGroupColumns.TryGetValue(keyGroupName, out var c))
+        {
+            columns = c;
+            return true;
+        }
+        columns = Array.Empty<string>();
+        return false;
+    }
+
+    public bool TryGetForeignKey(string foreignKeyName, out ForeignKeyInfo info)
+    {
+        if (_foreignKeys.TryGetValue(foreignKeyName, out var fk))
+        {
+            info = fk;
+            return true;
+        }
+        info = default!;
         return false;
     }
 
