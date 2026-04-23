@@ -39,14 +39,13 @@ public sealed class CompareOrchestrator
         if (!File.Exists(leftErwinPath)) throw new FileNotFoundException(leftErwinPath);
         if (!File.Exists(rightErwinPath)) throw new FileNotFoundException(rightErwinPath);
 
-        // 1. Read metadata for both PUs. Cheap, needed by Phase 3 emitter selection
-        //    and by CLI/REST for context logging.
+        // 1. Read metadata for both PUs. Sequential (not parallel) because SCAPI
+        //    is a process-level singleton on r10.10 - two concurrent worker
+        //    processes race on the same erwin.exe LocalServer and corrupt its
+        //    state, breaking the later CC call with RPC_E_SERVERFAULT.
         _logger.LogInformation("Reading metadata for {Left} and {Right}", leftErwinPath, rightErwinPath);
-        var leftMetaTask = _session.ReadModelMetadataAsync(leftErwinPath, ct);
-        var rightMetaTask = _session.ReadModelMetadataAsync(rightErwinPath, ct);
-        await Task.WhenAll(leftMetaTask, rightMetaTask).ConfigureAwait(false);
-        var leftMeta = leftMetaTask.Result;
-        var rightMeta = rightMetaTask.Result;
+        var leftMeta = await _session.ReadModelMetadataAsync(leftErwinPath, ct).ConfigureAwait(false);
+        var rightMeta = await _session.ReadModelMetadataAsync(rightErwinPath, ct).ConfigureAwait(false);
 
         // 2. Run CompleteCompare to produce the XLS.
         _logger.LogInformation("Running CompleteCompare");

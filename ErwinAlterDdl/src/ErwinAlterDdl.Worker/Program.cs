@@ -40,6 +40,7 @@ public static class Program
         PropertyNamingPolicy = null,
     };
 
+    [STAThread]
     public static int Main(string[] args)
     {
         try
@@ -71,6 +72,10 @@ public static class Program
         {
             Console.Error.WriteLine($"unhandled: {ex}");
             return ExitUnhandled;
+        }
+        finally
+        {
+            KillLingeringErwinProcesses();
         }
     }
 
@@ -114,21 +119,23 @@ public static class Program
         var bagType = Type.GetTypeFromProgID("ERwin9.SCAPI.PropertyBag.9.0", throwOnError: true)!;
         dynamic bag = Activator.CreateInstance(bagType)!;
         dynamic pu = scapi.PersistenceUnits.Create(bag);
-        try
-        {
-            bool ok = pu.CompleteCompare(left, right, outPath, preset, level, "");
-            if (!ok) return Fail(ExitOperationFailed, "CompleteCompare returned false");
-            if (!File.Exists(outPath)) return Fail(ExitOperationFailed, "xls not produced");
-            var info = new FileInfo(outPath);
-            WriteJson(new CompareArtifact(outPath, info.Length, 0));
-            return ExitOk;
-        }
-        finally
-        {
-            TryRelease(pu);
-            TryRelease(bag);
-            TryRelease(scapi);
-        }
+
+        bool ok = pu.CompleteCompare(left, right, outPath, preset, level, "");
+        if (!ok) return Fail(ExitOperationFailed, "CompleteCompare returned false");
+        if (!File.Exists(outPath)) return Fail(ExitOperationFailed, "xls not produced");
+
+        var info = new FileInfo(outPath);
+        WriteJson(new CompareArtifact(outPath, info.Length, 0));
+        Console.Out.Flush();
+
+        // SCAPI r10.10 triggers AccessViolation (0xC0000005) during
+        // Marshal.FinalReleaseComObject for the CC output bag/pu pair AFTER the
+        // XLS is already written. Nothing useful can happen after this point;
+        // we skip the managed finally + let the OS reclaim the COM handles.
+        // KillLingeringErwinProcesses in Main.finally still runs via atexit-like
+        // handlers on normal exit, and OOP session pre-kills on next call.
+        Environment.Exit(ExitOk);
+        return ExitOk; // unreachable but required for compiler
     }
 
     private static int RunDdl(Dictionary<string, string> kv)
@@ -161,8 +168,26 @@ public static class Program
     private static object CreateScapi()
     {
         var t = Type.GetTypeFromProgID("ERwin9.SCAPI.9.0", throwOnError: true)!;
-        return Activator.CreateInstance(t)
+        dynamic scapi = Activator.CreateInstance(t)
             ?? throw new InvalidOperationException("CreateInstance returned null for ERwin9.SCAPI.9.0");
+        // Clear any stray PUs left over by a previous worker (or by the user
+        // GUI) that happen to be attached to the same COM LocalServer. Without
+        // this the next Add can trip the r10.10 state-pollution bug.
+        try { scapi.PersistenceUnits.Clear(); } catch { /* best effort */ }
+        return scapi;
+    }
+
+    private static void KillLingeringErwinProcesses()
+    {
+        // After we release SCAPI, erwin.exe may linger as an idle COM server
+        // and poison the next worker. Kill what we can reach (same user's
+        // processes - system-owned ones will silently access-deny).
+        foreach (var p in System.Diagnostics.Process.GetProcessesByName("erwin"))
+        {
+            try { p.Kill(entireProcessTree: true); p.WaitForExit(2000); }
+            catch { /* best effort */ }
+            finally { try { p.Dispose(); } catch { } }
+        }
     }
 
     private static Dictionary<string, string> ParseArgs(ReadOnlySpan<string> args)

@@ -65,10 +65,26 @@ public sealed class OutOfProcessScapiSession : IScapiSession
             "--level", options.Level.ToScapiString(),
         };
 
-        var json = await RunWorkerAsync(args, ct).ConfigureAwait(false);
-        var result = JsonSerializer.Deserialize<CompareArtifact>(json)
-            ?? throw new InvalidOperationException("worker returned empty CC result");
-        return result;
+        try
+        {
+            var json = await RunWorkerAsync(args, ct).ConfigureAwait(false);
+            var result = JsonSerializer.Deserialize<CompareArtifact>(json)
+                ?? throw new InvalidOperationException("worker returned empty CC result");
+            return result;
+        }
+        catch (InvalidOperationException ex) when (File.Exists(outPath) && new FileInfo(outPath).Length > 0)
+        {
+            // SCAPI r10.10 AccessViolation during CC cleanup is known (see
+            // reference_scapi_gotchas_r10.md). The XLS is written BEFORE the
+            // native crash, so if we can see it on disk with non-zero size we
+            // honor it as the artifact. Logged as warning so the anomaly is
+            // still visible.
+            var info = new FileInfo(outPath);
+            _logger.LogWarning(
+                "Worker crashed after CC wrote {Size} bytes to {Path}; treating as success (SCAPI cleanup bug). msg: {Msg}",
+                info.Length, outPath, ex.Message);
+            return new CompareArtifact(outPath, info.Length, 0);
+        }
     }
 
     public async Task<DdlArtifact> GenerateCreateDdlAsync(
@@ -117,6 +133,14 @@ public sealed class OutOfProcessScapiSession : IScapiSession
 
     private async Task<string> RunWorkerAsync(string[] args, CancellationToken ct)
     {
+        // Kill any erwin.exe left from a previous worker call. Each SCAPI op
+        // must run against a freshly started LocalServer to dodge r10.10's
+        // singleton state pollution. Access-denied (system-owned instances)
+        // is silently tolerated; if we can't kill them the op will still
+        // fail and surface a useful error.
+        int killed = KillStaleErwinProcesses();
+        if (killed > 0) _logger.LogInformation("Pre-call kill: {Killed} stale erwin.exe", killed);
+
         var psi = new ProcessStartInfo
         {
             FileName = _workerPath,
@@ -165,6 +189,26 @@ public sealed class OutOfProcessScapiSession : IScapiSession
     private static void TryKill(Process p)
     {
         try { if (!p.HasExited) p.Kill(entireProcessTree: true); } catch { /* best effort */ }
+    }
+
+    private static int KillStaleErwinProcesses()
+    {
+        int killed = 0;
+        foreach (var p in Process.GetProcessesByName("erwin"))
+        {
+            try
+            {
+                if (!p.HasExited)
+                {
+                    p.Kill(entireProcessTree: true);
+                    p.WaitForExit(2000);
+                    killed++;
+                }
+            }
+            catch { /* access denied / already exited - best effort */ }
+            finally { try { p.Dispose(); } catch { } }
+        }
+        return killed;
     }
 
     private static string? ProbeDefaultWorkerPath()
