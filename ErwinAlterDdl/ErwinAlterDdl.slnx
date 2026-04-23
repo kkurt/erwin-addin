@@ -4,6 +4,7 @@
     <Project Path="src/ErwinAlterDdl.Cli/ErwinAlterDdl.Cli.csproj" />
     <Project Path="src/ErwinAlterDdl.ComInterop/ErwinAlterDdl.ComInterop.csproj" />
     <Project Path="src/ErwinAlterDdl.Core/ErwinAlterDdl.Core.csproj" />
+    <Project Path="src/ErwinAlterDdl.Worker/ErwinAlterDdl.Worker.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/ErwinAlterDdl.Core.Tests/ErwinAlterDdl.Core.Tests.csproj" />

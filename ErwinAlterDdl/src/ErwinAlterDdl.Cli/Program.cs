@@ -164,9 +164,12 @@ public static class Program
                 return new MockScapiSession(artifactsDir.FullName);
             case "in-process":
                 throw new NotSupportedException(
-                    "in-process session requires a live SCAPI handle; use the add-in integration or wait for Phase 3 out-of-process");
+                    "in-process session requires a live SCAPI handle; only the add-in integration uses this mode");
             case "out-of-process":
-                throw new NotImplementedException("Phase 3 feature; use --session-mode mock for now");
+                logger.LogInformation("Using OutOfProcessScapiSession (Worker)");
+                return new OutOfProcessScapiSession(
+                    logger: LoggerFactory.Create(b => b.AddSerilog(Log.Logger))
+                        .CreateLogger<OutOfProcessScapiSession>());
             default:
                 throw new ArgumentException($"unknown --session-mode: {mode}");
         }
