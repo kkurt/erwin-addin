@@ -16,6 +16,9 @@ namespace EliteSoft.Erwin.AlterDdl.Core.Models;
 [JsonDerivedType(typeof(AttributeDropped), nameof(AttributeDropped))]
 [JsonDerivedType(typeof(AttributeRenamed), nameof(AttributeRenamed))]
 [JsonDerivedType(typeof(AttributeTypeChanged), nameof(AttributeTypeChanged))]
+[JsonDerivedType(typeof(AttributeNullabilityChanged), nameof(AttributeNullabilityChanged))]
+[JsonDerivedType(typeof(AttributeDefaultChanged), nameof(AttributeDefaultChanged))]
+[JsonDerivedType(typeof(AttributeIdentityChanged), nameof(AttributeIdentityChanged))]
 public abstract record Change(ObjectRef Target);
 
 // ---------- Entity-level ----------
@@ -48,3 +51,36 @@ public sealed record AttributeTypeChanged(
     ObjectRef ParentEntity,
     string LeftType,
     string RightType) : Change(Target);
+
+/// <summary>
+/// NULL / NOT NULL flip on an attribute. The XLS row is "Null Option" with
+/// values of the form "Null" or "Not Null" (SCAPI-emitted strings).
+/// </summary>
+public sealed record AttributeNullabilityChanged(
+    ObjectRef Target,
+    ObjectRef ParentEntity,
+    bool LeftNullable,
+    bool RightNullable) : Change(Target);
+
+/// <summary>
+/// Column DEFAULT added / dropped / modified. Either side may be empty when
+/// the default is being added or removed. <see cref="RightDefault"/> empty
+/// means "drop the default".
+/// </summary>
+public sealed record AttributeDefaultChanged(
+    ObjectRef Target,
+    ObjectRef ParentEntity,
+    string LeftDefault,
+    string RightDefault) : Change(Target);
+
+/// <summary>
+/// Identity / auto-increment on an attribute. In SQL Server this means the
+/// column picks up <c>IDENTITY(seed, step)</c>. Most engines cannot toggle
+/// identity with a simple ALTER COLUMN so emitters will usually emit a
+/// marker comment plus the recommended drop+recreate approach.
+/// </summary>
+public sealed record AttributeIdentityChanged(
+    ObjectRef Target,
+    ObjectRef ParentEntity,
+    bool LeftHasIdentity,
+    bool RightHasIdentity) : Change(Target);

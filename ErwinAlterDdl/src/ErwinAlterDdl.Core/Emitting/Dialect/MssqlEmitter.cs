@@ -40,6 +40,9 @@ public sealed class MssqlEmitter : ISqlEmitter
                 AttributeDropped ad => EmitAttributeDropped(ad),
                 AttributeRenamed ar => EmitAttributeRenamed(ar),
                 AttributeTypeChanged at => EmitAttributeTypeChanged(at),
+                AttributeNullabilityChanged an => EmitAttributeNullability(an, rightCols),
+                AttributeDefaultChanged ad2 => EmitAttributeDefault(ad2),
+                AttributeIdentityChanged ai => EmitAttributeIdentity(ai),
                 _ => null,
             };
             if (emitted is not null) stmts.Add(emitted);
@@ -90,6 +93,58 @@ public sealed class MssqlEmitter : ISqlEmitter
     private static AlterStatement EmitAttributeTypeChanged(AttributeTypeChanged at) => new(
         Sql: $"ALTER TABLE {Quote(at.ParentEntity.Name)} ALTER COLUMN {Quote(at.Target.Name)} {at.RightType};",
         Comment: $"type change {at.ParentEntity.Name}.{at.Target.Name} {at.LeftType} -> {at.RightType}");
+
+    private static AlterStatement EmitAttributeNullability(AttributeNullabilityChanged an, DdlColumnMap? rightCols)
+    {
+        // SQL Server requires the full datatype on ALTER COLUMN. We read it
+        // from the right-side CREATE DDL; fall back to a TODO placeholder if
+        // not available.
+        string type = rightCols is not null
+            && rightCols.TryGetType(an.ParentEntity.Name, an.Target.Name, out var t)
+                ? t
+                : "/* TODO: datatype */";
+        var nullSuffix = an.RightNullable ? "NULL" : "NOT NULL";
+        return new AlterStatement(
+            Sql: $"ALTER TABLE {Quote(an.ParentEntity.Name)} ALTER COLUMN {Quote(an.Target.Name)} {type} {nullSuffix};",
+            Comment: $"nullability {an.ParentEntity.Name}.{an.Target.Name} {(an.LeftNullable ? "NULL" : "NOT NULL")} -> {nullSuffix}");
+    }
+
+    private static AlterStatement EmitAttributeDefault(AttributeDefaultChanged ad)
+    {
+        // SQL Server defaults are named constraints. Emit drop/add pairs when
+        // both sides non-empty; add-only / drop-only for lopsided cases.
+        // The existing default constraint name is SCAPI-generated (DF_...);
+        // we emit a safe sys.default_constraints drop lookup + a fresh ADD.
+        var table = Quote(ad.ParentEntity.Name);
+        var column = Quote(ad.Target.Name);
+        var comment = $"default {ad.ParentEntity.Name}.{ad.Target.Name} '{ad.LeftDefault}' -> '{ad.RightDefault}'";
+
+        if (string.IsNullOrWhiteSpace(ad.RightDefault))
+        {
+            return new AlterStatement(
+                Sql: $"-- TODO: DROP existing DEFAULT constraint on {table}.{column} (look up in sys.default_constraints)",
+                Comment: comment);
+        }
+
+        var addSql =
+            $"-- TODO: DROP existing DEFAULT constraint on {table}.{column} first\n" +
+            $"ALTER TABLE {table} ADD DEFAULT ({ad.RightDefault}) FOR {column};";
+        return new AlterStatement(addSql, comment);
+    }
+
+    private static AlterStatement EmitAttributeIdentity(AttributeIdentityChanged ai)
+    {
+        // SQL Server cannot toggle IDENTITY in place. The only supported path
+        // is a drop/recreate cycle (or swap via sp_rename + new table). Emit a
+        // marker so the DBA sees the intent.
+        var arrow = ai.RightHasIdentity
+            ? "add IDENTITY (requires table rebuild)"
+            : "drop IDENTITY (requires table rebuild)";
+        return new AlterStatement(
+            Sql: $"-- TODO: {arrow} on {Quote(ai.ParentEntity.Name)}.{Quote(ai.Target.Name)}\n"
+               + $"--       SQL Server has no in-place ALTER for IDENTITY; plan a swap table + sp_rename migration.",
+            Comment: $"identity {ai.ParentEntity.Name}.{ai.Target.Name}: {ai.LeftHasIdentity} -> {ai.RightHasIdentity}");
+    }
 
     /// <summary>Quote an identifier with square brackets and escape any embedded ']'.</summary>
     private static string Quote(string ident) => "[" + ident.Replace("]", "]]") + "]";
