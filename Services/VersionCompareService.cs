@@ -30,6 +30,32 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <summary>Dirty-state probe result reused by the UI for labelling.</summary>
         public readonly record struct DirtyProbe(bool IsDirty, string Source);
 
+        /// <summary>Single row in the target-version combo plan.</summary>
+        public readonly record struct TargetVersion(int Version, string Label);
+
+        /// <summary>
+        /// Build the target-version combo contents. Clean models list only
+        /// prior versions (current vs its own saved copy is a no-op); dirty
+        /// models additionally include the current version so the user can
+        /// diff the dirty buffer against its saved Mart counterpart.
+        ///
+        /// Pure function - no SCAPI involvement. Extracted from the form to
+        /// stay unit-testable.
+        /// </summary>
+        public static IReadOnlyList<TargetVersion> PlanTargetVersions(int currentVersion, bool isDirty)
+        {
+            if (currentVersion < 1) return Array.Empty<TargetVersion>();
+            int max = isDirty ? currentVersion : currentVersion - 1;
+            var list = new List<TargetVersion>();
+            for (int v = max; v >= 1; v--)
+            {
+                string label = $"v{v}" +
+                    (isDirty && v == currentVersion ? " (current saved copy)" : "");
+                list.Add(new TargetVersion(v, label));
+            }
+            return list;
+        }
+
         private readonly dynamic _scapi;
         private readonly dynamic _activePU;
         private readonly Action<string> _log;

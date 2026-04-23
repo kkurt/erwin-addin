@@ -15,7 +15,7 @@
     <NoWarn>MSB3246</NoWarn>
     <!-- Exclude erwin-injector / ErwinAlterDdl submodule / other nested projects from this compilation.
          They are consumed via ProjectReference below. -->
-    <DefaultItemExcludes>$(DefaultItemExcludes);scripts\**\*.cs;tools\**\*.cs;ErwinAlterDdl\**\*.cs</DefaultItemExcludes>
+    <DefaultItemExcludes>$(DefaultItemExcludes);scripts\**\*.cs;tools\**\*.cs;ErwinAlterDdl\**\*.cs;tests\**\*.cs</DefaultItemExcludes>
   </PropertyGroup>
 
   <!-- Packaged distribution build: set via `dotnet publish -p:PackagedBuild=true`.

@@ -76,15 +76,10 @@ namespace EliteSoft.Erwin.AddIn.Forms
             _versions.Clear();
             cmbTargetVersion.Items.Clear();
 
-            // Clean model: compare against any prior Mart version.
-            // Dirty model: also include the current version (compare dirty
-            // buffer vs its saved Mart baseline).
-            int max = isDirty ? currentVersion : currentVersion - 1;
-            for (int v = max; v >= 1; v--)
+            foreach (var row in VersionCompareService.PlanTargetVersions(currentVersion, isDirty))
             {
-                _versions.Add((v, $"v{v}"));
-                cmbTargetVersion.Items.Add($"v{v}" +
-                    (isDirty && v == currentVersion ? " (current saved copy)" : ""));
+                _versions.Add((row.Version, row.Label));
+                cmbTargetVersion.Items.Add(row.Label);
             }
             if (cmbTargetVersion.Items.Count > 0) cmbTargetVersion.SelectedIndex = 0;
         }
