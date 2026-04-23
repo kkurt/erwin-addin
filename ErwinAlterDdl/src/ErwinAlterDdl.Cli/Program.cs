@@ -153,7 +153,9 @@ public static class Program
                 try
                 {
                     var registry = new SqlEmitterRegistry()
-                        .Register(new MssqlEmitter(), "SQL Server", "MSSQL", "SQLServer");
+                        .Register(new MssqlEmitter(), "SQL Server", "MSSQL", "SQLServer")
+                        .Register(new OracleEmitter(), "Oracle", "Oracle Database")
+                        .Register(new Db2Emitter(), "Db2", "IBM Db2", "DB2", "Db2 z/OS", "DB2 for z/OS");
                     if (!registry.TryResolve(result.RightMetadata.TargetServer, out var emitter))
                     {
                         logger.LogWarning(
