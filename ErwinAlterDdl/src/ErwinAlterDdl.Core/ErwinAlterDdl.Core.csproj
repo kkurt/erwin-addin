@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>EliteSoft.Erwin.AlterDdl.Core</RootNamespace>
+    <AssemblyName>EliteSoft.Erwin.AlterDdl.Core</AssemblyName>
+    <!-- Publishable as NuGet package for downstream consumers (internal or OSS) -->
+    <PackageId>EliteSoft.Erwin.AlterDdl.Core</PackageId>
+    <Version>0.1.0-alpha</Version>
+    <Authors>EliteSoft</Authors>
+    <Description>Erwin Data Modeler alter-DDL generation core: SCAPI-agnostic XLS+XML correlation engine.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="HtmlAgilityPack" Version="1.11.72" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="9.0.0" />
+  </ItemGroup>
+</Project>

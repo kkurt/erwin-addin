@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <PlatformTarget>x64</PlatformTarget>
+    <RootNamespace>EliteSoft.Erwin.AlterDdl.ComInterop</RootNamespace>
+    <AssemblyName>EliteSoft.Erwin.AlterDdl.ComInterop</AssemblyName>
+    <PackageId>EliteSoft.Erwin.AlterDdl.ComInterop</PackageId>
+    <Version>0.1.0-alpha</Version>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\ErwinAlterDdl.Core\ErwinAlterDdl.Core.csproj" />
+  </ItemGroup>
+</Project>

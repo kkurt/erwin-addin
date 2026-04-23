@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ErwinAlterDdl.Api/ErwinAlterDdl.Api.csproj" />
+    <Project Path="src/ErwinAlterDdl.Cli/ErwinAlterDdl.Cli.csproj" />
+    <Project Path="src/ErwinAlterDdl.ComInterop/ErwinAlterDdl.ComInterop.csproj" />
+    <Project Path="src/ErwinAlterDdl.Core/ErwinAlterDdl.Core.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ErwinAlterDdl.Core.Tests/ErwinAlterDdl.Core.Tests.csproj" />
+    <Project Path="tests/ErwinAlterDdl.Integration.Tests/ErwinAlterDdl.Integration.Tests.csproj" />
+  </Folder>
+</Solution>
