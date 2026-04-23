@@ -445,3 +445,75 @@ alter.sql → user review
 ## 13. Bekleyen Kararlar + Faz 1 Tetikleme
 
 **Faz 1'e geçmeden kullanıcı onayı gerekir** (NEW_NEED.md §11 "aşama sırasını koru"). Bu raporu incelenip §11 açık sorulara cevap verildikten sonra Faz 1 spike implementation başlar.
+
+---
+
+## 14. Faz 1 Spike Sonuçları (2026-04-23)
+
+User §11 sorularını cevapladı (bkz. NEW_NEED.md §0), Faz 1 spike uygulandı.
+
+### 14.1 Teslim edilenler
+
+**Kod:**
+- `ErwinAlterDdl/spike/ErwinAlterDdl.Spike.csproj` + `Program.cs` (.NET 10 windows x64, HtmlAgilityPack + Serilog, hata yakalama yok NEW_NEED §6 gereği)
+- `ErwinAlterDdl/fixture_tools/FixtureGen/FixtureGen.csproj` + `Program.cs` (md case map + alter SQL rename parse + v1/v2 XML UID transplant + post-save reference rewrite)
+
+**Fixture'lar (canonical):**
+```
+ErwinAlterDdl/test_files/erwin/
+├── backup_dont_consider/          (orijinal RE çıktıları, dokunulmaz)
+├── mssql_2022_v1.erwin + .xml     (baseline)
+├── mssql_2022_v2.erwin + .xml     (UID-aligned, erwin import + save sonrası)
+├── db2_zos_v12_v13_v1/_v2.*       (aynı)
+└── oracle_19c_21c_v1/_v2.*        (aynı)
+```
+
+### 14.2 FixtureGen tool tasarımı
+
+- **Input:** v1.xml, v2.xml, md spec (case map), output path
+- **Rename parsing:** md satırları regex ile `` `X` → `Y` `` pattern + case ID prefix (TBL/COL/IDX/...) class inference. Ek olarak `expected_alters/*_v1_to_v2.sql` otomatik taranır: `ALTER TABLE ... RENAME COLUMN / RENAME TO`, `RENAME TABLE`, `sp_rename` pattern'leri.
+- **UID transplant:** v2 XML Descendants tarafından her `id+name` element için class-aware name match (Attribute parent-scope, Entity global). Rename match fallback.
+- **Composition-sensitive skip:** Key_Group, Key_Group_Member, Relationship için name match devre dışı (sadece rename). Sebebi: v1/v2 member list farklıysa UID transplant `ESX-112 invalid entries in the order list` hatasına yol açar.
+- **Post-save reference rewrite:** Tüm uidRemap entry'leri text-level olarak XML dosyasında search+replace ile güncellenir. Erwin XML'deki UID'ler hem `id` attribute'unda hem de reference arrays/element text'lerinde geçtiği için bu ikinci geçiş şart (aksi halde Key_Group_Member attribute referansları dangling kalır, `EBS-1051` hatası).
+
+### 14.3 Validation süreci (iterative, user-in-the-loop)
+
+1. İlk geçiş: sadece `id` attribute'u transplant → import EBS-1051 (dangling refs) → post-save text rewrite eklendi.
+2. Counter bug'ı (length karşılaştırması) düzeltildi, gerçek replacement sayısı rapor edildi (MSSQL: 2688 replacement / 2195 UID).
+3. İkinci import: ESX-32807 (Key_Group_Type renumber, cosmetic) + ESX-112 (invalid order list) → composition-sensitive skip eklendi (Key_Group, Key_Group_Member, Relationship).
+4. Üçüncü import: ESX-112 tamamen gitti, diagram temiz, erwin `.erwin` olarak kaydetti.
+
+### 14.4 Spike çalıştırma sonuçları
+
+| Fixture | Değerlendirme | Kanıt |
+|---|---|---|
+| **AchModel v1/v2** (retiree) | 4/4 exit criteria PASSED | ATTR_RENAME ACCOUNT_SUMMARY_ID → ..._CHANGED dahil |
+| **MSSQL 2022 canonical** | 4/4 PASSED | ENTITY_ADD CAMPAIGN, ENTITY_DROP PRODUCT_ARCHIVE, ENTITY_RENAME CUSTOMER_BACKUP → CUSTOMER_HISTORY, ATTR_RENAME CUSTOMER.mobile_phone → mobile_no, ATTR_TYPE varchar(100) → varchar(250), int → bigint, vs. |
+| **Db2 z/OS canonical** | 4/4 PASSED | Aynı sinyaller, COL-03 rename alter-sql'den auto-extracted |
+| **Oracle 19c canonical** | BLOCKED (fixture hazır, CC xls eksik) | SCAPI singleton state-pollution bug'ı (bkz. §14.5) |
+
+entity summary örneği MSSQL için: `added=1 dropped=1 common=7` (önceki independent-UID durumunda `added=8 dropped=8 common=0` idi - UID transplant'ın etkisi net).
+
+### 14.5 Yeni keşfedilen / teyit edilen SCAPI r10.10 gotcha'lar
+
+1. **FEModel_DDL singleton server pollution (§14.5.1):** Aynı COM oturumunda ardışık `FEModel_DDL` çağrıları farklı PU'larda `RPC_E_SERVERFAULT` atıyor. `PersistenceUnits.Clear()` + `FinalReleaseComObject` + `GC.Collect` çözmüyor. Workaround: Faz 2'de process-per-DDL veya erwin.exe kill + respawn. Spike'ta FEModel_DDL çağrıları deferred edildi (Faz 3'e).
+2. **CompleteCompare memory violation at SCAPI cleanup (§14.5.2):** CC başarıyla XLS yazıyor, ardından cleanup path'inde (`Marshal.FinalReleaseComObject`) `AccessViolationException` 0xC0000005. XLS zaten dosyaya yazılmış, iş kaybı yok. Faz 2'de try/catch + swallow cleanup exception ile tolere edilebilir.
+3. **erwin.exe COM singleton:** Her `CreateInstance` mevcut erwin.exe'ye attach (yeni process açmaz). User GUI açıksa CLI/spike onun state'ini kirletir veya onun state'inden etkilenir. Faz 2'nin "Option 3: daemon + dedicated erwin.exe child" kararı bunu direkt çözüyor.
+4. **"Processing Events" progress modal (§14.5.3):** CC sırasında erwin `Processing Events` modal'ı gösterir (ActivateSilentMode bastırmıyor). İş bitince kendi kapanır. Faz 2'de cross-process `ShowWindow(SW_HIDE)` ile gizlenecek.
+
+Hepsi `reference_scapi_gotchas_r10.md` memory'sinde dokümante.
+
+### 14.6 Faz 1 için sonuç
+
+**Spike'ın temel misyonu (correlation mantığının doğru olduğunu kanıtlamak) TAM BAŞARI.** 3 canonical fixture + 1 retiree fixture üzerinde ENTITY_ADD/DROP/RENAME + ATTR_ADD/DROP/RENAME + ATTR_TYPE_CHANGE sinyalleri ObjectID-aware doğru çıkıyor.
+
+Oracle'ın CC XLS'i spike'ta çalıştırılamadı ama **correlation kodu fixture'a bağlı değil** (aynı logic MSSQL ve Db2 için çalıştı). Faz 2'nin process-isolation kararı Oracle'ı da otomatik yeşile çevirecek.
+
+### 14.7 Faz 2'ye devir kararları
+
+- Core library tasarımı: NEW_NEED.md §0.4 mimari (Core + ComInterop + Cli + Api consumers)
+- `IScapiSession` abstraction: InProcess / OutOfProcess / Mock
+- `OutOfProcessScapiSession` Option-3 isolation implement edecek (her daemon instance kendi erwin.exe child process)
+- Spike `Program.cs` referans koddur - Faz 2'de `XlsDiffParser`, `ErwinXmlObjectIdMapper`, `CompleteCompareRunner` ayrı class'lara bölünür, SOLID temizliği ile
+- FixtureGen ayrı bir utility olarak kalacak (dev-time tool, Core'a sızmaz)
+
