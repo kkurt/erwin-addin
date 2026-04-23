@@ -96,39 +96,72 @@ public static class ChangeCorrelator
         // Data Type" Not Equal row whose parent Attribute/Column row is tracked.
         string? ctxEntityName = null;
         string? ctxAttrName = null;
+        int? ctxEntityIndent = null;
+        int? ctxAttrIndent = null;
 
         foreach (var row in xlsRows)
         {
+            // Hierarchy reset: a row at an indent <= the current context's
+            // indent means we have popped out of that scope.
+            if (ctxAttrIndent is int a && row.IndentLevel <= a) ctxAttrName = null;
+            if (ctxEntityIndent is int e && row.IndentLevel <= e)
+            {
+                ctxEntityName = null;
+                ctxAttrName = null;
+            }
+
             switch (row.Type)
             {
                 case "Entity/Table":
                     ctxEntityName = row.LeftValue.Length > 0 ? row.LeftValue : row.RightValue;
+                    ctxEntityIndent = row.IndentLevel;
                     ctxAttrName = null;
+                    ctxAttrIndent = null;
                     break;
 
                 case "Attribute/Column":
                     ctxAttrName = row.LeftValue.Length > 0 ? row.LeftValue : row.RightValue;
+                    ctxAttrIndent = row.IndentLevel;
                     break;
 
                 case "Physical Data Type" when row.IsNotEqual:
                     if (ctxEntityName is null || ctxAttrName is null) break;
 
-                    // Try to resolve the attribute's ObjectId via right map (post-state).
-                    // If we can't find it (e.g. entity was just renamed in XLS but XML
-                    // scope lookup fails), fall back to a synthetic ObjectRef.
-                    if (!right.TryGetAttributeId(ctxEntityName, ctxAttrName, out var aid) ||
-                        !right.TryGetById(aid, out var attr))
+                    ObjectRef? attr = null;
+                    if (right.TryGetAttributeId(ctxEntityName, ctxAttrName, out var aid) &&
+                        right.TryGetById(aid, out var resolved))
                     {
+                        attr = resolved;
+                    }
+                    else
+                    {
+                        // Synthetic reference when the XML map cannot resolve the
+                        // attribute (e.g. new attribute not yet in v2 XML via XLS).
                         attr = new ObjectRef(
                             ObjectId: $"(xls-only):{ctxEntityName}.{ctxAttrName}",
                             Name: ctxAttrName,
                             Class: "Attribute");
                     }
-                    var parent = ResolveParentEntity(right, attr) ?? UnknownParent();
+
+                    // Parent entity: first try the attribute's own ParentObjectId,
+                    // fall back to looking up the entity by the XLS context name.
+                    var parent = ResolveParentEntity(right, attr)
+                        ?? LookupEntityByName(right, ctxEntityName)
+                        ?? new ObjectRef(
+                            ObjectId: $"(xls-only):{ctxEntityName}",
+                            Name: ctxEntityName,
+                            Class: "Entity");
                     sink.Add(new AttributeTypeChanged(attr, parent, row.LeftValue, row.RightValue));
                     break;
             }
         }
+    }
+
+    private static ObjectRef? LookupEntityByName(ErwinModelMap map, string entityName)
+    {
+        return map.TryGetId("Entity", entityName, out var id) && map.TryGetById(id, out var entity)
+            ? entity
+            : null;
     }
 
     private static ObjectRef? ResolveParentEntity(ErwinModelMap map, ObjectRef child)
@@ -140,3 +173,4 @@ public static class ChangeCorrelator
     private static ObjectRef UnknownParent() =>
         new(ObjectId: "(unknown)", Name: "(unknown)", Class: "Entity");
 }
+

@@ -63,11 +63,35 @@ public class MssqlEmitterTests
     }
 
     [Fact]
-    public void AttributeAdded_emits_add_column_with_todo()
+    public void AttributeAdded_emits_add_column_with_todo_when_no_ddl_available()
     {
         var r = Result(new AttributeAdded(new("{A99}+0", "email_verified", "Attribute"), Customer));
         var sql = _emitter.Emit(r).Statements[0].Sql;
         sql.Should().StartWith("ALTER TABLE [CUSTOMER] ADD [email_verified]").And.Contain("TODO");
+    }
+
+    [Fact]
+    public void AttributeAdded_resolves_datatype_from_right_create_ddl()
+    {
+        // Prepare a v2 CREATE DDL that defines the new column's type, and
+        // point CompareResult.RightDdl at it.
+        var tmp = Path.GetTempFileName();
+        try
+        {
+            File.WriteAllText(tmp, """
+                CREATE TABLE [app].[CUSTOMER] (
+                    [customer_id] INT NOT NULL,
+                    [email_verified] BIT NOT NULL DEFAULT 0
+                );
+                """);
+            var r = Result(new AttributeAdded(new("{A99}+0", "email_verified", "Attribute"), Customer)) with
+            {
+                RightDdl = new DdlArtifact(tmp, new FileInfo(tmp).Length, "SQL Server"),
+            };
+            var sql = _emitter.Emit(r).Statements[0].Sql;
+            sql.Should().Be("ALTER TABLE [CUSTOMER] ADD [email_verified] BIT;");
+        }
+        finally { try { File.Delete(tmp); } catch { } }
     }
 
     [Fact]

@@ -1,4 +1,5 @@
 using EliteSoft.Erwin.AlterDdl.Core.Models;
+using EliteSoft.Erwin.AlterDdl.Core.Parsing;
 
 namespace EliteSoft.Erwin.AlterDdl.Core.Emitting.Dialect;
 
@@ -18,6 +19,15 @@ public sealed class MssqlEmitter : ISqlEmitter
         ArgumentNullException.ThrowIfNull(compareResult);
         var stmts = new List<AlterStatement>();
 
+        // Optional column lookup from right-side CREATE DDL (Phase 3.B
+        // artifact). Lets AttributeAdded emit a concrete datatype.
+        DdlColumnMap? rightCols = null;
+        if (compareResult.RightDdl is { SqlPath: var p } && File.Exists(p))
+        {
+            try { rightCols = CreateDdlParser.Parse(File.ReadAllText(p)); }
+            catch { /* best effort, fall back to TODO placeholder */ }
+        }
+
         foreach (var change in compareResult.Changes)
         {
             AlterStatement? emitted = change switch
@@ -26,7 +36,7 @@ public sealed class MssqlEmitter : ISqlEmitter
                 EntityDropped ed => EmitEntityDropped(ed),
                 EntityRenamed er => EmitEntityRenamed(er),
                 SchemaMoved sm => EmitSchemaMoved(sm),
-                AttributeAdded aa => EmitAttributeAdded(aa),
+                AttributeAdded aa => EmitAttributeAdded(aa, rightCols),
                 AttributeDropped ad => EmitAttributeDropped(ad),
                 AttributeRenamed ar => EmitAttributeRenamed(ar),
                 AttributeTypeChanged at => EmitAttributeTypeChanged(at),
@@ -58,9 +68,16 @@ public sealed class MssqlEmitter : ISqlEmitter
 
     // ---------- Attribute-level ----------
 
-    private static AlterStatement EmitAttributeAdded(AttributeAdded aa) => new(
-        Sql: $"ALTER TABLE {Quote(aa.ParentEntity.Name)} ADD {Quote(aa.Target.Name)} /* TODO: datatype from v2 CREATE DDL */;",
-        Comment: $"add column {aa.ParentEntity.Name}.{aa.Target.Name}");
+    private static AlterStatement EmitAttributeAdded(AttributeAdded aa, DdlColumnMap? rightCols)
+    {
+        var type = rightCols is not null
+            && rightCols.TryGetType(aa.ParentEntity.Name, aa.Target.Name, out var t)
+                ? t
+                : "/* TODO: datatype from v2 CREATE DDL */";
+        return new AlterStatement(
+            Sql: $"ALTER TABLE {Quote(aa.ParentEntity.Name)} ADD {Quote(aa.Target.Name)} {type};",
+            Comment: $"add column {aa.ParentEntity.Name}.{aa.Target.Name}");
+    }
 
     private static AlterStatement EmitAttributeDropped(AttributeDropped ad) => new(
         Sql: $"ALTER TABLE {Quote(ad.ParentEntity.Name)} DROP COLUMN {Quote(ad.Target.Name)};",
