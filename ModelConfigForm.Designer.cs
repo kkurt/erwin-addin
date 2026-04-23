@@ -42,7 +42,10 @@ namespace EliteSoft.Erwin.AddIn
             this.tabValidation = new System.Windows.Forms.TabPage();
             this.tabTableProcesses = new System.Windows.Forms.TabPage();
             this.tabApproval = new System.Windows.Forms.TabPage();
+            this.tabAlterCompare = new System.Windows.Forms.TabPage();
             this.tabDebug = new System.Windows.Forms.TabPage();
+            this.btnOpenCompareVersions = new System.Windows.Forms.Button();
+            this.lblAlterCompareHelp = new System.Windows.Forms.Label();
 
             // Model tab
             this.grpModel = new System.Windows.Forms.GroupBox();
@@ -134,6 +137,7 @@ namespace EliteSoft.Erwin.AddIn
             this.tabControl.Controls.Add(this.tabValidation);
             this.tabControl.Controls.Add(this.tabTableProcesses);
             this.tabControl.Controls.Add(this.tabApproval);
+            this.tabControl.Controls.Add(this.tabAlterCompare);
             this.tabControl.Controls.Add(this.tabDebug);
             this.tabControl.Location = new System.Drawing.Point(16, 16);
             this.tabControl.Name = "tabControl";
@@ -577,6 +581,36 @@ namespace EliteSoft.Erwin.AddIn
             this.lblTableProcessStatus.Text = "";
             this.lblTableProcessStatus.ForeColor = clrSuccess;
             this.lblTableProcessStatus.Font = fontCaption;
+
+            // ================================================================
+            // TAB: ALTER COMPARE (Phase 3.F launcher)
+            // ================================================================
+            this.tabAlterCompare.Location = new System.Drawing.Point(4, 26);
+            this.tabAlterCompare.Name = "tabAlterCompare";
+            this.tabAlterCompare.Padding = new System.Windows.Forms.Padding(20);
+            this.tabAlterCompare.Size = new System.Drawing.Size(860, 460);
+            this.tabAlterCompare.Text = "Alter Compare";
+            this.tabAlterCompare.UseVisualStyleBackColor = true;
+
+            this.lblAlterCompareHelp.AutoSize = false;
+            this.lblAlterCompareHelp.Location = new System.Drawing.Point(20, 20);
+            this.lblAlterCompareHelp.Name = "lblAlterCompareHelp";
+            this.lblAlterCompareHelp.Size = new System.Drawing.Size(820, 100);
+            this.lblAlterCompareHelp.Font = fontBody;
+            this.lblAlterCompareHelp.Text =
+                "Compare the currently active erwin model (including its unsaved / dirty buffer) against a previous Mart version of the same model family " +
+                "and emit the ALTER DDL required to migrate the saved version to the active one." + System.Environment.NewLine + System.Environment.NewLine +
+                "If the active model is clean, the combo lists all earlier versions. If it is dirty, the current version also appears so the dirty buffer can be diffed against its saved counterpart.";
+            this.tabAlterCompare.Controls.Add(this.lblAlterCompareHelp);
+
+            this.btnOpenCompareVersions.Location = new System.Drawing.Point(20, 140);
+            this.btnOpenCompareVersions.Name = "btnOpenCompareVersions";
+            this.btnOpenCompareVersions.Size = new System.Drawing.Size(260, 40);
+            this.btnOpenCompareVersions.Text = "Compare Active vs Mart Version...";
+            this.btnOpenCompareVersions.Font = fontBodyBold;
+            this.btnOpenCompareVersions.UseVisualStyleBackColor = true;
+            this.btnOpenCompareVersions.Click += new System.EventHandler(this.btnOpenCompareVersions_Click);
+            this.tabAlterCompare.Controls.Add(this.btnOpenCompareVersions);
 
             // ================================================================
             // TAB 6: DEBUG LOG
@@ -1052,6 +1086,9 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.TabPage tabGlossary;
         private System.Windows.Forms.TabPage tabValidation;
         private System.Windows.Forms.TabPage tabApproval;
+        private System.Windows.Forms.TabPage tabAlterCompare;
+        private System.Windows.Forms.Button btnOpenCompareVersions;
+        private System.Windows.Forms.Label lblAlterCompareHelp;
         private System.Windows.Forms.Button btnMartReview;
         private System.Windows.Forms.Button btnAlterWizardProd;
         private System.Windows.Forms.ComboBox cmbLeftModel;

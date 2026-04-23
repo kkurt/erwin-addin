@@ -4423,5 +4423,44 @@ namespace EliteSoft.Erwin.AddIn
         }
 
         #endregion
+
+        #region Alter Compare Tab (Phase 3.F)
+
+        /// <summary>
+        /// Launches the version-vs-active compare dialog. Baseline is always
+        /// the currently active PU (dirty or clean); the target is a Mart
+        /// version picked inside the dialog. See <see cref="Forms.CompareVersionsForm"/>.
+        /// </summary>
+        private void btnOpenCompareVersions_Click(object sender, EventArgs e)
+        {
+            if (!_isConnected || _currentModel == null)
+            {
+                MessageBox.Show(
+                    this,
+                    "No active erwin model. Open a model before running a compare.",
+                    "Alter Compare",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return;
+            }
+
+            try
+            {
+                using var dlg = new Forms.CompareVersionsForm(_scapi, _currentModel, (Action<string>)Log);
+                dlg.ShowDialog(this);
+            }
+            catch (Exception ex)
+            {
+                Log($"CompareVersions launch failed: {ex.GetType().Name}: {ex.Message}");
+                MessageBox.Show(
+                    this,
+                    $"Failed to open compare dialog:\n\n{ex.Message}",
+                    "Alter Compare",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+        }
+
+        #endregion
     }
 }
