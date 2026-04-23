@@ -1,29 +1,22 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
-using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 
-using EliteSoft.Erwin.AlterDdl.ComInterop;
 using EliteSoft.Erwin.AlterDdl.Core.Emitting;
-using EliteSoft.Erwin.AlterDdl.Core.Emitting.Dialect;
 using EliteSoft.Erwin.AlterDdl.Core.Models;
-using EliteSoft.Erwin.AlterDdl.Core.Pipeline;
 
 namespace EliteSoft.Erwin.AddIn.Services
 {
     /// <summary>
-    /// Phase 3.F: bridges the add-in's live SCAPI handle + active PU to the
-    /// ErwinAlterDdl pipeline. The baseline is always the currently-active model
-    /// (including its dirty buffer); the target is a selected Mart version of
-    /// the same model family.
-    ///
-    /// The service does NOT generate CREATE DDL for either side (InProcess
-    /// sessions can't on r10.10 because of singleton state pollution). As a
-    /// result the emitted ALTER SQL will contain TODO placeholders for new
-    /// column datatypes and constraint / index column lists. A follow-up phase
-    /// can add out-of-process DDL lookup if we need those filled.
+    /// Phase 3.F (in-process pivot disabled): bridges the add-in's live SCAPI
+    /// handle + active PU to the ErwinAlterDdl pipeline metadata only. The
+    /// end-to-end compare flow is currently intentionally inert - see
+    /// <see cref="CompareAsync"/> - because the naive save-to-temp / open-mart
+    /// dance collides with two hard SCAPI r10 constraints (see below).
+    /// The pure-logic helpers (<see cref="ResolveDialect"/>,
+    /// <see cref="PlanTargetVersions"/>, <see cref="ProbeDirty"/>) are still
+    /// used by the UI and are fully unit-tested.
     /// </summary>
     public sealed class VersionCompareService
     {
@@ -162,94 +155,26 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// Core pipeline, and emit the ALTER SQL for the active model's target
         /// server.
         /// </summary>
-        public async Task<CompareOutcome> CompareAsync(int targetVersion, CancellationToken ct = default)
+        public Task<CompareOutcome> CompareAsync(int targetVersion, CancellationToken ct = default)
         {
-            if (targetVersion <= 0) throw new ArgumentOutOfRangeException(nameof(targetVersion));
-
-            string tempDir = Path.Combine(Path.GetTempPath(), $"alter-ddl-{Guid.NewGuid():N}");
-            Directory.CreateDirectory(tempDir);
-            string leftErwin = Path.Combine(tempDir, "baseline.erwin");
-            string leftXml = Path.ChangeExtension(leftErwin, ".xml");
-            string rightErwin = Path.Combine(tempDir, "target.erwin");
-            string rightXml = Path.ChangeExtension(rightErwin, ".xml");
-            string xlsPath = Path.Combine(tempDir, "diff.xls");
-
-            dynamic targetPU = null;
-            string dialect = ResolveDialect(ReadActiveTargetServer().TargetServer);
-            try
-            {
-                _log($"VersionCompare: dumping baseline (active PU) to {leftErwin}");
-                SavePuToBothFormats(_activePU, leftErwin, leftXml);
-
-                _log($"VersionCompare: opening Mart target v{targetVersion}");
-                targetPU = DdlGenerationService.OpenMartVersionPU(_scapi, _activePU, targetVersion, _log);
-                if (targetPU is null)
-                    throw new InvalidOperationException($"Could not open Mart version v{targetVersion}.");
-
-                _log($"VersionCompare: dumping target (v{targetVersion}) to {rightErwin}");
-                SavePuToBothFormats(targetPU, rightErwin, rightXml);
-
-                var session = new InProcessScapiSession((object)_scapi);
-                await using (session.ConfigureAwait(false))
-                {
-                    var options = new CompareOptions
-                    {
-                        PresetOrOptionXmlPath = "Standard",
-                        Level = CompareLevel.PhysicalOnly,
-                        OutputXlsPath = xlsPath,
-                        IncludeCreateDdl = false,
-                    };
-
-                    var orchestrator = new CompareOrchestrator(session);
-                    var result = await orchestrator.CompareAsync(leftErwin, rightErwin, options, ct)
-                        .ConfigureAwait(false);
-
-                    var registry = new SqlEmitterRegistry()
-                        .Register(new MssqlEmitter(), "SQL Server")
-                        .Register(new OracleEmitter(), "Oracle")
-                        .Register(new Db2Emitter(), "Db2", "DB2 z/OS");
-                    var emitter = registry.Resolve(dialect);
-                    var script = emitter.Emit(result);
-
-                    _log($"VersionCompare: {result.Changes.Count} change(s), {script.Statements.Count} statement(s), dialect={dialect}");
-                    return new CompareOutcome(result, script, dialect);
-                }
-            }
-            finally
-            {
-                if (targetPU is not null)
-                {
-                    try { _scapi.PersistenceUnits.Remove(targetPU); } catch { }
-                    try { Marshal.FinalReleaseComObject(targetPU); } catch { }
-                }
-                TryCleanupTempDir(tempDir);
-            }
-        }
-
-        /// <summary>
-        /// erwin r10 supports saving a PU to either the binary .erwin format or
-        /// the XML interchange format by switching file extensions. Both are
-        /// produced side-by-side so the Core pipeline can read the XML for
-        /// ObjectId correlation and hand the .erwin to CompleteCompare.
-        /// </summary>
-        private void SavePuToBothFormats(dynamic pu, string erwinPath, string xmlPath)
-        {
-            try { pu.Save(erwinPath); }
-            catch (Exception ex)
-            {
-                throw new InvalidOperationException($"Save({erwinPath}) failed: {ex.Message}", ex);
-            }
-            try { pu.Save(xmlPath); }
-            catch (Exception ex)
-            {
-                throw new InvalidOperationException($"Save({xmlPath}) failed (erwin may not support the .xml extension on this PU type): {ex.Message}", ex);
-            }
-        }
-
-        private void TryCleanupTempDir(string tempDir)
-        {
-            try { if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true); }
-            catch (Exception ex) { _log($"VersionCompare: cleanup {tempDir} failed: {ex.Message}"); }
+            // Phase 3.F in-process pivot: the naive "save both PUs to temp
+            // + CompleteCompare" flow is blocked by two hard SCAPI r10
+            // constraints documented in DdlGenerationService.cs:
+            //   1. "Mart API blocks opening a second PU" (so target version
+            //      can't live next to the active PU in the same session).
+            //   2. pu.Save(path) intentionally corrupts a Mart-backed PU
+            //      (the add-in's own code relies on this to force reconnect).
+            // A user-triggered compare would therefore destroy the active
+            // model. We refuse rather than risk lost work and ask the user
+            // to wait for the out-of-process Worker pivot.
+            _ = targetVersion;
+            _ = ct;
+            throw new NotSupportedException(
+                "Active-vs-Mart compare through the in-process SCAPI pipeline is disabled: "
+                + "pu.Save(...) invalidates the active Mart PU on r10.10 and Mart API "
+                + "blocks opening a second PU in the same session. The follow-up design "
+                + "moves this flow to an out-of-process Worker that leaves the active "
+                + "add-in session untouched. Tracked as the 3.F 'real solution' pivot.");
         }
 
         private static string SafeGet(dynamic bag, string key)

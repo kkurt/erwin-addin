@@ -9,21 +9,36 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace EliteSoft.Erwin.AlterDdl.Core.Pipeline;
 
 /// <summary>
-/// End-to-end orchestrator for the Phase 2 compare flow:
-///   [SCAPI] CompleteCompare v1+v2 -> xls path
-///   [SCAPI] PropertyBag read x2   -> metadata
-///   [Core]  XLS parse             -> xlsRows
-///   [Core]  XML parse (v1, v2)    -> left/right ModelMap
-///   [Core]  Correlator             -> List&lt;Change&gt;
+/// End-to-end orchestrator for the compare flow:
+///   [SCAPI]    CompleteCompare v1+v2    -> xls path
+///   [SCAPI]    PropertyBag read x2      -> metadata
+///   [Core]     XLS parse                -> xlsRows
+///   [Provider] left + right model maps  -> ErwinModelMap x2
+///   [Core]     Correlator               -> List&lt;Change&gt;
+///
+/// The model-map source is pluggable via <see cref="IModelMapProvider"/>. The
+/// default is <see cref="XmlFileModelMapProvider"/>, preserving the original
+/// "sibling .xml export" contract; add-in / worker callers can inject their
+/// own provider that reads from SCAPI or an out-of-process dump.
 /// </summary>
 public sealed class CompareOrchestrator
 {
     private readonly IScapiSession _session;
+    private readonly IModelMapProvider _mapProvider;
     private readonly ILogger<CompareOrchestrator> _logger;
 
     public CompareOrchestrator(IScapiSession session, ILogger<CompareOrchestrator>? logger = null)
+        : this(session, mapProvider: null, logger)
+    {
+    }
+
+    public CompareOrchestrator(
+        IScapiSession session,
+        IModelMapProvider? mapProvider,
+        ILogger<CompareOrchestrator>? logger = null)
     {
         _session = session ?? throw new ArgumentNullException(nameof(session));
+        _mapProvider = mapProvider ?? new XmlFileModelMapProvider();
         _logger = logger ?? NullLogger<CompareOrchestrator>.Instance;
     }
 
@@ -54,16 +69,11 @@ public sealed class CompareOrchestrator
             .ConfigureAwait(false);
         _logger.LogInformation("CC produced {Path} ({Size} bytes)", xlsArtifact.XlsPath, xlsArtifact.SizeBytes);
 
-        // 3. Parse XLS + both XMLs. The XMLs are co-located next to the .erwin
-        //    files by erwin's "Export as XML" convention.
-        var leftXmlPath = Path.ChangeExtension(leftErwinPath, ".xml");
-        var rightXmlPath = Path.ChangeExtension(rightErwinPath, ".xml");
-        if (!File.Exists(leftXmlPath)) throw new FileNotFoundException("xml export missing", leftXmlPath);
-        if (!File.Exists(rightXmlPath)) throw new FileNotFoundException("xml export missing", rightXmlPath);
-
+        // 3. Parse XLS + fetch both model maps through the configured provider.
+        //    The provider decides the source (xml sibling / live SCAPI / etc).
         var xlsRows = XlsDiffParser.Parse(xlsArtifact.XlsPath);
-        var leftMap = ErwinXmlObjectIdMapper.ParseFile(leftXmlPath);
-        var rightMap = ErwinXmlObjectIdMapper.ParseFile(rightXmlPath);
+        var leftMap = await _mapProvider.BuildMapAsync(leftErwinPath, ct).ConfigureAwait(false);
+        var rightMap = await _mapProvider.BuildMapAsync(rightErwinPath, ct).ConfigureAwait(false);
 
         _logger.LogInformation(
             "Parsed: {Rows} xls rows, {LeftObjects} left objects, {RightObjects} right objects",
