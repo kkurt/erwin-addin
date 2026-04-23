@@ -43,6 +43,12 @@ public sealed class MssqlEmitter : ISqlEmitter
                 AttributeNullabilityChanged an => EmitAttributeNullability(an, rightCols),
                 AttributeDefaultChanged ad2 => EmitAttributeDefault(ad2),
                 AttributeIdentityChanged ai => EmitAttributeIdentity(ai),
+                KeyGroupAdded ka => EmitKeyGroupAdded(ka),
+                KeyGroupDropped kd => EmitKeyGroupDropped(kd),
+                KeyGroupRenamed kr => EmitKeyGroupRenamed(kr),
+                ForeignKeyAdded fa => EmitForeignKeyAdded(fa),
+                ForeignKeyDropped fd => EmitForeignKeyDropped(fd),
+                ForeignKeyRenamed fr => EmitForeignKeyRenamed(fr),
                 _ => null,
             };
             if (emitted is not null) stmts.Add(emitted);
@@ -145,6 +151,48 @@ public sealed class MssqlEmitter : ISqlEmitter
                + $"--       SQL Server has no in-place ALTER for IDENTITY; plan a swap table + sp_rename migration.",
             Comment: $"identity {ai.ParentEntity.Name}.{ai.Target.Name}: {ai.LeftHasIdentity} -> {ai.RightHasIdentity}");
     }
+
+    private static AlterStatement EmitKeyGroupAdded(KeyGroupAdded ka) => ka.Kind switch
+    {
+        KeyGroupKind.PrimaryKey => new(
+            Sql: $"ALTER TABLE {Quote(ka.ParentEntity.Name)} ADD CONSTRAINT {Quote(ka.Target.Name)} PRIMARY KEY (/* TODO: columns from v2 CREATE DDL */);",
+            Comment: $"add PK {ka.ParentEntity.Name}.{ka.Target.Name}"),
+        KeyGroupKind.UniqueConstraint => new(
+            Sql: $"ALTER TABLE {Quote(ka.ParentEntity.Name)} ADD CONSTRAINT {Quote(ka.Target.Name)} UNIQUE (/* TODO: columns */);",
+            Comment: $"add UQ {ka.ParentEntity.Name}.{ka.Target.Name}"),
+        _ => new(
+            Sql: $"CREATE INDEX {Quote(ka.Target.Name)} ON {Quote(ka.ParentEntity.Name)} (/* TODO: columns */);",
+            Comment: $"add index {ka.ParentEntity.Name}.{ka.Target.Name}"),
+    };
+
+    private static AlterStatement EmitKeyGroupDropped(KeyGroupDropped kd) => kd.Kind switch
+    {
+        KeyGroupKind.PrimaryKey => new(
+            Sql: $"ALTER TABLE {Quote(kd.ParentEntity.Name)} DROP CONSTRAINT {Quote(kd.Target.Name)};",
+            Comment: $"drop PK {kd.ParentEntity.Name}.{kd.Target.Name}"),
+        KeyGroupKind.UniqueConstraint => new(
+            Sql: $"ALTER TABLE {Quote(kd.ParentEntity.Name)} DROP CONSTRAINT {Quote(kd.Target.Name)};",
+            Comment: $"drop UQ {kd.ParentEntity.Name}.{kd.Target.Name}"),
+        _ => new(
+            Sql: $"DROP INDEX {Quote(kd.Target.Name)} ON {Quote(kd.ParentEntity.Name)};",
+            Comment: $"drop index {kd.ParentEntity.Name}.{kd.Target.Name}"),
+    };
+
+    private static AlterStatement EmitKeyGroupRenamed(KeyGroupRenamed kr) => new(
+        Sql: $"EXEC sp_rename '{kr.ParentEntity.Name}.{kr.OldName}', '{kr.Target.Name}', 'INDEX';",
+        Comment: $"rename {kr.Kind} {kr.OldName} -> {kr.Target.Name}");
+
+    private static AlterStatement EmitForeignKeyAdded(ForeignKeyAdded fa) => new(
+        Sql: $"-- TODO: ADD FOREIGN KEY CONSTRAINT {Quote(fa.Target.Name)} - child/parent columns from v2 CREATE DDL",
+        Comment: $"add FK {fa.Target.Name}");
+
+    private static AlterStatement EmitForeignKeyDropped(ForeignKeyDropped fd) => new(
+        Sql: $"-- TODO: ALTER TABLE <child> DROP CONSTRAINT {Quote(fd.Target.Name)} - child table from v1 model",
+        Comment: $"drop FK {fd.Target.Name}");
+
+    private static AlterStatement EmitForeignKeyRenamed(ForeignKeyRenamed fr) => new(
+        Sql: $"EXEC sp_rename '{fr.OldName}', '{fr.Target.Name}', 'OBJECT';",
+        Comment: $"rename FK {fr.OldName} -> {fr.Target.Name}");
 
     /// <summary>Quote an identifier with square brackets and escape any embedded ']'.</summary>
     private static string Quote(string ident) => "[" + ident.Replace("]", "]]") + "]";

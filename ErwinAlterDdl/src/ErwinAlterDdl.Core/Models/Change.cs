@@ -19,6 +19,12 @@ namespace EliteSoft.Erwin.AlterDdl.Core.Models;
 [JsonDerivedType(typeof(AttributeNullabilityChanged), nameof(AttributeNullabilityChanged))]
 [JsonDerivedType(typeof(AttributeDefaultChanged), nameof(AttributeDefaultChanged))]
 [JsonDerivedType(typeof(AttributeIdentityChanged), nameof(AttributeIdentityChanged))]
+[JsonDerivedType(typeof(KeyGroupAdded), nameof(KeyGroupAdded))]
+[JsonDerivedType(typeof(KeyGroupDropped), nameof(KeyGroupDropped))]
+[JsonDerivedType(typeof(KeyGroupRenamed), nameof(KeyGroupRenamed))]
+[JsonDerivedType(typeof(ForeignKeyAdded), nameof(ForeignKeyAdded))]
+[JsonDerivedType(typeof(ForeignKeyDropped), nameof(ForeignKeyDropped))]
+[JsonDerivedType(typeof(ForeignKeyRenamed), nameof(ForeignKeyRenamed))]
 public abstract record Change(ObjectRef Target);
 
 // ---------- Entity-level ----------
@@ -51,6 +57,41 @@ public sealed record AttributeTypeChanged(
     ObjectRef ParentEntity,
     string LeftType,
     string RightType) : Change(Target);
+
+// ---------- Key_Group-level (Primary Key / Unique Constraint / Index) ----------
+
+public enum KeyGroupKind
+{
+    Unknown,
+    PrimaryKey,
+    UniqueConstraint,
+    Index,
+    InversionEntry,
+}
+
+public sealed record KeyGroupAdded(
+    ObjectRef Target,
+    ObjectRef ParentEntity,
+    KeyGroupKind Kind = KeyGroupKind.Unknown) : Change(Target);
+
+public sealed record KeyGroupDropped(
+    ObjectRef Target,
+    ObjectRef ParentEntity,
+    KeyGroupKind Kind = KeyGroupKind.Unknown) : Change(Target);
+
+public sealed record KeyGroupRenamed(
+    ObjectRef Target,
+    ObjectRef ParentEntity,
+    string OldName,
+    KeyGroupKind Kind = KeyGroupKind.Unknown) : Change(Target);
+
+// ---------- Relationship (Foreign Key) ----------
+
+public sealed record ForeignKeyAdded(ObjectRef Target) : Change(Target);
+
+public sealed record ForeignKeyDropped(ObjectRef Target) : Change(Target);
+
+public sealed record ForeignKeyRenamed(ObjectRef Target, string OldName) : Change(Target);
 
 /// <summary>
 /// NULL / NOT NULL flip on an attribute. The XLS row is "Null Option" with

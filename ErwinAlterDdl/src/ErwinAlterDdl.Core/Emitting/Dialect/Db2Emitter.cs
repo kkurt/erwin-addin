@@ -36,6 +36,12 @@ public sealed class Db2Emitter : ISqlEmitter
                 AttributeNullabilityChanged an => EmitAttributeNullability(an),
                 AttributeDefaultChanged ad2 => EmitAttributeDefault(ad2),
                 AttributeIdentityChanged ai => EmitAttributeIdentity(ai),
+                KeyGroupAdded ka => EmitKeyGroupAdded(ka),
+                KeyGroupDropped kd => EmitKeyGroupDropped(kd),
+                KeyGroupRenamed kr => EmitKeyGroupRenamed(kr),
+                ForeignKeyAdded fa => EmitForeignKeyAdded(fa),
+                ForeignKeyDropped fd => EmitForeignKeyDropped(fd),
+                ForeignKeyRenamed fr => EmitForeignKeyRenamed(fr),
                 _ => null,
             };
             if (emitted is not null) stmts.Add(emitted);
@@ -117,6 +123,50 @@ public sealed class Db2Emitter : ISqlEmitter
                + $"--       Db2 has no in-place identity toggle; copy column + DROP/RENAME is required.",
             Comment: $"identity {ai.ParentEntity.Name}.{ai.Target.Name}: {ai.LeftHasIdentity} -> {ai.RightHasIdentity}");
     }
+
+    private static AlterStatement EmitKeyGroupAdded(KeyGroupAdded ka) => ka.Kind switch
+    {
+        KeyGroupKind.PrimaryKey => new(
+            Sql: $"ALTER TABLE {Quote(ka.ParentEntity.Name)} ADD CONSTRAINT {Quote(ka.Target.Name)} PRIMARY KEY (/* TODO: columns */);",
+            Comment: $"add PK {ka.ParentEntity.Name}.{ka.Target.Name}"),
+        KeyGroupKind.UniqueConstraint => new(
+            Sql: $"ALTER TABLE {Quote(ka.ParentEntity.Name)} ADD CONSTRAINT {Quote(ka.Target.Name)} UNIQUE (/* TODO: columns */);",
+            Comment: $"add UQ {ka.ParentEntity.Name}.{ka.Target.Name}"),
+        _ => new(
+            Sql: $"CREATE INDEX {Quote(ka.Target.Name)} ON {Quote(ka.ParentEntity.Name)} (/* TODO: columns */);",
+            Comment: $"add index {ka.ParentEntity.Name}.{ka.Target.Name}"),
+    };
+
+    private static AlterStatement EmitKeyGroupDropped(KeyGroupDropped kd) => kd.Kind switch
+    {
+        KeyGroupKind.PrimaryKey => new(
+            Sql: $"ALTER TABLE {Quote(kd.ParentEntity.Name)} DROP PRIMARY KEY;",
+            Comment: $"drop PK {kd.ParentEntity.Name}.{kd.Target.Name}"),
+        KeyGroupKind.UniqueConstraint => new(
+            Sql: $"ALTER TABLE {Quote(kd.ParentEntity.Name)} DROP CONSTRAINT {Quote(kd.Target.Name)};",
+            Comment: $"drop UQ {kd.ParentEntity.Name}.{kd.Target.Name}"),
+        _ => new(
+            Sql: $"DROP INDEX {Quote(kd.Target.Name)};",
+            Comment: $"drop index {kd.ParentEntity.Name}.{kd.Target.Name}"),
+    };
+
+    private static AlterStatement EmitKeyGroupRenamed(KeyGroupRenamed kr) => new(
+        Sql: kr.Kind == KeyGroupKind.Index
+            ? $"RENAME INDEX {Quote(kr.OldName)} TO {Quote(kr.Target.Name)};"
+            : $"-- TODO: Db2 z/OS constraint rename requires DROP + ADD of {Quote(kr.OldName)} -> {Quote(kr.Target.Name)}",
+        Comment: $"rename {kr.Kind} {kr.OldName} -> {kr.Target.Name}");
+
+    private static AlterStatement EmitForeignKeyAdded(ForeignKeyAdded fa) => new(
+        Sql: $"-- TODO: ALTER TABLE <child> ADD CONSTRAINT {Quote(fa.Target.Name)} FOREIGN KEY (/* cols */) REFERENCES <parent> (/* cols */)",
+        Comment: $"add FK {fa.Target.Name}");
+
+    private static AlterStatement EmitForeignKeyDropped(ForeignKeyDropped fd) => new(
+        Sql: $"-- TODO: ALTER TABLE <child> DROP FOREIGN KEY {Quote(fd.Target.Name)}",
+        Comment: $"drop FK {fd.Target.Name}");
+
+    private static AlterStatement EmitForeignKeyRenamed(ForeignKeyRenamed fr) => new(
+        Sql: $"-- TODO: Db2 has no FK rename; DROP + ADD {Quote(fr.OldName)} -> {Quote(fr.Target.Name)}",
+        Comment: $"rename FK {fr.OldName} -> {fr.Target.Name}");
 
     /// <summary>Db2 identifier quoting is "..." with doubled internal quotes (same as Oracle).</summary>
     private static string Quote(string ident) => "\"" + ident.Replace("\"", "\"\"") + "\"";

@@ -25,6 +25,8 @@ public static class ChangeCorrelator
         CorrelateAttributes(leftMap, rightMap, changes);
         CorrelateAttributeTypeChanges(leftMap, rightMap, xlsRows, changes);
         CorrelateAttributePropertyChanges(leftMap, rightMap, xlsRows, changes);
+        CorrelateKeyGroups(leftMap, rightMap, changes);
+        CorrelateRelationships(leftMap, rightMap, changes);
 
         // Deterministic order: stable by (Target.Class, Target.Name, kind name).
         return changes
@@ -289,6 +291,63 @@ public static class ChangeCorrelator
         return map.TryGetId("Entity", entityName, out var id) && map.TryGetById(id, out var entity)
             ? entity
             : null;
+    }
+
+    private static void CorrelateKeyGroups(ErwinModelMap left, ErwinModelMap right, List<Change> sink)
+    {
+        var lk = left.ObjectsOfClass("Key_Group").ToDictionary(o => o.ObjectId, o => o, StringComparer.Ordinal);
+        var rk = right.ObjectsOfClass("Key_Group").ToDictionary(o => o.ObjectId, o => o, StringComparer.Ordinal);
+
+        foreach (var id in rk.Keys.Except(lk.Keys))
+        {
+            var kg = rk[id];
+            var parent = (kg.ParentObjectId is not null && right.TryGetById(kg.ParentObjectId, out var p))
+                ? p : UnknownParent();
+            sink.Add(new KeyGroupAdded(kg, parent, GuessKind(kg.Name)));
+        }
+        foreach (var id in lk.Keys.Except(rk.Keys))
+        {
+            var kg = lk[id];
+            var parent = (kg.ParentObjectId is not null && left.TryGetById(kg.ParentObjectId, out var p))
+                ? p : UnknownParent();
+            sink.Add(new KeyGroupDropped(kg, parent, GuessKind(kg.Name)));
+        }
+        foreach (var id in lk.Keys.Intersect(rk.Keys))
+        {
+            if (!string.Equals(lk[id].Name, rk[id].Name, StringComparison.Ordinal))
+            {
+                var kg = rk[id];
+                var parent = (kg.ParentObjectId is not null && right.TryGetById(kg.ParentObjectId, out var p))
+                    ? p : UnknownParent();
+                sink.Add(new KeyGroupRenamed(kg, parent, lk[id].Name, GuessKind(kg.Name)));
+            }
+        }
+    }
+
+    private static void CorrelateRelationships(ErwinModelMap left, ErwinModelMap right, List<Change> sink)
+    {
+        var lr = left.ObjectsOfClass("Relationship").ToDictionary(o => o.ObjectId, o => o, StringComparer.Ordinal);
+        var rr = right.ObjectsOfClass("Relationship").ToDictionary(o => o.ObjectId, o => o, StringComparer.Ordinal);
+
+        foreach (var id in rr.Keys.Except(lr.Keys))
+            sink.Add(new ForeignKeyAdded(rr[id]));
+        foreach (var id in lr.Keys.Except(rr.Keys))
+            sink.Add(new ForeignKeyDropped(lr[id]));
+        foreach (var id in lr.Keys.Intersect(rr.Keys))
+        {
+            if (!string.Equals(lr[id].Name, rr[id].Name, StringComparison.Ordinal))
+                sink.Add(new ForeignKeyRenamed(rr[id], lr[id].Name));
+        }
+    }
+
+    private static KeyGroupKind GuessKind(string name)
+    {
+        // erwin default naming: XPK* = PK, XAK* = AK/Unique, XIE* = Inversion entry (non-unique index).
+        // Users can override. We fall back to Index when the prefix doesn't match.
+        if (name.StartsWith("XPK", StringComparison.OrdinalIgnoreCase)) return KeyGroupKind.PrimaryKey;
+        if (name.StartsWith("XAK", StringComparison.OrdinalIgnoreCase)) return KeyGroupKind.UniqueConstraint;
+        if (name.StartsWith("XIE", StringComparison.OrdinalIgnoreCase)) return KeyGroupKind.InversionEntry;
+        return KeyGroupKind.Index;
     }
 
     private static ObjectRef? ResolveParentEntity(ErwinModelMap map, ObjectRef child)
