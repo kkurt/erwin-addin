@@ -84,6 +84,7 @@ public static class Program
     private static int RunMetadata(Dictionary<string, string> kv)
     {
         var erwinPath = Require(kv, "--erwin");
+        ClearReadOnly(erwinPath);
 
         dynamic scapi = CreateScapi();
         dynamic pu = scapi.PersistenceUnits.Add(erwinPath, "");
@@ -114,6 +115,8 @@ public static class Program
         var outPath = Require(kv, "--out");
         var preset = kv.GetValueOrDefault("--preset", "Standard");
         var level = kv.GetValueOrDefault("--level", "LP");
+        ClearReadOnly(left);
+        ClearReadOnly(right);
 
         dynamic scapi = CreateScapi();
         var bagType = Type.GetTypeFromProgID("ERwin9.SCAPI.PropertyBag.9.0", throwOnError: true)!;
@@ -143,24 +146,23 @@ public static class Program
         var erwinPath = Require(kv, "--erwin");
         var outPath = Require(kv, "--out");
         var feXml = kv.GetValueOrDefault("--fe-option-xml", "");
+        ClearReadOnly(erwinPath);
 
         dynamic scapi = CreateScapi();
         dynamic pu = scapi.PersistenceUnits.Add(erwinPath, "");
-        try
-        {
-            dynamic bag = pu.PropertyBag(null, true);
-            string target = SafeBagString(bag, "Target_Server");
-            bool ok = pu.FEModel_DDL(outPath, feXml);
-            if (!ok) return Fail(ExitOperationFailed, "FEModel_DDL returned false");
-            if (!File.Exists(outPath)) return Fail(ExitOperationFailed, "sql not produced");
-            WriteJson(new DdlArtifact(outPath, new FileInfo(outPath).Length, target));
-            return ExitOk;
-        }
-        finally
-        {
-            TryRelease(pu);
-            TryRelease(scapi);
-        }
+
+        dynamic bag = pu.PropertyBag(null, true);
+        string target = SafeBagString(bag, "Target_Server");
+        bool ok = pu.FEModel_DDL(outPath, feXml);
+        if (!ok) return Fail(ExitOperationFailed, "FEModel_DDL returned false");
+        if (!File.Exists(outPath)) return Fail(ExitOperationFailed, "sql not produced");
+        WriteJson(new DdlArtifact(outPath, new FileInfo(outPath).Length, target));
+        Console.Out.Flush();
+
+        // Same cleanup-AV risk as CC; bail via OS exit to skip the managed
+        // finally and dodge Marshal.FinalReleaseComObject on a dirty handle.
+        Environment.Exit(ExitOk);
+        return ExitOk;
     }
 
     // ---------- helpers ----------
@@ -175,6 +177,25 @@ public static class Program
         // this the next Add can trip the r10.10 state-pollution bug.
         try { scapi.PersistenceUnits.Clear(); } catch { /* best effort */ }
         return scapi;
+    }
+
+    /// <summary>
+    /// Ensure input .erwin file is writable. After a CC run, SCAPI leaves the
+    /// file with the Read-Only attribute set, which breaks the next
+    /// PersistenceUnits.Add (COM 0x800407DC "File exists and read only").
+    /// </summary>
+    private static void ClearReadOnly(string path)
+    {
+        if (!File.Exists(path)) return;
+        try
+        {
+            var attrs = File.GetAttributes(path);
+            if ((attrs & FileAttributes.ReadOnly) != 0)
+            {
+                File.SetAttributes(path, attrs & ~FileAttributes.ReadOnly);
+            }
+        }
+        catch { /* best effort */ }
     }
 
     private static void KillLingeringErwinProcesses()

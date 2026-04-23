@@ -73,6 +73,22 @@ public sealed class CompareOrchestrator
         var changes = ChangeCorrelator.Correlate(leftMap, rightMap, xlsRows);
         _logger.LogInformation("Correlator produced {Count} changes", changes.Count);
 
-        return new CompareResult(leftMeta, rightMeta, changes, xlsArtifact);
+        // 5. Optional: generate CREATE DDL for each side (Phase 3 emitter fuel).
+        DdlArtifact? leftDdl = null, rightDdl = null;
+        if (options.IncludeCreateDdl)
+        {
+            _logger.LogInformation("Generating CREATE DDL for both sides");
+            leftDdl = await _session.GenerateCreateDdlAsync(leftErwinPath, DdlOptions.Default, ct).ConfigureAwait(false);
+            rightDdl = await _session.GenerateCreateDdlAsync(rightErwinPath, DdlOptions.Default, ct).ConfigureAwait(false);
+            _logger.LogInformation(
+                "DDL: left {LeftPath} ({LeftSize}), right {RightPath} ({RightSize})",
+                leftDdl.SqlPath, leftDdl.SizeBytes, rightDdl.SqlPath, rightDdl.SizeBytes);
+        }
+
+        return new CompareResult(leftMeta, rightMeta, changes, xlsArtifact)
+        {
+            LeftDdl = leftDdl,
+            RightDdl = rightDdl,
+        };
     }
 }

@@ -108,10 +108,23 @@ public sealed class OutOfProcessScapiSession : IScapiSession
             args.Add(options.FeOptionXmlPath);
         }
 
-        var json = await RunWorkerAsync(args.ToArray(), ct).ConfigureAwait(false);
-        var result = JsonSerializer.Deserialize<DdlArtifact>(json)
-            ?? throw new InvalidOperationException("worker returned empty ddl result");
-        return result;
+        try
+        {
+            var json = await RunWorkerAsync(args.ToArray(), ct).ConfigureAwait(false);
+            var result = JsonSerializer.Deserialize<DdlArtifact>(json)
+                ?? throw new InvalidOperationException("worker returned empty ddl result");
+            return result;
+        }
+        catch (InvalidOperationException ex) when (File.Exists(outPath) && new FileInfo(outPath).Length > 0)
+        {
+            // Same SCAPI r10.10 cleanup AV pattern as CC: sql is written before
+            // the native crash. Honor the artifact.
+            var info = new FileInfo(outPath);
+            _logger.LogWarning(
+                "Worker crashed after DDL wrote {Size} bytes to {Path}; treating as success. msg: {Msg}",
+                info.Length, outPath, ex.Message);
+            return new DdlArtifact(outPath, info.Length, "(unknown)");
+        }
     }
 
     public async Task<ModelMetadata> ReadModelMetadataAsync(string erwinPath, CancellationToken ct = default)

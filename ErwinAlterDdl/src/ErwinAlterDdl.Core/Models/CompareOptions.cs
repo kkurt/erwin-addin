@@ -24,6 +24,14 @@ public sealed record CompareOptions
     /// </summary>
     public string? OutputXlsPath { get; init; }
 
+    /// <summary>
+    /// When true the orchestrator also calls <c>GenerateCreateDdlAsync</c> for
+    /// each side, attaching the produced <see cref="DdlArtifact"/> to the
+    /// result. Needed by Phase 3 SQL emitters that consult the full CREATE
+    /// DDL for body details (datatype strings, constraints).
+    /// </summary>
+    public bool IncludeCreateDdl { get; init; }
+
     public static CompareOptions Default { get; } = new();
 }
 

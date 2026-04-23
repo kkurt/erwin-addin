@@ -30,4 +30,11 @@ public sealed record CompareResult(
     ModelMetadata LeftMetadata,
     ModelMetadata RightMetadata,
     IReadOnlyList<Change> Changes,
-    CompareArtifact XlsArtifact);
+    CompareArtifact XlsArtifact)
+{
+    /// <summary>Optional CREATE DDL for the baseline (left) model.</summary>
+    public DdlArtifact? LeftDdl { get; init; }
+
+    /// <summary>Optional CREATE DDL for the target (right) model.</summary>
+    public DdlArtifact? RightDdl { get; init; }
+}

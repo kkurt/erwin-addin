@@ -49,10 +49,13 @@ public static class Program
             aliases: ["--artifacts-dir"],
             description: "Used by --session-mode mock: directory containing diff.xls and (optional) metadata");
         var verboseOption = new Option<bool>(aliases: ["--verbose"], description: "Verbose console logging");
+        var includeDdlOption = new Option<bool>(
+            aliases: ["--include-create-ddl"],
+            description: "Also run FEModel_DDL on each side and attach DdlArtifact to the result");
 
         var root = new RootCommand("erwin-ddl-diff: produce a typed Change list for two .erwin models")
         {
-            leftOption, rightOption, outOption, levelOption, optionSetOption, sessionMode, artifactsDir, verboseOption,
+            leftOption, rightOption, outOption, levelOption, optionSetOption, sessionMode, artifactsDir, verboseOption, includeDdlOption,
         };
 
         root.SetHandler(async ctx =>
@@ -65,9 +68,10 @@ public static class Program
             var mode = ctx.ParseResult.GetValueForOption(sessionMode)!;
             var artifacts = ctx.ParseResult.GetValueForOption(artifactsDir);
             var verbose = ctx.ParseResult.GetValueForOption(verboseOption);
+            var includeDdl = ctx.ParseResult.GetValueForOption(includeDdlOption);
 
             ctx.ExitCode = await RunAsync(
-                left, right, outFile, level, preset, mode, artifacts, verbose, ctx.GetCancellationToken());
+                left, right, outFile, level, preset, mode, artifacts, verbose, includeDdl, ctx.GetCancellationToken());
         });
 
         return await root.InvokeAsync(args);
@@ -76,7 +80,7 @@ public static class Program
     private static async Task<int> RunAsync(
         FileInfo left, FileInfo right, FileInfo outFile,
         string level, string preset, string sessionMode, DirectoryInfo? artifactsDir,
-        bool verbose, CancellationToken ct)
+        bool verbose, bool includeDdl, CancellationToken ct)
     {
         ConfigureLogging(verbose);
         var logger = CreateLogger();
@@ -95,6 +99,7 @@ public static class Program
         {
             Level = parsedLevel,
             PresetOrOptionXmlPath = preset,
+            IncludeCreateDdl = includeDdl,
         };
 
         IScapiSession session;
