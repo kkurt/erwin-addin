@@ -55,8 +55,34 @@ public class ChangeCorrelatorTests
         new(4, "Physical Data Type", "varchar(100)", "Not Equal", "varchar(250)"),
     ];
 
+    /// <summary>
+    /// erwin CC XLS sometimes renders the Entity/Table row with its owner
+    /// schema prefixed (e.g. "app.CUSTOMER") while the XML model map stores
+    /// only the bare name ("CUSTOMER"). The correlator must resolve past
+    /// that mismatch and still wire up the real ObjectIds instead of falling
+    /// back to synthetic <c>(xls-only):...</c> references.
+    /// </summary>
+    private static readonly XlsDiffRow[] XlsRowsWithSchemaQualifiedEntity =
+    [
+        new(2, "Entity/Table", "app.CUSTOMER", "Equal", "app.CUSTOMER"),
+        new(3, "Attribute/Column", "mobile_no", "Not Equal", "mobile_no"),
+        new(4, "Physical Data Type", "varchar(100)", "Not Equal", "varchar(250)"),
+    ];
+
     private ErwinModelMap Left => ErwinXmlObjectIdMapper.ParseXml(V1Xml);
     private ErwinModelMap Right => ErwinXmlObjectIdMapper.ParseXml(V2Xml);
+
+    [Fact]
+    public void Correlate_resolves_type_change_when_xls_entity_is_schema_qualified()
+    {
+        var changes = ChangeCorrelator.Correlate(Left, Right, XlsRowsWithSchemaQualifiedEntity);
+        var typeChange = changes.OfType<AttributeTypeChanged>().Should().ContainSingle().Subject;
+        typeChange.Target.ObjectId.Should().Be("{A2}+0");
+        typeChange.ParentEntity.ObjectId.Should().Be("{E1}+0");
+        typeChange.ParentEntity.Name.Should().Be("CUSTOMER");
+        typeChange.LeftType.Should().Be("varchar(100)");
+        typeChange.RightType.Should().Be("varchar(250)");
+    }
 
     [Fact]
     public void Correlate_detects_entity_added()

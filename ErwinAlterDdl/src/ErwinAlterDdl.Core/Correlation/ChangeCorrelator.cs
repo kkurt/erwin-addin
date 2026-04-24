@@ -133,34 +133,46 @@ public static class ChangeCorrelator
                 case "Physical Data Type" when row.IsNotEqual:
                     if (ctxEntityName is null || ctxAttrName is null) break;
 
-                    ObjectRef? attr = null;
-                    if (right.TryGetAttributeId(ctxEntityName, ctxAttrName, out var aid) &&
-                        right.TryGetById(aid, out var resolved))
-                    {
-                        attr = resolved;
-                    }
-                    else
-                    {
-                        // Synthetic reference when the XML map cannot resolve the
-                        // attribute (e.g. new attribute not yet in v2 XML via XLS).
-                        attr = new ObjectRef(
-                            ObjectId: $"(xls-only):{ctxEntityName}.{ctxAttrName}",
-                            Name: ctxAttrName,
-                            Class: "Attribute");
-                    }
+                    // Skip XLS-derived property changes for entities/attributes
+                    // that no longer exist on the right side. Structural diff
+                    // already emits EntityDropped / AttributeDropped for these.
+                    if (!TryResolveAttribute(right, ctxEntityName, ctxAttrName, out var resolved))
+                        break;
 
-                    // Parent entity: first try the attribute's own ParentObjectId,
-                    // fall back to looking up the entity by the XLS context name.
-                    var parent = ResolveParentEntity(right, attr)
+                    var parent = ResolveParentEntity(right, resolved)
                         ?? LookupEntityByName(right, ctxEntityName)
                         ?? new ObjectRef(
                             ObjectId: $"(xls-only):{ctxEntityName}",
                             Name: ctxEntityName,
                             Class: "Entity");
-                    sink.Add(new AttributeTypeChanged(attr, parent, row.LeftValue, row.RightValue));
+                    sink.Add(new AttributeTypeChanged(resolved, parent, row.LeftValue, row.RightValue));
                     break;
             }
         }
+    }
+
+    /// <summary>
+    /// Resolve an attribute by its entity + column name, tolerating a
+    /// schema-qualified entity name (e.g. <c>app.CUSTOMER</c>) coming from
+    /// the CC XLS when the XML map stores only the unqualified entity name.
+    /// </summary>
+    private static bool TryResolveAttribute(ErwinModelMap map, string entityName, string attrName, out ObjectRef attr)
+    {
+        if (map.TryGetAttributeId(entityName, attrName, out var aid) && map.TryGetById(aid, out attr!))
+            return true;
+        var unqualified = StripSchemaPrefix(entityName);
+        if (!string.Equals(unqualified, entityName, StringComparison.Ordinal)
+            && map.TryGetAttributeId(unqualified, attrName, out aid)
+            && map.TryGetById(aid, out attr!))
+            return true;
+        attr = default!;
+        return false;
+    }
+
+    private static string StripSchemaPrefix(string name)
+    {
+        int dot = name.IndexOf('.');
+        return dot < 0 ? name : name[(dot + 1)..];
     }
 
     /// <summary>
@@ -209,6 +221,7 @@ public static class ChangeCorrelator
 
                 case "Null Option" when row.IsNotEqual:
                     if (ctxEntityName is null || ctxAttrName is null) break;
+                    if (!TryResolveAttribute(right, ctxEntityName, ctxAttrName, out _)) break;
                     var (attrN, parentN) = ResolveAttrRefs(right, ctxEntityName, ctxAttrName);
                     sink.Add(new AttributeNullabilityChanged(
                         attrN, parentN,
@@ -219,6 +232,7 @@ public static class ChangeCorrelator
                 case "Default" when row.IsNotEqual:
                 case "Default Value" when row.IsNotEqual:
                     if (ctxEntityName is null || ctxAttrName is null) break;
+                    if (!TryResolveAttribute(right, ctxEntityName, ctxAttrName, out _)) break;
                     var (attrD, parentD) = ResolveAttrRefs(right, ctxEntityName, ctxAttrName);
                     sink.Add(new AttributeDefaultChanged(
                         attrD, parentD,
@@ -230,6 +244,7 @@ public static class ChangeCorrelator
                 case "Identity Increment" when row.IsNotEqual:
                 case "Identity Seed" when row.IsNotEqual:
                     if (ctxEntityName is null || ctxAttrName is null) break;
+                    if (!TryResolveAttribute(right, ctxEntityName, ctxAttrName, out _)) break;
                     var dedupeKey = $"{ctxEntityName}.{ctxAttrName}";
                     if (!identityEmitted.Add(dedupeKey)) break;
                     var (attrI, parentI) = ResolveAttrRefs(right, ctxEntityName, ctxAttrName);
@@ -245,12 +260,7 @@ public static class ChangeCorrelator
     private static (ObjectRef Attr, ObjectRef Parent) ResolveAttrRefs(
         ErwinModelMap map, string entityName, string attrName)
     {
-        ObjectRef attr;
-        if (map.TryGetAttributeId(entityName, attrName, out var aid) && map.TryGetById(aid, out var resolved))
-        {
-            attr = resolved;
-        }
-        else
+        if (!TryResolveAttribute(map, entityName, attrName, out var attr))
         {
             attr = new ObjectRef(
                 ObjectId: $"(xls-only):{entityName}.{attrName}",
@@ -291,9 +301,17 @@ public static class ChangeCorrelator
 
     private static ObjectRef? LookupEntityByName(ErwinModelMap map, string entityName)
     {
-        return map.TryGetId("Entity", entityName, out var id) && map.TryGetById(id, out var entity)
-            ? entity
-            : null;
+        if (map.TryGetId("Entity", entityName, out var id) && map.TryGetById(id, out var entity))
+            return entity;
+        // CC XLS sometimes qualifies entities with a schema ("app.CUSTOMER")
+        // while the XML map stores just the name ("CUSTOMER"). Retry with the
+        // unqualified form so these entries link back to the real ObjectId.
+        var unqualified = StripSchemaPrefix(entityName);
+        if (!string.Equals(unqualified, entityName, StringComparison.Ordinal)
+            && map.TryGetId("Entity", unqualified, out id)
+            && map.TryGetById(id, out entity))
+            return entity;
+        return null;
     }
 
     private static void CorrelateKeyGroups(ErwinModelMap left, ErwinModelMap right, List<Change> sink)
