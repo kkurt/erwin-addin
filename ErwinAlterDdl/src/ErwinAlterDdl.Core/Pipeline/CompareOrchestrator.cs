@@ -47,8 +47,11 @@ public sealed class CompareOrchestrator
         ArgumentException.ThrowIfNullOrWhiteSpace(leftErwinPath);
         ArgumentException.ThrowIfNullOrWhiteSpace(rightErwinPath);
         ArgumentNullException.ThrowIfNull(options);
-        if (!File.Exists(leftErwinPath)) throw new FileNotFoundException(leftErwinPath);
-        if (!File.Exists(rightErwinPath)) throw new FileNotFoundException(rightErwinPath);
+        // Path existence checks only apply when we actually have a disk path.
+        // Live-SCAPI providers route through a virtual pathKey (e.g.
+        // "active-pu://<name>") that is not a file.
+        if (IsFilePath(leftErwinPath) && !File.Exists(leftErwinPath)) throw new FileNotFoundException(leftErwinPath);
+        if (IsFilePath(rightErwinPath) && !File.Exists(rightErwinPath)) throw new FileNotFoundException(rightErwinPath);
 
         // 1. Read metadata for both PUs. Sequential (not parallel) because SCAPI
         //    is a process-level singleton on r10.10 - two concurrent worker
@@ -58,16 +61,28 @@ public sealed class CompareOrchestrator
         var leftMeta = await _session.ReadModelMetadataAsync(leftErwinPath, ct).ConfigureAwait(false);
         var rightMeta = await _session.ReadModelMetadataAsync(rightErwinPath, ct).ConfigureAwait(false);
 
-        // 2. Run CompleteCompare to produce the XLS.
-        _logger.LogInformation("Running CompleteCompare");
-        var xlsArtifact = await _session
-            .RunCompleteCompareAsync(leftErwinPath, rightErwinPath, options, ct)
-            .ConfigureAwait(false);
-        _logger.LogInformation("CC produced {Path} ({Size} bytes)", xlsArtifact.XlsPath, xlsArtifact.SizeBytes);
+        // 2. Run CompleteCompare to produce the XLS (unless the caller told
+        //    us to skip it - e.g. the in-process add-in which cannot save the
+        //    active Mart PU without corrupting it).
+        CompareArtifact xlsArtifact;
+        IReadOnlyList<XlsDiffRow> xlsRows;
+        if (options.SkipCompleteCompare)
+        {
+            _logger.LogInformation("Skipping CompleteCompare (structural diff only)");
+            xlsArtifact = new CompareArtifact(string.Empty, 0, 0);
+            xlsRows = Array.Empty<XlsDiffRow>();
+        }
+        else
+        {
+            _logger.LogInformation("Running CompleteCompare");
+            xlsArtifact = await _session
+                .RunCompleteCompareAsync(leftErwinPath, rightErwinPath, options, ct)
+                .ConfigureAwait(false);
+            _logger.LogInformation("CC produced {Path} ({Size} bytes)", xlsArtifact.XlsPath, xlsArtifact.SizeBytes);
+            xlsRows = XlsDiffParser.Parse(xlsArtifact.XlsPath);
+        }
 
-        // 3. Parse XLS + fetch both model maps through the configured provider.
-        //    The provider decides the source (xml sibling / live SCAPI / etc).
-        var xlsRows = XlsDiffParser.Parse(xlsArtifact.XlsPath);
+        // 3. Fetch both model maps through the configured provider.
         var leftMap = await _mapProvider.BuildMapAsync(leftErwinPath, ct).ConfigureAwait(false);
         var rightMap = await _mapProvider.BuildMapAsync(rightErwinPath, ct).ConfigureAwait(false);
 
@@ -97,4 +112,13 @@ public sealed class CompareOrchestrator
             RightDdl = rightDdl,
         };
     }
+
+    /// <summary>
+    /// Returns true when the given path looks like a real filesystem path
+    /// (not a virtual locator like <c>mart://</c> or <c>active-pu://</c>).
+    /// </summary>
+    private static bool IsFilePath(string path) =>
+        !(path.StartsWith("mart://", StringComparison.OrdinalIgnoreCase)
+          || path.StartsWith("erwin://", StringComparison.OrdinalIgnoreCase)
+          || path.StartsWith("active-pu://", StringComparison.OrdinalIgnoreCase));
 }

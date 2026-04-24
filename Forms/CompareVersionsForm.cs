@@ -58,17 +58,10 @@ namespace EliteSoft.Erwin.AddIn.Forms
                     : $"{dialect} (from model: {target} v{major}.{minor})";
 
                 PopulateTargetVersions(currentVersion, dirty.IsDirty);
-
-                // Phase 3.F gate: the in-process SCAPI compare flow is
-                // intentionally disabled (it destroys the active Mart PU).
-                // Keep the form open for metadata inspection + layout
-                // validation; the Compare button stays off until the
-                // out-of-process Worker pivot lands.
-                btnCompare.Enabled = false;
-                lblStatus.Text =
-                    "Compare is temporarily disabled: in-process SCAPI on r10.10 "
-                    + "invalidates the active Mart PU when dumping to temp. "
-                    + "Pending Worker-based pivot (see 3.F follow-up).";
+                btnCompare.Enabled = cmbTargetVersion.Items.Count > 0;
+                lblStatus.Text = cmbTargetVersion.Items.Count > 0
+                    ? "Ready. Structural diff only (add/drop/rename). Property-level diff pending."
+                    : "No Mart version available to compare against.";
             }
             catch (Exception ex)
             {

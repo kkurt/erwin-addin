@@ -1,22 +1,38 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
+using EliteSoft.Erwin.AlterDdl.ComInterop;
+using EliteSoft.Erwin.AlterDdl.Core.Abstractions;
 using EliteSoft.Erwin.AlterDdl.Core.Emitting;
+using EliteSoft.Erwin.AlterDdl.Core.Emitting.Dialect;
 using EliteSoft.Erwin.AlterDdl.Core.Models;
+using EliteSoft.Erwin.AlterDdl.Core.Parsing;
+using EliteSoft.Erwin.AlterDdl.Core.Pipeline;
 
 namespace EliteSoft.Erwin.AddIn.Services
 {
     /// <summary>
-    /// Phase 3.F (in-process pivot disabled): bridges the add-in's live SCAPI
-    /// handle + active PU to the ErwinAlterDdl pipeline metadata only. The
-    /// end-to-end compare flow is currently intentionally inert - see
-    /// <see cref="CompareAsync"/> - because the naive save-to-temp / open-mart
-    /// dance collides with two hard SCAPI r10 constraints (see below).
-    /// The pure-logic helpers (<see cref="ResolveDialect"/>,
-    /// <see cref="PlanTargetVersions"/>, <see cref="ProbeDirty"/>) are still
-    /// used by the UI and are fully unit-tested.
+    /// Phase 3.F wiring: bridges the add-in's live SCAPI handle + active PU to
+    /// the ErwinAlterDdl pipeline.
+    ///
+    /// Baseline = active PU (walked in-process via
+    /// <see cref="LiveSessionModelMapProvider"/>, dirty buffer preserved, no
+    /// disk save - safe for Mart-backed PUs).
+    /// Target   = selected Mart version (opened in a fresh out-of-process
+    /// worker via <see cref="WorkerJsonModelMapProvider"/> with the
+    /// <c>mart://</c> locator inferred from the active PU).
+    ///
+    /// CompleteCompare is intentionally skipped (<c>SkipCompleteCompare</c>)
+    /// because we cannot safely dump the active Mart PU to disk. That means
+    /// property-level changes (type / nullable / default / identity) are NOT
+    /// emitted yet - a follow-up phase enriches the maps with property data
+    /// so we can diff them directly. Structural changes (ADD / DROP / RENAME
+    /// for entities, attributes, key groups, relationships, views, triggers,
+    /// sequences) are fully supported today.
     /// </summary>
     public sealed class VersionCompareService
     {
@@ -31,9 +47,6 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// prior versions (current vs its own saved copy is a no-op); dirty
         /// models additionally include the current version so the user can
         /// diff the dirty buffer against its saved Mart counterpart.
-        ///
-        /// Pure function - no SCAPI involvement. Extracted from the form to
-        /// stay unit-testable.
         /// </summary>
         public static IReadOnlyList<TargetVersion> PlanTargetVersions(int currentVersion, bool isDirty)
         {
@@ -60,17 +73,8 @@ namespace EliteSoft.Erwin.AddIn.Services
             _log = log ?? (_ => { });
         }
 
-        /// <summary>
-        /// Best-effort read of a PU's dirty state. erwin exposes one of several
-        /// flag names depending on r10 servicing level; we probe in order and
-        /// return the first one that answers.
-        /// </summary>
         public DirtyProbe ProbeDirty()
         {
-            // erwin r10 exposes the dirty flag as a COM property on the PU
-            // itself, but the available name varies across servicing levels.
-            // We probe by reflection rather than `_activePU.Modified`-style
-            // dynamic dispatch so missing members don't break the lookup.
             foreach (var prop in new[] { "Modified", "IsModified", "IsDirty", "Dirty", "HasChanges" })
             {
                 try
@@ -87,18 +91,9 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
                 catch { /* keep probing */ }
             }
-            // Treat unknown as dirty so the target combo still surfaces every
-            // Mart version (including the current one) for comparison. A false
-            // negative here would hide a valid target, which is worse than a
-            // spurious combo entry.
             return new DirtyProbe(true, "(unknown)");
         }
 
-        /// <summary>
-        /// Parse the active PU's locator to recover its current Mart version
-        /// number. Returns 1 for file-based (non-Mart) models or on parse
-        /// failure.
-        /// </summary>
         public int ReadActiveVersion()
         {
             try
@@ -114,10 +109,6 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
         }
 
-        /// <summary>
-        /// Read the Target_Server / version metadata from the active PU so the
-        /// UI can pick the right emitter (and display a read-only dialect label).
-        /// </summary>
         public (string TargetServer, int Major, int Minor) ReadActiveTargetServer()
         {
             try
@@ -135,10 +126,6 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
         }
 
-        /// <summary>
-        /// Map an erwin Target_Server name (e.g. "SQL Server") to the
-        /// <see cref="ISqlEmitter.Dialect"/> value used by the registry.
-        /// </summary>
         public static string ResolveDialect(string targetServer)
         {
             if (string.IsNullOrWhiteSpace(targetServer)) return "MSSQL";
@@ -150,32 +137,97 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// End-to-end compare: dump the active PU (with its dirty buffer) to a
-        /// temp .erwin, open the selected Mart version, dump it too, run the
-        /// Core pipeline, and emit the ALTER SQL for the active model's target
-        /// server.
+        /// End-to-end compare against a specific Mart version of the same model.
+        /// Produces a <see cref="CompareOutcome"/> that the UI can render.
+        /// Structural changes only (see class summary).
         /// </summary>
-        public Task<CompareOutcome> CompareAsync(int targetVersion, CancellationToken ct = default)
+        public async Task<CompareOutcome> CompareAsync(int targetVersion, CancellationToken ct = default)
         {
-            // Phase 3.F in-process pivot: the naive "save both PUs to temp
-            // + CompleteCompare" flow is blocked by two hard SCAPI r10
-            // constraints documented in DdlGenerationService.cs:
-            //   1. "Mart API blocks opening a second PU" (so target version
-            //      can't live next to the active PU in the same session).
-            //   2. pu.Save(path) intentionally corrupts a Mart-backed PU
-            //      (the add-in's own code relies on this to force reconnect).
-            // A user-triggered compare would therefore destroy the active
-            // model. We refuse rather than risk lost work and ask the user
-            // to wait for the out-of-process Worker pivot.
-            _ = targetVersion;
-            _ = ct;
-            throw new NotSupportedException(
-                "Active-vs-Mart compare through the in-process SCAPI pipeline is disabled: "
-                + "pu.Save(...) invalidates the active Mart PU on r10.10 and Mart API "
-                + "blocks opening a second PU in the same session. The follow-up design "
-                + "moves this flow to an out-of-process Worker that leaves the active "
-                + "add-in session untouched. Tracked as the 3.F 'real solution' pivot.");
+            if (targetVersion <= 0) throw new ArgumentOutOfRangeException(nameof(targetVersion));
+
+            string martLocator = BuildMartLocatorForTarget(targetVersion);
+            string activePathKey = $"active-pu://{SafeGet(_activePU.PropertyBag(null, true), "Persistence_Unit_Id")}";
+
+            _log($"VersionCompare: baseline=live active PU (v{ReadActiveVersion()}), target=Mart v{targetVersion}");
+            _log($"VersionCompare: target locator = {MaskMartPassword(martLocator)}");
+
+            // Compose the per-side providers into a single IModelMapProvider
+            // the orchestrator can consume.
+            var liveProvider = new LiveSessionModelMapProvider((object)_scapi, (object)_activePU, activePathKey);
+            var workerProvider = new WorkerJsonModelMapProvider();
+            var combined = new DispatchByPathModelMapProvider(activePathKey, liveProvider, martLocator, workerProvider);
+
+            // Null SCAPI session is safe because SkipCompleteCompare=true.
+            // Any accidental call to session methods would blow up loudly.
+            var session = new NoCompleteCompareSession();
+
+            var options = new CompareOptions
+            {
+                SkipCompleteCompare = true,
+                IncludeCreateDdl = false,
+            };
+
+            var (target, major, minor) = ReadActiveTargetServer();
+            string dialect = ResolveDialect(target);
+
+            var orchestrator = new CompareOrchestrator(session, combined);
+            var result = await orchestrator.CompareAsync(activePathKey, martLocator, options, ct).ConfigureAwait(false);
+
+            var registry = new SqlEmitterRegistry()
+                .Register(new MssqlEmitter(), "SQL Server")
+                .Register(new OracleEmitter(), "Oracle")
+                .Register(new Db2Emitter(), "Db2", "DB2 z/OS");
+            var emitter = registry.Resolve(dialect);
+            var script = emitter.Emit(result);
+
+            _log($"VersionCompare: {result.Changes.Count} change(s), {script.Statements.Count} statement(s), dialect={dialect} ({target} v{major}.{minor})");
+            return new CompareOutcome(result, script, dialect);
         }
+
+        /// <summary>
+        /// Derive the Mart locator for a specific version of the same model the
+        /// active PU points at. Preserves the existing Mart connection
+        /// parameters (server / port / credentials) and only swaps VNO.
+        /// </summary>
+        private string BuildMartLocatorForTarget(int targetVersion)
+        {
+            string active = "";
+            try { active = _activePU.PropertyBag().Value("Locator")?.ToString() ?? ""; } catch { }
+            if (!active.StartsWith("mart://", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("active PU is not Mart-hosted; version compare is only meaningful for Mart models.");
+
+            // Extract the "mart://Mart/<path>" prefix + the query params.
+            var pathMatch = Regex.Match(active, @"^(?<base>mart://[^?]+)\??(?<q>.*)$", RegexOptions.IgnoreCase);
+            if (!pathMatch.Success)
+                throw new InvalidOperationException($"cannot parse Mart locator from active PU: '{active}'");
+            string basePart = pathMatch.Groups["base"].Value;
+            string query = pathMatch.Groups["q"].Value;
+
+            var kv = new List<KeyValuePair<string, string>>();
+            foreach (var chunk in query.Split(';', StringSplitOptions.RemoveEmptyEntries))
+            {
+                var kvPair = chunk.Split('=', 2);
+                if (kvPair.Length == 2) kv.Add(new(kvPair[0], kvPair[1]));
+            }
+
+            bool replacedVno = false;
+            for (int i = 0; i < kv.Count; i++)
+            {
+                if (string.Equals(kv[i].Key, "VNO", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(kv[i].Key, "version", StringComparison.OrdinalIgnoreCase))
+                {
+                    kv[i] = new(kv[i].Key, targetVersion.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                    replacedVno = true;
+                }
+            }
+            if (!replacedVno) kv.Add(new("VNO", targetVersion.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+
+            var qs = string.Join(';', kv.ConvertAll(p => $"{p.Key}={p.Value}"));
+            return qs.Length == 0 ? basePart : $"{basePart}?{qs}";
+        }
+
+        private static string MaskMartPassword(string locator) =>
+            Regex.Replace(locator, @"PSW=[^;]*", "PSW=***", RegexOptions.IgnoreCase);
 
         private static string SafeGet(dynamic bag, string key)
         {
@@ -193,4 +245,70 @@ namespace EliteSoft.Erwin.AddIn.Services
         CompareResult Result,
         AlterDdlScript Script,
         string Dialect);
+
+    /// <summary>
+    /// Multiplexer over two <see cref="IModelMapProvider"/>s keyed by the
+    /// compare side's pathKey. Used to route the "baseline" request at the
+    /// live provider and the "target" request at the Worker provider.
+    /// </summary>
+    internal sealed class DispatchByPathModelMapProvider : IModelMapProvider
+    {
+        private readonly string _leftPath;
+        private readonly IModelMapProvider _left;
+        private readonly string _rightPath;
+        private readonly IModelMapProvider _right;
+
+        public DispatchByPathModelMapProvider(string leftPath, IModelMapProvider left, string rightPath, IModelMapProvider right)
+        {
+            _leftPath = leftPath;
+            _left = left;
+            _rightPath = rightPath;
+            _right = right;
+        }
+
+        public Task<ErwinModelMap> BuildMapAsync(string erwinPath, CancellationToken ct = default)
+        {
+            if (string.Equals(erwinPath, _leftPath, StringComparison.OrdinalIgnoreCase))
+                return _left.BuildMapAsync(erwinPath, ct);
+            if (string.Equals(erwinPath, _rightPath, StringComparison.OrdinalIgnoreCase))
+                return _right.BuildMapAsync(erwinPath, ct);
+            throw new InvalidOperationException(
+                $"no provider registered for '{erwinPath}'. Expected '{_leftPath}' or '{_rightPath}'.");
+        }
+    }
+
+    /// <summary>
+    /// <see cref="IScapiSession"/> stub used by Phase 3.F structural-only
+    /// compares. <see cref="CompareOrchestrator"/> still wants a session
+    /// instance, but with <c>SkipCompleteCompare = true</c> none of its
+    /// methods are invoked on the happy path. <see cref="ReadModelMetadataAsync"/>
+    /// is provided because the orchestrator does read metadata; we return a
+    /// minimal placeholder so the flow succeeds.
+    /// </summary>
+    internal sealed class NoCompleteCompareSession : IScapiSession
+    {
+        public Task<CompareArtifact> RunCompleteCompareAsync(
+            string leftErwinPath, string rightErwinPath, CompareOptions options, CancellationToken ct = default)
+            => throw new InvalidOperationException(
+                "structural-only compare path invoked CompleteCompare; check SkipCompleteCompare flag.");
+
+        public Task<DdlArtifact> GenerateCreateDdlAsync(string erwinPath, DdlOptions options, CancellationToken ct = default)
+            => throw new NotSupportedException("NoCompleteCompareSession does not implement FEModel_DDL");
+
+        public Task<ModelMetadata> ReadModelMetadataAsync(string erwinPath, CancellationToken ct = default)
+        {
+            string name = erwinPath;
+            int dot = erwinPath.LastIndexOf('/');
+            if (dot >= 0 && dot + 1 < erwinPath.Length) name = erwinPath[(dot + 1)..];
+            return Task.FromResult(new ModelMetadata(
+                PersistenceUnitId: erwinPath,
+                Name: name,
+                ModelType: "Physical",
+                TargetServer: string.Empty,
+                TargetServerVersion: 0,
+                TargetServerMinorVersion: 0));
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
 }

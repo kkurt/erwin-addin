@@ -175,10 +175,16 @@ public static class Program
     {
         var erwinPath = Require(kv, "--erwin");
         var outPath = Require(kv, "--out");
-        ClearReadOnly(erwinPath);
+        // --disposition flags let the caller open a Mart-hosted PU read-only
+        // (e.g. "OVM=Yes" for versioned access). Disk-based models ignore it.
+        var disposition = kv.GetValueOrDefault("--disposition", "");
+
+        bool isMartLocator = erwinPath.StartsWith("mart://", StringComparison.OrdinalIgnoreCase)
+            || erwinPath.StartsWith("erwin://", StringComparison.OrdinalIgnoreCase);
+        if (!isMartLocator) ClearReadOnly(erwinPath);
 
         dynamic scapi = CreateScapi();
-        dynamic pu = scapi.PersistenceUnits.Add(erwinPath, "");
+        dynamic pu = scapi.PersistenceUnits.Add(erwinPath, disposition);
         dynamic sess = scapi.Sessions.Add();
         try
         {

@@ -32,6 +32,17 @@ public sealed record CompareOptions
     /// </summary>
     public bool IncludeCreateDdl { get; init; }
 
+    /// <summary>
+    /// When true the orchestrator skips <c>CompleteCompare</c> entirely and
+    /// produces the <see cref="Change"/> list purely from the structural diff
+    /// of the two <see cref="Parsing.ErwinModelMap"/> providers. Property-level
+    /// changes (type / nullability / default / identity) require the XLS and
+    /// will NOT be emitted in this mode. Use when CC is unavailable - e.g.
+    /// the add-in comparing a live active PU against a Mart-hosted version
+    /// where disk-save would corrupt the active PU.
+    /// </summary>
+    public bool SkipCompleteCompare { get; init; }
+
     public static CompareOptions Default { get; } = new();
 }
 
