@@ -7,6 +7,7 @@ using EliteSoft.Erwin.AlterDdl.Core.Abstractions;
 using EliteSoft.Erwin.AlterDdl.Core.Emitting;
 using EliteSoft.Erwin.AlterDdl.Core.Emitting.Dialect;
 using EliteSoft.Erwin.AlterDdl.Core.Models;
+using EliteSoft.Erwin.AlterDdl.Core.Parsing;
 using EliteSoft.Erwin.AlterDdl.Core.Pipeline;
 
 using Microsoft.Extensions.Logging;
@@ -45,8 +46,8 @@ public static class Program
             description: "\"Standard\" | \"Advance\" | \"Speed\" OR path to custom CC option XML");
         var sessionMode = new Option<string>(
             aliases: ["--session-mode"],
-            getDefaultValue: () => "mock",
-            description: "mock | in-process (Phase 2 defaults to mock, Phase 3 adds out-of-process)");
+            getDefaultValue: () => "out-of-process",
+            description: "out-of-process (default, spawns Worker per op) | mock (needs --artifacts-dir + sibling .model-map.json)");
         var artifactsDir = new Option<DirectoryInfo?>(
             aliases: ["--artifacts-dir"],
             description: "Used by --session-mode mock: directory containing diff.xls and (optional) metadata");
@@ -119,9 +120,20 @@ public static class Program
             return ExitCodes.ComActivation;
         }
 
+        IModelMapProvider mapProvider;
+        try
+        {
+            mapProvider = BuildMapProvider(sessionMode);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "cannot initialize model-map provider");
+            return ExitCodes.ComActivation;
+        }
+
         await using (session)
         {
-            var orchestrator = new CompareOrchestrator(session, CreateOrchestratorLogger());
+            var orchestrator = new CompareOrchestrator(session, mapProvider, CreateOrchestratorLogger());
             CompareResult result;
             try
             {
@@ -214,6 +226,52 @@ public static class Program
                         .CreateLogger<OutOfProcessScapiSession>());
             default:
                 throw new ArgumentException($"unknown --session-mode: {mode}");
+        }
+    }
+
+    /// <summary>
+    /// Pick the <see cref="IModelMapProvider"/> to pair with the chosen
+    /// session mode. Real-SCAPI modes (out-of-process) drive the Worker to
+    /// walk <c>session.ModelObjects</c> directly from the .erwin file (no
+    /// sibling .xml required). Mock mode expects the artifacts dir to
+    /// contain pre-built JSON dumps named after the .erwin files.
+    /// </summary>
+    private static IModelMapProvider BuildMapProvider(string mode)
+    {
+        switch (mode.ToLowerInvariant())
+        {
+            case "out-of-process":
+                return new WorkerJsonModelMapProvider(
+                    logger: LoggerFactory.Create(b => b.AddSerilog(Log.Logger))
+                        .CreateLogger<WorkerJsonModelMapProvider>());
+            case "mock":
+                // Mock mode expects a pre-dumped JSON next to each .erwin
+                // file: v1.erwin -> v1.model-map.json. Helpful for unit /
+                // fixture test runs that do not have a Worker available.
+                return new SiblingJsonModelMapProvider();
+            case "in-process":
+                throw new NotSupportedException(
+                    "in-process mode is owned by the add-in; CLI uses out-of-process or mock");
+            default:
+                throw new ArgumentException($"unknown --session-mode: {mode}");
+        }
+    }
+
+    /// <summary>
+    /// Fallback provider for <c>--session-mode mock</c>: reads
+    /// <c>&lt;erwinPath&gt;.model-map.json</c> next to the .erwin file.
+    /// Produced by hand or by a prior out-of-process run.
+    /// </summary>
+    private sealed class SiblingJsonModelMapProvider : IModelMapProvider
+    {
+        public Task<Core.Parsing.ErwinModelMap> BuildMapAsync(string erwinPath, CancellationToken ct = default)
+        {
+            var jsonPath = Path.ChangeExtension(erwinPath, ".model-map.json");
+            if (!File.Exists(jsonPath))
+                throw new FileNotFoundException(
+                    "sibling model-map JSON missing. Mock session mode expects a .model-map.json next to the .erwin file.",
+                    jsonPath);
+            return Task.FromResult(Core.Parsing.ModelMapJsonSerializer.DeserializeFile(jsonPath));
         }
     }
 

@@ -4,6 +4,7 @@ using System.Text.Json.Serialization;
 using EliteSoft.Erwin.AlterDdl.ComInterop;
 using EliteSoft.Erwin.AlterDdl.Core.Abstractions;
 using EliteSoft.Erwin.AlterDdl.Core.Models;
+using EliteSoft.Erwin.AlterDdl.Core.Parsing;
 using EliteSoft.Erwin.AlterDdl.Core.Pipeline;
 
 using Serilog;
@@ -50,9 +51,13 @@ app.MapGet("/health", () => Results.Ok(new { status = "ok", phase = "2" }));
 
 app.MapGet("/", () => Results.Ok(new { service = "erwin-alter-ddl", version = "0.1.0-alpha" }));
 
-// Phase 2 synchronous compare endpoint. Clients upload two .erwin files and the
-// two matching .xml exports (erwin's Export-As-XML siblings). Async job API is a
-// Phase 3 improvement once OutOfProcessScapiSession exists.
+// Mock-mode compare endpoint for smoke / local harnesses. Clients upload:
+//   * leftErwin, rightErwin          - binary .erwin files (not parsed, stored
+//                                      for the orchestrator to hand to SCAPI)
+//   * leftModelMap, rightModelMap    - pre-dumped ErwinModelMapDto JSONs
+//                                      (produced by the Worker's dump-model)
+//   * diffXls                        - CC XLS (MockScapiSession reads this)
+// Out-of-process live mode (kicks off Worker per upload) is pending.
 app.MapPost("/compare", async (HttpRequest request, CancellationToken ct) =>
 {
     if (!request.HasFormContentType)
@@ -60,32 +65,30 @@ app.MapPost("/compare", async (HttpRequest request, CancellationToken ct) =>
 
     var form = await request.ReadFormAsync(ct);
     var leftErwin = form.Files.GetFile("leftErwin");
-    var leftXml = form.Files.GetFile("leftXml");
     var rightErwin = form.Files.GetFile("rightErwin");
-    var rightXml = form.Files.GetFile("rightXml");
-    var diffXls = form.Files.GetFile("diffXls"); // optional for Phase 2 mock
+    var leftMap = form.Files.GetFile("leftModelMap");
+    var rightMap = form.Files.GetFile("rightModelMap");
+    var diffXls = form.Files.GetFile("diffXls");
 
-    if (leftErwin is null || rightErwin is null || leftXml is null || rightXml is null)
-        return Results.BadRequest(new { error = "leftErwin/leftXml/rightErwin/rightXml form files are required" });
+    if (leftErwin is null || rightErwin is null || leftMap is null || rightMap is null || diffXls is null)
+        return Results.BadRequest(new { error = "leftErwin, rightErwin, leftModelMap, rightModelMap, diffXls form files are required" });
 
     var workDir = Path.Combine(Path.GetTempPath(), "erwin-alter-ddl-api-" + Guid.NewGuid());
     Directory.CreateDirectory(workDir);
     try
     {
         var leftErwinPath = await SaveUploadAsync(leftErwin, workDir, "v1.erwin", ct);
-        _ = await SaveUploadAsync(leftXml, workDir, "v1.xml", ct);
         var rightErwinPath = await SaveUploadAsync(rightErwin, workDir, "v2.erwin", ct);
-        _ = await SaveUploadAsync(rightXml, workDir, "v2.xml", ct);
-        if (diffXls is not null)
-            await SaveUploadAsync(diffXls, workDir, "diff.xls", ct);
+        var leftMapPath = await SaveUploadAsync(leftMap, workDir, "v1.model-map.json", ct);
+        var rightMapPath = await SaveUploadAsync(rightMap, workDir, "v2.model-map.json", ct);
+        await SaveUploadAsync(diffXls, workDir, "diff.xls", ct);
 
-        // Phase 2 currently serves only mock session. Phase 3 will branch based
-        // on a request header / query option to use out-of-process SCAPI.
-        if (diffXls is null)
-            return Results.BadRequest(new { error = "Phase 2 REST requires diffXls form file (mock mode). Phase 3 will run SCAPI out-of-process." });
+        var leftMapObj = ModelMapJsonSerializer.DeserializeFile(leftMapPath);
+        var rightMapObj = ModelMapJsonSerializer.DeserializeFile(rightMapPath);
+        var mapProvider = new PrebuiltModelMapProvider(leftErwinPath, leftMapObj, rightErwinPath, rightMapObj);
 
         await using var session = new MockScapiSession(workDir);
-        var orchestrator = new CompareOrchestrator(session);
+        var orchestrator = new CompareOrchestrator(session, mapProvider);
         var result = await orchestrator.CompareAsync(leftErwinPath, rightErwinPath, CompareOptions.Default, ct);
 
         var json = JsonSerializer.Serialize(result, jsonOpts);

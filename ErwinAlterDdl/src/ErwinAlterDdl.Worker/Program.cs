@@ -2,6 +2,7 @@ using System.Runtime.InteropServices;
 using System.Text.Json;
 
 using EliteSoft.Erwin.AlterDdl.Core.Models;
+using EliteSoft.Erwin.AlterDdl.Core.Parsing;
 
 namespace EliteSoft.Erwin.AlterDdl.Worker;
 
@@ -20,6 +21,10 @@ namespace EliteSoft.Erwin.AlterDdl.Worker;
 ///                                   [--level LP|L|P|DB]
 ///   erwin-alter-ddl-worker ddl      --erwin &lt;path&gt; --out &lt;sqlPath&gt;
 ///                                   [--fe-option-xml &lt;path&gt;]
+///   erwin-alter-ddl-worker dump-model --erwin &lt;path&gt; --out &lt;jsonPath&gt;
+///                                     (walks ModelObjects and emits an
+///                                     ErwinModelMapDto JSON; consumed by
+///                                     WorkerJsonModelMapProvider)
 ///
 /// stdout = JSON payload (shape depends on subcommand).
 /// stderr = diagnostic lines, error messages, exception stack traces.
@@ -59,6 +64,7 @@ public static class Program
                 "metadata" => RunMetadata(kv),
                 "cc" => RunCompleteCompare(kv),
                 "ddl" => RunDdl(kv),
+                "dump-model" => RunDumpModel(kv),
                 _ => Fail(ExitBadArgs, $"unknown subcommand '{command}'"),
             };
         }
@@ -163,6 +169,123 @@ public static class Program
         // finally and dodge Marshal.FinalReleaseComObject on a dirty handle.
         Environment.Exit(ExitOk);
         return ExitOk;
+    }
+
+    private static int RunDumpModel(Dictionary<string, string> kv)
+    {
+        var erwinPath = Require(kv, "--erwin");
+        var outPath = Require(kv, "--out");
+        ClearReadOnly(erwinPath);
+
+        dynamic scapi = CreateScapi();
+        dynamic pu = scapi.PersistenceUnits.Add(erwinPath, "");
+        dynamic sess = scapi.Sessions.Add();
+        try
+        {
+            sess.Open(pu, 0, 0); // SCD_SL_M0 - data level
+            var nodes = new List<ObjectNodeDto>();
+            dynamic modelObjects = sess.ModelObjects;
+            dynamic root = modelObjects.Root;
+            if (root is null)
+                return Fail(ExitOperationFailed, "session.ModelObjects.Root returned null");
+
+            CollectTopLevel(modelObjects, root, "Entity", nodes, walkNested: true);
+            CollectTopLevel(modelObjects, root, "Relationship", nodes, walkNested: false);
+            CollectTopLevel(modelObjects, root, "View", nodes, walkNested: false);
+            CollectTopLevel(modelObjects, root, "Trigger_Template", nodes, walkNested: false);
+            // erwin exposes sequences under different class names depending
+            // on DBMS (Oracle_Sequence / Sequence / ER_Sequence). Try each.
+            foreach (var cls in new[] { "Sequence", "Oracle_Sequence", "ER_Sequence" })
+                CollectTopLevel(modelObjects, root, cls, nodes, walkNested: false);
+
+            var dto = new ErwinModelMapDto(
+                SchemaVersion: ErwinModelMapDto.CurrentSchemaVersion,
+                SourceErwinPath: erwinPath,
+                Objects: nodes);
+            File.WriteAllText(outPath, ModelMapJsonSerializer.Serialize(dto),
+                new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+
+            WriteJson(new { path = outPath, objectCount = nodes.Count });
+            Console.Out.Flush();
+
+            Environment.Exit(ExitOk);
+            return ExitOk;
+        }
+        finally
+        {
+            try { sess.Close(); } catch { }
+            TryRelease(sess);
+            TryRelease(pu);
+            TryRelease(scapi);
+        }
+    }
+
+    private static void CollectTopLevel(
+        dynamic modelObjects, dynamic root, string className,
+        List<ObjectNodeDto> sink, bool walkNested)
+    {
+        dynamic items;
+        try { items = modelObjects.Collect(root, className); }
+        catch { return; }
+        if (items is null) return;
+
+        foreach (dynamic obj in items)
+        {
+            if (obj is null) continue;
+            var node = ToNode(obj, owningEntityName: null);
+            sink.Add(node);
+
+            if (walkNested && className == "Entity")
+            {
+                // Nested Attribute + Key_Group under this Entity.
+                TryCollectChildren(modelObjects, obj, "Attribute", node.Name, sink);
+                TryCollectChildren(modelObjects, obj, "Key_Group", null, sink);
+            }
+        }
+    }
+
+    private static void TryCollectChildren(
+        dynamic modelObjects, dynamic parent, string className,
+        string? owningEntityName, List<ObjectNodeDto> sink)
+    {
+        dynamic items;
+        try { items = modelObjects.Collect(parent, className); }
+        catch { return; }
+        if (items is null) return;
+
+        foreach (dynamic obj in items)
+        {
+            if (obj is null) continue;
+            sink.Add(ToNode(obj, owningEntityName));
+
+            // Key_Group has Key_Group_Members (column list composition).
+            // Phase 3.F+ may need those for PK/Index column rendering; for
+            // now we just record the Key_Group itself.
+        }
+    }
+
+    private static ObjectNodeDto ToNode(dynamic obj, string? owningEntityName)
+    {
+        string id = SafeStr(() => obj.ObjectId?.ToString());
+        string name = SafeStr(() => obj.Name?.ToString());
+        string cls = SafeStr(() => obj.ClassName?.ToString());
+        string? parentId = null;
+        try
+        {
+            dynamic ctx = obj.Context;
+            if (ctx is not null)
+                parentId = SafeStr(() => ctx.ObjectId?.ToString());
+        }
+        catch { }
+        if (string.IsNullOrEmpty(parentId)) parentId = null;
+        if (string.IsNullOrEmpty(owningEntityName)) owningEntityName = null;
+        return new ObjectNodeDto(id, name, cls, parentId, owningEntityName);
+    }
+
+    private static string SafeStr(Func<string?> get)
+    {
+        try { return get() ?? string.Empty; }
+        catch { return string.Empty; }
     }
 
     // ---------- helpers ----------

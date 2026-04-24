@@ -6,11 +6,13 @@ namespace EliteSoft.Erwin.AlterDdl.Core.Abstractions;
 /// Produces an <see cref="ErwinModelMap"/> (ObjectId -> Name / Class / Parent
 /// lookup) for one side of a compare. The provider abstracts over the data
 /// source, so the pipeline can work off any of:
-///   * the co-located <c>.xml</c> export (default, <see cref="XmlFileModelMapProvider"/>).
-///   * an already-loaded <see cref="ErwinModelMap"/> (tests, CLI, preloaded maps).
+///   * an out-of-process worker that walks <c>session.ModelObjects</c> for a
+///     disk <c>.erwin</c> file and hands back a JSON-serialized map
+///     (<c>WorkerJsonModelMapProvider</c> in ComInterop).
 ///   * a live SCAPI session that walks <c>ModelObjects</c> directly without a
 ///     disk artifact (add-in, in-process).
-///   * an out-of-process worker that hands back a JSON-serialized map.
+///   * a pre-built map (<see cref="PrebuiltModelMapProvider"/>) for tests or
+///     callers that already have the data in memory.
 ///
 /// <see cref="Pipeline.CompareOrchestrator"/> calls this once per side, after
 /// CompleteCompare. The <c>erwinPath</c> parameter is informational (letting

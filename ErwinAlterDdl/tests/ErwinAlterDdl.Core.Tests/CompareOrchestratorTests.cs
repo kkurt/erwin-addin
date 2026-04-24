@@ -1,5 +1,6 @@
 using EliteSoft.Erwin.AlterDdl.Core.Abstractions;
 using EliteSoft.Erwin.AlterDdl.Core.Models;
+using EliteSoft.Erwin.AlterDdl.Core.Parsing;
 using EliteSoft.Erwin.AlterDdl.Core.Pipeline;
 
 using FluentAssertions;
@@ -13,26 +14,20 @@ public class CompareOrchestratorTests
     [Fact]
     public async Task CompareAsync_throws_when_erwin_file_missing()
     {
-        var session = new TestSession();
-        var orch = new CompareOrchestrator(session);
+        using var workDir = new TempDir();
+        var session = new TestSession { XlsOutPath = workDir.CreateEmpty("diff.xls") };
+        var provider = new PrebuiltModelMapProvider("no/such/v1.erwin", EmptyMap(), "also/no.erwin", EmptyMap());
+        var orch = new CompareOrchestrator(session, provider);
+
         var act = () => orch.CompareAsync("no/such/v1.erwin", "also/no.erwin", CompareOptions.Default);
         await act.Should().ThrowAsync<FileNotFoundException>();
     }
 
     [Fact]
-    public async Task CompareAsync_throws_when_xml_sibling_missing()
+    public async Task Ctor_rejects_null_mapProvider()
     {
-        using var workDir = new TempDir();
-        var v1Erwin = workDir.Create("v1.erwin", "fake binary");
-        var v2Erwin = workDir.Create("v2.erwin", "fake binary");
-        // intentionally no v1.xml / v2.xml
-
-        var session = new TestSession { XlsPayload = "<html></html>" };
-        session.XlsOutPath = workDir.CreateEmpty("diff.xls");
-
-        var orch = new CompareOrchestrator(session);
-        var act = () => orch.CompareAsync(v1Erwin, v2Erwin, CompareOptions.Default);
-        await act.Should().ThrowAsync<FileNotFoundException>();
+        Action act = () => _ = new CompareOrchestrator(new TestSession(), mapProvider: null!);
+        act.Should().Throw<ArgumentNullException>();
     }
 
     [Fact]
@@ -42,28 +37,25 @@ public class CompareOrchestratorTests
         var v1Erwin = workDir.Create("v1.erwin", "fake binary");
         var v2Erwin = workDir.Create("v2.erwin", "fake binary");
 
-        const string v1Xml = """
-            <?xml version="1.0" encoding="UTF-8"?>
+        var v1Map = ErwinXmlObjectIdMapper.ParseXml("""
             <erwin xmlns="http://www.erwin.com/dm">
               <Entity id="{E1}+0" name="CUSTOMER"/>
               <Entity id="{E2}+0" name="OBSOLETE"/>
             </erwin>
-            """;
-        const string v2Xml = """
-            <?xml version="1.0" encoding="UTF-8"?>
+            """);
+        var v2Map = ErwinXmlObjectIdMapper.ParseXml("""
             <erwin xmlns="http://www.erwin.com/dm">
               <Entity id="{E1}+0" name="CUSTOMER"/>
               <Entity id="{E3}+0" name="NEWLY_ADDED"/>
             </erwin>
-            """;
-        workDir.Create("v1.xml", v1Xml);
-        workDir.Create("v2.xml", v2Xml);
+            """);
 
         var xlsPath = workDir.Create("diff.xls",
             "<html><body><table><tr><td>Entity/Table</td><td>OBSOLETE</td><td>Not Equal</td><td></td></tr></table></body></html>");
 
         var session = new TestSession { XlsOutPath = xlsPath };
-        var orch = new CompareOrchestrator(session);
+        var provider = new PrebuiltModelMapProvider(v1Erwin, v1Map, v2Erwin, v2Map);
+        var orch = new CompareOrchestrator(session, provider);
         var result = await orch.CompareAsync(v1Erwin, v2Erwin, CompareOptions.Default);
 
         result.Changes.OfType<EntityAdded>().Should().ContainSingle(c => c.Target.Name == "NEWLY_ADDED");
@@ -74,6 +66,9 @@ public class CompareOrchestratorTests
     }
 
     // ---------- helpers ----------
+
+    private static ErwinModelMap EmptyMap() => ErwinXmlObjectIdMapper.ParseXml(
+        """<erwin xmlns="http://www.erwin.com/dm"/>""");
 
     private sealed class TestSession : IScapiSession
     {

@@ -53,6 +53,13 @@ public sealed class ErwinModelMap
         _idByClassThenName.TryGetValue(className, out var map)
             ? map.Values.Select(id => _byId[id])
             : Enumerable.Empty<ObjectRef>();
+
+    /// <summary>
+    /// All objects in the map keyed by ObjectId. Useful for serialization /
+    /// round-trip use cases where we cannot rely on the class-name-keyed view
+    /// (same name can repeat across attribute siblings of different entities).
+    /// </summary>
+    public IEnumerable<ObjectRef> AllObjects() => _byId.Values;
 }
 
 public static class ErwinXmlObjectIdMapper

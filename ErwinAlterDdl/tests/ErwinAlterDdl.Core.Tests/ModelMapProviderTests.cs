@@ -10,46 +10,12 @@ using Xunit;
 namespace EliteSoft.Erwin.AlterDdl.Core.Tests;
 
 /// <summary>
-/// Tests the <see cref="IModelMapProvider"/> abstraction that replaces the
-/// previous hard-coded "xml sibling" lookup inside
-/// <see cref="CompareOrchestrator"/>. The provider indirection lets the add-in
-/// (which cannot safely export XML at runtime) plug its own map source while
-/// keeping the CLI / test fixtures on the default XML-sibling path.
+/// Covers the <see cref="IModelMapProvider"/> abstraction and the JSON DTO
+/// round-trip used by the Worker-based provider. The runtime no longer has a
+/// built-in "sibling .xml" path: callers must supply a provider.
 /// </summary>
 public class ModelMapProviderTests
 {
-    [Fact]
-    public async Task XmlFileProvider_loads_sibling_xml_next_to_erwin_path()
-    {
-        using var dir = new TempDir();
-        var erwinPath = dir.Create("v1.erwin", "fake binary");
-        dir.Create("v1.xml", """
-            <?xml version="1.0" encoding="UTF-8"?>
-            <erwin xmlns="http://www.erwin.com/dm">
-              <Entity id="{E1}+0" name="CUSTOMER"/>
-            </erwin>
-            """);
-
-        var provider = new XmlFileModelMapProvider();
-        var map = await provider.BuildMapAsync(erwinPath);
-        map.TotalObjectCount.Should().Be(1);
-        map.TryGetId("Entity", "CUSTOMER", out var id).Should().BeTrue();
-        id.Should().Be("{E1}+0");
-    }
-
-    [Fact]
-    public async Task XmlFileProvider_throws_with_clear_guidance_when_xml_missing()
-    {
-        using var dir = new TempDir();
-        var erwinPath = dir.Create("v1.erwin", "fake binary");
-        // no v1.xml
-
-        var provider = new XmlFileModelMapProvider();
-        var act = () => provider.BuildMapAsync(erwinPath);
-        var ex = await act.Should().ThrowAsync<FileNotFoundException>();
-        ex.Which.Message.Should().Contain("Actions > Export > XML");
-    }
-
     [Fact]
     public async Task PrebuiltProvider_returns_preloaded_maps_by_path()
     {
@@ -74,11 +40,11 @@ public class ModelMapProviderTests
     }
 
     [Fact]
-    public async Task CompareOrchestrator_uses_injected_provider_over_xml_sibling()
+    public async Task CompareOrchestrator_uses_injected_provider()
     {
-        // Goal: prove the orchestrator no longer demands an .xml sibling when
-        // a custom provider is supplied. If the provider returns a valid map
-        // the compare succeeds even when no .xml file exists on disk.
+        // Proves no .xml-on-disk requirement: only the injected provider
+        // is consulted for model maps. If the provider returns a valid map
+        // the compare succeeds regardless of any file-system siblings.
         using var dir = new TempDir();
         var v1 = dir.Create("v1.erwin", "bin");
         var v2 = dir.Create("v2.erwin", "bin");
@@ -104,21 +70,56 @@ public class ModelMapProviderTests
         result.Changes.OfType<EntityAdded>().Should().ContainSingle(c => c.Target.Name == "ORDER");
     }
 
-    [Fact]
-    public async Task CompareOrchestrator_default_provider_still_requires_xml_sibling_for_backcompat()
-    {
-        using var dir = new TempDir();
-        var v1 = dir.Create("v1.erwin", "bin");
-        var v2 = dir.Create("v2.erwin", "bin");
-        // deliberately no v1.xml / v2.xml and no custom provider
-        var session = new TestSession { XlsOutPath = dir.Create("diff.xls", "<html><body><table></table></body></html>") };
-        var orch = new CompareOrchestrator(session); // default = XmlFileModelMapProvider
+    // -------- JSON round-trip --------
 
-        var act = () => orch.CompareAsync(v1, v2, CompareOptions.Default);
-        await act.Should().ThrowAsync<FileNotFoundException>();
+    [Fact]
+    public void Serialize_and_Deserialize_round_trip_preserves_ObjectIds_and_parent_chain()
+    {
+        const string xml = """
+            <erwin xmlns="http://www.erwin.com/dm">
+              <Entity id="{E1}+0" name="CUSTOMER">
+                <Attribute id="{A1}+0" name="id"/>
+                <Attribute id="{A2}+0" name="email"/>
+              </Entity>
+              <Entity id="{E2}+0" name="ORDER">
+                <Attribute id="{A3}+0" name="id"/>
+              </Entity>
+            </erwin>
+            """;
+        var original = ErwinXmlObjectIdMapper.ParseXml(xml);
+        var dto = ModelMapJsonSerializer.ToDto(original, "v1.erwin");
+        var json = ModelMapJsonSerializer.Serialize(dto);
+        var rebuilt = ModelMapJsonSerializer.Deserialize(json);
+
+        rebuilt.TotalObjectCount.Should().Be(5);
+        rebuilt.TryGetId("Entity", "CUSTOMER", out var custId).Should().BeTrue();
+        custId.Should().Be("{E1}+0");
+        rebuilt.TryGetAttributeId("CUSTOMER", "email", out var emailId).Should().BeTrue();
+        emailId.Should().Be("{A2}+0");
+        rebuilt.TryGetAttributeId("ORDER", "id", out var orderIdAttr).Should().BeTrue();
+        orderIdAttr.Should().Be("{A3}+0");
     }
 
-    // ---------- helpers (duplicated tiny fixtures) ----------
+    [Fact]
+    public void Deserialize_rejects_unknown_schema_version()
+    {
+        var badJson = """{ "schemaVersion": "999", "sourceErwinPath": "x", "objects": [] }""";
+        var act = () => ModelMapJsonSerializer.Deserialize(badJson);
+        act.Should().Throw<NotSupportedException>();
+    }
+
+    [Fact]
+    public void Deserialize_rejects_missing_objects_array()
+    {
+        // A well-formed JSON with the right schema version but no objects
+        // array is a malformed dump. Parser must reject it loudly rather
+        // than silently returning an empty map.
+        var badJson = """{ "schemaVersion": "1", "sourceErwinPath": "x" }""";
+        var act = () => ModelMapJsonSerializer.Deserialize(badJson);
+        act.Should().Throw<InvalidDataException>();
+    }
+
+    // -------- helpers (duplicated mini-fixtures) --------
 
     private sealed class TestSession : IScapiSession
     {

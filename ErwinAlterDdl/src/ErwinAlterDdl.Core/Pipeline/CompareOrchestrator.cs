@@ -16,10 +16,11 @@ namespace EliteSoft.Erwin.AlterDdl.Core.Pipeline;
 ///   [Provider] left + right model maps  -> ErwinModelMap x2
 ///   [Core]     Correlator               -> List&lt;Change&gt;
 ///
-/// The model-map source is pluggable via <see cref="IModelMapProvider"/>. The
-/// default is <see cref="XmlFileModelMapProvider"/>, preserving the original
-/// "sibling .xml export" contract; add-in / worker callers can inject their
-/// own provider that reads from SCAPI or an out-of-process dump.
+/// The <see cref="IModelMapProvider"/> is required - Core no longer assumes a
+/// sibling <c>.xml</c> export. Callers supply the provider that matches their
+/// runtime: CLI uses <c>WorkerJsonModelMapProvider</c> (walks the .erwin via a
+/// short-lived worker), tests use <c>PrebuiltModelMapProvider</c>, and the
+/// add-in plugs in a live-SCAPI provider once it lands.
 /// </summary>
 public sealed class CompareOrchestrator
 {
@@ -27,18 +28,13 @@ public sealed class CompareOrchestrator
     private readonly IModelMapProvider _mapProvider;
     private readonly ILogger<CompareOrchestrator> _logger;
 
-    public CompareOrchestrator(IScapiSession session, ILogger<CompareOrchestrator>? logger = null)
-        : this(session, mapProvider: null, logger)
-    {
-    }
-
     public CompareOrchestrator(
         IScapiSession session,
-        IModelMapProvider? mapProvider,
+        IModelMapProvider mapProvider,
         ILogger<CompareOrchestrator>? logger = null)
     {
         _session = session ?? throw new ArgumentNullException(nameof(session));
-        _mapProvider = mapProvider ?? new XmlFileModelMapProvider();
+        _mapProvider = mapProvider ?? throw new ArgumentNullException(nameof(mapProvider));
         _logger = logger ?? NullLogger<CompareOrchestrator>.Instance;
     }
 
