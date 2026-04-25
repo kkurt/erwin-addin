@@ -78,7 +78,24 @@ parser'ında native AV ile erwin'i çökertmişti — ondan beri canonical
 form kullandık.)
 
 **Sonuç:** GUI bir Mart bağlantısı tutuyorken, SCAPI API kendi Mart
-oturumunu açamaz; sadece GUI'nin oturumunu okuyabilir. Yani:
+oturumunu açamaz; sadece GUI'nin oturumunu okuyabilir.
+
+**Ek probe (2026-04-25 22:57):** Bir kullanıcı VBScript örneği önerdi
+(`Mart://Lib/Model?version=N.0` formu). 5 URL formu in-process denendi
+(her biri OVM=Yes ile Add):
+
+```
+attempt #1: mart://Mart/Kursat/MetaRepo?version=3.0
+[NATIVE AV - erwin crashed]
+```
+
+`?version=N.0` formu SCAPI'nin parser'ında null-deref yapıyor (managed
+exception değil, fatal). Diğer 4 form denenemedi. Önemli ders: VBScript
+örneği muhtemelen **standalone wscript host'unda** çalışıyordu — bu
+bizim Worker process'imize denk; in-process eşdeğeri değil. Dış
+process'te GUI Mart oturumu yok, dolayısıyla constraint geçerli değil.
+
+Yani:
 
 | Yol | İn-process API'den çalışıyor mu? |
 |-----|----------------------------------|
