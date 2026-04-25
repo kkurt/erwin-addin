@@ -4433,16 +4433,25 @@ namespace EliteSoft.Erwin.AddIn
         /// </summary>
         /// <summary>
         /// <summary>
-        /// Lazy-refresh the Alter Compare tab the first time the user opens
-        /// it after a model change. Cheap to call when the tab is already
-        /// in sync (it just rereads PU metadata).
+        /// Tab-switch hook: only initialize the Alter Compare tab the FIRST
+        /// time it's shown for a given active model, or when the model has
+        /// changed. Switching back to the tab after a successful compare
+        /// must NOT wipe the user's results - they need them visible to
+        /// copy / save / inspect.
         /// </summary>
         private void tabControl_SelectedIndexChanged(object sender, EventArgs e)
         {
             try
             {
-                if (tabControl.SelectedTab == tabAlterCompare)
+                if (tabControl.SelectedTab != tabAlterCompare) return;
+
+                // First entry, or active model changed since last init.
+                bool needsInit = !ReferenceEquals(_alterTabInitFor, _currentModel as object);
+                if (needsInit)
+                {
                     RefreshAlterCompareTab();
+                    _alterTabInitFor = _currentModel as object;
+                }
             }
             catch (Exception ex)
             {
@@ -4464,19 +4473,25 @@ namespace EliteSoft.Erwin.AddIn
         private string _alterLastDialect = "MSSQL";
 
         /// <summary>
-        /// Refresh the Alter Compare tab when it becomes visible / when the
-        /// active model changes. Reads the active PU's dirty state, target
-        /// server, and current Mart version to populate the combo.
+        /// Snapshot of the model reference last seen by RefreshAlterCompareTab.
+        /// When the user switches tabs without changing models, the tab keeps
+        /// its previous state (combo selection, ListView contents, SQL text)
+        /// instead of resetting on every tab activation.
+        /// </summary>
+        private object _alterTabInitFor;
+
+        /// <summary>
+        /// Initialize the Alter Compare tab for the current active model:
+        /// read PU metadata, populate the version combo, set status. Only
+        /// touches metadata UI; does NOT clear lvAlterChanges / txtAlterSql
+        /// so that switching tabs after a successful compare keeps results
+        /// visible. Compare-button click is what populates results, and
+        /// pre-populates a fresh state when it runs.
         /// </summary>
         private void RefreshAlterCompareTab()
         {
             try
             {
-                lvAlterChanges.Items.Clear();
-                txtAlterSql.Clear();
-                _alterLastSql = string.Empty;
-                btnSaveAlterSql.Enabled = false;
-
                 if (!_isConnected || _currentModel == null || _scapi == null)
                 {
                     lblAlterActiveInfo.Text = "Active: (no model loaded)";
@@ -4485,6 +4500,13 @@ namespace EliteSoft.Erwin.AddIn
                     _alterTargetVersions.Clear();
                     btnAlterCompare.Enabled = false;
                     lblAlterCompareStatus.Text = "Open a model to begin.";
+                    // Stale results from a different model would mislead the
+                    // user, so clear them when there is no model anymore.
+                    lvAlterChanges.Items.Clear();
+                    txtAlterSql.Clear();
+                    _alterLastSql = string.Empty;
+                    btnSaveAlterSql.Enabled = false;
+                    btnCopyAlterSql.Enabled = false;
                     return;
                 }
 
@@ -4517,6 +4539,17 @@ namespace EliteSoft.Erwin.AddIn
                 lblAlterCompareStatus.Text = btnAlterCompare.Enabled
                     ? "Pick a target version and click Compare."
                     : "No earlier Mart version available to compare against.";
+
+                // First-init for a new model: clear previous results (they
+                // belonged to the old PU). Subsequent same-model refreshes
+                // are guarded by tabControl_SelectedIndexChanged, so this
+                // path only runs when the user's active model actually
+                // changed.
+                lvAlterChanges.Items.Clear();
+                txtAlterSql.Clear();
+                _alterLastSql = string.Empty;
+                btnSaveAlterSql.Enabled = false;
+                btnCopyAlterSql.Enabled = false;
             }
             catch (Exception ex)
             {
@@ -4543,6 +4576,7 @@ namespace EliteSoft.Erwin.AddIn
             txtAlterSql.Clear();
             _alterLastSql = string.Empty;
             btnSaveAlterSql.Enabled = false;
+            btnCopyAlterSql.Enabled = false;
 
             try
             {
@@ -4613,7 +4647,9 @@ namespace EliteSoft.Erwin.AddIn
             txtAlterSql.Text = _alterLastSql;
             txtAlterSql.SelectionStart = 0;
             txtAlterSql.ScrollToCaret();
-            btnSaveAlterSql.Enabled = !string.IsNullOrEmpty(_alterLastSql);
+            bool hasSql = !string.IsNullOrEmpty(_alterLastSql);
+            btnSaveAlterSql.Enabled = hasSql;
+            btnCopyAlterSql.Enabled = hasSql;
         }
 
         private static string DescribeAlterChangeDetail(EliteSoft.Erwin.AlterDdl.Core.Models.Change change) => change switch
@@ -4652,71 +4688,6 @@ namespace EliteSoft.Erwin.AddIn
             }
         }
 
-        /// <summary>
-        /// EXPERIMENTAL probe: calls <c>activePU.Save(temp.erwin, "OVF=Yes")</c>
-        /// and reports PropertyBag diff before/after, plus a benign FE_DDL
-        /// post-check. Used to learn whether Save on a live Mart-backed PU is
-        /// non-destructive (a true copy) or destructive (relocates the live
-        /// PU's Locator). Removed once we have a verdict.
-        /// </summary>
-        private async void btnProbePuSave_Click(object sender, EventArgs e)
-        {
-            if (!_isConnected || _currentModel == null || _scapi == null)
-            {
-                ErwinAddIn.ShowTopMostMessage("No active erwin model.", "Probe");
-                return;
-            }
-
-            var ok = MessageBox.Show(
-                this,
-                "EXPERIMENTAL probe.\n\n" +
-                "This will call activePU.Save(\"<temp>.erwin\", \"OVF=Yes\") on the currently " +
-                "open Mart model. Per the SCAPI doc, Save \"provides a new location\" - i.e. " +
-                "it MAY relocate the live PU. The probe captures Locator/Disposition before " +
-                "and after the call so we can see what actually happens.\n\n" +
-                "If the live PU does relocate, your Mart binding may need to be restored by " +
-                "closing and reopening the model from Mart.\n\n" +
-                "Run probe?",
-                "Probe PU.Save behavior",
-                MessageBoxButtons.YesNo,
-                MessageBoxIcon.Warning,
-                MessageBoxDefaultButton.Button2);
-            if (ok != DialogResult.Yes) return;
-
-            btnProbePuSave.Enabled = false;
-            lblAlterCompareStatus.Text = "Running PU.Save probe... watch Debug Log.";
-            try
-            {
-                var result = await Services.PuSaveProbe.ProbeAsync(
-                    (object)_scapi, (object)_currentModel, (Action<string>)Log).ConfigureAwait(true);
-
-                bool locatorChanged = !string.Equals(result.Before.Locator, result.After.Locator, StringComparison.Ordinal);
-                string verdict = (result.SaveSucceeded, locatorChanged, result.PostFeDdlOk) switch
-                {
-                    (true, false, true) => "BEST: save succeeded, Locator unchanged, FE_DDL still works",
-                    (true, true, true) => "MIXED: save succeeded, Locator RELOCATED, FE_DDL still works (data alive but binding changed)",
-                    (true, _, false) => "BAD: save succeeded but FE_DDL post-check failed (PU may be in a degraded state)",
-                    (false, _, _) => "FAILED: Save returned false / threw",
-                };
-                Log($"PuSaveProbe verdict: {verdict}");
-                lblAlterCompareStatus.Text = $"Probe done: {verdict}. See Debug Log for details.";
-
-                ErwinAddIn.ShowTopMostMessage(
-                    $"Probe complete.\n\nVerdict: {verdict}\n\nFile size: {result.ProducedFileBytes:N0} bytes\n" +
-                    $"Locator changed: {locatorChanged}\nFE_DDL post-check: {(result.PostFeDdlOk ? "OK" : "FAILED")}\n\n" +
-                    "See Debug Log for the full PropertyBag diff.",
-                    "Probe Result");
-            }
-            catch (Exception ex)
-            {
-                Log($"PuSaveProbe handler crashed: {ex.GetType().Name}: {ex.Message}");
-                lblAlterCompareStatus.Text = $"Probe crashed: {ex.Message}";
-            }
-            finally
-            {
-                btnProbePuSave.Enabled = true;
-            }
-        }
 
         private void btnSaveAlterSql_Click(object sender, EventArgs e)
         {
@@ -4747,7 +4718,9 @@ namespace EliteSoft.Erwin.AddIn
         {
             btnAlterCompare.Enabled = !busy && cmbAlterTargetVersion.Items.Count > 0;
             cmbAlterTargetVersion.Enabled = !busy;
-            btnSaveAlterSql.Enabled = !busy && !string.IsNullOrEmpty(_alterLastSql);
+            bool hasSql = !busy && !string.IsNullOrEmpty(_alterLastSql);
+            btnSaveAlterSql.Enabled = hasSql;
+            btnCopyAlterSql.Enabled = hasSql;
             progressAlterCompare.Visible = busy;
             progressAlterCompare.MarqueeAnimationSpeed = busy ? 30 : 0;
             if (status != null) lblAlterCompareStatus.Text = status;

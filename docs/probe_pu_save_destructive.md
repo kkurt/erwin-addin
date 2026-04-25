@@ -107,10 +107,8 @@ subcommand. (Sıradaki adım.)
 
 ## Probe Artifact'ları
 
-- Probe kodu: [Services/PuSaveProbe.cs](../Services/PuSaveProbe.cs)
-- Buton + handler: [ModelConfigForm.Designer.cs](../ModelConfigForm.Designer.cs)
-  ve [ModelConfigForm.cs](../ModelConfigForm.cs) `btnProbePuSave_Click`
-
-Buton şimdilik UI'da kalıyor; aynı bulguyu farklı bir Mart server / sürüm
-üzerinde teyit etmek isteyen olursa tekrar koşturulabilir. İleride
-production temizliği yapıldığında kaldırılabilir.
+Verdict netleştikten sonra `Services/PuSaveProbe.cs` ve `[DEV]` butonu ile
+handler kaldırıldı (commit'i bu dokümandan sonraki commit'tedir). Aynı
+bulguyu farklı bir Mart server / sürüm üzerinde tekrar koşturmak isteyen
+olursa probe kodu git history'den geri alınabilir
+(probe ilk eklenen commit: `20c5336 docs(alter-ddl): probe verdict ...`).

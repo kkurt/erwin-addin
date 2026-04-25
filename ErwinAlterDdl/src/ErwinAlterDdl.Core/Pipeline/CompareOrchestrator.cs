@@ -146,7 +146,13 @@ public sealed class CompareOrchestrator
         };
     }
 
-    private static IReadOnlyDictionary<string, string> ExtractSchemaByEntity(IReadOnlyList<XlsDiffRow> xlsRows)
+    /// <summary>
+    /// Extract the schema-by-entity-name mapping from the CC XLS rows. Public
+    /// so callers that bypass the orchestrator (e.g. the add-in's
+    /// single-Worker fast path) can reuse the exact same logic without
+    /// duplicating it.
+    /// </summary>
+    public static IReadOnlyDictionary<string, string> ExtractSchemaByEntity(IReadOnlyList<XlsDiffRow> xlsRows)
     {
         // erwin's CC XLS uses "Entity/Table" or just "Table" depending on the
         // metamodel version / DBMS adapter. Both are entity rows.

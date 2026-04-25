@@ -65,6 +65,7 @@ public static class Program
                 "cc" => RunCompleteCompare(kv),
                 "ddl" => RunDdl(kv),
                 "dump-model" => RunDumpModel(kv),
+                "cc-pipeline" => RunCcPipeline(kv),
                 _ => Fail(ExitBadArgs, $"unknown subcommand '{command}'"),
             };
         }
@@ -231,35 +232,10 @@ public static class Program
 
         dynamic scapi = CreateScapi();
         dynamic pu = scapi.PersistenceUnits.Add(erwinPath, disposition);
-        dynamic sess = scapi.Sessions.Add();
         try
         {
-            sess.Open(pu, 0, 0); // SCD_SL_M0 - data level
-            var nodes = new List<ObjectNodeDto>();
-            dynamic modelObjects = sess.ModelObjects;
-            dynamic root = modelObjects.Root;
-            if (root is null)
-                return Fail(ExitOperationFailed, "session.ModelObjects.Root returned null");
-
-            CollectTopLevel(modelObjects, root, "Entity", nodes, walkNested: true);
-            CollectTopLevel(modelObjects, root, "Relationship", nodes, walkNested: false);
-            CollectTopLevel(modelObjects, root, "View", nodes, walkNested: false);
-            CollectTopLevel(modelObjects, root, "Trigger_Template", nodes, walkNested: false);
-            // erwin exposes sequences under different class names depending
-            // on DBMS (Oracle_Sequence / Sequence / ER_Sequence). Try each.
-            foreach (var cls in new[] { "Sequence", "Oracle_Sequence", "ER_Sequence" })
-                CollectTopLevel(modelObjects, root, cls, nodes, walkNested: false);
-
-            ApplySchemaPrefix(modelObjects, root, nodes);
-
-            var dto = new ErwinModelMapDto(
-                SchemaVersion: ErwinModelMapDto.CurrentSchemaVersion,
-                SourceErwinPath: erwinPath,
-                Objects: nodes);
-            File.WriteAllText(outPath, ModelMapJsonSerializer.Serialize(dto),
-                new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
-
-            WriteJson(new { path = outPath, objectCount = nodes.Count });
+            int objectCount = WalkPuToModelMapJson(scapi, pu, sourcePath: erwinPath, outPath: outPath);
+            WriteJson(new { path = outPath, objectCount });
             Console.Out.Flush();
 
             Environment.Exit(ExitOk);
@@ -267,10 +243,270 @@ public static class Program
         }
         finally
         {
-            try { sess.Close(); } catch { }
-            TryRelease(sess);
             TryRelease(pu);
             TryRelease(scapi);
+        }
+    }
+
+    /// <summary>
+    /// Open a session on <paramref name="pu"/>, walk its ModelObjects tree,
+    /// serialize as <see cref="ErwinModelMapDto"/> JSON to
+    /// <paramref name="outPath"/>, and return the node count. Used by both
+    /// <c>dump-model</c> (single-op) and <c>cc-pipeline</c> (single-Worker
+    /// combined op) so the walk logic stays in one place.
+    /// </summary>
+    private static int WalkPuToModelMapJson(dynamic scapi, dynamic pu, string sourcePath, string outPath)
+    {
+        dynamic sess = scapi.Sessions.Add();
+        try
+        {
+            sess.Open(pu, 0, 0); // SCD_SL_M0 - data level
+            var nodes = new List<ObjectNodeDto>();
+            dynamic modelObjects = sess.ModelObjects;
+            dynamic root = modelObjects.Root
+                ?? throw new InvalidOperationException("session.ModelObjects.Root returned null");
+
+            CollectTopLevel(modelObjects, root, "Entity", nodes, walkNested: true);
+            CollectTopLevel(modelObjects, root, "Relationship", nodes, walkNested: false);
+            CollectTopLevel(modelObjects, root, "View", nodes, walkNested: false);
+            CollectTopLevel(modelObjects, root, "Trigger_Template", nodes, walkNested: false);
+            foreach (var cls in new[] { "Sequence", "Oracle_Sequence", "ER_Sequence" })
+                CollectTopLevel(modelObjects, root, cls, nodes, walkNested: false);
+
+            ApplySchemaPrefix(modelObjects, root, nodes);
+
+            var dto = new ErwinModelMapDto(
+                SchemaVersion: ErwinModelMapDto.CurrentSchemaVersion,
+                SourceErwinPath: sourcePath,
+                Objects: nodes);
+            File.WriteAllText(outPath, ModelMapJsonSerializer.Serialize(dto),
+                new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            return nodes.Count;
+        }
+        finally
+        {
+            try { sess.Close(); } catch { }
+            TryRelease(sess);
+        }
+    }
+
+    /// <summary>
+    /// Combined end-to-end pipeline: open both Mart locators, walk and dump
+    /// each PU as a model-map JSON, save each PU to a temp .erwin, run
+    /// CompleteCompare on the temp pair, and (optionally) run FEModel_DDL on
+    /// the right side. All steps share a single SCAPI initialization so the
+    /// caller pays the ~10s erwin LocalServer startup ONCE instead of 4-5
+    /// times. Verified against r10.10: SCAPI happily handles sequential
+    /// Mart-Add + Save + new-Mart-Add + Save + CC + Add + FE_DDL within one
+    /// process; only spawning multiple Worker processes triggers the
+    /// process-singleton race.
+    /// </summary>
+    private static int RunCcPipeline(Dictionary<string, string> kv)
+    {
+        var leftLoc = Require(kv, "--left");
+        var rightLoc = Require(kv, "--right");
+        var xlsOut = Require(kv, "--xls-out");
+        var leftMapOut = Require(kv, "--left-map-out");
+        var rightMapOut = Require(kv, "--right-map-out");
+        var rightDdlOut = kv.GetValueOrDefault("--right-ddl-out", string.Empty);
+        var leftDdlOut = kv.GetValueOrDefault("--left-ddl-out", string.Empty);
+        var preset = kv.GetValueOrDefault("--preset", "Standard");
+        var level = kv.GetValueOrDefault("--level", "LP");
+
+        dynamic scapi = CreateScapi();
+
+        // Step 1+2: open each Mart locator, walk + (optional) FE_DDL + save
+        // to temp .erwin. Save destroys the in-memory PU (per r10.10 probe),
+        // so any read-only ops on that PU MUST happen BEFORE Save. Doing
+        // FE_DDL on the saved temp file post-CC fails with "File exists and
+        // read only" because CC leaves a sticky COM file handle on its
+        // input files - even ClearReadOnly + Marshal.Release does not free
+        // it within the same process. Running FE_DDL on the still-alive
+        // Mart PU is the simpler, robust path.
+        var tempFiles = new List<string>();
+        string leftDisk; string leftTargetSrv;
+        try
+        {
+            var leftRes = OpenWalkDdlAndSave(
+                scapi, leftLoc, "left", leftMapOut,
+                ddlOut: string.IsNullOrEmpty(leftDdlOut) ? null : leftDdlOut);
+            leftDisk = leftRes.TempPath;
+            leftTargetSrv = leftRes.TargetServer;
+            tempFiles.Add(leftDisk);
+            Console.Error.WriteLine($"cc-pipeline: left dumped + saved to {leftDisk}");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"cc-pipeline: left side failed: {ex.GetType().Name}: {ex.Message}");
+            return ExitOperationFailed;
+        }
+
+        string rightDisk; string rightTargetSrv;
+        try
+        {
+            var rightRes = OpenWalkDdlAndSave(
+                scapi, rightLoc, "right", rightMapOut,
+                ddlOut: string.IsNullOrEmpty(rightDdlOut) ? null : rightDdlOut);
+            rightDisk = rightRes.TempPath;
+            rightTargetSrv = rightRes.TargetServer;
+            tempFiles.Add(rightDisk);
+            Console.Error.WriteLine($"cc-pipeline: right dumped + saved to {rightDisk}");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"cc-pipeline: right side failed: {ex.GetType().Name}: {ex.Message}");
+            CleanupTemps(tempFiles);
+            return ExitOperationFailed;
+        }
+
+        // Step 3: CompleteCompare on the two saved files (host PU is a
+        // throwaway empty PU created from a fresh PropertyBag).
+        try
+        {
+            var bagType = Type.GetTypeFromProgID("ERwin9.SCAPI.PropertyBag.9.0", throwOnError: true)!;
+            dynamic bag = Activator.CreateInstance(bagType)!;
+            dynamic ccPu = scapi.PersistenceUnits.Create(bag);
+            // Same arg-swap as RunCompleteCompare: SCAPI's XLS Left column
+            // mirrors the SECOND argument; passing (right, left) flips it
+            // back to the intuitive form.
+            bool ok = ccPu.CompleteCompare(rightDisk, leftDisk, xlsOut, preset, level, "");
+            if (!ok)
+            {
+                CleanupTemps(tempFiles);
+                return Fail(ExitOperationFailed, "CompleteCompare returned false");
+            }
+            if (!File.Exists(xlsOut))
+            {
+                CleanupTemps(tempFiles);
+                return Fail(ExitOperationFailed, "xls not produced");
+            }
+            Console.Error.WriteLine($"cc-pipeline: CC produced {xlsOut} ({new FileInfo(xlsOut).Length} bytes)");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"cc-pipeline: CC failed: {ex.GetType().Name}: {ex.Message}");
+            CleanupTemps(tempFiles);
+            return ExitOperationFailed;
+        }
+
+        // FE_DDL was already produced inside OpenWalkDdlAndSave for each
+        // side that requested it (before the destructive Save). The output
+        // bundle just wires up the paths and sizes.
+        long leftDdlBytes = !string.IsNullOrEmpty(leftDdlOut) && File.Exists(leftDdlOut)
+            ? new FileInfo(leftDdlOut).Length : 0;
+        long rightDdlBytes = !string.IsNullOrEmpty(rightDdlOut) && File.Exists(rightDdlOut)
+            ? new FileInfo(rightDdlOut).Length : 0;
+
+        var result = new
+        {
+            xlsPath = xlsOut,
+            xlsBytes = new FileInfo(xlsOut).Length,
+            leftMapPath = leftMapOut,
+            rightMapPath = rightMapOut,
+            leftDdlPath = string.IsNullOrEmpty(leftDdlOut) ? null : leftDdlOut,
+            leftDdlBytes,
+            leftTargetServer = leftTargetSrv,
+            rightDdlPath = string.IsNullOrEmpty(rightDdlOut) ? null : rightDdlOut,
+            rightDdlBytes,
+            rightTargetServer = rightTargetSrv,
+        };
+        WriteJson(result);
+        Console.Out.Flush();
+
+        // Cleanup: temp .erwin files are no longer needed once the artifacts
+        // they fed are written. JSON / XLS / SQL artifacts are owned by the
+        // caller now.
+        CleanupTemps(tempFiles);
+
+        // Same AV-on-shutdown trick as RunCompleteCompare: skip managed
+        // finally chain for the COM handles and exit cleanly.
+        Environment.Exit(ExitOk);
+        return ExitOk;
+    }
+
+    /// <summary>
+    /// Open a Mart locator (or file path), walk its ModelObjects to the
+    /// JSON model map at <paramref name="mapOut"/>, optionally generate
+    /// FEModel_DDL output to <paramref name="ddlOut"/> (BEFORE the
+    /// destructive Save - the live Mart PU still has its session and
+    /// FEModel_DDL works on it just like on the add-in's active PU), then
+    /// save the PU to a fresh temp .erwin. Returns (tempPath, targetServer).
+    /// The PU is destroyed by Save (r10.10 probe finding); callers must not
+    /// reuse it after this method returns.
+    /// </summary>
+    private sealed record SideResult(string TempPath, string TargetServer);
+
+    private static SideResult OpenWalkDdlAndSave(
+        dynamic scapi, string locator, string label, string mapOut, string? ddlOut)
+    {
+        bool isMart = locator.StartsWith("mart://", StringComparison.OrdinalIgnoreCase)
+            || locator.StartsWith("erwin://", StringComparison.OrdinalIgnoreCase);
+        if (!isMart) ClearReadOnly(locator);
+
+        string tempPath = Path.Combine(Path.GetTempPath(),
+            $"erwin-cc-{label}-{Guid.NewGuid():N}.erwin");
+
+        dynamic pu = scapi.PersistenceUnits.Add(locator, isMart ? "OVM=Yes" : "");
+        string targetServer = string.Empty;
+        try
+        {
+            // 1. Read target server (cheap PropertyBag lookup, useful for
+            //    DDL artifact metadata downstream).
+            try
+            {
+                dynamic bag = pu.PropertyBag(null, true);
+                targetServer = SafeBagString(bag, "Target_Server");
+            }
+            catch { /* best effort */ }
+
+            // 2. Walk while the PU is still alive.
+            int n = WalkPuToModelMapJson(scapi, pu, sourcePath: locator, outPath: mapOut);
+            Console.Error.WriteLine($"cc-pipeline[{label}]: walked {n} objects -> {mapOut}");
+
+            // 3. Generate FE_DDL on the live Mart PU. This is read-only and
+            //    safe (same call the add-in's DDL Generation tab makes on
+            //    its active PU). Doing it here, before Save, sidesteps the
+            //    "File exists and read only" COM error we hit when trying
+            //    to re-open the saved temp file post-CC.
+            if (!string.IsNullOrEmpty(ddlOut))
+            {
+                bool ok = pu.FEModel_DDL(ddlOut, "");
+                if (!ok || !File.Exists(ddlOut))
+                    throw new InvalidOperationException(
+                        $"FEModel_DDL on {label} Mart PU returned false / no output");
+                Console.Error.WriteLine(
+                    $"cc-pipeline[{label}]: FE_DDL = {new FileInfo(ddlOut).Length} bytes");
+            }
+
+            // 4. Save to disk. This destroys the in-memory PU on Mart-backed
+            //    sources (probe finding 2026-04-25), but we no longer touch
+            //    it after this point.
+            bool saved = pu.Save(tempPath);
+            if (!saved || !File.Exists(tempPath))
+                throw new InvalidOperationException($"PU.Save({tempPath}) returned false / file missing");
+            Console.Error.WriteLine($"cc-pipeline[{label}]: saved {new FileInfo(tempPath).Length} bytes");
+            return new SideResult(tempPath, targetServer);
+        }
+        catch
+        {
+            try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+            throw;
+        }
+    }
+
+    private static void CleanupTemps(List<string> tempFiles)
+    {
+        foreach (var t in tempFiles)
+        {
+            try
+            {
+                if (File.Exists(t))
+                {
+                    File.SetAttributes(t, FileAttributes.Normal);
+                    File.Delete(t);
+                }
+            }
+            catch { /* worker exit will release locks */ }
         }
     }
 

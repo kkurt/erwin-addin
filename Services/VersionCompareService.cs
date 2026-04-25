@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 
 using EliteSoft.Erwin.AlterDdl.ComInterop;
 using EliteSoft.Erwin.AlterDdl.Core.Abstractions;
+using EliteSoft.Erwin.AlterDdl.Core.Correlation;
 using EliteSoft.Erwin.AlterDdl.Core.Emitting;
 using EliteSoft.Erwin.AlterDdl.Core.Emitting.Dialect;
 using EliteSoft.Erwin.AlterDdl.Core.Models;
@@ -133,17 +134,19 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         /// <summary>
         /// End-to-end compare of the active Mart-backed model against an
-        /// earlier Mart version of itself. The pipeline is the same one the
-        /// CLI / sub-module uses end-to-end: out-of-process Worker for both
-        /// sides, real CompleteCompare via SCAPI (so the XLS report drives
-        /// schema-aware emit and CC-allowlist filtering), CREATE DDL for
-        /// each side for column types and verbatim CREATE TABLE bodies.
+        /// earlier Mart version of itself. Drives the entire pipeline through
+        /// a SINGLE Worker child process (cc-pipeline subcommand): the
+        /// Worker opens both Mart locators, walks each PU into a model-map
+        /// JSON, saves both to temp .erwin files, runs CompleteCompare on
+        /// the pair, and (optionally) generates FEModel_DDL on the right
+        /// side - all under one SCAPI initialization. Replaces 4-5 separate
+        /// Worker spawns the orchestrator would otherwise make, cutting
+        /// runtime from ~70s to ~25-30s on r10.10.
         ///
         /// The active PU is opened by the worker via its Mart locator
         /// (vCurrent), which captures only the saved state. If the live PU
         /// is dirty, the unsaved buffer is NOT in the diff - the caller is
-        /// responsible for warning the user before they save and lose
-        /// recoverability.
+        /// responsible for warning the user.
         /// </summary>
         public async Task<CompareOutcome> CompareAsync(int targetVersion, CancellationToken ct = default)
         {
@@ -165,41 +168,55 @@ namespace EliteSoft.Erwin.AddIn.Services
             _log($"VersionCompare: left  locator = {MaskMartPassword(leftMart)}");
             _log($"VersionCompare: right locator = {MaskMartPassword(rightMart)}");
 
-            WorkerJsonModelMapProvider workerProvider;
-            OutOfProcessScapiSession scapiSession;
+            var (target, major, minor) = ReadActiveTargetServer();
+            string dialect = ResolveDialect(target);
+
+            // Single-Worker pipeline: one SCAPI init handles all 5 SCAPI ops
+            // (open left, walk left, save left, open right, walk right, save
+            // right, CC, FE_DDL right). See CcPipelineRunner for the wire
+            // protocol; the Worker subcommand is "cc-pipeline" in
+            // ErwinAlterDdl.Worker.Program.
+            CcPipelineRunner runner;
             try
             {
-                workerProvider = new WorkerJsonModelMapProvider();
-                scapiSession = new OutOfProcessScapiSession();
-                _log("VersionCompare: out-of-process worker session ready");
+                runner = new CcPipelineRunner();
+                _log("VersionCompare: cc-pipeline runner ready (single-Worker fast path)");
             }
             catch (Exception ex)
             {
-                _log($"VersionCompare: worker init failed: {ex.GetType().FullName}: {ex.Message}");
+                _log($"VersionCompare: runner init failed: {ex.GetType().FullName}: {ex.Message}");
                 throw new InvalidOperationException(
                     "Could not locate erwin-alter-ddl-worker.exe. Set the ERWIN_ALTER_DDL_WORKER environment " +
                     "variable to its full path, or copy the worker EXE next to the add-in DLL.", ex);
             }
 
-            var options = new CompareOptions
+            CcPipelineResult bundle = await runner.RunAsync(
+                leftLocator: leftMart,
+                rightLocator: rightMart,
+                generateLeftDdl: false,    // emitter only consumes RIGHT DDL
+                generateRightDdl: true,    // for verbatim CREATE TABLE bodies + column types
+                preset: "Standard",
+                level: "LP",
+                ct: ct).ConfigureAwait(false);
+
+            // Parse XLS, correlate, emit - same logic as
+            // CompareOrchestrator.CompareAsync minus the per-step Worker
+            // spawns we just consolidated.
+            var xlsRows = XlsDiffParser.Parse(bundle.Xls.XlsPath);
+            _log($"VersionCompare: parsed {xlsRows.Count} xls rows; left={bundle.LeftMap.TotalObjectCount} objects, right={bundle.RightMap.TotalObjectCount} objects");
+
+            var changes = ChangeCorrelator.Correlate(bundle.LeftMap, bundle.RightMap, xlsRows);
+            var schemaByEntity = CompareOrchestrator.ExtractSchemaByEntity(xlsRows);
+            _log($"VersionCompare: correlator produced {changes.Count} change(s); XLS yielded {schemaByEntity.Count} entity-schema mapping(s)");
+
+            var leftMeta = StubMetadata(leftMart, major, minor, target);
+            var rightMeta = StubMetadata(rightMart, major, minor, target);
+            var result = new CompareResult(leftMeta, rightMeta, changes, bundle.Xls)
             {
-                SkipCompleteCompare = false,    // Run real CC for XLS-driven schema + filter
-                IncludeCreateDdl = true,        // CREATE DDL feeds column types + verbatim CREATE TABLE
-                IncludeLeftCreateDdl = false,   // emitter only consumes RIGHT DDL; saves a Worker call
-                SkipMetadataRead = true,        // we already have active PU metadata locally
+                LeftDdl = bundle.LeftDdl,
+                RightDdl = bundle.RightDdl,
+                SchemaByEntityName = schemaByEntity.Count > 0 ? schemaByEntity : null,
             };
-
-            var (target, major, minor) = ReadActiveTargetServer();
-            string dialect = ResolveDialect(target);
-
-            CompareResult result;
-            await using (scapiSession)
-            {
-                var orchestrator = new CompareOrchestrator(scapiSession, workerProvider);
-                result = await orchestrator
-                    .CompareAsync(leftMart, rightMart, options, ct)
-                    .ConfigureAwait(false);
-            }
 
             var registry = new SqlEmitterRegistry()
                 .Register(new MssqlEmitter(), "SQL Server")
@@ -212,105 +229,28 @@ namespace EliteSoft.Erwin.AddIn.Services
             return new CompareOutcome(result, script, dialect);
         }
 
+        private static ModelMetadata StubMetadata(string locator, int major, int minor, string targetServer)
+        {
+            string name = locator;
+            int lastSep = locator.LastIndexOfAny(new[] { '/', '\\' });
+            if (lastSep >= 0 && lastSep + 1 < locator.Length) name = locator[(lastSep + 1)..];
+            int q = name.IndexOf('?');
+            if (q >= 0) name = name[..q];
+            return new ModelMetadata(
+                PersistenceUnitId: locator,
+                Name: name,
+                ModelType: "Physical",
+                TargetServer: targetServer ?? string.Empty,
+                TargetServerVersion: major,
+                TargetServerMinorVersion: minor);
+        }
+
         /// <summary>
-        /// Build CREATE DDL artifacts for both sides of the compare:
-        ///   left  = Mart vN target (out-of-process worker)
-        ///   right = active PU (in-process FEModel_DDL on the live handle;
-        ///           safe per existing DdlGenerationService pattern)
-        /// </summary>
-        private async Task<(DdlArtifact Left, DdlArtifact Right)> BuildCreateDdlArtifactsAsync(
-            string martLocator,
-            CancellationToken ct)
-        {
-            DdlArtifact leftDdl = null;
-            DdlArtifact rightDdl = null;
-
-            // Active PU side - in-process FEModel_DDL is safe (does not
-            // corrupt the PU; the Mart "DDL Generation" tab uses the same
-            // call on every run).
-            try
-            {
-                string leftSql = Path.Combine(Path.GetTempPath(), $"erwin-active-ddl-{Guid.NewGuid():N}.sql");
-                bool ok = false;
-                try { ok = (bool)_activePU.FEModel_DDL(leftSql, ""); }
-                catch (Exception ex) { _log($"VersionCompare: FEModel_DDL on active PU threw: {ex.Message}"); }
-                if (ok && File.Exists(leftSql) && new FileInfo(leftSql).Length > 0)
-                {
-                    string targetServer = ReadActiveTargetServer().TargetServer;
-                    rightDdl = new DdlArtifact(leftSql, new FileInfo(leftSql).Length, targetServer);
-                    _log($"VersionCompare: active PU CREATE DDL = {rightDdl.SizeBytes} bytes");
-                }
-                else
-                {
-                    _log("VersionCompare: active PU FEModel_DDL did not produce output");
-                }
-            }
-            catch (Exception ex)
-            {
-                _log($"VersionCompare: active PU CREATE DDL build failed: {ex.GetType().Name}: {ex.Message}");
-            }
-
-            // Mart vN side - delegated to a fresh worker process (own SCAPI
-            // instance, no interference with the user's add-in session).
-            try
-            {
-                string martSql = Path.Combine(Path.GetTempPath(), $"erwin-mart-ddl-{Guid.NewGuid():N}.sql");
-                var workerExe = LocateWorkerExe();
-                var psi = new System.Diagnostics.ProcessStartInfo
-                {
-                    FileName = workerExe,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                };
-                psi.ArgumentList.Add("ddl");
-                psi.ArgumentList.Add("--erwin"); psi.ArgumentList.Add(martLocator);
-                psi.ArgumentList.Add("--out"); psi.ArgumentList.Add(martSql);
-                psi.ArgumentList.Add("--disposition"); psi.ArgumentList.Add("OVM=Yes");
-
-                _log($"VersionCompare: Worker ddl: {workerExe} ddl --erwin <mart> --out {martSql}");
-                using var proc = System.Diagnostics.Process.Start(psi)
-                    ?? throw new InvalidOperationException("Process.Start returned null");
-                using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                linked.CancelAfter(TimeSpan.FromMinutes(5));
-                var stderrTask = proc.StandardError.ReadToEndAsync(linked.Token);
-                await proc.WaitForExitAsync(linked.Token).ConfigureAwait(false);
-                var stderr = await stderrTask.ConfigureAwait(false);
-                if (proc.ExitCode == 0 && File.Exists(martSql) && new FileInfo(martSql).Length > 0)
-                {
-                    leftDdl = new DdlArtifact(martSql, new FileInfo(martSql).Length, "(worker)");
-                    _log($"VersionCompare: Mart CREATE DDL = {leftDdl.SizeBytes} bytes");
-                }
-                else
-                {
-                    _log($"VersionCompare: Mart Worker ddl exit={proc.ExitCode} stderr={stderr.TrimEnd()}");
-                }
-            }
-            catch (Exception ex)
-            {
-                _log($"VersionCompare: Mart CREATE DDL build failed: {ex.GetType().Name}: {ex.Message}");
-            }
-
-            return (leftDdl, rightDdl);
-        }
-
-        private static string LocateWorkerExe()
-        {
-            const string exeName = "erwin-alter-ddl-worker.exe";
-            var env = Environment.GetEnvironmentVariable("ERWIN_ALTER_DDL_WORKER");
-            if (!string.IsNullOrEmpty(env) && File.Exists(env)) return env;
-            var asmDir = Path.GetDirectoryName(typeof(VersionCompareService).Assembly.Location) ?? "";
-            foreach (var c in new[]
-            {
-                Path.Combine(asmDir, "Worker", exeName),
-                Path.Combine(asmDir, exeName),
-            })
-            {
-                if (File.Exists(c)) return c;
-            }
-            throw new FileNotFoundException("could not locate erwin-alter-ddl-worker.exe", exeName);
-        }
+        // BuildCreateDdlArtifactsAsync + LocateWorkerExe were removed when
+        // we collapsed the pipeline into a single Worker call (cc-pipeline
+        // subcommand via CcPipelineRunner). The Worker now generates the
+        // right CREATE DDL inline so we no longer need a separate FE_DDL
+        // round-trip.
 
         /// <summary>
         /// Derive the Mart locator for a specific version of the same model the
