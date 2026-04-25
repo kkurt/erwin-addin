@@ -96,8 +96,13 @@ public sealed class MssqlEmitter : ISqlEmitter
             // the real owner. Rewrite the header so the emitted body lines
             // up with the schema-prefixed ALTER statements emitted elsewhere.
             var withSchema = InjectSchemaIntoCreateBlock(block, bare, rightCols);
+            // erwin's "Resolve Differences > Right Alter Script" output
+            // brackets every column identifier; FEModel_DDL leaves them bare.
+            // Bracket them ourselves so the verbatim CREATE matches what the
+            // user sees in the GUI compare wizard.
+            var quoted = QuoteColumnIdentifiersInCreateBody(withSchema);
             return new AlterStatement(
-                Sql: withSchema.TrimEnd() + ";",
+                Sql: quoted.TrimEnd() + ";",
                 Comment: $"new entity {ea.Target.Name}");
         }
         return new AlterStatement(
@@ -136,6 +141,61 @@ public sealed class MssqlEmitter : ISqlEmitter
         if (rightCols is not null && rightCols.TryGetSchema(bareTableName, out var sch) && !string.IsNullOrEmpty(sch))
             return sch;
         return null;
+    }
+
+    /// <summary>
+    /// Bracket bare column identifiers inside a verbatim CREATE TABLE body so
+    /// the emitted SQL matches what erwin's GUI compare wizard produces (every
+    /// column name in <c>[brackets]</c>). Lines whose first token is a
+    /// constraint keyword (CONSTRAINT / PRIMARY / FOREIGN / etc.) are left
+    /// untouched. Already-bracketed names stay untouched because <c>[</c> is
+    /// not a word character so the regex's identifier group never matches.
+    /// </summary>
+    private static string QuoteColumnIdentifiersInCreateBody(string block)
+    {
+        int open = block.IndexOf('(');
+        if (open < 0) return block;
+        int close = FindMatchingCloseParen(block, open);
+        if (close < 0) return block;
+
+        string before = block[..(open + 1)];
+        string body = block.Substring(open + 1, close - open - 1);
+        string after = block[close..];
+
+        var rewritten = Regex.Replace(
+            body,
+            @"^([\t ]*)([A-Za-z_]\w*)(\s)",
+            m =>
+            {
+                var keyword = m.Groups[2].Value.ToUpperInvariant();
+                if (IsBodyKeyword(keyword)) return m.Value;
+                return m.Groups[1].Value + Quote(m.Groups[2].Value) + m.Groups[3].Value;
+            },
+            RegexOptions.Multiline);
+
+        return before + rewritten + after;
+    }
+
+    private static bool IsBodyKeyword(string upper) => upper switch
+    {
+        "CONSTRAINT" or "PRIMARY" or "FOREIGN" or "UNIQUE" or "CHECK"
+            or "INDEX" or "KEY" or "REFERENCES" or "CLUSTERED" or "NONCLUSTERED" => true,
+        _ => false,
+    };
+
+    private static int FindMatchingCloseParen(string s, int openIdx)
+    {
+        int depth = 0;
+        for (int i = openIdx; i < s.Length; i++)
+        {
+            if (s[i] == '(') depth++;
+            else if (s[i] == ')')
+            {
+                depth--;
+                if (depth == 0) return i;
+            }
+        }
+        return -1;
     }
 
     private static AlterStatement EmitEntityDropped(EntityDropped ed, DdlColumnMap? rightCols) => new(

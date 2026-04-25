@@ -43,22 +43,18 @@ namespace EliteSoft.Erwin.AddIn.Services
         public readonly record struct TargetVersion(int Version, string Label);
 
         /// <summary>
-        /// Build the target-version combo contents. Clean models list only
-        /// prior versions (current vs its own saved copy is a no-op); dirty
-        /// models additionally include the current version so the user can
-        /// diff the dirty buffer against its saved Mart counterpart.
+        /// Build the target-version combo contents. Lists every prior Mart
+        /// version from <c>currentVersion-1</c> down to <c>1</c>. Phase 3.G
+        /// pipeline runs CompleteCompare in an out-of-process worker against
+        /// two Mart locators (vCurrent vs vN), so the dirty buffer is not
+        /// captured - the UI surfaces a "Dirty" warning separately.
         /// </summary>
         public static IReadOnlyList<TargetVersion> PlanTargetVersions(int currentVersion, bool isDirty)
         {
-            if (currentVersion < 1) return Array.Empty<TargetVersion>();
-            int max = isDirty ? currentVersion : currentVersion - 1;
+            if (currentVersion < 2) return Array.Empty<TargetVersion>();
             var list = new List<TargetVersion>();
-            for (int v = max; v >= 1; v--)
-            {
-                string label = $"v{v}" +
-                    (isDirty && v == currentVersion ? " (current saved copy)" : "");
-                list.Add(new TargetVersion(v, label));
-            }
+            for (int v = currentVersion - 1; v >= 1; v--)
+                list.Add(new TargetVersion(v, $"v{v}"));
             return list;
         }
 
@@ -136,76 +132,84 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// End-to-end compare against a specific Mart version of the same model.
-        /// Produces a <see cref="CompareOutcome"/> that the UI can render.
-        /// Structural changes only (see class summary).
+        /// End-to-end compare of the active Mart-backed model against an
+        /// earlier Mart version of itself. The pipeline is the same one the
+        /// CLI / sub-module uses end-to-end: out-of-process Worker for both
+        /// sides, real CompleteCompare via SCAPI (so the XLS report drives
+        /// schema-aware emit and CC-allowlist filtering), CREATE DDL for
+        /// each side for column types and verbatim CREATE TABLE bodies.
+        ///
+        /// The active PU is opened by the worker via its Mart locator
+        /// (vCurrent), which captures only the saved state. If the live PU
+        /// is dirty, the unsaved buffer is NOT in the diff - the caller is
+        /// responsible for warning the user before they save and lose
+        /// recoverability.
         /// </summary>
         public async Task<CompareOutcome> CompareAsync(int targetVersion, CancellationToken ct = default)
         {
             if (targetVersion <= 0) throw new ArgumentOutOfRangeException(nameof(targetVersion));
 
-            string martLocator = BuildMartLocatorForTarget(targetVersion);
-            string activePathKey = $"active-pu://{SafeGet(_activePU.PropertyBag(null, true), "Persistence_Unit_Id")}";
+            int currentVersion = ReadActiveVersion();
+            if (currentVersion <= targetVersion)
+                throw new InvalidOperationException(
+                    $"target Mart version (v{targetVersion}) must be older than the active version (v{currentVersion}).");
 
-            // Pipeline orientation: the alter SQL migrates LEFT -> RIGHT, so
-            // left = the older saved Mart version (where we're starting from)
-            // right = the active model (the desired end state, including its
-            // dirty buffer). An entity present on the right but not on the
-            // left becomes "ADD entity"; the user expects exactly this when
-            // diffing "v1 to current".
-            _log($"VersionCompare: from=Mart v{targetVersion} (left), to=active PU v{ReadActiveVersion()} (right)");
-            _log($"VersionCompare: Mart locator = {MaskMartPassword(martLocator)}");
+            var dirty = ProbeDirty();
+            if (dirty.IsDirty)
+                _log($"VersionCompare: WARNING active PU has unsaved changes ({dirty.Source}). " +
+                    $"Compare runs against the last-saved Mart v{currentVersion}; in-memory edits are NOT captured.");
 
-            var liveProvider = new LiveSessionModelMapProvider((object)_scapi, (object)_activePU, activePathKey);
+            string leftMart = BuildMartLocatorForTarget(targetVersion);
+            string rightMart = BuildMartLocatorForTarget(currentVersion);
+            _log($"VersionCompare: from=Mart v{targetVersion} (left), to=Mart v{currentVersion} (right, saved state)");
+            _log($"VersionCompare: left  locator = {MaskMartPassword(leftMart)}");
+            _log($"VersionCompare: right locator = {MaskMartPassword(rightMart)}");
+
             WorkerJsonModelMapProvider workerProvider;
+            OutOfProcessScapiSession scapiSession;
             try
             {
                 workerProvider = new WorkerJsonModelMapProvider();
-                _log("VersionCompare: WorkerJsonModelMapProvider initialized OK");
+                scapiSession = new OutOfProcessScapiSession();
+                _log("VersionCompare: out-of-process worker session ready");
             }
             catch (Exception ex)
             {
-                _log($"VersionCompare: WorkerJsonModelMapProvider init failed: {ex.GetType().FullName}: {ex.Message}");
+                _log($"VersionCompare: worker init failed: {ex.GetType().FullName}: {ex.Message}");
                 throw new InvalidOperationException(
-                    "Could not locate erwin-alter-ddl-worker.exe. Set the ERWIN_ALTER_DDL_WORKER environment variable " +
-                    "to its full path, or copy the worker EXE next to the add-in DLL.", ex);
+                    "Could not locate erwin-alter-ddl-worker.exe. Set the ERWIN_ALTER_DDL_WORKER environment " +
+                    "variable to its full path, or copy the worker EXE next to the add-in DLL.", ex);
             }
-            // left = Mart vN (worker dump),  right = active PU (live walk)
-            var combined = new DispatchByPathModelMapProvider(martLocator, workerProvider, activePathKey, liveProvider);
-
-            // Null SCAPI session is safe because SkipCompleteCompare=true.
-            var session = new NoCompleteCompareSession();
 
             var options = new CompareOptions
             {
-                SkipCompleteCompare = true,
-                IncludeCreateDdl = false,
+                SkipCompleteCompare = false,    // Run real CC for XLS-driven schema + filter
+                IncludeCreateDdl = true,        // CREATE DDL feeds column types + verbatim CREATE TABLE
+                IncludeLeftCreateDdl = false,   // emitter only consumes RIGHT DDL; saves a Worker call
+                SkipMetadataRead = true,        // we already have active PU metadata locally
             };
 
             var (target, major, minor) = ReadActiveTargetServer();
             string dialect = ResolveDialect(target);
 
-            var orchestrator = new CompareOrchestrator(session, combined);
-            var result = await orchestrator.CompareAsync(martLocator, activePathKey, options, ct).ConfigureAwait(false);
-
-            // Generate CREATE DDL for both sides so the emitter can fill in
-            // column datatypes, PK / UNIQUE / Index column lists, FK column
-            // lists, and (most importantly) full CREATE TABLE bodies for
-            // newly-added entities. The active PU side runs in-process via
-            // FEModel_DDL (safe per existing DdlGenerationService pattern);
-            // the Mart side reuses the Worker.
-            var (leftDdl, rightDdl) = await BuildCreateDdlArtifactsAsync(martLocator, ct).ConfigureAwait(false);
-            var enriched = result with { LeftDdl = leftDdl, RightDdl = rightDdl };
+            CompareResult result;
+            await using (scapiSession)
+            {
+                var orchestrator = new CompareOrchestrator(scapiSession, workerProvider);
+                result = await orchestrator
+                    .CompareAsync(leftMart, rightMart, options, ct)
+                    .ConfigureAwait(false);
+            }
 
             var registry = new SqlEmitterRegistry()
                 .Register(new MssqlEmitter(), "SQL Server")
                 .Register(new OracleEmitter(), "Oracle")
                 .Register(new Db2Emitter(), "Db2", "DB2 z/OS");
             var emitter = registry.Resolve(dialect);
-            var script = emitter.Emit(enriched);
+            var script = emitter.Emit(result);
 
-            _log($"VersionCompare: {enriched.Changes.Count} change(s), {script.Statements.Count} statement(s), dialect={dialect} ({target} v{major}.{minor})");
-            return new CompareOutcome(enriched, script, dialect);
+            _log($"VersionCompare: {result.Changes.Count} change(s), {script.Statements.Count} statement(s), dialect={dialect} ({target} v{major}.{minor})");
+            return new CompareOutcome(result, script, dialect);
         }
 
         /// <summary>

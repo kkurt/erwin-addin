@@ -57,9 +57,19 @@ public sealed class CompareOrchestrator
         //    is a process-level singleton on r10.10 - two concurrent worker
         //    processes race on the same erwin.exe LocalServer and corrupt its
         //    state, breaking the later CC call with RPC_E_SERVERFAULT.
-        _logger.LogInformation("Reading metadata for {Left} and {Right}", leftErwinPath, rightErwinPath);
-        var leftMeta = await _session.ReadModelMetadataAsync(leftErwinPath, ct).ConfigureAwait(false);
-        var rightMeta = await _session.ReadModelMetadataAsync(rightErwinPath, ct).ConfigureAwait(false);
+        ModelMetadata leftMeta, rightMeta;
+        if (options.SkipMetadataRead)
+        {
+            _logger.LogInformation("Skipping metadata read (SkipMetadataRead=true)");
+            leftMeta = StubMetadata(leftErwinPath);
+            rightMeta = StubMetadata(rightErwinPath);
+        }
+        else
+        {
+            _logger.LogInformation("Reading metadata for {Left} and {Right}", leftErwinPath, rightErwinPath);
+            leftMeta = await _session.ReadModelMetadataAsync(leftErwinPath, ct).ConfigureAwait(false);
+            rightMeta = await _session.ReadModelMetadataAsync(rightErwinPath, ct).ConfigureAwait(false);
+        }
 
         // 2. Run CompleteCompare to produce the XLS (unless the caller told
         //    us to skip it - e.g. the in-process add-in which cannot save the
@@ -107,15 +117,25 @@ public sealed class CompareOrchestrator
                 schemaByEntity.First().Key + "->" + schemaByEntity.First().Value);
 
         // 5. Optional: generate CREATE DDL for each side (Phase 3 emitter fuel).
+        //    The emitters only consume the RIGHT (target) DDL for new entity
+        //    bodies and column type lookups, so callers can disable
+        //    IncludeLeftCreateDdl to skip a 10s Worker round-trip.
         DdlArtifact? leftDdl = null, rightDdl = null;
         if (options.IncludeCreateDdl)
         {
-            _logger.LogInformation("Generating CREATE DDL for both sides");
-            leftDdl = await _session.GenerateCreateDdlAsync(leftErwinPath, DdlOptions.Default, ct).ConfigureAwait(false);
-            rightDdl = await _session.GenerateCreateDdlAsync(rightErwinPath, DdlOptions.Default, ct).ConfigureAwait(false);
+            if (options.IncludeLeftCreateDdl)
+            {
+                _logger.LogInformation("Generating CREATE DDL for left side");
+                leftDdl = await _session.GenerateCreateDdlAsync(leftErwinPath, DdlOptions.Default, ct).ConfigureAwait(false);
+            }
+            if (options.IncludeRightCreateDdl)
+            {
+                _logger.LogInformation("Generating CREATE DDL for right side");
+                rightDdl = await _session.GenerateCreateDdlAsync(rightErwinPath, DdlOptions.Default, ct).ConfigureAwait(false);
+            }
             _logger.LogInformation(
-                "DDL: left {LeftPath} ({LeftSize}), right {RightPath} ({RightSize})",
-                leftDdl.SqlPath, leftDdl.SizeBytes, rightDdl.SqlPath, rightDdl.SizeBytes);
+                "DDL: left {LeftSize}, right {RightSize}",
+                leftDdl?.SizeBytes ?? -1, rightDdl?.SizeBytes ?? -1);
         }
 
         return new CompareResult(leftMeta, rightMeta, changes, xlsArtifact)
@@ -174,6 +194,29 @@ public sealed class CompareOrchestrator
             }
         }
         return map;
+    }
+
+    /// <summary>
+    /// Build a path-derived <see cref="ModelMetadata"/> when the caller asks
+    /// us to skip the (~10s per call) Worker SCAPI metadata read. The model
+    /// name is taken from the locator's last path segment; everything else
+    /// stays empty / zero. Callers that need real metadata leave
+    /// <see cref="CompareOptions.SkipMetadataRead"/> at false.
+    /// </summary>
+    private static ModelMetadata StubMetadata(string path)
+    {
+        string name = path;
+        int lastSep = path.LastIndexOfAny(new[] { '/', '\\' });
+        if (lastSep >= 0 && lastSep + 1 < path.Length) name = path[(lastSep + 1)..];
+        int q = name.IndexOf('?');
+        if (q >= 0) name = name[..q];
+        return new ModelMetadata(
+            PersistenceUnitId: path,
+            Name: name,
+            ModelType: "Physical",
+            TargetServer: string.Empty,
+            TargetServerVersion: 0,
+            TargetServerMinorVersion: 0);
     }
 
     /// <summary>

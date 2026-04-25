@@ -4432,83 +4432,242 @@ namespace EliteSoft.Erwin.AddIn
         /// version picked inside the dialog. See <see cref="Forms.CompareVersionsForm"/>.
         /// </summary>
         /// <summary>
-        /// "F2" pipeline: invoke erwin's own native MCXInvokeCompleteCompare +
-        /// GenerateAlterScript through the native bridge. The output is the
-        /// alter DDL erwin would produce if the user clicked
-        /// "Resolve Differences > Right Alter Script" in the GUI - schema
-        /// prefixes, extended properties, and dialect handling included.
-        /// Compares the active PU (with its dirty buffer) against the Mart
-        /// baseline that the model is linked to.
+        /// <summary>
+        /// Lazy-refresh the Alter Compare tab the first time the user opens
+        /// it after a model change. Cheap to call when the tab is already
+        /// in sync (it just rereads PU metadata).
         /// </summary>
-        private async void btnNativeAlterDdl_Click(object sender, EventArgs e)
+        private void tabControl_SelectedIndexChanged(object sender, EventArgs e)
         {
-            if (!_isConnected || _currentModel == null)
-            {
-                ErwinAddIn.ShowTopMostMessage("No active erwin model.", "Native Alter DDL");
-                return;
-            }
-
-            btnNativeAlterDdl.Enabled = false;
-            btnSaveNativeAlterDdl.Enabled = false;
-            lblNativeAlterStatus.Text = "Running native CC pipeline... (silent mode, no dialogs)";
-            txtNativeAlterDdl.Text = string.Empty;
-            Application.DoEvents();
-
-            Action<string> log = msg =>
-            {
-                if (InvokeRequired) BeginInvoke(new Action(() => Log(msg)));
-                else Log(msg);
-            };
-
             try
             {
-                Services.NativeBridgeService.Install(log);
-                string ddl = await Task.Run(() =>
-                    Services.NativeBridgeService.GenerateAlterDdl((object)_currentModel, log));
-
-                if (string.IsNullOrEmpty(ddl))
-                {
-                    txtNativeAlterDdl.Text = "(no alter DDL produced - see Debug Log for details)";
-                    lblNativeAlterStatus.Text = "Native pipeline returned empty. Check Debug Log.";
-                    return;
-                }
-
-                txtNativeAlterDdl.Text = ddl;
-                txtNativeAlterDdl.SelectionStart = 0;
-                txtNativeAlterDdl.ScrollToCaret();
-                lblNativeAlterStatus.Text = $"Native alter DDL produced ({ddl.Length:N0} chars).";
-                btnSaveNativeAlterDdl.Enabled = true;
+                if (tabControl.SelectedTab == tabAlterCompare)
+                    RefreshAlterCompareTab();
             }
             catch (Exception ex)
             {
-                log($"NativeAlterDdl failed: {ex.GetType().Name}: {ex.Message}");
-                lblNativeAlterStatus.Text = "Native pipeline failed - see Debug Log.";
-                ErwinAddIn.ShowTopMostMessage(
-                    $"Native alter DDL pipeline failed:\n\n{ex.Message}",
-                    "Native Alter DDL");
-            }
-            finally
-            {
-                btnNativeAlterDdl.Enabled = true;
+                Log($"tabControl_SelectedIndexChanged: {ex.GetType().Name}: {ex.Message}");
             }
         }
 
-        private void btnSaveNativeAlterDdl_Click(object sender, EventArgs e)
+        // ====================================================================
+        // Alter Compare tab — inline UI (Phase 3.G)
+        //
+        // Active PU (live + dirty buffer) is the baseline; user picks a Mart
+        // version to diff against; VersionCompareService runs the pipeline,
+        // emits alter SQL, and the tab fills in the changes ListView + SQL
+        // textbox in place. No popup dialog is involved.
+        // ====================================================================
+
+        private readonly List<Services.VersionCompareService.TargetVersion> _alterTargetVersions = new();
+        private string _alterLastSql = string.Empty;
+        private string _alterLastDialect = "MSSQL";
+
+        /// <summary>
+        /// Refresh the Alter Compare tab when it becomes visible / when the
+        /// active model changes. Reads the active PU's dirty state, target
+        /// server, and current Mart version to populate the combo.
+        /// </summary>
+        private void RefreshAlterCompareTab()
         {
-            if (string.IsNullOrEmpty(txtNativeAlterDdl.Text)) return;
+            try
+            {
+                lvAlterChanges.Items.Clear();
+                txtAlterSql.Clear();
+                _alterLastSql = string.Empty;
+                btnSaveAlterSql.Enabled = false;
+
+                if (!_isConnected || _currentModel == null || _scapi == null)
+                {
+                    lblAlterActiveInfo.Text = "Active: (no model loaded)";
+                    lblAlterDialectInfo.Text = "Dialect: -";
+                    cmbAlterTargetVersion.Items.Clear();
+                    _alterTargetVersions.Clear();
+                    btnAlterCompare.Enabled = false;
+                    lblAlterCompareStatus.Text = "Open a model to begin.";
+                    return;
+                }
+
+                var service = new Services.VersionCompareService(_scapi, _currentModel, (Action<string>)Log);
+                var dirty = service.ProbeDirty();
+                var (target, major, minor) = service.ReadActiveTargetServer();
+                var dialect = Services.VersionCompareService.ResolveDialect(target);
+                _alterLastDialect = dialect;
+                int currentVersion = service.ReadActiveVersion();
+                string dirtyTag = dirty.IsDirty ? "Dirty" : "Clean";
+
+                string dirtyHint = dirty.IsDirty
+                    ? "  -  unsaved changes will NOT be in the diff (save first to capture them)"
+                    : "";
+                lblAlterActiveInfo.Text = $"Active: v{currentVersion} ({dirtyTag}){dirtyHint}";
+                lblAlterDialectInfo.Text = string.IsNullOrEmpty(target)
+                    ? $"Dialect: {dialect}"
+                    : $"Dialect: {dialect}  (model target: {target} v{major}.{minor})";
+
+                _alterTargetVersions.Clear();
+                cmbAlterTargetVersion.Items.Clear();
+                foreach (var row in Services.VersionCompareService.PlanTargetVersions(currentVersion, dirty.IsDirty))
+                {
+                    _alterTargetVersions.Add(row);
+                    cmbAlterTargetVersion.Items.Add(row.Label);
+                }
+                if (cmbAlterTargetVersion.Items.Count > 0) cmbAlterTargetVersion.SelectedIndex = 0;
+
+                btnAlterCompare.Enabled = cmbAlterTargetVersion.Items.Count > 0;
+                lblAlterCompareStatus.Text = btnAlterCompare.Enabled
+                    ? "Pick a target version and click Compare."
+                    : "No earlier Mart version available to compare against.";
+            }
+            catch (Exception ex)
+            {
+                Log($"RefreshAlterCompareTab failed: {ex.GetType().Name}: {ex.Message}");
+                lblAlterCompareStatus.Text = $"Init error: {ex.Message}";
+                btnAlterCompare.Enabled = false;
+            }
+        }
+
+        private async void btnAlterCompare_Click(object sender, EventArgs e)
+        {
+            if (cmbAlterTargetVersion.SelectedIndex < 0
+                || cmbAlterTargetVersion.SelectedIndex >= _alterTargetVersions.Count)
+                return;
+            if (!_isConnected || _currentModel == null || _scapi == null)
+            {
+                ErwinAddIn.ShowTopMostMessage("No active erwin model.", "Alter Compare");
+                return;
+            }
+
+            int targetVersion = _alterTargetVersions[cmbAlterTargetVersion.SelectedIndex].Version;
+            SetAlterBusy(true, $"Comparing against Mart v{targetVersion}...");
+            lvAlterChanges.Items.Clear();
+            txtAlterSql.Clear();
+            _alterLastSql = string.Empty;
+            btnSaveAlterSql.Enabled = false;
+
+            try
+            {
+                var service = new Services.VersionCompareService(_scapi, _currentModel, (Action<string>)Log);
+                var outcome = await Task.Run(() =>
+                    service.CompareAsync(targetVersion, System.Threading.CancellationToken.None)).ConfigureAwait(true);
+
+                PopulateAlterChanges(outcome);
+                lblAlterCompareStatus.Text =
+                    $"Done. {outcome.Result.Changes.Count} change(s), {outcome.Script.Statements.Count} statement(s) emitted for {outcome.Dialect}.";
+            }
+            catch (Exception ex)
+            {
+                Log($"AlterCompare failed: {ex.GetType().FullName}: {ex.Message}");
+                Log("--- stack trace ---");
+                Log(ex.ToString());
+                if (ex.InnerException is not null)
+                {
+                    Log("--- inner exception ---");
+                    Log(ex.InnerException.ToString());
+                }
+                lblAlterCompareStatus.Text = "Compare failed. See Debug Log for details.";
+                ErwinAddIn.ShowTopMostMessage(
+                    $"Compare failed:\n\n{ex.GetType().Name}: {ex.Message}\n\n(Full stack in Debug Log.)",
+                    "Alter Compare");
+            }
+            finally
+            {
+                SetAlterBusy(false);
+            }
+        }
+
+        private void PopulateAlterChanges(Services.CompareOutcome outcome)
+        {
+            lvAlterChanges.BeginUpdate();
+            try
+            {
+                foreach (var change in outcome.Result.Changes)
+                {
+                    var row = new ListViewItem(new[]
+                    {
+                        change.GetType().Name,
+                        change.Target.Class,
+                        change.Target.Name,
+                        DescribeAlterChangeDetail(change),
+                    });
+                    lvAlterChanges.Items.Add(row);
+                }
+            }
+            finally
+            {
+                lvAlterChanges.EndUpdate();
+            }
+
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine($"-- ALTER SQL for {outcome.Dialect} ({outcome.Script.Statements.Count} statement(s))");
+            sb.AppendLine($"-- From: Mart version selected above   To: active model (current dirty state)");
+            sb.AppendLine();
+            foreach (var stmt in outcome.Script.Statements)
+            {
+                if (!string.IsNullOrWhiteSpace(stmt.Comment)) sb.AppendLine("-- " + stmt.Comment);
+                sb.AppendLine(stmt.Sql);
+                if (outcome.Dialect == "MSSQL") sb.AppendLine("GO");
+                sb.AppendLine();
+            }
+            _alterLastSql = sb.ToString();
+            _alterLastDialect = outcome.Dialect;
+            txtAlterSql.Text = _alterLastSql;
+            txtAlterSql.SelectionStart = 0;
+            txtAlterSql.ScrollToCaret();
+            btnSaveAlterSql.Enabled = !string.IsNullOrEmpty(_alterLastSql);
+        }
+
+        private static string DescribeAlterChangeDetail(EliteSoft.Erwin.AlterDdl.Core.Models.Change change) => change switch
+        {
+            EliteSoft.Erwin.AlterDdl.Core.Models.EntityRenamed er => $"from '{er.OldName}'",
+            EliteSoft.Erwin.AlterDdl.Core.Models.SchemaMoved sm => $"{sm.OldSchema} -> {sm.NewSchema}",
+            EliteSoft.Erwin.AlterDdl.Core.Models.AttributeAdded aa => $"in {aa.ParentEntity.Name}",
+            EliteSoft.Erwin.AlterDdl.Core.Models.AttributeDropped ad => $"from {ad.ParentEntity.Name}",
+            EliteSoft.Erwin.AlterDdl.Core.Models.AttributeRenamed ar => $"{ar.ParentEntity.Name}: '{ar.OldName}' -> '{ar.Target.Name}'",
+            EliteSoft.Erwin.AlterDdl.Core.Models.AttributeTypeChanged at => $"{at.ParentEntity.Name}.{at.Target.Name}: {at.LeftType} -> {at.RightType}",
+            EliteSoft.Erwin.AlterDdl.Core.Models.AttributeNullabilityChanged an => $"{an.ParentEntity.Name}.{an.Target.Name}: {(an.LeftNullable ? "NULL" : "NOT NULL")} -> {(an.RightNullable ? "NULL" : "NOT NULL")}",
+            EliteSoft.Erwin.AlterDdl.Core.Models.AttributeDefaultChanged ad => $"{ad.ParentEntity.Name}.{ad.Target.Name}: '{ad.LeftDefault}' -> '{ad.RightDefault}'",
+            EliteSoft.Erwin.AlterDdl.Core.Models.AttributeIdentityChanged ai => $"{ai.ParentEntity.Name}.{ai.Target.Name}: {ai.LeftHasIdentity} -> {ai.RightHasIdentity}",
+            EliteSoft.Erwin.AlterDdl.Core.Models.KeyGroupAdded ka => $"{ka.Kind} on {ka.ParentEntity.Name}",
+            EliteSoft.Erwin.AlterDdl.Core.Models.KeyGroupDropped kd => $"{kd.Kind} on {kd.ParentEntity.Name}",
+            EliteSoft.Erwin.AlterDdl.Core.Models.KeyGroupRenamed kr => $"{kr.Kind} on {kr.ParentEntity.Name}: '{kr.OldName}' -> '{kr.Target.Name}'",
+            EliteSoft.Erwin.AlterDdl.Core.Models.ForeignKeyRenamed fr => $"from '{fr.OldName}'",
+            EliteSoft.Erwin.AlterDdl.Core.Models.TriggerRenamed tr => $"from '{tr.OldName}'",
+            EliteSoft.Erwin.AlterDdl.Core.Models.SequenceRenamed sr => $"from '{sr.OldName}'",
+            EliteSoft.Erwin.AlterDdl.Core.Models.ViewRenamed vr => $"from '{vr.OldName}'",
+            _ => string.Empty,
+        };
+
+        private void btnCopyAlterSql_Click(object sender, EventArgs e)
+        {
+            if (string.IsNullOrEmpty(_alterLastSql)) return;
+            try
+            {
+                Clipboard.SetText(_alterLastSql);
+                lblAlterCompareStatus.Text = $"Copied {_alterLastSql.Length:N0} chars to clipboard.";
+            }
+            catch (Exception ex)
+            {
+                Log($"Copy SQL failed: {ex.GetType().Name}: {ex.Message}");
+                ErwinAddIn.ShowTopMostMessage($"Copy failed:\n\n{ex.Message}", "Copy Error");
+            }
+        }
+
+        private void btnSaveAlterSql_Click(object sender, EventArgs e)
+        {
+            if (string.IsNullOrEmpty(_alterLastSql)) return;
             using var dlg = new SaveFileDialog
             {
                 Filter = "SQL script (*.sql)|*.sql|All files (*.*)|*.*",
-                FileName = $"native-alter-{DateTime.Now:yyyyMMdd-HHmmss}.sql",
-                Title = "Save Native Alter DDL",
+                FileName = $"alter-{_alterLastDialect.ToLowerInvariant()}-{DateTime.Now:yyyyMMdd-HHmmss}.sql",
+                Title = "Save Alter SQL",
                 OverwritePrompt = true,
             };
             if (dlg.ShowDialog(this) != DialogResult.OK) return;
             try
             {
-                System.IO.File.WriteAllText(dlg.FileName, txtNativeAlterDdl.Text,
+                System.IO.File.WriteAllText(dlg.FileName, _alterLastSql,
                     new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
-                lblNativeAlterStatus.Text = $"Saved to {dlg.FileName}";
+                lblAlterCompareStatus.Text = $"Saved to {dlg.FileName}";
             }
             catch (Exception ex)
             {
@@ -4518,34 +4677,15 @@ namespace EliteSoft.Erwin.AddIn
             }
         }
 
-        private void btnOpenCompareVersions_Click(object sender, EventArgs e)
+        private void SetAlterBusy(bool busy, string status = null)
         {
-            if (!_isConnected || _currentModel == null)
-            {
-                MessageBox.Show(
-                    this,
-                    "No active erwin model. Open a model before running a compare.",
-                    "Alter Compare",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Warning);
-                return;
-            }
-
-            try
-            {
-                using var dlg = new Forms.CompareVersionsForm(_scapi, _currentModel, (Action<string>)Log);
-                dlg.ShowDialog(this);
-            }
-            catch (Exception ex)
-            {
-                Log($"CompareVersions launch failed: {ex.GetType().Name}: {ex.Message}");
-                MessageBox.Show(
-                    this,
-                    $"Failed to open compare dialog:\n\n{ex.Message}",
-                    "Alter Compare",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Error);
-            }
+            btnAlterCompare.Enabled = !busy && cmbAlterTargetVersion.Items.Count > 0;
+            cmbAlterTargetVersion.Enabled = !busy;
+            btnSaveAlterSql.Enabled = !busy && !string.IsNullOrEmpty(_alterLastSql);
+            progressAlterCompare.Visible = busy;
+            progressAlterCompare.MarqueeAnimationSpeed = busy ? 30 : 0;
+            if (status != null) lblAlterCompareStatus.Text = status;
+            Cursor = busy ? Cursors.WaitCursor : Cursors.Default;
         }
 
         #endregion

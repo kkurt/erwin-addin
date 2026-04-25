@@ -226,30 +226,54 @@ public sealed class OutOfProcessScapiSession : IScapiSession
 
     private static string? ProbeDefaultWorkerPath()
     {
-        var baseDir = AppContext.BaseDirectory;
-        foreach (var candidate in new[]
+        // Anchor priority mirrors WorkerJsonModelMapProvider: when the add-in
+        // is loaded into erwin.exe, AppContext.BaseDirectory points at
+        // erwin's install dir (and may even be empty in some hosts), but
+        // this DLL lives next to the freshly-built Worker/. Use the
+        // assembly's own location first.
+        var anchors = new List<string>();
+        try
         {
-            Path.Combine(baseDir, WorkerExeName),
-            // fallback: sibling bin directory at publish time
-            Path.Combine(baseDir, "..", "ErwinAlterDdl.Worker", WorkerExeName),
-        })
-        {
-            var full = Path.GetFullPath(candidate);
-            if (File.Exists(full)) return full;
+            var asmLoc = typeof(OutOfProcessScapiSession).Assembly.Location;
+            if (!string.IsNullOrEmpty(asmLoc))
+                anchors.Add(Path.GetDirectoryName(asmLoc) ?? string.Empty);
         }
+        catch { /* best effort */ }
+        anchors.Add(AppContext.BaseDirectory);
 
-        // dev-time: walk up two directories looking for the Worker's bin output
-        // (handy when running CLI from `dotnet run`).
-        var probeRoot = baseDir;
-        for (int i = 0; i < 6 && probeRoot is not null; i++)
+        foreach (var anchor in anchors)
         {
-            var candidate = Path.Combine(probeRoot, "src", "ErwinAlterDdl.Worker", "bin",
-                "Debug", "net10.0-windows", WorkerExeName);
-            if (File.Exists(candidate)) return candidate;
-            candidate = Path.Combine(probeRoot, "src", "ErwinAlterDdl.Worker", "bin",
-                "Release", "net10.0-windows", WorkerExeName);
-            if (File.Exists(candidate)) return candidate;
-            probeRoot = Directory.GetParent(probeRoot)?.FullName;
+            if (string.IsNullOrEmpty(anchor)) continue;
+            foreach (var candidate in new[]
+            {
+                Path.Combine(anchor, WorkerExeName),
+                Path.Combine(anchor, "Worker", WorkerExeName),
+                Path.Combine(anchor, "..", "ErwinAlterDdl.Worker", WorkerExeName),
+            })
+            {
+                if (string.IsNullOrEmpty(candidate)) continue;
+                string full;
+                try { full = Path.GetFullPath(candidate); }
+                catch { continue; }
+                if (File.Exists(full)) return full;
+            }
+
+            // dev-time walk-up fallback: handy when running from `dotnet run`
+            // where the EXE sits under src/ErwinAlterDdl.Worker/bin/<config>/.
+            var probeRoot = anchor;
+            for (int i = 0; i < 8 && !string.IsNullOrEmpty(probeRoot); i++)
+            {
+                var c1 = Path.Combine(probeRoot, "src", "ErwinAlterDdl.Worker", "bin", "Debug", "net10.0-windows", WorkerExeName);
+                if (File.Exists(c1)) return c1;
+                var c2 = Path.Combine(probeRoot, "src", "ErwinAlterDdl.Worker", "bin", "Release", "net10.0-windows", WorkerExeName);
+                if (File.Exists(c2)) return c2;
+                var c3 = Path.Combine(probeRoot, "ErwinAlterDdl", "src", "ErwinAlterDdl.Worker", "bin", "Debug", "net10.0-windows", WorkerExeName);
+                if (File.Exists(c3)) return c3;
+                var c4 = Path.Combine(probeRoot, "ErwinAlterDdl", "src", "ErwinAlterDdl.Worker", "bin", "Release", "net10.0-windows", WorkerExeName);
+                if (File.Exists(c4)) return c4;
+                try { probeRoot = Directory.GetParent(probeRoot)?.FullName ?? string.Empty; }
+                catch { break; }
+            }
         }
         return null;
     }

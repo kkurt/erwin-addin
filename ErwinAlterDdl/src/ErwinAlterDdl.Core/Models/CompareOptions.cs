@@ -43,6 +43,31 @@ public sealed record CompareOptions
     /// </summary>
     public bool SkipCompleteCompare { get; init; }
 
+    /// <summary>
+    /// When true the orchestrator skips reading per-PU metadata (each Worker
+    /// invocation costs ~10s of SCAPI startup). The returned
+    /// <see cref="ModelMetadata"/> records degrade to a path-derived stub.
+    /// Useful when the caller already has the metadata in hand (e.g. the
+    /// add-in inspecting its own active PU).
+    /// </summary>
+    public bool SkipMetadataRead { get; init; }
+
+    /// <summary>
+    /// When <see cref="IncludeCreateDdl"/> is true, controls whether the
+    /// LEFT side's CREATE DDL is generated. Most emitters only consume the
+    /// RIGHT (target) DDL for new entity bodies and column types, so callers
+    /// that don't need the left can disable it to save one Worker round-trip
+    /// (~10s on r10.10).
+    /// </summary>
+    public bool IncludeLeftCreateDdl { get; init; } = true;
+
+    /// <summary>
+    /// When <see cref="IncludeCreateDdl"/> is true, controls whether the
+    /// RIGHT side's CREATE DDL is generated. Defaults to true; the emitters
+    /// rely on this for new entity bodies and column type lookups.
+    /// </summary>
+    public bool IncludeRightCreateDdl { get; init; } = true;
+
     public static CompareOptions Default { get; } = new();
 }
 

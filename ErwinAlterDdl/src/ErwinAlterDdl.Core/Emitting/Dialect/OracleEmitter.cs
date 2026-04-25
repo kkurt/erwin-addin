@@ -87,8 +87,9 @@ public sealed class OracleEmitter : ISqlEmitter
         if (rightCols is not null && rightCols.TryGetCreateBlock(bare, out var block))
         {
             var withSchema = InjectSchemaIntoCreateBlock(block, bare, rightCols);
+            var quoted = QuoteColumnIdentifiersInCreateBody(withSchema);
             return new AlterStatement(
-                Sql: withSchema.TrimEnd() + ";",
+                Sql: quoted.TrimEnd() + ";",
                 Comment: $"new entity {ea.Target.Name}");
         }
         return new AlterStatement(
@@ -296,5 +297,58 @@ public sealed class OracleEmitter : ISqlEmitter
         if (rightCols is not null && rightCols.TryGetSchema(bareTableName, out var sch) && !string.IsNullOrEmpty(sch))
             return sch;
         return null;
+    }
+
+    /// <summary>
+    /// Wrap bare column identifiers inside a verbatim CREATE TABLE body in
+    /// Oracle's <c>"double quotes"</c> so the emitted SQL matches what
+    /// erwin's GUI compare wizard produces. Constraint-keyword lines pass
+    /// through untouched.
+    /// </summary>
+    private static string QuoteColumnIdentifiersInCreateBody(string block)
+    {
+        int open = block.IndexOf('(');
+        if (open < 0) return block;
+        int close = FindMatchingCloseParen(block, open);
+        if (close < 0) return block;
+
+        string before = block[..(open + 1)];
+        string body = block.Substring(open + 1, close - open - 1);
+        string after = block[close..];
+
+        var rewritten = Regex.Replace(
+            body,
+            @"^([\t ]*)([A-Za-z_]\w*)(\s)",
+            m =>
+            {
+                var keyword = m.Groups[2].Value.ToUpperInvariant();
+                if (IsBodyKeyword(keyword)) return m.Value;
+                return m.Groups[1].Value + Quote(m.Groups[2].Value) + m.Groups[3].Value;
+            },
+            RegexOptions.Multiline);
+
+        return before + rewritten + after;
+    }
+
+    private static bool IsBodyKeyword(string upper) => upper switch
+    {
+        "CONSTRAINT" or "PRIMARY" or "FOREIGN" or "UNIQUE" or "CHECK"
+            or "INDEX" or "KEY" or "REFERENCES" => true,
+        _ => false,
+    };
+
+    private static int FindMatchingCloseParen(string s, int openIdx)
+    {
+        int depth = 0;
+        for (int i = openIdx; i < s.Length; i++)
+        {
+            if (s[i] == '(') depth++;
+            else if (s[i] == ')')
+            {
+                depth--;
+                if (depth == 0) return i;
+            }
+        }
+        return -1;
     }
 }
