@@ -46,6 +46,10 @@ namespace EliteSoft.Erwin.AddIn
             this.tabDebug = new System.Windows.Forms.TabPage();
             this.btnOpenCompareVersions = new System.Windows.Forms.Button();
             this.lblAlterCompareHelp = new System.Windows.Forms.Label();
+            this.btnNativeAlterDdl = new System.Windows.Forms.Button();
+            this.txtNativeAlterDdl = new System.Windows.Forms.TextBox();
+            this.btnSaveNativeAlterDdl = new System.Windows.Forms.Button();
+            this.lblNativeAlterStatus = new System.Windows.Forms.Label();
 
             // Model tab
             this.grpModel = new System.Windows.Forms.GroupBox();
@@ -612,6 +616,49 @@ namespace EliteSoft.Erwin.AddIn
             this.btnOpenCompareVersions.Click += new System.EventHandler(this.btnOpenCompareVersions_Click);
             this.tabAlterCompare.Controls.Add(this.btnOpenCompareVersions);
 
+            // F2 native pipeline button: invokes erwin's own MCXInvokeCompleteCompare
+            // + GenerateAlterScript so the output is byte-identical to what the
+            // GUI's "Resolve Differences > Right Alter Script" produces.
+            this.btnNativeAlterDdl.Location = new System.Drawing.Point(300, 140);
+            this.btnNativeAlterDdl.Name = "btnNativeAlterDdl";
+            this.btnNativeAlterDdl.Size = new System.Drawing.Size(360, 40);
+            this.btnNativeAlterDdl.Text = "Generate Native Alter DDL (Current vs Mart Baseline)";
+            this.btnNativeAlterDdl.Font = fontBodyBold;
+            this.btnNativeAlterDdl.UseVisualStyleBackColor = true;
+            this.btnNativeAlterDdl.Click += new System.EventHandler(this.btnNativeAlterDdl_Click);
+            this.tabAlterCompare.Controls.Add(this.btnNativeAlterDdl);
+
+            this.lblNativeAlterStatus.AutoSize = false;
+            this.lblNativeAlterStatus.Location = new System.Drawing.Point(20, 190);
+            this.lblNativeAlterStatus.Size = new System.Drawing.Size(820, 18);
+            this.lblNativeAlterStatus.Font = fontCaption;
+            this.lblNativeAlterStatus.Text = "Output: erwin native alter DDL appears below.";
+            this.lblNativeAlterStatus.ForeColor = clrSurfaceAlt;
+            this.tabAlterCompare.Controls.Add(this.lblNativeAlterStatus);
+
+            this.txtNativeAlterDdl.Location = new System.Drawing.Point(20, 215);
+            this.txtNativeAlterDdl.Name = "txtNativeAlterDdl";
+            this.txtNativeAlterDdl.Size = new System.Drawing.Size(820, 200);
+            this.txtNativeAlterDdl.Multiline = true;
+            this.txtNativeAlterDdl.ReadOnly = true;
+            this.txtNativeAlterDdl.Font = new System.Drawing.Font("Consolas", 9.5F);
+            this.txtNativeAlterDdl.ScrollBars = System.Windows.Forms.ScrollBars.Both;
+            this.txtNativeAlterDdl.WordWrap = false;
+            this.txtNativeAlterDdl.Anchor = System.Windows.Forms.AnchorStyles.Top
+                | System.Windows.Forms.AnchorStyles.Left
+                | System.Windows.Forms.AnchorStyles.Right
+                | System.Windows.Forms.AnchorStyles.Bottom;
+            this.tabAlterCompare.Controls.Add(this.txtNativeAlterDdl);
+
+            this.btnSaveNativeAlterDdl.Location = new System.Drawing.Point(700, 425);
+            this.btnSaveNativeAlterDdl.Name = "btnSaveNativeAlterDdl";
+            this.btnSaveNativeAlterDdl.Size = new System.Drawing.Size(140, 28);
+            this.btnSaveNativeAlterDdl.Text = "Save Alter DDL...";
+            this.btnSaveNativeAlterDdl.Anchor = System.Windows.Forms.AnchorStyles.Bottom | System.Windows.Forms.AnchorStyles.Right;
+            this.btnSaveNativeAlterDdl.Enabled = false;
+            this.btnSaveNativeAlterDdl.Click += new System.EventHandler(this.btnSaveNativeAlterDdl_Click);
+            this.tabAlterCompare.Controls.Add(this.btnSaveNativeAlterDdl);
+
             // ================================================================
             // TAB 6: DEBUG LOG
             // ================================================================
@@ -1089,6 +1136,10 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.TabPage tabAlterCompare;
         private System.Windows.Forms.Button btnOpenCompareVersions;
         private System.Windows.Forms.Label lblAlterCompareHelp;
+        private System.Windows.Forms.Button btnNativeAlterDdl;
+        private System.Windows.Forms.TextBox txtNativeAlterDdl;
+        private System.Windows.Forms.Button btnSaveNativeAlterDdl;
+        private System.Windows.Forms.Label lblNativeAlterStatus;
         private System.Windows.Forms.Button btnMartReview;
         private System.Windows.Forms.Button btnAlterWizardProd;
         private System.Windows.Forms.ComboBox cmbLeftModel;

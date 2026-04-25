@@ -60,6 +60,13 @@
     <!-- Phase 3.F: in-process consumption of the shared ErwinAlterDdl pipeline. -->
     <ProjectReference Include="ErwinAlterDdl\src\ErwinAlterDdl.Core\ErwinAlterDdl.Core.csproj" />
     <ProjectReference Include="ErwinAlterDdl\src\ErwinAlterDdl.ComInterop\ErwinAlterDdl.ComInterop.csproj" />
+    <!-- Worker is invoked at runtime via Process.Start; declared here so
+         MSBuild builds it before us and we can copy its output to our bin. -->
+    <ProjectReference Include="ErwinAlterDdl\src\ErwinAlterDdl.Worker\ErwinAlterDdl.Worker.csproj">
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <Private>false</Private>
+      <SkipGetTargetFrameworkProperties>true</SkipGetTargetFrameworkProperties>
+    </ProjectReference>
   </ItemGroup>
 
   <ItemGroup>
@@ -84,6 +91,23 @@
     <Copy SourceFiles="$(ProjectDir)References\EAL.dll" DestinationFiles="$(OutputPath)EAL.dll" SkipUnchangedFiles="true" />
     <Copy SourceFiles="$(ProjectDir)scripts\native-bridge\ErwinNativeBridge.dll" DestinationFiles="$(OutputPath)ErwinNativeBridge.dll" SkipUnchangedFiles="true" Condition="Exists('$(ProjectDir)scripts\native-bridge\ErwinNativeBridge.dll')" />
     <Message Text="Copied EAL.dll to $(OutputPath)" Importance="high" />
+  </Target>
+
+  <!-- Copy the Worker EXE + its runtime files into our output dir so the
+       LiveSession/Worker provider can spawn it via Process.Start at runtime
+       without an explicit ERWIN_ALTER_DDL_WORKER environment variable. -->
+  <Target Name="CopyWorkerToOutput" AfterTargets="Build">
+    <PropertyGroup>
+      <_WorkerOutDir>$(ProjectDir)ErwinAlterDdl\src\ErwinAlterDdl.Worker\bin\$(Configuration)\net10.0-windows\</_WorkerOutDir>
+    </PropertyGroup>
+    <ItemGroup>
+      <_WorkerFiles Include="$(_WorkerOutDir)**\*.*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_WorkerFiles)"
+          DestinationFiles="@(_WorkerFiles->'$(OutputPath)Worker\%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true"
+          Condition="Exists('$(_WorkerOutDir)')" />
+    <Message Text="Copied Worker output to $(OutputPath)Worker\" Importance="high" Condition="Exists('$(_WorkerOutDir)')" />
   </Target>
 
 </Project>

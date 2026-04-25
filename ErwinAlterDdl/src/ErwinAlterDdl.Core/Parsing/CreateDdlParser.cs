@@ -40,19 +40,23 @@ public static class CreateDdlParser
         var columnsByTable = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
         var keyGroupColumns = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
         var foreignKeys = new Dictionary<string, ForeignKeyInfo>(StringComparer.OrdinalIgnoreCase);
+        var schemaByTable = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var createBlockByTable = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
-        ParseCreateTables(ddl, columnsByTable, keyGroupColumns, foreignKeys);
+        ParseCreateTables(ddl, columnsByTable, keyGroupColumns, foreignKeys, schemaByTable, createBlockByTable);
         ParseCreateIndexes(ddl, keyGroupColumns);
         ParseAlterTableAddConstraints(ddl, keyGroupColumns, foreignKeys);
 
-        return new DdlColumnMap(columnsByTable, keyGroupColumns, foreignKeys);
+        return new DdlColumnMap(columnsByTable, keyGroupColumns, foreignKeys, schemaByTable, createBlockByTable);
     }
 
     private static void ParseCreateTables(
         string ddl,
         Dictionary<string, Dictionary<string, string>> columnsByTable,
         Dictionary<string, string[]> keyGroupColumns,
-        Dictionary<string, ForeignKeyInfo> foreignKeys)
+        Dictionary<string, ForeignKeyInfo> foreignKeys,
+        Dictionary<string, string> schemaByTable,
+        Dictionary<string, string> createBlockByTable)
     {
         int searchStart = 0;
         while (searchStart < ddl.Length)
@@ -61,6 +65,7 @@ public static class CreateDdlParser
             if (!headerMatch.Success) break;
 
             var table = StripQuoting(headerMatch.Groups["table"].Value);
+            var schema = StripQuoting(headerMatch.Groups["schema"].Value);
             int bodyStart = headerMatch.Index + headerMatch.Length;
             int bodyEnd = FindMatchingCloseParen(ddl, bodyStart);
             if (bodyEnd < 0) break;
@@ -69,6 +74,11 @@ public static class CreateDdlParser
             searchStart = bodyEnd + 1;
 
             if (string.IsNullOrWhiteSpace(table) || string.IsNullOrWhiteSpace(body)) continue;
+            if (!string.IsNullOrEmpty(schema)) schemaByTable.TryAdd(table, schema);
+            // Capture the entire CREATE TABLE statement (header + body + ")")
+            // verbatim so the emitter can copy it for new entities.
+            var fullBlock = ddl[headerMatch.Index..(bodyEnd + 1)];
+            createBlockByTable.TryAdd(table, fullBlock);
 
             var columns = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             foreach (var piece in SplitBodyPieces(body))
@@ -319,15 +329,53 @@ public sealed class DdlColumnMap
     private readonly Dictionary<string, Dictionary<string, string>> _tables;
     private readonly Dictionary<string, string[]> _keyGroupColumns;
     private readonly Dictionary<string, ForeignKeyInfo> _foreignKeys;
+    private readonly Dictionary<string, string> _schemaByTable;
+    private readonly Dictionary<string, string> _createBlockByTable;
 
     internal DdlColumnMap(
         Dictionary<string, Dictionary<string, string>> tables,
         Dictionary<string, string[]> keyGroupColumns,
-        Dictionary<string, ForeignKeyInfo> foreignKeys)
+        Dictionary<string, ForeignKeyInfo> foreignKeys,
+        Dictionary<string, string>? schemaByTable = null,
+        Dictionary<string, string>? createBlockByTable = null)
     {
         _tables = tables;
         _keyGroupColumns = keyGroupColumns;
         _foreignKeys = foreignKeys;
+        _schemaByTable = schemaByTable ?? new(StringComparer.OrdinalIgnoreCase);
+        _createBlockByTable = createBlockByTable ?? new(StringComparer.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Returns the schema (owner) name parsed from the CREATE TABLE header
+    /// for <paramref name="tableName"/>. Empty string when the table is
+    /// either unknown or its CREATE TABLE statement was not schema-qualified.
+    /// </summary>
+    public bool TryGetSchema(string tableName, out string schema)
+    {
+        if (_schemaByTable.TryGetValue(tableName, out var s) && !string.IsNullOrEmpty(s))
+        {
+            schema = s;
+            return true;
+        }
+        schema = string.Empty;
+        return false;
+    }
+
+    /// <summary>
+    /// Returns the verbatim CREATE TABLE statement block (header + body +
+    /// closing paren) for <paramref name="tableName"/>. Empty string when
+    /// the table is unknown.
+    /// </summary>
+    public bool TryGetCreateBlock(string tableName, out string block)
+    {
+        if (_createBlockByTable.TryGetValue(tableName, out var b) && !string.IsNullOrEmpty(b))
+        {
+            block = b;
+            return true;
+        }
+        block = string.Empty;
+        return false;
     }
 
     public int TableCount => _tables.Count;

@@ -708,7 +708,7 @@ WScript.Quit 0
         /// Get Mart Server connection info from CONNECTION_DEF ID=4.
         /// No Portal DB dependency - reads from MetaRepo only.
         /// </summary>
-        private static (string host, string port, string username, string password)? GetMartConnectionInfo(Action<string> log)
+        internal static (string host, string port, string username, string password)? GetMartConnectionInfo(Action<string> log)
         {
             try
             {

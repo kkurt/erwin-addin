@@ -48,12 +48,21 @@ public sealed class WorkerJsonModelMapProvider : IModelMapProvider
     public async Task<ErwinModelMap> BuildMapAsync(string erwinPath, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(erwinPath);
-        if (!File.Exists(erwinPath)) throw new FileNotFoundException("erwin file missing", erwinPath);
+        bool isMartLocator = erwinPath.StartsWith("mart://", StringComparison.OrdinalIgnoreCase)
+            || erwinPath.StartsWith("erwin://", StringComparison.OrdinalIgnoreCase);
+        if (!isMartLocator && !File.Exists(erwinPath))
+            throw new FileNotFoundException("erwin file missing", erwinPath);
 
         var jsonOut = Path.Combine(Path.GetTempPath(), $"erwin-model-map-{Guid.NewGuid():N}.json");
         try
         {
-            await RunWorkerAsync(["dump-model", "--erwin", erwinPath, "--out", jsonOut], ct).ConfigureAwait(false);
+            // Mart locators require a versioned-read disposition for the
+            // worker's PersistenceUnits.Add to authenticate against the
+            // remote server. File paths ignore --disposition.
+            var args = isMartLocator
+                ? new[] { "dump-model", "--erwin", erwinPath, "--out", jsonOut, "--disposition", "OVM=Yes" }
+                : new[] { "dump-model", "--erwin", erwinPath, "--out", jsonOut };
+            await RunWorkerAsync(args, ct).ConfigureAwait(false);
             if (!File.Exists(jsonOut))
                 throw new InvalidOperationException($"worker did not produce {jsonOut}");
             return ModelMapJsonSerializer.DeserializeFile(jsonOut);
@@ -132,25 +141,61 @@ public sealed class WorkerJsonModelMapProvider : IModelMapProvider
 
     private static string? ProbeDefaultWorkerPath()
     {
-        var baseDir = AppContext.BaseDirectory;
-        foreach (var candidate in new[]
+        // Anchor priority (first-match wins):
+        //   1. ComInterop.dll's own folder. When the add-in is loaded into
+        //      erwin.exe, AppContext.BaseDirectory points at erwin's install
+        //      dir but our DLL lives in the add-in's bin/. The
+        //      post-build "CopyWorkerToOutput" target drops the Worker into
+        //      "<add-in bin>/Worker/" so this anchor finds the freshly-built
+        //      EXE that matches the currently loaded ComInterop.
+        //   2. AppContext.BaseDirectory - useful for CLI / Worker hosts
+        //      where the EXE sits next to the worker.
+        // The walk-up fallback below is intentionally conservative: hitting
+        // an unrelated old build under src/.../bin/Release/ would launch a
+        // stale worker that doesn't speak the new subcommands.
+        var anchors = new List<string>();
+        try
         {
-            Path.Combine(baseDir, WorkerExeName),
-            Path.Combine(baseDir, "..", "ErwinAlterDdl.Worker", WorkerExeName),
-        })
-        {
-            var full = Path.GetFullPath(candidate);
-            if (File.Exists(full)) return full;
+            var asmLoc = typeof(WorkerJsonModelMapProvider).Assembly.Location;
+            if (!string.IsNullOrEmpty(asmLoc))
+                anchors.Add(Path.GetDirectoryName(asmLoc) ?? string.Empty);
         }
+        catch { /* best effort */ }
+        anchors.Add(AppContext.BaseDirectory);
 
-        var probeRoot = baseDir;
-        for (int i = 0; i < 6 && probeRoot is not null; i++)
+        foreach (var anchor in anchors)
         {
-            var c1 = Path.Combine(probeRoot, "src", "ErwinAlterDdl.Worker", "bin", "Debug", "net10.0-windows", WorkerExeName);
-            if (File.Exists(c1)) return c1;
-            var c2 = Path.Combine(probeRoot, "src", "ErwinAlterDdl.Worker", "bin", "Release", "net10.0-windows", WorkerExeName);
-            if (File.Exists(c2)) return c2;
-            probeRoot = Directory.GetParent(probeRoot)?.FullName;
+            if (string.IsNullOrEmpty(anchor)) continue;
+            foreach (var candidate in new[]
+            {
+                Path.Combine(anchor, WorkerExeName),
+                Path.Combine(anchor, "Worker", WorkerExeName),
+                Path.Combine(anchor, "..", "ErwinAlterDdl.Worker", WorkerExeName),
+            })
+            {
+                if (string.IsNullOrEmpty(candidate)) continue;
+                string full;
+                try { full = Path.GetFullPath(candidate); }
+                catch { continue; }
+                if (File.Exists(full)) return full;
+            }
+
+            var probeRoot = anchor;
+            for (int i = 0; i < 8 && !string.IsNullOrEmpty(probeRoot); i++)
+            {
+                var c1 = Path.Combine(probeRoot, "src", "ErwinAlterDdl.Worker", "bin", "Debug", "net10.0-windows", WorkerExeName);
+                if (File.Exists(c1)) return c1;
+                var c2 = Path.Combine(probeRoot, "src", "ErwinAlterDdl.Worker", "bin", "Release", "net10.0-windows", WorkerExeName);
+                if (File.Exists(c2)) return c2;
+                // Also try the ErwinAlterDdl/src/... layout if the anchor is
+                // already inside a build output (add-in's bin/Debug/...)
+                var c3 = Path.Combine(probeRoot, "ErwinAlterDdl", "src", "ErwinAlterDdl.Worker", "bin", "Debug", "net10.0-windows", WorkerExeName);
+                if (File.Exists(c3)) return c3;
+                var c4 = Path.Combine(probeRoot, "ErwinAlterDdl", "src", "ErwinAlterDdl.Worker", "bin", "Release", "net10.0-windows", WorkerExeName);
+                if (File.Exists(c4)) return c4;
+                try { probeRoot = Directory.GetParent(probeRoot)?.FullName ?? string.Empty; }
+                catch { break; }
+            }
         }
         return null;
     }

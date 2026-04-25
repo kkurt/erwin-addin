@@ -4431,6 +4431,93 @@ namespace EliteSoft.Erwin.AddIn
         /// the currently active PU (dirty or clean); the target is a Mart
         /// version picked inside the dialog. See <see cref="Forms.CompareVersionsForm"/>.
         /// </summary>
+        /// <summary>
+        /// "F2" pipeline: invoke erwin's own native MCXInvokeCompleteCompare +
+        /// GenerateAlterScript through the native bridge. The output is the
+        /// alter DDL erwin would produce if the user clicked
+        /// "Resolve Differences > Right Alter Script" in the GUI - schema
+        /// prefixes, extended properties, and dialect handling included.
+        /// Compares the active PU (with its dirty buffer) against the Mart
+        /// baseline that the model is linked to.
+        /// </summary>
+        private async void btnNativeAlterDdl_Click(object sender, EventArgs e)
+        {
+            if (!_isConnected || _currentModel == null)
+            {
+                ErwinAddIn.ShowTopMostMessage("No active erwin model.", "Native Alter DDL");
+                return;
+            }
+
+            btnNativeAlterDdl.Enabled = false;
+            btnSaveNativeAlterDdl.Enabled = false;
+            lblNativeAlterStatus.Text = "Running native CC pipeline... (silent mode, no dialogs)";
+            txtNativeAlterDdl.Text = string.Empty;
+            Application.DoEvents();
+
+            Action<string> log = msg =>
+            {
+                if (InvokeRequired) BeginInvoke(new Action(() => Log(msg)));
+                else Log(msg);
+            };
+
+            try
+            {
+                Services.NativeBridgeService.Install(log);
+                string ddl = await Task.Run(() =>
+                    Services.NativeBridgeService.GenerateAlterDdl((object)_currentModel, log));
+
+                if (string.IsNullOrEmpty(ddl))
+                {
+                    txtNativeAlterDdl.Text = "(no alter DDL produced - see Debug Log for details)";
+                    lblNativeAlterStatus.Text = "Native pipeline returned empty. Check Debug Log.";
+                    return;
+                }
+
+                txtNativeAlterDdl.Text = ddl;
+                txtNativeAlterDdl.SelectionStart = 0;
+                txtNativeAlterDdl.ScrollToCaret();
+                lblNativeAlterStatus.Text = $"Native alter DDL produced ({ddl.Length:N0} chars).";
+                btnSaveNativeAlterDdl.Enabled = true;
+            }
+            catch (Exception ex)
+            {
+                log($"NativeAlterDdl failed: {ex.GetType().Name}: {ex.Message}");
+                lblNativeAlterStatus.Text = "Native pipeline failed - see Debug Log.";
+                ErwinAddIn.ShowTopMostMessage(
+                    $"Native alter DDL pipeline failed:\n\n{ex.Message}",
+                    "Native Alter DDL");
+            }
+            finally
+            {
+                btnNativeAlterDdl.Enabled = true;
+            }
+        }
+
+        private void btnSaveNativeAlterDdl_Click(object sender, EventArgs e)
+        {
+            if (string.IsNullOrEmpty(txtNativeAlterDdl.Text)) return;
+            using var dlg = new SaveFileDialog
+            {
+                Filter = "SQL script (*.sql)|*.sql|All files (*.*)|*.*",
+                FileName = $"native-alter-{DateTime.Now:yyyyMMdd-HHmmss}.sql",
+                Title = "Save Native Alter DDL",
+                OverwritePrompt = true,
+            };
+            if (dlg.ShowDialog(this) != DialogResult.OK) return;
+            try
+            {
+                System.IO.File.WriteAllText(dlg.FileName, txtNativeAlterDdl.Text,
+                    new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+                lblNativeAlterStatus.Text = $"Saved to {dlg.FileName}";
+            }
+            catch (Exception ex)
+            {
+                ErwinAddIn.ShowTopMostMessage(
+                    $"Save failed:\n\n{ex.Message}",
+                    "Save Error");
+            }
+        }
+
         private void btnOpenCompareVersions_Click(object sender, EventArgs e)
         {
             if (!_isConnected || _currentModel == null)

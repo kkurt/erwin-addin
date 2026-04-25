@@ -33,8 +33,8 @@ public static class Program
 {
     public static async Task<int> Main(string[] args)
     {
-        var leftOption = new Option<FileInfo>("--left") { Description = "Baseline .erwin file", IsRequired = true };
-        var rightOption = new Option<FileInfo>("--right") { Description = "Target .erwin file", IsRequired = true };
+        var leftOption = new Option<string>("--left") { Description = "Baseline .erwin file path OR mart://... locator", IsRequired = true };
+        var rightOption = new Option<string>("--right") { Description = "Target .erwin file path OR mart://... locator", IsRequired = true };
         var outOption = new Option<FileInfo>("--out") { Description = "Output JSON file", IsRequired = true };
         var levelOption = new Option<string>(
             aliases: ["--compare-level"],
@@ -85,16 +85,23 @@ public static class Program
     }
 
     private static async Task<int> RunAsync(
-        FileInfo left, FileInfo right, FileInfo outFile,
+        string left, string right, FileInfo outFile,
         string level, string preset, string sessionMode, DirectoryInfo? artifactsDir,
         bool verbose, bool includeDdl, FileInfo? emitSql, CancellationToken ct)
     {
         ConfigureLogging(verbose);
         var logger = CreateLogger();
 
-        if (!left.Exists || !right.Exists)
+        bool leftIsLocator = IsVirtualLocator(left);
+        bool rightIsLocator = IsVirtualLocator(right);
+        if (!leftIsLocator && !File.Exists(left))
         {
-            logger.LogError("Input file missing: left exists={L} right exists={R}", left.Exists, right.Exists);
+            logger.LogError("Input file missing: --left='{L}' is not a file and not a mart:// / erwin:// locator", left);
+            return ExitCodes.InputValidation;
+        }
+        if (!rightIsLocator && !File.Exists(right))
+        {
+            logger.LogError("Input file missing: --right='{R}' is not a file and not a mart:// / erwin:// locator", right);
             return ExitCodes.InputValidation;
         }
 
@@ -137,7 +144,7 @@ public static class Program
             CompareResult result;
             try
             {
-                result = await orchestrator.CompareAsync(left.FullName, right.FullName, options, ct);
+                result = await orchestrator.CompareAsync(left, right, options, ct);
             }
             catch (FileNotFoundException ex)
             {
@@ -197,6 +204,10 @@ public static class Program
             return ExitCodes.Success;
         }
     }
+
+    private static bool IsVirtualLocator(string path) =>
+        path.StartsWith("mart://", StringComparison.OrdinalIgnoreCase)
+        || path.StartsWith("erwin://", StringComparison.OrdinalIgnoreCase);
 
     private static CompareLevel ParseLevel(string s) => s.ToUpperInvariant() switch
     {

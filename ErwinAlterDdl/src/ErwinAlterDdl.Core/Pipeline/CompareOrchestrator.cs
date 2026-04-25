@@ -94,6 +94,18 @@ public sealed class CompareOrchestrator
         var changes = ChangeCorrelator.Correlate(leftMap, rightMap, xlsRows);
         _logger.LogInformation("Correlator produced {Count} changes", changes.Count);
 
+        // 4b. Pull schema-by-entity-name out of the XLS Entity/Table rows.
+        //     erwin's CC consistently emits these as <schema>.<table>; we
+        //     keep them aside so the SQL emitter can produce
+        //     [schema].[table] even when FEModel_DDL output happens to be
+        //     schema-less (some target-server defaults).
+        var schemaByEntity = ExtractSchemaByEntity(xlsRows);
+        if (schemaByEntity.Count > 0)
+            _logger.LogInformation(
+                "XLS yielded {Count} entity-schema mappings (e.g. first: {Sample})",
+                schemaByEntity.Count,
+                schemaByEntity.First().Key + "->" + schemaByEntity.First().Value);
+
         // 5. Optional: generate CREATE DDL for each side (Phase 3 emitter fuel).
         DdlArtifact? leftDdl = null, rightDdl = null;
         if (options.IncludeCreateDdl)
@@ -110,7 +122,58 @@ public sealed class CompareOrchestrator
         {
             LeftDdl = leftDdl,
             RightDdl = rightDdl,
+            SchemaByEntityName = schemaByEntity.Count > 0 ? schemaByEntity : null,
         };
+    }
+
+    private static IReadOnlyDictionary<string, string> ExtractSchemaByEntity(IReadOnlyList<XlsDiffRow> xlsRows)
+    {
+        // erwin's CC XLS uses "Entity/Table" or just "Table" depending on the
+        // metamodel version / DBMS adapter. Both are entity rows.
+        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        string? defaultSchema = null;
+
+        foreach (var row in xlsRows)
+        {
+            bool isEntityRow =
+                string.Equals(row.Type, "Entity/Table", StringComparison.Ordinal)
+                || string.Equals(row.Type, "Table", StringComparison.Ordinal)
+                || string.Equals(row.Type, "Entity", StringComparison.Ordinal);
+            if (!isEntityRow) continue;
+
+            var raw = row.LeftValue.Length > 0 ? row.LeftValue : row.RightValue;
+            if (string.IsNullOrEmpty(raw)) continue;
+
+            int dot = raw.IndexOf('.');
+            if (dot <= 0 || dot >= raw.Length - 1) continue;
+            var schema = raw[..dot];
+            var bare = raw[(dot + 1)..];
+            if (!map.ContainsKey(bare)) map[bare] = schema;
+            // Track the most common schema in this XLS so we can fall back
+            // for newly-added (yet-unowned) tables that come bare.
+            defaultSchema ??= schema;
+        }
+
+        // Second pass: bare entity rows inherit the default schema. erwin
+        // sometimes emits a fresh table without a schema prefix even though
+        // the model itself is firmly under one (e.g. "dbo").
+        if (!string.IsNullOrEmpty(defaultSchema))
+        {
+            foreach (var row in xlsRows)
+            {
+                bool isEntityRow =
+                    string.Equals(row.Type, "Entity/Table", StringComparison.Ordinal)
+                    || string.Equals(row.Type, "Table", StringComparison.Ordinal)
+                    || string.Equals(row.Type, "Entity", StringComparison.Ordinal);
+                if (!isEntityRow) continue;
+
+                var raw = row.LeftValue.Length > 0 ? row.LeftValue : row.RightValue;
+                if (string.IsNullOrEmpty(raw)) continue;
+                if (raw.Contains('.')) continue;
+                if (!map.ContainsKey(raw)) map[raw] = defaultSchema;
+            }
+        }
+        return map;
     }
 
     /// <summary>

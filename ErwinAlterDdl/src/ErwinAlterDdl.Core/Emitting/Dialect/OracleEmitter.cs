@@ -1,3 +1,5 @@
+using System.Text.RegularExpressions;
+
 using EliteSoft.Erwin.AlterDdl.Core.Models;
 using EliteSoft.Erwin.AlterDdl.Core.Parsing;
 
@@ -6,11 +8,21 @@ namespace EliteSoft.Erwin.AlterDdl.Core.Emitting.Dialect;
 /// <summary>
 /// Oracle 19c / 21c alter DDL emitter. Phase 3.D polish fills in column lists
 /// for PK / UQ / Index / FK when available, and quotes schema-qualified names
-/// as "schema"."table" rather than "schema.table".
+/// as "schema"."table" rather than "schema.table". Phase 3.G adds the same
+/// CC-XLS-derived schema lookup the MSSQL emitter uses, so bare entity names
+/// in the CREATE DDL are still emitted with their owner schema.
 /// </summary>
 public sealed class OracleEmitter : ISqlEmitter
 {
     public string Dialect => "Oracle";
+
+    /// <summary>
+    /// XLS-derived schema-by-entity-name lookup, valid only for the duration
+    /// of a single <see cref="Emit"/> call. Stored in [ThreadStatic] so the
+    /// existing static helpers can read it without an extra parameter.
+    /// </summary>
+    [System.ThreadStatic]
+    private static IReadOnlyDictionary<string, string>? t_xlsSchemas;
 
     public AlterDdlScript Emit(CompareResult compareResult)
     {
@@ -23,53 +35,73 @@ public sealed class OracleEmitter : ISqlEmitter
             try { rightCols = CreateDdlParser.Parse(File.ReadAllText(p)); } catch { }
         }
 
+        t_xlsSchemas = compareResult.SchemaByEntityName;
+        try
+        {
+
         foreach (var change in compareResult.Changes)
         {
             AlterStatement? emitted = change switch
             {
-                EntityAdded ea => EmitEntityAdded(ea),
-                EntityDropped ed => EmitEntityDropped(ed),
-                EntityRenamed er => EmitEntityRenamed(er),
+                EntityAdded ea => EmitEntityAdded(ea, rightCols),
+                EntityDropped ed => EmitEntityDropped(ed, rightCols),
+                EntityRenamed er => EmitEntityRenamed(er, rightCols),
                 SchemaMoved sm => EmitSchemaMoved(sm),
                 AttributeAdded aa => EmitAttributeAdded(aa, rightCols),
-                AttributeDropped ad => EmitAttributeDropped(ad),
-                AttributeRenamed ar => EmitAttributeRenamed(ar),
-                AttributeTypeChanged at => EmitAttributeTypeChanged(at),
-                AttributeNullabilityChanged an => EmitAttributeNullability(an),
-                AttributeDefaultChanged ad2 => EmitAttributeDefault(ad2),
-                AttributeIdentityChanged ai => EmitAttributeIdentity(ai),
+                AttributeDropped ad => EmitAttributeDropped(ad, rightCols),
+                AttributeRenamed ar => EmitAttributeRenamed(ar, rightCols),
+                AttributeTypeChanged at => EmitAttributeTypeChanged(at, rightCols),
+                AttributeNullabilityChanged an => EmitAttributeNullability(an, rightCols),
+                AttributeDefaultChanged ad2 => EmitAttributeDefault(ad2, rightCols),
+                AttributeIdentityChanged ai => EmitAttributeIdentity(ai, rightCols),
                 KeyGroupAdded ka => EmitKeyGroupAdded(ka, rightCols),
-                KeyGroupDropped kd => EmitKeyGroupDropped(kd),
-                KeyGroupRenamed kr => EmitKeyGroupRenamed(kr),
+                KeyGroupDropped kd => EmitKeyGroupDropped(kd, rightCols),
+                KeyGroupRenamed kr => EmitKeyGroupRenamed(kr, rightCols),
                 ForeignKeyAdded fa => EmitForeignKeyAdded(fa, rightCols),
                 ForeignKeyDropped fd => EmitForeignKeyDropped(fd),
                 ForeignKeyRenamed fr => EmitForeignKeyRenamed(fr),
-                ViewAdded va => new($"-- TODO: CREATE OR REPLACE VIEW {QuoteQualified(va.Target.Name)} AS <body from v2 DDL>", $"add view {va.Target.Name}"),
-                ViewDropped vd => new($"DROP VIEW {QuoteQualified(vd.Target.Name)};", $"drop view {vd.Target.Name}"),
+                ViewAdded va => new($"-- TODO: CREATE OR REPLACE VIEW {QuoteEntityName(va.Target.Name, rightCols)} AS <body from v2 DDL>", $"add view {va.Target.Name}"),
+                ViewDropped vd => new($"DROP VIEW {QuoteEntityName(vd.Target.Name, rightCols)};", $"drop view {vd.Target.Name}"),
                 ViewRenamed vr => new($"RENAME {Quote(vr.OldName)} TO {Quote(vr.Target.Name)};", $"rename view {vr.OldName} -> {vr.Target.Name}"),
-                TriggerAdded ta => new($"-- TODO: CREATE OR REPLACE TRIGGER {QuoteQualified(ta.Target.Name)} body from v2 model", $"add trigger {ta.Target.Name}"),
-                TriggerDropped td => new($"DROP TRIGGER {QuoteQualified(td.Target.Name)};", $"drop trigger {td.Target.Name}"),
+                TriggerAdded ta => new($"-- TODO: CREATE OR REPLACE TRIGGER {QuoteEntityName(ta.Target.Name, rightCols)} body from v2 model", $"add trigger {ta.Target.Name}"),
+                TriggerDropped td => new($"DROP TRIGGER {QuoteEntityName(td.Target.Name, rightCols)};", $"drop trigger {td.Target.Name}"),
                 TriggerRenamed tr => new($"ALTER TRIGGER {Quote(tr.OldName)} RENAME TO {Quote(tr.Target.Name)};", $"rename trigger {tr.OldName} -> {tr.Target.Name}"),
-                SequenceAdded sa => new($"-- TODO: CREATE SEQUENCE {QuoteQualified(sa.Target.Name)} START WITH / INCREMENT BY from v2 model", $"add sequence {sa.Target.Name}"),
-                SequenceDropped sd => new($"DROP SEQUENCE {QuoteQualified(sd.Target.Name)};", $"drop sequence {sd.Target.Name}"),
+                SequenceAdded sa => new($"-- TODO: CREATE SEQUENCE {QuoteEntityName(sa.Target.Name, rightCols)} START WITH / INCREMENT BY from v2 model", $"add sequence {sa.Target.Name}"),
+                SequenceDropped sd => new($"DROP SEQUENCE {QuoteEntityName(sd.Target.Name, rightCols)};", $"drop sequence {sd.Target.Name}"),
                 SequenceRenamed sr => new($"RENAME {Quote(sr.OldName)} TO {Quote(sr.Target.Name)};", $"rename sequence {sr.OldName} -> {sr.Target.Name}"),
                 _ => null,
             };
             if (emitted is not null) stmts.Add(emitted);
         }
         return new AlterDdlScript(Dialect, stmts);
+        }
+        finally
+        {
+            t_xlsSchemas = null;
+        }
     }
 
-    private static AlterStatement EmitEntityAdded(EntityAdded ea) => new(
-        Sql: $"-- TODO: copy CREATE TABLE body for {QuoteQualified(ea.Target.Name)} from v2 CREATE DDL",
-        Comment: $"new entity {ea.Target.Name}");
+    private static AlterStatement EmitEntityAdded(EntityAdded ea, DdlColumnMap? rightCols)
+    {
+        var bare = UnqualifiedTable(ea.Target.Name);
+        if (rightCols is not null && rightCols.TryGetCreateBlock(bare, out var block))
+        {
+            var withSchema = InjectSchemaIntoCreateBlock(block, bare, rightCols);
+            return new AlterStatement(
+                Sql: withSchema.TrimEnd() + ";",
+                Comment: $"new entity {ea.Target.Name}");
+        }
+        return new AlterStatement(
+            Sql: $"-- TODO: copy CREATE TABLE body for {QuoteEntityName(ea.Target.Name, rightCols)} from v2 CREATE DDL",
+            Comment: $"new entity {ea.Target.Name}");
+    }
 
-    private static AlterStatement EmitEntityDropped(EntityDropped ed) => new(
-        Sql: $"DROP TABLE {QuoteQualified(ed.Target.Name)} CASCADE CONSTRAINTS;",
+    private static AlterStatement EmitEntityDropped(EntityDropped ed, DdlColumnMap? rightCols) => new(
+        Sql: $"DROP TABLE {QuoteEntityName(ed.Target.Name, rightCols)} CASCADE CONSTRAINTS;",
         Comment: $"drop entity {ed.Target.Name}");
 
-    private static AlterStatement EmitEntityRenamed(EntityRenamed er) => new(
-        Sql: $"ALTER TABLE {QuoteQualified(er.OldName)} RENAME TO {Quote(er.Target.Name)};",
+    private static AlterStatement EmitEntityRenamed(EntityRenamed er, DdlColumnMap? rightCols) => new(
+        Sql: $"ALTER TABLE {QuoteEntityName(er.OldName, rightCols)} RENAME TO {Quote(er.Target.Name)};",
         Comment: $"rename entity {er.OldName} -> {er.Target.Name}");
 
     private static AlterStatement EmitSchemaMoved(SchemaMoved sm) => new(
@@ -83,60 +115,60 @@ public sealed class OracleEmitter : ISqlEmitter
                 ? t
                 : "/* TODO: datatype from v2 CREATE DDL */";
         return new AlterStatement(
-            Sql: $"ALTER TABLE {QuoteQualified(aa.ParentEntity.Name)} ADD ({Quote(aa.Target.Name)} {type});",
+            Sql: $"ALTER TABLE {QuoteEntityName(aa.ParentEntity.Name, rightCols)} ADD ({Quote(aa.Target.Name)} {type});",
             Comment: $"add column {aa.ParentEntity.Name}.{aa.Target.Name}");
     }
 
-    private static AlterStatement EmitAttributeDropped(AttributeDropped ad) => new(
-        Sql: $"ALTER TABLE {QuoteQualified(ad.ParentEntity.Name)} DROP COLUMN {Quote(ad.Target.Name)};",
+    private static AlterStatement EmitAttributeDropped(AttributeDropped ad, DdlColumnMap? rightCols) => new(
+        Sql: $"ALTER TABLE {QuoteEntityName(ad.ParentEntity.Name, rightCols)} DROP COLUMN {Quote(ad.Target.Name)};",
         Comment: $"drop column {ad.ParentEntity.Name}.{ad.Target.Name}");
 
-    private static AlterStatement EmitAttributeRenamed(AttributeRenamed ar) => new(
-        Sql: $"ALTER TABLE {QuoteQualified(ar.ParentEntity.Name)} RENAME COLUMN {Quote(ar.OldName)} TO {Quote(ar.Target.Name)};",
+    private static AlterStatement EmitAttributeRenamed(AttributeRenamed ar, DdlColumnMap? rightCols) => new(
+        Sql: $"ALTER TABLE {QuoteEntityName(ar.ParentEntity.Name, rightCols)} RENAME COLUMN {Quote(ar.OldName)} TO {Quote(ar.Target.Name)};",
         Comment: $"rename column {ar.ParentEntity.Name}.{ar.OldName} -> {ar.Target.Name}");
 
-    private static AlterStatement EmitAttributeTypeChanged(AttributeTypeChanged at) => new(
-        Sql: $"ALTER TABLE {QuoteQualified(at.ParentEntity.Name)} MODIFY ({Quote(at.Target.Name)} {at.RightType});",
+    private static AlterStatement EmitAttributeTypeChanged(AttributeTypeChanged at, DdlColumnMap? rightCols) => new(
+        Sql: $"ALTER TABLE {QuoteEntityName(at.ParentEntity.Name, rightCols)} MODIFY ({Quote(at.Target.Name)} {at.RightType});",
         Comment: $"type change {at.ParentEntity.Name}.{at.Target.Name} {at.LeftType} -> {at.RightType}");
 
-    private static AlterStatement EmitAttributeNullability(AttributeNullabilityChanged an)
+    private static AlterStatement EmitAttributeNullability(AttributeNullabilityChanged an, DdlColumnMap? rightCols)
     {
         var clause = an.RightNullable ? "NULL" : "NOT NULL";
         return new AlterStatement(
-            Sql: $"ALTER TABLE {QuoteQualified(an.ParentEntity.Name)} MODIFY ({Quote(an.Target.Name)} {clause});",
+            Sql: $"ALTER TABLE {QuoteEntityName(an.ParentEntity.Name, rightCols)} MODIFY ({Quote(an.Target.Name)} {clause});",
             Comment: $"nullability {an.ParentEntity.Name}.{an.Target.Name} {(an.LeftNullable ? "NULL" : "NOT NULL")} -> {clause}");
     }
 
-    private static AlterStatement EmitAttributeDefault(AttributeDefaultChanged ad)
+    private static AlterStatement EmitAttributeDefault(AttributeDefaultChanged ad, DdlColumnMap? rightCols)
     {
         if (string.IsNullOrWhiteSpace(ad.RightDefault))
         {
             return new AlterStatement(
-                Sql: $"ALTER TABLE {QuoteQualified(ad.ParentEntity.Name)} MODIFY ({Quote(ad.Target.Name)} DEFAULT NULL);",
+                Sql: $"ALTER TABLE {QuoteEntityName(ad.ParentEntity.Name, rightCols)} MODIFY ({Quote(ad.Target.Name)} DEFAULT NULL);",
                 Comment: $"drop default {ad.ParentEntity.Name}.{ad.Target.Name}");
         }
         return new AlterStatement(
-            Sql: $"ALTER TABLE {QuoteQualified(ad.ParentEntity.Name)} MODIFY ({Quote(ad.Target.Name)} DEFAULT {ad.RightDefault});",
+            Sql: $"ALTER TABLE {QuoteEntityName(ad.ParentEntity.Name, rightCols)} MODIFY ({Quote(ad.Target.Name)} DEFAULT {ad.RightDefault});",
             Comment: $"default {ad.ParentEntity.Name}.{ad.Target.Name} '{ad.LeftDefault}' -> '{ad.RightDefault}'");
     }
 
-    private static AlterStatement EmitAttributeIdentity(AttributeIdentityChanged ai)
+    private static AlterStatement EmitAttributeIdentity(AttributeIdentityChanged ai, DdlColumnMap? rightCols)
     {
         if (ai.RightHasIdentity)
         {
             return new AlterStatement(
-                Sql: $"ALTER TABLE {QuoteQualified(ai.ParentEntity.Name)} MODIFY ({Quote(ai.Target.Name)} GENERATED BY DEFAULT AS IDENTITY);",
+                Sql: $"ALTER TABLE {QuoteEntityName(ai.ParentEntity.Name, rightCols)} MODIFY ({Quote(ai.Target.Name)} GENERATED BY DEFAULT AS IDENTITY);",
                 Comment: $"add identity {ai.ParentEntity.Name}.{ai.Target.Name}");
         }
         return new AlterStatement(
-            Sql: $"ALTER TABLE {QuoteQualified(ai.ParentEntity.Name)} MODIFY ({Quote(ai.Target.Name)} DROP IDENTITY);",
+            Sql: $"ALTER TABLE {QuoteEntityName(ai.ParentEntity.Name, rightCols)} MODIFY ({Quote(ai.Target.Name)} DROP IDENTITY);",
             Comment: $"drop identity {ai.ParentEntity.Name}.{ai.Target.Name}");
     }
 
     private static AlterStatement EmitKeyGroupAdded(KeyGroupAdded ka, DdlColumnMap? rightCols)
     {
         var columns = ColumnsClause(rightCols, ka.Target.Name);
-        var table = QuoteQualified(ka.ParentEntity.Name);
+        var table = QuoteEntityName(ka.ParentEntity.Name, rightCols);
         return ka.Kind switch
         {
             KeyGroupKind.PrimaryKey => new(
@@ -151,9 +183,9 @@ public sealed class OracleEmitter : ISqlEmitter
         };
     }
 
-    private static AlterStatement EmitKeyGroupDropped(KeyGroupDropped kd)
+    private static AlterStatement EmitKeyGroupDropped(KeyGroupDropped kd, DdlColumnMap? rightCols)
     {
-        var table = QuoteQualified(kd.ParentEntity.Name);
+        var table = QuoteEntityName(kd.ParentEntity.Name, rightCols);
         return kd.Kind switch
         {
             KeyGroupKind.PrimaryKey => new(
@@ -168,10 +200,10 @@ public sealed class OracleEmitter : ISqlEmitter
         };
     }
 
-    private static AlterStatement EmitKeyGroupRenamed(KeyGroupRenamed kr) => new(
+    private static AlterStatement EmitKeyGroupRenamed(KeyGroupRenamed kr, DdlColumnMap? rightCols) => new(
         Sql: kr.Kind == KeyGroupKind.Index
             ? $"ALTER INDEX {Quote(kr.OldName)} RENAME TO {Quote(kr.Target.Name)};"
-            : $"ALTER TABLE {QuoteQualified(kr.ParentEntity.Name)} RENAME CONSTRAINT {Quote(kr.OldName)} TO {Quote(kr.Target.Name)};",
+            : $"ALTER TABLE {QuoteEntityName(kr.ParentEntity.Name, rightCols)} RENAME CONSTRAINT {Quote(kr.OldName)} TO {Quote(kr.Target.Name)};",
         Comment: $"rename {kr.Kind} {kr.OldName} -> {kr.Target.Name}");
 
     private static AlterStatement EmitForeignKeyAdded(ForeignKeyAdded fa, DdlColumnMap? rightCols)
@@ -181,7 +213,7 @@ public sealed class OracleEmitter : ISqlEmitter
             var childCols = string.Join(", ", fk.ChildColumns.Select(Quote));
             var parentCols = string.Join(", ", fk.ParentColumns.Select(Quote));
             return new AlterStatement(
-                Sql: $"ALTER TABLE {Quote(fk.ChildTable)} ADD CONSTRAINT {Quote(fa.Target.Name)} FOREIGN KEY ({childCols}) REFERENCES {Quote(fk.ParentTable)} ({parentCols});",
+                Sql: $"ALTER TABLE {QuoteEntityName(fk.ChildTable, rightCols)} ADD CONSTRAINT {Quote(fa.Target.Name)} FOREIGN KEY ({childCols}) REFERENCES {QuoteEntityName(fk.ParentTable, rightCols)} ({parentCols});",
                 Comment: $"add FK {fa.Target.Name}");
         }
         return new AlterStatement(
@@ -220,5 +252,49 @@ public sealed class OracleEmitter : ISqlEmitter
         var dot = name.IndexOf('.');
         if (dot < 0) return Quote(name);
         return Quote(name[..dot]) + "." + Quote(name[(dot + 1)..]);
+    }
+
+    /// <summary>
+    /// Quote an entity / table name. Schema lookup priority mirrors
+    /// MssqlEmitter.QuoteEntityName so all dialects behave consistently.
+    /// </summary>
+    private static string QuoteEntityName(string name, DdlColumnMap? rightCols)
+    {
+        if (name.Contains('.')) return QuoteQualified(name);
+        var xls = t_xlsSchemas;
+        if (xls is not null && xls.TryGetValue(name, out var xlsSch) && !string.IsNullOrEmpty(xlsSch))
+            return Quote(xlsSch) + "." + Quote(name);
+        if (rightCols is not null && rightCols.TryGetSchema(name, out var sch))
+            return Quote(sch) + "." + Quote(name);
+        return Quote(name);
+    }
+
+    /// <summary>
+    /// Inject the resolved schema into a verbatim CREATE TABLE block so the
+    /// emitted body reads <c>CREATE TABLE "schema"."table" (...)</c> rather
+    /// than the bare form FEModel_DDL sometimes produces.
+    /// </summary>
+    private static string InjectSchemaIntoCreateBlock(string block, string bareTableName, DdlColumnMap? rightCols)
+    {
+        var schema = ResolveSchema(bareTableName, rightCols);
+        if (string.IsNullOrEmpty(schema)) return block;
+
+        var pattern = new Regex(
+            @"(CREATE\s+TABLE\s+)(?:[\[""]?\w+[\]""]?\s*\.\s*)?[\[""]?"
+                + Regex.Escape(bareTableName)
+                + @"[\]""]?(\s*\()",
+            RegexOptions.IgnoreCase);
+        var replacement = "$1" + Quote(schema) + "." + Quote(bareTableName) + "$2";
+        return pattern.Replace(block, replacement, count: 1);
+    }
+
+    private static string? ResolveSchema(string bareTableName, DdlColumnMap? rightCols)
+    {
+        var xls = t_xlsSchemas;
+        if (xls is not null && xls.TryGetValue(bareTableName, out var xlsSch) && !string.IsNullOrEmpty(xlsSch))
+            return xlsSch;
+        if (rightCols is not null && rightCols.TryGetSchema(bareTableName, out var sch) && !string.IsNullOrEmpty(sch))
+            return sch;
+        return null;
     }
 }

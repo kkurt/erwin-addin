@@ -98,10 +98,17 @@ namespace EliteSoft.Erwin.AddIn.Forms
             }
             catch (Exception ex)
             {
-                _log($"CompareVersionsForm.Compare failed: {ex.Message}");
+                _log($"CompareVersionsForm.Compare failed: {ex.GetType().FullName}: {ex.Message}");
+                _log("--- stack trace ---");
+                _log(ex.ToString());
+                if (ex.InnerException is not null)
+                {
+                    _log("--- inner exception ---");
+                    _log(ex.InnerException.ToString());
+                }
                 MessageBox.Show(
                     this,
-                    $"Compare failed:\n\n{ex.GetType().Name}: {ex.Message}",
+                    $"Compare failed:\n\n{ex.GetType().Name}: {ex.Message}\n\n(Full stack in Debug Log.)",
                     "Compare Error",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error);
@@ -138,7 +145,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
 
             var sb = new StringBuilder();
             sb.AppendLine($"-- ALTER SQL for {outcome.Dialect} ({outcome.Script.Statements.Count} statement(s))");
-            sb.AppendLine($"-- Baseline: active model (possibly dirty)  Target: Mart version selected above");
+            sb.AppendLine($"-- From: Mart version selected above   To: active model (current dirty state)");
             sb.AppendLine();
             foreach (var stmt in outcome.Script.Statements)
             {

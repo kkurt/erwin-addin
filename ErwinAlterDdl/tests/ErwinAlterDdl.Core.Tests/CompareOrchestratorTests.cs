@@ -50,8 +50,16 @@ public class CompareOrchestratorTests
             </erwin>
             """);
 
+        // CC reports both the drop (OBSOLETE on the left only) and the add
+        // (NEWLY_ADDED on the right only). The correlator's CC-allowlist
+        // filter requires that every emitted change be backed by a CC row,
+        // so both Entity/Table rows must appear in the XLS even though the
+        // structural diff alone could find them.
         var xlsPath = workDir.Create("diff.xls",
-            "<html><body><table><tr><td>Entity/Table</td><td>OBSOLETE</td><td>Not Equal</td><td></td></tr></table></body></html>");
+            "<html><body><table>"
+            + "<tr><td>Entity/Table</td><td>OBSOLETE</td><td>Not Equal</td><td></td></tr>"
+            + "<tr><td>Entity/Table</td><td></td><td>Not Equal</td><td>NEWLY_ADDED</td></tr>"
+            + "</table></body></html>");
 
         var session = new TestSession { XlsOutPath = xlsPath };
         var provider = new PrebuiltModelMapProvider(v1Erwin, v1Map, v2Erwin, v2Map);

@@ -34,7 +34,7 @@ public class AttributePropertyChangeTests
             var r = Result(MssqlMeta, new AttributeNullabilityChanged(OrderCol, Customer, true, false))
                 with { RightDdl = new DdlArtifact(tmp, new FileInfo(tmp).Length, "SQL Server") };
             new MssqlEmitter().Emit(r).Statements[0].Sql
-                .Should().Be("ALTER TABLE [CUSTOMER] ALTER COLUMN [customer_id] INT NOT NULL;");
+                .Should().Be("ALTER TABLE [app].[CUSTOMER] ALTER COLUMN [customer_id] INT NOT NULL;");
         }
         finally { try { File.Delete(tmp); } catch { } }
     }

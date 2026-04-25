@@ -98,8 +98,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             try
             {
-                string locator = "";
-                try { locator = _activePU.PropertyBag().Value("Locator")?.ToString() ?? ""; } catch { }
+                var locator = ReadActiveLocator();
                 return DdlGenerationService.ParseVersionFromLocator(locator);
             }
             catch (Exception ex)
@@ -148,17 +147,33 @@ namespace EliteSoft.Erwin.AddIn.Services
             string martLocator = BuildMartLocatorForTarget(targetVersion);
             string activePathKey = $"active-pu://{SafeGet(_activePU.PropertyBag(null, true), "Persistence_Unit_Id")}";
 
-            _log($"VersionCompare: baseline=live active PU (v{ReadActiveVersion()}), target=Mart v{targetVersion}");
-            _log($"VersionCompare: target locator = {MaskMartPassword(martLocator)}");
+            // Pipeline orientation: the alter SQL migrates LEFT -> RIGHT, so
+            // left = the older saved Mart version (where we're starting from)
+            // right = the active model (the desired end state, including its
+            // dirty buffer). An entity present on the right but not on the
+            // left becomes "ADD entity"; the user expects exactly this when
+            // diffing "v1 to current".
+            _log($"VersionCompare: from=Mart v{targetVersion} (left), to=active PU v{ReadActiveVersion()} (right)");
+            _log($"VersionCompare: Mart locator = {MaskMartPassword(martLocator)}");
 
-            // Compose the per-side providers into a single IModelMapProvider
-            // the orchestrator can consume.
             var liveProvider = new LiveSessionModelMapProvider((object)_scapi, (object)_activePU, activePathKey);
-            var workerProvider = new WorkerJsonModelMapProvider();
-            var combined = new DispatchByPathModelMapProvider(activePathKey, liveProvider, martLocator, workerProvider);
+            WorkerJsonModelMapProvider workerProvider;
+            try
+            {
+                workerProvider = new WorkerJsonModelMapProvider();
+                _log("VersionCompare: WorkerJsonModelMapProvider initialized OK");
+            }
+            catch (Exception ex)
+            {
+                _log($"VersionCompare: WorkerJsonModelMapProvider init failed: {ex.GetType().FullName}: {ex.Message}");
+                throw new InvalidOperationException(
+                    "Could not locate erwin-alter-ddl-worker.exe. Set the ERWIN_ALTER_DDL_WORKER environment variable " +
+                    "to its full path, or copy the worker EXE next to the add-in DLL.", ex);
+            }
+            // left = Mart vN (worker dump),  right = active PU (live walk)
+            var combined = new DispatchByPathModelMapProvider(martLocator, workerProvider, activePathKey, liveProvider);
 
             // Null SCAPI session is safe because SkipCompleteCompare=true.
-            // Any accidental call to session methods would blow up loudly.
             var session = new NoCompleteCompareSession();
 
             var options = new CompareOptions
@@ -171,17 +186,126 @@ namespace EliteSoft.Erwin.AddIn.Services
             string dialect = ResolveDialect(target);
 
             var orchestrator = new CompareOrchestrator(session, combined);
-            var result = await orchestrator.CompareAsync(activePathKey, martLocator, options, ct).ConfigureAwait(false);
+            var result = await orchestrator.CompareAsync(martLocator, activePathKey, options, ct).ConfigureAwait(false);
+
+            // Generate CREATE DDL for both sides so the emitter can fill in
+            // column datatypes, PK / UNIQUE / Index column lists, FK column
+            // lists, and (most importantly) full CREATE TABLE bodies for
+            // newly-added entities. The active PU side runs in-process via
+            // FEModel_DDL (safe per existing DdlGenerationService pattern);
+            // the Mart side reuses the Worker.
+            var (leftDdl, rightDdl) = await BuildCreateDdlArtifactsAsync(martLocator, ct).ConfigureAwait(false);
+            var enriched = result with { LeftDdl = leftDdl, RightDdl = rightDdl };
 
             var registry = new SqlEmitterRegistry()
                 .Register(new MssqlEmitter(), "SQL Server")
                 .Register(new OracleEmitter(), "Oracle")
                 .Register(new Db2Emitter(), "Db2", "DB2 z/OS");
             var emitter = registry.Resolve(dialect);
-            var script = emitter.Emit(result);
+            var script = emitter.Emit(enriched);
 
-            _log($"VersionCompare: {result.Changes.Count} change(s), {script.Statements.Count} statement(s), dialect={dialect} ({target} v{major}.{minor})");
-            return new CompareOutcome(result, script, dialect);
+            _log($"VersionCompare: {enriched.Changes.Count} change(s), {script.Statements.Count} statement(s), dialect={dialect} ({target} v{major}.{minor})");
+            return new CompareOutcome(enriched, script, dialect);
+        }
+
+        /// <summary>
+        /// Build CREATE DDL artifacts for both sides of the compare:
+        ///   left  = Mart vN target (out-of-process worker)
+        ///   right = active PU (in-process FEModel_DDL on the live handle;
+        ///           safe per existing DdlGenerationService pattern)
+        /// </summary>
+        private async Task<(DdlArtifact Left, DdlArtifact Right)> BuildCreateDdlArtifactsAsync(
+            string martLocator,
+            CancellationToken ct)
+        {
+            DdlArtifact leftDdl = null;
+            DdlArtifact rightDdl = null;
+
+            // Active PU side - in-process FEModel_DDL is safe (does not
+            // corrupt the PU; the Mart "DDL Generation" tab uses the same
+            // call on every run).
+            try
+            {
+                string leftSql = Path.Combine(Path.GetTempPath(), $"erwin-active-ddl-{Guid.NewGuid():N}.sql");
+                bool ok = false;
+                try { ok = (bool)_activePU.FEModel_DDL(leftSql, ""); }
+                catch (Exception ex) { _log($"VersionCompare: FEModel_DDL on active PU threw: {ex.Message}"); }
+                if (ok && File.Exists(leftSql) && new FileInfo(leftSql).Length > 0)
+                {
+                    string targetServer = ReadActiveTargetServer().TargetServer;
+                    rightDdl = new DdlArtifact(leftSql, new FileInfo(leftSql).Length, targetServer);
+                    _log($"VersionCompare: active PU CREATE DDL = {rightDdl.SizeBytes} bytes");
+                }
+                else
+                {
+                    _log("VersionCompare: active PU FEModel_DDL did not produce output");
+                }
+            }
+            catch (Exception ex)
+            {
+                _log($"VersionCompare: active PU CREATE DDL build failed: {ex.GetType().Name}: {ex.Message}");
+            }
+
+            // Mart vN side - delegated to a fresh worker process (own SCAPI
+            // instance, no interference with the user's add-in session).
+            try
+            {
+                string martSql = Path.Combine(Path.GetTempPath(), $"erwin-mart-ddl-{Guid.NewGuid():N}.sql");
+                var workerExe = LocateWorkerExe();
+                var psi = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = workerExe,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                };
+                psi.ArgumentList.Add("ddl");
+                psi.ArgumentList.Add("--erwin"); psi.ArgumentList.Add(martLocator);
+                psi.ArgumentList.Add("--out"); psi.ArgumentList.Add(martSql);
+                psi.ArgumentList.Add("--disposition"); psi.ArgumentList.Add("OVM=Yes");
+
+                _log($"VersionCompare: Worker ddl: {workerExe} ddl --erwin <mart> --out {martSql}");
+                using var proc = System.Diagnostics.Process.Start(psi)
+                    ?? throw new InvalidOperationException("Process.Start returned null");
+                using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                linked.CancelAfter(TimeSpan.FromMinutes(5));
+                var stderrTask = proc.StandardError.ReadToEndAsync(linked.Token);
+                await proc.WaitForExitAsync(linked.Token).ConfigureAwait(false);
+                var stderr = await stderrTask.ConfigureAwait(false);
+                if (proc.ExitCode == 0 && File.Exists(martSql) && new FileInfo(martSql).Length > 0)
+                {
+                    leftDdl = new DdlArtifact(martSql, new FileInfo(martSql).Length, "(worker)");
+                    _log($"VersionCompare: Mart CREATE DDL = {leftDdl.SizeBytes} bytes");
+                }
+                else
+                {
+                    _log($"VersionCompare: Mart Worker ddl exit={proc.ExitCode} stderr={stderr.TrimEnd()}");
+                }
+            }
+            catch (Exception ex)
+            {
+                _log($"VersionCompare: Mart CREATE DDL build failed: {ex.GetType().Name}: {ex.Message}");
+            }
+
+            return (leftDdl, rightDdl);
+        }
+
+        private static string LocateWorkerExe()
+        {
+            const string exeName = "erwin-alter-ddl-worker.exe";
+            var env = Environment.GetEnvironmentVariable("ERWIN_ALTER_DDL_WORKER");
+            if (!string.IsNullOrEmpty(env) && File.Exists(env)) return env;
+            var asmDir = Path.GetDirectoryName(typeof(VersionCompareService).Assembly.Location) ?? "";
+            foreach (var c in new[]
+            {
+                Path.Combine(asmDir, "Worker", exeName),
+                Path.Combine(asmDir, exeName),
+            })
+            {
+                if (File.Exists(c)) return c;
+            }
+            throw new FileNotFoundException("could not locate erwin-alter-ddl-worker.exe", exeName);
         }
 
         /// <summary>
@@ -189,45 +313,123 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// active PU points at. Preserves the existing Mart connection
         /// parameters (server / port / credentials) and only swaps VNO.
         /// </summary>
+        /// <summary>
+        /// Derive a Worker-usable Mart locator for the requested target
+        /// version. Active PU locators come in several shapes (observed in
+        /// the wild):
+        ///   "Mart://Mart/&lt;lib&gt;/&lt;model&gt;?...VNO=N..."
+        ///   "erwin://Mart://Mart/&lt;lib&gt;/&lt;model&gt;?&amp;version=N&amp;modelLongId=..."
+        /// We extract just the model path and re-emit a fresh, full Mart URL
+        /// with the connection credentials read from the local CONNECTION_DEF
+        /// row (mirrors <c>OpenMartVersionPU</c>'s "full + RDO" attempt). The
+        /// fresh erwin.exe Worker process has no Mart session of its own, so
+        /// embedded credentials are mandatory.
+        /// </summary>
         private string BuildMartLocatorForTarget(int targetVersion)
         {
-            string active = "";
-            try { active = _activePU.PropertyBag().Value("Locator")?.ToString() ?? ""; } catch { }
-            if (!active.StartsWith("mart://", StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException("active PU is not Mart-hosted; version compare is only meaningful for Mart models.");
+            string active = ReadActiveLocator();
+            _log($"VersionCompare: active PU locator = '{MaskMartPassword(active)}' (length={active.Length})");
+            if (string.IsNullOrEmpty(active))
+                throw new InvalidOperationException(
+                    "active PU locator could not be read (PropertyBag returned empty). " +
+                    "Open the model from Mart and try again.");
 
-            // Extract the "mart://Mart/<path>" prefix + the query params.
-            var pathMatch = Regex.Match(active, @"^(?<base>mart://[^?]+)\??(?<q>.*)$", RegexOptions.IgnoreCase);
+            var pathMatch = Regex.Match(active, @"Mart://Mart/(?<path>[^?]+?)(?:[?&]|$)", RegexOptions.IgnoreCase);
             if (!pathMatch.Success)
-                throw new InvalidOperationException($"cannot parse Mart locator from active PU: '{active}'");
-            string basePart = pathMatch.Groups["base"].Value;
-            string query = pathMatch.Groups["q"].Value;
+                throw new InvalidOperationException(
+                    $"could not extract a Mart model path from locator='{MaskMartPassword(active)}'. " +
+                    "Version compare is only meaningful for Mart models.");
+            string modelPath = pathMatch.Groups["path"].Value.Trim('/');
+            _log($"VersionCompare: extracted Mart model path = '{modelPath}'");
 
-            var kv = new List<KeyValuePair<string, string>>();
-            foreach (var chunk in query.Split(';', StringSplitOptions.RemoveEmptyEntries))
+            var info = DdlGenerationService.GetMartConnectionInfo(s => _log(s));
+            if (info is null)
             {
-                var kvPair = chunk.Split('=', 2);
-                if (kvPair.Length == 2) kv.Add(new(kvPair[0], kvPair[1]));
+                _log("VersionCompare: Mart credentials unavailable (CONNECTION_DEF lookup failed); short-form may not authenticate from a fresh worker.");
+                return $"mart://Mart/{modelPath}?VNO={targetVersion.ToString(System.Globalization.CultureInfo.InvariantCulture)}";
             }
 
-            bool replacedVno = false;
-            for (int i = 0; i < kv.Count; i++)
-            {
-                if (string.Equals(kv[i].Key, "VNO", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(kv[i].Key, "version", StringComparison.OrdinalIgnoreCase))
-                {
-                    kv[i] = new(kv[i].Key, targetVersion.ToString(System.Globalization.CultureInfo.InvariantCulture));
-                    replacedVno = true;
-                }
-            }
-            if (!replacedVno) kv.Add(new("VNO", targetVersion.ToString(System.Globalization.CultureInfo.InvariantCulture)));
-
-            var qs = string.Join(';', kv.ConvertAll(p => $"{p.Key}={p.Value}"));
-            return qs.Length == 0 ? basePart : $"{basePart}?{qs}";
+            string ver = targetVersion.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            return $"mart://Mart/{modelPath}?TRC=NO;SRV={info.Value.host};PRT={info.Value.port};ASR=MartServer;UID={info.Value.username};PSW={info.Value.password};VNO={ver}";
         }
 
         private static string MaskMartPassword(string locator) =>
             Regex.Replace(locator, @"PSW=[^;]*", "PSW=***", RegexOptions.IgnoreCase);
+
+        /// <summary>
+        /// Read the active PU's <c>Locator</c> property bag value with two
+        /// fallbacks: the no-arg <c>PropertyBag()</c> overload (matches the
+        /// existing add-in's pattern) and the <c>PropertyBag(null, true)</c>
+        /// overload (returns the bag with derived strings). Logs the failures
+        /// instead of swallowing them silently.
+        /// </summary>
+        private string ReadActiveLocator()
+        {
+            string value = "";
+            try
+            {
+                value = (string)(_activePU.PropertyBag().Value("Locator") ?? string.Empty);
+            }
+            catch (Exception ex)
+            {
+                _log($"VersionCompare: PropertyBag().Value(Locator) threw: {ex.GetType().Name}: {ex.Message}");
+            }
+            if (!string.IsNullOrEmpty(value)) return value;
+
+            try
+            {
+                value = (string)(_activePU.PropertyBag(null, true).Value("Locator") ?? string.Empty);
+            }
+            catch (Exception ex)
+            {
+                _log($"VersionCompare: PropertyBag(null,true).Value(Locator) threw: {ex.GetType().Name}: {ex.Message}");
+            }
+            if (!string.IsNullOrEmpty(value)) return value;
+
+            // Last-resort: read erwin's main window title. The existing
+            // ModelConfigForm parser already mines the version from this
+            // string ("erwin DM - [Mart://.../<model> : vN : ...]"), so we
+            // mirror that approach for the full Mart locator stem.
+            value = ReadLocatorFromWindowTitle();
+            if (!string.IsNullOrEmpty(value))
+                _log($"VersionCompare: locator recovered from window title");
+            return value ?? string.Empty;
+        }
+
+        private static string ReadLocatorFromWindowTitle()
+        {
+            try
+            {
+                var hWnd = Win32Helper.GetErwinMainWindow();
+                if (hWnd == IntPtr.Zero) return string.Empty;
+                var sb = new System.Text.StringBuilder(1024);
+                Win32Helper.GetWindowTextPublic(hWnd, sb, sb.Capacity);
+                var title = sb.ToString();
+                // Patterns observed:
+                //   "erwin DM - [Mart://Mart/<lib>/<model> : vN : <diagram> [* ]]"
+                // Extract the bracketed locator stem; we still need a version
+                // suffix on the consumer end via ParseVersionFromLocator.
+                var m = Regex.Match(title, @"\[(?<base>(?:[Mm]art://)[^\s\]]+)(?:\s*:\s*v(?<v>\d+))?", RegexOptions.IgnoreCase);
+                if (!m.Success) return string.Empty;
+                var basePart = m.Groups["base"].Value;
+                var ver = m.Groups["v"].Value;
+                return string.IsNullOrEmpty(ver) ? basePart : $"{basePart}?VNO={ver}";
+            }
+            catch { return string.Empty; }
+        }
+
+        /// <summary>
+        /// Tolerant detection of a Mart-hosted locator. Accepts
+        /// <c>mart://</c> in any casing AND the (rare) plain
+        /// <c>Mart:</c> form some servicing levels emit before the slashes.
+        /// </summary>
+        private static bool IsMartLocator(string locator)
+        {
+            if (string.IsNullOrEmpty(locator)) return false;
+            return locator.StartsWith("mart://", StringComparison.OrdinalIgnoreCase)
+                || locator.StartsWith("mart:", StringComparison.OrdinalIgnoreCase)
+                || locator.IndexOf("mart://", StringComparison.OrdinalIgnoreCase) == 0;
+        }
 
         private static string SafeGet(dynamic bag, string key)
         {

@@ -1,3 +1,5 @@
+using System.Text.RegularExpressions;
+
 using EliteSoft.Erwin.AlterDdl.Core.Models;
 using EliteSoft.Erwin.AlterDdl.Core.Parsing;
 
@@ -12,6 +14,15 @@ public sealed class MssqlEmitter : ISqlEmitter
 {
     public string Dialect => "MSSQL";
 
+    /// <summary>
+    /// XLS-derived schema-by-entity-name lookup, valid only for the duration
+    /// of a single <see cref="Emit"/> call. Stored in a [ThreadStatic] so
+    /// the existing static <c>EmitXxx</c> helpers can read it without an
+    /// extra parameter on every signature.
+    /// </summary>
+    [System.ThreadStatic]
+    private static IReadOnlyDictionary<string, string>? t_xlsSchemas;
+
     public AlterDdlScript Emit(CompareResult compareResult)
     {
         ArgumentNullException.ThrowIfNull(compareResult);
@@ -23,30 +34,33 @@ public sealed class MssqlEmitter : ISqlEmitter
             try { rightCols = CreateDdlParser.Parse(File.ReadAllText(p)); }
             catch { /* best effort, fall back to TODO placeholder */ }
         }
+        t_xlsSchemas = compareResult.SchemaByEntityName;
+        try
+        {
 
         foreach (var change in compareResult.Changes)
         {
             AlterStatement? emitted = change switch
             {
-                EntityAdded ea => EmitEntityAdded(ea),
-                EntityDropped ed => EmitEntityDropped(ed),
+                EntityAdded ea => EmitEntityAdded(ea, rightCols),
+                EntityDropped ed => EmitEntityDropped(ed, rightCols),
                 EntityRenamed er => EmitEntityRenamed(er),
                 SchemaMoved sm => EmitSchemaMoved(sm),
                 AttributeAdded aa => EmitAttributeAdded(aa, rightCols),
-                AttributeDropped ad => EmitAttributeDropped(ad),
+                AttributeDropped ad => EmitAttributeDropped(ad, rightCols),
                 AttributeRenamed ar => EmitAttributeRenamed(ar),
-                AttributeTypeChanged at => EmitAttributeTypeChanged(at),
+                AttributeTypeChanged at => EmitAttributeTypeChanged(at, rightCols),
                 AttributeNullabilityChanged an => EmitAttributeNullability(an, rightCols),
-                AttributeDefaultChanged ad2 => EmitAttributeDefault(ad2),
-                AttributeIdentityChanged ai => EmitAttributeIdentity(ai),
+                AttributeDefaultChanged ad2 => EmitAttributeDefault(ad2, rightCols),
+                AttributeIdentityChanged ai => EmitAttributeIdentity(ai, rightCols),
                 KeyGroupAdded ka => EmitKeyGroupAdded(ka, rightCols),
-                KeyGroupDropped kd => EmitKeyGroupDropped(kd),
+                KeyGroupDropped kd => EmitKeyGroupDropped(kd, rightCols),
                 KeyGroupRenamed kr => EmitKeyGroupRenamed(kr),
                 ForeignKeyAdded fa => EmitForeignKeyAdded(fa, rightCols),
                 ForeignKeyDropped fd => EmitForeignKeyDropped(fd),
                 ForeignKeyRenamed fr => EmitForeignKeyRenamed(fr),
-                ViewAdded va => new($"-- TODO: CREATE VIEW {QuoteQualified(va.Target.Name)} AS <body from v2 DDL>", $"add view {va.Target.Name}"),
-                ViewDropped vd => new($"DROP VIEW {QuoteQualified(vd.Target.Name)};", $"drop view {vd.Target.Name}"),
+                ViewAdded va => EmitViewAdded(va, rightCols),
+                ViewDropped vd => new($"DROP VIEW {QuoteEntityName(vd.Target.Name, rightCols)};", $"drop view {vd.Target.Name}"),
                 ViewRenamed vr => new($"EXEC sp_rename '{vr.OldName}', '{vr.Target.Name}';", $"rename view {vr.OldName} -> {vr.Target.Name}"),
                 TriggerAdded ta => new($"-- TODO: CREATE TRIGGER {QuoteQualified(ta.Target.Name)} body from v2 model", $"add trigger {ta.Target.Name}"),
                 TriggerDropped td => new($"DROP TRIGGER {QuoteQualified(td.Target.Name)};", $"drop trigger {td.Target.Name}"),
@@ -60,16 +74,72 @@ public sealed class MssqlEmitter : ISqlEmitter
         }
 
         return new AlterDdlScript(Dialect, stmts);
+        }
+        finally
+        {
+            t_xlsSchemas = null;
+        }
     }
 
     // ---------- Entity-level ----------
 
-    private static AlterStatement EmitEntityAdded(EntityAdded ea) => new(
-        Sql: $"-- TODO: copy CREATE TABLE body for {QuoteQualified(ea.Target.Name)} from v2 CREATE DDL",
-        Comment: $"new entity {ea.Target.Name}");
+    private static AlterStatement EmitEntityAdded(EntityAdded ea, DdlColumnMap? rightCols)
+    {
+        // Prefer the verbatim CREATE TABLE block from the v2 CREATE DDL so
+        // the user sees exactly what erwin would generate; fall back to a
+        // TODO comment when the DDL is unavailable.
+        var bare = UnqualifiedTable(ea.Target.Name);
+        if (rightCols is not null && rightCols.TryGetCreateBlock(bare, out var block))
+        {
+            // erwin's FEModel_DDL writes the CREATE TABLE header schema-less
+            // for some target servers, but the CC XLS / right map gives us
+            // the real owner. Rewrite the header so the emitted body lines
+            // up with the schema-prefixed ALTER statements emitted elsewhere.
+            var withSchema = InjectSchemaIntoCreateBlock(block, bare, rightCols);
+            return new AlterStatement(
+                Sql: withSchema.TrimEnd() + ";",
+                Comment: $"new entity {ea.Target.Name}");
+        }
+        return new AlterStatement(
+            Sql: $"-- TODO: copy CREATE TABLE body for {QuoteEntityName(ea.Target.Name, rightCols)} from v2 CREATE DDL",
+            Comment: $"new entity {ea.Target.Name}");
+    }
 
-    private static AlterStatement EmitEntityDropped(EntityDropped ed) => new(
-        Sql: $"DROP TABLE {QuoteQualified(ed.Target.Name)};",
+    /// <summary>
+    /// Rewrite the <c>CREATE TABLE [schema.]name (</c> header in a verbatim
+    /// CREATE block so the emitted name is schema-qualified using MSSQL
+    /// quoting (<c>[schema].[name]</c>). Schema is resolved from the XLS map
+    /// first (most reliable - CC always emits Entity/Table rows as
+    /// <c>schema.table</c>), then from the v2 CREATE DDL header. If neither
+    /// knows the schema, the block is returned unchanged.
+    /// </summary>
+    private static string InjectSchemaIntoCreateBlock(string block, string bareTableName, DdlColumnMap? rightCols)
+    {
+        var schema = ResolveSchema(bareTableName, rightCols);
+        if (string.IsNullOrEmpty(schema)) return block;
+
+        var pattern = new Regex(
+            @"(CREATE\s+TABLE\s+)(?:[\[""]?\w+[\]""]?\s*\.\s*)?[\[""]?"
+                + Regex.Escape(bareTableName)
+                + @"[\]""]?(\s*\()",
+            RegexOptions.IgnoreCase);
+        var replacement = "$1" + Quote(schema) + "." + Quote(bareTableName) + "$2";
+        return pattern.Replace(block, replacement, count: 1);
+    }
+
+    /// <summary>Schema lookup priority: XLS map first, then right CREATE DDL.</summary>
+    private static string? ResolveSchema(string bareTableName, DdlColumnMap? rightCols)
+    {
+        var xls = t_xlsSchemas;
+        if (xls is not null && xls.TryGetValue(bareTableName, out var xlsSch) && !string.IsNullOrEmpty(xlsSch))
+            return xlsSch;
+        if (rightCols is not null && rightCols.TryGetSchema(bareTableName, out var sch) && !string.IsNullOrEmpty(sch))
+            return sch;
+        return null;
+    }
+
+    private static AlterStatement EmitEntityDropped(EntityDropped ed, DdlColumnMap? rightCols) => new(
+        Sql: $"DROP TABLE {QuoteEntityName(ed.Target.Name, rightCols)};",
         Comment: $"drop entity {ed.Target.Name}");
 
     private static AlterStatement EmitEntityRenamed(EntityRenamed er) => new(
@@ -80,6 +150,10 @@ public sealed class MssqlEmitter : ISqlEmitter
         Sql: $"ALTER SCHEMA {Quote(sm.NewSchema)} TRANSFER {Quote(sm.OldSchema)}.{Quote(sm.Target.Name)};",
         Comment: $"move {sm.Target.Name} from schema {sm.OldSchema} to {sm.NewSchema}");
 
+    private static AlterStatement EmitViewAdded(ViewAdded va, DdlColumnMap? rightCols) => new(
+        Sql: $"-- TODO: CREATE VIEW {QuoteEntityName(va.Target.Name, rightCols)} AS <body from v2 DDL>",
+        Comment: $"add view {va.Target.Name}");
+
     // ---------- Attribute-level ----------
 
     private static AlterStatement EmitAttributeAdded(AttributeAdded aa, DdlColumnMap? rightCols)
@@ -89,20 +163,20 @@ public sealed class MssqlEmitter : ISqlEmitter
                 ? t
                 : "/* TODO: datatype from v2 CREATE DDL */";
         return new AlterStatement(
-            Sql: $"ALTER TABLE {QuoteQualified(aa.ParentEntity.Name)} ADD {Quote(aa.Target.Name)} {type};",
+            Sql: $"ALTER TABLE {QuoteEntityName(aa.ParentEntity.Name, rightCols)} ADD {Quote(aa.Target.Name)} {type};",
             Comment: $"add column {aa.ParentEntity.Name}.{aa.Target.Name}");
     }
 
-    private static AlterStatement EmitAttributeDropped(AttributeDropped ad) => new(
-        Sql: $"ALTER TABLE {QuoteQualified(ad.ParentEntity.Name)} DROP COLUMN {Quote(ad.Target.Name)};",
+    private static AlterStatement EmitAttributeDropped(AttributeDropped ad, DdlColumnMap? rightCols) => new(
+        Sql: $"ALTER TABLE {QuoteEntityName(ad.ParentEntity.Name, rightCols)} DROP COLUMN {Quote(ad.Target.Name)};",
         Comment: $"drop column {ad.ParentEntity.Name}.{ad.Target.Name}");
 
     private static AlterStatement EmitAttributeRenamed(AttributeRenamed ar) => new(
         Sql: $"EXEC sp_rename '{ar.ParentEntity.Name}.{ar.OldName}', '{ar.Target.Name}', 'COLUMN';",
         Comment: $"rename column {ar.ParentEntity.Name}.{ar.OldName} -> {ar.Target.Name}");
 
-    private static AlterStatement EmitAttributeTypeChanged(AttributeTypeChanged at) => new(
-        Sql: $"ALTER TABLE {QuoteQualified(at.ParentEntity.Name)} ALTER COLUMN {Quote(at.Target.Name)} {at.RightType};",
+    private static AlterStatement EmitAttributeTypeChanged(AttributeTypeChanged at, DdlColumnMap? rightCols) => new(
+        Sql: $"ALTER TABLE {QuoteEntityName(at.ParentEntity.Name, rightCols)} ALTER COLUMN {Quote(at.Target.Name)} {at.RightType};",
         Comment: $"type change {at.ParentEntity.Name}.{at.Target.Name} {at.LeftType} -> {at.RightType}");
 
     private static AlterStatement EmitAttributeNullability(AttributeNullabilityChanged an, DdlColumnMap? rightCols)
@@ -113,13 +187,13 @@ public sealed class MssqlEmitter : ISqlEmitter
                 : "/* TODO: datatype */";
         var nullSuffix = an.RightNullable ? "NULL" : "NOT NULL";
         return new AlterStatement(
-            Sql: $"ALTER TABLE {QuoteQualified(an.ParentEntity.Name)} ALTER COLUMN {Quote(an.Target.Name)} {type} {nullSuffix};",
+            Sql: $"ALTER TABLE {QuoteEntityName(an.ParentEntity.Name, rightCols)} ALTER COLUMN {Quote(an.Target.Name)} {type} {nullSuffix};",
             Comment: $"nullability {an.ParentEntity.Name}.{an.Target.Name} {(an.LeftNullable ? "NULL" : "NOT NULL")} -> {nullSuffix}");
     }
 
-    private static AlterStatement EmitAttributeDefault(AttributeDefaultChanged ad)
+    private static AlterStatement EmitAttributeDefault(AttributeDefaultChanged ad, DdlColumnMap? rightCols)
     {
-        var table = QuoteQualified(ad.ParentEntity.Name);
+        var table = QuoteEntityName(ad.ParentEntity.Name, rightCols);
         var column = Quote(ad.Target.Name);
         var comment = $"default {ad.ParentEntity.Name}.{ad.Target.Name} '{ad.LeftDefault}' -> '{ad.RightDefault}'";
 
@@ -136,13 +210,13 @@ public sealed class MssqlEmitter : ISqlEmitter
         return new AlterStatement(addSql, comment);
     }
 
-    private static AlterStatement EmitAttributeIdentity(AttributeIdentityChanged ai)
+    private static AlterStatement EmitAttributeIdentity(AttributeIdentityChanged ai, DdlColumnMap? rightCols)
     {
         var arrow = ai.RightHasIdentity
             ? "add IDENTITY (requires table rebuild)"
             : "drop IDENTITY (requires table rebuild)";
         return new AlterStatement(
-            Sql: $"-- TODO: {arrow} on {QuoteQualified(ai.ParentEntity.Name)}.{Quote(ai.Target.Name)}\n"
+            Sql: $"-- TODO: {arrow} on {QuoteEntityName(ai.ParentEntity.Name, rightCols)}.{Quote(ai.Target.Name)}\n"
                + $"--       SQL Server has no in-place ALTER for IDENTITY; plan a swap table + sp_rename migration.",
             Comment: $"identity {ai.ParentEntity.Name}.{ai.Target.Name}: {ai.LeftHasIdentity} -> {ai.RightHasIdentity}");
     }
@@ -150,7 +224,7 @@ public sealed class MssqlEmitter : ISqlEmitter
     private static AlterStatement EmitKeyGroupAdded(KeyGroupAdded ka, DdlColumnMap? rightCols)
     {
         var columns = ColumnsClause(rightCols, ka.Target.Name);
-        var table = QuoteQualified(ka.ParentEntity.Name);
+        var table = QuoteEntityName(ka.ParentEntity.Name, rightCols);
         return ka.Kind switch
         {
             KeyGroupKind.PrimaryKey => new(
@@ -165,9 +239,9 @@ public sealed class MssqlEmitter : ISqlEmitter
         };
     }
 
-    private static AlterStatement EmitKeyGroupDropped(KeyGroupDropped kd)
+    private static AlterStatement EmitKeyGroupDropped(KeyGroupDropped kd, DdlColumnMap? rightCols)
     {
-        var table = QuoteQualified(kd.ParentEntity.Name);
+        var table = QuoteEntityName(kd.ParentEntity.Name, rightCols);
         return kd.Kind switch
         {
             KeyGroupKind.PrimaryKey => new(
@@ -241,5 +315,24 @@ public sealed class MssqlEmitter : ISqlEmitter
         var dot = name.IndexOf('.');
         if (dot < 0) return Quote(name);
         return Quote(name[..dot]) + "." + Quote(name[(dot + 1)..]);
+    }
+
+    /// <summary>
+    /// Quote an entity / table name. Schema lookup priority:
+    ///   1. The name is already qualified (<c>schema.table</c>) - split + quote.
+    ///   2. CC XLS told us the owner schema for this table (most reliable -
+    ///      erwin's CC always emits <c>schema.table</c> in Entity/Table rows).
+    ///   3. The v2 CREATE DDL has a schema in its <c>CREATE TABLE</c> header.
+    ///   4. No schema known - emit bare <c>[table]</c>.
+    /// </summary>
+    private static string QuoteEntityName(string name, DdlColumnMap? rightCols)
+    {
+        if (name.Contains('.')) return QuoteQualified(name);
+        var xls = t_xlsSchemas;
+        if (xls is not null && xls.TryGetValue(name, out var xlsSch) && !string.IsNullOrEmpty(xlsSch))
+            return Quote(xlsSch) + "." + Quote(name);
+        if (rightCols is not null && rightCols.TryGetSchema(name, out var sch))
+            return Quote(sch) + "." + Quote(name);
+        return Quote(name);
     }
 }

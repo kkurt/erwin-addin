@@ -76,6 +76,8 @@ public sealed class LiveSessionModelMapProvider : IModelMapProvider
             foreach (var cls in new[] { "Sequence", "Oracle_Sequence", "ER_Sequence" })
                 CollectTopLevel(modelObjects, root, cls, nodes, walkNested: false);
 
+            ApplySchemaPrefix(modelObjects, root, nodes);
+
             return new ErwinModelMapDto(ErwinModelMapDto.CurrentSchemaVersion, _pathKey, nodes);
         }
         finally
@@ -139,12 +141,129 @@ public sealed class LiveSessionModelMapProvider : IModelMapProvider
         catch { /* Context unavailable on some classes */ }
         if (string.IsNullOrEmpty(parentId)) parentId = null;
         if (string.IsNullOrEmpty(owningEntityName)) owningEntityName = null;
+
+        // erwin's Table editor exposes a Schema column for Entity / View;
+        // prefix the name with that schema so the emitter renders
+        // [schema].[entity] (matches erwin's own CompleteCompare output).
+        if (cls == "Entity" || cls == "View")
+        {
+            var sch = ReadSchemaProperty(obj);
+            if (!string.IsNullOrEmpty(sch))
+                name = $"{sch}.{name}";
+        }
+
         return new ObjectNodeDto(id, name, cls, parentId, owningEntityName);
     }
+
+    private static string ReadSchemaProperty(dynamic obj)
+    {
+        // First try the Properties("Name") accessor pattern with the most
+        // common erwin r10 property keys.
+        foreach (var key in new[]
+        {
+            "Schema",
+            "SQL_Server_Schema",
+            "Oracle_Owner",
+            "Owner_Schema",
+            "Owner",
+            "Physical_Schema",
+            "Table_Owner",
+            "Owner_Name",
+            "Schema_Name",
+            "Owner_Schema_Name",
+            "DB_Schema_Name",
+        })
+        {
+            try
+            {
+                var v = SafeStr(() => obj.Properties(key).Value?.ToString());
+                if (IsRealValue(v)) return v;
+            }
+            catch { /* try next */ }
+        }
+
+        // Fall back to direct COM property access. Some r10 metamodels
+        // surface Schema as a navigable reference rather than a scalar
+        // Properties() entry.
+        foreach (var directProbe in new Func<dynamic, string>[]
+        {
+            o => SafeStr(() => o.Schema?.Name?.ToString()),
+            o => SafeStr(() => o.Owner?.Name?.ToString()),
+            o => SafeStr(() => o.OwnerSchema?.Name?.ToString()),
+            o => SafeStr(() => o.Schema?.ToString()),
+            o => SafeStr(() => o.Owner?.ToString()),
+        })
+        {
+            try
+            {
+                var v = directProbe(obj);
+                if (IsRealValue(v)) return v;
+            }
+            catch { }
+        }
+        return string.Empty;
+    }
+
+    private static bool IsRealValue(string v) =>
+        !string.IsNullOrEmpty(v)
+        && !v.StartsWith("%", StringComparison.Ordinal)
+        && !v.Equals("System.__ComObject", StringComparison.Ordinal);
 
     private static string SafeStr(Func<string?> get)
     {
         try { return get() ?? string.Empty; }
         catch { return string.Empty; }
+    }
+
+    /// <summary>
+    /// Mirror of the Worker's schema-prefix post-pass. Iterates the
+    /// model's <c>Schema</c> objects, maps each member entity / view to its
+    /// owning schema name, and rewrites the matching nodes' Name to
+    /// "schema.entity" so the emitter's QuoteQualified splits it back into
+    /// "[schema].[entity]".
+    /// </summary>
+    private static void ApplySchemaPrefix(dynamic modelObjects, dynamic root, List<ObjectNodeDto> nodes)
+    {
+        var schemaByObjectId = new Dictionary<string, string>(StringComparer.Ordinal);
+        try
+        {
+            dynamic schemas = modelObjects.Collect(root, "Schema");
+            if (schemas is not null)
+            {
+                foreach (dynamic sch in schemas)
+                {
+                    if (sch is null) continue;
+                    string schName = SafeStr(() => sch.Name?.ToString());
+                    if (string.IsNullOrEmpty(schName)) continue;
+                    foreach (var memberClass in new[] { "Entity", "View" })
+                    {
+                        try
+                        {
+                            dynamic members = modelObjects.Collect(sch, memberClass);
+                            if (members is null) continue;
+                            foreach (dynamic m in members)
+                            {
+                                if (m is null) continue;
+                                string mid = SafeStr(() => m.ObjectId?.ToString());
+                                if (!string.IsNullOrEmpty(mid)) schemaByObjectId[mid] = schName;
+                            }
+                        }
+                        catch { /* member class may not exist for this schema */ }
+                    }
+                }
+            }
+        }
+        catch { /* Schema class may be unavailable in some target servers */ }
+
+        if (schemaByObjectId.Count == 0) return;
+        for (int i = 0; i < nodes.Count; i++)
+        {
+            if (nodes[i].Class != "Entity" && nodes[i].Class != "View") continue;
+            // ToNode may have already attached a schema prefix via the
+            // entity's Property("Schema"); skip to avoid "dbo.dbo.X".
+            if (nodes[i].Name.Contains('.')) continue;
+            if (schemaByObjectId.TryGetValue(nodes[i].ObjectId, out var sch) && !string.IsNullOrEmpty(sch))
+                nodes[i] = nodes[i] with { Name = $"{sch}.{nodes[i].Name}" };
+        }
     }
 }

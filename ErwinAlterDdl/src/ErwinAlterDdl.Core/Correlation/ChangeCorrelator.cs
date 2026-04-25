@@ -31,6 +31,17 @@ public static class ChangeCorrelator
         CorrelateTriggers(leftMap, rightMap, changes);
         CorrelateSequences(leftMap, rightMap, changes);
 
+        // CC is the source of truth. When the caller supplies XLS rows, drop
+        // any change whose target/parent was not mentioned by CC. Structural
+        // diff (XML map set-diff) can find more granular differences than CC
+        // chooses to surface, but the user's policy is "if CC didn't report
+        // it, we don't emit it" - both to avoid noise and to stay aligned
+        // with what the DBA sees in erwin's GUI compare.
+        // When xlsRows is empty (e.g. SkipCompleteCompare path or unit tests
+        // that don't supply XLS), we trust the structural diff outright.
+        if (xlsRows.Count > 0)
+            changes = FilterByXlsAllowlist(changes, xlsRows);
+
         // Deterministic order: stable by (Target.Class, Target.Name, kind name).
         return changes
             .OrderBy(c => c.Target.Class, StringComparer.Ordinal)
@@ -38,6 +49,169 @@ public static class ChangeCorrelator
             .ThenBy(c => c.GetType().Name, StringComparer.Ordinal)
             .ToList();
     }
+
+    /// <summary>
+    /// Build an allow-set of (class -> names) and (entity -> attribute names)
+    /// observed in CC XLS, then drop any structural-diff change whose target
+    /// is not in the corresponding set. Names are normalized by stripping
+    /// schema prefix (CC sometimes qualifies entities as "schema.X" while
+    /// the XML map stores just "X").
+    /// </summary>
+    private static List<Change> FilterByXlsAllowlist(List<Change> changes, IReadOnlyList<XlsDiffRow> xlsRows)
+    {
+        var entityAllow = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var attrAllow = new HashSet<string>(StringComparer.OrdinalIgnoreCase); // entity\0attr
+        var keyGroupAllow = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var relationshipAllow = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var viewAllow = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var triggerAllow = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var sequenceAllow = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        string? ctxEntity = null;
+        int? ctxEntityIndent = null;
+
+        void AddBoth(HashSet<string> set, XlsDiffRow row)
+        {
+            if (!string.IsNullOrEmpty(row.LeftValue))
+                set.Add(StripSchemaPrefix(row.LeftValue));
+            if (!string.IsNullOrEmpty(row.RightValue))
+                set.Add(StripSchemaPrefix(row.RightValue));
+        }
+
+        foreach (var row in xlsRows)
+        {
+            if (ctxEntityIndent is int e && row.IndentLevel <= e)
+            {
+                ctxEntity = null;
+                ctxEntityIndent = null;
+            }
+
+            if (IsEntityRowType(row.Type))
+            {
+                AddBoth(entityAllow, row);
+                var name = row.LeftValue.Length > 0 ? row.LeftValue : row.RightValue;
+                if (!string.IsNullOrEmpty(name))
+                {
+                    ctxEntity = StripSchemaPrefix(name);
+                    ctxEntityIndent = row.IndentLevel;
+                }
+            }
+            else if (IsAttributeRowType(row.Type))
+            {
+                if (ctxEntity is not null)
+                {
+                    if (!string.IsNullOrEmpty(row.LeftValue))
+                        attrAllow.Add(ctxEntity + "\0" + row.LeftValue);
+                    if (!string.IsNullOrEmpty(row.RightValue))
+                        attrAllow.Add(ctxEntity + "\0" + row.RightValue);
+                }
+            }
+            else if (IsKeyGroupRowType(row.Type))
+            {
+                AddBoth(keyGroupAllow, row);
+            }
+            else if (IsRelationshipRowType(row.Type))
+            {
+                AddBoth(relationshipAllow, row);
+            }
+            else if (IsViewRowType(row.Type))
+            {
+                AddBoth(viewAllow, row);
+            }
+            else if (IsTriggerRowType(row.Type))
+            {
+                AddBoth(triggerAllow, row);
+            }
+            else if (IsSequenceRowType(row.Type))
+            {
+                AddBoth(sequenceAllow, row);
+            }
+        }
+
+        bool EntityKept(string name) =>
+            entityAllow.Contains(StripSchemaPrefix(name));
+
+        bool AttrKept(string entity, string attr) =>
+            attrAllow.Contains(StripSchemaPrefix(entity) + "\0" + attr);
+
+        var kept = new List<Change>(changes.Count);
+        foreach (var c in changes)
+        {
+            bool keep = c switch
+            {
+                EntityAdded ea => EntityKept(ea.Target.Name),
+                EntityDropped ed => EntityKept(ed.Target.Name),
+                EntityRenamed er => EntityKept(er.Target.Name) || EntityKept(er.OldName),
+                SchemaMoved sm => EntityKept(sm.Target.Name),
+                AttributeAdded aa => AttrKept(aa.ParentEntity.Name, aa.Target.Name),
+                AttributeDropped ad => AttrKept(ad.ParentEntity.Name, ad.Target.Name),
+                AttributeRenamed ar => AttrKept(ar.ParentEntity.Name, ar.Target.Name)
+                                       || AttrKept(ar.ParentEntity.Name, ar.OldName),
+                AttributeTypeChanged at => AttrKept(at.ParentEntity.Name, at.Target.Name),
+                AttributeNullabilityChanged an => AttrKept(an.ParentEntity.Name, an.Target.Name),
+                AttributeDefaultChanged ad2 => AttrKept(ad2.ParentEntity.Name, ad2.Target.Name),
+                AttributeIdentityChanged ai => AttrKept(ai.ParentEntity.Name, ai.Target.Name),
+                KeyGroupAdded ka => keyGroupAllow.Contains(ka.Target.Name),
+                KeyGroupDropped kd => keyGroupAllow.Contains(kd.Target.Name),
+                KeyGroupRenamed kr => keyGroupAllow.Contains(kr.Target.Name)
+                                      || keyGroupAllow.Contains(kr.OldName),
+                ForeignKeyAdded fa => relationshipAllow.Contains(fa.Target.Name),
+                ForeignKeyDropped fd => relationshipAllow.Contains(fd.Target.Name),
+                ForeignKeyRenamed fr => relationshipAllow.Contains(fr.Target.Name)
+                                        || relationshipAllow.Contains(fr.OldName),
+                ViewAdded va => viewAllow.Contains(va.Target.Name),
+                ViewDropped vd => viewAllow.Contains(vd.Target.Name),
+                ViewRenamed vr => viewAllow.Contains(vr.Target.Name)
+                                  || viewAllow.Contains(vr.OldName),
+                TriggerAdded ta => triggerAllow.Contains(ta.Target.Name),
+                TriggerDropped td => triggerAllow.Contains(td.Target.Name),
+                TriggerRenamed tr => triggerAllow.Contains(tr.Target.Name)
+                                     || triggerAllow.Contains(tr.OldName),
+                SequenceAdded sa => sequenceAllow.Contains(sa.Target.Name),
+                SequenceDropped sd => sequenceAllow.Contains(sd.Target.Name),
+                SequenceRenamed sr => sequenceAllow.Contains(sr.Target.Name)
+                                      || sequenceAllow.Contains(sr.OldName),
+                _ => true,
+            };
+            if (keep) kept.Add(c);
+        }
+        return kept;
+    }
+
+    private static bool IsEntityRowType(string t) =>
+        t.Equals("Entity/Table", StringComparison.OrdinalIgnoreCase)
+        || t.Equals("Table", StringComparison.OrdinalIgnoreCase)
+        || t.Equals("Entity", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsAttributeRowType(string t) =>
+        t.Equals("Attribute/Column", StringComparison.OrdinalIgnoreCase)
+        || t.Equals("Column", StringComparison.OrdinalIgnoreCase)
+        || t.Equals("Attribute", StringComparison.OrdinalIgnoreCase);
+
+    // Liberal matchers: erwin's CC XLS row-Type strings drift between
+    // metamodel revisions and DBMS adapters, so we accept anything that
+    // mentions the broad object class. False positives here only WIDEN the
+    // allow-set, never discard real CC signals.
+    private static bool IsKeyGroupRowType(string t) =>
+        t.Contains("Key Group", StringComparison.OrdinalIgnoreCase)
+        || t.Contains("Key_Group", StringComparison.OrdinalIgnoreCase)
+        || t.Contains("Index", StringComparison.OrdinalIgnoreCase)
+        || t.Equals("Primary Key", StringComparison.OrdinalIgnoreCase)
+        || t.Equals("Unique Constraint", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsRelationshipRowType(string t) =>
+        t.Contains("Relationship", StringComparison.OrdinalIgnoreCase)
+        || t.Contains("Foreign Key", StringComparison.OrdinalIgnoreCase)
+        || t.Contains("Foreign_Key", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsViewRowType(string t) =>
+        t.Equals("View", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsTriggerRowType(string t) =>
+        t.Contains("Trigger", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsSequenceRowType(string t) =>
+        t.Contains("Sequence", StringComparison.OrdinalIgnoreCase);
 
     private static void CorrelateEntities(ErwinModelMap left, ErwinModelMap right, List<Change> sink)
     {
@@ -139,6 +313,18 @@ public static class ChangeCorrelator
                     if (!TryResolveAttribute(right, ctxEntityName, ctxAttrName, out var resolved))
                         break;
 
+                    // Skip property change when the attribute is brand new on
+                    // the right side. erwin's CC emits "Not Equal" property
+                    // rows (Physical Data Type, Null Option, Default, ...)
+                    // for newly-added attributes too - one row per property,
+                    // with the missing side empty. Surfacing those as ALTER
+                    // COLUMN statements is duplicate noise: AttributeAdded
+                    // (or the verbatim CREATE TABLE for newly-added entities)
+                    // already carries the type, nullability, default, etc.
+                    // We use ObjectId (not name) so renames - same id, new
+                    // name on the right - still get their property changes.
+                    if (!left.TryGetById(resolved.ObjectId, out _)) break;
+
                     var parent = ResolveParentEntity(right, resolved)
                         ?? LookupEntityByName(right, ctxEntityName)
                         ?? new ObjectRef(
@@ -221,7 +407,13 @@ public static class ChangeCorrelator
 
                 case "Null Option" when row.IsNotEqual:
                     if (ctxEntityName is null || ctxAttrName is null) break;
-                    if (!TryResolveAttribute(right, ctxEntityName, ctxAttrName, out _)) break;
+                    if (!TryResolveAttribute(right, ctxEntityName, ctxAttrName, out var attrN0)) break;
+                    // Suppress redundant "Null Option Not Equal" rows that CC
+                    // emits for newly-added attributes - the AttributeAdded
+                    // path (or verbatim CREATE TABLE for new entities) already
+                    // carries the column nullability. ObjectId match (rather
+                    // than name match) tolerates renames.
+                    if (!left.TryGetById(attrN0.ObjectId, out _)) break;
                     var (attrN, parentN) = ResolveAttrRefs(right, ctxEntityName, ctxAttrName);
                     sink.Add(new AttributeNullabilityChanged(
                         attrN, parentN,
@@ -232,7 +424,8 @@ public static class ChangeCorrelator
                 case "Default" when row.IsNotEqual:
                 case "Default Value" when row.IsNotEqual:
                     if (ctxEntityName is null || ctxAttrName is null) break;
-                    if (!TryResolveAttribute(right, ctxEntityName, ctxAttrName, out _)) break;
+                    if (!TryResolveAttribute(right, ctxEntityName, ctxAttrName, out var attrD0)) break;
+                    if (!left.TryGetById(attrD0.ObjectId, out _)) break;
                     var (attrD, parentD) = ResolveAttrRefs(right, ctxEntityName, ctxAttrName);
                     sink.Add(new AttributeDefaultChanged(
                         attrD, parentD,
@@ -244,7 +437,8 @@ public static class ChangeCorrelator
                 case "Identity Increment" when row.IsNotEqual:
                 case "Identity Seed" when row.IsNotEqual:
                     if (ctxEntityName is null || ctxAttrName is null) break;
-                    if (!TryResolveAttribute(right, ctxEntityName, ctxAttrName, out _)) break;
+                    if (!TryResolveAttribute(right, ctxEntityName, ctxAttrName, out var attrI0)) break;
+                    if (!left.TryGetById(attrI0.ObjectId, out _)) break;
                     var dedupeKey = $"{ctxEntityName}.{ctxAttrName}";
                     if (!identityEmitted.Add(dedupeKey)) break;
                     var (attrI, parentI) = ResolveAttrRefs(right, ctxEntityName, ctxAttrName);

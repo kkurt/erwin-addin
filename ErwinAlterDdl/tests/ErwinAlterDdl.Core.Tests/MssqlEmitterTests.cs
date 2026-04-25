@@ -89,7 +89,10 @@ public class MssqlEmitterTests
                 RightDdl = new DdlArtifact(tmp, new FileInfo(tmp).Length, "SQL Server"),
             };
             var sql = _emitter.Emit(r).Statements[0].Sql;
-            sql.Should().Be("ALTER TABLE [CUSTOMER] ADD [email_verified] BIT;");
+            // Schema "[app]" is recovered from the CREATE TABLE header so
+            // the emitter renders [schema].[table] - matches erwin's own
+            // CompleteCompare output.
+            sql.Should().Be("ALTER TABLE [app].[CUSTOMER] ADD [email_verified] BIT;");
         }
         finally { try { File.Delete(tmp); } catch { } }
     }
