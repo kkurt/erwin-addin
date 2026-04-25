@@ -4652,6 +4652,72 @@ namespace EliteSoft.Erwin.AddIn
             }
         }
 
+        /// <summary>
+        /// EXPERIMENTAL probe: calls <c>activePU.Save(temp.erwin, "OVF=Yes")</c>
+        /// and reports PropertyBag diff before/after, plus a benign FE_DDL
+        /// post-check. Used to learn whether Save on a live Mart-backed PU is
+        /// non-destructive (a true copy) or destructive (relocates the live
+        /// PU's Locator). Removed once we have a verdict.
+        /// </summary>
+        private async void btnProbePuSave_Click(object sender, EventArgs e)
+        {
+            if (!_isConnected || _currentModel == null || _scapi == null)
+            {
+                ErwinAddIn.ShowTopMostMessage("No active erwin model.", "Probe");
+                return;
+            }
+
+            var ok = MessageBox.Show(
+                this,
+                "EXPERIMENTAL probe.\n\n" +
+                "This will call activePU.Save(\"<temp>.erwin\", \"OVF=Yes\") on the currently " +
+                "open Mart model. Per the SCAPI doc, Save \"provides a new location\" - i.e. " +
+                "it MAY relocate the live PU. The probe captures Locator/Disposition before " +
+                "and after the call so we can see what actually happens.\n\n" +
+                "If the live PU does relocate, your Mart binding may need to be restored by " +
+                "closing and reopening the model from Mart.\n\n" +
+                "Run probe?",
+                "Probe PU.Save behavior",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2);
+            if (ok != DialogResult.Yes) return;
+
+            btnProbePuSave.Enabled = false;
+            lblAlterCompareStatus.Text = "Running PU.Save probe... watch Debug Log.";
+            try
+            {
+                var result = await Services.PuSaveProbe.ProbeAsync(
+                    (object)_scapi, (object)_currentModel, (Action<string>)Log).ConfigureAwait(true);
+
+                bool locatorChanged = !string.Equals(result.Before.Locator, result.After.Locator, StringComparison.Ordinal);
+                string verdict = (result.SaveSucceeded, locatorChanged, result.PostFeDdlOk) switch
+                {
+                    (true, false, true) => "BEST: save succeeded, Locator unchanged, FE_DDL still works",
+                    (true, true, true) => "MIXED: save succeeded, Locator RELOCATED, FE_DDL still works (data alive but binding changed)",
+                    (true, _, false) => "BAD: save succeeded but FE_DDL post-check failed (PU may be in a degraded state)",
+                    (false, _, _) => "FAILED: Save returned false / threw",
+                };
+                Log($"PuSaveProbe verdict: {verdict}");
+                lblAlterCompareStatus.Text = $"Probe done: {verdict}. See Debug Log for details.";
+
+                ErwinAddIn.ShowTopMostMessage(
+                    $"Probe complete.\n\nVerdict: {verdict}\n\nFile size: {result.ProducedFileBytes:N0} bytes\n" +
+                    $"Locator changed: {locatorChanged}\nFE_DDL post-check: {(result.PostFeDdlOk ? "OK" : "FAILED")}\n\n" +
+                    "See Debug Log for the full PropertyBag diff.",
+                    "Probe Result");
+            }
+            catch (Exception ex)
+            {
+                Log($"PuSaveProbe handler crashed: {ex.GetType().Name}: {ex.Message}");
+                lblAlterCompareStatus.Text = $"Probe crashed: {ex.Message}";
+            }
+            finally
+            {
+                btnProbePuSave.Enabled = true;
+            }
+        }
+
         private void btnSaveAlterSql_Click(object sender, EventArgs e)
         {
             if (string.IsNullOrEmpty(_alterLastSql)) return;

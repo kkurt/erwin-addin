@@ -56,6 +56,7 @@ namespace EliteSoft.Erwin.AddIn
             this.txtAlterSql = new System.Windows.Forms.TextBox();
             this.btnCopyAlterSql = new System.Windows.Forms.Button();
             this.btnSaveAlterSql = new System.Windows.Forms.Button();
+            this.btnProbePuSave = new System.Windows.Forms.Button();
 
             // Model tab
             this.grpModel = new System.Windows.Forms.GroupBox();
@@ -721,6 +722,24 @@ namespace EliteSoft.Erwin.AddIn
             this.btnSaveAlterSql.Click += new System.EventHandler(this.btnSaveAlterSql_Click);
             this.tabAlterCompare.Controls.Add(this.btnSaveAlterSql);
 
+            // Research probe (TEMPORARY) - calls activePU.Save("temp.erwin","OVF=Yes")
+            // and logs PropertyBag diff before/after. Distinctive color so it's
+            // obviously an experimental dev button. Will be removed once we
+            // know whether Save is destructive or non-destructive on a live
+            // Mart-backed PU.
+            this.btnProbePuSave.Location = new System.Drawing.Point(20, 425);
+            this.btnProbePuSave.Name = "btnProbePuSave";
+            this.btnProbePuSave.Size = new System.Drawing.Size(220, 28);
+            this.btnProbePuSave.Text = "[DEV] Probe PU.Save behavior";
+            this.btnProbePuSave.Font = fontCaption;
+            this.btnProbePuSave.BackColor = System.Drawing.Color.FromArgb(255, 220, 130);
+            this.btnProbePuSave.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnProbePuSave.FlatAppearance.BorderColor = System.Drawing.Color.FromArgb(220, 150, 60);
+            this.btnProbePuSave.Anchor = System.Windows.Forms.AnchorStyles.Bottom | System.Windows.Forms.AnchorStyles.Left;
+            this.btnProbePuSave.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnProbePuSave.Click += new System.EventHandler(this.btnProbePuSave_Click);
+            this.tabAlterCompare.Controls.Add(this.btnProbePuSave);
+
             // ================================================================
             // TAB 6: DEBUG LOG
             // ================================================================
@@ -1208,6 +1227,7 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.TextBox txtAlterSql;
         private System.Windows.Forms.Button btnCopyAlterSql;
         private System.Windows.Forms.Button btnSaveAlterSql;
+        private System.Windows.Forms.Button btnProbePuSave;
         private System.Windows.Forms.Button btnMartReview;
         private System.Windows.Forms.Button btnAlterWizardProd;
         private System.Windows.Forms.ComboBox cmbLeftModel;
