@@ -4688,7 +4688,6 @@ namespace EliteSoft.Erwin.AddIn
             }
         }
 
-
         private void btnSaveAlterSql_Click(object sender, EventArgs e)
         {
             if (string.IsNullOrEmpty(_alterLastSql)) return;
