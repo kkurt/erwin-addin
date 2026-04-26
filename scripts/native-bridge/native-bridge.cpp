@@ -1857,6 +1857,92 @@ extern "C" __declspec(dllexport) void __cdecl ClearCapturedDdl(void) {
     LeaveCriticalSection(&g_ddlLock);
 }
 
+// ---------------------------------------------------------------------------
+// Cleanup-time WinEvent hook: hide ANY new dialog (#32770 / Afx wizard frame)
+// in erwin's process the moment it is created, BEFORE its first paint. The
+// MartMartAutomation cleanup path triggers a cascade of dialogs (Mart Offline,
+// Save As pickers, Close Model checklist, "Save changes?" prompts) when the
+// CC wizard closes after Apply-to-Right; without this hook each one paints
+// briefly even though we dismiss them programmatically. With this hook
+// installed for the cleanup window, the dialogs never reach first-paint.
+//
+// Differs from WizardWinEventCb in two ways:
+//   - matches *any* dialog/wizard class, not just "Alter Script" by title
+//   - does not stop after first hit (cleanup spawns multiple dialogs)
+// ---------------------------------------------------------------------------
+
+static volatile LONG g_cleanupHookActive = 0;
+static HWINEVENTHOOK g_cleanupEvHook = nullptr;
+static int g_cleanupHidCount = 0;
+
+static bool LooksLikeCleanupTarget(HWND hwnd) {
+    char cls[64] = {0};
+    GetClassNameA(hwnd, cls, sizeof(cls));
+    if (strcmp(cls, "#32770") == 0) return true;          // dialog frame
+    if (strncmp(cls, "Afx", 3) == 0) return true;          // MFC frame (CC wizard variants)
+    return false;
+}
+
+static void CALLBACK CleanupWinEventCb(
+    HWINEVENTHOOK /*hook*/, DWORD event, HWND hwnd,
+    LONG idObject, LONG /*idChild*/, DWORD /*eventThread*/, DWORD /*eventTime*/)
+{
+    if (!hwnd) return;
+    if (idObject != OBJID_WINDOW) return;
+    if (InterlockedCompareExchange(&g_cleanupHookActive, 0, 0) == 0) return;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != GetCurrentProcessId()) return;
+    if (!LooksLikeCleanupTarget(hwnd)) return;
+
+    // Skip windows that are already hidden (e.g. the original CC wizard we
+    // hid on session start - HideWizardAggressive already moved it off-screen).
+    LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    if ((ex & WS_EX_LAYERED) != 0) {
+        BYTE alpha = 255;
+        DWORD flags = 0;
+        if (GetLayeredWindowAttributes(hwnd, nullptr, &alpha, &flags) && alpha == 0) {
+            return;
+        }
+    }
+
+    HideWizardAggressive(hwnd);
+    g_cleanupHidCount++;
+    char title[128] = {0};
+    GetWindowTextA(hwnd, title, sizeof(title));
+    char cls[64] = {0};
+    GetClassNameA(hwnd, cls, sizeof(cls));
+    LogLine("[CLEAN-EVT] hid hwnd=%p cls='%s' title='%s' event=%lu",
+        hwnd, cls, title, event);
+}
+
+extern "C" __declspec(dllexport) int __cdecl CCInsp_CleanupHookInstall(void) {
+    if (g_cleanupEvHook) {
+        LogLine("[CLEAN-EVT] install: hook already installed (%p)", g_cleanupEvHook);
+        return -1;
+    }
+    g_cleanupHidCount = 0;
+    InterlockedExchange(&g_cleanupHookActive, 1);
+    g_cleanupEvHook = SetWinEventHook(
+        EVENT_OBJECT_CREATE, EVENT_OBJECT_NAMECHANGE,
+        nullptr, CleanupWinEventCb,
+        GetCurrentProcessId(), 0,
+        WINEVENT_OUTOFCONTEXT);
+    LogLine("[CLEAN-EVT] install: hook=%p", g_cleanupEvHook);
+    return g_cleanupEvHook ? 0 : -2;
+}
+
+extern "C" __declspec(dllexport) int __cdecl CCInsp_CleanupHookUninstall(void) {
+    InterlockedExchange(&g_cleanupHookActive, 0);
+    int hid = g_cleanupHidCount;
+    if (g_cleanupEvHook) {
+        UnhookWinEvent(g_cleanupEvHook);
+        g_cleanupEvHook = nullptr;
+        LogLine("[CLEAN-EVT] uninstall: hid %d dialog(s) during cleanup", hid);
+    }
+    return hid;
+}
+
 extern "C" __declspec(dllexport) int __cdecl UninstallHook(void) {
     // For the spike we intentionally leave the detour installed for the process
     // lifetime. Restoring the original bytes mid-flight risks a race if erwin
@@ -2537,6 +2623,47 @@ extern "C" __declspec(dllexport) int __cdecl CCInsp_GetSeenMsCount(void) {
     return InterlockedCompareExchange(&g_seenMsCount, 0, 0);
 }
 
+// PSM probe: calls PrepareServerModelSet(ms, &as1) under SEH, logs result.
+// Used to determine if the F2/MCX native pipeline is reachable for a given
+// mart-bound ms (without committing to a full MCX::Execute attempt).
+//
+// Return semantics:
+//   1  = success, as1 returned non-null (F2 path is open for this ms)
+//   0  = PSM ran but returned null/null-as (F2 not viable with this ms)
+//  -1  = invalid input or PSM symbol unresolved
+//  -2  = SEH during PSM call (mart state likely missing)
+extern "C" __declspec(dllexport) int __cdecl CCInsp_TestPSM(void* ms) {
+    if (!ms) {
+        LogLine("[PSM-PROBE] ms is null - nothing to probe");
+        return -1;
+    }
+    if (!g_prepareServer) {
+        HMODULE mcx = GetModuleHandleW(L"EM_MCX.dll");
+        if (!mcx) mcx = LoadLibraryW(L"EM_MCX.dll");
+        if (mcx) g_prepareServer = (PrepareServerFn)GetProcAddress(mcx, kPrepareServerSym);
+    }
+    if (!g_prepareServer) {
+        LogLine("[PSM-PROBE] PrepareServerModelSet symbol unresolved");
+        return -1;
+    }
+    void* outAs = nullptr;
+    void* serverMsOut = nullptr;
+    LogLine("[PSM-PROBE] calling PrepareServerModelSet(ms=%p, &outAs)...", ms);
+    __try {
+        serverMsOut = g_prepareServer(ms, &outAs);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        LogLine("[PSM-PROBE] SEH 0x%08lX during PSM call (mart state likely missing)", GetExceptionCode());
+        return -2;
+    }
+    LogLine("[PSM-PROBE] returned: serverMs=%p outAs=%p", serverMsOut, outAs);
+    if (outAs) {
+        LogLine("[PSM-PROBE] SUCCESS: as1 returned, F2/MCX path is OPEN for this ms");
+        return 1;
+    }
+    LogLine("[PSM-PROBE] FAILED: outAs is null - F2 path not viable with this ms");
+    return 0;
+}
+
 static const char* kElaOnFeSym =
     "?OnFE@ELA@@YA?AW4Success_e@@PEAVGDMModelSetI@@_NI@Z";
 
@@ -2687,14 +2814,20 @@ static DWORD WINAPI OnFeWorkerProc(LPVOID lp) {
 // this thread), worker drives wizard to Preview and closes it, OnFE returns,
 // we return whatever DDL was captured.
 extern "C" __declspec(dllexport) const char* __cdecl CCInsp_GenerateMartMartDdlViaOnFE(void* ms) {
-    // Prefer the MS captured from a prior OnFE call (the RIGHT-side model)
-    // over whatever the caller passed (usually the LEFT-side active PU MS).
-    void* onFeMs = (void*)InterlockedCompareExchange64(&g_lastOnFeMs, 0, 0);
-    if (onFeMs) {
-        LogLine("[ONFE-ORCH] using captured g_lastOnFeMs=%p (overrides caller ms=%p)", onFeMs, ms);
-        ms = onFeMs;
+    // If caller did not pass an explicit ms, fall back to whatever the
+    // last seen OnFE call recorded (g_lastOnFeMs). When the caller does
+    // pass an ms (Mart-Mart with v1 PU), respect it - do NOT override
+    // with stale g_lastOnFeMs from a prior dirty-vs-saved test.
+    if (!ms) {
+        void* onFeMs = (void*)InterlockedCompareExchange64(&g_lastOnFeMs, 0, 0);
+        if (onFeMs) {
+            LogLine("[ONFE-ORCH] caller ms=null, falling back to g_lastOnFeMs=%p", onFeMs);
+            ms = onFeMs;
+        }
+    } else {
+        LogLine("[ONFE-ORCH] caller passed explicit ms=%p (g_lastOnFeMs ignored)", ms);
     }
-    if (!ms) { LogLine("[ONFE-ORCH] ms is null (no g_lastOnFeMs and caller passed null)"); return nullptr; }
+    if (!ms) { LogLine("[ONFE-ORCH] ms is null (no caller ms and g_lastOnFeMs empty)"); return nullptr; }
     if (!g_elaOnFe) {
         HMODULE ela = GetModuleHandleW(L"EM_ELA.dll");
         if (!ela) ela = LoadLibraryW(L"EM_ELA.dll");

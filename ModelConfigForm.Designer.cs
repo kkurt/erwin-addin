@@ -748,33 +748,35 @@ namespace EliteSoft.Erwin.AddIn
             this.grpDdlSource.ForeColor = clrTextSecondary;
             this.tabApproval.Controls.Add(this.grpDdlSource);
 
-            var lblSourceCaption = new System.Windows.Forms.Label();
-            lblSourceCaption.Location = new System.Drawing.Point(12, 22);
-            lblSourceCaption.Size = new System.Drawing.Size(80, 20);
-            lblSourceCaption.Text = "Active Model:";
-            lblSourceCaption.Font = fontCaption;
-            lblSourceCaption.ForeColor = clrTextSecondary;
-            this.grpDdlSource.Controls.Add(lblSourceCaption);
+            // Single read-only label replaces the previous "Active Model:" caption
+            // + combo. The active model is implicit (only one PU is in focus) so
+            // a dropdown is misleading. The label always shows the opened model
+            // with version + a hint that unsaved (dirty) changes are included.
+            this.lblOpenedModel = new System.Windows.Forms.Label();
+            this.lblOpenedModel.Location = new System.Drawing.Point(12, 22);
+            this.lblOpenedModel.Size = new System.Drawing.Size(360, 22);
+            this.lblOpenedModel.Text = "Opened Model: (none)";
+            this.lblOpenedModel.Font = fontBodyBold;
+            this.lblOpenedModel.ForeColor = clrTextPrimary;
+            this.lblOpenedModel.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
+            this.grpDdlSource.Controls.Add(this.lblOpenedModel);
 
+            // cmbLeftModel kept as a hidden field so legacy code that reads
+            // SelectedItem still works; user can no longer change it.
             this.cmbLeftModel = new System.Windows.Forms.ComboBox();
             this.cmbLeftModel.Location = new System.Drawing.Point(95, 19);
             this.cmbLeftModel.Size = new System.Drawing.Size(270, 24);
             this.cmbLeftModel.DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList;
             this.cmbLeftModel.Font = fontCaption;
+            this.cmbLeftModel.Visible = false;
             this.grpDdlSource.Controls.Add(this.cmbLeftModel);
 
+            // Mart Review button removed - DDL Generation tab now has the
+            // smart-routing Generate DDL button which covers both same-version
+            // (dirty vs last saved) and different-version compare paths.
             this.btnMartReview = new System.Windows.Forms.Button();
-            this.btnMartReview.Location = new System.Drawing.Point(12, 48);
-            this.btnMartReview.Size = new System.Drawing.Size(110, 24);
-            this.btnMartReview.Text = "Mart Review";
-            this.btnMartReview.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnMartReview.BackColor = System.Drawing.Color.White;
-            this.btnMartReview.ForeColor = clrTextPrimary;
-            this.btnMartReview.FlatAppearance.BorderColor = clrBorder;
-            this.btnMartReview.Font = fontCaption;
-            this.btnMartReview.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnMartReview.Visible = false;
             this.btnMartReview.Click += new System.EventHandler(this.BtnMartReview_Click);
-            this.grpDdlSource.Controls.Add(this.btnMartReview);
 
             // ----- Group: Target (right side = Mart version OR DB) -----
             this.grpDdlTarget = new System.Windows.Forms.GroupBox();
@@ -984,33 +986,35 @@ namespace EliteSoft.Erwin.AddIn
             this.btnDumpCCState.Click += new System.EventHandler(this.BtnDumpCCState_Click);
             this.grpDebugLog.Controls.Add(this.btnDumpCCState);
 
-            // Row 3 (y=88): Mart-Mart exploration.
+            // --- Hidden research spikes (kept as fields so handlers compile) ---
+            // Removed from UI on 2026-04-26 (cleanup): MartMartSpike, MMDiscovery,
+            // SpikeShowCCWiz, SpikeOpenMartV1, CaptureApplyStack. Original
+            // implementations live in ModelConfigForm.cs as no-longer-bound
+            // handlers (Click+= still wired in case a future research path needs
+            // to surface them quickly without re-creating the button).
             this.btnMartMartSpike = new System.Windows.Forms.Button();
-            this.btnMartMartSpike.Location = new System.Drawing.Point(16, 88);
-            this.btnMartMartSpike.Size = new System.Drawing.Size(220, 28);
-            this.btnMartMartSpike.Text = "Mart-Mart DDL Spike (Ctrl+Alt+T)";
-            this.btnMartMartSpike.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnMartMartSpike.BackColor = System.Drawing.Color.FromArgb(200, 230, 255);
-            this.btnMartMartSpike.FlatAppearance.BorderColor = clrBorder;
-            this.btnMartMartSpike.Font = fontCaption;
-            this.btnMartMartSpike.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnMartMartSpike.Visible = false;
             this.btnMartMartSpike.Click += new System.EventHandler(this.BtnMartMartSpike_Click);
-            this.grpDebugLog.Controls.Add(this.btnMartMartSpike);
 
             this.btnMMDiscovery = new System.Windows.Forms.Button();
-            this.btnMMDiscovery.Location = new System.Drawing.Point(16, 184);
-            this.btnMMDiscovery.Size = new System.Drawing.Size(420, 28);
-            this.btnMMDiscovery.Text = "Mart-Mart Auto Discovery (drive CC + dump RD UIA)";
-            this.btnMMDiscovery.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnMMDiscovery.BackColor = System.Drawing.Color.FromArgb(200, 255, 240);
-            this.btnMMDiscovery.FlatAppearance.BorderColor = clrBorder;
-            this.btnMMDiscovery.Font = fontCaption;
-            this.btnMMDiscovery.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnMMDiscovery.Visible = false;
             this.btnMMDiscovery.Click += new System.EventHandler(this.BtnMMDiscovery_Click);
-            this.grpDebugLog.Controls.Add(this.btnMMDiscovery);
 
+            this.btnCaptureApplyStack = new System.Windows.Forms.Button();
+            this.btnCaptureApplyStack.Visible = false;
+            this.btnCaptureApplyStack.Click += new System.EventHandler(this.BtnCaptureApplyStack_Click);
+
+            this.btnSpikeShowCCWiz = new System.Windows.Forms.Button();
+            this.btnSpikeShowCCWiz.Visible = false;
+            this.btnSpikeShowCCWiz.Click += new System.EventHandler(this.BtnSpikeShowCCWiz_Click);
+
+            this.btnSpikeOpenMartV1 = new System.Windows.Forms.Button();
+            this.btnSpikeOpenMartV1.Visible = false;
+            this.btnSpikeOpenMartV1.Click += new System.EventHandler(this.BtnSpikeOpenMartV1_Click);
+
+            // --- Visible debug toggle (kept) ---
             this.btnToggleEdrST = new System.Windows.Forms.Button();
-            this.btnToggleEdrST.Location = new System.Drawing.Point(244, 152);
+            this.btnToggleEdrST.Location = new System.Drawing.Point(244, 120);
             this.btnToggleEdrST.Size = new System.Drawing.Size(200, 28);
             this.btnToggleEdrST.Text = "Toggle EDR stack-trace";
             this.btnToggleEdrST.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
@@ -1021,42 +1025,7 @@ namespace EliteSoft.Erwin.AddIn
             this.btnToggleEdrST.Click += new System.EventHandler(this.BtnToggleEdrST_Click);
             this.grpDebugLog.Controls.Add(this.btnToggleEdrST);
 
-            this.btnCaptureApplyStack = new System.Windows.Forms.Button();
-            this.btnCaptureApplyStack.Location = new System.Drawing.Point(16, 216);
-            this.btnCaptureApplyStack.Size = new System.Drawing.Size(420, 28);
-            this.btnCaptureApplyStack.Text = "Diag: Capture Apply-to-Right stack (click arrow manually)";
-            this.btnCaptureApplyStack.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnCaptureApplyStack.BackColor = System.Drawing.Color.FromArgb(255, 230, 200);
-            this.btnCaptureApplyStack.FlatAppearance.BorderColor = clrBorder;
-            this.btnCaptureApplyStack.Font = fontCaption;
-            this.btnCaptureApplyStack.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnCaptureApplyStack.Click += new System.EventHandler(this.BtnCaptureApplyStack_Click);
-            this.grpDebugLog.Controls.Add(this.btnCaptureApplyStack);
-
-            this.btnSpikeShowCCWiz = new System.Windows.Forms.Button();
-            this.btnSpikeShowCCWiz.Location = new System.Drawing.Point(16, 152);
-            this.btnSpikeShowCCWiz.Size = new System.Drawing.Size(220, 28);
-            this.btnSpikeShowCCWiz.Text = "Spike: ShowERwinCCWiz(v3, v1)";
-            this.btnSpikeShowCCWiz.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnSpikeShowCCWiz.BackColor = System.Drawing.Color.FromArgb(255, 200, 220);
-            this.btnSpikeShowCCWiz.FlatAppearance.BorderColor = clrBorder;
-            this.btnSpikeShowCCWiz.Font = fontCaption;
-            this.btnSpikeShowCCWiz.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnSpikeShowCCWiz.Click += new System.EventHandler(this.BtnSpikeShowCCWiz_Click);
-            this.grpDebugLog.Controls.Add(this.btnSpikeShowCCWiz);
-
-            this.btnSpikeOpenMartV1 = new System.Windows.Forms.Button();
-            this.btnSpikeOpenMartV1.Location = new System.Drawing.Point(16, 120);
-            this.btnSpikeOpenMartV1.Size = new System.Drawing.Size(220, 28);
-            this.btnSpikeOpenMartV1.Text = "Spike: Open Mart v1 PU";
-            this.btnSpikeOpenMartV1.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnSpikeOpenMartV1.BackColor = System.Drawing.Color.FromArgb(210, 255, 200);
-            this.btnSpikeOpenMartV1.FlatAppearance.BorderColor = clrBorder;
-            this.btnSpikeOpenMartV1.Font = fontCaption;
-            this.btnSpikeOpenMartV1.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnSpikeOpenMartV1.Click += new System.EventHandler(this.BtnSpikeOpenMartV1_Click);
-            this.grpDebugLog.Controls.Add(this.btnSpikeOpenMartV1);
-
+            // --- Mart-Mart via ELA::OnFE (kept) ---
             this.btnCallOnFE = new System.Windows.Forms.Button();
             this.btnCallOnFE.Location = new System.Drawing.Point(244, 88);
             this.btnCallOnFE.Size = new System.Drawing.Size(220, 28);
@@ -1068,6 +1037,21 @@ namespace EliteSoft.Erwin.AddIn
             this.btnCallOnFE.Cursor = System.Windows.Forms.Cursors.Hand;
             this.btnCallOnFE.Click += new System.EventHandler(this.BtnCallOnFE_Click);
             this.grpDebugLog.Controls.Add(this.btnCallOnFE);
+
+            // --- F2 Probe: tests PrepareServerModelSet on captured active Mart MS.
+            // If as1 returns non-null, the F2/MCX native pipeline can be used as
+            // the flash-free Mart-Mart strategy (replacing UIA-driven CC). ---
+            this.btnF2Probe = new System.Windows.Forms.Button();
+            this.btnF2Probe.Location = new System.Drawing.Point(16, 88);
+            this.btnF2Probe.Size = new System.Drawing.Size(220, 28);
+            this.btnF2Probe.Text = "F2 Probe: PSM(active mart MS)";
+            this.btnF2Probe.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnF2Probe.BackColor = System.Drawing.Color.FromArgb(220, 200, 255);
+            this.btnF2Probe.FlatAppearance.BorderColor = clrBorder;
+            this.btnF2Probe.Font = fontCaption;
+            this.btnF2Probe.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnF2Probe.Click += new System.EventHandler(this.BtnF2Probe_Click);
+            this.grpDebugLog.Controls.Add(this.btnF2Probe);
 
             this.btnClearLog.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right;
             this.btnClearLog.Location = new System.Drawing.Point(498, 24);
@@ -1209,6 +1193,8 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.Button btnCopyAlterSql;
         private System.Windows.Forms.Button btnSaveAlterSql;
         private System.Windows.Forms.Button btnMartReview;
+        private System.Windows.Forms.Label lblOpenedModel;
+        private System.Windows.Forms.Button btnF2Probe;
         private System.Windows.Forms.Button btnAlterWizardProd;
         private System.Windows.Forms.ComboBox cmbLeftModel;
         private System.Windows.Forms.ComboBox cmbRightModel;

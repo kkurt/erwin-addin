@@ -58,9 +58,14 @@ $clArgs = @(
 $cmd = "call `"$vcvars`" >nul && cl.exe $clArgs"
 Write-Host "cmd: cl.exe $clArgs" -ForegroundColor DarkGray
 
-$p = Start-Process -FilePath "cmd.exe" -ArgumentList "/c", $cmd -NoNewWindow -Wait -PassThru
-if ($p.ExitCode -ne 0) {
-    throw "cl.exe failed with exit code $($p.ExitCode)"
+# Using `& cmd /c` instead of Start-Process -Wait. Start-Process with
+# -NoNewWindow -Wait -PassThru has a known stdin handle inheritance bug that
+# hangs after cl.exe exits when invoked from an elevated PowerShell session;
+# the call operator path doesn't have that issue.
+& cmd.exe /c $cmd 2>&1
+$exit = $LASTEXITCODE
+if ($exit -ne 0) {
+    throw "cl.exe failed with exit code $exit"
 }
 
 if (-not (Test-Path $outDll)) {

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -442,6 +443,21 @@ namespace EliteSoft.Erwin.AddIn.Services
         public static void CloseSession(CCSession s, Action<string> log)
         {
             if (s == null) return;
+
+            // Install the bridge-level WinEvent hook BEFORE we post any close
+            // commands. The hook fires on EVENT_OBJECT_CREATE for every new
+            // window in erwin's process, hiding (#32770 / Afx) dialogs before
+            // they paint - so the entire dismissal cascade (CC close ->
+            // Close Model checklist -> Mart Offline -> Save As pickers ->
+            // re-shown Mart Offline) is invisible to the user even though
+            // each dialog is dismissed programmatically. The CC wizard
+            // itself stays hidden as set by HideWindow on session start; we
+            // intentionally do NOT UnhideWindow it (previous attempts at
+            // unhide caused a brief visible flash before the next dialog
+            // could be hidden in turn).
+            int instRc = NativeBridgeService.CleanupHookInstall(log);
+            log?.Invoke($"  cleanup: WinEvent hook install rc={instRc}");
+
             try
             {
                 if (s.ResolveDifferences != IntPtr.Zero)
@@ -463,8 +479,185 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // 2nd-run "compare-to-itself" cache issue).
                     HandleCloseModelDialogChain(log);
                 }
+
+                // Final safety net: erwin variants may not show the "Close
+                // Model" checklist (suppressed by user setting) and instead
+                // pop a per-model "Save changes to <model>?" message box, or
+                // the CC wizard itself may still be alive because a hidden
+                // modal blocked CC_CLOSE. Sweep the erwin process for any
+                // residual #32770 dialogs and dismiss them so the user is
+                // never left staring at a frozen erwin frame.
+                ForceCleanupResidualDialogs(s, log);
             }
             catch (Exception ex) { log?.Invoke($"  CloseSession err: {ex.Message}"); }
+            finally
+            {
+                int hidCount = NativeBridgeService.CleanupHookUninstall(log);
+                log?.Invoke($"  cleanup: WinEvent hook uninstall, hid {hidCount} dialog(s)");
+            }
+        }
+
+        /// <summary>
+        /// 5-second sweep that finds any #32770 dialogs in erwin's process
+        /// (visible OR hidden via WS_EX_LAYERED) and dismisses them based on
+        /// title:
+        ///   - "Save Changes" / "erwin Data Modeler" with Yes/No buttons -> click No
+        ///   - "Close Model" -> drive the existing checklist chain
+        ///   - "Mart Offline" -> set Save-to=Close + OK
+        ///   - any leftover Wizard frame -> WM_CLOSE
+        /// All matched dialogs are first un-hidden so the user can SEE what
+        /// happened in the rare case our dismissal path doesn't fully apply.
+        /// Logs every dialog inspected, regardless of action taken.
+        /// </summary>
+        private static void ForceCleanupResidualDialogs(CCSession s, Action<string> log)
+        {
+            try
+            {
+                uint myPid = (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
+                IntPtr myFormHwnd = IntPtr.Zero;
+                try { myFormHwnd = System.Diagnostics.Process.GetCurrentProcess().MainWindowHandle; } catch { }
+
+                // 15s deadline: a single Mart Offline cascade can spawn up
+                // to 2 Save As pickers PLUS another Mart Offline pass after
+                // each cancel. 5s was too tight to ride out the full cycle.
+                int deadline = Environment.TickCount + 15000;
+                int sweepCount = 0;
+                int totalDismissed = 0;
+                int idleSweepsAfterDismiss = 0;
+                while (Environment.TickCount < deadline)
+                {
+                    int dismissedThisSweep = 0;
+                    sweepCount++;
+                    var residuals = new List<(IntPtr h, string title, string cls)>();
+                    EnumWindows((hWnd, lp) =>
+                    {
+                        GetWindowThreadProcessId(hWnd, out uint pid);
+                        if (pid != myPid) return true;
+                        var clsBuf = new StringBuilder(64);
+                        GetClassName(hWnd, clsBuf, clsBuf.Capacity);
+                        string cls = clsBuf.ToString();
+                        // Inspect dialog frames + Afx wizard frames + any
+                        // window title containing the wizard names.
+                        if (cls != "#32770" && !cls.StartsWith("Afx", StringComparison.Ordinal))
+                            return true;
+                        // Skip our own form / known erwin main frame.
+                        if (hWnd == myFormHwnd) return true;
+                        string t = GetTitle(hWnd);
+                        residuals.Add((hWnd, t, cls));
+                        return true;
+                    }, IntPtr.Zero);
+
+                    foreach (var r in residuals)
+                    {
+                        // Do NOT UnhideWindow here. The bridge's WinEvent
+                        // hook already aggressively hid each new dialog the
+                        // moment it was created (alpha=0 + off-screen),
+                        // and we want them to stay hidden while we dispatch
+                        // dismissal messages. Unhiding would defeat the
+                        // zero-flash design.
+
+                        string t = r.title ?? "";
+                        bool dismissed = false;
+                        try
+                        {
+                            if (t.IndexOf("Close Model", StringComparison.OrdinalIgnoreCase) >= 0)
+                            {
+                                log?.Invoke($"  [residual] Close Model dialog 0x{r.h.ToInt64():X} - driving checklist");
+                                HandleCloseModelDialogChain(log);
+                                dismissed = true;
+                            }
+                            else if (t.IndexOf("Mart Offline", StringComparison.OrdinalIgnoreCase) >= 0)
+                            {
+                                log?.Invoke($"  [residual] Mart Offline dialog 0x{r.h.ToInt64():X} - driving Save-to=Close + OK");
+                                DismissMartOfflineDialog(r.h, log);
+                                dismissed = true;
+                            }
+                            else if (t.Equals("Save As", StringComparison.OrdinalIgnoreCase)
+                                  || t.Equals("Farklı Kaydet", StringComparison.OrdinalIgnoreCase))
+                            {
+                                // Standard OS Save As file picker - typically
+                                // spawned when Mart Offline's per-row Save-to
+                                // is left at "Save As" and OK is pressed.
+                                // Cancel discards the file picker; the Mart
+                                // Offline dialog should re-appear and our
+                                // toolbar-Close path will handle it next.
+                                log?.Invoke($"  [residual] Save As file picker 0x{r.h.ToInt64():X} - Cancel");
+                                var root = AutomationElement.FromHandle(r.h);
+                                if (root != null)
+                                    dismissed = ClickButtonByName(root, new[] { "Cancel", "İptal" });
+                                if (!dismissed)
+                                {
+                                    PostMessage(r.h, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero);
+                                    dismissed = true;
+                                }
+                            }
+                            else if (t.IndexOf("Save", StringComparison.OrdinalIgnoreCase) >= 0
+                                  || t.IndexOf("erwin Data Modeler", StringComparison.OrdinalIgnoreCase) >= 0)
+                            {
+                                // Save-changes prompt: discard so the v1 PU
+                                // we modified for diff is dropped, not saved
+                                // back to Mart.
+                                log?.Invoke($"  [residual] Save/popup dialog 0x{r.h.ToInt64():X} title='{t}' - clicking No");
+                                var root = AutomationElement.FromHandle(r.h);
+                                if (root != null)
+                                    dismissed = ClickButtonByName(root, new[] { "No", "Hayır", "Don't Save", "Discard", "Cancel", "İptal" });
+                                if (!dismissed)
+                                {
+                                    PostMessage(r.h, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero);
+                                    dismissed = true;
+                                }
+                            }
+                            else if (s != null && (r.h == s.CCWizard || r.h == s.ResolveDifferences))
+                            {
+                                log?.Invoke($"  [residual] CC/RD frame 0x{r.h.ToInt64():X} still alive - WM_CLOSE");
+                                PostMessage(r.h, 0x0010 /*WM_CLOSE*/, IntPtr.Zero, IntPtr.Zero);
+                                dismissed = true;
+                            }
+                            else if (t.IndexOf("Wizard", StringComparison.OrdinalIgnoreCase) >= 0
+                                  || t.IndexOf("Resolve Differences", StringComparison.OrdinalIgnoreCase) >= 0
+                                  || t.IndexOf("Complete Compare", StringComparison.OrdinalIgnoreCase) >= 0
+                                  || t.IndexOf("Forward Engineer", StringComparison.OrdinalIgnoreCase) >= 0)
+                            {
+                                log?.Invoke($"  [residual] wizard 0x{r.h.ToInt64():X} title='{t}' - WM_CLOSE");
+                                PostMessage(r.h, 0x0010 /*WM_CLOSE*/, IntPtr.Zero, IntPtr.Zero);
+                                dismissed = true;
+                            }
+                            else
+                            {
+                                // Quietly log unidentified dialogs for diag.
+                                log?.Invoke($"  [residual] (skip) cls='{r.cls}' title='{t}' hwnd=0x{r.h.ToInt64():X}");
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            log?.Invoke($"  [residual] dismiss err on 0x{r.h.ToInt64():X}: {ex.Message}");
+                        }
+
+                        if (dismissed) dismissedThisSweep++;
+                    }
+
+                    if (dismissedThisSweep > 0)
+                    {
+                        totalDismissed += dismissedThisSweep;
+                        idleSweepsAfterDismiss = 0;
+                        Thread.Sleep(250);
+                    }
+                    else
+                    {
+                        // Stop early when we've already dismissed something
+                        // and the next 600ms passed without any new dialogs.
+                        // If we never dismissed anything, just exit on first
+                        // empty sweep (nothing to clean up).
+                        if (totalDismissed == 0) break;
+                        idleSweepsAfterDismiss++;
+                        if (idleSweepsAfterDismiss >= 3) break;
+                        Thread.Sleep(200);
+                    }
+                }
+
+                log?.Invoke($"  cleanup sweep: {sweepCount} pass(es) complete, {totalDismissed} dialog(s) dismissed");
+            }
+            catch (Exception ex) { log?.Invoke($"  ForceCleanupResidualDialogs err: {ex.Message}"); }
         }
 
         /// <summary>
@@ -578,71 +771,427 @@ namespace EliteSoft.Erwin.AddIn.Services
                     log?.Invoke("  cleanup: 'Mart Offline' dialog did not appear (may be suppressed)");
                     return;
                 }
-                log?.Invoke($"  cleanup: 'Mart Offline' dialog = 0x{martOffline.ToInt64():X}");
-                var offRoot = AutomationElement.FromHandle(martOffline);
-                if (offRoot == null)
-                {
-                    log?.Invoke("  cleanup: UIA FromHandle returned null on Mart Offline dialog");
-                    return;
-                }
-
-                try
-                {
-                    // "Save to" ComboBox - set to "Close".
-                    var comboCond = new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ComboBox);
-                    var combos = offRoot.FindAll(TreeScope.Descendants, comboCond);
-                    log?.Invoke($"  cleanup: Mart Offline has {combos.Count} combo(s)");
-                    bool setCombo = false;
-                    foreach (AutomationElement combo in combos)
-                    {
-                        // Prefer ValuePattern.SetValue("Close") - simplest
-                        // path and mimics typing the option name.
-                        if (combo.TryGetCurrentPattern(ValuePattern.Pattern, out object vp))
-                        {
-                            try
-                            {
-                                ((ValuePattern)vp).SetValue("Close");
-                                log?.Invoke("    combo set via ValuePattern -> 'Close'");
-                                setCombo = true;
-                                break;
-                            }
-                            catch { /* fall through to expand-and-select */ }
-                        }
-
-                        // Fallback: expand + find SelectionItem named "Close".
-                        if (combo.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out object ec))
-                        {
-                            try
-                            {
-                                ((ExpandCollapsePattern)ec).Expand();
-                                Thread.Sleep(150);
-                                var itemCond = new AndCondition(
-                                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ListItem),
-                                    new PropertyCondition(AutomationElement.NameProperty, "Close"));
-                                var item = combo.FindFirst(TreeScope.Descendants, itemCond);
-                                if (item != null && item.TryGetCurrentPattern(SelectionItemPattern.Pattern, out object sip))
-                                {
-                                    ((SelectionItemPattern)sip).Select();
-                                    log?.Invoke("    combo set via Expand+Select -> 'Close'");
-                                    setCombo = true;
-                                    break;
-                                }
-                                ((ExpandCollapsePattern)ec).Collapse();
-                            }
-                            catch { }
-                        }
-                    }
-                    if (!setCombo) log?.Invoke("  cleanup: WARN could not set 'Save to' combo to 'Close'");
-                }
-                catch (Exception ex) { log?.Invoke($"  cleanup: combo err: {ex.Message}"); }
-
-                Thread.Sleep(200);
-                if (!ClickButtonByName(offRoot, new[] { "OK", "Tamam" }))
-                    log?.Invoke("  cleanup: WARN could not find OK button on Mart Offline dialog");
-                log?.Invoke("  cleanup: Mart Offline dismissed with Close+OK");
+                DismissMartOfflineDialog(martOffline, log);
             }
             catch (Exception ex) { log?.Invoke($"  HandleCloseModelDialogChain err: {ex.Message}"); }
         }
+
+        /// <summary>
+        /// Drives the "Mart Offline" dialog: sets Save-to to "Close" on the
+        /// toolbar combo AND on each listview row (erwin keeps a per-row
+        /// override that the toolbar combo does not always propagate to),
+        /// then tries OK via UIA, falling back to WM_COMMAND IDOK if the
+        /// click doesn't take the dialog down. Also brings the dialog to the
+        /// foreground first since cleanup runs after dialogs were hidden via
+        /// WS_EX_LAYERED and OK clicks don't always route on a window the OS
+        /// has marked invisible.
+        /// </summary>
+        private static void DismissMartOfflineDialog(IntPtr martOffline, Action<string> log)
+        {
+            if (martOffline == IntPtr.Zero) return;
+            var offRoot = AutomationElement.FromHandle(martOffline);
+            if (offRoot == null)
+            {
+                log?.Invoke("  cleanup: UIA FromHandle returned null on Mart Offline dialog");
+                return;
+            }
+
+            // Make sure the dialog can actually receive input. UnhideWindow
+            // already cleared WS_EX_LAYERED, but the OS may still consider
+            // the window non-foreground; SetForegroundWindow restores routing.
+            try { SetForegroundWindow(martOffline); } catch { }
+
+            // NOTE: we deliberately do NOT toggle the "Close models, don't
+            // show this dialog in future" checkbox. Empirically that flag
+            // does not alter the current OK semantics (per-row Save-to is
+            // still honored, so OK still triggers Save As file pickers when
+            // a row defaults to Save), AND persisting the user's dialog
+            // preference would silently change the user's experience for
+            // their own manual CC operations - a side-effect we can't ship.
+
+            // STRATEGY 1: dispatch toolbar button via Win32 WM_COMMAND with
+            // the button's command ID extracted from TB_GETBUTTON. This is
+            // mouse-position-free and DPI/multi-monitor agnostic. erwin's
+            // XTPToolbar filters UIA InvokePattern but routes WM_COMMAND
+            // through standard MFC dispatch, so the per-row Save-to mode
+            // actually changes (unlike UIA Invoke which silently no-ops).
+            bool toolbarPathWorked = TryClickMartOfflineToolbarViaWmCommand(martOffline, offRoot, log);
+
+            // STRATEGY 1b (UIA fallback if Win32 toolbar discovery fails):
+            // visual btn[2] via UIA Invoke. Less reliable but backup.
+            if (!toolbarPathWorked)
+                toolbarPathWorked = TryClickMartOfflineToolbarClose(offRoot, log);
+
+            // STRATEGY 2 (fallback): iterate every per-row ComboBox and try
+            // to switch it to "Close" via UIA. Diagnostic-heavy: logs each
+            // combo's current value AND its full dropdown list so we can see
+            // (in next runs) what items erwin actually exposes.
+            if (!toolbarPathWorked)
+            {
+                try
+                {
+                    var comboCond = new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ComboBox);
+                    var combos = offRoot.FindAll(TreeScope.Descendants, comboCond);
+                    log?.Invoke($"  cleanup: Mart Offline toolbar path failed - falling back to {combos.Count} combo(s)");
+                    int setCount = 0;
+                    int idx = 0;
+                    foreach (AutomationElement combo in combos)
+                    {
+                        if (TrySetComboBoxToClose(combo, idx++, log)) setCount++;
+                    }
+                    log?.Invoke($"    set {setCount}/{combos.Count} combo(s)");
+                }
+                catch (Exception ex) { log?.Invoke($"  cleanup: combo err: {ex.Message}"); }
+            }
+
+            Thread.Sleep(200);
+
+            // First try: UIA Invoke on OK / Tamam button.
+            bool clicked = ClickButtonByName(offRoot, new[] { "OK", "Tamam" });
+            if (!clicked)
+                log?.Invoke("  cleanup: WARN could not find OK button on Mart Offline dialog");
+
+            // Second try if dialog is still alive 500ms later: WM_COMMAND IDOK.
+            Thread.Sleep(500);
+            if (IsWindow(martOffline))
+            {
+                log?.Invoke("  cleanup: Mart Offline still alive after OK click - posting WM_COMMAND IDOK");
+                PostMessage(martOffline, WM_COMMAND, MakeWParam(IDOK, 0), IntPtr.Zero);
+                Thread.Sleep(400);
+            }
+
+            log?.Invoke(IsWindow(martOffline)
+                ? "  cleanup: WARN Mart Offline did NOT close - manual intervention may be required"
+                : "  cleanup: Mart Offline dismissed");
+        }
+
+        /// <summary>
+        /// Walks the Mart Offline dialog's toolbar (ControlType.ToolBar) and
+        /// invokes the button whose accessible name signals "Close" / "Set
+        /// to Close" / "Discard". Logs every button's name so the next run
+        /// reveals the exact label if our keyword match misses. Returns true
+        /// when a matching button was clicked, false otherwise.
+        /// </summary>
+        /// <summary>
+        /// Win32 path: find the toolbar HWND inside the Mart Offline dialog,
+        /// enumerate its buttons via TB_GETBUTTON to obtain command IDs,
+        /// then PostMessage WM_COMMAND with the 3rd button's command ID
+        /// (visual "Set All to Close" position per user's manual sequence).
+        /// Mouse-free, DPI-agnostic, no UIA InvokePattern - this works
+        /// because XTPToolbar routes button clicks through standard MFC
+        /// WM_COMMAND dispatch even though it filters UIA Invoke.
+        /// </summary>
+        private static bool TryClickMartOfflineToolbarViaWmCommand(
+            IntPtr martOffline, AutomationElement offRoot, Action<string> log)
+        {
+            try
+            {
+                IntPtr toolbarHwnd = FindToolbarChild(martOffline);
+                if (toolbarHwnd == IntPtr.Zero)
+                {
+                    log?.Invoke("  cleanup: no ToolbarWindow32 child found in Mart Offline");
+                    return false;
+                }
+                log?.Invoke($"  cleanup: toolbar HWND = 0x{toolbarHwnd.ToInt64():X}");
+
+                IntPtr countRes = SendMessage(toolbarHwnd, TB_BUTTONCOUNT, IntPtr.Zero, IntPtr.Zero);
+                int count = countRes.ToInt32();
+                log?.Invoke($"    TB_BUTTONCOUNT = {count}");
+                if (count <= 0) return false;
+
+                // Walk all buttons, log their command IDs, pick visual
+                // index 2 (3rd from left) as the "Close" action.
+                int chosenCmd = 0;
+                for (int i = 0; i < count; i++)
+                {
+                    var tbb = new TBBUTTON();
+                    SendMessageTbButton(toolbarHwnd, TB_GETBUTTON, new IntPtr(i), ref tbb);
+                    log?.Invoke($"    btn[{i}] cmdId={tbb.idCommand} state=0x{tbb.fsState:X2} style=0x{tbb.fsStyle:X2}");
+                    if (i == 2) chosenCmd = tbb.idCommand;
+                }
+                if (chosenCmd == 0)
+                {
+                    log?.Invoke("    no btn[2] command id captured");
+                    return false;
+                }
+
+                // Dispatch WM_COMMAND with the toolbar button's command ID.
+                // wParam high word = BN_CLICKED (0). lParam = toolbar HWND
+                // (per MFC convention - identifies the source control).
+                IntPtr wParam = MakeWParam(chosenCmd, BN_CLICKED);
+                PostMessage(martOffline, WM_COMMAND, wParam, toolbarHwnd);
+                log?.Invoke($"    posted WM_COMMAND cmdId={chosenCmd} to dialog (3rd toolbar button = Close action)");
+                return true;
+            }
+            catch (Exception ex) { log?.Invoke($"  toolbar WM_COMMAND err: {ex.Message}"); return false; }
+        }
+
+        private static IntPtr FindToolbarChild(IntPtr parent)
+        {
+            IntPtr result = IntPtr.Zero;
+            EnumChildWindows(parent, (hWnd, lp) =>
+            {
+                var cls = new StringBuilder(64);
+                GetClassName(hWnd, cls, cls.Capacity);
+                string c = cls.ToString();
+                // Standard Win32 toolbar (MFC wraps XTP on top of this).
+                if (c == "ToolbarWindow32" || c.IndexOf("ToolBar", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    result = hWnd;
+                    return false;
+                }
+                return true;
+            }, IntPtr.Zero);
+            return result;
+        }
+
+        private static bool TryClickMartOfflineToolbarClose(AutomationElement offRoot, Action<string> log)
+        {
+            try
+            {
+                // First try: scope buttons to a ToolBar element. XTPToolBar
+                // sometimes registers as ControlType.ToolBar via UIAutomationCore.
+                var toolbarCond = new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ToolBar);
+                var toolbars = offRoot.FindAll(TreeScope.Descendants, toolbarCond);
+                log?.Invoke($"  cleanup: Mart Offline has {toolbars.Count} toolbar(s)");
+
+                // Collect candidate buttons and their bounding rects so we
+                // can sort them by visual X position. UIA enumeration order
+                // does NOT match left-to-right paint order on XTP toolbars,
+                // so positional fallback was clicking the wrong button.
+                var btnCond = new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button);
+
+                // Get the dialog bounds; we'll filter to buttons inside the
+                // top strip (above the listview) which is where the toolbar
+                // sits visually. This protects us from picking up the OK /
+                // Cancel buttons at the bottom.
+                System.Windows.Rect dialogRect = default;
+                try { dialogRect = offRoot.Current.BoundingRectangle; } catch { }
+                double topStripCutoff = dialogRect.Top + dialogRect.Height * 0.40;
+
+                var allBtns = offRoot.FindAll(TreeScope.Descendants, btnCond);
+                var candidates = new List<(AutomationElement el, string name, string help, System.Windows.Rect rect)>();
+                for (int i = 0; i < allBtns.Count; i++)
+                {
+                    AutomationElement b = allBtns[i];
+                    string n = "";
+                    string h = "";
+                    System.Windows.Rect r = default;
+                    try { n = b.Current.Name ?? ""; } catch { }
+                    try { h = b.Current.HelpText ?? ""; } catch { }
+                    try { r = b.Current.BoundingRectangle; } catch { }
+                    candidates.Add((b, n, h, r));
+                }
+                log?.Invoke($"    found {candidates.Count} button(s) total in dialog (will filter to toolbar strip):");
+                foreach (var c in candidates)
+                {
+                    log?.Invoke($"      btn name='{c.name}' help='{c.help}' rect=({c.rect.Left:0},{c.rect.Top:0},{c.rect.Right:0},{c.rect.Bottom:0})");
+                }
+
+                // Filter to top-strip toolbar buttons: small (icon-sized),
+                // high up (Y < topStripCutoff), and NOT title-bar window
+                // chrome (Minimize/Maximize/Close X). Title-bar buttons sit
+                // higher on the dialog and have explicit Name values that
+                // match the chrome - excluding them prevents Strategy 1
+                // from picking the dialog's X (which Cancels the dialog,
+                // leaving the CC close path aborted and v1 still loaded).
+                var toolbarBtns = candidates
+                    .Where(c => c.rect.Width > 0 && c.rect.Height > 0
+                             && c.rect.Top < topStripCutoff
+                             && c.rect.Width < 60
+                             && !IsTitleBarChromeButton(c.name))
+                    .OrderBy(c => c.rect.Left)
+                    .ToList();
+                log?.Invoke($"    after top-strip filter + visual sort: {toolbarBtns.Count} button(s)");
+
+                // STRATEGY 1: keyword match (close / discard) AFTER title-
+                // bar filter, so we never pick the dialog's X button.
+                foreach (var c in toolbarBtns)
+                {
+                    string blob = (c.name + " " + c.help).ToLowerInvariant();
+                    if (blob.Contains("close") || blob.Contains("discard"))
+                    {
+                        if (TryInvokeButton(c.el, $"keyword '{c.name}'", log)) return true;
+                    }
+                }
+
+                // STRATEGY 2: positional - the user manually clicks the 3rd
+                // button from the left, so pick visual index 2.
+                if (toolbarBtns.Count >= 3)
+                {
+                    var c = toolbarBtns[2];
+                    if (TryInvokeButton(c.el, $"visual btn[2] '{c.name}' rect.Left={c.rect.Left:0}", log)) return true;
+                }
+
+                // STRATEGY 3: if filter discarded everything, fall back to
+                // raw 3rd button by raw enumeration order.
+                if (toolbarBtns.Count == 0 && candidates.Count >= 3)
+                {
+                    var c = candidates[2];
+                    if (TryInvokeButton(c.el, $"raw btn[2] '{c.name}'", log)) return true;
+                }
+            }
+            catch (Exception ex) { log?.Invoke($"  toolbar enum err: {ex.Message}"); }
+            return false;
+        }
+
+        /// <summary>
+        /// Toggles the "Close models, don't show this dialog in future"
+        /// checkbox in the Mart Offline dialog. erwin uses this checkbox
+        /// as a master "discard all" override: when set, OK closes every
+        /// dirty Mart model with the Close action (no Save As file pickers,
+        /// no Save prompts, no Offline path), AND erwin remembers the
+        /// preference so the dialog never appears in future runs. Way more
+        /// reliable than fighting unnamed XTPToolBar icons whose UIA
+        /// InvokePattern is partially filtered.
+        /// </summary>
+        private static bool TryCheckMartOfflineCloseAllCheckbox(AutomationElement offRoot, Action<string> log)
+        {
+            try
+            {
+                var cbCond = new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.CheckBox);
+                var cbs = offRoot.FindAll(TreeScope.Descendants, cbCond);
+                log?.Invoke($"  cleanup: Mart Offline has {cbs.Count} checkbox(es)");
+                foreach (AutomationElement cb in cbs)
+                {
+                    string n = "";
+                    try { n = cb.Current.Name ?? ""; } catch { }
+                    string lo = n.ToLowerInvariant();
+                    bool match = lo.Contains("close models") || lo.Contains("don't show")
+                              || lo.Contains("dialog in future") || lo.Contains("future");
+                    log?.Invoke($"    cb name='{n}' match={match}");
+                    if (!match) continue;
+
+                    if (cb.TryGetCurrentPattern(TogglePattern.Pattern, out object tog))
+                    {
+                        try
+                        {
+                            var t = (TogglePattern)tog;
+                            var st = t.Current.ToggleState;
+                            log?.Invoke($"    current ToggleState={st}");
+                            if (st != ToggleState.On)
+                            {
+                                t.Toggle();
+                                log?.Invoke("    toggled checkbox ON");
+                            }
+                            else
+                            {
+                                log?.Invoke("    already ON - no toggle needed");
+                            }
+                            return true;
+                        }
+                        catch (Exception ex) { log?.Invoke($"    toggle err: {ex.Message}"); }
+                    }
+                    else
+                    {
+                        log?.Invoke("    WARN: no TogglePattern on checkbox");
+                    }
+                }
+            }
+            catch (Exception ex) { log?.Invoke($"  checkbox enum err: {ex.Message}"); }
+            return false;
+        }
+
+        private static bool IsTitleBarChromeButton(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            return name.Equals("Close", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("Minimize", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("Maximize", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("Restore", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("Kapat", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("Simge Durumuna Küçült", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("Ekranı Kapla", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool TryInvokeButton(AutomationElement el, string label, Action<string> log)
+        {
+            if (el == null) return false;
+            try
+            {
+                if (el.TryGetCurrentPattern(InvokePattern.Pattern, out object inv))
+                {
+                    ((InvokePattern)inv).Invoke();
+                    log?.Invoke($"    invoked toolbar button: {label}");
+                    return true;
+                }
+            }
+            catch (Exception ex) { log?.Invoke($"    invoke err on {label}: {ex.Message}"); }
+            return false;
+        }
+
+
+        /// <summary>
+        /// Diagnostic-heavy combo setter: dumps current value and dropdown
+        /// items, then tries to select an item matching "Close" / "Discard"
+        /// / "Don't Save" via Expand+Select; falls back to ValuePattern if
+        /// no list match. Returns true on any successful select.
+        /// </summary>
+        private static bool TrySetComboBoxToClose(AutomationElement combo, int idx, Action<string> log)
+        {
+            if (combo == null) return false;
+            string current = "?";
+            try
+            {
+                if (combo.TryGetCurrentPattern(ValuePattern.Pattern, out object vpRead))
+                    current = ((ValuePattern)vpRead).Current.Value ?? "?";
+            }
+            catch { }
+            log?.Invoke($"    combo[{idx}] current='{current}'");
+
+            try
+            {
+                if (combo.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out object ec))
+                {
+                    try
+                    {
+                        ((ExpandCollapsePattern)ec).Expand();
+                        Thread.Sleep(120);
+                        var itemCond = new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ListItem);
+                        var items = combo.FindAll(TreeScope.Descendants, itemCond);
+                        AutomationElement target = null;
+                        var available = new List<string>();
+                        foreach (AutomationElement it in items)
+                        {
+                            string nm = "";
+                            try { nm = it.Current.Name ?? ""; } catch { }
+                            available.Add(nm);
+                            if (target == null)
+                            {
+                                string lo = nm.ToLowerInvariant();
+                                if (lo.Contains("close") || lo.Contains("discard") || lo.Contains("don't save"))
+                                    target = it;
+                            }
+                        }
+                        log?.Invoke($"      items=[{string.Join(", ", available)}]");
+                        if (target != null && target.TryGetCurrentPattern(SelectionItemPattern.Pattern, out object sip))
+                        {
+                            ((SelectionItemPattern)sip).Select();
+                            log?.Invoke($"      selected '{target.Current.Name}'");
+                            return true;
+                        }
+                        ((ExpandCollapsePattern)ec).Collapse();
+                    }
+                    catch (Exception ex) { log?.Invoke($"      expand err: {ex.Message}"); }
+                }
+
+                if (combo.TryGetCurrentPattern(ValuePattern.Pattern, out object vp))
+                {
+                    try
+                    {
+                        ((ValuePattern)vp).SetValue("Close");
+                        log?.Invoke("      ValuePattern.SetValue('Close') ok");
+                        return true;
+                    }
+                    catch (Exception ex) { log?.Invoke($"      ValuePattern err: {ex.Message}"); }
+                }
+            }
+            catch (Exception ex) { log?.Invoke($"    combo set err: {ex.Message}"); }
+            return false;
+        }
+
+        [DllImport("user32.dll")]
+        private static extern bool IsWindow(IntPtr hWnd);
 
         /// <summary>
         /// Synchronous worker that walks the CC wizard from nothing → Apply-to-Right.
@@ -777,6 +1326,19 @@ namespace EliteSoft.Erwin.AddIn.Services
                     return session;
                 }
                 log?.Invoke($"  [7] listview id=200 found = 0x{lv.ToInt64():X}");
+
+                // Diag: dump all subitem rects for item 0 so we can verify the
+                // arrow column index is still 6 in this erwin version. If the
+                // expected click misses, this log shows the actual layout.
+                log?.Invoke("  [7] [LV-DUMP] item 0 subitem rects:");
+                for (int si = 0; si <= 10; si++)
+                {
+                    RECT diagR = new RECT { left = LVIR_BOUNDS, top = si, right = 0, bottom = 0 };
+                    SendMessage(lv, LVM_GETSUBITEMRECT, new IntPtr(0), ref diagR);
+                    int w = diagR.right - diagR.left;
+                    int h = diagR.bottom - diagR.top;
+                    log?.Invoke($"    subItem={si}: ({diagR.left},{diagR.top})-({diagR.right},{diagR.bottom})  w={w} h={h}");
+                }
 
                 // Arrow column for Model row: item=0, subItem=6 (per NMHDR dump).
                 RECT rc = new RECT { left = LVIR_BOUNDS, top = 6, right = 0, bottom = 0 };
@@ -1255,6 +1817,24 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// Reverses <see cref="HideWindow"/>: clears the WS_EX_LAYERED bit so
+        /// the window paints normally. Used during cleanup so any modal child
+        /// dialog (e.g. a "Save changes?" prompt) that the wizard pops as
+        /// part of closing is NOT hidden by inherited transparency, which
+        /// would leave erwin's UI thread blocked behind an invisible modal
+        /// for the user to discover via ESC.
+        /// </summary>
+        internal static void UnhideWindow(IntPtr hWnd)
+        {
+            try
+            {
+                IntPtr ex = GetWindowLongPtr(hWnd, GWL_EXSTYLE);
+                SetWindowLongPtr(hWnd, GWL_EXSTYLE, new IntPtr(ex.ToInt64() & ~WS_EX_LAYERED));
+            }
+            catch { }
+        }
+
+        /// <summary>
         /// Near-invisible window (alpha=1). Unlike <see cref="HideWindow"/>
         /// (alpha=0) which makes the window fully transparent and causes
         /// mouse input to pass through, alpha=1 keeps the window in the OS
@@ -1299,9 +1879,33 @@ namespace EliteSoft.Erwin.AddIn.Services
         // Toolbar command query messages
         private const uint TB_COMMANDTOINDEX = 0x0419;   // WM_USER + 25
         private const uint TB_BUTTONCOUNT    = 0x0418;   // WM_USER + 24
+        private const uint TB_GETBUTTON      = 0x0417;   // WM_USER + 23
         private const uint TB_GETRECT        = 0x0433;   // WM_USER + 51
         private const uint WM_NOTIFY         = 0x004E;
         private const int  NM_CLICK          = -2;
+        private const int  BN_CLICKED        = 0;
+
+        // x64 TBBUTTON layout: 4 ints + IntPtr (dwData) + IntPtr (iString)
+        // = 8 + 8 + 8 + 4 + 4 = 32 bytes (with alignment).
+        [StructLayout(LayoutKind.Sequential, Pack = 8)]
+        private struct TBBUTTON
+        {
+            public int    iBitmap;
+            public int    idCommand;
+            public byte   fsState;
+            public byte   fsStyle;
+            public byte   bReserved0;
+            public byte   bReserved1;
+            public byte   bReserved2;
+            public byte   bReserved3;
+            public byte   bReserved4;
+            public byte   bReserved5;
+            public IntPtr dwData;
+            public IntPtr iString;
+        }
+
+        [DllImport("user32.dll", EntryPoint = "SendMessageW")]
+        private static extern IntPtr SendMessageTbButton(IntPtr hWnd, uint Msg, IntPtr wParam, ref TBBUTTON lParam);
 
         [StructLayout(LayoutKind.Sequential)]
         private struct NMITEMACTIVATE

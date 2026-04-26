@@ -90,8 +90,35 @@ Stop-UserProcesses "DdlHelper"
 Stop-UserProcesses "ErwinInjector"
 Start-Sleep -Seconds 2
 
-# --- Step 2: Build ---
-Write-Host "`n[1/5] Building project..." -ForegroundColor Yellow
+# --- Step 2a: Build native bridge (cl.exe) ---
+# Must run BEFORE dotnet build so the csproj Copy task picks up the fresh DLL.
+# build-and-run.ps1 is the dev "do-it-all" entry point - bridge changes
+# need to compile here too, otherwise managed-only rebuild ships a stale DLL.
+# We verify success by checking the DLL timestamp advanced after the call;
+# build.ps1 itself uses $ErrorActionPreference=Stop + throw on failure, so
+# any compile error halts the sub-script before it returns.
+$bridgeScript = Join-Path $scriptDir "scripts\native-bridge\build.ps1"
+$bridgeDll    = Join-Path $scriptDir "scripts\native-bridge\ErwinNativeBridge.dll"
+if (Test-Path $bridgeScript) {
+    Write-Host "`n[1a/5] Building native bridge (cl.exe)..." -ForegroundColor Yellow
+    $beforeMtime = if (Test-Path $bridgeDll) { (Get-Item $bridgeDll).LastWriteTime } else { [DateTime]::MinValue }
+    & $bridgeScript
+    if (-not (Test-Path $bridgeDll)) {
+        Write-Host "Native bridge build failed - DLL not produced!" -ForegroundColor Red
+        Write-Host "`nPress any key to exit..." -ForegroundColor Gray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown"); exit 1
+    }
+    $afterMtime = (Get-Item $bridgeDll).LastWriteTime
+    if ($afterMtime -le $beforeMtime) {
+        Write-Host "  Native bridge unchanged (still cached, OK)" -ForegroundColor Green
+    } else {
+        Write-Host "  Native bridge built! (refreshed at $afterMtime)" -ForegroundColor Green
+    }
+} else {
+    Write-Host "`n[1a/5] (skipped) native bridge script not found at $bridgeScript" -ForegroundColor DarkGray
+}
+
+# --- Step 2b: Build managed code ---
+Write-Host "`n[1b/5] Building project..." -ForegroundColor Yellow
 dotnet clean erwin-addin.sln 2>&1 | Out-Null
 dotnet build erwin-addin.sln -c Release
 

@@ -95,7 +95,12 @@ namespace EliteSoft.Erwin.AddIn.Services
         private delegate IntPtr CCInspGenerateMartMartDdlViaOnFEFn(IntPtr ms);
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int CCInspTestPSMFn(IntPtr ms);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate int CCInspInstallOnFeHookFn();
+        private delegate int CCInspCleanupHookInstallFn();
+        private delegate int CCInspCleanupHookUninstallFn();
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate IntPtr CCInspGetLastOnFeMsFn();
@@ -174,7 +179,10 @@ namespace EliteSoft.Erwin.AddIn.Services
         private static CCInspSetGlobalPxAsFn _ccInspSetGlobalPxAs;
         private static CCInspCallOnFeFn _ccInspCallOnFe;
         private static CCInspGenerateMartMartDdlViaOnFEFn _ccInspGenerateMartMartDdlViaOnFE;
+        private static CCInspTestPSMFn _ccInspTestPSM;
         private static CCInspInstallOnFeHookFn _ccInspInstallOnFeHook;
+        private static CCInspCleanupHookInstallFn _ccInspCleanupHookInstall;
+        private static CCInspCleanupHookUninstallFn _ccInspCleanupHookUninstall;
         private static CCInspGetLastOnFeMsFn _ccInspGetLastOnFeMs;
         private static CCInspGetLastEdrMsFn _ccInspGetLastEdrMs;
         private static CCInspGetEdrTxCountFn _ccInspGetEdrTxCount;
@@ -323,9 +331,20 @@ namespace EliteSoft.Erwin.AddIn.Services
                     if (ccMMOrch != IntPtr.Zero)
                         _ccInspGenerateMartMartDdlViaOnFE = Marshal.GetDelegateForFunctionPointer<CCInspGenerateMartMartDdlViaOnFEFn>(ccMMOrch);
 
+                    IntPtr ccTestPsm = GetProcAddress(_bridgeModule, "CCInsp_TestPSM");
+                    if (ccTestPsm != IntPtr.Zero)
+                        _ccInspTestPSM = Marshal.GetDelegateForFunctionPointer<CCInspTestPSMFn>(ccTestPsm);
+
                     IntPtr ccOnFeHk = GetProcAddress(_bridgeModule, "CCInsp_InstallOnFeHook");
                     if (ccOnFeHk != IntPtr.Zero)
                         _ccInspInstallOnFeHook = Marshal.GetDelegateForFunctionPointer<CCInspInstallOnFeHookFn>(ccOnFeHk);
+
+                    IntPtr ccCleanInst = GetProcAddress(_bridgeModule, "CCInsp_CleanupHookInstall");
+                    if (ccCleanInst != IntPtr.Zero)
+                        _ccInspCleanupHookInstall = Marshal.GetDelegateForFunctionPointer<CCInspCleanupHookInstallFn>(ccCleanInst);
+                    IntPtr ccCleanUn = GetProcAddress(_bridgeModule, "CCInsp_CleanupHookUninstall");
+                    if (ccCleanUn != IntPtr.Zero)
+                        _ccInspCleanupHookUninstall = Marshal.GetDelegateForFunctionPointer<CCInspCleanupHookUninstallFn>(ccCleanUn);
 
                     IntPtr ccGetLastOnFe = GetProcAddress(_bridgeModule, "CCInsp_GetLastOnFeMs");
                     if (ccGetLastOnFe != IntPtr.Zero)
@@ -613,9 +632,62 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// Internally computes the CC-context AS, writes gbl_pxActionSummary,
         /// and opens the alter wizard modally.
         /// </summary>
+        /// <summary>
+        /// Probe PrepareServerModelSet on a captured mart-bound ModelSet pointer.
+        /// Returns 1 if as1 is produced (F2/MCX path is open), 0 if PSM ran but
+        /// returned null, -1 if PSM symbol unresolved or ms is null, -2 on SEH.
+        /// All diagnostics emit to bridge log under [PSM-PROBE].
+        /// </summary>
+        public static int TestPSM(IntPtr ms, Action<string> log = null)
+        {
+            if (_ccInspTestPSM == null)
+            {
+                log?.Invoke("TestPSM: bridge export not bound (rebuild bridge?).");
+                return -1;
+            }
+            if (ms == IntPtr.Zero)
+            {
+                log?.Invoke("TestPSM: ms pointer is zero.");
+                return -1;
+            }
+            try { return _ccInspTestPSM(ms); }
+            catch (Exception ex)
+            {
+                log?.Invoke($"TestPSM threw: {ex.GetType().Name}: {ex.Message}");
+                return -1;
+            }
+        }
+
         public static int CallOnFE(IntPtr ms, bool flag, uint flags)
         {
             return _ccInspCallOnFe?.Invoke(ms, flag ? 1 : 0, flags) ?? -10000;
+        }
+
+        /// <summary>
+        /// Installs an OS-level WinEvent hook that hides every #32770 / Afx
+        /// frame created in erwin's process before its first paint. Used
+        /// during MartMartAutomation cleanup so the dialog cascade (Mart
+        /// Offline + Save As pickers + Close Model) never reaches the
+        /// screen even though we're dismissing each dialog programmatically.
+        /// Pair with <see cref="CleanupHookUninstall"/> in a finally block.
+        /// </summary>
+        public static int CleanupHookInstall(Action<string> log = null)
+        {
+            if (_ccInspCleanupHookInstall == null) { log?.Invoke("CleanupHookInstall: bridge export not bound (rebuild bridge?)."); return -1; }
+            try { return _ccInspCleanupHookInstall(); }
+            catch (Exception ex) { log?.Invoke($"CleanupHookInstall threw: {ex.Message}"); return -1; }
+        }
+
+        /// <summary>
+        /// Removes the cleanup-time WinEvent hook installed by
+        /// <see cref="CleanupHookInstall"/>. Returns the number of dialogs
+        /// the hook hid during the cleanup window (diagnostic).
+        /// </summary>
+        public static int CleanupHookUninstall(Action<string> log = null)
+        {
+            if (_ccInspCleanupHookUninstall == null) { log?.Invoke("CleanupHookUninstall: bridge export not bound."); return -1; }
+            try { return _ccInspCleanupHookUninstall(); }
+            catch (Exception ex) { log?.Invoke($"CleanupHookUninstall threw: {ex.Message}"); return -1; }
         }
 
         /// <summary>D1-spike: install inline detour on ELA::OnFE to log args

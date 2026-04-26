@@ -210,6 +210,7 @@ namespace EliteSoft.Erwin.AddIn
                     cmbLeftModel.Items.Clear();
                     cmbLeftModel.Items.Add($"Active Model ({_connectedModelName})");
                     cmbLeftModel.SelectedIndex = 0;
+                    lblOpenedModel.Text = $"Opened Model: {_connectedModelName} (with last changes)";
                     return;
                 }
 
@@ -2276,13 +2277,29 @@ namespace EliteSoft.Erwin.AddIn
             {
                 if (martMode)
                 {
+                    int v = ParseRightVersion();
+                    int activeV = ParseActivePuVersion();
+                    bool sameVersion = (v > 0 && activeV > 0 && v == activeV);
+
+                    if (sameVersion)
+                    {
+                        // Same version on both sides = "active dirty vs last
+                        // saved". OnFE pipeline alone handles this with zero
+                        // GUI flashes (no CC wizard, no Mart picker). This is
+                        // the proven flash-free path used by Debug Log's
+                        // "Normal Alter DDL (dirty vs save)" button.
+                        log($"[ROUTE] Same version v{v} on both sides - OnFE fast path (dirty vs last saved, no flashes)");
+                        script = await System.Threading.Tasks.Task.Run(() =>
+                            Services.NativeBridgeService.GenerateAlterDdl(log));
+                    }
+                    else
+                    {
                     // Production Mart-Mart zero-click flow:
                     //   1. Drive CC wizard + Apply-to-Right programmatically
                     //      (hidden dialogs), honoring cmbRightModel selection.
                     //   2. After EDR state is populated, call native
                     //      GenerateMartMartDdlViaOnFE to produce the alter DDL.
                     //   3. Close the CC/RD session regardless of outcome.
-                    int v = ParseRightVersion();
                     string catalog = ParseActivePuCatalog();
                     if (v <= 0 || string.IsNullOrEmpty(catalog))
                     {
@@ -2331,6 +2348,7 @@ namespace EliteSoft.Erwin.AddIn
                             try { overlay?.Close(); } catch { }
                         }
                     }
+                    } // close: else (different versions) of sameVersion check
                 }
                 else
                 {
@@ -3309,6 +3327,8 @@ namespace EliteSoft.Erwin.AddIn
                 string leftLabel = version > 1 ? $"Active Model (v{version})" : "Active Model";
                 cmbLeftModel.Items.Add(leftLabel);
                 cmbLeftModel.SelectedIndex = 0;
+                string vTag = version > 1 ? $"v{version} " : "";
+                lblOpenedModel.Text = $"Opened Model: {modelName} {vTag}(with last changes)";
 
                 // Right model: list versions from Mart (only for Mart models)
                 var versions = DdlGenerationService.GetMartVersions(modelName, (object)_currentModel, (Action<string>)Log);
@@ -3338,6 +3358,7 @@ namespace EliteSoft.Erwin.AddIn
                 Log($"PopulateVersionCombos error: {ex.Message}");
                 cmbLeftModel.Items.Add("Active Model");
                 cmbLeftModel.SelectedIndex = 0;
+                lblOpenedModel.Text = "Opened Model: (active, with last changes)";
                 cmbRightModel.Items.Add("(Mart Baseline)");
                 cmbRightModel.SelectedIndex = 0;
             }
@@ -3347,8 +3368,19 @@ namespace EliteSoft.Erwin.AddIn
 
         #region Debug Log
 
+        private static readonly string _addinLogPath =
+            System.IO.Path.Combine(System.IO.Path.GetTempPath(), "erwin-addin-debug.log");
+
         private void Log(string message)
         {
+            string timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
+            string line = $"[{timestamp}] {message}\r\n";
+
+            // Always tee to file - even when the form is disposed or the
+            // call lands off-thread - so cleanup output survives a window
+            // close and can be inspected post-hoc.
+            try { System.IO.File.AppendAllText(_addinLogPath, line); } catch { }
+
             if (IsDisposed || txtDebugLog == null || txtDebugLog.IsDisposed) return;
 
             if (InvokeRequired)
@@ -3357,8 +3389,6 @@ namespace EliteSoft.Erwin.AddIn
                 return;
             }
 
-            string timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
-            string line = $"[{timestamp}] {message}\r\n";
             _fullLogText += line;
 
             // Only append if no search filter is active
@@ -3634,6 +3664,64 @@ namespace EliteSoft.Erwin.AddIn
                 Log("[SPIKE] PU is now in session. Native MS capture is the next step.");
             }
             finally { btnSpikeOpenMartV1.Enabled = true; }
+        }
+
+        /// <summary>
+        /// F2 Probe: capture the active dirty PU's mart-bound ModelSet pointer
+        /// and call PrepareServerModelSet on it. If as1 is produced (rv=1), the
+        /// native F2/MCX pipeline can serve flash-free Mart-Mart compares for
+        /// this user's session. Logs all bridge-level diagnostics under
+        /// [PSM-PROBE] in erwin-native-bridge.log.
+        /// </summary>
+        private async void BtnF2Probe_Click(object sender, EventArgs e)
+        {
+            btnF2Probe.Enabled = false;
+            try
+            {
+                Log("");
+                Log("=== F2 Probe: PrepareServerModelSet on active mart MS ===");
+                if (_currentModel == null)
+                {
+                    Log("[F2-PROBE] No active model loaded.");
+                    return;
+                }
+                Action<string> log = msg =>
+                {
+                    if (InvokeRequired) BeginInvoke(new Action(() => Log(msg)));
+                    else Log(msg);
+                };
+                int rv = await System.Threading.Tasks.Task.Run(() =>
+                {
+                    IntPtr ms = Services.NativeBridgeService.EnsureActiveModelSetCaptured(_currentModel, log);
+                    if (ms == IntPtr.Zero)
+                    {
+                        log("[F2-PROBE] Could not capture active ModelSet pointer.");
+                        return -1;
+                    }
+                    log($"[F2-PROBE] active mart MS = 0x{ms.ToInt64():X}");
+                    return Services.NativeBridgeService.TestPSM(ms, log);
+                });
+                switch (rv)
+                {
+                    case 1:
+                        Log("[F2-PROBE] SUCCESS - PSM produced as1. F2/MCX pipeline OPEN. Plan B viable.");
+                        break;
+                    case 0:
+                        Log("[F2-PROBE] PSM ran but as1 was null - mart history likely missing. Plan B not viable.");
+                        break;
+                    case -2:
+                        Log("[F2-PROBE] PSM crashed (SEH). Mart state issue. Plan B not viable.");
+                        break;
+                    default:
+                        Log($"[F2-PROBE] failed with rv={rv}. See bridge log.");
+                        break;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"[F2-PROBE] threw: {ex.GetType().Name}: {ex.Message}");
+            }
+            finally { btnF2Probe.Enabled = true; }
         }
 
         private async void BtnCallOnFE_Click(object sender, EventArgs e)
