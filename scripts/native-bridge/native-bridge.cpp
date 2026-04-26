@@ -852,6 +852,110 @@ cleanup:
     return result;
 }
 
+// =====================================================================
+// F2-PAIR: variant of RunSilentAlterDdl that takes BOTH ModelSets and
+// SKIPS PrepareServerModelSet. Used by the dirty-aware add-in flow:
+// the caller already created a session-less duplicate PU via
+// app.PersistenceUnits.Create(... ;Duplicate=YES, modelLongId) and
+// passes (dupModelSet, activeModelSet). The active PU's in-memory
+// dirty buffer becomes the clientMs, and the duplicate's clean
+// Mart-fetched ModelSet becomes the serverMs.
+// =====================================================================
+static char* RunSilentAlterDdlWithServerMs(void* serverMs, void* clientMs) {
+    LogLine("===== [F2-PAIR] RunSilentAlterDdlWithServerMs(serverMs=%p, clientMs=%p) =====",
+        serverMs, clientMs);
+    if (!serverMs || !clientMs) { LogLine("[F2-PAIR] null arg"); return nullptr; }
+    if (!ResolveFaz2Symbols()) { LogLine("[F2-PAIR] symbol resolution failed"); return nullptr; }
+
+    void* as1 = nullptr;
+    void* as2 = nullptr;
+    char* ccBuf = (char*)_aligned_malloc(4096, 16);
+    char* fepBuf = (char*)_aligned_malloc(4096, 16);
+    char* result = nullptr;
+    bool ccConstructed = false;
+    bool fepConstructed = false;
+
+    if (!ccBuf || !fepBuf) { LogLine("[F2-PAIR] buffer alloc failed"); goto cleanup; }
+    memset(ccBuf, 0, 4096);
+    memset(fepBuf, 0, 4096);
+
+    if (g_activateSilent) {
+        __try { g_activateSilent(1); LogLine("[F2-PAIR] silent mode ON"); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[F2-PAIR] ActivateSilentMode(1) SEH"); }
+    }
+
+    __try {
+        // Step 1: SKIP PrepareServerModelSet - caller supplied serverMs.
+        // PrepareServerModelSet normally returns as1 alongside the serverMs;
+        // since we already have serverMs, we'd need to manufacture as1.
+        // First attempt: InitClientAS on serverMs (it has the same shape as
+        // any other MS in memory). If that AVs (it does, when serverMs is a
+        // session-less duplicate), fall back to using as2 for both slots
+        // (let MCX::ctor see them as identical pre-state holders) and
+        // ultimately to a null - some MCX paths only consult as2.
+        LogLine("[F2-PAIR] step 1: InitializeClientActionSummary(clientMs) -> as2...");
+        bool ok2 = g_initClientAs(clientMs, &as2);
+        LogLine("[F2-PAIR]   rc=%d as2=%p", (int)ok2, as2);
+        if (!ok2 || !as2) { LogLine("[F2-PAIR] InitClientAs(clientMs) failed"); goto finally_block; }
+
+        LogLine("[F2-PAIR] step 2: probe InitializeClientActionSummary(serverMs) under SEH...");
+        __try { ok2 = g_initClientAs(serverMs, &as1); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            LogLine("[F2-PAIR]   InitClientAs(serverMs) AV 0x%08lX (expected for session-less dup)", GetExceptionCode());
+            as1 = nullptr;
+        }
+        LogLine("[F2-PAIR]   as1=%p", as1);
+        // Fall back: reuse as2 for both. If that also blows up downstream
+        // we'll try null next iteration of the probe.
+        if (!as1)
+        {
+            LogLine("[F2-PAIR]   reusing as2 as as1 (server-side AS fallback)");
+            as1 = as2;
+        }
+
+        LogLine("[F2-PAIR] step 3: MCXInvokeCompleteCompare ctor(serverMs, clientMs, as1, as2)...");
+        g_mcxCtor(ccBuf, serverMs, clientMs, as1, as2);
+        ccConstructed = true;
+
+        LogLine("[F2-PAIR] step 4: MCXInvokeCompleteCompare::Execute(clientMs)...");
+        bool ccOk = g_mcxExecute(ccBuf, clientMs);
+        LogLine("[F2-PAIR]   Execute -> %d", (int)ccOk);
+        if (!ccOk) { LogLine("[F2-PAIR] Execute returned false"); goto finally_block; }
+
+        LogLine("[F2-PAIR] step 5: FEProcessor ctor + GenerateAlterScript...");
+        g_fepCtor(fepBuf);
+        fepConstructed = true;
+        int feRv = g_origGenerateAlter
+            ? g_origGenerateAlter(fepBuf, clientMs, as2, nullptr, false)
+            : -1;
+        LogLine("[F2-PAIR]   GenerateAlterScript rv=%d (0=OK)", feRv);
+        if (feRv != 0) goto finally_block;
+
+        LogLine("[F2-PAIR] step 6: GetScript + concatenate...");
+        void* vec = g_getScript(fepBuf);
+        LogLine("[F2-PAIR]   vec=%p", vec);
+        result = ConcatScriptVector(vec);
+        LogLine("[F2-PAIR]   result=%p (len=%zu)", (void*)result, result ? strlen(result) : 0);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        LogLine("[F2-PAIR] SEH 0x%08lX during pipeline", GetExceptionCode());
+    }
+
+finally_block:
+    if (fepConstructed) { __try { g_fepDtor(fepBuf); } __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[F2-PAIR] fepDtor SEH"); } }
+    if (ccConstructed)  { __try { g_mcxDtor(ccBuf);  } __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[F2-PAIR] mcxDtor SEH"); } }
+
+cleanup:
+    if (fepBuf) _aligned_free(fepBuf);
+    if (ccBuf)  _aligned_free(ccBuf);
+    if (g_activateSilent) {
+        __try { g_activateSilent(0); LogLine("[F2-PAIR] silent mode OFF"); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[F2-PAIR] ActivateSilentMode(0) SEH"); }
+    }
+    LogLine("===== [F2-PAIR] done, result=%s =====", result ? "(text)" : "(null)");
+    return result;
+}
+
 // ----- Exports -----
 // ===========================================================================
 // FAZ A-SPIKE: observer detours on MCX internal entry points so we can see
@@ -1713,6 +1817,17 @@ extern "C" __declspec(dllexport) const char* __cdecl GenerateAlterDdlFromCapture
         (volatile LONG64*)&g_lastCapturedModelSet, 0, 0);
     if (!clientMs) { LogLine("[F2] no captured modelSet; call EnsureActiveModelSetCaptured first"); return nullptr; }
     return (const char*)RunSilentAlterDdl(clientMs);
+}
+
+// F2-PAIR export. Caller supplies BOTH ModelSet pointers - typically the
+// active dirty PU's ModelSet (clientMs) and a Mart-Create()'d duplicate
+// PU's ModelSet (serverMs). Skips PrepareServerModelSet entirely - the
+// duplicate already gives us the clean Mart-fetched server side, so the
+// CC pipeline can run end-to-end without a Mart-version-history fetch.
+extern "C" __declspec(dllexport) const char* __cdecl GenerateAlterDdlWithServerMs(
+    void* serverMs, void* clientMs)
+{
+    return (const char*)RunSilentAlterDdlWithServerMs(serverMs, clientMs);
 }
 
 extern "C" __declspec(dllexport) void __cdecl FreeDdlBuffer(const char* buf) {

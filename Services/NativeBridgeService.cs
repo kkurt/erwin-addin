@@ -59,6 +59,10 @@ namespace EliteSoft.Erwin.AddIn.Services
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate IntPtr GenerateAlterDdlStandaloneFn(IntPtr clientMs);
 
+        // F2-PAIR: takes BOTH ModelSet pointers, skips PrepareServerModelSet.
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate IntPtr GenerateAlterDdlWithServerMsFn(IntPtr serverMs, IntPtr clientMs);
+
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate IntPtr OpenAlterScriptWizardHiddenFn();
 
@@ -154,6 +158,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         private static ClearCapturedDdlFn _clearCapturedDdl;
         private static CallInvokePreviewFn _callInvokePreview;
         private static GenerateAlterDdlStandaloneFn _generateAlterStandalone;
+        private static GenerateAlterDdlWithServerMsFn _generateAlterWithServerMs;
         private static OpenAlterScriptWizardHiddenFn _openHiddenWizard;
         private static CloseHiddenWizardFn _closeHiddenWizard;
         private static GetCapturedFEWPageOptionsFn _getCapturedFEWPO;
@@ -274,6 +279,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                     IntPtr standaloneProc = GetProcAddress(_bridgeModule, "GenerateAlterDdlStandalone");
                     if (standaloneProc != IntPtr.Zero)
                         _generateAlterStandalone = Marshal.GetDelegateForFunctionPointer<GenerateAlterDdlStandaloneFn>(standaloneProc);
+
+                    IntPtr serverMsProc = GetProcAddress(_bridgeModule, "GenerateAlterDdlWithServerMs");
+                    if (serverMsProc != IntPtr.Zero)
+                        _generateAlterWithServerMs = Marshal.GetDelegateForFunctionPointer<GenerateAlterDdlWithServerMsFn>(serverMsProc);
 
                     IntPtr openProc = GetProcAddress(_bridgeModule, "OpenAlterScriptWizardHidden");
                     IntPtr closeProc = GetProcAddress(_bridgeModule, "CloseHiddenWizard");
@@ -1007,6 +1016,55 @@ namespace EliteSoft.Erwin.AddIn.Services
             IntPtr captured = _getLastCapturedModelSet();
             log?.Invoke($"NativeBridge: capture result = 0x{captured.ToInt64():X}");
             return captured;
+        }
+
+        /// <summary>
+        /// F2-PAIR: runs the silent alter-DDL pipeline given BOTH ModelSet
+        /// pointers, skipping PrepareServerModelSet. Used by the dirty-aware
+        /// add-in compare flow - the caller has already created a session-less
+        /// duplicate PU via PUs.Create(...;Duplicate=YES, modelLongId) and
+        /// passes (dupModelSet, activeModelSet) so the active PU's in-memory
+        /// dirty buffer becomes the clientMs (= what the diff is FROM) and the
+        /// duplicate's clean Mart-fetched MS becomes the serverMs (= what the
+        /// diff is AGAINST). Returns the concatenated alter DDL or null on
+        /// failure. Caller handles cleanup of the duplicate PU.
+        /// </summary>
+        public static string GenerateAlterDdlWithServerMs(IntPtr serverMs, IntPtr clientMs, Action<string> log = null)
+        {
+            if (_generateAlterWithServerMs == null || _freeDdlBuffer == null)
+            {
+                log?.Invoke("NativeBridge: GenerateAlterDdlWithServerMs export missing - rebuild bridge DLL.");
+                return null;
+            }
+            if (serverMs == IntPtr.Zero || clientMs == IntPtr.Zero)
+            {
+                log?.Invoke("NativeBridge: serverMs / clientMs is null.");
+                return null;
+            }
+
+            IntPtr ptr = IntPtr.Zero;
+            try
+            {
+                log?.Invoke($"NativeBridge: invoking GenerateAlterDdlWithServerMs(server=0x{serverMs.ToInt64():X}, client=0x{clientMs.ToInt64():X})...");
+                ptr = _generateAlterWithServerMs(serverMs, clientMs);
+                if (ptr == IntPtr.Zero)
+                {
+                    log?.Invoke("NativeBridge: F2-PAIR returned null. See bridge log [F2-PAIR] tags.");
+                    return null;
+                }
+                string ddl = Marshal.PtrToStringAnsi(ptr);
+                log?.Invoke($"NativeBridge: F2-PAIR returned {ddl?.Length ?? 0} chars.");
+                return ddl;
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"NativeBridge: F2-PAIR threw: {ex.GetType().Name}: {ex.Message}");
+                return null;
+            }
+            finally
+            {
+                if (ptr != IntPtr.Zero) { try { _freeDdlBuffer(ptr); } catch { } }
+            }
         }
 
         /// <summary>
