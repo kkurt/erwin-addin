@@ -771,13 +771,6 @@ namespace EliteSoft.Erwin.AddIn
             this.cmbLeftModel.Visible = false;
             this.grpDdlSource.Controls.Add(this.cmbLeftModel);
 
-            // Mart Review button removed - DDL Generation tab now has the
-            // smart-routing Generate DDL button which covers both same-version
-            // (dirty vs last saved) and different-version compare paths.
-            this.btnMartReview = new System.Windows.Forms.Button();
-            this.btnMartReview.Visible = false;
-            this.btnMartReview.Click += new System.EventHandler(this.BtnMartReview_Click);
-
             // ----- Group: Target (right side = Mart version OR DB) -----
             this.grpDdlTarget = new System.Windows.Forms.GroupBox();
             this.grpDdlTarget.Location = new System.Drawing.Point(400, 12);
@@ -986,32 +979,6 @@ namespace EliteSoft.Erwin.AddIn
             this.btnDumpCCState.Click += new System.EventHandler(this.BtnDumpCCState_Click);
             this.grpDebugLog.Controls.Add(this.btnDumpCCState);
 
-            // --- Hidden research spikes (kept as fields so handlers compile) ---
-            // Removed from UI on 2026-04-26 (cleanup): MartMartSpike, MMDiscovery,
-            // SpikeShowCCWiz, SpikeOpenMartV1, CaptureApplyStack. Original
-            // implementations live in ModelConfigForm.cs as no-longer-bound
-            // handlers (Click+= still wired in case a future research path needs
-            // to surface them quickly without re-creating the button).
-            this.btnMartMartSpike = new System.Windows.Forms.Button();
-            this.btnMartMartSpike.Visible = false;
-            this.btnMartMartSpike.Click += new System.EventHandler(this.BtnMartMartSpike_Click);
-
-            this.btnMMDiscovery = new System.Windows.Forms.Button();
-            this.btnMMDiscovery.Visible = false;
-            this.btnMMDiscovery.Click += new System.EventHandler(this.BtnMMDiscovery_Click);
-
-            this.btnCaptureApplyStack = new System.Windows.Forms.Button();
-            this.btnCaptureApplyStack.Visible = false;
-            this.btnCaptureApplyStack.Click += new System.EventHandler(this.BtnCaptureApplyStack_Click);
-
-            this.btnSpikeShowCCWiz = new System.Windows.Forms.Button();
-            this.btnSpikeShowCCWiz.Visible = false;
-            this.btnSpikeShowCCWiz.Click += new System.EventHandler(this.BtnSpikeShowCCWiz_Click);
-
-            this.btnSpikeOpenMartV1 = new System.Windows.Forms.Button();
-            this.btnSpikeOpenMartV1.Visible = false;
-            this.btnSpikeOpenMartV1.Click += new System.EventHandler(this.BtnSpikeOpenMartV1_Click);
-
             // --- Visible debug toggle (kept) ---
             this.btnToggleEdrST = new System.Windows.Forms.Button();
             this.btnToggleEdrST.Location = new System.Drawing.Point(244, 120);
@@ -1037,21 +1004,6 @@ namespace EliteSoft.Erwin.AddIn
             this.btnCallOnFE.Cursor = System.Windows.Forms.Cursors.Hand;
             this.btnCallOnFE.Click += new System.EventHandler(this.BtnCallOnFE_Click);
             this.grpDebugLog.Controls.Add(this.btnCallOnFE);
-
-            // --- F2 Probe: tests PrepareServerModelSet on captured active Mart MS.
-            // If as1 returns non-null, the F2/MCX native pipeline can be used as
-            // the flash-free Mart-Mart strategy (replacing UIA-driven CC). ---
-            this.btnF2Probe = new System.Windows.Forms.Button();
-            this.btnF2Probe.Location = new System.Drawing.Point(16, 88);
-            this.btnF2Probe.Size = new System.Drawing.Size(220, 28);
-            this.btnF2Probe.Text = "F2 Probe: PSM(active mart MS)";
-            this.btnF2Probe.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnF2Probe.BackColor = System.Drawing.Color.FromArgb(220, 200, 255);
-            this.btnF2Probe.FlatAppearance.BorderColor = clrBorder;
-            this.btnF2Probe.Font = fontCaption;
-            this.btnF2Probe.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnF2Probe.Click += new System.EventHandler(this.BtnF2Probe_Click);
-            this.grpDebugLog.Controls.Add(this.btnF2Probe);
 
             this.btnClearLog.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right;
             this.btnClearLog.Location = new System.Drawing.Point(498, 24);
@@ -1192,9 +1144,7 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.TextBox txtAlterSql;
         private System.Windows.Forms.Button btnCopyAlterSql;
         private System.Windows.Forms.Button btnSaveAlterSql;
-        private System.Windows.Forms.Button btnMartReview;
         private System.Windows.Forms.Label lblOpenedModel;
-        private System.Windows.Forms.Button btnF2Probe;
         private System.Windows.Forms.Button btnAlterWizardProd;
         private System.Windows.Forms.ComboBox cmbLeftModel;
         private System.Windows.Forms.ComboBox cmbRightModel;
@@ -1254,13 +1204,8 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.Button btnCopyLog;
         private System.Windows.Forms.Button btnClearLog;
         private System.Windows.Forms.Button btnDumpCCState;
-        private System.Windows.Forms.Button btnMartMartSpike;
         private System.Windows.Forms.Button btnCallOnFE;
-        private System.Windows.Forms.Button btnSpikeOpenMartV1;
-        private System.Windows.Forms.Button btnSpikeShowCCWiz;
         private System.Windows.Forms.Button btnToggleEdrST;
-        private System.Windows.Forms.Button btnMMDiscovery;
-        private System.Windows.Forms.Button btnCaptureApplyStack;
         private bool _edrStOn = false;
         private System.Windows.Forms.Button btnInvokePreviewDirect;
         private System.Windows.Forms.TextBox txtLogSearch;

@@ -2223,27 +2223,6 @@ namespace EliteSoft.Erwin.AddIn
 
         #region Approval / Review
 
-        private void BtnMartReview_Click(object sender, EventArgs e)
-        {
-            var hWnd = Services.Win32Helper.GetErwinMainWindow();
-            if (hWnd == IntPtr.Zero)
-            {
-                ErwinAddIn.ShowTopMostMessage("erwin window not found.", "Mart Review");
-                return;
-            }
-
-            Log("[REVIEW] Triggering erwin Mart Review...");
-            bool invoked = Services.Win32Helper.InvokeToolbarButton(hWnd, "Review", Log);
-
-            if (invoked)
-                Log("[REVIEW] Review triggered.");
-            else
-            {
-                Log("[REVIEW] 'Review' button not found.");
-                ErwinAddIn.ShowTopMostMessage("'Review' button not found in erwin.", "Mart Review");
-            }
-        }
-
         private async void BtnAlterWizardProd_Click(object sender, EventArgs e)
         {
             if (!_isConnected || _currentModel == null)
@@ -3538,53 +3517,6 @@ namespace EliteSoft.Erwin.AddIn
             return -1;
         }
 
-        private async void BtnCaptureApplyStack_Click(object sender, EventArgs e)
-        {
-            btnCaptureApplyStack.Enabled = false;
-            try
-            {
-                int v = ParseRightVersion();
-                if (v <= 0) v = 1;
-                string catalogPath = ParseActivePuCatalog();
-                Log("");
-                Log("=== DIAG: Capture Apply-to-Right stack trace ===");
-                Log("Instructions:");
-                Log("  1. When Resolve Differences opens and becomes visible,");
-                Log("     manually click the RIGHT-pointing arrow on the Model row.");
-                Log("  2. You have 45 seconds to click. After that we auto-close.");
-                Log("  3. Bridge log (erwin-native-bridge.log) will capture the");
-                Log("     call stack. Send that log back for analysis.");
-                Log("");
-                await Services.MartMartAutomation.CaptureApplyStackAsync(v, catalogPath, msg =>
-                {
-                    if (InvokeRequired) BeginInvoke(new Action(() => Log(msg)));
-                    else Log(msg);
-                });
-                Log("=== DIAG done. Share erwin-native-bridge.log contents. ===");
-            }
-            finally { btnCaptureApplyStack.Enabled = true; }
-        }
-
-        private async void BtnMMDiscovery_Click(object sender, EventArgs e)
-        {
-            btnMMDiscovery.Enabled = false;
-            try
-            {
-                int v = ParseRightVersion();
-                if (v <= 0) v = 1;
-                string catalogPath = ParseActivePuCatalog();
-                Log("");
-                Log($"=== Mart-Mart Auto: discovery for v{v}, catalog='{catalogPath}' ===");
-                await Services.MartMartAutomation.RunDiscoveryAsync(v, catalogPath, msg =>
-                {
-                    if (InvokeRequired) BeginInvoke(new Action(() => Log(msg)));
-                    else Log(msg);
-                });
-                Log("Discovery complete. Search the output above for ControlType + AutomationId of the 'Copy to Right' arrow on the Model row.");
-            }
-            finally { btnMMDiscovery.Enabled = true; }
-        }
-
         private void BtnToggleEdrST_Click(object sender, EventArgs e)
         {
             _edrStOn = !_edrStOn;
@@ -3597,131 +3529,6 @@ namespace EliteSoft.Erwin.AddIn
             Log($"EDR stack-trace mode: {(_edrStOn ? "ON" : "OFF")}");
             if (_edrStOn)
                 Log("  Now: do CC + click Apply-to-Right in Resolve Differences.");
-        }
-
-        private void BtnSpikeShowCCWiz_Click(object sender, EventArgs e)
-        {
-            btnSpikeShowCCWiz.Enabled = false;
-            try
-            {
-                Log("");
-                Log("=== Spike: CWizInterface::ShowERwinCCWiz(v3, v1) ===");
-                var seen = Services.NativeBridgeService.GetSeenModelSets();
-                Log($"Distinct MSs seen so far: {seen.Length}");
-                for (int i = 0; i < seen.Length; ++i)
-                    Log($"  [{i}] 0x{seen[i].ToInt64():X}");
-                if (seen.Length < 2)
-                {
-                    Log("  Need at least 2 distinct modelSets (v3 + v1).");
-                    Log("  Do: Mart -> Open the second version (v1), then retry this spike.");
-                    return;
-                }
-                IntPtr ms1 = seen[0];   // first seen: usually v3 (active model)
-                IntPtr ms2 = seen[seen.Length - 1];   // last seen distinct: likely v1
-                if (ms1 == ms2)
-                {
-                    Log("  Distinct-pick collapsed; retry with more hook fires.");
-                    return;
-                }
-                Log($"Picking ms1={ms1.ToInt64():X16} (first) ms2={ms2.ToInt64():X16} (last)");
-                int rv = Services.NativeBridgeService.CallShowERwinCCWiz(ms1, ms2, true, true);
-                Log($"ShowERwinCCWiz returned {rv}");
-                Log("Now observe: did a CC wizard dialog open? Did EDR transactions fire on v1?");
-                Log("Check bridge log for [CC-PIPE-CALL] + subsequent [EDR-REG*] lines.");
-            }
-            finally { btnSpikeShowCCWiz.Enabled = true; }
-        }
-
-        private void BtnSpikeOpenMartV1_Click(object sender, EventArgs e)
-        {
-            if (!_isConnected || _currentModel == null)
-            {
-                Log("[SPIKE] No model connected.");
-                return;
-            }
-            btnSpikeOpenMartV1.Enabled = false;
-            try
-            {
-                Log("");
-                Log("=== Spike: Open Mart v1 as 2nd PU ===");
-                dynamic v1Pu = Services.DdlGenerationService.OpenMartVersionPU(
-                    _scapi, _currentModel, 1, (Action<string>)Log);
-                if (v1Pu == null)
-                {
-                    Log("[SPIKE] OpenMartVersionPU returned null. See attempts above.");
-                    return;
-                }
-                string name = "";
-                try { name = v1Pu.Name?.ToString() ?? ""; } catch { }
-                Log($"[SPIKE] v1 PU opened. Name='{name}'");
-                // Read its Locator for verification.
-                try
-                {
-                    string loc = v1Pu.PropertyBag().Value("Locator")?.ToString() ?? "";
-                    Log($"[SPIKE] v1 PU Locator: {loc}");
-                }
-                catch (Exception ex) { Log($"[SPIKE] Locator read failed: {ex.Message}"); }
-                Log("[SPIKE] PU is now in session. Native MS capture is the next step.");
-            }
-            finally { btnSpikeOpenMartV1.Enabled = true; }
-        }
-
-        /// <summary>
-        /// F2 Probe: capture the active dirty PU's mart-bound ModelSet pointer
-        /// and call PrepareServerModelSet on it. If as1 is produced (rv=1), the
-        /// native F2/MCX pipeline can serve flash-free Mart-Mart compares for
-        /// this user's session. Logs all bridge-level diagnostics under
-        /// [PSM-PROBE] in erwin-native-bridge.log.
-        /// </summary>
-        private async void BtnF2Probe_Click(object sender, EventArgs e)
-        {
-            btnF2Probe.Enabled = false;
-            try
-            {
-                Log("");
-                Log("=== F2 Probe: PrepareServerModelSet on active mart MS ===");
-                if (_currentModel == null)
-                {
-                    Log("[F2-PROBE] No active model loaded.");
-                    return;
-                }
-                Action<string> log = msg =>
-                {
-                    if (InvokeRequired) BeginInvoke(new Action(() => Log(msg)));
-                    else Log(msg);
-                };
-                int rv = await System.Threading.Tasks.Task.Run(() =>
-                {
-                    IntPtr ms = Services.NativeBridgeService.EnsureActiveModelSetCaptured(_currentModel, log);
-                    if (ms == IntPtr.Zero)
-                    {
-                        log("[F2-PROBE] Could not capture active ModelSet pointer.");
-                        return -1;
-                    }
-                    log($"[F2-PROBE] active mart MS = 0x{ms.ToInt64():X}");
-                    return Services.NativeBridgeService.TestPSM(ms, log);
-                });
-                switch (rv)
-                {
-                    case 1:
-                        Log("[F2-PROBE] SUCCESS - PSM produced as1. F2/MCX pipeline OPEN. Plan B viable.");
-                        break;
-                    case 0:
-                        Log("[F2-PROBE] PSM ran but as1 was null - mart history likely missing. Plan B not viable.");
-                        break;
-                    case -2:
-                        Log("[F2-PROBE] PSM crashed (SEH). Mart state issue. Plan B not viable.");
-                        break;
-                    default:
-                        Log($"[F2-PROBE] failed with rv={rv}. See bridge log.");
-                        break;
-                }
-            }
-            catch (Exception ex)
-            {
-                Log($"[F2-PROBE] threw: {ex.GetType().Name}: {ex.Message}");
-            }
-            finally { btnF2Probe.Enabled = true; }
         }
 
         private async void BtnCallOnFE_Click(object sender, EventArgs e)
@@ -3750,42 +3557,6 @@ namespace EliteSoft.Erwin.AddIn
                 }
             }
             finally { btnCallOnFE.Enabled = true; }
-        }
-
-        /// <summary>
-        /// D1-spike: Mart-Mart DDL end-to-end test via Ctrl+Alt+T.
-        /// Prereq: user has done manual CC + Apply-to-Right in Resolve Diff
-        /// (DO NOT click Right Alter Script yet). Pulls AS via
-        /// GetTrasactionSummary, pokes gbl_pxAs, opens alter wizard hidden,
-        /// invokes preview, captures DDL. Known issue: Ctrl+Alt+T doesn't
-        /// reach erwin's main frame while Resolve Diff is modal.
-        /// </summary>
-        private async void BtnMartMartSpike_Click(object sender, EventArgs e)
-        {
-            btnMartMartSpike.Enabled = false;
-            try
-            {
-                Log("");
-                Log("=== Mart-Mart DDL Spike ===");
-                string ddl = await System.Threading.Tasks.Task.Run(() =>
-                    Services.NativeBridgeService.GenerateMartMartDdl(msg =>
-                    {
-                        if (InvokeRequired) BeginInvoke(new Action(() => Log(msg)));
-                        else Log(msg);
-                    }));
-                if (string.IsNullOrEmpty(ddl))
-                {
-                    Log("[MART-MART] FAILED or no DDL. See bridge log.");
-                }
-                else
-                {
-                    Log($"[MART-MART] SUCCESS: {ddl.Length} chars");
-                    var preview = ddl.Length > 300 ? ddl.Substring(0, 300) : ddl;
-                    Log($"[MART-MART] preview: {preview.Replace("\n", "\\n")}");
-                    rtbDDLOutput.Text = ddl;
-                }
-            }
-            finally { btnMartMartSpike.Enabled = true; }
         }
 
         /// <summary>

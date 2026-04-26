@@ -1035,63 +1035,6 @@ namespace EliteSoft.Erwin.AddIn.Services
             return false;
         }
 
-        /// <summary>
-        /// Toggles the "Close models, don't show this dialog in future"
-        /// checkbox in the Mart Offline dialog. erwin uses this checkbox
-        /// as a master "discard all" override: when set, OK closes every
-        /// dirty Mart model with the Close action (no Save As file pickers,
-        /// no Save prompts, no Offline path), AND erwin remembers the
-        /// preference so the dialog never appears in future runs. Way more
-        /// reliable than fighting unnamed XTPToolBar icons whose UIA
-        /// InvokePattern is partially filtered.
-        /// </summary>
-        private static bool TryCheckMartOfflineCloseAllCheckbox(AutomationElement offRoot, Action<string> log)
-        {
-            try
-            {
-                var cbCond = new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.CheckBox);
-                var cbs = offRoot.FindAll(TreeScope.Descendants, cbCond);
-                log?.Invoke($"  cleanup: Mart Offline has {cbs.Count} checkbox(es)");
-                foreach (AutomationElement cb in cbs)
-                {
-                    string n = "";
-                    try { n = cb.Current.Name ?? ""; } catch { }
-                    string lo = n.ToLowerInvariant();
-                    bool match = lo.Contains("close models") || lo.Contains("don't show")
-                              || lo.Contains("dialog in future") || lo.Contains("future");
-                    log?.Invoke($"    cb name='{n}' match={match}");
-                    if (!match) continue;
-
-                    if (cb.TryGetCurrentPattern(TogglePattern.Pattern, out object tog))
-                    {
-                        try
-                        {
-                            var t = (TogglePattern)tog;
-                            var st = t.Current.ToggleState;
-                            log?.Invoke($"    current ToggleState={st}");
-                            if (st != ToggleState.On)
-                            {
-                                t.Toggle();
-                                log?.Invoke("    toggled checkbox ON");
-                            }
-                            else
-                            {
-                                log?.Invoke("    already ON - no toggle needed");
-                            }
-                            return true;
-                        }
-                        catch (Exception ex) { log?.Invoke($"    toggle err: {ex.Message}"); }
-                    }
-                    else
-                    {
-                        log?.Invoke("    WARN: no TogglePattern on checkbox");
-                    }
-                }
-            }
-            catch (Exception ex) { log?.Invoke($"  checkbox enum err: {ex.Message}"); }
-            return false;
-        }
-
         private static bool IsTitleBarChromeButton(string name)
         {
             if (string.IsNullOrEmpty(name)) return false;
