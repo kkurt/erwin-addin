@@ -3883,23 +3883,62 @@ namespace EliteSoft.Erwin.AddIn
         private const int SW_HIDE = 0;
         private const int SW_SHOW = 5;
 
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int nIndex);
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr SetWindowLongPtr(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool SetLayeredWindowAttributes(IntPtr hWnd, uint crKey, byte bAlpha, uint dwFlags);
+        private const int GWL_EXSTYLE_MCF = -20;
+        private const long WS_EX_LAYERED_MCF = 0x00080000;
+        private const long WS_EX_TRANSPARENT_MCF = 0x00000020;
+        private const uint LWA_ALPHA_MCF = 0x00000002;
+
         /// <summary>
-        /// Hides/shows both the overlay and the main ModelConfigForm
-        /// SYNCHRONOUSLY via ShowWindow (not Form.Visible which is async and
-        /// can leave the window on screen during RDP redraw delays). This
-        /// ensures our synthesized click lands on RD, not on our own UI.
+        /// Toggles the form between "interactive" and "click pass-through"
+        /// state. visible=true keeps the form fully opaque AND interactive
+        /// (the user can use the addin). visible=false keeps the form
+        /// VISIBLE (no flicker, no hide/show) but adds WS_EX_TRANSPARENT so
+        /// any synthesized mouse input at form-covered screen coordinates
+        /// passes through to whatever lies below (the RD listview).
+        /// Replaces the previous ShowWindow(SW_HIDE) approach which incurred
+        /// ~200-300ms per direction for the main form's compositor recalc +
+        /// child layout + repaint, observed as ~475ms unaccounted time
+        /// during the Apply-to-Right click sequence.
         /// </summary>
         private void ToggleBusyOverlay(Form overlay, bool visible)
         {
             try
             {
+                // Small overlay popup: still hide/show as before - it's a
+                // tiny window, ShowWindow on it is fast (<5ms).
                 int cmd = visible ? SW_SHOW : SW_HIDE;
                 if (overlay != null && !overlay.IsDisposed && overlay.Handle != IntPtr.Zero)
                     ShowWindow(overlay.Handle, cmd);
+
+                // Main form: stay visible always, just toggle mouse-transparency.
                 if (this.Handle != IntPtr.Zero)
-                    ShowWindow(this.Handle, cmd);
-                // Force synchronous paint of whatever is now revealed.
-                Application.DoEvents();
+                {
+                    IntPtr h = this.Handle;
+                    long ex = GetWindowLongPtr(h, GWL_EXSTYLE_MCF).ToInt64();
+                    if (visible)
+                    {
+                        // Restore: clear WS_EX_TRANSPARENT, keep layered with
+                        // alpha=255 so future toggles cost only a flag flip.
+                        long newEx = (ex & ~WS_EX_TRANSPARENT_MCF) | WS_EX_LAYERED_MCF;
+                        SetWindowLongPtr(h, GWL_EXSTYLE_MCF, new IntPtr(newEx));
+                        SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA_MCF);
+                    }
+                    else
+                    {
+                        // Make form click-through: WS_EX_TRANSPARENT requires
+                        // WS_EX_LAYERED to take effect. Alpha stays 255 (fully
+                        // opaque) - no visual change, just mouse routing.
+                        long newEx = ex | WS_EX_LAYERED_MCF | WS_EX_TRANSPARENT_MCF;
+                        SetWindowLongPtr(h, GWL_EXSTYLE_MCF, new IntPtr(newEx));
+                        SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA_MCF);
+                    }
+                }
             }
             catch { }
         }

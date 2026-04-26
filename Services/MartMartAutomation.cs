@@ -79,6 +79,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         private const uint LVM_FIRST = 0x1000;
         private const uint LVM_GETSUBITEMRECT = LVM_FIRST + 56;   // 0x1038
         private const uint LVM_SETITEMSTATE   = LVM_FIRST + 43;   // 0x102B
+        private const uint LVM_GETITEMCOUNT   = LVM_FIRST + 4;    // 0x1004
         private const int LVIR_BOUNDS = 0;
         private const uint LVIF_STATE = 0x0008;
         private const uint LVIS_FOCUSED = 0x0001;
@@ -1253,34 +1254,56 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
                 log?.Invoke($"  Resolve Differences = 0x{resolveDlg.ToInt64():X}");
                 session.ResolveDifferences = resolveDlg;
-                // RD must stay fully opaque - XTP rejects synthetic clicks
-                // on layered/transparent windows (alpha=0 passes through,
-                // alpha=1 still fails). Mouse lock prevents user from
-                // interfering during the ~300ms visible flash.
-                SetForegroundWindow(resolveDlg);
-                Thread.Sleep(400);   // let RD paint its children
 
-                // Find listview id=200 (Object View with diff arrows, confirmed
-                // via NMHDR dump in diag test).
-                IntPtr lv = FindListViewById(resolveDlg, 200, log);
+                // Make the addin form click-through ONCE up-front (instead
+                // of toggling around each click attempt). This is a single
+                // cross-thread Invoke saving ~50-100ms vs the previous
+                // pattern of toggle-off + click + toggle-on per attempt.
+                // Form stays visually opaque, just routes mouse to whatever
+                // is below it.
+                try { overlayToggle?.Invoke(false); } catch { }
+
+                // Poll for listview readiness. Three conditions all required:
+                //   1. Listview HWND exists (FindListViewById)
+                //   2. Item count > 0 (model row actually populated, not
+                //      just the column header laid out - the previous
+                //      version checked only column layout and exited at
+                //      0ms, clicking on empty space which fired a bogus
+                //      EDR tx and made OnFE produce "No schema to generate")
+                //   3. Item 0's arrow column (subItem=6) has a non-zero rect
+                IntPtr lv = IntPtr.Zero;
+                int polled = 0;
+                const int pollStep = 5;
+                const int pollMaxMs = 800;
+                while (polled < pollMaxMs)
+                {
+                    lv = FindListViewById(resolveDlg, 200, log: null);
+                    if (lv != IntPtr.Zero)
+                    {
+                        IntPtr cnt = SendMessage(lv, LVM_GETITEMCOUNT, IntPtr.Zero, IntPtr.Zero);
+                        if (cnt.ToInt32() > 0)
+                        {
+                            RECT testRc = new RECT { left = LVIR_BOUNDS, top = 6, right = 0, bottom = 0 };
+                            SendMessage(lv, LVM_GETSUBITEMRECT, new IntPtr(0), ref testRc);
+                            if (testRc.right > testRc.left && testRc.bottom > testRc.top)
+                            {
+                                log?.Invoke($"  [7] listview ready after {polled}ms (items={cnt.ToInt32()}, arrow rect ok)");
+                                break;
+                            }
+                        }
+                    }
+                    Thread.Sleep(pollStep);
+                    polled += pollStep;
+                }
                 if (lv == IntPtr.Zero)
                 {
-                    log?.Invoke("  [7] listview id=200 not found - aborting");
+                    log?.Invoke($"  [7] listview id=200 not found within {pollMaxMs}ms - aborting");
+                    try { overlayToggle?.Invoke(true); } catch { }
                     return session;
                 }
-                log?.Invoke($"  [7] listview id=200 found = 0x{lv.ToInt64():X}");
-
-                // Diag: dump all subitem rects for item 0 so we can verify the
-                // arrow column index is still 6 in this erwin version. If the
-                // expected click misses, this log shows the actual layout.
-                log?.Invoke("  [7] [LV-DUMP] item 0 subitem rects:");
-                for (int si = 0; si <= 10; si++)
+                if (polled >= pollMaxMs)
                 {
-                    RECT diagR = new RECT { left = LVIR_BOUNDS, top = si, right = 0, bottom = 0 };
-                    SendMessage(lv, LVM_GETSUBITEMRECT, new IntPtr(0), ref diagR);
-                    int w = diagR.right - diagR.left;
-                    int h = diagR.bottom - diagR.top;
-                    log?.Invoke($"    subItem={si}: ({diagR.left},{diagR.top})-({diagR.right},{diagR.bottom})  w={w} h={h}");
+                    log?.Invoke($"  [7] listview found but never reached ready state ({pollMaxMs}ms timeout)");
                 }
 
                 // Arrow column for Model row: item=0, subItem=6 (per NMHDR dump).
@@ -1303,52 +1326,86 @@ namespace EliteSoft.Erwin.AddIn.Services
                     return session;
                 }
 
-                // Two attempts max. If the first click doesn't produce any
-                // EDR tx within 2s, user's mouse may have interfered or RD
-                // wasn't fully ready - retry once.
+                // Mouse simulation is the only path that works for the
+                // Apply-to-Right click. Two non-mouse alternatives proven
+                // failed (2026-04-26):
+                //   1. Direct CallApplyDifferencesToRight(leftMs, rightMs)
+                //      via bridge trampoline -> SEH 0xC0000005 + 50 GDM-13
+                //      popups (function depends on dialog-member state seeded
+                //      by the listview NM_CLICK handler).
+                //   2. SendSynthesizedNmClick(resolveDlg, lv, ...) -> WM_NOTIFY
+                //      returns rc=0, no EDR tx (XTP listview filters
+                //      synthesized notifies the same way it filters UIA Invoke
+                //      on toolbar buttons; the child's hit-test handler must
+                //      run on a real input event for state to propagate).
+                // The mouse path uses Win32 LVM_GETSUBITEMRECT + ClientToScreen
+                // so it remains DPI-aware and multi-monitor agnostic. See
+                // reference_apply_diff_right_direct_call_avs.md for full
+                // verdict on why a programmatic replacement isn't viable.
+                // Mouse simulation is the only working path - all synthetic
+                // input alternatives (direct CallApplyDifferencesToRight,
+                // SendSynthesizedNmClick WM_NOTIFY, SendMessage WM_LBUTTON)
+                // are filtered by XTP's custom listview hit-test layer. See
+                // reference_apply_diff_right_direct_call_avs.md for the
+                // verdict. We minimize the visible-RD window by hiding it
+                // the moment the click registers, BEFORE waiting for EDR
+                // settle - the EDR transaction commits regardless of RD
+                // visibility, so there's no reason to keep it on screen.
                 int txAfter = txBefore;
-                for (int attempt = 1; attempt <= 2; attempt++)
+                try
                 {
-                    // Hide the overlay + ModelConfigForm so our mouse click
-                    // lands on RD (not our own UI on top of it). Longer
-                    // sleep than you'd expect: under RDP, ShowWindow
-                    // redraw round-trips can take 200-400ms before the
-                    // window truly disappears from hit-testing.
-                    try { overlayToggle?.Invoke(false); } catch { }
-                    Thread.Sleep(400);
-
-                    try
+                    for (int attempt = 1; attempt <= 2; attempt++)
                     {
+                        // Form is already click-through (overlayToggle
+                        // applied once before polling). RD must be foreground
+                        // for XTP to accept the synthetic click.
                         SetForegroundWindow(resolveDlg);
-                        Thread.Sleep(50);
-                        ShowCursor(false);
-                        SendMouseClickAt(pt.X, pt.Y);
-                        Thread.Sleep(80);
-                    }
-                    finally
-                    {
-                        SetCursorPos(saved.X, saved.Y);
-                        ShowCursor(true);
-                        // Restore overlay + main form (addin UI thread needs
-                        // a visible context for OnFE orchestration, proven
-                        // empirically - keeping hidden deadlocks OnFE).
-                        try { overlayToggle?.Invoke(true); } catch { }
-                    }
-                    log?.Invoke($"  [7] attempt {attempt}: click fired, waiting for EDR tx settle");
+                        try
+                        {
+                            ShowCursor(false);
+                            SendMouseClickAt(pt.X, pt.Y);
+                            Thread.Sleep(20);
+                        }
+                        finally
+                        {
+                            SetCursorPos(saved.X, saved.Y);
+                            ShowCursor(true);
+                        }
 
-                    txAfter = WaitForEdrTxSettle(txBefore, timeoutMs: 2500, stableMs: 350, log);
-                    if (txAfter > txBefore)
-                    {
-                        log?.Invoke($"  [7] attempt {attempt}: tx delta = {txAfter - txBefore}");
-                        break;
+                        // Hide RD immediately after the click is sent. Click
+                        // is already registered with the listview's input
+                        // queue; EDR tx will fire async whether RD is
+                        // visible or not. This cuts the perceptible flash
+                        // by ~500ms (the EDR settle window).
+                        HideWindow(resolveDlg);
+                        log?.Invoke($"  [7] attempt {attempt}: click fired + RD hidden, waiting for EDR tx settle");
+
+                        txAfter = WaitForEdrTxSettle(txBefore, timeoutMs: 2500, stableMs: 350, log);
+                        if (txAfter > txBefore)
+                        {
+                            log?.Invoke($"  [7] attempt {attempt}: tx delta = {txAfter - txBefore}");
+                            break;
+                        }
+                        log?.Invoke($"  [7] attempt {attempt}: no tx - retrying...");
+                        // Restore visibility for retry - second attempt is
+                        // rare (only fires when first click missed the hot
+                        // zone, e.g. listview not yet fully populated).
+                        UnhideWindow(resolveDlg);
+                        Thread.Sleep(100);
                     }
-                    log?.Invoke($"  [7] attempt {attempt}: no tx - retrying...");
-                    Thread.Sleep(300);
+
+                    session.Applied = (txAfter - txBefore) > 0;
+                    if (!session.Applied)
+                        log?.Invoke("  [WARN] mouse click did not trigger EDR tx after 2 attempts.");
                 }
-
-                session.Applied = (txAfter - txBefore) > 0;
-                if (!session.Applied)
-                    log?.Invoke("  [WARN] mouse click did not trigger EDR tx after 2 attempts.");
+                finally
+                {
+                    // Restore the addin form's interactivity. Done here so
+                    // it runs even if click attempts threw or returned
+                    // early - leaving the form stuck in click-through mode
+                    // would silently break user interaction.
+                    try { overlayToggle?.Invoke(true); } catch { }
+                }
                 return session;
             }
             catch (Exception ex)
