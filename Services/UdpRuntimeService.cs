@@ -472,17 +472,23 @@ namespace EliteSoft.Erwin.AddIn.Services
 
             foreach (var def in UdpDefinitionService.Instance.GetByObjectType(objectType))
             {
+                string path = $"{prefix}.{def.Name}";
+                string val = "";
                 try
                 {
-                    string path = $"{prefix}.{def.Name}";
                     var prop = entity.Properties(path);
-                    string val = prop?.Value?.ToString() ?? "";
-                    values[def.Name] = val;
+                    val = prop?.Value?.ToString() ?? "";
                 }
                 catch
                 {
-                    // UDP not defined in erwin model — skip silently
+                    // erwin stores UDP values sparsely — Properties() throws when the
+                    // entity has never had this UDP set. We MUST still track it as ""
+                    // so a later write (e.g. user picking TABLE_TYPE=LOG via the property
+                    // panel) is detected as a "" -> "LOG" diff in CheckForUdpValueChanges.
+                    // Previously this catch swallowed silently and snapshot.UdpValues
+                    // stayed empty, blocking the entire UDP-driven pipeline.
                 }
+                values[def.Name] = val;
             }
 
             return values;

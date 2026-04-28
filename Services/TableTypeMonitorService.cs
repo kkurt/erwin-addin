@@ -28,6 +28,10 @@ namespace EliteSoft.Erwin.AddIn.Services
         // MODEL_PATH read-only enforcement
         private string _modelPathOriginalValue;
 
+        // Diagnostic: log "skipped UDP check" reason at most once per entity per session
+        // (so the user can see WHY nothing fires when they change a UDP value)
+        private readonly HashSet<string> _diagLoggedEmptyUdp = new HashSet<string>();
+
         /// <summary>
         /// Silently restore MODEL_PATH if user changed it.
         /// </summary>
@@ -160,7 +164,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                         // Also snapshot UDP values for dependency monitoring
                         if (_udpRuntimeService != null && _udpRuntimeService.IsInitialized)
                         {
-                            snapshot.UdpValues = _udpRuntimeService.ReadUdpValues(entity);
+                            snapshot.UdpValues = _udpRuntimeService.ReadUdpValues((object)entity);
                         }
 
                         _entitySnapshots[objectId] = snapshot;
@@ -197,7 +201,18 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
                 catch (Exception ex) { _modelPathOriginalValue = null; System.Diagnostics.Debug.WriteLine($"MODEL_PATH snapshot error: {ex.Message}"); }
 
-                Log($"TableTypeMonitorService: Snapshot taken - {_entitySnapshots.Count} entities, {_keyGroupSnapshots.Count} key groups");
+                int populatedCount = _entitySnapshots.Values.Count(s => s.UdpValues.Count > 0);
+                int emptyCount = _entitySnapshots.Count - populatedCount;
+                Log($"TableTypeMonitorService: Snapshot taken - {_entitySnapshots.Count} entities ({populatedCount} with UDP values tracked, {emptyCount} without), {_keyGroupSnapshots.Count} key groups");
+
+                // Sample first entity's UDP values for diagnostics (so user can see what's tracked)
+                var sampleSnap = _entitySnapshots.Values.FirstOrDefault(s => s.UdpValues.Count > 0);
+                if (sampleSnap != null)
+                {
+                    string sampleStr = string.Join(", ", sampleSnap.UdpValues.Take(5).Select(kv => $"{kv.Key}='{kv.Value}'"));
+                    Log($"  Sample entity '{sampleSnap.PhysicalName}': {sampleStr}");
+                }
+                _diagLoggedEmptyUdp.Clear();
             }
             catch (Exception ex)
             {
@@ -280,9 +295,20 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // Check for UDP value changes only on existing entities with known snapshots
                     // This reads UDP values via COM — only done for entities already in snapshot
                     if (!isNew && !physicalNameChanged && _udpRuntimeService != null && _udpRuntimeService.IsInitialized
-                        && _entitySnapshots.ContainsKey(objectId) && _entitySnapshots[objectId].UdpValues.Count > 0)
+                        && _entitySnapshots.ContainsKey(objectId))
                     {
-                        CheckForUdpValueChanges(entity, objectId, physicalName);
+                        if (_entitySnapshots[objectId].UdpValues.Count > 0)
+                        {
+                            CheckForUdpValueChanges(entity, objectId, physicalName);
+                        }
+                        else if (_diagLoggedEmptyUdp.Add(objectId))
+                        {
+                            // Diagnostic: snapshot has zero tracked UDP values for this entity.
+                            // Means ReadUdpValues returned empty at snapshot time. Either
+                            // UdpDefinitionService had no defs for "Table" then, or every
+                            // Properties("Entity.Physical.<udp>") access threw and was swallowed.
+                            Log($"[Diag] Skipping UDP check for '{physicalName}' (id={objectId.Substring(0, Math.Min(8, objectId.Length))}...): snapshot has 0 tracked UDP values");
+                        }
                     }
 
                     if (isNew)
@@ -319,7 +345,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 Log($"UDP defaults applied for new entity '{physicalName}'");
 
                                 // Snapshot UDP values after defaults applied (so first check doesn't re-trigger)
-                                _entitySnapshots[objectId].UdpValues = _udpRuntimeService.ReadUdpValues(entity);
+                                _entitySnapshots[objectId].UdpValues = _udpRuntimeService.ReadUdpValues((object)entity);
                             }
                             catch (Exception ex)
                             {
@@ -657,51 +683,89 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// Validate object name against naming standards and log/show results.
         /// </summary>
         /// <summary>
-        /// Validate naming standards and auto-apply prefix/suffix if AUTO_APPLY=true.
-        /// Shows confirmation dialog before auto-applying.
+        /// Validate naming standards and apply prefix/suffix.
+        /// AUTO_APPLY=true rules are applied silently (no popup).
+        /// AUTO_APPLY=false rules that would change the name prompt the user before applying.
         /// </summary>
         private void ValidateNamingStandard(string objectType, string physicalName, dynamic scapiObject = null)
         {
             if (!NamingStandardService.Instance.IsLoaded) return;
 
-            // Step 1: Check if auto-apply would change the name
-            if (scapiObject != null && NamingValidationEngine.HasAutoApplyChanges(objectType, physicalName))
+            // scapiObject MUST be passed so UDP-conditional rules (DEPENDS_ON_UDP_ID) can read
+            // the live UDP value off the entity. Without it, IsRuleApplicable returns false for
+            // any UDP-conditional rule and the prefix is silently dropped.
+            // Cast to object to keep the call compile-time resolved (otherwise dynamic dispatch
+            // breaks the LINQ lambdas inside the engine — see CheckEntityKeyGroups for prior art).
+            object scapiBoxed = scapiObject;
+
+            // Step 1: silently apply AUTO_APPLY=true rules
+            if (scapiBoxed != null)
             {
-                string newName = NamingValidationEngine.ApplyNamingStandards(objectType, physicalName);
-
-                var answer = System.Windows.Forms.MessageBox.Show(
-                    $"Naming standard requires changes for '{physicalName}':\n\n" +
-                    $"'{physicalName}' → '{newName}'\n\n" +
-                    $"Apply automatically?",
-                    "Naming Standard — Auto Apply",
-                    System.Windows.Forms.MessageBoxButtons.YesNo,
-                    System.Windows.Forms.MessageBoxIcon.Question);
-
-                if (answer == System.Windows.Forms.DialogResult.Yes)
+                string afterAuto = NamingValidationEngine.ApplyNamingStandards(objectType, physicalName, scapiBoxed, autoOnly: true);
+                if (!string.Equals(afterAuto, physicalName, StringComparison.Ordinal))
                 {
-                    int transId = _session.BeginNamedTransaction("ApplyNamingStandard");
+                    int transId = _session.BeginNamedTransaction("ApplyAutoNamingStandard");
                     try
                     {
-                        scapiObject.Properties("Physical_Name").Value = newName;
+                        scapiObject.Properties("Physical_Name").Value = afterAuto;
                         _session.CommitTransaction(transId);
-                        Log($"Naming standard auto-applied: '{physicalName}' → '{newName}'");
+                        Log($"Naming standard auto-applied (silent): '{physicalName}' -> '{afterAuto}'");
 
                         // Update snapshot
                         string objectId = scapiObject.ObjectId?.ToString() ?? "";
                         if (_entitySnapshots.ContainsKey(objectId))
-                            _entitySnapshots[objectId].PhysicalName = newName;
+                            _entitySnapshots[objectId].PhysicalName = afterAuto;
 
-                        return; // Auto-applied — skip further validation (will re-validate on next tick)
+                        physicalName = afterAuto;
                     }
                     catch (Exception ex)
                     {
-                        try { _session.RollbackTransaction(transId); } catch { }
-                        Log($"Naming standard auto-apply failed: {ex.Message}");
+                        try { _session.RollbackTransaction(transId); } catch (Exception rbEx) { Log($"ApplyAutoNamingStandard rollback error: {rbEx.Message}"); }
+                        Log($"Naming standard silent auto-apply failed: {ex.Message}");
                     }
                 }
             }
 
-            // Step 2: Validate (after auto-apply or if user declined)
+            // Step 2: ask user about AUTO_APPLY=false rules that would still change the name
+            if (scapiBoxed != null)
+            {
+                string afterAll = NamingValidationEngine.ApplyNamingStandards(objectType, physicalName, scapiBoxed, autoOnly: false);
+                if (!string.Equals(afterAll, physicalName, StringComparison.Ordinal))
+                {
+                    var answer = System.Windows.Forms.MessageBox.Show(
+                        $"Naming standard suggests changes for '{physicalName}':\n\n" +
+                        $"'{physicalName}' -> '{afterAll}'\n\n" +
+                        $"Apply?",
+                        "Naming Standard",
+                        System.Windows.Forms.MessageBoxButtons.YesNo,
+                        System.Windows.Forms.MessageBoxIcon.Question);
+
+                    if (answer == System.Windows.Forms.DialogResult.Yes)
+                    {
+                        int transId = _session.BeginNamedTransaction("ApplyManualNamingStandard");
+                        try
+                        {
+                            scapiObject.Properties("Physical_Name").Value = afterAll;
+                            _session.CommitTransaction(transId);
+                            Log($"Naming standard applied (user confirmed): '{physicalName}' -> '{afterAll}'");
+
+                            string objectId = scapiObject.ObjectId?.ToString() ?? "";
+                            if (_entitySnapshots.ContainsKey(objectId))
+                                _entitySnapshots[objectId].PhysicalName = afterAll;
+
+                            physicalName = afterAll;
+                            return; // User-applied — re-validate on next tick
+                        }
+                        catch (Exception ex)
+                        {
+                            try { _session.RollbackTransaction(transId); } catch (Exception rbEx) { Log($"ApplyManualNamingStandard rollback error: {rbEx.Message}"); }
+                            Log($"Naming standard manual apply failed: {ex.Message}");
+                        }
+                    }
+                }
+            }
+
+            // Step 3: Validate remaining issues (warning popup for un-fixable rules e.g. regex/length)
             string nameToValidate = physicalName;
             if (scapiObject != null)
             {
@@ -714,7 +778,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 catch { }
             }
 
-            var results = NamingValidationEngine.ValidateObjectName(objectType, nameToValidate);
+            var results = NamingValidationEngine.ValidateObjectName(objectType, nameToValidate, scapiBoxed);
             var failures = results.Where(r => !r.IsValid).ToList();
 
             if (failures.Count > 0)
@@ -744,7 +808,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 var snapshot = _entitySnapshots[objectId];
 
                 // Read current UDP values
-                var currentValues = _udpRuntimeService.ReadUdpValues(entity);
+                var currentValues = _udpRuntimeService.ReadUdpValues((object)entity);
                 if (currentValues.Count == 0) return;
 
                 // Compare with snapshot — only process changes
@@ -777,11 +841,17 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // Only re-read if dependencies actually changed something
                 if (anyChanged)
                 {
-                    var updatedValues = _udpRuntimeService.ReadUdpValues(entity);
+                    var updatedValues = _udpRuntimeService.ReadUdpValues((object)entity);
                     foreach (var kvp in updatedValues)
                     {
                         snapshot.UdpValues[kvp.Key] = kvp.Value;
                     }
+
+                    // UDP value change can affect UDP-conditional naming rules
+                    // (e.g. TABLE_TYPE='LOG' triggers a 'LOG_' prefix rule scoped to TABLE_TYPE=LOG).
+                    // Without this call, naming validation only runs on rename / new entity, so
+                    // setting a UDP that has a conditional naming rule would never apply the prefix.
+                    ValidateNamingStandard("Table", physicalName, entity);
                 }
             }
             catch (Exception ex)

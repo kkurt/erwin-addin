@@ -56,34 +56,60 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// Apply auto-apply naming standards (prefix/suffix) to an object name.
-        /// Only applies rules where AutoApply = true and UDP condition matches.
+        /// Apply naming standards (prefix/suffix) to an object name.
+        /// When autoOnly=true (default), only rules with AutoApply=true are applied — used by the
+        /// silent auto-apply path. When autoOnly=false, ALL applicable rules are applied — used by
+        /// the "ask user" path so we can compute what the name would look like with manual rules.
         /// </summary>
-        public static string ApplyNamingStandards(string objectType, string objectName, dynamic scapiObject = null)
+        public static string ApplyNamingStandards(string objectType, string objectName, dynamic scapiObject = null, bool autoOnly = true)
         {
             if (string.IsNullOrEmpty(objectName)) return objectName;
             if (!NamingStandardService.Instance.IsLoaded) return objectName;
 
-            var rules = NamingStandardService.Instance.GetByObjectType(objectType)
-                .Where(r => r.AutoApply);
+            IEnumerable<NamingStandardRule> rules = NamingStandardService.Instance.GetByObjectType(objectType);
+            if (autoOnly)
+                rules = rules.Where(r => r.AutoApply);
 
             string result = objectName;
 
             foreach (var rule in rules)
             {
-                if (!IsRuleApplicable(rule, objectType, scapiObject))
-                    continue;
+                bool applicable = IsRuleApplicable(rule, objectType, scapiObject);
+                bool isConditional = rule.DependsOnUdpId.HasValue && !string.IsNullOrEmpty(rule.DependsOnUdpName);
 
-                if (!string.IsNullOrEmpty(rule.Prefix) &&
-                    !result.StartsWith(rule.Prefix, StringComparison.OrdinalIgnoreCase))
+                if (applicable)
                 {
-                    result = rule.Prefix + result;
+                    // Add prefix/suffix if missing
+                    if (!string.IsNullOrEmpty(rule.Prefix) &&
+                        !result.StartsWith(rule.Prefix, StringComparison.OrdinalIgnoreCase))
+                    {
+                        result = rule.Prefix + result;
+                    }
+
+                    if (!string.IsNullOrEmpty(rule.Suffix) &&
+                        !result.EndsWith(rule.Suffix, StringComparison.OrdinalIgnoreCase))
+                    {
+                        result = result + rule.Suffix;
+                    }
                 }
-
-                if (!string.IsNullOrEmpty(rule.Suffix) &&
-                    !result.EndsWith(rule.Suffix, StringComparison.OrdinalIgnoreCase))
+                else if (isConditional)
                 {
-                    result = result + rule.Suffix;
+                    // Reverse direction: a conditional rule (DependsOnUdpId) no longer matches the
+                    // entity's current UDP value, so any prefix/suffix it had previously added must
+                    // come off (e.g. user flips TABLE_TYPE from LOG to HISTORY: strip 'LOG_' here,
+                    // then the HISTORY rule below adds '_HST'). Only conditional rules strip — a
+                    // non-conditional baseline prefix should never be auto-stripped by us.
+                    if (!string.IsNullOrEmpty(rule.Prefix) &&
+                        result.StartsWith(rule.Prefix, StringComparison.OrdinalIgnoreCase))
+                    {
+                        result = result.Substring(rule.Prefix.Length);
+                    }
+
+                    if (!string.IsNullOrEmpty(rule.Suffix) &&
+                        result.EndsWith(rule.Suffix, StringComparison.OrdinalIgnoreCase))
+                    {
+                        result = result.Substring(0, result.Length - rule.Suffix.Length);
+                    }
                 }
             }
 
@@ -91,14 +117,15 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// Check if any auto-apply rules would change the given name.
+        /// Check if applying naming standards would change the given name.
+        /// autoOnly=true → only AUTO_APPLY rules; autoOnly=false → all rules.
         /// </summary>
-        public static bool HasAutoApplyChanges(string objectType, string objectName, dynamic scapiObject = null)
+        public static bool HasAutoApplyChanges(string objectType, string objectName, dynamic scapiObject = null, bool autoOnly = true)
         {
             if (string.IsNullOrEmpty(objectName)) return false;
             if (!NamingStandardService.Instance.IsLoaded) return false;
 
-            string applied = ApplyNamingStandards(objectType, objectName, scapiObject);
+            string applied = ApplyNamingStandards(objectType, objectName, scapiObject, autoOnly);
             return !string.Equals(applied, objectName, StringComparison.Ordinal);
         }
 

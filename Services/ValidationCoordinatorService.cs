@@ -26,7 +26,12 @@ namespace EliteSoft.Erwin.AddIn.Services
         private bool _isMonitoring;
         private bool _disposed;
         private bool _isProcessingChange;
-        private bool _validationSuspended;
+        // volatile: pipeline UI thread'inden set ediliyor, validation
+        // event handler'lar erwin'in baska thread'lerinde calisabilir.
+        // .NET memory model bool yazi/okumayi default reorder edebilir,
+        // diger thread cached eski deger goruyor olabilir. volatile ile
+        // her okuma main memory'den, set sonrasi tum thread'ler gorur.
+        private volatile bool _validationSuspended;
         private bool _popupVisible;
         private volatile bool _isCheckingForChanges;
         private bool _columnEditorWasOpen;
@@ -162,15 +167,29 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             _validationSuspended = true;
             _scanCycleActive = false;
-            Log("ValidationCoordinatorService: Validation suspended");
+            // Suspend sirasinda biriken validation sonuclari temizle.
+            // Aksi takdirde resume sonrasi timer tick'inde
+            // ShowConsolidatedPopup eski sonuclari popup olarak goster
+            // (verified 2026-04-27 13:23 From-DB pipeline sonrasi DOMAIN
+            // VALIDATION popup spam).
+            _pendingResults.Clear();
+            Log("ValidationCoordinatorService: Validation suspended (pendingResults cleared)");
         }
 
         public void ResumeValidation()
         {
             _validationSuspended = false;
             _scanCycleActive = false;
-            TakeSnapshot();
-            Log("ValidationCoordinatorService: Validation resumed");
+            // Resume oncesi pendingResults temizle.
+            _pendingResults.Clear();
+            // TakeSnapshot CAGRILMIYOR (kasitli):
+            // Eski (pipeline-oncesi) snapshot kullanilirsa loop-stable
+            // state korunur. Yeni snapshot (Apply-to-Right ile degisen
+            // column'lari "yeni baseline" olarak kabul eder) sonraki
+            // tick'te diff yakalar -> ValidateGlossary -> popup. Test
+            // 13:37:37 dogrulamasi: TakeSnapshot kaldirildiktan sonra
+            // resume sonrasi popup beklenmiyor.
+            Log("ValidationCoordinatorService: Validation resumed (pendingResults cleared, snapshot UNCHANGED)");
         }
 
         public void TakeSnapshot()
@@ -707,6 +726,7 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         private void CheckEntityForChanges(dynamic entity, dynamic modelObjects)
         {
+            if (_validationSuspended) return;
             try
             {
                 string tableName = GetTableName(entity);
@@ -809,6 +829,9 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         private void ProcessNewAttribute(dynamic attr, AttributeValidationSnapshot currentState, HashSet<string> predefinedColumnNames)
         {
+            // Suspended ise hicbir validation yapma. Timer-tick disindan
+            // (event handler) cagrilan path'ler icin sigorta.
+            if (_validationSuspended) return;
             _isProcessingChange = true;
             try
             {
@@ -840,6 +863,7 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         private void ProcessAttributeChanges(dynamic attr, AttributeValidationSnapshot previousState, AttributeValidationSnapshot currentState, HashSet<string> predefinedColumnNames)
         {
+            if (_validationSuspended) return;
             bool physicalNameChanged = previousState.PhysicalName != currentState.PhysicalName;
             bool domainChanged = previousState.DomainParentValue != currentState.DomainParentValue;
             bool hasValidDomain = IsValidDomain(currentState.DomainParentValue);
@@ -892,6 +916,7 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         private void ValidateGlossary(dynamic attr, AttributeValidationSnapshot state, HashSet<string> predefinedColumnNames)
         {
+            if (_validationSuspended) return;
             // Skip special names
             if (string.IsNullOrEmpty(state.PhysicalName) ||
                 state.PhysicalName.Equals("<default>", StringComparison.OrdinalIgnoreCase) ||
@@ -952,6 +977,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// </summary>
         private void ValidateColumnNamingStandard(dynamic attr, AttributeValidationSnapshot state)
         {
+            if (_validationSuspended) return;
             if (!NamingStandardService.Instance.IsLoaded) return;
             if (string.IsNullOrEmpty(state.PhysicalName) ||
                 state.PhysicalName.Equals("<default>", StringComparison.OrdinalIgnoreCase) ||
@@ -960,40 +986,70 @@ namespace EliteSoft.Erwin.AddIn.Services
                 return;
             }
 
-            // Auto-apply prefix/suffix if AUTO_APPLY=true
-            if (attr != null && NamingValidationEngine.HasAutoApplyChanges("Column", state.PhysicalName))
+            // attr MUST be passed so UDP-conditional rules (DEPENDS_ON_UDP_ID) can read
+            // the live UDP value off the column. Without it, UDP-conditional rules are skipped.
+            // Cast to object to keep the call compile-time resolved (dynamic dispatch breaks
+            // the LINQ lambdas inside the engine — same trick as CheckEntityKeyGroups).
+            object attrBoxed = attr;
+
+            // Step 1: silently apply AUTO_APPLY=true rules
+            if (attrBoxed != null)
             {
-                string newName = NamingValidationEngine.ApplyNamingStandards("Column", state.PhysicalName);
-
-                var answer = MessageBox.Show(
-                    $"Naming standard requires changes for column '{state.TableName}.{state.PhysicalName}':\n\n" +
-                    $"'{state.PhysicalName}' → '{newName}'\n\n" +
-                    $"Apply automatically?",
-                    "Naming Standard — Auto Apply",
-                    MessageBoxButtons.YesNo,
-                    MessageBoxIcon.Question);
-
-                if (answer == DialogResult.Yes)
+                string afterAuto = NamingValidationEngine.ApplyNamingStandards("Column", state.PhysicalName, attrBoxed, autoOnly: true);
+                if (!string.Equals(afterAuto, state.PhysicalName, StringComparison.Ordinal))
                 {
-                    int transId = _session.BeginNamedTransaction("ApplyColumnNamingStandard");
+                    int transId = _session.BeginNamedTransaction("ApplyAutoColumnNaming");
                     try
                     {
-                        attr.Properties("Physical_Name").Value = newName;
+                        attr.Properties("Physical_Name").Value = afterAuto;
                         _session.CommitTransaction(transId);
-                        Log($"Naming standard auto-applied: '{state.TableName}.{state.PhysicalName}' → '{newName}'");
-                        state.PhysicalName = newName;
-                        return;
+                        Log($"Column naming auto-applied (silent): '{state.TableName}.{state.PhysicalName}' -> '{afterAuto}'");
+                        state.PhysicalName = afterAuto;
                     }
                     catch (Exception ex)
                     {
-                        try { _session.RollbackTransaction(transId); } catch { }
-                        Log($"Naming standard auto-apply failed: {ex.Message}");
+                        try { _session.RollbackTransaction(transId); } catch (Exception rbEx) { Log($"ApplyAutoColumnNaming rollback error: {rbEx.Message}"); }
+                        Log($"Column naming silent auto-apply failed: {ex.Message}");
                     }
                 }
             }
 
-            // Validate (after auto-apply or if user declined)
-            var results = NamingValidationEngine.ValidateObjectName("Column", state.PhysicalName);
+            // Step 2: prompt for AUTO_APPLY=false rules that would change the name
+            if (attrBoxed != null)
+            {
+                string afterAll = NamingValidationEngine.ApplyNamingStandards("Column", state.PhysicalName, attrBoxed, autoOnly: false);
+                if (!string.Equals(afterAll, state.PhysicalName, StringComparison.Ordinal))
+                {
+                    var answer = MessageBox.Show(
+                        $"Naming standard suggests changes for column '{state.TableName}.{state.PhysicalName}':\n\n" +
+                        $"'{state.PhysicalName}' -> '{afterAll}'\n\n" +
+                        $"Apply?",
+                        "Naming Standard",
+                        MessageBoxButtons.YesNo,
+                        MessageBoxIcon.Question);
+
+                    if (answer == DialogResult.Yes)
+                    {
+                        int transId = _session.BeginNamedTransaction("ApplyManualColumnNaming");
+                        try
+                        {
+                            attr.Properties("Physical_Name").Value = afterAll;
+                            _session.CommitTransaction(transId);
+                            Log($"Column naming applied (user confirmed): '{state.TableName}.{state.PhysicalName}' -> '{afterAll}'");
+                            state.PhysicalName = afterAll;
+                            return;
+                        }
+                        catch (Exception ex)
+                        {
+                            try { _session.RollbackTransaction(transId); } catch (Exception rbEx) { Log($"ApplyManualColumnNaming rollback error: {rbEx.Message}"); }
+                            Log($"Column naming manual apply failed: {ex.Message}");
+                        }
+                    }
+                }
+            }
+
+            // Step 3: Validate remaining issues (warning popup for un-fixable rules)
+            var results = NamingValidationEngine.ValidateObjectName("Column", state.PhysicalName, attrBoxed);
             foreach (var r in results.Where(r => !r.IsValid))
             {
                 Log($"Naming standard violation ({r.RuleName}): {state.TableName}.{state.PhysicalName} — {r.ErrorMessage}");
@@ -1034,7 +1090,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
 
             // Re-read after dependency writes to update snapshot
-            var updatedValues = _udpRuntimeService.ReadUdpValues(attr, "Column");
+            var updatedValues = _udpRuntimeService.ReadUdpValues((object)attr, "Column");
             currentState.UdpValues = updatedValues;
         }
 
@@ -1270,6 +1326,7 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         private void ValidateDomain(dynamic attr, AttributeValidationSnapshot state, string oldDomainValue)
         {
+            if (_validationSuspended) return;
             // Ensure DomainDefService is loaded
             if (!DomainDefService.Instance.IsLoaded)
             {
@@ -1382,6 +1439,14 @@ namespace EliteSoft.Erwin.AddIn.Services
         private void ShowConsolidatedPopup()
         {
             if (_pendingResults.Count == 0 || _popupVisible) return;
+            // Suspend flag check: From-DB pipeline gibi long-running ops
+            // sirasinda popup spawn etme. Pipeline finish'inde resume
+            // edilince fresh snapshot alindiktan sonra normal flow.
+            if (_validationSuspended)
+            {
+                _pendingResults.Clear();
+                return;
+            }
 
             _popupVisible = true;
             try
