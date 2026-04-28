@@ -1865,7 +1865,18 @@ namespace EliteSoft.Erwin.AddIn
                 }
                 finally
                 {
-                    // Resume validation after table copy completes
+                    // Refresh snapshots BEFORE resuming so the freshly created entities and
+                    // their attributes are seen as "known" baseline rather than "new" on the
+                    // next tick. Without this, the resumed validation cycle treats every new
+                    // column as new -> Glossary validation FAILED -> "PLEASE CHANGE IT" rename
+                    // loop (verified 01:04:05 log), and PropertyApplicator fires its question
+                    // wizard for each new entity. Snapshot calls are safe while suspended:
+                    // both timers are gated and the calls just clear-and-rebuild internal dicts.
+                    try { _tableTypeMonitorService?.TakeSnapshot(); }
+                    catch (Exception ex) { Log($"BtnCreateTables: TableTypeMonitor TakeSnapshot err: {ex.Message}"); }
+                    try { _validationCoordinatorService?.TakeSnapshot(); }
+                    catch (Exception ex) { Log($"BtnCreateTables: ValidationCoord TakeSnapshot err: {ex.Message}"); }
+
                     _validationCoordinatorService?.ResumeValidation();
                 }
 
