@@ -673,7 +673,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 }
                                 catch (Exception ex) { Log($"DeletePleaseChangeIt: Failed to read attr name: {ex.Message}"); continue; }
 
-                                if (physicalName.Equals("PLEASE CHANGE IT", StringComparison.OrdinalIgnoreCase))
+                                // Catch the canonical name AND erwin's sibling-collision variants
+                                // (PLEASE_CHANGE_IT__792 etc.) so the cleanup-on-editor-close pass
+                                // doesn't leave orphan placeholders behind.
+                                if (IsPleaseChangeItPlaceholder(physicalName))
                                 {
                                     columnsToDelete.Add(attr);
                                 }
@@ -914,6 +917,19 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         #region Validation Methods
 
+        /// <summary>
+        /// Match any of the auto-generated "needs-rename" placeholder names: the canonical
+        /// 'PLEASE CHANGE IT' we write, plus the variants erwin produces when sibling
+        /// attribute names collide (e.g. 'PLEASE_CHANGE_IT__792'). Treat them all as
+        /// already-flagged so we don't re-validate them and re-trigger the rename loop.
+        /// </summary>
+        private static bool IsPleaseChangeItPlaceholder(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            return name.StartsWith("PLEASE CHANGE IT", StringComparison.OrdinalIgnoreCase)
+                || name.StartsWith("PLEASE_CHANGE_IT", StringComparison.OrdinalIgnoreCase);
+        }
+
         private void ValidateGlossary(dynamic attr, AttributeValidationSnapshot state, HashSet<string> predefinedColumnNames)
         {
             if (_validationSuspended) return;
@@ -921,7 +937,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             if (string.IsNullOrEmpty(state.PhysicalName) ||
                 state.PhysicalName.Equals("<default>", StringComparison.OrdinalIgnoreCase) ||
                 state.PhysicalName.StartsWith("<default>", StringComparison.OrdinalIgnoreCase) ||
-                state.PhysicalName.Equals("PLEASE CHANGE IT", StringComparison.OrdinalIgnoreCase))
+                IsPleaseChangeItPlaceholder(state.PhysicalName))
             {
                 return;
             }
@@ -1569,13 +1585,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                             try { result.Attribute.Properties("Physical_Name").Value = "PLEASE CHANGE IT"; }
                             catch (Exception phEx) { Log($"RenameInvalidGlossary: Failed to set Physical_Name: {phEx.Message}"); }
                             Log($"Renamed column {result.TableName}.{result.ColumnName} to 'PLEASE CHANGE IT'");
-
-                            // Update snapshot so next cycle doesn't re-trigger validation
-                            if (!string.IsNullOrEmpty(result.ObjectId) && _attributeSnapshots.ContainsKey(result.ObjectId))
-                            {
-                                _attributeSnapshots[result.ObjectId].PhysicalName = "PLEASE CHANGE IT";
-                                _attributeSnapshots[result.ObjectId].AttributeName = "PLEASE CHANGE IT";
-                            }
                         }
                         catch (Exception ex)
                         {
@@ -1584,6 +1593,41 @@ namespace EliteSoft.Erwin.AddIn.Services
                     }
 
                     _session.CommitTransaction(transId);
+
+                    // Snapshot update MUST happen post-commit. Reason: erwin enforces
+                    // sibling-unique attribute names within an entity. If two siblings
+                    // are both set to 'PLEASE CHANGE IT', erwin auto-renames the second
+                    // to e.g. 'PLEASE_CHANGE_IT__792'. If we naively store
+                    // 'PLEASE CHANGE IT' in the snapshot for both, the next tick reads
+                    // the actual physical_name on the renamed sibling, sees a diff
+                    // ('PLEASE CHANGE IT' -> 'PLEASE_CHANGE_IT__792'), re-triggers
+                    // ValidateGlossary, which fails again because '__792' isn't in the
+                    // glossary -> popup -> rename -> erwin uniqueness -> infinite loop.
+                    // Verified 01:04:23 -> 01:07:29 in logs. Read back the actual values.
+                    foreach (var result in glossaryResults)
+                    {
+                        if (result.Attribute == null) continue;
+                        if (string.IsNullOrEmpty(result.ObjectId)) continue;
+                        if (!_attributeSnapshots.ContainsKey(result.ObjectId)) continue;
+
+                        string actualName = "PLEASE CHANGE IT";
+                        string actualPhys = "PLEASE CHANGE IT";
+                        try { actualName = result.Attribute.Name?.ToString() ?? actualName; }
+                        catch (Exception ex) { Log($"RenameInvalidGlossary: read-back Name error: {ex.Message}"); }
+                        try
+                        {
+                            string val = result.Attribute.Properties("Physical_Name").Value?.ToString();
+                            if (!string.IsNullOrEmpty(val) && !val.StartsWith("%"))
+                                actualPhys = val;
+                        }
+                        catch (Exception ex) { Log($"RenameInvalidGlossary: read-back Physical_Name error: {ex.Message}"); }
+
+                        _attributeSnapshots[result.ObjectId].PhysicalName = actualPhys;
+                        _attributeSnapshots[result.ObjectId].AttributeName = actualName;
+
+                        if (!actualPhys.Equals("PLEASE CHANGE IT", StringComparison.OrdinalIgnoreCase))
+                            Log($"  erwin auto-renamed sibling collision: {result.TableName}.{result.ColumnName} -> {actualPhys}");
+                    }
                 }
                 catch (Exception ex)
                 {
