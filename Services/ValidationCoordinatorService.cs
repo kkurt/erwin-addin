@@ -56,6 +56,14 @@ namespace EliteSoft.Erwin.AddIn.Services
         // Snapshot of all attributes
         private Dictionary<string, AttributeValidationSnapshot> _attributeSnapshots;
 
+        // Term-type policy popup deduplication. erwin's Column Editor combo commits the
+        // same user pick twice (combo commit + later sync), so without this we revert + popup
+        // for the same attempt twice in ~3 seconds. Key = attribute ObjectId, value = the
+        // exact attempted value plus when it was first seen.
+        private readonly Dictionary<string, (string attempt, DateTime when)> _termTypeRecentAttempts
+            = new Dictionary<string, (string, DateTime)>(StringComparer.OrdinalIgnoreCase);
+        private const double TermTypeDedupSeconds = 3.0;
+
         // Snapshot of Key_Group (Index) names for naming standard checks
         private Dictionary<string, string> _keyGroupSnapshots;
 
@@ -764,10 +772,19 @@ namespace EliteSoft.Erwin.AddIn.Services
                         else
                         {
                             var previousState = _attributeSnapshots[objectId];
-                            ProcessAttributeChanges(attr, previousState, currentState, predefinedColumnNames);
-                            // Carry over UDP values from old snapshot to new
+
+                            // Carry over BEFORE ProcessAttributeChanges runs, so the term-type
+                            // policy inside it can see the canonical concept resolved at glossary
+                            // apply time. ValidateGlossary in the rename branch may overwrite this
+                            // (column renamed to a different glossary term); for the data-type-only
+                            // branch, this carry-over is the only source of TermTypeCanonical.
+                            currentState.TermTypeCanonical = previousState.TermTypeCanonical;
                             foreach (var kvp in previousState.UdpValues)
                                 currentState.UdpValues[kvp.Key] = kvp.Value;
+                            if (string.IsNullOrEmpty(currentState.PhysicalDataType))
+                                currentState.PhysicalDataType = previousState.PhysicalDataType;
+
+                            ProcessAttributeChanges(attr, previousState, currentState, predefinedColumnNames);
                             _attributeSnapshots[objectId] = currentState;
                         }
 
@@ -871,9 +888,16 @@ namespace EliteSoft.Erwin.AddIn.Services
             bool domainChanged = previousState.DomainParentValue != currentState.DomainParentValue;
             bool hasValidDomain = IsValidDomain(currentState.DomainParentValue);
             bool hadValidDomain = IsValidDomain(previousState.DomainParentValue);
+            // Term-type guard fires when the user edits Physical_Data_Type without renaming
+            // the column. If the rename path runs, glossary will re-apply the type itself
+            // (authoritative), so we skip the policy in that branch to avoid reverting our
+            // own write.
+            bool dataTypeChanged = !string.Equals(previousState.PhysicalDataType ?? string.Empty,
+                                                  currentState.PhysicalDataType ?? string.Empty,
+                                                  StringComparison.Ordinal);
 
             // No changes relevant to validation
-            if (!physicalNameChanged && !domainChanged) return;
+            if (!physicalNameChanged && !domainChanged && !dataTypeChanged) return;
 
             _isProcessingChange = true;
             try
@@ -906,10 +930,133 @@ namespace EliteSoft.Erwin.AddIn.Services
                     Log($"Domain changed: {currentState.TableName}.{currentState.PhysicalName} -> {currentState.DomainParentValue}");
                     ValidateDomain(attr, currentState, previousState.DomainParentValue);
                 }
+
+                // Term-type policy: only fires when ONLY Physical_Data_Type changed (not on rename
+                // — the rename branch above re-applied glossary defaults authoritatively, so any
+                // diff there is intentional, not a user edit to constrain).
+                if (dataTypeChanged && !physicalNameChanged)
+                {
+                    Log($"Physical_Data_Type changed: {currentState.TableName}.{currentState.PhysicalName} '{previousState.PhysicalDataType}' -> '{currentState.PhysicalDataType}' (canonical='{currentState.TermTypeCanonical ?? "(none)"}')");
+                    EnforceTermTypePolicy(attr, previousState, currentState);
+                }
             }
             finally
             {
                 _isProcessingChange = false;
+            }
+        }
+
+        /// <summary>
+        /// Apply the term-type policy when a column's Physical_Data_Type changed and the
+        /// snapshot carries a canonical concept resolved at glossary-apply time:
+        ///   BUSINESS_TERM       -> revert both base type and length to the previous value
+        ///   AMORPH_DATA_TYPE    -> accept new base type, revert length to previous
+        ///   AMORPH_DATA_LENGTH  -> accept new length, revert base type to previous
+        ///   AMORPH (or null)    -> no-op (no constraint)
+        /// On revert we also pop a popup explaining what was disallowed; on full acceptance
+        /// (e.g. AMORPH_DATA_TYPE with only the type changed) we stay silent.
+        /// </summary>
+        private void EnforceTermTypePolicy(dynamic attr, AttributeValidationSnapshot prev, AttributeValidationSnapshot curr)
+        {
+            string canonical = curr.TermTypeCanonical;
+            if (string.IsNullOrEmpty(canonical)) return;
+            if (canonical.Equals("AMORPH", StringComparison.OrdinalIgnoreCase)) return;
+
+            var oldParts = DataTypeParser.Parse(prev.PhysicalDataType);
+            var newParts = DataTypeParser.Parse(curr.PhysicalDataType);
+
+            bool baseChanged = !string.Equals(oldParts.Base, newParts.Base, StringComparison.OrdinalIgnoreCase);
+            bool lenChanged = !string.Equals(oldParts.Length ?? string.Empty, newParts.Length ?? string.Empty, StringComparison.Ordinal);
+
+            if (!baseChanged && !lenChanged) return;
+
+            // Decide which parts to keep from new vs revert from old. Suffix is always taken
+            // from the new value so user-added modifiers (e.g. " WITH TIME ZONE") survive
+            // length-only or type-only locking, unless the policy locks both.
+            string keepBase = oldParts.Base;
+            string keepLength = oldParts.Length;
+            string keepSuffix = oldParts.Suffix;
+            string disallowed;
+
+            switch (canonical.ToUpperInvariant())
+            {
+                case "BUSINESS_TERM":
+                    disallowed = (baseChanged && lenChanged) ? "Type and length"
+                                : baseChanged ? "Type" : "Length";
+                    // keep everything from old parts
+                    break;
+                case "AMORPH_DATA_TYPE":
+                    if (!lenChanged) return; // user only touched type, which is allowed
+                    keepBase = newParts.Base;
+                    keepSuffix = newParts.Suffix;
+                    disallowed = "Length";
+                    break;
+                case "AMORPH_DATA_LENGTH":
+                    if (!baseChanged) return; // user only touched length, which is allowed
+                    // Type change is forbidden; keep both old base AND old length. erwin's combo
+                    // clears the length when the user picks a different type from the dropdown,
+                    // so newParts.Length is usually null here — adopting that null would erase
+                    // the length entirely (visible as "VARCHAR2" with no parens). The user's
+                    // intent was a type swap, not a length edit, so revert everything to old.
+                    disallowed = "Type";
+                    break;
+                default:
+                    Log($"TermType policy: unknown canonical '{canonical}' for {curr.TableName}.{curr.PhysicalName} — skipping enforcement");
+                    return;
+            }
+
+            string corrected = DataTypeParser.Format(new DataTypeParser.Parts(keepBase, keepLength, keepSuffix));
+
+            // Already at the right value — nothing to write. This guards against feedback
+            // loops where erwin normalises the format slightly between writes.
+            if (string.Equals(corrected, curr.PhysicalDataType ?? string.Empty, StringComparison.Ordinal)) return;
+
+            // Suppress duplicate popups for the same attempt. erwin's Column Editor combo
+            // commits the user pick twice (combo commit + a second sync later), so without
+            // this guard we'd revert+popup the same attempt back-to-back. Silent revert is
+            // still correct on the duplicate so the model never holds the disallowed value.
+            string attemptedFormatted = curr.PhysicalDataType ?? string.Empty;
+            bool suppressPopup = false;
+            if (!string.IsNullOrEmpty(curr.ObjectId)
+                && _termTypeRecentAttempts.TryGetValue(curr.ObjectId, out var lastAttempt)
+                && string.Equals(lastAttempt.attempt, attemptedFormatted, StringComparison.Ordinal)
+                && (DateTime.UtcNow - lastAttempt.when).TotalSeconds < TermTypeDedupSeconds)
+            {
+                suppressPopup = true;
+            }
+            if (!string.IsNullOrEmpty(curr.ObjectId))
+            {
+                _termTypeRecentAttempts[curr.ObjectId] = (attemptedFormatted, DateTime.UtcNow);
+            }
+
+            int trans = _session.BeginNamedTransaction("EnforceTermTypePolicy");
+            try
+            {
+                attr.Properties("Physical_Data_Type").Value = corrected;
+                _session.CommitTransaction(trans);
+
+                // Update the snapshot so the next tick sees the corrected state as baseline
+                // and doesn't re-fire as another "Physical_Data_Type changed" diff.
+                curr.PhysicalDataType = corrected;
+
+                Log($"TermType policy [{canonical}]: {curr.TableName}.{curr.PhysicalName} {disallowed} reverted ('{prev.PhysicalDataType}' -> '{corrected}', user attempted '{attemptedFormatted}'{(suppressPopup ? ", popup suppressed (duplicate within " + TermTypeDedupSeconds + "s)" : "")})");
+
+                if (!suppressPopup)
+                {
+                    MessageBox.Show(
+                        $"Column '{curr.TableName}.{curr.PhysicalName}' is tagged '{canonical}' in the glossary.\n\n" +
+                        $"{disallowed} cannot be changed and was reverted.\n\n" +
+                        $"Restored: {corrected}",
+                        "Term Type Constraint",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                }
+            }
+            catch (Exception ex)
+            {
+                try { _session.RollbackTransaction(trans); }
+                catch (Exception rbEx) { Log($"EnforceTermTypePolicy rollback error: {rbEx.Message}"); }
+                Log($"EnforceTermTypePolicy write failed for {curr.PhysicalName}: {ex.Message}");
             }
         }
 
@@ -984,6 +1131,22 @@ namespace EliteSoft.Erwin.AddIn.Services
                 if (attr != null && udpValues != null && udpValues.Count > 0)
                 {
                     ApplyGlossaryUdpValues(attr, udpValues, state.PhysicalName);
+                }
+
+                // Term-type metadata for downstream policy enforcement: cache the canonical
+                // concept on the snapshot and refresh PhysicalDataType from erwin (the
+                // glossary apply above may have just written a new value via the
+                // DATA_TYPE -> Physical_Data_Type mapping).
+                state.TermTypeCanonical = glossary.GetTermTypeCanonical(state.PhysicalName);
+                if (attr != null)
+                {
+                    try
+                    {
+                        string freshDataType = attr.Properties("Physical_Data_Type").Value?.ToString();
+                        if (!string.IsNullOrEmpty(freshDataType))
+                            state.PhysicalDataType = freshDataType;
+                    }
+                    catch (Exception ex) { Log($"Glossary post-apply data type read error: {ex.Message}"); }
                 }
             }
         }
@@ -1666,17 +1829,29 @@ namespace EliteSoft.Erwin.AddIn.Services
 
             domainParentValue = GetDomainParentValue(attr, modelObjects);
 
+            // Physical_Data_Type is read on every snapshot so the diff path can compare
+            // current vs previous and decide whether a term-type policy must intervene.
+            // Read failures keep the previous behaviour (no policy enforcement) by leaving
+            // the field empty.
+            string physicalDataType = "";
+            try { physicalDataType = attr.Properties("Physical_Data_Type").Value?.ToString() ?? ""; }
+            catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"CreateSnapshot: Physical_Data_Type error: {ex.Message}"); }
+
             var snapshot = new AttributeValidationSnapshot
             {
                 ObjectId = objectId,
                 AttributeName = attrName,
                 PhysicalName = physicalName,
                 DomainParentValue = domainParentValue,
-                TableName = tableName
+                TableName = tableName,
+                PhysicalDataType = physicalDataType
             };
 
             // Column UDP values are read lazily in ProcessAttributeChanges only when needed
-            // (not in every snapshot — too expensive for 100+ attributes per tick)
+            // (not in every snapshot — too expensive for 100+ attributes per tick).
+            // TermTypeCanonical is also intentionally NOT resolved here; it's set when a
+            // glossary entry is applied to the column (ApplyGlossaryUdpValues path) and
+            // refreshed when Physical_Name changes (column renamed to a different glossary term).
 
             return snapshot;
         }
@@ -1851,6 +2026,22 @@ namespace EliteSoft.Erwin.AddIn.Services
             public string TableName { get; set; }
             /// <summary>Column UDP values for dependency change detection</summary>
             public Dictionary<string, string> UdpValues { get; set; } = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            /// <summary>
+            /// Last seen Physical_Data_Type. Used to detect user edits and to revert the
+            /// disallowed portion when a term-type policy applies.
+            /// </summary>
+            public string PhysicalDataType { get; set; }
+
+            /// <summary>
+            /// Canonical term-type concept (BUSINESS_TERM / AMORPH_DATA_TYPE /
+            /// AMORPH_DATA_LENGTH / AMORPH) resolved from the Glossary row. Null means
+            /// "no term-type constraint" — the column isn't in the glossary, the column
+            /// is in the glossary but its TERM_TYPE value is empty/unmapped, or admin
+            /// hasn't configured the term-type column. Snapshotted at glossary apply time
+            /// so it survives later UDP cascades; refreshed on Physical_Name changes.
+            /// </summary>
+            public string TermTypeCanonical { get; set; }
         }
 
         #endregion
