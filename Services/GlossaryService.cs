@@ -25,6 +25,18 @@ namespace EliteSoft.Erwin.AddIn.Services
         private List<(string sourceCol, string targetType, string targetField)> _valueMappings;
         private string _tableName;
 
+        // Term-type metadata (Step 3 in Admin):
+        //  _termTypeColumn: which glossary column holds the term-type label
+        //                   (DG_TABLE_MAPPING_COLUMN row with target_field = '_TERM_TYPE_').
+        //  _termTypeMap:    external label -> canonical concept code
+        //                   (DG_TABLE_MAPPING_COLUMN rows with target_type = 'TERM_TYPE_MAP',
+        //                    source_column = external value, target_field = canonical code).
+        //  _termTypeByMatch: per-glossary-row, the canonical concept resolved from the row's
+        //                    TERM_TYPE column value via _termTypeMap (null when unmapped).
+        private string _termTypeColumn;
+        private Dictionary<string, string> _termTypeMap;
+        private Dictionary<string, string> _termTypeByMatch;
+
         public event Action<string> OnLog;
 
         public static GlossaryService Instance
@@ -47,6 +59,8 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             _glossaryCache = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
             _valueMappings = new List<(string, string, string)>();
+            _termTypeMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            _termTypeByMatch = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         }
 
         public bool IsLoaded => _isLoaded;
@@ -65,6 +79,9 @@ namespace EliteSoft.Erwin.AddIn.Services
                 _matchSourceColumn = null;
                 _valueMappings.Clear();
                 _tableName = null;
+                _termTypeColumn = null;
+                _termTypeMap.Clear();
+                _termTypeByMatch.Clear();
 
                 if (!DatabaseService.Instance.IsConfigured)
                 {
@@ -146,9 +163,27 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 if (string.IsNullOrEmpty(sourceCol)) continue;
 
                                 if (targetField == "_MATCH_")
+                                {
                                     _matchSourceColumn = sourceCol;
+                                }
+                                else if (targetField == "_TERM_TYPE_")
+                                {
+                                    // Config row: which glossary column holds the term-type label.
+                                    // Not added to _valueMappings — its value never gets written
+                                    // back to erwin; it's only used to look up the canonical concept.
+                                    _termTypeColumn = sourceCol;
+                                }
+                                else if (string.Equals(targetType, "TERM_TYPE_MAP", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    // Mapping row: source_column = external label (e.g. "Business Term"),
+                                    // target_field = canonical code (e.g. "BUSINESS_TERM").
+                                    if (!string.IsNullOrEmpty(targetField))
+                                        _termTypeMap[sourceCol] = targetField;
+                                }
                                 else if (!string.IsNullOrEmpty(targetField))
+                                {
                                     _valueMappings.Add((sourceCol, targetType, targetField));
+                                }
                             }
                         }
                     }
@@ -162,6 +197,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                     }
 
                     Log($"GlossaryService: Match column='{_matchSourceColumn}', {_valueMappings.Count} value mapping(s): [{string.Join(", ", _valueMappings.Select(m => $"{m.sourceCol}→{m.targetType}:{m.targetField}"))}]");
+                    if (!string.IsNullOrEmpty(_termTypeColumn))
+                    {
+                        Log($"GlossaryService: TermType column='{_termTypeColumn}', {_termTypeMap.Count} concept mapping(s): [{string.Join(", ", _termTypeMap.Select(kv => $"{kv.Key}->{kv.Value}"))}]");
+                    }
 
                     // Step 3: Read CONNECTION_DEF for glossary DB connection
                     if (connectionDefId == null)
@@ -247,6 +286,8 @@ namespace EliteSoft.Erwin.AddIn.Services
             // Build dynamic SELECT with only needed columns
             var allCols = new List<string> { _matchSourceColumn };
             allCols.AddRange(_valueMappings.Select(m => m.sourceCol));
+            if (!string.IsNullOrEmpty(_termTypeColumn))
+                allCols.Add(_termTypeColumn);
             var distinctCols = allCols.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
 
             string selectCols = string.Join(", ", distinctCols.Select(c => QuoteColumn(dbType, c)));
@@ -287,6 +328,22 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                             if (!_glossaryCache.ContainsKey(matchValue))
                                 _glossaryCache[matchValue] = udpValues;
+
+                            // Resolve term-type concept for this row, if a term-type column is configured.
+                            // Unmapped values (admin didn't pair them with any concept) leave _termTypeByMatch
+                            // entry absent, which downstream treats as "no constraint" (same as TERM_TYPE NULL).
+                            if (!string.IsNullOrEmpty(_termTypeColumn))
+                            {
+                                string rawTermType = "";
+                                try { rawTermType = reader[_termTypeColumn]?.ToString()?.Trim() ?? ""; }
+                                catch (Exception ex) { Log($"GlossaryService: TermType column '{_termTypeColumn}' read error: {ex.Message}"); }
+
+                                if (!string.IsNullOrEmpty(rawTermType) && _termTypeMap.TryGetValue(rawTermType, out var canonical))
+                                {
+                                    if (!_termTypeByMatch.ContainsKey(matchValue))
+                                        _termTypeByMatch[matchValue] = canonical;
+                                }
+                            }
                         }
                     }
                 }
@@ -328,6 +385,22 @@ namespace EliteSoft.Erwin.AddIn.Services
             var mapping = _valueMappings.FirstOrDefault(m => m.targetField.Equals(targetField, StringComparison.OrdinalIgnoreCase));
             return mapping.targetType ?? "";
         }
+
+        /// <summary>
+        /// Resolve the canonical term-type concept for a glossary entry.
+        /// Returns the canonical code (BUSINESS_TERM / AMORPH_DATA_TYPE / AMORPH_DATA_LENGTH /
+        /// AMORPH) or null when the column is not in the glossary, the term-type column is
+        /// unconfigured, the value is empty, or the value is unmapped. Null means "no constraint"
+        /// for the downstream policy.
+        /// </summary>
+        public string GetTermTypeCanonical(string columnName)
+        {
+            if (string.IsNullOrEmpty(columnName)) return null;
+            return _termTypeByMatch.TryGetValue(columnName, out var canonical) ? canonical : null;
+        }
+
+        /// <summary>True when admin configured the optional term-type column in Step 3.</summary>
+        public bool HasTermTypeConfig => !string.IsNullOrEmpty(_termTypeColumn);
 
         /// <summary>
         /// Reload with last used modelId.
