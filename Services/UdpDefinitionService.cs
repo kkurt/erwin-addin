@@ -99,14 +99,18 @@ namespace EliteSoft.Erwin.AddIn.Services
                     return false;
                 }
 
+                var ctx = ConfigContextService.Instance;
+                if (!ctx.IsInitialized)
+                {
+                    _lastError = "ConfigContext not initialized.";
+                    _isLoaded = false;
+                    System.Diagnostics.Debug.WriteLine($"UdpDefinitionService: {_lastError}");
+                    return false;
+                }
+
                 string dbType = DatabaseService.Instance.GetDbType();
                 bool filterByType = !string.IsNullOrEmpty(objectType);
                 string query = GetDefinitionQuery(dbType, filterByType);
-
-                // Effective project IDs for corporate filtering (applied in-memory)
-                var effectiveModelIds = CorporateContextService.Instance.IsInitialized
-                    ? new HashSet<int>(CorporateContextService.Instance.EffectiveModelIds)
-                    : null;
 
                 using (var connection = DatabaseService.Instance.CreateConnection())
                 {
@@ -114,6 +118,11 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                     using (var command = DatabaseService.Instance.CreateCommand(query, connection))
                     {
+                        var pCfg = command.CreateParameter();
+                        pCfg.ParameterName = dbType == "ORACLE" ? ":cfgId" : "@cfgId";
+                        pCfg.Value = ctx.ActiveConfigId;
+                        command.Parameters.Add(pCfg);
+
                         if (filterByType)
                         {
                             var param = command.CreateParameter();
@@ -126,14 +135,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                         {
                             while (reader.Read())
                             {
-                                // Corporate scope filter (in-memory)
-                                if (effectiveModelIds != null)
-                                {
-                                    int rowModelId = Convert.ToInt32(reader["MODEL_ID"]);
-                                    if (rowModelId > 0 && !effectiveModelIds.Contains(rowModelId))
-                                        continue;
-                                }
-
                                 int defId = Convert.ToInt32(reader["DEF_ID"]);
                                 string name = reader["NAME"]?.ToString()?.Trim() ?? "";
                                 string objType = reader["OBJECT_TYPE"]?.ToString()?.Trim() ?? "";
@@ -225,11 +226,13 @@ namespace EliteSoft.Erwin.AddIn.Services
             switch (dbType?.ToUpper())
             {
                 case "POSTGRESQL":
-                    whereClause = filterByType ? @"WHERE d.""OBJECT_TYPE"" = @objectType" : "";
+                    whereClause = filterByType
+                        ? @"WHERE d.""CONFIG_ID"" = @cfgId AND d.""OBJECT_TYPE"" = @objectType"
+                        : @"WHERE d.""CONFIG_ID"" = @cfgId";
                     return $@"SELECT d.""ID"" AS ""DEF_ID"", d.""NAME"", d.""DESCRIPTION"", d.""OBJECT_TYPE"", d.""UDP_TYPE"",
                             d.""DEFAULT_VALUE"", d.""IS_REQUIRED"", d.""MIN_VALUE"", d.""MAX_VALUE"", d.""MAX_LENGTH"",
                             d.""VALIDATION_OPERATOR"", d.""VALIDATION_VALUE"", d.""ERROR_MESSAGE"", d.""APPLY_ON"", d.""SORT_ORDER"",
-                            d.""MODEL_ID"",
+                            d.""CONFIG_ID"",
 
                             o.""VALUE"" AS ""OPT_VALUE"", o.""DISPLAY_TEXT"" AS ""OPT_DISPLAY"", o.""SORT_ORDER"" AS ""OPT_ORDER""
                             FROM ""MC_UDP_DEFINITION"" d
@@ -238,11 +241,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                             ORDER BY d.""SORT_ORDER"", o.""SORT_ORDER""";
 
                 case "ORACLE":
-                    whereClause = filterByType ? "WHERE d.OBJECT_TYPE = :objectType" : "";
+                    whereClause = filterByType
+                        ? "WHERE d.CONFIG_ID = :cfgId AND d.OBJECT_TYPE = :objectType"
+                        : "WHERE d.CONFIG_ID = :cfgId";
                     return $@"SELECT d.ID AS DEF_ID, d.NAME, d.DESCRIPTION, d.OBJECT_TYPE, d.UDP_TYPE,
                             d.DEFAULT_VALUE, d.IS_REQUIRED, d.MIN_VALUE, d.MAX_VALUE, d.MAX_LENGTH,
                             d.VALIDATION_OPERATOR, d.VALIDATION_VALUE, d.ERROR_MESSAGE, d.APPLY_ON, d.SORT_ORDER,
-                            d.MODEL_ID,
+                            d.CONFIG_ID,
 
                             o.VALUE AS OPT_VALUE, o.DISPLAY_TEXT AS OPT_DISPLAY, o.SORT_ORDER AS OPT_ORDER
                             FROM MC_UDP_DEFINITION d
@@ -252,11 +257,13 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                 case "MSSQL":
                 default:
-                    whereClause = filterByType ? "WHERE d.[OBJECT_TYPE] = @objectType" : "";
+                    whereClause = filterByType
+                        ? "WHERE d.[CONFIG_ID] = @cfgId AND d.[OBJECT_TYPE] = @objectType"
+                        : "WHERE d.[CONFIG_ID] = @cfgId";
                     return $@"SELECT d.[ID] AS [DEF_ID], d.[NAME], d.[DESCRIPTION], d.[OBJECT_TYPE], d.[UDP_TYPE],
                             d.[DEFAULT_VALUE], d.[IS_REQUIRED], d.[MIN_VALUE], d.[MAX_VALUE], d.[MAX_LENGTH],
                             d.[VALIDATION_OPERATOR], d.[VALIDATION_VALUE], d.[ERROR_MESSAGE], d.[APPLY_ON], d.[SORT_ORDER],
-                            d.[MODEL_ID],
+                            d.[CONFIG_ID],
 
                             o.[VALUE] AS [OPT_VALUE], o.[DISPLAY_TEXT] AS [OPT_DISPLAY], o.[SORT_ORDER] AS [OPT_ORDER]
                             FROM [dbo].[MC_UDP_DEFINITION] d

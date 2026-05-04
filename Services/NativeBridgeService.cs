@@ -101,6 +101,11 @@ namespace EliteSoft.Erwin.AddIn.Services
         private delegate int CCInspInstallOnFeHookFn();
         private delegate int CCInspCleanupHookInstallFn();
         private delegate int CCInspCleanupHookUninstallFn();
+        private delegate int CCInspMonitorHookInstallFn();
+        private delegate int CCInspMonitorHookUninstallFn();
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int CCInspForceDestroyWizardFn(IntPtr hwnd);
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate IntPtr CCInspGetLastOnFeMsFn();
@@ -110,6 +115,18 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate int CCInspGetEdrTxCountFn();
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate uint CCInspGetLastEdrStartIdFn();
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate IntPtr CCInspGetLastEdrStartMsFn();
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate IntPtr CCInspGenerateAlterDdlViaOnFEFn(IntPtr ms, uint flags);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate IntPtr CCInspGetLastCcWizMs1Fn();
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate int CCInspCallApplyDiffRightFn(IntPtr leftMs, IntPtr rightMs);
@@ -183,9 +200,16 @@ namespace EliteSoft.Erwin.AddIn.Services
         private static CCInspInstallOnFeHookFn _ccInspInstallOnFeHook;
         private static CCInspCleanupHookInstallFn _ccInspCleanupHookInstall;
         private static CCInspCleanupHookUninstallFn _ccInspCleanupHookUninstall;
+        private static CCInspMonitorHookInstallFn _ccInspMonitorHookInstall;
+        private static CCInspMonitorHookUninstallFn _ccInspMonitorHookUninstall;
+        private static CCInspForceDestroyWizardFn _ccInspForceDestroyWizard;
         private static CCInspGetLastOnFeMsFn _ccInspGetLastOnFeMs;
         private static CCInspGetLastEdrMsFn _ccInspGetLastEdrMs;
         private static CCInspGetEdrTxCountFn _ccInspGetEdrTxCount;
+        private static CCInspGetLastEdrStartIdFn _ccInspGetLastEdrStartId;
+        private static CCInspGetLastEdrStartMsFn _ccInspGetLastEdrStartMs;
+        private static CCInspGenerateAlterDdlViaOnFEFn _ccInspGenerateAlterDdlViaOnFE;
+        private static CCInspGetLastCcWizMs1Fn _ccInspGetLastCcWizMs1;
         private static CCInspCallApplyDiffRightFn _ccInspCallApplyDiffRight;
         private static CCInspHookEccApplyFn _ccInspHookEccApply;
         private static CCInspGetEccApplyArgsFn _ccInspGetEccApplyArgs;
@@ -346,6 +370,17 @@ namespace EliteSoft.Erwin.AddIn.Services
                     if (ccCleanUn != IntPtr.Zero)
                         _ccInspCleanupHookUninstall = Marshal.GetDelegateForFunctionPointer<CCInspCleanupHookUninstallFn>(ccCleanUn);
 
+                    IntPtr ccMonInst = GetProcAddress(_bridgeModule, "CCInsp_MonitorHookInstall");
+                    if (ccMonInst != IntPtr.Zero)
+                        _ccInspMonitorHookInstall = Marshal.GetDelegateForFunctionPointer<CCInspMonitorHookInstallFn>(ccMonInst);
+                    IntPtr ccMonUn = GetProcAddress(_bridgeModule, "CCInsp_MonitorHookUninstall");
+                    if (ccMonUn != IntPtr.Zero)
+                        _ccInspMonitorHookUninstall = Marshal.GetDelegateForFunctionPointer<CCInspMonitorHookUninstallFn>(ccMonUn);
+
+                    IntPtr ccForceDestroy = GetProcAddress(_bridgeModule, "CCInsp_ForceDestroyWizard");
+                    if (ccForceDestroy != IntPtr.Zero)
+                        _ccInspForceDestroyWizard = Marshal.GetDelegateForFunctionPointer<CCInspForceDestroyWizardFn>(ccForceDestroy);
+
                     IntPtr ccGetLastOnFe = GetProcAddress(_bridgeModule, "CCInsp_GetLastOnFeMs");
                     if (ccGetLastOnFe != IntPtr.Zero)
                         _ccInspGetLastOnFeMs = Marshal.GetDelegateForFunctionPointer<CCInspGetLastOnFeMsFn>(ccGetLastOnFe);
@@ -357,6 +392,22 @@ namespace EliteSoft.Erwin.AddIn.Services
                     IntPtr ccGetEdrTxCount = GetProcAddress(_bridgeModule, "CCInsp_GetEdrTxCount");
                     if (ccGetEdrTxCount != IntPtr.Zero)
                         _ccInspGetEdrTxCount = Marshal.GetDelegateForFunctionPointer<CCInspGetEdrTxCountFn>(ccGetEdrTxCount);
+
+                    IntPtr ccGetLastEdrStartId = GetProcAddress(_bridgeModule, "CCInsp_GetLastEdrStartId");
+                    if (ccGetLastEdrStartId != IntPtr.Zero)
+                        _ccInspGetLastEdrStartId = Marshal.GetDelegateForFunctionPointer<CCInspGetLastEdrStartIdFn>(ccGetLastEdrStartId);
+
+                    IntPtr ccGetLastEdrStartMs = GetProcAddress(_bridgeModule, "CCInsp_GetLastEdrStartMs");
+                    if (ccGetLastEdrStartMs != IntPtr.Zero)
+                        _ccInspGetLastEdrStartMs = Marshal.GetDelegateForFunctionPointer<CCInspGetLastEdrStartMsFn>(ccGetLastEdrStartMs);
+
+                    IntPtr ccGenAlterFlags = GetProcAddress(_bridgeModule, "CCInsp_GenerateAlterDdlViaOnFE");
+                    if (ccGenAlterFlags != IntPtr.Zero)
+                        _ccInspGenerateAlterDdlViaOnFE = Marshal.GetDelegateForFunctionPointer<CCInspGenerateAlterDdlViaOnFEFn>(ccGenAlterFlags);
+
+                    IntPtr ccGetCcWizMs1 = GetProcAddress(_bridgeModule, "CCInsp_GetLastCcWizMs1");
+                    if (ccGetCcWizMs1 != IntPtr.Zero)
+                        _ccInspGetLastCcWizMs1 = Marshal.GetDelegateForFunctionPointer<CCInspGetLastCcWizMs1Fn>(ccGetCcWizMs1);
 
                     IntPtr ccCallAdr = GetProcAddress(_bridgeModule, "CCInsp_CallApplyDifferencesToRight");
                     if (ccCallAdr != IntPtr.Zero)
@@ -492,6 +543,67 @@ namespace EliteSoft.Erwin.AddIn.Services
         public static int GetEdrTxCount()
         {
             return _ccInspGetEdrTxCount?.Invoke() ?? -1;
+        }
+
+        /// <summary>
+        /// Returns the most-recent <c>id</c> argument passed to
+        /// <c>EDRAlterNameCaching::RegsiterStartTransactionId</c>, captured
+        /// by the bridge's EDR hook. The From-DB pipeline reads this right
+        /// after Apply-to-Right to obtain the lastApplyEdrId that erwin's
+        /// internal 'Right Alter Script' button handler reads from CC state
+        /// and forwards to <c>ELA::OnFE</c> as the <c>flags</c> argument.
+        /// Returns 0 if no transaction has been observed yet.
+        /// </summary>
+        public static uint GetLastEdrStartId()
+        {
+            return _ccInspGetLastEdrStartId?.Invoke() ?? 0u;
+        }
+
+        /// <summary>
+        /// Returns the ms pointer accompanying the last
+        /// <c>RegsiterStartTransactionId</c> call. Useful to disambiguate
+        /// which side (active mart vs RE'd PU) was the apply target.
+        /// </summary>
+        public static IntPtr GetLastEdrStartMs()
+        {
+            return _ccInspGetLastEdrStartMs?.Invoke() ?? IntPtr.Zero;
+        }
+
+        /// <summary>
+        /// Returns the <c>ms1</c> argument captured from the most recent
+        /// <c>ShowERwinCCWiz</c> hook fire. In the From-DB pipeline this is
+        /// the active mart's GDMModelSetI* - exactly what OnFE needs as its
+        /// <c>ms</c> argument. Returns <see cref="IntPtr.Zero"/> if the hook
+        /// has not fired yet.
+        /// </summary>
+        public static IntPtr GetLastCcWizMs1()
+        {
+            return _ccInspGetLastCcWizMs1?.Invoke() ?? IntPtr.Zero;
+        }
+
+        /// <summary>
+        /// Drives the <c>ELA::OnFE</c> alter-script wizard programmatically
+        /// via the bridge orchestrator, with a caller-supplied <c>flags</c>
+        /// argument (the manual 'Right Alter Script' button passes a non-zero
+        /// lastApplyEdrId here). Returns the captured DDL or null on failure.
+        /// </summary>
+        public static string GenerateAlterDdlViaOnFE(IntPtr ms, uint flags, Action<string> log)
+        {
+            if (_ccInspGenerateAlterDdlViaOnFE == null)
+            {
+                log?.Invoke("[bridge] CCInsp_GenerateAlterDdlViaOnFE not bound");
+                return null;
+            }
+            log?.Invoke($"[bridge] GenerateAlterDdlViaOnFE(ms=0x{ms.ToInt64():X}, flags=0x{flags:X})");
+            IntPtr ddlPtr = _ccInspGenerateAlterDdlViaOnFE(ms, flags);
+            if (ddlPtr == IntPtr.Zero)
+            {
+                log?.Invoke("[bridge] GenerateAlterDdlViaOnFE returned null");
+                return null;
+            }
+            string ddl = Marshal.PtrToStringAnsi(ddlPtr);
+            log?.Invoke($"[bridge] captured DDL ({ddl?.Length ?? 0} chars)");
+            return ddl;
         }
 
         /// <summary>
@@ -690,6 +802,53 @@ namespace EliteSoft.Erwin.AddIn.Services
             catch (Exception ex) { log?.Invoke($"CleanupHookUninstall threw: {ex.Message}"); return -1; }
         }
 
+        /// <summary>
+        /// Diagnostic-only WinEvent hook that LOGS every #32770 / Afx window
+        /// creation in erwin's process WITHOUT hiding anything. Used during
+        /// manual reverse-engineering of new wizard flows so we can capture
+        /// dialog title/class sequences. Pair with <see cref="MonitorHookUninstall"/>.
+        /// </summary>
+        public static int MonitorHookInstall(Action<string> log = null)
+        {
+            if (_ccInspMonitorHookInstall == null) { log?.Invoke("MonitorHookInstall: bridge export not bound (rebuild bridge?)."); return -1; }
+            try { return _ccInspMonitorHookInstall(); }
+            catch (Exception ex) { log?.Invoke($"MonitorHookInstall threw: {ex.Message}"); return -1; }
+        }
+
+        public static int MonitorHookUninstall(Action<string> log = null)
+        {
+            if (_ccInspMonitorHookUninstall == null) { log?.Invoke("MonitorHookUninstall: bridge export not bound."); return -1; }
+            try { return _ccInspMonitorHookUninstall(); }
+            catch (Exception ex) { log?.Invoke($"MonitorHookUninstall threw: {ex.Message}"); return -1; }
+        }
+
+        /// <summary>
+        /// Cross-thread DestroyWindow on a wizard whose engine state has been
+        /// nulled by ELA::OnFE post-cleanup (so MFC IDCANCEL/IDOK handlers
+        /// would AV trying to deref CERwinFEData::m_xActionSummary etc.).
+        /// Bridge installs a transient WH_CALLWNDPROCRET hook on the wizard's
+        /// owner thread, sends a sentinel message, and from inside the hook
+        /// (which runs on the UI thread) calls DestroyWindow directly. MFC
+        /// command handlers are NEVER invoked.
+        ///
+        /// Returns 1 if window is gone after the call, 0 otherwise.
+        /// </summary>
+        public static int ForceDestroyWizard(IntPtr hwnd, Action<string> log = null)
+        {
+            if (_ccInspForceDestroyWizard == null)
+            {
+                log?.Invoke("ForceDestroyWizard: bridge export not bound (rebuild bridge?).");
+                return 0;
+            }
+            if (hwnd == IntPtr.Zero) return 1;
+            try { return _ccInspForceDestroyWizard(hwnd); }
+            catch (Exception ex)
+            {
+                log?.Invoke($"ForceDestroyWizard threw: {ex.GetType().Name}: {ex.Message}");
+                return 0;
+            }
+        }
+
         /// <summary>D1-spike: install inline detour on ELA::OnFE to log args
         /// every time it fires. Lets us discover which flags value the
         /// 'Right Alter Script' button actually passes.</summary>
@@ -751,6 +910,54 @@ namespace EliteSoft.Erwin.AddIn.Services
             catch (Exception ex)
             {
                 log?.Invoke($"GenerateMartMartDdlViaOnFE threw: {ex.GetType().Name}: {ex.Message}");
+                return null;
+            }
+            finally
+            {
+                if (buf != IntPtr.Zero) { try { _freeDdlBuffer(buf); } catch { } }
+            }
+        }
+
+        /// <summary>
+        /// Overload: caller supplies the modelSet pointer explicitly. Used by
+        /// the From-DB pipeline (RunFromDbDdlPipelineAsync) where the silent
+        /// RE'd PU on the RIGHT side leaves OnFE/GA crashing if that ms is
+        /// passed (08:48:00 GA AV with ms=RE'd PU). Memory
+        /// reference_dirty_alter_ddl_pipeline says OnFE expects the active
+        /// dirty ms (LEFT). Bypassing the EDR/right fallback chain lets us
+        /// test that hypothesis without disturbing the Mart-Mart pipeline.
+        /// </summary>
+        public static string GenerateMartMartDdlViaOnFE(IntPtr explicitMs, Action<string> log = null)
+        {
+            if (_ccInspGenerateMartMartDdlViaOnFE == null || _freeDdlBuffer == null)
+            {
+                log?.Invoke("GenerateMartMartDdlViaOnFE: native orchestrator export missing.");
+                return null;
+            }
+            if (explicitMs == IntPtr.Zero)
+            {
+                log?.Invoke("GenerateMartMartDdlViaOnFE: explicit MS is zero - caller bug.");
+                return null;
+            }
+            log?.Invoke($"Using MS = 0x{explicitMs.ToInt64():X} (source: explicit caller-supplied)");
+            log?.Invoke("Native orchestrator spawns worker + calls OnFE; bg thread blocks until worker closes wizard.");
+
+            IntPtr buf = IntPtr.Zero;
+            try
+            {
+                buf = _ccInspGenerateMartMartDdlViaOnFE(explicitMs);
+                if (buf == IntPtr.Zero)
+                {
+                    log?.Invoke("Native orchestrator returned null. Check [ONFE-ORCH] / [ONFE-WORKER] / [GA] lines in bridge log.");
+                    return null;
+                }
+                string ddl = Marshal.PtrToStringAnsi(buf);
+                log?.Invoke($"Native orchestrator returned {ddl?.Length ?? 0} chars.");
+                return ddl;
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"GenerateMartMartDdlViaOnFE(explicit) threw: {ex.GetType().Name}: {ex.Message}");
                 return null;
             }
             finally

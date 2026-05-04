@@ -101,22 +101,33 @@ namespace EliteSoft.Erwin.AddIn
         /// </summary>
         public void Execute()
         {
+            Services.AddinLogger.StartSession();
+            using var _scope = Services.AddinLogger.BeginScope("ErwinAddIn.Execute");
             try
             {
-                EnsureExceptionHandler();
+                using (Services.AddinLogger.BeginScope("EnsureExceptionHandler"))
+                    EnsureExceptionHandler();
 
                 // Phase A spike: install native SyncModelCallback hook.
                 // Safe no-op if the bridge DLL is missing or EM_ECX can't be found.
-                Services.NativeBridgeService.Install(msg =>
-                    System.Diagnostics.Debug.WriteLine(msg));
+                using (Services.AddinLogger.BeginScope("NativeBridgeService.Install"))
+                    Services.NativeBridgeService.Install(msg =>
+                        System.Diagnostics.Debug.WriteLine(msg));
 
                 // License check
-                if (!CheckLicense())
+                bool licenseOk;
+                using (Services.AddinLogger.BeginScope("CheckLicense"))
+                    licenseOk = CheckLicense();
+                if (!licenseOk)
+                {
+                    Services.AddinLogger.Log("CheckLicense returned false - aborting load");
                     return;
+                }
 
                 // If form is already open, bring it to front
                 if (_activeForm != null && !_activeForm.IsDisposed)
                 {
+                    Services.AddinLogger.Log("Active form already open - bringing to front (skipping init)");
                     _activeForm.TopMost = true;
                     _activeForm.BringToFront();
                     _activeForm.Activate();
@@ -125,23 +136,37 @@ namespace EliteSoft.Erwin.AddIn
                 }
 
                 // Create SCAPI connection
-                Type scapiType = Type.GetTypeFromProgID("erwin9.SCAPI");
+                Type scapiType;
+                using (Services.AddinLogger.BeginScope("Type.GetTypeFromProgID(erwin9.SCAPI)"))
+                    scapiType = Type.GetTypeFromProgID("erwin9.SCAPI");
                 if (scapiType == null)
                 {
+                    Services.AddinLogger.Log("erwin9.SCAPI ProgID not registered - aborting");
                     ShowTopMostMessage("Could not find erwin SCAPI!", "Error");
                     return;
                 }
 
-                dynamic scapi = Activator.CreateInstance(scapiType);
+                dynamic scapi;
+                using (Services.AddinLogger.BeginScope("Activator.CreateInstance(SCAPI)"))
+                    scapi = Activator.CreateInstance(scapiType);
 
-                _activeForm = new ModelConfigForm(scapi);
+                using (Services.AddinLogger.BeginScope("new ModelConfigForm(scapi)"))
+                    _activeForm = new ModelConfigForm(scapi);
                 _activeForm.StartPosition = FormStartPosition.CenterScreen;
                 _activeForm.TopMost = true;
-                _activeForm.Shown += (s, e) => { ((Form)s).TopMost = false; };
-                _activeForm.Show();
+                // ForceClose during init can dispose the form before this
+                // event fires; guard against the resulting ObjectDisposedException.
+                _activeForm.Shown += (s, e) =>
+                {
+                    var form = (Form)s;
+                    if (!form.IsDisposed) form.TopMost = false;
+                };
+                using (Services.AddinLogger.BeginScope("ModelConfigForm.Show"))
+                    _activeForm.Show();
             }
             catch (Exception ex)
             {
+                Services.AddinLogger.Log($"Execute() FAILED: {ex.GetType().Name}: {ex.Message}");
                 ShowTopMostMessage("Add-In Error: " + ex.Message, "Error");
             }
         }

@@ -29,6 +29,11 @@
 #include <set>
 #include <string.h>
 
+// Captured on DLL_PROCESS_ATTACH (DllMain). Used by SetWindowsHookEx in
+// CCInsp_ForceDestroyWizard so a thread-targeted hook can be installed
+// pointing at this DLL.
+extern HMODULE g_hBridgeModule;
+
 static void GetLogPath(char* out, size_t outSize) {
     DWORD n = GetEnvironmentVariableA("TEMP", out, (DWORD)outSize);
     if (n == 0 || n >= outSize) strcpy_s(out, outSize, "C:\\tmp");
@@ -1943,6 +1948,195 @@ extern "C" __declspec(dllexport) int __cdecl CCInsp_CleanupHookUninstall(void) {
     return hid;
 }
 
+// ---------------------------------------------------------------------------
+// Diagnostic monitor hook: logs every #32770 / Afx window creation in erwin's
+// process WITHOUT hiding anything. Used during manual reverse-engineering of
+// new wizard flows (e.g. From-DB Generate DDL discovery) so we can map dialog
+// titles to manual click sequences. Same WinEvent infrastructure as the
+// cleanup hook but with a no-hide callback.
+// ---------------------------------------------------------------------------
+
+static volatile LONG g_monitorHookActive = 0;
+static HWINEVENTHOOK g_monitorEvHook = nullptr;
+static int g_monitorEventCount = 0;
+
+static void CALLBACK MonitorWinEventCb(
+    HWINEVENTHOOK /*hook*/, DWORD event, HWND hwnd,
+    LONG idObject, LONG /*idChild*/, DWORD /*eventThread*/, DWORD /*eventTime*/)
+{
+    if (!hwnd) return;
+    if (idObject != OBJID_WINDOW) return;
+    if (InterlockedCompareExchange(&g_monitorHookActive, 0, 0) == 0) return;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != GetCurrentProcessId()) return;
+    if (!LooksLikeCleanupTarget(hwnd)) return;
+
+    char cls[64] = {0};
+    GetClassNameA(hwnd, cls, sizeof(cls));
+    char title[256] = {0};
+    GetWindowTextA(hwnd, title, sizeof(title));
+
+    // Only log on CREATE and NAMECHANGE so we get the "born" event AND the
+    // moment the title is set (CREATE often fires before title is assigned).
+    if (event == EVENT_OBJECT_CREATE) {
+        g_monitorEventCount++;
+        LogLine("[MONITOR] CREATE  hwnd=%p cls='%s' title='%s'", hwnd, cls, title);
+    } else if (event == EVENT_OBJECT_NAMECHANGE) {
+        // Skip empty titles - those are interim during dialog construction
+        if (title[0] != '\0') {
+            LogLine("[MONITOR] RENAME  hwnd=%p cls='%s' title='%s'", hwnd, cls, title);
+        }
+    } else if (event == EVENT_OBJECT_SHOW) {
+        LogLine("[MONITOR] SHOW    hwnd=%p cls='%s' title='%s'", hwnd, cls, title);
+    } else if (event == EVENT_OBJECT_DESTROY) {
+        LogLine("[MONITOR] DESTROY hwnd=%p cls='%s' title='%s'", hwnd, cls, title);
+    }
+}
+
+extern "C" __declspec(dllexport) int __cdecl CCInsp_MonitorHookInstall(void) {
+    if (g_monitorEvHook) {
+        LogLine("[MONITOR] install: hook already installed (%p)", g_monitorEvHook);
+        return -1;
+    }
+    g_monitorEventCount = 0;
+    InterlockedExchange(&g_monitorHookActive, 1);
+    // Wider event range than cleanup hook so we see show + destroy too.
+    g_monitorEvHook = SetWinEventHook(
+        EVENT_OBJECT_CREATE, EVENT_OBJECT_NAMECHANGE,
+        nullptr, MonitorWinEventCb,
+        GetCurrentProcessId(), 0,
+        WINEVENT_OUTOFCONTEXT);
+    LogLine("[MONITOR] install: hook=%p (will log all #32770/Afx CREATE+RENAME in erwin pid)", g_monitorEvHook);
+    return g_monitorEvHook ? 0 : -2;
+}
+
+extern "C" __declspec(dllexport) int __cdecl CCInsp_MonitorHookUninstall(void) {
+    InterlockedExchange(&g_monitorHookActive, 0);
+    int seen = g_monitorEventCount;
+    if (g_monitorEvHook) {
+        UnhookWinEvent(g_monitorEvHook);
+        g_monitorEvHook = nullptr;
+        LogLine("[MONITOR] uninstall: logged %d CREATE event(s) during session", seen);
+    }
+    return seen;
+}
+
+// ---------------------------------------------------------------------------
+// ForceDestroyWizard: cross-thread DestroyWindow on a wizard that has had its
+// engine-state pointers nulled by ELA::OnFE post-run cleanup.
+//
+// Background:
+//   After CCInsp_GenerateMartMartDdlViaOnFE finishes, the OnFE worker's
+//   wizard cancel handler calls CERwinFEData::ClearERwinFEData which nulls
+//   ELC2.gbl_pxActionSummary, CERwinFEData::m_xActionSummary, m_modelSet
+//   (process-globals shared across all CC/RD wizards). Any subsequent
+//   PostMessage(WM_COMMAND, IDCANCEL) to the user-facing CC wizard or
+//   Resolve Differences dialog runs MFC handlers that re-enter that nulled
+//   state and AV. Verified crash on the From-DB pipeline at 23:43:57.790
+//   right after "cleanup: Cancel Resolve Differences" was posted.
+//
+// Approach:
+//   DestroyWindow MUST be called on the thread that owns the window, but we
+//   are invoked from the addin's Task.Run background thread. We install a
+//   transient WH_CALLWNDPROCRET hook on the wizard's owner thread, send a
+//   sentinel WM_USER+0x4242, and from the hook (running on the UI thread)
+//   call DestroyWindow. CallWndProcRet runs AFTER the WindowProc dispatch
+//   so the wizard is still alive when we receive the hook event. MFC
+//   command handlers (OnCancel/OnOK) are NEVER invoked because we never
+//   send WM_COMMAND/WM_CLOSE.
+//
+// Limitations / leaks:
+//   The CDialog C++ object on the heap is not freed (no MFC bookkeeping).
+//   For one-shot cleanup of a wizard whose engine state is broken, this is
+//   strictly better than crashing the whole process.
+// ---------------------------------------------------------------------------
+
+#define BRIDGE_FORCE_DESTROY_MSG (WM_USER + 0x4242)
+
+static volatile HWND g_forceDestroyTarget = nullptr;
+static volatile LONG g_forceDestroyDone = 0;   // 0=pending, 1=ok, -1=DestroyWindow false, -2=SEH
+
+static LRESULT CALLBACK ForceDestroyHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION) {
+        CWPRETSTRUCT* p = (CWPRETSTRUCT*)lParam;
+        HWND tgt = (HWND)InterlockedCompareExchangePointer((PVOID volatile*)&g_forceDestroyTarget, nullptr, nullptr);
+        if (p && tgt && p->hwnd == tgt && p->message == BRIDGE_FORCE_DESTROY_MSG) {
+            // Clear target FIRST so CWPRET callbacks for the destroy storm
+            // (WM_DESTROY/WM_NCDESTROY etc.) don't re-enter this branch.
+            InterlockedExchangePointer((PVOID volatile*)&g_forceDestroyTarget, nullptr);
+            __try {
+                if (IsWindow(tgt)) {
+                    BOOL ok = DestroyWindow(tgt);
+                    LogLine("[FORCE-DESTROY] DestroyWindow(%p) = %d", (void*)tgt, ok);
+                    InterlockedExchange(&g_forceDestroyDone, ok ? 1 : -1);
+                } else {
+                    LogLine("[FORCE-DESTROY] window already gone before destroy hook");
+                    InterlockedExchange(&g_forceDestroyDone, 1);
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                LogLine("[FORCE-DESTROY] SEH inside DestroyWindow");
+                InterlockedExchange(&g_forceDestroyDone, -2);
+            }
+        }
+    }
+    return CallNextHookEx(nullptr, nCode, wParam, lParam);
+}
+
+extern "C" __declspec(dllexport) int __cdecl CCInsp_ForceDestroyWizard(void* hwndPtr) {
+    HWND hwnd = (HWND)hwndPtr;
+    if (!hwnd) {
+        LogLine("[FORCE-DESTROY] null hwnd");
+        return 0;
+    }
+    if (!IsWindow(hwnd)) {
+        LogLine("[FORCE-DESTROY] hwnd=%p not a window (already gone?)", (void*)hwnd);
+        return 1;   // treat as success — nothing to destroy
+    }
+    DWORD tid = GetWindowThreadProcessId(hwnd, nullptr);
+    if (!tid) {
+        LogLine("[FORCE-DESTROY] GetWindowThreadProcessId(%p) returned 0 err=%lu",
+                (void*)hwnd, GetLastError());
+        return 0;
+    }
+    if (!g_hBridgeModule) {
+        LogLine("[FORCE-DESTROY] bridge HMODULE not captured — DllMain didn't run?");
+        return 0;
+    }
+
+    LogLine("[FORCE-DESTROY] target hwnd=%p tid=%lu hMod=%p",
+            (void*)hwnd, tid, (void*)g_hBridgeModule);
+
+    InterlockedExchangePointer((PVOID volatile*)&g_forceDestroyTarget, hwnd);
+    InterlockedExchange(&g_forceDestroyDone, 0);
+
+    HHOOK hook = SetWindowsHookExW(WH_CALLWNDPROCRET, ForceDestroyHookProc,
+                                    g_hBridgeModule, tid);
+    if (!hook) {
+        DWORD err = GetLastError();
+        LogLine("[FORCE-DESTROY] SetWindowsHookExW failed err=%lu", err);
+        InterlockedExchangePointer((PVOID volatile*)&g_forceDestroyTarget, nullptr);
+        return 0;
+    }
+
+    DWORD_PTR result = 0;
+    LRESULT sm = SendMessageTimeoutW(hwnd, BRIDGE_FORCE_DESTROY_MSG, 0, 0,
+                                     SMTO_ABORTIFHUNG | SMTO_NORMAL,
+                                     2000, &result);
+
+    UnhookWindowsHookEx(hook);
+
+    LONG done = InterlockedCompareExchange(&g_forceDestroyDone, 0, 0);
+    InterlockedExchangePointer((PVOID volatile*)&g_forceDestroyTarget, nullptr);
+    bool stillAlive = (IsWindow(hwnd) != FALSE);
+
+    LogLine("[FORCE-DESTROY] sm=%lld lastErr=%lu done=%ld stillAlive=%d",
+            (long long)sm, GetLastError(), done, stillAlive ? 1 : 0);
+
+    // Caller-visible result: 1 if window is gone (success), 0 otherwise.
+    return stillAlive ? 0 : 1;
+}
+
 extern "C" __declspec(dllexport) int __cdecl UninstallHook(void) {
     // For the spike we intentionally leave the detour installed for the process
     // lifetime. Restoring the original bytes mid-flight risks a race if erwin
@@ -2332,6 +2526,15 @@ static volatile LONG64 g_lastEdrMs = 0;
 // transactions before calling OnFE (which empties the ActionSummary if
 // called too early).
 static volatile LONG g_edrTxCount = 0;
+// Most-recent id passed to RegsiterStartTransactionId. Used by managed code
+// to feed the OnFE flags parameter so that the alter-script wizard sees a
+// real lastApplyEdrId instead of 0 (which makes the wizard recompute a
+// stripped-down DDL containing only the dirty buffer diff).
+static volatile LONG g_lastEdrStartId = 0;
+// Most-recent ms passed alongside the start-id above. Capturing this lets
+// managed code disambiguate which side (mart vs RE'd PU) the last apply
+// transaction belonged to.
+static volatile LONG64 g_lastEdrStartMs = 0;
 // Chronological list of distinct ms pointers seen by our various hooks.
 // Used by the Mart-Mart spike to identify v3 (first/left) and v1 (second/right).
 // Simple fixed-size; we don't expect more than a few MSs per session.
@@ -2382,6 +2585,8 @@ static volatile LONG g_edrStackTrace = 0;
 static void __cdecl EdrRegisterStartHook(void* ms, unsigned int id) {
     LogLine("[EDR-REG-START] RegsiterStartTransactionId ms=%p id=%u", ms, id);
     InterlockedExchange64(&g_lastEdrMs, (LONG64)ms);
+    InterlockedExchange64(&g_lastEdrStartMs, (LONG64)ms);
+    InterlockedExchange(&g_lastEdrStartId, (LONG)id);
     InterlockedIncrement(&g_edrTxCount);
     TrackMsSeen(ms);
     if (InterlockedCompareExchange(&g_edrStackTrace, 0, 0) != 0) {
@@ -2413,9 +2618,15 @@ static volatile LONG64 g_capturedCStrPtr = 0;
 // MFC's static empty-CString data pointer (lives in mfc140.dll; always valid).
 // Captured from ShowERwinCCWiz hook when cstr.data points at the sentinel.
 static volatile LONG64 g_mfcEmptyCStrData = 0;
+// Captured ms1 from the most recent ShowERwinCCWiz call. ms1 is the LEFT
+// model in the CC compare (the dirty active mart in the From-DB pipeline).
+// Used by managed code as the OnFE 'ms' argument for the alter-script
+// orchestrator without having to trigger an extra FEModel_DDL capture.
+static volatile LONG64 g_lastCcWizMs1 = 0;
 
 static int __cdecl ShowERwinCCWizHook(void* ms1, void* ms2, bool b1, bool b2, const void* cstr) {
     LogLine("[CC-PIPE] ShowERwinCCWiz ENTER ms1=%p ms2=%p b1=%d b2=%d cstr=%p", ms1, ms2, (int)b1, (int)b2, cstr);
+    if (ms1) InterlockedExchange64(&g_lastCcWizMs1, (LONG64)ms1);
     if (cstr) {
         __try {
             const char* data = *(const char**)cstr;
@@ -2608,6 +2819,32 @@ extern "C" __declspec(dllexport) int __cdecl CCInsp_CallApplyDifferencesToRight(
 
 extern "C" __declspec(dllexport) void* __cdecl CCInsp_GetLastEdrMs(void) {
     return (void*)InterlockedCompareExchange64(&g_lastEdrMs, 0, 0);
+}
+
+// Exported: returns the most-recent id passed to RegsiterStartTransactionId
+// (captured by EdrRegisterStartHook). Use this immediately after the CC
+// Apply-to-Right click to obtain the lastApplyEdrId that the manual 'Right
+// Alter Script' button handler reads from CC's internal state and forwards
+// to ELA::OnFE as the flags argument. Returns 0 if no transaction has been
+// observed yet.
+extern "C" __declspec(dllexport) unsigned int __cdecl CCInsp_GetLastEdrStartId(void) {
+    return (unsigned int)InterlockedCompareExchange(&g_lastEdrStartId, 0, 0);
+}
+
+// Exported: returns the ms pointer that accompanied the last
+// RegsiterStartTransactionId call. Useful to disambiguate which side
+// (active mart vs RE'd PU) was the target of the last apply.
+extern "C" __declspec(dllexport) void* __cdecl CCInsp_GetLastEdrStartMs(void) {
+    return (void*)InterlockedCompareExchange64(&g_lastEdrStartMs, 0, 0);
+}
+
+// Exported: returns ms1 captured from the most recent ShowERwinCCWiz call.
+// In the From-DB pipeline ms1 is the active dirty mart's GDMModelSetI* -
+// exactly what we need to feed to ELA::OnFE. Side-effect-free: the hook
+// fires naturally when the addin opens the CC wizard. Returns null if no
+// ShowERwinCCWiz call has been observed yet.
+extern "C" __declspec(dllexport) void* __cdecl CCInsp_GetLastCcWizMs1(void) {
+    return (void*)InterlockedCompareExchange64(&g_lastCcWizMs1, 0, 0);
 }
 
 // Exported: return the Nth distinct ms seen (0-based). N=0 gives the first
@@ -2809,6 +3046,169 @@ static DWORD WINAPI OnFeWorkerProc(LPVOID lp) {
     return 0;
 }
 
+// Worker variant for the From-DB pipeline: instead of calling
+// InvokePreviewStringOnlyCommand directly (which works for Mart-Mart because
+// the v2 mart-PU has a saved baseline that auto-populates the Object Filter),
+// step through the wizard via WM_COMMAND CMD_FE_WIZARD_NEXT (1766) so the
+// hidden Object Filter / Owner Override page logic runs and selects the
+// "changed objects" set. The Preview page itself triggers GenerateAlterScript
+// natively when reached, so no Invoke call is needed here.
+//
+// Manual 'Right Alter Script' click traversal (verified 2026-04-27):
+//   Overview -> Options -> Summary -> Owner Override -> Object Filter -> Preview
+// 5-6 Next presses to reach Preview; we cap at 8 with an early-exit if
+// g_lastCapturedDdl populates (GA detour writes it from Preview).
+static DWORD WINAPI OnFeWorkerProcViaNext(LPVOID lp) {
+    OnFeWorkerCtx* ctx = (OnFeWorkerCtx*)lp;
+    LogLine("[ONFE-WORKER-NEXT] started");
+
+    // Phase 1: wait for FEWPageOptions ctor (signals wizard opened).
+    DWORD start = GetTickCount();
+    void* fewpo = nullptr;
+    while (GetTickCount() - start < 15000) {
+        fewpo = (void*)InterlockedCompareExchange64(&g_capturedFEWPO, 0, 0);
+        if (fewpo) break;
+        Sleep(20);
+    }
+    if (!fewpo) {
+        LogLine("[ONFE-WORKER-NEXT] timeout - FEW-CTOR never fired");
+        delete ctx;
+        return 1;
+    }
+    LogLine("[ONFE-WORKER-NEXT] FEWPO captured = %p", fewpo);
+
+    // Phase 2: locate wizard hwnd. Prefer the hidden hwnd captured by our
+    // WinEvent hook (we hide the wizard pre-paint to avoid flash). Fall
+    // back to enumerating top-level dialogs if the hide didn't fire.
+    Sleep(150);
+    HWND wizard = (HWND)InterlockedCompareExchange64(&g_hiddenWizardHwnd, 0, 0);
+    if (!wizard) {
+        auto dialogs = EnumerateVisibleDialogs();
+        for (HWND h : dialogs) {
+            if (LooksLikeAlterScriptWizard(h)) { wizard = h; break; }
+        }
+    }
+    if (!wizard) {
+        LogLine("[ONFE-WORKER-NEXT] wizard hwnd not found - aborting");
+        delete ctx;
+        return 2;
+    }
+    LogLine("[ONFE-WORKER-NEXT] wizard hwnd=%p", wizard);
+
+    // Phase 2.5: hidden wizard (pre-paint hide via WinEvent hook) ignores
+    // WM_COMMAND posts because dialog controls do focus/visibility checks
+    // before processing button-click commands. Manual click flow works
+    // because real mouse click goes through the visible UI. We move the
+    // wizard off-screen instead - still flash-free but Win32 considers
+    // it visible so WM_COMMAND posts succeed.
+    SetWindowPos(wizard, nullptr, -32000, -32000, 0, 0,
+        SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE);
+    ShowWindow(wizard, SW_SHOWNOACTIVATE);
+    LogLine("[ONFE-WORKER-NEXT] wizard moved off-screen + shown (so WM_COMMAND is processed)");
+
+    // Phase 3: post Next up to 8 times, with an early-exit when GA writes DDL.
+    // Lock-free pointer check for ddl readiness (sufficient for break decision).
+    //
+    // Between Next posts the wizard's Object Filter page can spawn an
+    // 'erwin Data Modeler' popup ("Use current diagram selections? You have N
+    // entity selected"). Manual flow: user clicks No to keep all changed
+    // objects in scope; if Yes is clicked, the wizard scopes to only the
+    // selected entity which produces a stripped DDL. We auto-No it here.
+    const int CMD_FE_WIZARD_NEXT = 1766;
+    auto dismissDiagramPopup = []() -> bool {
+        // Use EnumerateVisibleDialogs - the diagram-selection popup is an
+        // owned modal child of erwin's main, not a system top-level, so
+        // FindWindowExW(NULL, ...) misses it.
+        auto dialogs = EnumerateVisibleDialogs();
+        for (HWND popup : dialogs) {
+            wchar_t title[256] = {0};
+            GetWindowTextW(popup, title, 255);
+            // Title contains "erwin Data Modeler" (exact or with extras).
+            if (wcsstr(title, L"erwin Data Modeler") == nullptr) continue;
+            // Search for a 'No' button child to confirm it's a Yes/No popup.
+            HWND noBtn = FindWindowExW(popup, nullptr, L"Button", L"&No");
+            if (!noBtn) noBtn = FindWindowExW(popup, nullptr, L"Button", L"No");
+            if (!noBtn) noBtn = FindWindowExW(popup, nullptr, L"Button", L"&Hayır");
+            if (!noBtn) noBtn = FindWindowExW(popup, nullptr, L"Button", L"Hayır");
+            if (!noBtn) {
+                // Some erwin popups use unicode ampersand-prefixed text; try
+                // enumerating Button children to find one whose text starts with N.
+                HWND child = nullptr;
+                while ((child = FindWindowExW(popup, child, L"Button", nullptr)) != nullptr) {
+                    wchar_t btxt[64] = {0};
+                    GetWindowTextW(child, btxt, 63);
+                    if (btxt[0] == L'N' || btxt[0] == L'n' ||
+                        (btxt[0] == L'&' && (btxt[1] == L'N' || btxt[1] == L'n')) ||
+                        wcsstr(btxt, L"Hayır") || wcsstr(btxt, L"Hayir"))
+                    { noBtn = child; break; }
+                }
+            }
+            if (!noBtn) continue;
+            LogLine("[ONFE-WORKER-NEXT] dismissing 'erwin Data Modeler' popup hwnd=%p title='%ls' (clicking No)", popup, title);
+            PostMessage(popup, WM_COMMAND, MAKEWPARAM(IDNO, BN_CLICKED), (LPARAM)noBtn);
+            // Also send BM_CLICK directly to the button as a backup -
+            // some custom dialogs don't honor IDNO unless the message
+            // targets the button hwnd specifically.
+            PostMessage(noBtn, BM_CLICK, 0, 0);
+            return true;
+        }
+        return false;
+    };
+    // NOTE: FEWPagePreviewEx ctor fires at WIZARD CREATION time, not when
+    // navigating to Preview page (eager page construction). It can't be used
+    // as a "preview reached" signal. Instead we run the Next-loop to a fixed
+    // budget so the Object Filter page gets a chance to fire and process its
+    // popup, then unconditionally call InvokePreview at the end.
+    int postedCount = 0;
+    for (int i = 0; i < 8; i++) {
+        char* ddlPtr = (char*)InterlockedCompareExchangePointer((PVOID*)&g_lastCapturedDdl, nullptr, nullptr);
+        if (ddlPtr != nullptr) {
+            LogLine("[ONFE-WORKER-NEXT] DDL captured after %d Next clicks", i);
+            break;
+        }
+        LogLine("[ONFE-WORKER-NEXT] posting CMD_FE_WIZARD_NEXT (1766) attempt %d", i + 1);
+        PostMessage(wizard, WM_COMMAND, MAKEWPARAM(CMD_FE_WIZARD_NEXT, BN_CLICKED), 0);
+        postedCount++;
+        // Between page transitions, watch briefly for the diagram-selection
+        // popup. Sleep is split so popup appears within the wait window.
+        Sleep(150);
+        dismissDiagramPopup();
+        Sleep(200);
+        dismissDiagramPopup();
+    }
+
+    // Phase 4: explicitly invoke the preview command on the captured
+    // FEWPageOptions self pointer. The Next-loop has driven the wizard
+    // through Overview -> Options -> Summary -> Owner Override -> Object
+    // Filter (where it dismissed the diagram-selection popup with No, so
+    // the filter is now "all changed objects") and on to the Preview page.
+    // InvokePreview triggers GenerateAlterScript natively which our GA
+    // detour captures into g_lastCapturedDdl.
+    if (g_directInvokePreview) {
+        void* fewpoSelf = (void*)InterlockedCompareExchange64(&g_capturedFEWPO, 0, 0);
+        if (fewpoSelf) {
+            LogLine("[ONFE-WORKER-NEXT] %d Next clicks posted - calling InvokePreviewStringOnlyCommand on FEWPO=%p", postedCount, fewpoSelf);
+            InvokePreviewSeh(fewpoSelf);
+            LogLine("[ONFE-WORKER-NEXT] InvokePreview returned");
+        } else {
+            LogLine("[ONFE-WORKER-NEXT] FEWPO not captured - cannot invoke preview");
+        }
+    }
+
+    // Phase 5: settle window for GA to fire on Preview page if not yet.
+    Sleep(800);
+
+    // Phase 5: close wizard so OnFE returns. IDCANCEL is the clean MFC path
+    // (matches reference_from_db_pipeline_working IDCANCEL recipe).
+    LogLine("[ONFE-WORKER-NEXT] posting IDCANCEL to wizard hwnd=%p", wizard);
+    PostMessage(wizard, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
+    PostMessage(wizard, WM_CLOSE, 0, 0);
+
+    LogLine("[ONFE-WORKER-NEXT] done");
+    delete ctx;
+    return 0;
+}
+
 // Orchestrated Mart-Mart DDL via ELA::OnFE.
 // Arms FEW-CTOR watcher in a worker thread, calls OnFE (blocks on modal on
 // this thread), worker drives wizard to Preview and closes it, OnFE returns,
@@ -2884,6 +3284,77 @@ extern "C" __declspec(dllexport) const char* __cdecl CCInsp_GenerateMartMartDdlV
 
     // Read captured DDL. Returns heap-allocated UTF-8 string; caller must
     // free via FreeDdlBuffer.
+    return (const char*)ConsumeLastCapturedDdl();
+}
+
+// Parametric variant of CCInsp_GenerateMartMartDdlViaOnFE. Same orchestration
+// (worker thread + WinEvent hook + OnFE blocking call + DDL capture) but the
+// flags argument is supplied by the caller instead of hardcoded to 0x13.
+//
+// Use case: From-DB pipeline where erwin's internal 'Right Alter Script'
+// handler reads a non-zero lastApplyEdrId from CC state on the manual code
+// path (verified flags=0x2370 in 2026-04-27 trace). Programmatic WM_COMMAND
+// dispatch fails to populate that state, so we capture the id from our EDR
+// hook (CCInsp_GetLastEdrStartId) and pass it explicitly here.
+extern "C" __declspec(dllexport) const char* __cdecl CCInsp_GenerateAlterDdlViaOnFE(
+    void* ms, unsigned int flags)
+{
+    if (!ms) {
+        void* onFeMs = (void*)InterlockedCompareExchange64(&g_lastOnFeMs, 0, 0);
+        if (onFeMs) {
+            LogLine("[ONFE-ORCH-FLAGS] caller ms=null, falling back to g_lastOnFeMs=%p", onFeMs);
+            ms = onFeMs;
+        }
+    } else {
+        LogLine("[ONFE-ORCH-FLAGS] caller passed explicit ms=%p flags=0x%X", ms, flags);
+    }
+    if (!ms) { LogLine("[ONFE-ORCH-FLAGS] ms is null"); return nullptr; }
+    if (!g_elaOnFe) {
+        HMODULE ela = GetModuleHandleW(L"EM_ELA.dll");
+        if (!ela) ela = LoadLibraryW(L"EM_ELA.dll");
+        if (ela) g_elaOnFe = (ElaOnFeFn)GetProcAddress(ela, kElaOnFeSym);
+    }
+    if (!g_elaOnFe) { LogLine("[ONFE-ORCH-FLAGS] OnFE unresolved"); return nullptr; }
+    if (!g_directInvokePreview) { LogLine("[ONFE-ORCH-FLAGS] InvokePreview unresolved"); return nullptr; }
+
+    HWND mainHwnd = FindErwinMain();
+    LogLine("[ONFE-ORCH-FLAGS] starting - erwin main=%p ms=%p flags=0x%X", (void*)mainHwnd, ms, flags);
+
+    InterlockedExchange64(&g_capturedFEWPO, 0);
+    InterlockedExchange64(&g_capturedFEWPreviewEx, 0);
+    InterlockedExchange(&g_autoOpenCtorFired, 0);
+    ClearCapturedDdl();
+
+    InterlockedExchange64(&g_hiddenWizardHwnd, 0);
+    HWINEVENTHOOK evHook = SetWinEventHook(
+        EVENT_OBJECT_CREATE, EVENT_OBJECT_NAMECHANGE,
+        nullptr, WizardWinEventCb,
+        GetCurrentProcessId(), 0,
+        WINEVENT_OUTOFCONTEXT);
+    LogLine("[ONFE-ORCH-FLAGS] WinEvent hook = %p", (void*)evHook);
+
+    // Use Next-loop worker (not InvokePreview). Object Filter and other
+    // wizard pages need to fire their hidden setup logic for From-DB to
+    // produce a real alter DDL (RE'd PU has no saved baseline so default
+    // mode emits full schema; Next-loop traversal picks the changed-only
+    // filter that the manual click flow uses).
+    OnFeWorkerCtx* ctx = new OnFeWorkerCtx{ mainHwnd };
+    HANDLE worker = CreateThread(nullptr, 0, OnFeWorkerProcViaNext, ctx, 0, nullptr);
+    if (!worker) {
+        LogLine("[ONFE-ORCH-FLAGS] CreateThread failed");
+        if (evHook) UnhookWinEvent(evHook);
+        delete ctx;
+        return nullptr;
+    }
+
+    LogLine("[ONFE-ORCH-FLAGS] calling ELA::OnFE(ms=%p, true, 0x%X)", ms, flags);
+    int rv = CallOnFeSeh(g_elaOnFe, ms, true, flags);
+    LogLine("[ONFE-ORCH-FLAGS] OnFE returned rv=%d", rv);
+
+    WaitForSingleObject(worker, 2000);
+    CloseHandle(worker);
+    if (evHook) UnhookWinEvent(evHook);
+
     return (const char*)ConsumeLastCapturedDdl();
 }
 
@@ -3328,10 +3799,17 @@ extern "C" __declspec(dllexport) int __cdecl CCInsp_SnapshotState(void* outBuf) 
     return 0;
 }
 
-BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID) {
+// Definition of the forward-declared g_hBridgeModule. Captured on
+// DLL_PROCESS_ATTACH so SetWindowsHookEx (used by CCInsp_ForceDestroyWizard)
+// can install a thread-targeted CWP hook pointing at this DLL.
+HMODULE g_hBridgeModule = nullptr;
+
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
+        g_hBridgeModule = hModule;
         TruncateLog();   // fresh log per erwin process
-        LogLine("DllMain DLL_PROCESS_ATTACH in PID %lu", GetCurrentProcessId());
+        LogLine("DllMain DLL_PROCESS_ATTACH in PID %lu hMod=%p",
+                GetCurrentProcessId(), (void*)hModule);
     } else if (reason == DLL_PROCESS_DETACH) {
         LogLine("DllMain DLL_PROCESS_DETACH");
     }

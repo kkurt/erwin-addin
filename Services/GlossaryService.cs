@@ -104,16 +104,26 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // Try DG_TABLE_MAPPING first (new dynamic mapping)
                     try
                     {
-                        // Use corporate effective project IDs if available
-                        var corpContext = CorporateContextService.Instance;
-                        bool hasCorporateFilter = corpContext.IsInitialized && corpContext.EffectiveModelIds.Count > 0;
-                        string effectiveIds = hasCorporateFilter
-                            ? string.Join(",", corpContext.EffectiveModelIds)
-                            : null;
+                        // CONFIG_ID scope (one config per mart path; addin won't even reach
+                        // here when ConfigContextService.IsInitialized is false because
+                        // ModelConfigForm gates initialization on it).
+                        var ctx = ConfigContextService.Instance;
+                        if (!ctx.IsInitialized)
+                        {
+                            _lastError = "ConfigContext not initialized; cannot resolve glossary mapping.";
+                            _isLoaded = false;
+                            Log($"GlossaryService: {_lastError}");
+                            return false;
+                        }
+                        int cfgId = ctx.ActiveConfigId;
 
-                        string mappingQuery = GetMappingQuery(repoDbType, hasCorporateFilter, effectiveIds);
+                        string mappingQuery = GetMappingQuery(repoDbType);
                         using (var cmd = DatabaseService.Instance.CreateCommand(mappingQuery, conn))
                         {
+                            var pCfg = cmd.CreateParameter();
+                            pCfg.ParameterName = repoDbType == "ORACLE" ? ":cfgId" : "@cfgId";
+                            pCfg.Value = cfgId;
+                            cmd.Parameters.Add(pCfg);
 
                             using (var reader = cmd.ExecuteReader())
                             {
@@ -194,6 +204,23 @@ namespace EliteSoft.Erwin.AddIn.Services
                         _isLoaded = false;
                         Log($"GlossaryService: {_lastError}");
                         return false;
+                    }
+
+                    // Honour the USE_TERM_TYPE_MAPPING toggle from the admin Configuration
+                    // panel. When the flag is unset/false, drop everything we read from the
+                    // term-type rows so GetTermTypeCanonical always returns null and the
+                    // policy in ValidationCoordinatorService stays a no-op. The flag lives
+                    // in MODEL_PROPERTY scoped to the active model (with All-Models fallback)
+                    // so the same code path adapts to per-model overrides.
+                    if (!string.IsNullOrEmpty(_termTypeColumn) || _termTypeMap.Count > 0)
+                    {
+                        bool termTypeEnabled = ReadModelPropertyBool(conn, repoDbType, "USE_TERM_TYPE_MAPPING");
+                        if (!termTypeEnabled)
+                        {
+                            Log($"GlossaryService: TermType mapping disabled by USE_TERM_TYPE_MAPPING flag — clearing {_termTypeMap.Count} concept mapping(s)");
+                            _termTypeColumn = null;
+                            _termTypeMap.Clear();
+                        }
                     }
 
                     Log($"GlossaryService: Match column='{_matchSourceColumn}', {_valueMappings.Count} value mapping(s): [{string.Join(", ", _valueMappings.Select(m => $"{m.sourceCol}→{m.targetType}:{m.targetField}"))}]");
@@ -416,39 +443,24 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         #region SQL Helpers
 
-        private string GetMappingQuery(string dbType, bool hasCorporateFilter, string effectiveIds)
+        private string GetMappingQuery(string dbType)
         {
-            // effectiveIds is a safe comma-separated list of integer IDs (no SQL injection risk)
+            // Single CONFIG_ID lookup — DG_TABLE_MAPPING is keyed on CONFIG_ID after the
+            // MODEL→CONFIG rename, no IN-list, no fallback chain.
             switch (dbType?.ToUpper())
             {
                 case "POSTGRESQL":
-                {
-                    string where = hasCorporateFilter && !string.IsNullOrEmpty(effectiveIds)
-                        ? $@"""MAPPING_CODE"" = 'GLOSSARY' AND ""MODEL_ID"" IN ({effectiveIds})"
-                        : @"""MAPPING_CODE"" = 'GLOSSARY'";
-                    return $@"SELECT ""ID"", ""CONNECTION_DEF_ID"", ""TABLE_NAME"" FROM ""DG_TABLE_MAPPING""
-                            WHERE {where}
-                            ORDER BY ""MODEL_ID"" DESC NULLS LAST LIMIT 1";
-                }
+                    return @"SELECT ""ID"", ""CONNECTION_DEF_ID"", ""TABLE_NAME"" FROM ""DG_TABLE_MAPPING""
+                            WHERE ""MAPPING_CODE"" = 'GLOSSARY' AND ""CONFIG_ID"" = @cfgId
+                            LIMIT 1";
                 case "ORACLE":
-                {
-                    string where = hasCorporateFilter && !string.IsNullOrEmpty(effectiveIds)
-                        ? $"MAPPING_CODE = 'GLOSSARY' AND MODEL_ID IN ({effectiveIds})"
-                        : "MAPPING_CODE = 'GLOSSARY'";
-                    return $@"SELECT ID, CONNECTION_DEF_ID, TABLE_NAME FROM DG_TABLE_MAPPING
-                            WHERE {where}
-                            ORDER BY MODEL_ID DESC NULLS LAST FETCH FIRST 1 ROWS ONLY";
-                }
+                    return @"SELECT ID, CONNECTION_DEF_ID, TABLE_NAME FROM DG_TABLE_MAPPING
+                            WHERE MAPPING_CODE = 'GLOSSARY' AND CONFIG_ID = :cfgId
+                            FETCH FIRST 1 ROWS ONLY";
                 case "MSSQL":
                 default:
-                {
-                    string where = hasCorporateFilter && !string.IsNullOrEmpty(effectiveIds)
-                        ? $"[MAPPING_CODE] = 'GLOSSARY' AND [MODEL_ID] IN ({effectiveIds})"
-                        : "[MAPPING_CODE] = 'GLOSSARY'";
-                    return $@"SELECT TOP 1 [ID], [CONNECTION_DEF_ID], [TABLE_NAME] FROM [dbo].[DG_TABLE_MAPPING]
-                            WHERE {where}
-                            ORDER BY [MODEL_ID] DESC";
-                }
+                    return @"SELECT TOP 1 [ID], [CONNECTION_DEF_ID], [TABLE_NAME] FROM [dbo].[DG_TABLE_MAPPING]
+                            WHERE [MAPPING_CODE] = 'GLOSSARY' AND [CONFIG_ID] = @cfgId";
             }
         }
 
@@ -466,6 +478,65 @@ namespace EliteSoft.Erwin.AddIn.Services
                 default:
                     return @"SELECT [SOURCE_COLUMN], [TARGET_TYPE], [TARGET_FIELD] FROM [dbo].[DG_TABLE_MAPPING_COLUMN]
                             WHERE [TABLE_MAPPING_ID] = @mappingId ORDER BY [SORT_ORDER]";
+            }
+        }
+
+        /// <summary>
+        /// Read a boolean CONFIG_PROPERTY value scoped to the active config. Returns false
+        /// when the row is missing or the value is anything other than "Yes" / "True" / "1"
+        /// — same convention as PropertyApplicatorService.
+        /// </summary>
+        private bool ReadModelPropertyBool(DbConnection conn, string repoDbType, string key)
+        {
+            try
+            {
+                var ctx = ConfigContextService.Instance;
+                if (!ctx.IsInitialized) return false;
+
+                string query;
+                switch (repoDbType?.ToUpper())
+                {
+                    case "POSTGRESQL":
+                        query = @"SELECT ""VALUE"" FROM ""CONFIG_PROPERTY""
+                                  WHERE ""KEY"" = @key AND ""CONFIG_ID"" = @cfgId
+                                  LIMIT 1";
+                        break;
+                    case "ORACLE":
+                        query = @"SELECT VALUE FROM CONFIG_PROPERTY
+                                  WHERE KEY = :key AND CONFIG_ID = :cfgId
+                                  FETCH FIRST 1 ROWS ONLY";
+                        break;
+                    case "MSSQL":
+                    default:
+                        query = @"SELECT TOP 1 [VALUE] FROM [dbo].[CONFIG_PROPERTY]
+                                  WHERE [KEY] = @key AND [CONFIG_ID] = @cfgId";
+                        break;
+                }
+
+                using (var cmd = DatabaseService.Instance.CreateCommand(query, conn))
+                {
+                    var pKey = cmd.CreateParameter();
+                    pKey.ParameterName = repoDbType == "ORACLE" ? ":key" : "@key";
+                    pKey.Value = key;
+                    cmd.Parameters.Add(pKey);
+
+                    var pCfg = cmd.CreateParameter();
+                    pCfg.ParameterName = repoDbType == "ORACLE" ? ":cfgId" : "@cfgId";
+                    pCfg.Value = ctx.ActiveConfigId;
+                    cmd.Parameters.Add(pCfg);
+
+                    var result = cmd.ExecuteScalar();
+                    if (result == null || result == DBNull.Value) return false;
+                    string value = result.ToString().Trim();
+                    return value.Equals("Yes", StringComparison.OrdinalIgnoreCase)
+                        || value.Equals("True", StringComparison.OrdinalIgnoreCase)
+                        || value == "1";
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"GlossaryService: ReadModelPropertyBool('{key}') error: {ex.Message}");
+                return false;
             }
         }
 

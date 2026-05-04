@@ -36,6 +36,10 @@ namespace EliteSoft.Erwin.AddIn.Services
         [DllImport("user32.dll")]
         private static extern bool SetForegroundWindow(IntPtr hWnd);
 
+        /// <summary>Public wrapper. Returns true if the window was brought
+        /// to the foreground; false if the foreground lock blocked it.</summary>
+        public static bool SetForegroundWindowPublic(IntPtr hWnd) => SetForegroundWindow(hWnd);
+
         [DllImport("user32.dll")]
         private static extern bool EnumChildWindows(IntPtr hWndParent, EnumChildProc lpEnumFunc, IntPtr lParam);
 

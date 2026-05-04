@@ -30,10 +30,19 @@ namespace EliteSoft.Erwin.AddIn.Services
             return new RepoDbContext(config);
         }
 
-        public List<Platform> GetPlatforms()
+        public List<DbmsLibrary> GetDbmsList()
         {
             using (var context = CreateContext())
-                return context.Platforms.OrderBy(p => p.Name).ToList();
+                return context.DbmsLibraries.OrderBy(d => d.DisplayName).ToList();
+        }
+
+        public List<DbmsVersion> GetDbmsVersions(int dbmsId)
+        {
+            using (var context = CreateContext())
+                return context.DbmsVersions
+                    .Where(v => v.DbmsId == dbmsId)
+                    .OrderBy(v => v.DisplayName)
+                    .ToList();
         }
 
         public List<ObjectType> GetObjectTypes()
@@ -42,13 +51,28 @@ namespace EliteSoft.Erwin.AddIn.Services
                 return context.ObjectTypes.OrderBy(o => o.Name).ToList();
         }
 
-        public List<PropertyDef> GetPropertyDefs(int platformId, int objectTypeId, bool erwinMode = false)
+        public List<PropertyDef> GetPropertyDefs(int dbmsVersionId, int objectTypeId, bool erwinMode = false)
         {
+            // After the schema rename: MC_PROPERTY_DEF lost CONFIG_ID and uses
+            // (DBMS_VERSION_ID, OBJECT_TYPE_ID) for scoping. erwinMode=true means
+            // "DBMS-agnostic only" (DBMS_VERSION_ID IS NULL); regular mode pulls both
+            // the version-specific rows AND the agnostic ones (NULL) so a UI doesn't
+            // miss generic properties.
             using (var context = CreateContext())
             {
+                if (erwinMode)
+                {
+                    return context.PropertyDefs
+                        .Include(pd => pd.EnumOptions)
+                        .Where(pd => pd.DbmsVersionId == null && pd.ObjectTypeId == objectTypeId)
+                        .OrderBy(pd => pd.GroupName)
+                        .ThenBy(pd => pd.SortOrder)
+                        .ToList();
+                }
                 return context.PropertyDefs
                     .Include(pd => pd.EnumOptions)
-                    .Where(pd => pd.PlatformId == platformId && pd.ObjectTypeId == objectTypeId)
+                    .Where(pd => (pd.DbmsVersionId == dbmsVersionId || pd.DbmsVersionId == null)
+                                 && pd.ObjectTypeId == objectTypeId)
                     .OrderBy(pd => pd.GroupName)
                     .ThenBy(pd => pd.SortOrder)
                     .ToList();
@@ -68,33 +92,39 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         public List<ModelStandard> GetModelStandards(int modelId)
         {
+            // 'modelId' is the active CONFIG.ID after the rename — the parameter
+            // name is preserved on the interface for source-compat with callers
+            // that haven't migrated yet.
             using (var context = CreateContext())
             {
                 return context.ModelStandards
                     .Include(ps => ps.PropertyDef)
-                    .Where(ps => ps.ModelId == modelId)
+                    .Where(ps => ps.ConfigId == modelId)
                     .ToList();
             }
         }
 
-        // Question-based property assignment (read-only)
+        // Question-based property assignment (read-only).
+        // NOTE: 'platformId' is now interpreted as DBMS_VERSION_ID (the schema renamed
+        // MC_PLATFORM -> DBMS_LIBRARY/DBMS_VERSION; question rows are scoped on
+        // DBMS_VERSION_ID). Parameter name kept for caller compatibility — rename
+        // separately along with the caller in PropertyApplicatorService.
         public List<QuestionDef> GetQuestions(int platformId, int objectTypeId)
         {
             using (var context = CreateContext())
             {
-                var query = context.QuestionDefs
+                var ctx = ConfigContextService.Instance;
+                int cfgId = ctx.IsInitialized ? ctx.ActiveConfigId : -1;
+
+                return context.QuestionDefs
                     .Include(q => q.QuestionOptions)
                     .Include(q => q.QuestionRules)
                         .ThenInclude(r => r.PropertyDef)
-                    .Where(q => q.PlatformId == platformId && q.ObjectTypeId == objectTypeId);
-
-                // Filter by effective model IDs (corporate scope)
-                var effectiveModelIds = CorporateContextService.Instance.IsInitialized
-                    ? CorporateContextService.Instance.EffectiveModelIds : null;
-                if (effectiveModelIds != null && effectiveModelIds.Count > 0)
-                    query = query.Where(q => effectiveModelIds.Contains(q.ModelId));
-
-                return query.OrderBy(q => q.SortOrder).ToList();
+                    .Where(q => q.DbmsVersionId == platformId
+                                && q.ObjectTypeId == objectTypeId
+                                && q.ConfigId == cfgId)
+                    .OrderBy(q => q.SortOrder)
+                    .ToList();
             }
         }
 

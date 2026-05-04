@@ -81,6 +81,15 @@ namespace EliteSoft.Erwin.AddIn.Services
                     return false;
                 }
 
+                var ctx = ConfigContextService.Instance;
+                if (!ctx.IsInitialized)
+                {
+                    _lastError = "ConfigContext not initialized.";
+                    _isLoaded = false;
+                    System.Diagnostics.Debug.WriteLine($"PredefinedColumnService: {_lastError}");
+                    return false;
+                }
+
                 string dbType = DatabaseService.Instance.GetDbType();
                 string query = GetQuery(dbType);
 
@@ -90,18 +99,17 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                     using (var command = DatabaseService.Instance.CreateCommand(query, connection))
                     {
+                        var pCfg = command.CreateParameter();
+                        pCfg.ParameterName = dbType == "ORACLE" ? ":cfgId" : "@cfgId";
+                        pCfg.Value = ctx.ActiveConfigId;
+                        command.Parameters.Add(pCfg);
+
                         using (var reader = command.ExecuteReader())
                         {
                             while (reader.Read())
                             {
-                                int rowModelId = Convert.ToInt32(reader["MODEL_ID"]);
+                                int rowConfigId = Convert.ToInt32(reader["CONFIG_ID"]);
                                 string rowDbType = reader["DB_TYPE"] == DBNull.Value ? "" : reader["DB_TYPE"]?.ToString()?.Trim() ?? "";
-
-                                // Corporate scope filter
-                                var effectiveModelIds = CorporateContextService.Instance.IsInitialized
-                                    ? CorporateContextService.Instance.EffectiveModelIds : null;
-                                if (effectiveModelIds != null && rowModelId > 0 && !effectiveModelIds.Contains(rowModelId))
-                                    continue;
 
                                 // DB_TYPE filter: match platform or empty (all platforms)
                                 if (!string.IsNullOrEmpty(platformDbType) && !string.IsNullOrEmpty(rowDbType) &&
@@ -114,7 +122,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 _columns.Add(new PredefinedColumn
                                 {
                                     Id = Convert.ToInt32(reader["ID"]),
-                                    ModelId = rowModelId,
+                                    ModelId = rowConfigId,
                                     ColumnName = colName,
                                     DataType = reader["DATA_TYPE"]?.ToString()?.Trim() ?? "",
                                     Nullable = reader["NULLABLE"] != DBNull.Value && Convert.ToBoolean(reader["NULLABLE"]),
@@ -148,31 +156,34 @@ namespace EliteSoft.Erwin.AddIn.Services
             switch (dbType?.ToUpper())
             {
                 case "POSTGRESQL":
-                    return @"SELECT pc.""ID"", pc.""MODEL_ID"", pc.""COLUMN_NAME"", pc.""DATA_TYPE"", pc.""NULLABLE"",
+                    return @"SELECT pc.""ID"", pc.""CONFIG_ID"", pc.""COLUMN_NAME"", pc.""DATA_TYPE"", pc.""NULLABLE"",
                             pc.""DEFAULT_VALUE"", pc.""DEPENDS_ON_UDP_ID"", pc.""DEPENDS_ON_UDP_VALUE"",
                             pc.""DB_TYPE"", pc.""SORT_ORDER"",
                             udp.""NAME"" AS ""UDP_NAME""
                             FROM ""PREDEFINED_COLUMN"" pc
                             LEFT JOIN ""MC_UDP_DEFINITION"" udp ON pc.""DEPENDS_ON_UDP_ID"" = udp.""ID""
+                            WHERE pc.""CONFIG_ID"" = @cfgId
                             ORDER BY pc.""SORT_ORDER""";
 
                 case "ORACLE":
-                    return @"SELECT pc.ID, pc.MODEL_ID, pc.COLUMN_NAME, pc.DATA_TYPE, pc.NULLABLE,
+                    return @"SELECT pc.ID, pc.CONFIG_ID, pc.COLUMN_NAME, pc.DATA_TYPE, pc.NULLABLE,
                             pc.DEFAULT_VALUE, pc.DEPENDS_ON_UDP_ID, pc.DEPENDS_ON_UDP_VALUE,
                             pc.DB_TYPE, pc.SORT_ORDER,
                             udp.NAME AS UDP_NAME
                             FROM PREDEFINED_COLUMN pc
                             LEFT JOIN MC_UDP_DEFINITION udp ON pc.DEPENDS_ON_UDP_ID = udp.ID
+                            WHERE pc.CONFIG_ID = :cfgId
                             ORDER BY pc.SORT_ORDER";
 
                 case "MSSQL":
                 default:
-                    return @"SELECT pc.[ID], pc.[MODEL_ID], pc.[COLUMN_NAME], pc.[DATA_TYPE], pc.[NULLABLE],
+                    return @"SELECT pc.[ID], pc.[CONFIG_ID], pc.[COLUMN_NAME], pc.[DATA_TYPE], pc.[NULLABLE],
                             pc.[DEFAULT_VALUE], pc.[DEPENDS_ON_UDP_ID], pc.[DEPENDS_ON_UDP_VALUE],
                             pc.[DB_TYPE], pc.[SORT_ORDER],
                             udp.[NAME] AS [UDP_NAME]
                             FROM [dbo].[PREDEFINED_COLUMN] pc
                             LEFT JOIN [dbo].[MC_UDP_DEFINITION] udp ON pc.[DEPENDS_ON_UDP_ID] = udp.[ID]
+                            WHERE pc.[CONFIG_ID] = @cfgId
                             ORDER BY pc.[SORT_ORDER]";
             }
         }

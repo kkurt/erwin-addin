@@ -20,13 +20,14 @@ namespace EliteSoft.Erwin.AddIn.Services
         private readonly IPropertyMetadataService _metadataService;
         private bool _disposed;
 
-        // Cached data
-        private Platform _detectedPlatform;
-        private string _targetServerValue;
+        // Cached data — after the schema rename, scoping is by (CONFIG_ID, DBMS_VERSION_ID)
+        // resolved up-front in ConfigContextService. Old MC_PLATFORM detection from
+        // Target_Server / MODEL_PATH UDP / MODEL.PATH lookup is gone.
+        private int _dbmsVersionId;
+        private int _configId;
         private List<PropertyDef> _tablePropertyDefs;
         private Dictionary<int, string> _modelStandardMap; // PropertyDefId -> Value
-        private List<QuestionDef> _questions; // Question definitions for this platform+TABLE
-        private int _modelId;
+        private List<QuestionDef> _questions; // Question definitions for this DBMS_VERSION+TABLE
         private int _tableObjectTypeId;
 
         public event Action<string> OnLog;
@@ -40,31 +41,29 @@ namespace EliteSoft.Erwin.AddIn.Services
         #region Initialization
 
         /// <summary>
-        /// Initialize: detect platform from model, find model by path, load property defs + standards.
+        /// Initialize: read CONFIG_ID + DBMS_VERSION_ID from ConfigContextService,
+        /// load property defs / standards / questions scoped on those.
         /// </summary>
         public bool Initialize()
         {
             try
             {
-                // 1. Detect platform from model's target server
-                _detectedPlatform = DetectPlatform();
-                if (_detectedPlatform == null)
+                var ctx = ConfigContextService.Instance;
+                if (!ctx.IsInitialized)
                 {
-                    Log("PropertyApplicator: Could not detect model platform");
+                    Log("PropertyApplicator: ConfigContext not initialized — aborting");
                     return false;
                 }
-                Log($"PropertyApplicator: Detected platform = {_detectedPlatform.Name} (ID={_detectedPlatform.Id})");
-
-                // 2. Find model by file path
-                _modelId = FindModelId();
-                if (_modelId <= 0)
+                _configId = ctx.ActiveConfigId;
+                _dbmsVersionId = ctx.DbmsVersionId ?? 0;
+                if (_dbmsVersionId <= 0)
                 {
-                    Log("PropertyApplicator: No matching model found in DB");
+                    Log("PropertyApplicator: CONFIG.DBMS_VERSION_ID is null — cannot scope MC_PROPERTY_DEF; admin must pick a DBMS version on the config");
                     return false;
                 }
-                Log($"PropertyApplicator: Matched model ID = {_modelId}");
+                Log($"PropertyApplicator: config={_configId}, dbms_version={_dbmsVersionId}");
 
-                // 3. Get TABLE object type
+                // TABLE object type
                 var objectTypes = _metadataService.GetObjectTypes();
                 var tableType = objectTypes.FirstOrDefault(o => o.Name == "TABLE");
                 if (tableType == null)
@@ -74,13 +73,16 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
                 _tableObjectTypeId = tableType.Id;
 
-                // 4. Load property definitions for this platform + TABLE
-                _tablePropertyDefs = _metadataService.GetPropertyDefs(_detectedPlatform.Id, tableType.Id);
-                Log($"PropertyApplicator: Loaded {_tablePropertyDefs.Count} property definitions for {_detectedPlatform.Name} TABLE");
+                // Property definitions for this DBMS version + TABLE (no CONFIG_ID filter
+                // — MC_PROPERTY_DEF is global after the rename; the only scope key is
+                // (DBMS_VERSION_ID, OBJECT_TYPE_ID), with DBMS_VERSION_ID NULL meaning
+                // "applies to any DBMS").
+                _tablePropertyDefs = _metadataService.GetPropertyDefs(_dbmsVersionId, tableType.Id);
+                Log($"PropertyApplicator: Loaded {_tablePropertyDefs.Count} property definitions for DBMS_VERSION={_dbmsVersionId} TABLE");
 
-                // 5. Load model standards
-                var standards = _metadataService.GetModelStandards(_modelId);
-                Log($"PropertyApplicator: Raw standards from DB for MODEL_ID={_modelId}: {standards.Count} record(s)");
+                // Model standards — these stay per-config (MC_MODEL_STANDARD.CONFIG_ID).
+                var standards = _metadataService.GetModelStandards(_configId);
+                Log($"PropertyApplicator: Raw standards from DB for CONFIG_ID={_configId}: {standards.Count} record(s)");
                 foreach (var s in standards)
                 {
                     var matchingDef = _tablePropertyDefs.FirstOrDefault(pd => pd.Id == s.PropertyDefId);
@@ -94,9 +96,9 @@ namespace EliteSoft.Erwin.AddIn.Services
                     .ToDictionary(s => s.PropertyDefId, s => s.Value);
                 Log($"PropertyApplicator: Loaded {_modelStandardMap.Count} model standards (after filter)");
 
-                // 6. Load question definitions for this platform + TABLE
-                _questions = _metadataService.GetQuestions(_detectedPlatform.Id, tableType.Id);
-                Log($"PropertyApplicator: Loaded {_questions.Count} question(s) for {_detectedPlatform.Name} TABLE");
+                // Question definitions for this DBMS version + TABLE
+                _questions = _metadataService.GetQuestions(_dbmsVersionId, tableType.Id);
+                Log($"PropertyApplicator: Loaded {_questions.Count} question(s) for DBMS_VERSION={_dbmsVersionId} TABLE");
 
                 return true;
             }
@@ -105,445 +107,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                 Log($"PropertyApplicator: Initialize error: {ex.Message}");
                 return false;
             }
-        }
-
-        /// <summary>
-        /// Find the MODEL record by matching model file path.
-        /// MODEL.PATH is set by erwin-admin when a model is registered.
-        /// </summary>
-        private int FindModelId()
-        {
-            try
-            {
-                var bootstrapService = new RegistryBootstrapService();
-                var config = bootstrapService.GetConfig();
-                if (config == null || !config.IsConfigured)
-                {
-                    Log("PropertyApplicator: Database not configured");
-                    return -1;
-                }
-
-                // Corporate scope: only match within effective models
-                var effectiveIds = CorporateContextService.Instance.IsInitialized
-                    ? new HashSet<int>(CorporateContextService.Instance.EffectiveModelIds)
-                    : null;
-
-                // 1. Read MODEL_PATH UDP (primary source)
-                string modelPath = ReadModelPathUdp();
-
-                // 2. If MODEL_PATH is empty, try file path and set it
-                if (string.IsNullOrEmpty(modelPath))
-                {
-                    modelPath = ReadModelFilePath();
-                    if (!string.IsNullOrEmpty(modelPath))
-                        Log($"PropertyApplicator: MODEL_PATH empty, using file path: '{modelPath}'");
-                }
-                else
-                {
-                    Log($"PropertyApplicator: MODEL_PATH = '{modelPath}'");
-                }
-
-                // 3. Try matching MODEL_PATH against MODEL.PATH
-                if (!string.IsNullOrEmpty(modelPath))
-                {
-                    string normalizedModelPath = modelPath.Replace("/", "\\").TrimEnd('\\').ToUpperInvariant();
-
-                    using (var context = new RepoDbContext(config))
-                    {
-                        var model = context.Models
-                            .AsEnumerable()
-                            .Where(p => effectiveIds == null || effectiveIds.Contains(p.Id))
-                            .FirstOrDefault(p => !string.IsNullOrEmpty(p.Path) &&
-                                p.Path.Replace("/", "\\").TrimEnd('\\').ToUpperInvariant() == normalizedModelPath);
-
-                        if (model != null)
-                        {
-                            Log($"PropertyApplicator: Matched model by MODEL_PATH, ID={model.Id}");
-                            return model.Id;
-                        }
-                    }
-
-                    // 3b. Fallback: match model name portion against MODEL.PATH filename
-                    string modelName = ReadModelName();
-                    if (!string.IsNullOrEmpty(modelName))
-                    {
-                        using (var context = new RepoDbContext(config))
-                        {
-                            var model = context.Models
-                                .AsEnumerable()
-                                .Where(p => effectiveIds == null || effectiveIds.Contains(p.Id))
-                                .FirstOrDefault(p => !string.IsNullOrEmpty(p.Path) &&
-                                    MatchesModelName(p.Path, modelName));
-
-                            if (model != null)
-                            {
-                                Log($"PropertyApplicator: Matched model by name, ID={model.Id}, PATH='{model.Path}'");
-                                UpdateModelPathUdp(model.Path);
-                                return model.Id;
-                            }
-                        }
-                    }
-
-                    Log($"PropertyApplicator: No model matched path '{modelPath}'");
-                }
-
-                // 4. Fallback: first effective model
-                if (effectiveIds != null && effectiveIds.Count > 0)
-                {
-                    int fallbackId = effectiveIds.First();
-                    Log($"PropertyApplicator: Fallback to first effective model, ID={fallbackId}");
-                    return fallbackId;
-                }
-
-                // 5. Last resort: first model in DB
-                using (var ctx = new RepoDbContext(config))
-                {
-                    var firstModel = ctx.Models.OrderBy(p => p.Id).FirstOrDefault();
-                    if (firstModel != null)
-                    {
-                        Log($"PropertyApplicator: Last resort fallback, ID={firstModel.Id}, PATH='{firstModel.Path}'");
-                        return firstModel.Id;
-                    }
-                }
-
-                Log("PropertyApplicator: No models found in DB");
-                return -1;
-            }
-            catch (Exception ex)
-            {
-                Log($"PropertyApplicator: FindModelId error: {ex.Message}");
-                return -1;
-            }
-        }
-
-        /// <summary>
-        /// Read MODEL_PATH UDP from erwin model root.
-        /// </summary>
-        private string ReadModelPathUdp()
-        {
-            try
-            {
-                dynamic modelObjects = _session.ModelObjects;
-                dynamic root = modelObjects.Root;
-                string val = root?.Properties("Model.Physical.MODEL_PATH").Value?.ToString() ?? "";
-                return string.IsNullOrEmpty(val) || val.StartsWith("%") ? null : val;
-            }
-            catch (Exception ex) { Log($"PropertyApplicator: ReadModelPathUdp error: {ex.Message}"); return null; }
-        }
-
-        /// <summary>
-        /// Write model path to MODEL_PATH UDP so it persists in the model for future opens.
-        /// </summary>
-        private void UpdateModelPathUdp(string modelPath)
-        {
-            if (string.IsNullOrEmpty(modelPath)) return;
-            try
-            {
-                dynamic modelObjects = _session.ModelObjects;
-                dynamic root = modelObjects.Root;
-
-                string currentValue = "";
-                try { currentValue = root.Properties("Model.Physical.MODEL_PATH").Value?.ToString() ?? ""; }
-                catch { return; } // UDP not available yet
-
-                // Only update if different from current value
-                if (currentValue.Equals(modelPath, StringComparison.OrdinalIgnoreCase)) return;
-
-                int transId = _session.BeginNamedTransaction("UpdateModelPath");
-                try
-                {
-                    root.Properties("Model.Physical.MODEL_PATH").Value = modelPath;
-                    _session.CommitTransaction(transId);
-                    Log($"PropertyApplicator: MODEL_PATH updated to: '{modelPath}'");
-                }
-                catch (Exception ex)
-                {
-                    try { _session.RollbackTransaction(transId); } catch (Exception rbEx) { Log($"PropertyApplicator: MODEL_PATH rollback error: {rbEx.Message}"); }
-                    Log($"PropertyApplicator: MODEL_PATH update failed: {ex.Message}");
-                }
-            }
-            catch (Exception ex)
-            {
-                Log($"PropertyApplicator: UpdateModelPathUdp error: {ex.Message}");
-            }
-        }
-
-        /// <summary>
-        /// Check if a MODEL.PATH contains the model name as its filename (without extension).
-        /// E.g. PATH="C:\Models\AchModel.erwin" matches modelName="AchModel"
-        /// </summary>
-        private bool MatchesModelName(string modelPath, string modelName)
-        {
-            try
-            {
-                string fileName = System.IO.Path.GetFileNameWithoutExtension(modelPath);
-                return string.Equals(fileName, modelName, StringComparison.OrdinalIgnoreCase);
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        /// <summary>
-        /// Read model file path from SCAPI.
-        /// Tries multiple properties: File_Name, then Name as fallback.
-        /// </summary>
-        private string ReadModelFilePath()
-        {
-            try
-            {
-                dynamic modelObjects = _session.ModelObjects;
-                dynamic root = modelObjects.Root;
-                if (root == null) return null;
-
-                // 1. Try File_Name property (full path for file-based models)
-                try
-                {
-                    string path = root.Properties("File_Name").Value?.ToString();
-                    Log($"PropertyApplicator: File_Name = '{path ?? "(null)"}'");
-                    if (!string.IsNullOrEmpty(path) && !path.StartsWith("%"))
-                        return path;
-                }
-                catch (Exception ex)
-                {
-                    Log($"PropertyApplicator: File_Name read failed: {ex.Message}");
-                }
-
-                // 2. Try other path-related properties
-                string[] pathProps = { "File_Path", "Model_File_Name", "Source_File_Name" };
-                foreach (var propName in pathProps)
-                {
-                    try
-                    {
-                        string val = root.Properties(propName).Value?.ToString();
-                        if (!string.IsNullOrEmpty(val) && !val.StartsWith("%"))
-                        {
-                            Log($"PropertyApplicator: {propName} = '{val}'");
-                            return val;
-                        }
-                    }
-                    catch { }
-                }
-
-                return null;
-            }
-            catch { return null; }
-        }
-
-        /// <summary>
-        /// Read model name from SCAPI root object.
-        /// </summary>
-        private string ReadModelName()
-        {
-            try
-            {
-                dynamic modelObjects = _session.ModelObjects;
-                dynamic root = modelObjects.Root;
-                return root?.Properties("Name").Value?.ToString();
-            }
-            catch { return null; }
-        }
-
-        /// <summary>
-        /// Reload standards from DB (e.g. after admin changes).
-        /// </summary>
-        public void ReloadStandards()
-        {
-            try
-            {
-                var standards = _metadataService.GetModelStandards(_modelId);
-                _modelStandardMap = standards
-                    .Where(s => _tablePropertyDefs.Any(pd => pd.Id == s.PropertyDefId))
-                    .ToDictionary(s => s.PropertyDefId, s => s.Value);
-                Log($"PropertyApplicator: Reloaded {_modelStandardMap.Count} model standards");
-            }
-            catch (Exception ex)
-            {
-                Log($"PropertyApplicator: ReloadStandards error: {ex.Message}");
-            }
-        }
-
-        #endregion
-
-        #region Platform Detection
-
-        /// <summary>
-        /// Detect platform from model's target server property via SCAPI.
-        /// First tries exact match, then partial match (platform name starts with detected vendor).
-        /// </summary>
-        private Platform DetectPlatform()
-        {
-            try
-            {
-                var platforms = _metadataService.GetPlatforms();
-                Log($"PropertyApplicator: DB platforms: [{string.Join(", ", platforms.Select(p => $"'{p.Name}' (ID={p.Id})"))}]");
-
-                string targetServer = ReadTargetServer();
-
-                if (string.IsNullOrEmpty(targetServer))
-                {
-                    Log("PropertyApplicator: Target_Server property is empty");
-                    _targetServerValue = null;
-                    return null;
-                }
-
-                _targetServerValue = targetServer;
-                Log($"PropertyApplicator: Model Target_Server = '{targetServer}'");
-
-                // 1. Exact match against MC_PLATFORM.NAME (case-insensitive)
-                var match = platforms.FirstOrDefault(p =>
-                    string.Equals(p.Name, targetServer, StringComparison.OrdinalIgnoreCase));
-
-                if (match != null)
-                {
-                    Log($"PropertyApplicator: Platform exact match = '{match.Name}'");
-                    return match;
-                }
-
-                // 2. Partial match: platform name starts with detected vendor (e.g. "ORACLE" matches "Oracle 19c")
-                match = platforms.FirstOrDefault(p =>
-                    p.Name != null && p.Name.StartsWith(targetServer, StringComparison.OrdinalIgnoreCase));
-
-                if (match != null)
-                {
-                    Log($"PropertyApplicator: Platform partial match = '{match.Name}' (starts with '{targetServer}')");
-                    return match;
-                }
-
-                // 3. Reverse partial: detected name starts with platform name (e.g. detected "Oracle 19c" matches platform "ORACLE")
-                match = platforms.FirstOrDefault(p =>
-                    p.Name != null && targetServer.StartsWith(p.Name, StringComparison.OrdinalIgnoreCase));
-
-                if (match != null)
-                {
-                    Log($"PropertyApplicator: Platform reverse partial match = '{match.Name}'");
-                    return match;
-                }
-
-                Log($"PropertyApplicator: No platform match for '{targetServer}'");
-                return null;
-            }
-            catch (Exception ex)
-            {
-                Log($"PropertyApplicator: DetectPlatform error: {ex.Message}");
-                return null;
-            }
-        }
-
-        /// <summary>
-        /// Read Target_Server from model root via SCAPI.
-        /// erwin stores Target_Server as a numeric enum ID (e.g. 174 = Oracle).
-        /// We probe the model to determine the DBMS platform.
-        /// </summary>
-        private string ReadTargetServer()
-        {
-            try
-            {
-                dynamic modelObjects = _session.ModelObjects;
-                dynamic root = modelObjects.Root;
-                if (root == null) return null;
-
-                // 1. Probe all root properties for debugging
-                string[] probeProperties = new[]
-                {
-                    "Target_Server", "DBMS", "Type_Name", "Long_Id",
-                    "ClassName", "Name", "Logical_Physical_Type"
-                };
-
-                foreach (string propName in probeProperties)
-                {
-                    try
-                    {
-                        var val = root.Properties(propName).Value;
-                        string strVal = val?.ToString() ?? "";
-                        if (!string.IsNullOrEmpty(strVal))
-                            Log($"PropertyApplicator: root.{propName} = '{strVal}'");
-                    }
-                    catch { }
-                }
-
-                // 2. Try root.ClassName (object class name, not a property)
-                try
-                {
-                    string className = root.ClassName?.ToString() ?? "";
-                    if (!string.IsNullOrEmpty(className))
-                        Log($"PropertyApplicator: root.ClassName = '{className}'");
-                }
-                catch { }
-
-                // 3. Determine platform by probing for platform-specific child objects.
-                // This is the most reliable method — if Oracle objects exist, it's Oracle.
-                string detectedByProbe = DetectPlatformByObjectProbe(modelObjects, root);
-                if (!string.IsNullOrEmpty(detectedByProbe))
-                {
-                    Log($"PropertyApplicator: Detected platform by object probe = '{detectedByProbe}'");
-                    return detectedByProbe;
-                }
-
-                // 4. Fallback: return Target_Server numeric value
-                try
-                {
-                    string ts = root.Properties("Target_Server").Value?.ToString() ?? "";
-                    if (!string.IsNullOrEmpty(ts))
-                        return ts;
-                }
-                catch { }
-
-                return null;
-            }
-            catch (Exception ex)
-            {
-                Log($"PropertyApplicator: ReadTargetServer error: {ex.Message}");
-                return null;
-            }
-        }
-
-        /// <summary>
-        /// Detect platform by probing for platform-specific SCAPI object types.
-        /// If Oracle_Physical_Object_Storage can be collected, it's an Oracle model.
-        /// Returns MC_PLATFORM.NAME value (ORACLE, MSSQL, POSTGRESQL) or null.
-        /// </summary>
-        private string DetectPlatformByObjectProbe(dynamic modelObjects, dynamic root)
-        {
-            // Oracle: try collecting Oracle-specific object types
-            try
-            {
-                dynamic oracleCheck = modelObjects.Collect(root, "Oracle_Physical_Object_Storage", -1);
-                // If no exception, Oracle objects exist in the metamodel → it's Oracle
-                Log($"PropertyApplicator: Oracle probe OK (count={oracleCheck?.Count ?? 0})");
-                return "ORACLE";
-            }
-            catch
-            {
-                Log("PropertyApplicator: Oracle probe failed (not Oracle model)");
-            }
-
-            // SQL Server: try collecting SQL Server-specific object types
-            try
-            {
-                dynamic mssqlCheck = modelObjects.Collect(root, "SQL_Server_Index", -1);
-                Log($"PropertyApplicator: MSSQL probe OK (count={mssqlCheck?.Count ?? 0})");
-                return "MSSQL";
-            }
-            catch
-            {
-                Log("PropertyApplicator: MSSQL probe failed (not MSSQL model)");
-            }
-
-            // PostgreSQL: try collecting PostgreSQL-specific object types
-            try
-            {
-                dynamic pgCheck = modelObjects.Collect(root, "Postgres_Tablespace", -1);
-                Log($"PropertyApplicator: PostgreSQL probe OK (count={pgCheck?.Count ?? 0})");
-                return "POSTGRESQL";
-            }
-            catch
-            {
-                Log("PropertyApplicator: PostgreSQL probe failed (not PostgreSQL model)");
-            }
-
-            return null;
         }
 
         #endregion
@@ -1170,17 +733,17 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         #region Public Properties
 
-        public int ModelId => _modelId;
-        public Platform DetectedPlatform => _detectedPlatform;
-        public string TargetServerValue => _targetServerValue;
+        public int ConfigId => _configId;
+        public int DbmsVersionId => _dbmsVersionId;
         public int StandardCount => _modelStandardMap?.Count ?? 0;
         public int QuestionCount => _questions?.Count ?? 0;
         public List<PropertyDef> TablePropertyDefs => _tablePropertyDefs;
-        public bool IsInitialized => _detectedPlatform != null && _tablePropertyDefs != null;
+        public bool IsInitialized => _configId > 0 && _tablePropertyDefs != null;
 
         /// <summary>
-        /// Check if a model property (MODEL_PROPERTY table) is enabled.
-        /// Values "Yes", "True", or "1" are considered enabled.
+        /// Check if a CONFIG_PROPERTY (KEY,VALUE) row exists for the active config and is
+        /// enabled. Values "Yes", "True", or "1" are considered enabled. The "All Models"
+        /// (ID=1) fallback is gone post-rename — schema requires a per-config row.
         /// </summary>
         public bool IsPropertyEnabled(string propertyKey)
         {
@@ -1189,19 +752,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                 var bootstrapService = new RegistryBootstrapService();
                 var config = bootstrapService.GetConfig();
                 if (config == null || !config.IsConfigured) return false;
+                if (_configId <= 0) return false;
 
                 using (var context = new RepoDbContext(config))
                 {
-                    var prop = context.ModelProperties
-                        .FirstOrDefault(p => p.ModelId == _modelId && p.Key == propertyKey);
-
-                    if (prop == null)
-                    {
-                        // Fallback: check "All Models" (ID=1) if not found for specific model
-                        prop = context.ModelProperties
-                            .FirstOrDefault(p => p.ModelId == 1 && p.Key == propertyKey);
-                    }
-
+                    var prop = context.ConfigProperties
+                        .FirstOrDefault(p => p.ConfigId == _configId && p.Key == propertyKey);
                     if (prop == null) return false;
 
                     return prop.Value.Equals("Yes", StringComparison.OrdinalIgnoreCase)

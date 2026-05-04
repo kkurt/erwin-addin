@@ -86,12 +86,17 @@ namespace EliteSoft.Erwin.AddIn.Services
                     return false;
                 }
 
+                var ctx = ConfigContextService.Instance;
+                if (!ctx.IsInitialized)
+                {
+                    _lastError = "ConfigContext not initialized.";
+                    _isLoaded = false;
+                    System.Diagnostics.Debug.WriteLine($"NamingStandardService: {_lastError}");
+                    return false;
+                }
+
                 string dbType = DatabaseService.Instance.GetDbType();
                 string query = GetQuery(dbType);
-
-                var effectiveModelIds = CorporateContextService.Instance.IsInitialized
-                    ? new HashSet<int>(CorporateContextService.Instance.EffectiveModelIds)
-                    : null;
 
                 using (var connection = DatabaseService.Instance.CreateConnection())
                 {
@@ -99,18 +104,15 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                     using (var command = DatabaseService.Instance.CreateCommand(query, connection))
                     {
+                        var pCfg = command.CreateParameter();
+                        pCfg.ParameterName = dbType == "ORACLE" ? ":cfgId" : "@cfgId";
+                        pCfg.Value = ctx.ActiveConfigId;
+                        command.Parameters.Add(pCfg);
+
                         using (var reader = command.ExecuteReader())
                         {
                             while (reader.Read())
                             {
-                                // Corporate scope filter
-                                if (effectiveModelIds != null)
-                                {
-                                    int rowModelId = Convert.ToInt32(reader["MODEL_ID"]);
-                                    if (rowModelId > 0 && !effectiveModelIds.Contains(rowModelId))
-                                        continue;
-                                }
-
                                 var rule = new NamingStandardRule
                                 {
                                     Id = Convert.ToInt32(reader["ID"]),
@@ -124,7 +126,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     AutoApply = reader["AUTO_APPLY"] != DBNull.Value && Convert.ToBoolean(reader["AUTO_APPLY"]),
                                     IsActive = Convert.ToBoolean(reader["IS_ACTIVE"]),
                                     SortOrder = reader["SORT_ORDER"] == DBNull.Value ? 0 : Convert.ToInt32(reader["SORT_ORDER"]),
-                                    ModelId = Convert.ToInt32(reader["MODEL_ID"]),
+                                    ModelId = Convert.ToInt32(reader["CONFIG_ID"]),
                                     DependsOnUdpId = reader["DEPENDS_ON_UDP_ID"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["DEPENDS_ON_UDP_ID"]),
                                     DependsOnUdpValue = reader["DEPENDS_ON_UDP_VALUE"] == DBNull.Value ? "" : reader["DEPENDS_ON_UDP_VALUE"]?.ToString()?.Trim() ?? "",
                                     DependsOnUdpName = reader["UDP_NAME"] == DBNull.Value ? "" : reader["UDP_NAME"]?.ToString()?.Trim() ?? ""
@@ -163,32 +165,32 @@ namespace EliteSoft.Erwin.AddIn.Services
                 case "POSTGRESQL":
                     return @"SELECT ns.""ID"", ns.""OBJECT_TYPE"", ns.""PREFIX"", ns.""SUFFIX"", ns.""LENGTH_OPERATOR"", ns.""LENGTH_VALUE"",
                             ns.""REGEXP_PATTERN"", ns.""ERROR_MESSAGE"", ns.""AUTO_APPLY"", ns.""IS_ACTIVE"", ns.""SORT_ORDER"",
-                            ns.""MODEL_ID"", ns.""DEPENDS_ON_UDP_ID"", ns.""DEPENDS_ON_UDP_VALUE"",
+                            ns.""CONFIG_ID"", ns.""DEPENDS_ON_UDP_ID"", ns.""DEPENDS_ON_UDP_VALUE"",
                             udp.""NAME"" AS ""UDP_NAME""
                             FROM ""MC_NAMING_STANDARD"" ns
                             LEFT JOIN ""MC_UDP_DEFINITION"" udp ON ns.""DEPENDS_ON_UDP_ID"" = udp.""ID""
-                            WHERE ns.""IS_ACTIVE"" = true
+                            WHERE ns.""IS_ACTIVE"" = true AND ns.""CONFIG_ID"" = @cfgId
                             ORDER BY ns.""OBJECT_TYPE"", ns.""SORT_ORDER""";
 
                 case "ORACLE":
                     return @"SELECT ns.ID, ns.OBJECT_TYPE, ns.PREFIX, ns.SUFFIX, ns.LENGTH_OPERATOR, ns.LENGTH_VALUE,
                             ns.REGEXP_PATTERN, ns.ERROR_MESSAGE, ns.AUTO_APPLY, ns.IS_ACTIVE, ns.SORT_ORDER,
-                            ns.MODEL_ID, ns.DEPENDS_ON_UDP_ID, ns.DEPENDS_ON_UDP_VALUE,
+                            ns.CONFIG_ID, ns.DEPENDS_ON_UDP_ID, ns.DEPENDS_ON_UDP_VALUE,
                             udp.NAME AS UDP_NAME
                             FROM MC_NAMING_STANDARD ns
                             LEFT JOIN MC_UDP_DEFINITION udp ON ns.DEPENDS_ON_UDP_ID = udp.ID
-                            WHERE ns.IS_ACTIVE = 1
+                            WHERE ns.IS_ACTIVE = 1 AND ns.CONFIG_ID = :cfgId
                             ORDER BY ns.OBJECT_TYPE, ns.SORT_ORDER";
 
                 case "MSSQL":
                 default:
                     return @"SELECT ns.[ID], ns.[OBJECT_TYPE], ns.[PREFIX], ns.[SUFFIX], ns.[LENGTH_OPERATOR], ns.[LENGTH_VALUE],
                             ns.[REGEXP_PATTERN], ns.[ERROR_MESSAGE], ns.[AUTO_APPLY], ns.[IS_ACTIVE], ns.[SORT_ORDER],
-                            ns.[MODEL_ID], ns.[DEPENDS_ON_UDP_ID], ns.[DEPENDS_ON_UDP_VALUE],
+                            ns.[CONFIG_ID], ns.[DEPENDS_ON_UDP_ID], ns.[DEPENDS_ON_UDP_VALUE],
                             udp.[NAME] AS [UDP_NAME]
                             FROM [dbo].[MC_NAMING_STANDARD] ns
                             LEFT JOIN [dbo].[MC_UDP_DEFINITION] udp ON ns.[DEPENDS_ON_UDP_ID] = udp.[ID]
-                            WHERE ns.[IS_ACTIVE] = 1
+                            WHERE ns.[IS_ACTIVE] = 1 AND ns.[CONFIG_ID] = @cfgId
                             ORDER BY ns.[OBJECT_TYPE], ns.[SORT_ORDER]";
             }
         }

@@ -301,66 +301,12 @@ namespace EliteSoft.Erwin.AddIn.Services
             Regex.Replace(locator, @"PSW=[^;]*", "PSW=***", RegexOptions.IgnoreCase);
 
         /// <summary>
-        /// Read the active PU's <c>Locator</c> property bag value with two
-        /// fallbacks: the no-arg <c>PropertyBag()</c> overload (matches the
-        /// existing add-in's pattern) and the <c>PropertyBag(null, true)</c>
-        /// overload (returns the bag with derived strings). Logs the failures
-        /// instead of swallowing them silently.
+        /// Reads the active PU's locator through the shared
+        /// <see cref="PuLocatorReader"/> fallback chain (direct property,
+        /// two PropertyBag overloads, then the main-window title).
         /// </summary>
-        private string ReadActiveLocator()
-        {
-            string value = "";
-            try
-            {
-                value = (string)(_activePU.PropertyBag().Value("Locator") ?? string.Empty);
-            }
-            catch (Exception ex)
-            {
-                _log($"VersionCompare: PropertyBag().Value(Locator) threw: {ex.GetType().Name}: {ex.Message}");
-            }
-            if (!string.IsNullOrEmpty(value)) return value;
-
-            try
-            {
-                value = (string)(_activePU.PropertyBag(null, true).Value("Locator") ?? string.Empty);
-            }
-            catch (Exception ex)
-            {
-                _log($"VersionCompare: PropertyBag(null,true).Value(Locator) threw: {ex.GetType().Name}: {ex.Message}");
-            }
-            if (!string.IsNullOrEmpty(value)) return value;
-
-            // Last-resort: read erwin's main window title. The existing
-            // ModelConfigForm parser already mines the version from this
-            // string ("erwin DM - [Mart://.../<model> : vN : ...]"), so we
-            // mirror that approach for the full Mart locator stem.
-            value = ReadLocatorFromWindowTitle();
-            if (!string.IsNullOrEmpty(value))
-                _log($"VersionCompare: locator recovered from window title");
-            return value ?? string.Empty;
-        }
-
-        private static string ReadLocatorFromWindowTitle()
-        {
-            try
-            {
-                var hWnd = Win32Helper.GetErwinMainWindow();
-                if (hWnd == IntPtr.Zero) return string.Empty;
-                var sb = new System.Text.StringBuilder(1024);
-                Win32Helper.GetWindowTextPublic(hWnd, sb, sb.Capacity);
-                var title = sb.ToString();
-                // Patterns observed:
-                //   "erwin DM - [Mart://Mart/<lib>/<model> : vN : <diagram> [* ]]"
-                // Extract the bracketed locator stem; we still need a version
-                // suffix on the consumer end via ParseVersionFromLocator.
-                var m = Regex.Match(title, @"\[(?<base>(?:[Mm]art://)[^\s\]]+)(?:\s*:\s*v(?<v>\d+))?", RegexOptions.IgnoreCase);
-                if (!m.Success) return string.Empty;
-                var basePart = m.Groups["base"].Value;
-                var ver = m.Groups["v"].Value;
-                return string.IsNullOrEmpty(ver) ? basePart : $"{basePart}?VNO={ver}";
-            }
-            catch { return string.Empty; }
-        }
+        private string ReadActiveLocator() =>
+            PuLocatorReader.Read(_activePU, _log);
 
         /// <summary>
         /// Tolerant detection of a Mart-hosted locator. Accepts

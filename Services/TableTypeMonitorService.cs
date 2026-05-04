@@ -576,6 +576,46 @@ namespace EliteSoft.Erwin.AddIn.Services
                     return;
                 }
 
+                // Guard: entity may already have a shape on the target diagram (erwin can
+                // auto-add shapes when modelObjects.Add('Entity') is called from CreateTableCopy
+                // etc.). Adding a second one stacks two shapes on the same entity, both wired
+                // to the same Model_Object_Ref. We then write Anchor_Point with a malformed
+                // single-int string ("200" instead of int[] {x,y}), which leaves the duplicate
+                // at an undefined position. Suspected cause of the intermittent black-bar
+                // rendering artifacts on entity headers reported 2026-04-30. Cheap, safe to skip.
+                int existingShapeCount = 0;
+                bool alreadyOnDiagram = false;
+                try
+                {
+                    dynamic preExistingShapes = modelObjects.Collect(targetDiagram, "ER_Model_Shape");
+                    if (preExistingShapes != null)
+                    {
+                        foreach (dynamic shape in preExistingShapes)
+                        {
+                            if (shape == null) continue;
+                            existingShapeCount++;
+                            try
+                            {
+                                string refId = shape.Properties("Model_Object_Ref").Value?.ToString() ?? "";
+                                if (string.Equals(refId, entityId, StringComparison.Ordinal))
+                                {
+                                    alreadyOnDiagram = true;
+                                }
+                            }
+                            catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"Shape ref read error: {ex.Message}"); }
+                        }
+                    }
+                }
+                catch (Exception ex) { Log($"AddEntityToDiagram: pre-scan error: {ex.Message}"); }
+
+                if (alreadyOnDiagram)
+                {
+                    Log($"AddEntityToDiagram: '{entityName}' already has a shape on '{targetDiagramName}' (skipped, {existingShapeCount} existing shapes total)");
+                    return;
+                }
+
+                Log($"AddEntityToDiagram: '{entityName}' will be added to '{targetDiagramName}' (currently {existingShapeCount} shape(s) on diagram)");
+
                 // Check if target diagram belongs to a Subject_Area (non-default SA needs membership)
                 dynamic targetParent = root;
                 try
@@ -662,10 +702,16 @@ namespace EliteSoft.Erwin.AddIn.Services
                     }
                     catch { }
 
-                    try { newShape.Properties("Anchor_Point").Value = anchorStr; } catch { }
+                    // NOTE: anchorStr is currently a single int as string (e.g. "200"), not the
+                    // int[]{x,y} or "x,y" format erwin's Anchor_Point typically expects. Logged
+                    // verbatim so we can inspect what we're actually writing if rendering glitches
+                    // recur. Suspected contributor to the intermittent black-bar artifact.
+                    string anchorWriteResult = "ok";
+                    try { newShape.Properties("Anchor_Point").Value = anchorStr; }
+                    catch (Exception ex) { anchorWriteResult = $"err: {ex.Message}"; }
 
                     _session.CommitTransaction(transId);
-                    Log($"AddEntityToDiagram: '{entityName}' added to '{targetDiagramName}'");
+                    Log($"AddEntityToDiagram: '{entityName}' added to '{targetDiagramName}' (Anchor_Point='{anchorStr}', write={anchorWriteResult}, total shapes now={existingShapeCount + 1})");
                 }
                 catch (Exception ex)
                 {

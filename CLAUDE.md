@@ -66,6 +66,25 @@
 - Consider user experience and ease of use in every change
 - For complex UI changes, sketch out the design first and get feedback before implementation
 
+- **Statik analiz:** `<TreatWarningsAsErrors>true</TreatWarningsAsErrors>` + `<AnalysisLevel>latest</AnalysisLevel>` + `<EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>`
+- **Nullable:** `<Nullable>enable</Nullable>` her projede
+- **Format:** `.editorconfig` + `dotnet format` pre-commit hook
+- **Commit'ler:** Conventional Commits (feat:, fix:, docs:, refactor:, test:, chore:)
+- **Dökümantasyon:** her public metot XML doc comment; `README.md` başlangıç kılavuzu; `docs/ARCHITECTURE.md` Mermaid diyagramıyla
+- **Yorumlar:** "ne" değil "neden"; erwin COM idiosyncrasies için bol yorum (garip davranışlar, workaround'lar, dokümante edilmemiş davranışlar)
+- **Hiç `#pragma warning disable` yok** - warning varsa düzelt, bastırma
+- **Hiç `TODO` / `FIXME` kod içinde yok** - varsa GitHub issue aç, link commit mesajına koy
+
+## 11. Senin Çalışma Tarzın
+
+- **Önce sor:** belirsiz noktada bana sor, tahminle ilerleme
+- **Aşama sırasını koru:** Faz X bitmeden Faz X+1'e geçme, onayımı bekle
+- **Küçük commit'ler:** her mantıksal adım ayrı commit
+- **Assumption'ları loga yaz:** "X'in Y şekilde çalıştığını varsayıyorum çünkü dokümanda..." - erken hata yakalamam için
+- **Bilmediğin zaman de ki bilmiyorum:** araştırma gerekiyorsa yap, ama sonucu halüsinasyona uğratma; kaynak URL'i paylaş
+- **Dil:** dokümanlar + commit mesajları + XML doc comment'ler İngilizce (açık kaynak standardı), benimle sohbet Türkçe, kod içi yorumlar ihtiyaca göre (kritik "neden"ler Türkçe OK)
+- **Hata yutma yasağına uy:** bir exception'ı görmezden geldiğini yakalarsam Faz baştan başlar
+
 
 Hiçbir yerde emdash kullanma! Scriptlerde ve dökümantasyonda!
 
@@ -73,3 +92,5 @@ Her zaman benim söylediğim doğru olmayabilir, yanlış analiz etmiş olabilir
 Söylediklerimi sorgula, ayrıca senin de çözüm için bulduğun  mantıklarını  da sorgula. Bunları unutma!
 
 Çalışan kodu, tam kanıtlanana kadar temizleme, ilgili yere implemente edince gerekirse sorarak temizle!
+
+Yazılımı oluşturuken profesyönel ve deneyimli bir yazılımcı olarak düşün. eklediğin kodların etkilerini göz ardı etme.

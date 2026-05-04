@@ -80,6 +80,41 @@ namespace EliteSoft.Erwin.AddIn.Services
         private const uint LVM_GETSUBITEMRECT = LVM_FIRST + 56;   // 0x1038
         private const uint LVM_SETITEMSTATE   = LVM_FIRST + 43;   // 0x102B
         private const uint LVM_GETITEMCOUNT   = LVM_FIRST + 4;    // 0x1004
+        private const uint LVM_GETITEMTEXTW   = LVM_FIRST + 115;  // 0x1073
+
+        /// <summary>
+        /// Read the text of a single listview cell (item/subitem) via
+        /// LVM_GETITEMTEXTW. Used to identify which row in the Resolve
+        /// Differences listview is the "Model" / "Tables" container so we
+        /// click on the right one (mart-mart had item=0 as the root, but
+        /// DB-mart compare typically has a deeper tree).
+        /// </summary>
+        private static string GetListViewItemText(IntPtr lv, int item, int subItem)
+        {
+            try
+            {
+                var lvi = new LVITEM
+                {
+                    iItem = item,
+                    iSubItem = subItem,
+                    cchTextMax = 256,
+                    pszText = Marshal.AllocHGlobal(512),
+                };
+                try
+                {
+                    SendMessageLVItem(lv, LVM_GETITEMTEXTW, new IntPtr(item), ref lvi);
+                    return Marshal.PtrToStringUni(lvi.pszText) ?? "";
+                }
+                finally
+                {
+                    if (lvi.pszText != IntPtr.Zero) Marshal.FreeHGlobal(lvi.pszText);
+                }
+            }
+            catch
+            {
+                return "";
+            }
+        }
         private const int LVIR_BOUNDS = 0;
         private const uint LVIF_STATE = 0x0008;
         private const uint LVIS_FOCUSED = 0x0001;
@@ -87,6 +122,20 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         [DllImport("user32.dll", EntryPoint = "SendMessageW")]
         private static extern IntPtr SendMessageLVItem(IntPtr hWnd, uint Msg, IntPtr wParam, ref LVITEM lParam);
+
+        // RD's toolbars are standard Win32 ToolbarWindow32 controls
+        // (verified by RAS-DUMP). Existing TB_BUTTONCOUNT/TB_GETBUTTON +
+        // TBBUTTON struct + SendMessageTbButton are defined further below in
+        // this file. Add only the TB_GETITEMRECT message and a couple of
+        // overload helpers here so we can resolve the button rect without
+        // colliding with the existing definitions.
+        private const uint TB_GETITEMRECT = 0x41D;
+
+        [DllImport("user32.dll", EntryPoint = "SendMessageW")]
+        private static extern IntPtr SendMessageInt(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll", EntryPoint = "SendMessageW")]
+        private static extern IntPtr SendMessageRectOut(IntPtr hWnd, uint Msg, IntPtr wParam, ref RECT lParam);
 
         [DllImport("user32.dll")]
         private static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, bool bRepaint);
@@ -101,6 +150,12 @@ namespace EliteSoft.Erwin.AddIn.Services
         [DllImport("user32.dll")]
         private static extern void mouse_event(uint dwFlags, int dx, int dy, uint dwData, IntPtr dwExtraInfo);
 
+        [DllImport("user32.dll")]
+        private static extern IntPtr WindowFromPoint(POINT pt);
+
+        [DllImport("user32.dll")]
+        private static extern bool BringWindowToTop(IntPtr hWnd);
+
         [StructLayout(LayoutKind.Sequential)]
         private struct POINT { public int X; public int Y; }
 
@@ -114,6 +169,10 @@ namespace EliteSoft.Erwin.AddIn.Services
         private static extern int GetSystemMetrics(int nIndex);
         private const int SM_CXSCREEN = 0;
         private const int SM_CYSCREEN = 1;
+        private const int SM_XVIRTUALSCREEN = 76;
+        private const int SM_YVIRTUALSCREEN = 77;
+        private const int SM_CXVIRTUALSCREEN = 78;
+        private const int SM_CYVIRTUALSCREEN = 79;
 
         // SendInput (modern API, more reliable under RDP/UIPI than mouse_event).
         // MOUSEINPUT on x64: dx(4)+dy(4)+mouseData(4)+dwFlags(4)+time(4)+4pad
@@ -143,43 +202,59 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         /// <summary>
         /// Atomic MOVE+DOWN+UP sequence via single SendInput call using
-        /// absolute coordinates (MOUSEEVENTF_ABSOLUTE). The OS delivers the
-        /// sequence atomically - no external process (including RDP cursor
-        /// sync) can interrupt between steps. Coordinates are normalised
-        /// to 0..65535 as required by MOUSEEVENTF_ABSOLUTE.
+        /// absolute coordinates over the VIRTUAL DESKTOP. The OS delivers
+        /// the sequence atomically - no external process (including RDP
+        /// cursor sync) can interrupt between steps.
+        ///
+        /// MOUSEEVENTF_VIRTUALDESK flag (NOT plain MOUSEEVENTF_ABSOLUTE)
+        /// is critical for multi-monitor setups: without it, coordinates
+        /// are normalized only against the PRIMARY monitor's 0..65535 range,
+        /// so a click target on a secondary monitor (screenX > primary
+        /// width) gets clamped to primary's right edge - the click misses.
+        /// VIRTUALDESK normalizes against the entire virtual desktop
+        /// rectangle reported by SM_X/Y/CX/CYVIRTUALSCREEN, which spans
+        /// all monitors in their actual layout.
         /// </summary>
         private static void SendMouseClickAt(int screenX, int screenY)
         {
-            int cx = GetSystemMetrics(SM_CXSCREEN);
-            int cy = GetSystemMetrics(SM_CYSCREEN);
-            if (cx <= 0) cx = 1920;
-            if (cy <= 0) cy = 1080;
-            int absX = (int)((screenX * 65535L + cx / 2) / cx);
-            int absY = (int)((screenY * 65535L + cy / 2) / cy);
+            SendMouseClickAt(screenX, screenY, log: null);
+        }
 
-            var inputs = new INPUT[3];
-            inputs[0].type = 0;
-            inputs[0].mi.dx = absX;
-            inputs[0].mi.dy = absY;
-            inputs[0].mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
-            inputs[1].type = 0;
-            inputs[1].mi.dx = absX;
-            inputs[1].mi.dy = absY;
-            inputs[1].mi.dwFlags = MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_ABSOLUTE;
-            inputs[2].type = 0;
-            inputs[2].mi.dx = absX;
-            inputs[2].mi.dy = absY;
-            inputs[2].mi.dwFlags = MOUSEEVENTF_LEFTUP | MOUSEEVENTF_ABSOLUTE;
+        private static void SendMouseClickAt(int screenX, int screenY, Action<string> log)
+        {
+            // RAW path (proven multi-monitor): SetCursorPos accepts raw
+            // screen coords (handles negative + secondary monitors
+            // natively). mouse_event then fires DOWN/UP at current cursor
+            // position. No 0..65535 normalization, no monitor-bound
+            // calculations. Trade-off: cursor visibly jumps - acceptable
+            // since ShowCursor(false) is in effect during the click.
+            POINT savedCursor;
+            bool savedOk = GetCursorPos(out savedCursor);
+            log?.Invoke($"    [click] target screen=({screenX},{screenY}) raw mouse_event path");
 
-            uint sent = SendInput(3, inputs, Marshal.SizeOf<INPUT>());
-            if (sent != 3)
+            try
             {
-                // Legacy fallback.
                 SetCursorPos(screenX, screenY);
                 Thread.Sleep(30);
+                // Verify cursor actually landed where we asked. Multi-
+                // monitor with weird DPI scaling can clip.
+                if (GetCursorPos(out POINT actual))
+                {
+                    int dx = Math.Abs(actual.X - screenX);
+                    int dy = Math.Abs(actual.Y - screenY);
+                    if (dx > 5 || dy > 5)
+                        log?.Invoke($"    [click] WARN cursor landed at ({actual.X},{actual.Y}) - delta=({dx},{dy})");
+                }
                 mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, IntPtr.Zero);
                 Thread.Sleep(40);
                 mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, IntPtr.Zero);
+            }
+            finally
+            {
+                if (savedOk)
+                {
+                    try { SetCursorPos(savedCursor.X, savedCursor.Y); } catch { }
+                }
             }
         }
 
@@ -195,6 +270,8 @@ namespace EliteSoft.Erwin.AddIn.Services
         private const int CMD_RD_ALTER_SCRIPT = 1056;    // Resolve Differences toolbar: Alter Script
         private const int IDCANCEL = 2;
         private const int IDOK     = 1;
+        private const int IDYES    = 6;
+        private const int IDNO     = 7;
 
         private static IntPtr MakeWParam(int low, int high) =>
             new IntPtr(((high & 0xFFFF) << 16) | (low & 0xFFFF));
@@ -436,6 +513,656 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// From-DB variant of <see cref="DriveCCAndApplyAsync"/>: caller has
+        /// already silent-RE'd a fresh PU (named <paramref name="reModelName"/>)
+        /// into the session, and the dirty mart MDI child has been
+        /// re-activated. Mirrors DriveCCAndApply exactly EXCEPT for Step 3-4:
+        /// instead of "From Mart" radio + Mart picker, we pick the RE'd PU
+        /// from the "Open Models in Memory" DataGrid (id=1083) on the Right
+        /// Model page. Everything from Step 5 onward (Compare, RD wait,
+        /// listview poll, Apply-to-Right click, RD hide, EDR settle) is
+        /// identical to the Mart-Mart pipeline.
+        /// </summary>
+        public static async Task<CCSession> DriveCCDbAndApplyAsync(string reModelName,
+            Action<string> log, Action<bool> overlayToggle = null, bool dbgPauseBeforeApply = false)
+        {
+            return await Task.Run(() => DriveCCDbAndApply(reModelName, log, overlayToggle, dbgPauseBeforeApply));
+        }
+
+        // ---------------------------------------------------------------------
+        // Architecture 2: drive Forward Engineer Alter Script wizard directly.
+        //
+        // Rationale: the CC-wizard pipeline requires synthesizing a mouse click
+        // on the Resolve Differences listview's transfer arrow. XTP filters
+        // synthetic input intermittently (verified 2026-04-26/27 multi-monitor
+        // failures). The Apply-to-Right click is the ONLY mouse simulation in
+        // the entire pipeline; everything else is WM_COMMAND posts.
+        //
+        // The Forward Engineer Alter Script wizard, opened via menu/ribbon
+        // command 1161 / 61631 on the XTPMainFrame, calls ELA::OnFE +
+        // FEProcessor::GenerateAlterScript natively as part of its Next /
+        // Generate flow - the bridge's existing GenerateAlterScript hook fires
+        // automatically when erwin invokes the wizard. No mouse clicks
+        // anywhere in the pipeline.
+        //
+        // Smoke test (Phase 0): open wizard, Next-loop until DDL is captured
+        // by the bridge or until Next-button stalls, then IDCANCEL the wizard.
+        // No baseline selection - whatever the wizard's first-page default is
+        // becomes the baseline (typically "compare to last saved version" for
+        // a Mart-opened model).
+        // ---------------------------------------------------------------------
+
+        private const int CMD_FE_ALTER_SCRIPT_RIBBON = 61631;
+        private const int CMD_FE_ALTER_SCRIPT_MENU   = 1161;
+        private const int CMD_FE_WIZARD_NEXT         = 1766;
+        private const int CMD_FE_WIZARD_BACK         = 1767;
+        private const int CMD_FE_WIZARD_GENERATE     = 1760;
+
+        public static async Task<string> DriveFEAlterScriptWizardAsync(Action<string> log)
+        {
+            return await Task.Run(() => DriveFEAlterScriptWizard(log));
+        }
+
+        private static string DriveFEAlterScriptWizard(Action<string> log)
+        {
+            // Clear any stale DDL so we only see this run's output.
+            try { NativeBridgeService.ClearCapturedDdl(); } catch { }
+
+            IntPtr mainHwnd = FindErwinMain();
+            if (mainHwnd == IntPtr.Zero)
+            {
+                log?.Invoke("  [FE] erwin main window not found");
+                return null;
+            }
+
+            // Open the wizard. Try the menu flyout id first, fall back to
+            // the ribbon id (different erwin builds use one or the other).
+            var dialogsBefore = EnumerateVisibleDialogs();
+            log?.Invoke($"  [FE] posting WM_COMMAND {CMD_FE_ALTER_SCRIPT_MENU} (FE Alter Script flyout) to main frame");
+            PostMessage(mainHwnd, WM_COMMAND, MakeWParam(CMD_FE_ALTER_SCRIPT_MENU, 0), IntPtr.Zero);
+            IntPtr wizard = WaitForNewDialog(dialogsBefore, "FE Alter Script wizard", 4000, log);
+            if (wizard == IntPtr.Zero)
+            {
+                log?.Invoke($"  [FE] flyout did not open wizard - retrying with ribbon id {CMD_FE_ALTER_SCRIPT_RIBBON}");
+                PostMessage(mainHwnd, WM_COMMAND, MakeWParam(CMD_FE_ALTER_SCRIPT_RIBBON, 0), IntPtr.Zero);
+                wizard = WaitForNewDialog(dialogsBefore, "FE Alter Script wizard", 4000, log);
+            }
+            if (wizard == IntPtr.Zero)
+            {
+                log?.Invoke("  [FE] FE Alter Script wizard did NOT open (neither cmd 1161 nor 61631 worked)");
+                return null;
+            }
+
+            log?.Invoke($"  [FE] wizard hwnd=0x{wizard.ToInt64():X} title='{GetTitle(wizard)}'");
+
+            // DISCOVERY MODE: keep wizard VISIBLE so the user can correlate
+            // log output with on-screen page transitions. We're trying to
+            // map the wizard's "Compare-to" path for cross-version + From-DB
+            // baselines (no selection → wizard offers source picker rather
+            // than self-compare). Speed not critical here.
+            // HideWindow(wizard);  // commented for discovery; re-enable for production
+
+            // Snapshot of dialogs that existed before we opened the wizard
+            // (so on each Next we can spot NEW child modals like the
+            // "Use current diagram selections?" Yes/No popup, the SQL Server
+            // Connection picker, or a Mart version picker).
+            //
+            // CRITICAL: knownDialogs is a "skip list" only - it's used to
+            // distinguish "newly appeared during this run" from "was there
+            // before". Cleanup must NEVER touch entries from this initial
+            // set because it includes erwin's XTPMainFrame and dock panes.
+            // Posting IDCANCEL to the main frame closes the user's active
+            // model and locks erwin (verified 2026-04-27 01:37 lock-up).
+            // Only dialogs added to wizardChildDialogs during the page-walk
+            // are cleanup targets.
+            var knownDialogs = new HashSet<IntPtr>(EnumerateVisibleDialogs());
+            knownDialogs.Add(wizard);
+            var wizardChildDialogs = new List<IntPtr>();
+
+            try
+            {
+                // Initial wizard page dump - we want to see what the very
+                // first page offers (might have a "Compare to: Mart / DB /
+                // File / Existing" source-selector that we missed before).
+                Thread.Sleep(500);
+                DumpUiaTree(wizard, "FE wizard initial page", log, maxDepth: 5);
+
+                for (int page = 1; page <= 8; page++)
+                {
+                    // 1500ms during discovery to let any child sub-dialog
+                    // (SQL Connection, Mart version picker, etc.) appear and
+                    // be enumerable.
+                    Thread.Sleep(1500);
+
+                    // Capture-poll BEFORE clicking Next, so if the prior
+                    // Next already triggered a Compare we exit gracefully.
+                    string captured = NativeBridgeService.ConsumeLastCapturedDdl();
+                    if (!string.IsNullOrEmpty(captured))
+                    {
+                        log?.Invoke($"  [FE] DDL captured by bridge ({captured.Length} chars) at page {page}");
+                        return captured;
+                    }
+
+                    // Detect any new child dialog that wasn't there before
+                    // and auto-handle the diagram-selections popup. Other
+                    // child dialogs are logged + UIA-dumped so we can map
+                    // them in subsequent runs (e.g. SQL Server Connection
+                    // for the From-DB baseline path). Per-dialog handlers
+                    // get added as we discover the structure.
+                    var nowDialogs = EnumerateVisibleDialogs();
+                    foreach (var d in nowDialogs)
+                    {
+                        if (knownDialogs.Contains(d)) continue;
+                        knownDialogs.Add(d);
+                        string dt = GetTitle(d);
+                        // Filter to true dialogs only - main frame /
+                        // MDI children share the visible-window space.
+                        var clsBuf = new StringBuilder(64);
+                        GetClassName(d, clsBuf, clsBuf.Capacity);
+                        string cls = clsBuf.ToString();
+                        if (cls != "#32770")
+                        {
+                            log?.Invoke($"  [FE] (skip) new visible non-dialog hwnd=0x{d.ToInt64():X} cls='{cls}' title='{dt}'");
+                            continue;
+                        }
+                        // Skip anything that LOOKS like erwin's main MDI
+                        // frame title even if it slipped through (e.g.
+                        // "erwin DM - [Mart://...]"). Belt-and-braces guard.
+                        if (dt.StartsWith("erwin DM", StringComparison.OrdinalIgnoreCase))
+                        {
+                            log?.Invoke($"  [FE] (skip) main-frame-looking hwnd=0x{d.ToInt64():X} title='{dt}'");
+                            continue;
+                        }
+
+                        wizardChildDialogs.Add(d);
+                        log?.Invoke($"  [FE] new child dialog: hwnd=0x{d.ToInt64():X} title='{dt}'");
+
+                        if (DialogTextContains(d, "current diagram selections"))
+                        {
+                            log?.Invoke("  [FE] auto-Yes 'Use current diagram selections?' (scope=selection)");
+                            PostMessage(d, WM_COMMAND, MakeWParam(IDYES, 0), IntPtr.Zero);
+                        }
+                        else if (DialogTextContains(d, "No schema to generate"))
+                        {
+                            // The wizard's "no diff" terminal popup. Auto-OK
+                            // so we can proceed to cleanup without manual
+                            // input.
+                            log?.Invoke("  [FE] auto-OK 'No schema to generate' popup");
+                            PostMessage(d, WM_COMMAND, MakeWParam(IDOK, 0), IntPtr.Zero);
+                        }
+                        else
+                        {
+                            // Unknown / not-yet-handled child dialog - dump
+                            // its UIA tree so we can write a handler next
+                            // iteration.
+                            DumpUiaTree(d, $"child dialog '{dt}'", log, maxDepth: 6);
+                        }
+                    }
+
+                    // Per-page wizard content dump - see if a "Compare to"
+                    // source-selector page exists with radios for File /
+                    // Mart Version / DB / In-Memory Model.
+                    DumpUiaTree(wizard, $"FE wizard page {page} content", log, maxDepth: 4);
+
+                    log?.Invoke($"  [FE] page {page}: posting WM_COMMAND {CMD_FE_WIZARD_NEXT} (Next)");
+                    PostMessage(wizard, WM_COMMAND, MakeWParam(CMD_FE_WIZARD_NEXT, 0), IntPtr.Zero);
+                }
+
+                // Last-resort: explicit Generate command for the rare case
+                // where the wizard ends in a "Generate" button rather than
+                // an auto-Preview page.
+                log?.Invoke($"  [FE] Next-loop done without capture - posting Generate ({CMD_FE_WIZARD_GENERATE})");
+                PostMessage(wizard, WM_COMMAND, MakeWParam(CMD_FE_WIZARD_GENERATE, 0), IntPtr.Zero);
+
+                // After Generate, the wizard may take several seconds to
+                // either produce DDL (if a baseline is already configured)
+                // OR pop a deferred source-picker child modal like
+                // "SQL Server Connection". The 2s wait we used previously
+                // was too short - the connection dialog appeared on screen
+                // AFTER our cleanup, so we never logged it.
+                //
+                // Poll for 8s, every 250ms, capturing any new child dialog
+                // that materialises (including the source-picker we want
+                // to map for From-DB).
+                int postGenDeadline = Environment.TickCount + 8000;
+                string late = null;
+                while (Environment.TickCount < postGenDeadline)
+                {
+                    Thread.Sleep(250);
+                    late = NativeBridgeService.ConsumeLastCapturedDdl();
+                    if (!string.IsNullOrEmpty(late))
+                    {
+                        log?.Invoke($"  [FE] DDL captured after Generate ({late.Length} chars)");
+                        return late;
+                    }
+
+                    // Detect any deferred child dialog (e.g. SQL Server
+                    // Connection picker, ODBC DSN selector). Dump UIA so
+                    // we can build a programmatic filler in the next pass.
+                    var deferredDialogs = EnumerateVisibleDialogs();
+                    foreach (var d in deferredDialogs)
+                    {
+                        if (knownDialogs.Contains(d)) continue;
+                        knownDialogs.Add(d);
+                        var clsBuf2 = new StringBuilder(64);
+                        GetClassName(d, clsBuf2, clsBuf2.Capacity);
+                        string cls2 = clsBuf2.ToString();
+                        if (cls2 != "#32770") continue;
+                        string dt2 = GetTitle(d);
+                        if (dt2.StartsWith("erwin DM", StringComparison.OrdinalIgnoreCase)) continue;
+
+                        wizardChildDialogs.Add(d);
+                        log?.Invoke($"  [FE] post-Generate child dialog: hwnd=0x{d.ToInt64():X} title='{dt2}'");
+                        DumpUiaTree(d, $"post-Generate dialog '{dt2}'", log, maxDepth: 6);
+
+                        // Auto-OK known popups so we can keep observing
+                        // what the wizard does next.
+                        if (DialogTextContains(d, "No schema to generate"))
+                        {
+                            log?.Invoke("  [FE] auto-OK 'No schema to generate'");
+                            PostMessage(d, WM_COMMAND, MakeWParam(IDOK, 0), IntPtr.Zero);
+                        }
+                    }
+                }
+                log?.Invoke("  [FE] no DDL captured after full page-walk + Generate (8s post-poll done)");
+                return null;
+            }
+            finally
+            {
+                // FE wizard is user-facing and well-behaved; standard
+                // IDCANCEL is safe (unlike CC + RD which we have to
+                // ForceDestroy after OnFE nukes engine state).
+                //
+                // Cleanup ONLY the child dialogs that we explicitly tagged
+                // as wizard sub-modals during the page-walk. We do NOT
+                // iterate knownDialogs (the pre-wizard snapshot) because
+                // that set includes erwin's XTPMainFrame, dock panes, and
+                // the active-model MDI child window - posting IDCANCEL
+                // to those closes the user's model and locks erwin.
+                foreach (var d in wizardChildDialogs)
+                {
+                    if (!IsWindow(d)) continue;
+                    string dt = GetTitle(d);
+                    log?.Invoke($"  [FE] cleanup: IDCANCEL child dialog 0x{d.ToInt64():X} '{dt}'");
+                    try { PostMessage(d, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero); } catch { }
+                }
+                Thread.Sleep(200);
+                log?.Invoke("  [FE] posting IDCANCEL to FE wizard");
+                try { PostMessage(wizard, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero); } catch { }
+                Thread.Sleep(300);
+                if (IsWindow(wizard))
+                {
+                    log?.Invoke("  [FE] wizard still alive after IDCANCEL - WM_CLOSE");
+                    try { PostMessage(wizard, 0x0010 /*WM_CLOSE*/, IntPtr.Zero, IntPtr.Zero); } catch { }
+                }
+            }
+        }
+
+        // Recursive UIA tree dump for discovery probes. Logs each visible
+        // control with its ControlType / Name / AutomationId / ClassName /
+        // IsEnabled. Used to map unknown wizards before writing automation
+        // code against them. maxDepth defaults to 3 because erwin dialogs
+        // sometimes have 200+ descendants and a deeper dump fills the log
+        // without adding signal.
+        private static void DumpUiaTree(IntPtr hwnd, string label, Action<string> log, int maxDepth = 3)
+        {
+            try
+            {
+                var root = AutomationElement.FromHandle(hwnd);
+                if (root == null)
+                {
+                    log?.Invoke($"  [UIA] {label}: AutomationElement.FromHandle returned null");
+                    return;
+                }
+                log?.Invoke($"  [UIA] === {label} ===");
+                int dumped = 0;
+                DumpUiaNode(root, log, 0, maxDepth, ref dumped, hardCap: 120);
+                log?.Invoke($"  [UIA] === end of {label} (dumped {dumped} node(s)) ===");
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"  [UIA] {label} threw: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        // Returns true when any UIA Text descendant under the given window
+        // contains the given substring (case-insensitive). Used to identify
+        // confirmation popups by their static-text content rather than just
+        // the window title (since erwin reuses the title "erwin Data Modeler"
+        // for many distinct prompts).
+        private static bool DialogTextContains(IntPtr hwnd, string substring)
+        {
+            if (hwnd == IntPtr.Zero || string.IsNullOrEmpty(substring)) return false;
+            try
+            {
+                var root = AutomationElement.FromHandle(hwnd);
+                if (root == null) return false;
+                var texts = root.FindAll(TreeScope.Descendants,
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Text));
+                foreach (AutomationElement t in texts)
+                {
+                    string n = null;
+                    try { n = t.Current.Name; } catch { }
+                    if (!string.IsNullOrEmpty(n) &&
+                        n.IndexOf(substring, StringComparison.OrdinalIgnoreCase) >= 0)
+                        return true;
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        private static void DumpUiaNode(AutomationElement el, Action<string> log,
+                                        int depth, int maxDepth,
+                                        ref int dumped, int hardCap)
+        {
+            if (depth > maxDepth) return;
+            if (dumped >= hardCap) return;
+            string indent = new string(' ', depth * 2 + 2);
+            string ctype = "?", name = "", aid = "", cls = "";
+            bool enabled = false;
+            try
+            {
+                var info = el.Current;
+                ctype = info.ControlType?.ProgrammaticName?.Replace("ControlType.", "") ?? "?";
+                name = info.Name ?? "";
+                aid = info.AutomationId ?? "";
+                cls = info.ClassName ?? "";
+                enabled = info.IsEnabled;
+            }
+            catch { }
+            // Truncate over-long names so the log stays readable.
+            if (name.Length > 80) name = name.Substring(0, 77) + "...";
+            log?.Invoke($"  [UIA]{indent}[{ctype}] name='{name}' aid='{aid}' cls='{cls}' en={enabled}");
+            dumped++;
+            try
+            {
+                foreach (AutomationElement child in el.FindAll(TreeScope.Children, Condition.TrueCondition))
+                {
+                    if (dumped >= hardCap) return;
+                    DumpUiaNode(child, log, depth + 1, maxDepth, ref dumped, hardCap);
+                }
+            }
+            catch { }
+        }
+
+        private static CCSession DriveCCDbAndApply(string reModelName, Action<string> log, Action<bool> overlayToggle, bool dbgPauseBeforeApply = false)
+        {
+            var session = new CCSession();
+            // Auto-dismiss GDM-1001 popups in the background for the entire
+            // pipeline. Empirically, after silent RE the CC engine validates
+            // referenced objects and pops blocking popups that prevent the
+            // CC wizard window from being created (we observed 15s waits
+            // with 0 window CREATE events). The dismisser keeps clicking
+            // OK so erwin's UI thread stays unblocked.
+            var gdmCts = new System.Threading.CancellationTokenSource();
+            var gdmDismisser = DismissGdmPopupsContinuous(gdmCts.Token, log);
+            try
+            {
+                IntPtr erwinMain = FindErwinMain();
+                if (erwinMain == IntPtr.Zero)
+                {
+                    log?.Invoke("  erwin main window not found.");
+                    return null;
+                }
+
+                var dialogsBefore = EnumerateVisibleDialogs();
+
+                // Step 1: open CC wizard. Auto-install monitor hook for
+                // diagnostic visibility.
+                log?.Invoke("  [DB-1] posting CMD_COMPLETE_COMPARE (1082) to main frame");
+                NativeBridgeService.MonitorHookInstall(log);
+                PostMessage(erwinMain, WM_COMMAND, MakeWParam(CMD_COMPLETE_COMPARE, 0), IntPtr.Zero);
+                // Longer timeout: post-RE state + GDM popup cascade can
+                // take 5-10s before the wizard window finally appears.
+                IntPtr ccWizard = WaitForNewDialog(dialogsBefore, "CC wizard", 20000, log);
+                if (ccWizard == IntPtr.Zero)
+                {
+                    NativeBridgeService.MonitorHookUninstall(log);
+                    log?.Invoke("  [DB-1] CC wizard never appeared. Check [MONITOR] CREATE entries in bridge log.");
+                    return null;
+                }
+                HideWindow(ccWizard);
+                session.CCWizard = ccWizard;
+                log?.Invoke($"  [DB-1] CC wizard = 0x{ccWizard.ToInt64():X}");
+                NativeBridgeService.MonitorHookUninstall(log);
+
+                // Step 2: Back to Overview, then Next x2 to reach Right Model page
+                for (int i = 0; i < 12; i++)
+                {
+                    string t = GetTitle(ccWizard);
+                    if (t.StartsWith("Wizard Overview", StringComparison.OrdinalIgnoreCase)
+                        || t.StartsWith("Overview", StringComparison.OrdinalIgnoreCase)) break;
+                    PostMessage(ccWizard, WM_COMMAND, MakeWParam(CC_BACK, 0), IntPtr.Zero);
+                    Thread.Sleep(80);
+                }
+                PostMessage(ccWizard, WM_COMMAND, MakeWParam(CC_NEXT, 0), IntPtr.Zero); Thread.Sleep(150);
+                PostMessage(ccWizard, WM_COMMAND, MakeWParam(CC_NEXT, 0), IntPtr.Zero); Thread.Sleep(300);
+                log?.Invoke($"  [DB-2] at Right Model page, title='{GetTitle(ccWizard)}'");
+
+                // Step 3: select RE'd model from "Open Models in Memory"
+                // DataGrid (id=1083). UIA-based: find DataItem by Name match.
+                var ccRoot = AutomationElement.FromHandle(ccWizard);
+                if (ccRoot == null)
+                {
+                    log?.Invoke("  [DB-3] UIA FromHandle returned null on CC wizard");
+                    return session;
+                }
+                var listCond = new AndCondition(
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.DataGrid),
+                    new PropertyCondition(AutomationElement.AutomationIdProperty, "1083"));
+                var openModelsList = ccRoot.FindFirst(TreeScope.Descendants, listCond);
+                if (openModelsList == null)
+                {
+                    log?.Invoke("  [DB-3] 'Open Models in Memory' DataGrid (id=1083) not found");
+                    return session;
+                }
+                var itemCond = new AndCondition(
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.DataItem),
+                    new PropertyCondition(AutomationElement.NameProperty, reModelName));
+                var item = openModelsList.FindFirst(TreeScope.Descendants, itemCond);
+                if (item == null)
+                {
+                    log?.Invoke($"  [DB-3] DataItem name='{reModelName}' not found in Open Models list");
+                    return session;
+                }
+                if (item.TryGetCurrentPattern(SelectionItemPattern.Pattern, out object sip))
+                {
+                    try { ((SelectionItemPattern)sip).Select(); }
+                    catch (Exception ex) { log?.Invoke($"  [DB-3] Select err: {ex.Message}"); }
+                    log?.Invoke($"  [DB-3] selected '{reModelName}' in Open Models list");
+                }
+                else
+                {
+                    log?.Invoke($"  [DB-3] DataItem '{reModelName}' has no SelectionItemPattern");
+                    return session;
+                }
+                Thread.Sleep(150);
+
+                // Step 5 (no step 4 - we don't load from external source): Compare
+                log?.Invoke($"  [DB-5] posting WM_COMMAND {CC_COMPARE} (Compare)");
+                PostMessage(ccWizard, WM_COMMAND, MakeWParam(CC_COMPARE, 0), IntPtr.Zero);
+
+                // "Compare to itself" popup safety check (same as Mart pipeline)
+                Thread.Sleep(800);
+                IntPtr popup = WaitForDialog("erwin Data Modeler", 1500);
+                if (popup != IntPtr.Zero)
+                {
+                    log?.Invoke($"  [DB-5] popup: '{GetTitle(popup)}' - dismissing with No");
+                    try
+                    {
+                        var pop = AutomationElement.FromHandle(popup);
+                        if (pop != null) ClickButtonByName(pop, new[] { "No", "Hayır", "Cancel", "İptal" });
+                    }
+                    catch { }
+                    return null;
+                }
+
+                // Step 6: wait for Resolve Differences (longer timeout for DB
+                // compare - the RE-vs-mart compare can take more than 10s if
+                // the model has many entities).
+                IntPtr resolveDlg = WaitForDialog("Resolve Differences", 30000);
+                if (resolveDlg == IntPtr.Zero)
+                {
+                    log?.Invoke("  [DB-6] Resolve Differences did not appear within 30s");
+                    return session;
+                }
+                log?.Invoke($"  [DB-6] Resolve Differences = 0x{resolveDlg.ToInt64():X}");
+                session.ResolveDifferences = resolveDlg;
+
+                // From here: identical to Mart-Mart pipeline (form transparent,
+                // listview ready poll with items>0 guard, mouse click on
+                // subItem=6 arrow, RD hide, EDR settle).
+                try { overlayToggle?.Invoke(false); } catch { }
+
+                IntPtr lv = IntPtr.Zero;
+                int polled = 0;
+                const int pollStep = 5;
+                const int pollMaxMs = 800;
+                while (polled < pollMaxMs)
+                {
+                    lv = FindListViewById(resolveDlg, 200, log: null);
+                    if (lv != IntPtr.Zero)
+                    {
+                        IntPtr cnt = SendMessage(lv, LVM_GETITEMCOUNT, IntPtr.Zero, IntPtr.Zero);
+                        if (cnt.ToInt32() > 0)
+                        {
+                            RECT testRc = new RECT { left = LVIR_BOUNDS, top = 6, right = 0, bottom = 0 };
+                            SendMessage(lv, LVM_GETSUBITEMRECT, new IntPtr(0), ref testRc);
+                            if (testRc.right > testRc.left && testRc.bottom > testRc.top)
+                            {
+                                log?.Invoke($"  [DB-7] listview ready after {polled}ms (items={cnt.ToInt32()}, arrow rect ok)");
+                                break;
+                            }
+                        }
+                    }
+                    Thread.Sleep(pollStep);
+                    polled += pollStep;
+                }
+                if (lv == IntPtr.Zero)
+                {
+                    log?.Invoke($"  [DB-7] listview id=200 not found within {pollMaxMs}ms");
+                    try { overlayToggle?.Invoke(true); } catch { }
+                    return session;
+                }
+
+                // Diagnostic: dump first 8 items so we can identify which
+                // row is the "Model" / "Tables" container with the apply-
+                // to-right arrow that actually cascades changes. Mart-Mart
+                // pipeline used item=0 because there's only one root
+                // (Model). DB-mart compare with hundreds of differences
+                // probably has a deeper tree (Database -> Schema ->
+                // Tables -> Columns) where item=0 is no-op.
+                int totalItems = SendMessage(lv, LVM_GETITEMCOUNT, IntPtr.Zero, IntPtr.Zero).ToInt32();
+                int dumpCount = Math.Min(totalItems, 8);
+                log?.Invoke($"  [DB-7] [LV-DUMP] first {dumpCount} of {totalItems} item(s):");
+                for (int i = 0; i < dumpCount; i++)
+                {
+                    string itemText = GetListViewItemText(lv, i, 0);
+                    string col4Text = GetListViewItemText(lv, i, 4);   // left model name col
+                    string col7Text = GetListViewItemText(lv, i, 7);   // right model name col
+                    RECT rowRc = new RECT { left = LVIR_BOUNDS, top = 6, right = 0, bottom = 0 };
+                    SendMessage(lv, LVM_GETSUBITEMRECT, new IntPtr(i), ref rowRc);
+                    log?.Invoke($"    item[{i}] col0='{itemText}' col4='{col4Text}' col7='{col7Text}' arrow=({rowRc.left},{rowRc.top})-({rowRc.right},{rowRc.bottom})");
+                }
+
+                RECT rc = new RECT { left = LVIR_BOUNDS, top = 6, right = 0, bottom = 0 };
+                SendMessage(lv, LVM_GETSUBITEMRECT, new IntPtr(0), ref rc);
+                POINT pt = new POINT { X = (rc.left + rc.right) / 2, Y = (rc.top + rc.bottom) / 2 };
+                if (!ClientToScreen(lv, ref pt))
+                {
+                    log?.Invoke("  [DB-7] ClientToScreen failed");
+                    try { overlayToggle?.Invoke(true); } catch { }
+                    return session;
+                }
+                log?.Invoke($"  [DB-7] click target (screen) = ({pt.X},{pt.Y})");
+
+                int txBefore = NativeBridgeService.GetEdrTxCount();
+                if (!GetCursorPos(out POINT saved))
+                {
+                    log?.Invoke("  [DB-7] GetCursorPos failed");
+                    try { overlayToggle?.Invoke(true); } catch { }
+                    return session;
+                }
+
+                // GECICI DEBUG: kullanici manuel inceleme istedi (2026-04-27).
+                // Apply-to-Right click'ten ONCE pause - kullanici RD'yi
+                // gorebilir, hangi modeller, hangi ok'lar; OK basinca click
+                // yapilir. dbgPauseBeforeApply false ise (mart-mart default)
+                // bu kod no-op.
+                if (dbgPauseBeforeApply)
+                {
+                    log?.Invoke("  [DB-7] [DEBUG-PAUSE] waiting for user to inspect RD - OK basinca Apply-to-Right tiklanacak");
+                    try { overlayToggle?.Invoke(false); } catch { }
+                    System.Windows.Forms.MessageBox.Show(
+                        $"RD ekrani acik. Hangi modeller karsilastiriliyor + hangi ok tiklanacak (target: ({pt.X},{pt.Y})) inceleyin.\n\nOK basinca Apply-to-Right tiklanacak.",
+                        "[DEBUG] From-DB Manuel Inceleme",
+                        System.Windows.Forms.MessageBoxButtons.OK,
+                        System.Windows.Forms.MessageBoxIcon.Information);
+                    log?.Invoke("  [DB-7] [DEBUG-PAUSE] user OK - proceeding with click");
+                }
+                int txAfter = txBefore;
+                try
+                {
+                    for (int attempt = 1; attempt <= 2; attempt++)
+                    {
+                        SetForegroundWindow(resolveDlg);
+                        try
+                        {
+                            ShowCursor(false);
+                            SendMouseClickAt(pt.X, pt.Y, log);
+                            Thread.Sleep(20);
+                        }
+                        finally
+                        {
+                            SetCursorPos(saved.X, saved.Y);
+                            ShowCursor(true);
+                        }
+                        HideWindow(resolveDlg);
+                        log?.Invoke($"  [DB-7] attempt {attempt}: click fired + RD hidden, waiting for EDR tx settle");
+                        txAfter = WaitForEdrTxSettle(txBefore, timeoutMs: 2500, stableMs: 350, log);
+                        if (txAfter > txBefore)
+                        {
+                            log?.Invoke($"  [DB-7] attempt {attempt}: tx delta = {txAfter - txBefore}");
+                            break;
+                        }
+                        log?.Invoke($"  [DB-7] attempt {attempt}: no tx - retrying...");
+                        UnhideWindow(resolveDlg);
+                        Thread.Sleep(100);
+                    }
+                    session.Applied = (txAfter - txBefore) > 0;
+                    if (!session.Applied)
+                        log?.Invoke("  [DB-7] [WARN] mouse click did not trigger EDR tx after 2 attempts.");
+                }
+                finally
+                {
+                    try { overlayToggle?.Invoke(true); } catch { }
+                }
+                return session;
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"  DB-CC threw: {ex.GetType().Name}: {ex.Message}");
+                try { overlayToggle?.Invoke(true); } catch { }
+                return session.CCWizard != IntPtr.Zero ? session : null;
+            }
+            finally
+            {
+                // Stop the GDM-1001 popup auto-dismisser. Wait briefly for
+                // the task to terminate so its final log line ("dismissed N
+                // popup(s)") interleaves correctly with the rest of the
+                // pipeline output.
+                try
+                {
+                    gdmCts.Cancel();
+                    gdmDismisser?.Wait(500);
+                    gdmCts.Dispose();
+                }
+                catch { }
+            }
+        }
+
+        /// <summary>
         /// Closes the CC wizard + Resolve Differences dialogs captured in a
         /// <see cref="CCSession"/>. Plain Cancel - no Reset attempt (we
         /// proved Reset toolbar IDs have no effect on erwin's internal
@@ -461,23 +1188,43 @@ namespace EliteSoft.Erwin.AddIn.Services
 
             try
             {
+                // RD + CC wizards: after ELA::OnFE has run, posting
+                // WM_COMMAND IDCANCEL/CC_CLOSE to these wizards triggers
+                // their MFC OnCancel/OnClose handlers which dereference
+                // CERwinFEData::m_xActionSummary / m_modelSet, both nulled
+                // by OnFE's post-cleanup. Verified crash on From-DB pipeline
+                // 2026-04-26 23:43 right after "cleanup: Cancel Resolve
+                // Differences" was posted to handle 0xC5D09A6.
+                //
+                // Use bridge ForceDestroyWizard which calls DestroyWindow
+                // directly on the wizard's owner thread (via WH_CALLWNDPROCRET
+                // sentinel injection), bypassing all MFC command handlers.
+                // Side effect: leaks the CDialog C++ object but never crashes.
                 if (s.ResolveDifferences != IntPtr.Zero)
                 {
-                    log?.Invoke("  cleanup: Cancel Resolve Differences");
-                    PostMessage(s.ResolveDifferences, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero);
-                    Thread.Sleep(300);
+                    log?.Invoke($"  cleanup: ForceDestroy Resolve Differences (hwnd=0x{s.ResolveDifferences.ToInt64():X})");
+                    int rc = NativeBridgeService.ForceDestroyWizard(s.ResolveDifferences, log);
+                    log?.Invoke($"  cleanup: ForceDestroy RD rc={rc}");
+                    Thread.Sleep(150);
                 }
                 if (s.CCWizard != IntPtr.Zero)
                 {
-                    log?.Invoke("  cleanup: Close CC wizard");
-                    PostMessage(s.CCWizard, WM_COMMAND, MakeWParam(CC_CLOSE, 0), IntPtr.Zero);
-                    // CC wizard's Close button pops up the "Close Model"
-                    // dialog when it has dirty models opened by the wizard
-                    // (e.g. the right-side Mart PU that got dirtied by
-                    // Apply-to-Right). We must drive that dialog and the
-                    // potential "Mart Offline" sub-dialog to avoid leaving
-                    // a stale dirty PU in erwin's session (which causes the
-                    // 2nd-run "compare-to-itself" cache issue).
+                    // Reverted to ForceDestroy 2026-04-27 03:00 after the
+                    // IDCANCEL-revert hypothesis (matching manual close
+                    // path) failed in practice: post-OnFE the bridge's
+                    // OBS-FED-CLEAR has already nulled m_xActionSummary +
+                    // m_modelSet, so the CC wizard's MFC OnCancel handler
+                    // silent-fails when WM_COMMAND CC_CLOSE arrives. The
+                    // wizard stays alive AND the v1 PU stays orphaned -
+                    // worst of both worlds. ForceDestroy at least kills
+                    // the wizard frame consistently. The orphan v1 leak
+                    // remains but is a separate, deeper problem requiring
+                    // either programmatic Alter Script wizard drive (old
+                    // deleted WizardAutomationService approach) or bridge
+                    // state snapshot/restore around OnFE.
+                    log?.Invoke($"  cleanup: ForceDestroy CC wizard (hwnd=0x{s.CCWizard.ToInt64():X})");
+                    int rc = NativeBridgeService.ForceDestroyWizard(s.CCWizard, log);
+                    log?.Invoke($"  cleanup: ForceDestroy CC rc={rc}");
                     HandleCloseModelDialogChain(log);
                 }
 
@@ -610,18 +1357,20 @@ namespace EliteSoft.Erwin.AddIn.Services
                             }
                             else if (s != null && (r.h == s.CCWizard || r.h == s.ResolveDifferences))
                             {
-                                log?.Invoke($"  [residual] CC/RD frame 0x{r.h.ToInt64():X} still alive - WM_CLOSE");
-                                PostMessage(r.h, 0x0010 /*WM_CLOSE*/, IntPtr.Zero, IntPtr.Zero);
-                                dismissed = true;
+                                log?.Invoke($"  [residual] CC/RD frame 0x{r.h.ToInt64():X} still alive - ForceDestroy");
+                                int rc = NativeBridgeService.ForceDestroyWizard(r.h, log);
+                                log?.Invoke($"  [residual] ForceDestroy rc={rc}");
+                                dismissed = (rc == 1);
                             }
                             else if (t.IndexOf("Wizard", StringComparison.OrdinalIgnoreCase) >= 0
                                   || t.IndexOf("Resolve Differences", StringComparison.OrdinalIgnoreCase) >= 0
                                   || t.IndexOf("Complete Compare", StringComparison.OrdinalIgnoreCase) >= 0
                                   || t.IndexOf("Forward Engineer", StringComparison.OrdinalIgnoreCase) >= 0)
                             {
-                                log?.Invoke($"  [residual] wizard 0x{r.h.ToInt64():X} title='{t}' - WM_CLOSE");
-                                PostMessage(r.h, 0x0010 /*WM_CLOSE*/, IntPtr.Zero, IntPtr.Zero);
-                                dismissed = true;
+                                log?.Invoke($"  [residual] wizard 0x{r.h.ToInt64():X} title='{t}' - ForceDestroy");
+                                int rc = NativeBridgeService.ForceDestroyWizard(r.h, log);
+                                log?.Invoke($"  [residual] ForceDestroy rc={rc}");
+                                dismissed = (rc == 1);
                             }
                             else
                             {
@@ -1363,7 +2112,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                         try
                         {
                             ShowCursor(false);
-                            SendMouseClickAt(pt.X, pt.Y);
+                            SendMouseClickAt(pt.X, pt.Y, log);
                             Thread.Sleep(20);
                         }
                         finally
@@ -1411,6 +2160,12 @@ namespace EliteSoft.Erwin.AddIn.Services
             catch (Exception ex)
             {
                 log?.Invoke($"  automation threw: {ex.GetType().Name}: {ex.Message}");
+                // Belt-and-suspenders: restore the addin form even if an
+                // exception bubbles past the inner finally (e.g. polling
+                // throws before we reach the click loop). Without this the
+                // form stays in click-through state and modal children
+                // (Configure dialog, etc.) become invisible-but-active.
+                try { overlayToggle?.Invoke(true); } catch { }
                 return session.CCWizard != IntPtr.Zero ? session : null;
             }
         }
@@ -1629,6 +2384,538 @@ namespace EliteSoft.Erwin.AddIn.Services
             return false;
         }
 
+        /// <summary>
+        /// Manuel akış mimicry: RD dialog'undan "Right Alter Script/Schema
+        /// Generation" toolbar butonuna mouse click yapar. Bu erwin'in iç
+        /// `ELA::OnFE(ms, true, lastEdrId)` çağrısını tetikler (manuel test
+        /// 11:18:38 doğrulaması: flags=0x236C == son EDR tx id 9068). Bu
+        /// flag programmatic OnFE çağrısında 0x13 olarak veriliyor → AS
+        /// yanlış attach → full DDL. Manuel akış doğru flag verdiği için
+        /// AS doğru attach + alter DDL üretiliyor.
+        ///
+        /// Akış: RD'de UIA ile "Right Alter Script/Schema Generation" name
+        /// match'li button bul -> BoundingRectangle al -> mouse click ->
+        /// "Forward Engineer Alter Script Schema Generation Wizard" CREATE
+        /// event bekle -> wizard hwnd dön. Wizard CREATE 5 saniye içinde
+        /// olmazsa IntPtr.Zero dön.
+        ///
+        /// Returns: wizard hwnd on success, IntPtr.Zero on failure.
+        /// </summary>
+        public static async Task<IntPtr> ClickRightAlterScriptInRdAsync(IntPtr rdHwnd, Action<string> log)
+        {
+            return await Task.Run(() => ClickRightAlterScriptInRd(rdHwnd, log));
+        }
+
+        private static IntPtr ClickRightAlterScriptInRd(IntPtr rdHwnd, Action<string> log)
+        {
+            if (rdHwnd == IntPtr.Zero || !IsWindow(rdHwnd))
+            {
+                log?.Invoke("  [RAS] RD hwnd invalid");
+                return IntPtr.Zero;
+            }
+
+            // 2026-04-27 verdict: WM_COMMAND 1056 PostMessage to RD parent
+            // does NOT reproduce a real mouse click on the toolbar button.
+            // Manual mouse click invokes OnFE with flags=lastApplyEdrId+1
+            // (proper post-apply state); PostMessage variant invokes OnFE
+            // with flags=0 - same handler, missing button-level state setup.
+            // RD diagnostics (RAS-DUMP) confirmed RD owns 5 standard
+            // ToolbarWindow32 controls; we now locate the one carrying
+            // CMD_RD_ALTER_SCRIPT (1056) at runtime, fetch its item rect,
+            // map to screen coords, and synthesize a real mouse click via
+            // SendMouseClickAt (the same proven helper used for the
+            // Apply-to-Right click). Fully dynamic - no hardcoded coords.
+            (IntPtr toolbar, int buttonIdx) = FindToolbarButtonByCommand(
+                rdHwnd, CMD_RD_ALTER_SCRIPT, log);
+
+            var dialogsBefore = EnumerateVisibleDialogs();
+            try { SetForegroundWindow(rdHwnd); UnhideWindow(rdHwnd); } catch { }
+
+            if (toolbar == IntPtr.Zero || buttonIdx < 0)
+            {
+                log?.Invoke($"  [RAS] toolbar with cmd {CMD_RD_ALTER_SCRIPT} NOT found - falling back to WM_COMMAND PostMessage (will produce stripped DDL)");
+                PostMessage(rdHwnd, WM_COMMAND, MakeWParam(CMD_RD_ALTER_SCRIPT, 0), IntPtr.Zero);
+            }
+            else
+            {
+                RECT btnRect = new RECT();
+                IntPtr rcRes = SendMessageRectOut(toolbar, TB_GETITEMRECT, new IntPtr(buttonIdx), ref btnRect);
+                if (rcRes == IntPtr.Zero || (btnRect.right == 0 && btnRect.bottom == 0))
+                {
+                    log?.Invoke($"  [RAS] TB_GETITEMRECT returned empty for toolbar=0x{toolbar.ToInt64():X} idx={buttonIdx} - fallback to WM_COMMAND");
+                    PostMessage(rdHwnd, WM_COMMAND, MakeWParam(CMD_RD_ALTER_SCRIPT, 0), IntPtr.Zero);
+                }
+                else
+                {
+                    POINT center = new POINT
+                    {
+                        X = (btnRect.left + btnRect.right) / 2,
+                        Y = (btnRect.top + btnRect.bottom) / 2,
+                    };
+                    if (!ClientToScreen(toolbar, ref center))
+                    {
+                        log?.Invoke("  [RAS] ClientToScreen failed - fallback to WM_COMMAND");
+                        PostMessage(rdHwnd, WM_COMMAND, MakeWParam(CMD_RD_ALTER_SCRIPT, 0), IntPtr.Zero);
+                    }
+                    else
+                    {
+                        log?.Invoke($"  [RAS] real mouse click on toolbar=0x{toolbar.ToInt64():X} idx={buttonIdx} btnRect=({btnRect.left},{btnRect.top})-({btnRect.right},{btnRect.bottom}) screen=({center.X},{center.Y})");
+                        // Force RD to top of Z-order so its toolbar receives
+                        // the click. Without this another window (e.g. our
+                        // addin form) might cover the target coordinates.
+                        try { BringWindowToTop(rdHwnd); SetForegroundWindow(rdHwnd); UnhideWindow(rdHwnd); } catch { }
+                        Thread.Sleep(40);
+                        // Diagnostic: confirm the target screen coord actually
+                        // belongs to RD's toolbar (not some overlay window).
+                        IntPtr targetHwnd = WindowFromPoint(center);
+                        log?.Invoke($"  [RAS] WindowFromPoint({center.X},{center.Y})=0x{targetHwnd.ToInt64():X} (expected toolbar=0x{toolbar.ToInt64():X})");
+                        if (targetHwnd != toolbar && targetHwnd != IntPtr.Zero)
+                        {
+                            log?.Invoke($"  [RAS] WARNING: click target window mismatch - another window covers the toolbar!");
+                        }
+                        // XTP toolbar filters obviously-synthetic input. The
+                        // Apply-to-Right click path used ShowCursor(false) +
+                        // immediate down/up which XTP eats on the toolbar
+                        // (verified 20:45 - mouse click logged but wizard
+                        // never appeared). Use a human-like sequence here:
+                        // visible cursor, settle delay before press, hold
+                        // briefly, then release. Yields a brief cursor jump
+                        // (~150ms) but bypasses the filter heuristic.
+                        if (GetCursorPos(out POINT savedCursor))
+                        {
+                            try
+                            {
+                                SetCursorPos(center.X, center.Y);
+                                Thread.Sleep(60);   // settle before press
+                                mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, IntPtr.Zero);
+                                Thread.Sleep(80);   // human-like hold
+                                mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, IntPtr.Zero);
+                                Thread.Sleep(40);   // settle after release
+                            }
+                            finally
+                            {
+                                SetCursorPos(savedCursor.X, savedCursor.Y);
+                            }
+                        }
+                        else
+                        {
+                            SetCursorPos(center.X, center.Y);
+                            Thread.Sleep(60);
+                            mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, IntPtr.Zero);
+                            Thread.Sleep(80);
+                            mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, IntPtr.Zero);
+                            Thread.Sleep(40);
+                        }
+                    }
+                }
+            }
+
+            IntPtr wizard = WaitForNewDialog(dialogsBefore,
+                "Forward Engineer Alter Script Schema Generation Wizard",
+                5000, log);
+            if (wizard == IntPtr.Zero)
+            {
+                log?.Invoke("  [RAS] FE Alter Script wizard did not appear within 5s");
+                return IntPtr.Zero;
+            }
+            log?.Invoke($"  [RAS] Wizard appeared = 0x{wizard.ToInt64():X}");
+            return wizard;
+        }
+
+        /// <summary>
+        /// Walk every <c>ToolbarWindow32</c> child of <paramref name="parent"/>
+        /// looking for the one whose button list contains <paramref name="cmdId"/>.
+        /// Returns the toolbar handle and zero-based button index, or
+        /// <c>(IntPtr.Zero, -1)</c> if no match. RD owns multiple toolbars so we
+        /// must check each. Fully dynamic - no hardcoded coords or HWNDs.
+        /// </summary>
+        private static (IntPtr toolbar, int buttonIdx) FindToolbarButtonByCommand(
+            IntPtr parent, int cmdId, Action<string> log)
+        {
+            IntPtr foundToolbar = IntPtr.Zero;
+            int foundIdx = -1;
+            EnumChildWindows(parent, (h, _) =>
+            {
+                StringBuilder cls = new StringBuilder(64);
+                GetClassName(h, cls, cls.Capacity);
+                if (cls.ToString() != "ToolbarWindow32") return true;
+
+                int count = SendMessageInt(h, TB_BUTTONCOUNT, IntPtr.Zero, IntPtr.Zero).ToInt32();
+                if (count <= 0) return true;
+
+                for (int i = 0; i < count; i++)
+                {
+                    TBBUTTON tb = default;
+                    IntPtr res = SendMessageTbButton(h, TB_GETBUTTON, new IntPtr(i), ref tb);
+                    if (res == IntPtr.Zero) continue;
+                    if (tb.idCommand == cmdId)
+                    {
+                        log?.Invoke($"  [RAS] toolbar=0x{h.ToInt64():X} button[{i}] idCommand={tb.idCommand} (matched cmd {cmdId})");
+                        foundToolbar = h;
+                        foundIdx = i;
+                        return false;
+                    }
+                }
+                return true;
+            }, IntPtr.Zero);
+            return (foundToolbar, foundIdx);
+        }
+
+        /// <summary>
+        /// Manuel akış mimicry: FE Alter Script wizard'ı açıldıktan sonra
+        /// sol nav listesinde "Preview" item'ına UIA Invoke / SelectionItem
+        /// Select. Bu erwin'in iç GA çağrısını tetikler -> bridge'in GA
+        /// hook'u DDL'i capture buffer'a yazar (ConsumeLastCapturedDdl
+        /// ile alınır). Manuel test 11:19:07 doğrulaması: GA EXIT rv=0,
+        /// 23 lines / 5582 chars alter DDL.
+        /// </summary>
+        public static async Task<bool> ClickWizardPreviewTabAsync(IntPtr wizardHwnd, Action<string> log)
+        {
+            return await Task.Run(() => ClickWizardPreviewTab(wizardHwnd, log));
+        }
+
+        private static bool ClickWizardPreviewTab(IntPtr wizardHwnd, Action<string> log)
+        {
+            if (wizardHwnd == IntPtr.Zero || !IsWindow(wizardHwnd))
+            {
+                log?.Invoke("  [WPT] Wizard hwnd invalid");
+                return false;
+            }
+
+            // Next-loop strategy (UIA-free): post CMD_FE_WIZARD_NEXT (1766)
+            // repeatedly until the bridge's GA hook captures DDL. Each Next
+            // walks one page: Overview -> Option Selection -> Summary ->
+            // Owner Override -> Object Filter -> Preview. The Preview page
+            // triggers FE Wizard's internal generate flow which calls
+            // ELA -> FEProcessor::GenerateAlterScript -> bridge GA hook
+            // captures the DDL into the bridge's buffer (consumed by
+            // caller via ConsumeLastCapturedDdl). Memory:
+            // reference_alter_script_wizard_automation - same pattern is
+            // used by DriveFEAlterScriptWizard (line 546+). UIA path
+            // failed because XTP wizard property sheet does not expose
+            // navigation items in the UIA tree consistently.
+            log?.Invoke("  [WPT] Next-loop strategy: posting CMD_FE_WIZARD_NEXT until DDL captured");
+
+            for (int page = 1; page <= 8; page++)
+            {
+                // Wait for current page to render and any sub-dialogs to
+                // settle (e.g. SQL Server Connection picker, Use current
+                // diagram selections? Yes/No popup).
+                Thread.Sleep(700);
+
+                // Caller (RunFromDbDdlPipelineAsync) polls bridge buffer
+                // continuously after this method returns; we don't consume
+                // here so the caller sees the DDL on its own poll.
+                // Just check if bridge already captured (fast path - some
+                // wizards generate DDL during initial CTOR).
+                string preview = NativeBridgeService.ConsumeLastCapturedDdl();
+                if (!string.IsNullOrEmpty(preview))
+                {
+                    log?.Invoke($"  [WPT] DDL captured at page {page} ({preview.Length} chars) - re-stashing for caller");
+                    // Re-stash via a marker - but bridge has no Set. Just
+                    // signal success; caller will see empty buffer but we
+                    // succeeded. To not lose DDL we stash it on the static
+                    // field below for caller to retrieve.
+                    LastCapturedWizardDdl = preview;
+                    return true;
+                }
+
+                log?.Invoke($"  [WPT] page {page}: posting CMD_FE_WIZARD_NEXT (1766)");
+                PostMessage(wizardHwnd, WM_COMMAND, MakeWParam(CMD_FE_WIZARD_NEXT, 0), IntPtr.Zero);
+            }
+
+            // After Next-loop, give it one more second for the final page's
+            // generate to complete and bridge GA hook to fire.
+            Thread.Sleep(1500);
+            string finalDdl = NativeBridgeService.ConsumeLastCapturedDdl();
+            if (!string.IsNullOrEmpty(finalDdl))
+            {
+                log?.Invoke($"  [WPT] DDL captured at end ({finalDdl.Length} chars)");
+                LastCapturedWizardDdl = finalDdl;
+                return true;
+            }
+
+            log?.Invoke("  [WPT] Next-loop exhausted without DDL capture");
+            return false;
+        }
+
+        /// <summary>
+        /// Static stash for DDL captured during ClickWizardPreviewTab's
+        /// Next-loop. Set by ClickWizardPreviewTab when bridge buffer has
+        /// content; consumed by RunFromDbDdlPipelineAsync. Avoids
+        /// double-consume race between Next-loop poll and caller poll.
+        /// </summary>
+        public static string LastCapturedWizardDdl { get; private set; }
+
+        public static void ClearLastCapturedWizardDdl() { LastCapturedWizardDdl = null; }
+
+        /// <summary>
+        /// FE Alter Script wizard'in Generate/Next adimi sirasinda
+        /// "Use current diagram selections? You have N entity selected"
+        /// child popup'ini detect eder ve "No" ile dismiss eder. Wizard'i
+        /// kapatmadan once bu modal popup kapatilmali (parent wizard child
+        /// popup acikken kapanmiyor). 2026-04-27 ekran goruntusunde
+        /// dogrulandi: pipeline sonunda wizard Preview tab'inda DDL
+        /// gozukurken bu popup acik kaliyor.
+        /// </summary>
+        public static async Task DismissUseCurrentDiagramPopupAsync(Action<string> log)
+        {
+            await Task.Run(() =>
+            {
+                IntPtr popup = WaitForDialog("erwin Data Modeler", 500);
+                if (popup == IntPtr.Zero) return;
+                string title = GetTitle(popup);
+                log?.Invoke($"  [POP] erwin popup detected hwnd=0x{popup.ToInt64():X} title='{title}' - dismissing with No");
+                try
+                {
+                    var pop = AutomationElement.FromHandle(popup);
+                    if (pop != null) ClickButtonByName(pop, new[] { "No", "Hayir", "Hayır" });
+                }
+                catch (Exception ex) { log?.Invoke($"  [POP] dismiss err: {ex.Message}"); }
+                Thread.Sleep(300);
+            });
+        }
+
+        /// <summary>
+        /// FE Alter Script wizard'i WM_COMMAND IDCANCEL ile temiz kapatir.
+        /// 1.5sn bekler. Hala canli ise son care olarak ForceDestroy. Bu
+        /// MFC OnCancel handler path'ini kullanir; ForceDestroy yan etkili
+        /// idi (FEW-CTOR cached state inconsistent -> ~3sn sonra erwin
+        /// sessizce oluyor; doğrulama: 11:46:39 force-destroy + 11:46:42
+        /// silent erwin death).
+        /// </summary>
+        public static async Task CloseFEWizardCleanAsync(IntPtr wizardHwnd, Action<string> log)
+        {
+            if (wizardHwnd == IntPtr.Zero || !IsWindow(wizardHwnd)) return;
+
+            log?.Invoke($"  [WC] closing FE wizard via IDCANCEL 0x{wizardHwnd.ToInt64():X}");
+            const int IDCANCEL = 2;
+            try { PostMessage(wizardHwnd, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero); }
+            catch (Exception ex) { log?.Invoke($"  [WC] PostMessage err: {ex.Message}"); }
+            await Task.Delay(1500);
+
+            if (IsWindow(wizardHwnd))
+            {
+                log?.Invoke("  [WC] wizard still alive after IDCANCEL - last-resort ForceDestroy");
+                try { NativeBridgeService.ForceDestroyWizard(wizardHwnd, log); }
+                catch (Exception ex) { log?.Invoke($"  [WC] ForceDestroy err: {ex.Message}"); }
+            }
+            else
+            {
+                log?.Invoke("  [WC] wizard closed cleanly via IDCANCEL");
+            }
+        }
+
+        /// <summary>
+        /// From-DB-ozel temiz CC + RD kapatma. Mevcut CloseSession metodu
+        /// (Mart-Mart icin) ForceDestroy kullaniyor; bu CC engine'i
+        /// inconsistent state'e sokup ~3sn sonra erwin'in sessizce
+        /// olmesine sebep oluyor (memory: reference_cross_version_orphan
+        /// _unsolved.md "erwin locks within ~3min", 13:00:43.991 force-
+        /// destroy + 13:00:47 sonrasi silent erwin death).
+        ///
+        /// CloseFEWizardCleanAsync ile ayni pattern: WM_COMMAND IDCANCEL
+        /// ile MFC OnCancel handler path'inden git, son care ForceDestroy.
+        /// Mart-Mart'a dokunulmadi (CloseSession ayni kalir).
+        /// </summary>
+        public static async Task CloseDbCCSessionCleanAsync(CCSession s, Action<string> log)
+        {
+            if (s == null) return;
+            const int IDCANCEL = 2;
+
+            // Sira: ONCE RD (cocuk dialog), SONRA CC (parent wizard).
+            // RD acikken CC'yi kapatmak race olusturabilir (RD CC'nin
+            // child'i, parent kapanirken child'i WM_DESTROY yagmuruna
+            // tutar). RD'yi IDCANCEL ile temiz kapat, sonra CC'yi.
+            if (s.ResolveDifferences != IntPtr.Zero && IsWindow(s.ResolveDifferences))
+            {
+                log?.Invoke($"  [DB-CLEAN] closing RD via IDCANCEL 0x{s.ResolveDifferences.ToInt64():X}");
+                try { PostMessage(s.ResolveDifferences, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero); }
+                catch (Exception ex) { log?.Invoke($"  [DB-CLEAN] RD IDCANCEL err: {ex.Message}"); }
+                await Task.Delay(1500);
+
+                if (IsWindow(s.ResolveDifferences))
+                {
+                    log?.Invoke("  [DB-CLEAN] RD still alive - last-resort ForceDestroy");
+                    try { NativeBridgeService.ForceDestroyWizard(s.ResolveDifferences, log); }
+                    catch (Exception ex) { log?.Invoke($"  [DB-CLEAN] RD ForceDestroy err: {ex.Message}"); }
+                }
+                else
+                {
+                    log?.Invoke("  [DB-CLEAN] RD closed cleanly via IDCANCEL");
+                }
+            }
+
+            if (s.CCWizard != IntPtr.Zero && IsWindow(s.CCWizard))
+            {
+                log?.Invoke($"  [DB-CLEAN] closing CC wizard via IDCANCEL 0x{s.CCWizard.ToInt64():X}");
+                try { PostMessage(s.CCWizard, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero); }
+                catch (Exception ex) { log?.Invoke($"  [DB-CLEAN] CC IDCANCEL err: {ex.Message}"); }
+                await Task.Delay(1500);
+
+                // Some erwin builds spawn a "Close Model?" confirmation
+                // popup after CC IDCANCEL. The Mart-Mart CloseSession has
+                // a HandleCloseModelDialogChain helper for this; we
+                // delegate to it for consistency.
+                try { HandleCloseModelDialogChain(log); } catch { }
+
+                if (IsWindow(s.CCWizard))
+                {
+                    log?.Invoke("  [DB-CLEAN] CC still alive after IDCANCEL chain - last-resort ForceDestroy");
+                    try { NativeBridgeService.ForceDestroyWizard(s.CCWizard, log); }
+                    catch (Exception ex) { log?.Invoke($"  [DB-CLEAN] CC ForceDestroy err: {ex.Message}"); }
+                }
+                else
+                {
+                    log?.Invoke("  [DB-CLEAN] CC closed cleanly via IDCANCEL");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Switches erwin's active MDI child to the model whose title
+        /// contains "Mart://" - i.e. back to the dirty mart model after a
+        /// silent RE made the RE'd PU the foreground tab. Necessary so the
+        /// CC wizard's "Left Model" defaults to the dirty mart (matching
+        /// the Mart-Mart pipeline's direction); without this the wizard
+        /// picks RE'd as left and we'd need an Apply-to-Left in RD instead
+        /// of the proven Apply-to-Right.
+        /// </summary>
+        public static bool ActivateMartMdiChild(Action<string> log)
+        {
+            IntPtr erwinMain = FindErwinMain();
+            if (erwinMain == IntPtr.Zero) { log?.Invoke("  [MDI-ACT] erwin main not found"); return false; }
+
+            IntPtr mdiClient = IntPtr.Zero;
+            EnumChildWindows(erwinMain, (h, _) =>
+            {
+                var cls = new StringBuilder(64);
+                GetClassName(h, cls, cls.Capacity);
+                if (cls.ToString() == "MDIClient")
+                {
+                    mdiClient = h;
+                    return false;
+                }
+                return true;
+            }, IntPtr.Zero);
+            if (mdiClient == IntPtr.Zero)
+            {
+                log?.Invoke("  [MDI-ACT] MDIClient not found - erwin not using standard MDI?");
+                return false;
+            }
+
+            IntPtr martMdi = IntPtr.Zero;
+            EnumChildWindows(mdiClient, (h, _) =>
+            {
+                string title = GetTitle(h);
+                if (title.IndexOf("Mart://", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    martMdi = h;
+                    return false;
+                }
+                return true;
+            }, IntPtr.Zero);
+            if (martMdi == IntPtr.Zero)
+            {
+                log?.Invoke("  [MDI-ACT] no MDI child with 'Mart://' in title");
+                return false;
+            }
+
+            string activeTitle = GetTitle(martMdi);
+            log?.Invoke($"  [MDI-ACT] activating MDI child hwnd=0x{martMdi.ToInt64():X} title='{activeTitle}'");
+            const uint WM_MDIACTIVATE = 0x0222;
+            SendMessage(mdiClient, WM_MDIACTIVATE, martMdi, IntPtr.Zero);
+            Thread.Sleep(100);  // let the switch settle
+            return true;
+        }
+
+        /// <summary>
+        /// Diagnostic helper for the From-DB-via-Existing-Model spike: opens
+        /// CC wizard programmatically, navigates to Right Model page, dumps
+        /// the UIA tree (so we can identify the "From Existing Model" radio
+        /// + dropdown by Name/AutomationId), then closes CC. RE'd PU stays
+        /// loaded in the session - the production pipeline will reuse it.
+        /// </summary>
+        public static void DumpRightModelPageUia(Action<string> log)
+        {
+            log?.Invoke("");
+            log?.Invoke("=== CC wizard Right Model page UIA dump (From-DB discovery) ===");
+            IntPtr erwinMain = FindErwinMain();
+            if (erwinMain == IntPtr.Zero) { log?.Invoke("  erwin main window not found"); return; }
+
+            var dialogsBefore = EnumerateVisibleDialogs();
+            log?.Invoke("  posting CMD_COMPLETE_COMPARE (1082) to open CC wizard");
+            PostMessage(erwinMain, WM_COMMAND, MakeWParam(CMD_COMPLETE_COMPARE, 0), IntPtr.Zero);
+            IntPtr ccWizard = WaitForNewDialog(dialogsBefore, "CC wizard", 5000, log);
+            if (ccWizard == IntPtr.Zero) { log?.Invoke("  CC wizard did not open"); return; }
+            HideWindow(ccWizard);
+            log?.Invoke($"  CC wizard hwnd=0x{ccWizard.ToInt64():X} title='{GetTitle(ccWizard)}'");
+
+            try
+            {
+                // Navigate Back to Overview (multiple times if needed) then
+                // Next x2 to land on Right Model Selection.
+                for (int i = 0; i < 12; i++)
+                {
+                    string t = GetTitle(ccWizard);
+                    if (t.StartsWith("Wizard Overview", StringComparison.OrdinalIgnoreCase)
+                        || t.StartsWith("Overview", StringComparison.OrdinalIgnoreCase)) break;
+                    PostMessage(ccWizard, WM_COMMAND, MakeWParam(CC_BACK, 0), IntPtr.Zero);
+                    Thread.Sleep(80);
+                }
+                log?.Invoke($"  at Overview, title='{GetTitle(ccWizard)}'");
+                PostMessage(ccWizard, WM_COMMAND, MakeWParam(CC_NEXT, 0), IntPtr.Zero); Thread.Sleep(150);
+                PostMessage(ccWizard, WM_COMMAND, MakeWParam(CC_NEXT, 0), IntPtr.Zero); Thread.Sleep(300);
+                log?.Invoke($"  at Right Model page, title='{GetTitle(ccWizard)}'");
+
+                // Dump full UIA tree of the wizard window so we see all
+                // radios + comboboxes + buttons + their Name/AutomationId.
+                var root = AutomationElement.FromHandle(ccWizard);
+                if (root != null)
+                {
+                    log?.Invoke("  --- UIA tree (depth budget = 200) ---");
+                    DumpUiaTree(root, 0, 200, log);
+                    log?.Invoke("  --- end UIA tree ---");
+                }
+
+                // Also enumerate all child windows via Win32 to capture
+                // dialog control IDs (GetDlgCtrlID) for each radio - these
+                // are the WM_COMMAND IDs we'd PostMessage to switch route.
+                log?.Invoke("  --- Win32 child windows + ctrl IDs ---");
+                EnumChildWindows(ccWizard, (h, _) =>
+                {
+                    var clsBuf = new StringBuilder(64);
+                    GetClassName(h, clsBuf, clsBuf.Capacity);
+                    int id = GetDlgCtrlID(h);
+                    if (id == 0) return true;
+                    var titleBuf = new StringBuilder(128);
+                    GetWindowText(h, titleBuf, titleBuf.Capacity);
+                    string txt = titleBuf.ToString();
+                    if (string.IsNullOrEmpty(txt) && clsBuf.ToString() != "Button"
+                        && clsBuf.ToString() != "ComboBox" && clsBuf.ToString() != "ListBox") return true;
+                    log?.Invoke($"    hwnd=0x{h.ToInt64():X} cls='{clsBuf}' id={id} text='{txt}'");
+                    return true;
+                }, IntPtr.Zero);
+                log?.Invoke("  --- end Win32 children ---");
+            }
+            catch (Exception ex) { log?.Invoke($"  dump err: {ex.GetType().Name}: {ex.Message}"); }
+            finally
+            {
+                log?.Invoke("  closing CC wizard via CC_CLOSE");
+                PostMessage(ccWizard, WM_COMMAND, MakeWParam(CC_CLOSE, 0), IntPtr.Zero);
+                Thread.Sleep(500);
+                // Try to dismiss any "Close Model" / save prompts that may
+                // appear - we don't want to leave stale dialogs.
+                IntPtr closeDlg = WaitForDialog("Close Model", 1500);
+                if (closeDlg != IntPtr.Zero)
+                {
+                    var croot = AutomationElement.FromHandle(closeDlg);
+                    if (croot != null) ClickButtonByName(croot, new[] { "OK", "Cancel" });
+                }
+            }
+            log?.Invoke("=== Right Model page UIA dump complete ===");
+        }
+
         private static void DumpUiaTree(AutomationElement el, int depth, int budget, Action<string> log)
         {
             if (el == null || depth > 10 || budget <= 0) return;
@@ -1764,6 +3051,62 @@ namespace EliteSoft.Erwin.AddIn.Services
                     catch { }
                     Thread.Sleep(100);
                 }
+            });
+        }
+
+        /// <summary>
+        /// Continuously polls for "erwin Data Modeler" GDM-1001 / unexpected
+        /// condition popups and dismisses them with OK so erwin's UI thread
+        /// stays unblocked. Critical for the From-DB silent-RE pipeline:
+        /// during ShowERwinCCWiz, erwin's CC engine validates referenced
+        /// objects against a "No Delete list"; when the silent-RE'd PU has
+        /// FK references to tables not in the RE filter, erwin pops a
+        /// blocking GDM-1001 popup that prevents the CC wizard window from
+        /// being created. Without auto-dismiss the wizard never appears
+        /// (we observed 15s timeouts with 0 CREATE events in the bridge
+        /// monitor log). The dismisser polls every 100ms and clicks OK on
+        /// any matching popup until the cancellation token signals.
+        /// </summary>
+        public static Task DismissGdmPopupsContinuous(System.Threading.CancellationToken token, Action<string> log)
+        {
+            return Task.Run(() =>
+            {
+                int dismissedCount = 0;
+                while (!token.IsCancellationRequested)
+                {
+                    try
+                    {
+                        IntPtr popup = WaitForDialog("erwin Data Modeler", 100);
+                        if (popup != IntPtr.Zero)
+                        {
+                            string title = GetTitle(popup);
+                            try
+                            {
+                                var root = AutomationElement.FromHandle(popup);
+                                if (root != null)
+                                {
+                                    bool clicked = ClickButtonByName(root, new[] { "OK", "Tamam" });
+                                    if (clicked)
+                                    {
+                                        dismissedCount++;
+                                        log?.Invoke($"  [GDM-DISMISS] popup #{dismissedCount} '{title}' dismissed with OK");
+                                    }
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                log?.Invoke($"  [GDM-DISMISS] err: {ex.Message}");
+                            }
+                            // Brief pause after dismissal so we don't see
+                            // the same dialog twice while it's tearing down.
+                            Thread.Sleep(150);
+                        }
+                    }
+                    catch { }
+                    try { Thread.Sleep(100); } catch { }
+                }
+                if (dismissedCount > 0)
+                    log?.Invoke($"  [GDM-DISMISS] continuous dismisser stopped, total {dismissedCount} popup(s) dismissed");
             });
         }
 

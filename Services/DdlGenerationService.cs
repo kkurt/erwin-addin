@@ -272,7 +272,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             catch { }
         }
 
-        private static string TryOpenMartVersionDirectly(dynamic scapi, dynamic currentPU, int version, string feOptionXml, Action<string> log)
+        public static string TryOpenMartVersionDirectly(dynamic scapi, dynamic currentPU, int version, string feOptionXml, Action<string> log)
         {
             Directory.CreateDirectory(TempDir);
             string ddlFile = Path.Combine(TempDir, $"direct_v{version}.sql");
@@ -919,7 +919,8 @@ WScript.Quit 0
             int targetServerVersion,
             string schema,
             IEnumerable<string> selectedTables,
-            Action<string> log)
+            Action<string> log,
+            string modelType = "Combined")
         {
             string tempDsn = null;
             string tempReOptionXml = null;
@@ -928,24 +929,39 @@ WScript.Quit 0
             {
                 if (string.IsNullOrWhiteSpace(host) || string.IsNullOrWhiteSpace(database))
                     throw new InvalidOperationException("DB host/database missing. Click 'Configure DB' first.");
+
+                // Normalize table names: strip schema prefix if present.
+                // DbTableBrowserService surfaces tables as "schema.name" so
+                // the picker is unambiguous, but RE's Synch_Table_Filter_By_Name
+                // expects bare table names (schema is already controlled by
+                // Synch_Owned_Only_Name). Without this strip, an empty PU
+                // results from the filter never matching.
                 var tableList = (selectedTables ?? new string[0])
                     .Where(t => !string.IsNullOrWhiteSpace(t))
-                    .Select(t => t.Trim()).ToList();
+                    .Select(t => t.Trim())
+                    .Select(t =>
+                    {
+                        int dot = t.IndexOf('.');
+                        return dot > 0 ? t.Substring(dot + 1) : t;
+                    })
+                    .ToList();
                 if (tableList.Count == 0)
                     throw new InvalidOperationException("No tables selected for comparison.");
                 if (targetServerCode == 0)
                     throw new InvalidOperationException("Target server code not provided.");
 
                 log?.Invoke($"RE: DB = {host}/{database}, {tableList.Count} table(s), schema='{schema}'");
+                log?.Invoke($"RE: Synch_Table_Filter_By_Name = '{string.Join(",", tableList)}'");
 
                 // Open SQL connection for XML_OPTION lookup
                 sqlConnLong = OpenSqlConnectionForXmlOption(host, database, user, password, useWindowsAuth, log);
-                int? activeModelId = null;
-                if (sqlConnLong != null)
-                {
-                    string modelPath = ActiveModelMetadataService.ReadModelPathUdp(null, currentPU, log);
-                    activeModelId = ActiveModelMetadataService.LookupModelIdByPath(sqlConnLong, modelPath, log);
-                }
+                // After the MODEL→CONFIG schema rename, the XML_OPTION row is keyed on
+                // CONFIG_ID. ConfigContextService already resolved the active config from
+                // the live model's mart locator at addin startup, so we pass that directly
+                // instead of re-deriving it from the MODEL_PATH UDP + MODEL.PATH lookup.
+                int? activeConfigId = ConfigContextService.Instance.IsInitialized
+                    ? ConfigContextService.Instance.ActiveConfigId
+                    : (int?)null;
 
                 // ODBC driver preflight + transient DSN
                 var drvCheck = OdbcDsnHelper.CheckSqlServerDriver(log);
@@ -953,17 +969,17 @@ WScript.Quit 0
                 OdbcDsnHelper.CleanupStale(log);
                 tempDsn = OdbcDsnHelper.CreateTempSqlServerDsn(host, database, user, log);
 
-                tempReOptionXml = XmlOptionLoaderService.LoadAndWriteToTempFile(sqlConnLong, activeModelId, "RE", log);
+                tempReOptionXml = XmlOptionLoaderService.LoadAndWriteToTempFile(sqlConnLong, activeConfigId, "RE", log);
 
                 // Create blank PU for RE
                 Type pbType = Type.GetTypeFromProgID("ERwin9.SCAPI.PropertyBag.9.0");
                 if (pbType == null) throw new InvalidOperationException("SCAPI PropertyBag ProgID not registered.");
                 dynamic propBag = Activator.CreateInstance(pbType);
-                propBag.Add("Model_Type", "Combined");
+                propBag.Add("Model_Type", modelType);
                 propBag.Add("Target_Server", (int)targetServerCode);
                 propBag.Add("Target_Server_Version", targetServerVersion);
                 dynamic rePU = scapi.PersistenceUnits.Create(propBag);
-                log?.Invoke($"RE: blank PU created — {rePU.Name}");
+                log?.Invoke($"RE: blank PU created — {rePU.Name} (Model_Type={modelType})");
 
                 // Set RE keys
                 propBag.ClearAll();
@@ -971,8 +987,14 @@ WScript.Quit 0
                 propBag.Add("Oracle_Use_DBA_Views", false);
                 propBag.Add("Synch_Owned_Only", !string.IsNullOrEmpty(schema));
                 propBag.Add("Synch_Owned_Only_Name", schema ?? "");
-                propBag.Add("Case_Option", 25091);
-                propBag.Add("Logical_Case_Option", 25046);
+                // Case_Option: 25090=None(preserve), 25091=lower, 25092=Upper
+                // (SCAPI doc line 6778). 25091 lowercase'e ceviriyordu ->
+                // mart UPPERCASE model ile case-mismatch -> CC compare
+                // 819 item false-diff (RD'de "dbo.APPROVEMENT_DEF" vs
+                // "dbo.approvement_def" iki ayri obje gibi). 25090 ile
+                // DB'deki orijinal case korunur, mart model ile match.
+                propBag.Add("Case_Option", 25090);
+                propBag.Add("Logical_Case_Option", 25045);
                 propBag.Add("Infer_Primary_Keys", false);
                 propBag.Add("Infer_Relations", false);
                 propBag.Add("Infer_Relations_Indexes", false);
@@ -1064,19 +1086,20 @@ WScript.Quit 0
 
                 // Step 0: open SQL connection ONCE for both XML_OPTION lookups (RE + DDL).
                 sqlConnLong = OpenSqlConnectionForXmlOption(host, database, user, password, useWindowsAuth, log);
-                int? activeModelId = null;
-                if (sqlConnLong != null)
-                {
-                    string modelPath = ActiveModelMetadataService.ReadModelPathUdp(null, currentPU, log);
-                    activeModelId = ActiveModelMetadataService.LookupModelIdByPath(sqlConnLong, modelPath, log);
-                }
+                // After the MODEL→CONFIG schema rename, the XML_OPTION row is keyed on
+                // CONFIG_ID. ConfigContextService already resolved the active config from
+                // the live model's mart locator at addin startup, so we pass that directly
+                // instead of re-deriving it from the MODEL_PATH UDP + MODEL.PATH lookup.
+                int? activeConfigId = ConfigContextService.Instance.IsInitialized
+                    ? ConfigContextService.Instance.ActiveConfigId
+                    : (int?)null;
 
                 // If user did NOT pass a feOption path, resolve TYPE='DDL' from XML_OPTION and use
                 // the SAME XML for BOTH active-model and RE-d model FEModel_DDL calls so triggers/options
                 // don't create false diffs (e.g. triggers on one side but not the other).
                 if (string.IsNullOrEmpty(optionArg))
                 {
-                    tempDdlOptionXml = XmlOptionLoaderService.LoadAndWriteToTempFile(sqlConnLong, activeModelId, "DDL", log);
+                    tempDdlOptionXml = XmlOptionLoaderService.LoadAndWriteToTempFile(sqlConnLong, activeConfigId, "DDL", log);
                     if (!string.IsNullOrEmpty(tempDdlOptionXml))
                     {
                         optionArg = tempDdlOptionXml;
@@ -1106,7 +1129,7 @@ WScript.Quit 0
                 log?.Invoke($"DDL: created transient DSN '{tempDsn}'");
 
                 // Step 3: REoption XML from XML_OPTION (per-model -> ALL=1 -> embedded) — reuse open conn
-                tempReOptionXml = XmlOptionLoaderService.LoadAndWriteToTempFile(sqlConnLong, activeModelId, "RE", log);
+                tempReOptionXml = XmlOptionLoaderService.LoadAndWriteToTempFile(sqlConnLong, activeConfigId, "RE", log);
 
                 // Step 4: build PropBag for Create
                 Type pbType = Type.GetTypeFromProgID("ERwin9.SCAPI.PropertyBag.9.0");
@@ -1127,8 +1150,14 @@ WScript.Quit 0
                 propBag.Add("Oracle_Use_DBA_Views", false);
                 propBag.Add("Synch_Owned_Only", !string.IsNullOrEmpty(schema));
                 propBag.Add("Synch_Owned_Only_Name", schema ?? "");
-                propBag.Add("Case_Option", 25091);
-                propBag.Add("Logical_Case_Option", 25046);
+                // Case_Option: 25090=None(preserve), 25091=lower, 25092=Upper
+                // (SCAPI doc line 6778). 25091 lowercase'e ceviriyordu ->
+                // mart UPPERCASE model ile case-mismatch -> CC compare
+                // 819 item false-diff (RD'de "dbo.APPROVEMENT_DEF" vs
+                // "dbo.approvement_def" iki ayri obje gibi). 25090 ile
+                // DB'deki orijinal case korunur, mart model ile match.
+                propBag.Add("Case_Option", 25090);
+                propBag.Add("Logical_Case_Option", 25045);
                 propBag.Add("Infer_Primary_Keys", false);
                 propBag.Add("Infer_Relations", false);
                 propBag.Add("Infer_Relations_Indexes", false);

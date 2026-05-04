@@ -63,25 +63,27 @@ namespace EliteSoft.Erwin.AddIn.Services
                 var config = bootstrapService.GetConfig();
                 if (config == null || !config.IsConfigured) return false;
 
-                // Load sets with mappings and relations for effective models
-                var effectiveModelIds = CorporateContextService.Instance.IsInitialized
-                    ? CorporateContextService.Instance.EffectiveModelIds
-                    : null;
+                // Single config scope (one mart path -> one config row)
+                var ctx = ConfigContextService.Instance;
+                if (!ctx.IsInitialized)
+                {
+                    _lastError = "ConfigContext not initialized.";
+                    _isLoaded = false;
+                    return false;
+                }
+                int cfgId = ctx.ActiveConfigId;
 
                 using (var context = new RepoDbContext(config))
                 {
-                    var query = context.DependencySets
+                    _sets = context.DependencySets
                         .Include(s => s.Mappings)
                             .ThenInclude(m => m.SourceUdp)
                         .Include(s => s.Mappings)
                             .ThenInclude(m => m.TargetUdp)
                         .Include(s => s.Relations)
-                        .AsQueryable();
-
-                    if (effectiveModelIds != null && effectiveModelIds.Count > 0)
-                        query = query.Where(s => effectiveModelIds.Contains(s.ModelId));
-
-                    _sets = query.OrderBy(s => s.Name).ToList();
+                        .Where(s => s.ConfigId == cfgId)
+                        .OrderBy(s => s.Name)
+                        .ToList();
                 }
 
                 Log($"DependencySetRuntime: Loaded {_sets.Count} set(s), {MappingCount} mapping(s)");

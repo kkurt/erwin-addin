@@ -36,7 +36,6 @@ namespace EliteSoft.Erwin.AddIn
             // === Control Instantiation ===
             this.tabControl = new System.Windows.Forms.TabControl();
             this.tabGeneral = new System.Windows.Forms.TabPage();
-            this.tabModel = new System.Windows.Forms.TabPage();
             this.tabConfiguration = new System.Windows.Forms.TabPage();
             this.tabGlossary = new System.Windows.Forms.TabPage();
             this.tabValidation = new System.Windows.Forms.TabPage();
@@ -122,7 +121,7 @@ namespace EliteSoft.Erwin.AddIn
             this.lblStatus = new System.Windows.Forms.Label();
 
             this.tabControl.SuspendLayout();
-            this.tabModel.SuspendLayout();
+            this.tabGeneral.SuspendLayout();
             this.tabConfiguration.SuspendLayout();
             this.tabGlossary.SuspendLayout();
             this.tabValidation.SuspendLayout();
@@ -141,7 +140,6 @@ namespace EliteSoft.Erwin.AddIn
             // ================================================================
             this.tabControl.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right | System.Windows.Forms.AnchorStyles.Bottom;
             this.tabControl.Controls.Add(this.tabGeneral);
-            this.tabControl.Controls.Add(this.tabModel);
             this.tabControl.Controls.Add(this.tabConfiguration);
             this.tabControl.Controls.Add(this.tabGlossary);
             this.tabControl.Controls.Add(this.tabValidation);
@@ -168,19 +166,9 @@ namespace EliteSoft.Erwin.AddIn
             this.tabGeneral.Text = "General";
             this.tabGeneral.UseVisualStyleBackColor = true;
 
-            // --- General tab content (built at runtime in InitializeGeneralTab) ---
-
-            // ================================================================
-            // TAB 1: MODEL
-            // ================================================================
-            this.tabModel.Controls.Add(this.grpModel);
-            this.tabModel.Location = new System.Drawing.Point(4, 26);
-            this.tabModel.Name = "tabModel";
-            this.tabModel.Padding = new System.Windows.Forms.Padding(12);
-            this.tabModel.Size = new System.Drawing.Size(860, 460);
-            this.tabModel.TabIndex = 0;
-            this.tabModel.Text = "Model";
-            this.tabModel.UseVisualStyleBackColor = true;
+            // --- General tab content (header/info card built at runtime in InitializeGeneralTab) ---
+            // Active Model groupbox (formerly the standalone "Model" tab) lives below the info card.
+            this.tabGeneral.Controls.Add(this.grpModel);
 
             // grpModel — Platform status moved inside
             this.grpModel.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
@@ -188,9 +176,9 @@ namespace EliteSoft.Erwin.AddIn
             this.grpModel.Controls.Add(this.lblConnectionStatus);
             this.grpModel.Controls.Add(this.lblModelName);
             this.grpModel.Controls.Add(this.lblPlatformStatus);
-            this.grpModel.Location = new System.Drawing.Point(12, 12);
+            this.grpModel.Location = new System.Drawing.Point(24, 180);
             this.grpModel.Name = "grpModel";
-            this.grpModel.Size = new System.Drawing.Size(833, 95);
+            this.grpModel.Size = new System.Drawing.Size(812, 95);
             this.grpModel.TabIndex = 0;
             this.grpModel.TabStop = false;
             this.grpModel.Text = "Active Model";
@@ -794,6 +782,8 @@ namespace EliteSoft.Erwin.AddIn
             this.cmbRightModel.Size = new System.Drawing.Size(322, 24);
             this.cmbRightModel.DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList;
             this.cmbRightModel.Font = fontCaption;
+            // Locked until the multi-version compare flow is wired up; will be re-enabled later.
+            this.cmbRightModel.Enabled = false;
             this.grpDdlTarget.Controls.Add(this.cmbRightModel);
 
             this.rbFromDB = new System.Windows.Forms.RadioButton();
@@ -992,6 +982,73 @@ namespace EliteSoft.Erwin.AddIn
             this.btnToggleEdrST.Click += new System.EventHandler(this.BtnToggleEdrST_Click);
             this.grpDebugLog.Controls.Add(this.btnToggleEdrST);
 
+            // --- Monitor toggle: logs every #32770/Afx dialog creation in
+            // erwin's process. Used to reverse-engineer new wizard flows
+            // (e.g. From-DB Generate DDL). Off by default. ---
+            this.btnToggleMonitor = new System.Windows.Forms.Button();
+            this.btnToggleMonitor.Location = new System.Drawing.Point(454, 120);
+            this.btnToggleMonitor.Size = new System.Drawing.Size(200, 28);
+            this.btnToggleMonitor.Text = "Toggle Dialog Monitor";
+            this.btnToggleMonitor.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnToggleMonitor.BackColor = System.Drawing.Color.FromArgb(245, 245, 200);
+            this.btnToggleMonitor.FlatAppearance.BorderColor = clrBorder;
+            this.btnToggleMonitor.Font = fontCaption;
+            this.btnToggleMonitor.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnToggleMonitor.Click += new System.EventHandler(this.BtnToggleMonitor_Click);
+            this.grpDebugLog.Controls.Add(this.btnToggleMonitor);
+
+            // --- From DB probe: silent RE + CallShowERwinCCWiz hybrid test ---
+            this.btnFromDbProbe = new System.Windows.Forms.Button();
+            this.btnFromDbProbe.Location = new System.Drawing.Point(16, 152);
+            this.btnFromDbProbe.Size = new System.Drawing.Size(280, 28);
+            this.btnFromDbProbe.Text = "From DB Probe: Silent RE + CC Wiz";
+            this.btnFromDbProbe.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnFromDbProbe.BackColor = System.Drawing.Color.FromArgb(200, 230, 255);
+            this.btnFromDbProbe.FlatAppearance.BorderColor = clrBorder;
+            this.btnFromDbProbe.Font = fontCaption;
+            this.btnFromDbProbe.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnFromDbProbe.Click += new System.EventHandler(this.BtnFromDbProbe_Click);
+            this.grpDebugLog.Controls.Add(this.btnFromDbProbe);
+
+            // --- FE Alter Script wizard probe (Architecture 2: no CC, no Apply click) ---
+            this.btnFEAlterProbe = new System.Windows.Forms.Button();
+            this.btnFEAlterProbe.Location = new System.Drawing.Point(304, 152);
+            this.btnFEAlterProbe.Size = new System.Drawing.Size(280, 28);
+            this.btnFEAlterProbe.Text = "FE Alter Script Probe (no clicks)";
+            this.btnFEAlterProbe.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnFEAlterProbe.BackColor = System.Drawing.Color.FromArgb(220, 250, 220);
+            this.btnFEAlterProbe.FlatAppearance.BorderColor = clrBorder;
+            this.btnFEAlterProbe.Font = fontCaption;
+            this.btnFEAlterProbe.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnFEAlterProbe.Click += new System.EventHandler(this.BtnFEAlterProbe_Click);
+            this.grpDebugLog.Controls.Add(this.btnFEAlterProbe);
+
+            // --- ReverseEngineerScript spike: import own DDL, test PUs.Remove ---
+            this.btnREScriptProbe = new System.Windows.Forms.Button();
+            this.btnREScriptProbe.Location = new System.Drawing.Point(16, 184);
+            this.btnREScriptProbe.Size = new System.Drawing.Size(280, 28);
+            this.btnREScriptProbe.Text = "REScript Probe (import + remove test)";
+            this.btnREScriptProbe.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnREScriptProbe.BackColor = System.Drawing.Color.FromArgb(255, 240, 200);
+            this.btnREScriptProbe.FlatAppearance.BorderColor = clrBorder;
+            this.btnREScriptProbe.Font = fontCaption;
+            this.btnREScriptProbe.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnREScriptProbe.Click += new System.EventHandler(this.BtnREScriptProbe_Click);
+            this.grpDebugLog.Controls.Add(this.btnREScriptProbe);
+
+            // --- REScript Cross-Version probe: full pipeline test (clean PU + CC compare + Remove) ---
+            this.btnREScriptXVProbe = new System.Windows.Forms.Button();
+            this.btnREScriptXVProbe.Location = new System.Drawing.Point(304, 184);
+            this.btnREScriptXVProbe.Size = new System.Drawing.Size(280, 28);
+            this.btnREScriptXVProbe.Text = "REScript Cross-Version Probe";
+            this.btnREScriptXVProbe.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnREScriptXVProbe.BackColor = System.Drawing.Color.FromArgb(255, 220, 180);
+            this.btnREScriptXVProbe.FlatAppearance.BorderColor = clrBorder;
+            this.btnREScriptXVProbe.Font = fontCaption;
+            this.btnREScriptXVProbe.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnREScriptXVProbe.Click += new System.EventHandler(this.BtnREScriptXVProbe_Click);
+            this.grpDebugLog.Controls.Add(this.btnREScriptXVProbe);
+
             // --- Mart-Mart via ELA::OnFE (kept) ---
             this.btnCallOnFE = new System.Windows.Forms.Button();
             this.btnCallOnFE.Location = new System.Drawing.Point(244, 88);
@@ -1102,7 +1159,7 @@ namespace EliteSoft.Erwin.AddIn
             this.Load += new System.EventHandler(this.ModelConfigForm_Load);
 
             this.tabControl.ResumeLayout(false);
-            this.tabModel.ResumeLayout(false);
+            this.tabGeneral.ResumeLayout(false);
             this.tabConfiguration.ResumeLayout(false);
             this.tabGlossary.ResumeLayout(false);
             this.tabValidation.ResumeLayout(false);
@@ -1126,7 +1183,6 @@ namespace EliteSoft.Erwin.AddIn
 
         private System.Windows.Forms.TabControl tabControl;
         private System.Windows.Forms.TabPage tabGeneral;
-        private System.Windows.Forms.TabPage tabModel;
         private System.Windows.Forms.TabPage tabConfiguration;
         private System.Windows.Forms.TabPage tabGlossary;
         private System.Windows.Forms.TabPage tabValidation;
@@ -1206,6 +1262,12 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.Button btnDumpCCState;
         private System.Windows.Forms.Button btnCallOnFE;
         private System.Windows.Forms.Button btnToggleEdrST;
+        private System.Windows.Forms.Button btnToggleMonitor;
+        private bool _monitorOn = false;
+        private System.Windows.Forms.Button btnFromDbProbe;
+        private System.Windows.Forms.Button btnFEAlterProbe;
+        private System.Windows.Forms.Button btnREScriptProbe;
+        private System.Windows.Forms.Button btnREScriptXVProbe;
         private bool _edrStOn = false;
         private System.Windows.Forms.Button btnInvokePreviewDirect;
         private System.Windows.Forms.TextBox txtLogSearch;

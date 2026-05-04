@@ -38,6 +38,11 @@ namespace EliteSoft.Erwin.AddIn
         // Services
         private ColumnValidationService _validationService;
         private TableTypeMonitorService _tableTypeMonitorService;
+
+        // TEMPORARY discovery — logs erwin Column Editor + child window classes/messages
+        // so we can pick the right strategy for filtering the Physical Data Type dropdown.
+        // Remove once that filter is implemented.
+        private ColumnEditorInspector _columnEditorInspector;
         private ValidationCoordinatorService _validationCoordinatorService;
         private PropertyApplicatorService _propertyApplicatorService;
         private UdpRuntimeService _udpRuntimeService;
@@ -56,10 +61,14 @@ namespace EliteSoft.Erwin.AddIn
         public ModelConfigForm(dynamic scapi)
         {
             _scapi = scapi ?? throw new ArgumentNullException(nameof(scapi));
-            InitializeComponent();
-            InitializeValidationUI();
-            InitializeGeneralTab();
-            InitializeGlossaryRefreshTimer();
+            using (AddinLogger.BeginScope("InitializeComponent"))
+                InitializeComponent();
+            using (AddinLogger.BeginScope("InitializeValidationUI"))
+                InitializeValidationUI();
+            using (AddinLogger.BeginScope("InitializeGeneralTab"))
+                InitializeGeneralTab();
+            using (AddinLogger.BeginScope("InitializeGlossaryRefreshTimer"))
+                InitializeGlossaryRefreshTimer();
         }
 
         #endregion
@@ -68,7 +77,8 @@ namespace EliteSoft.Erwin.AddIn
 
         private void ModelConfigForm_Load(object sender, EventArgs e)
         {
-            LoadOpenModels();
+            using (AddinLogger.BeginScope("ModelConfigForm_Load"))
+                LoadOpenModels();
         }
 
         protected override void OnFormClosed(FormClosedEventArgs e)
@@ -83,26 +93,38 @@ namespace EliteSoft.Erwin.AddIn
 
         private void LoadOpenModels()
         {
+            using var scope = AddinLogger.BeginScope("LoadOpenModels");
             try
             {
                 UpdateConnectionStatus(StatusLoading, Color.Gray);
                 _openModels.Clear();
                 Application.DoEvents();
 
-                dynamic persistenceUnits = _scapi.PersistenceUnits;
+                dynamic persistenceUnits;
+                using (AddinLogger.BeginScope("scapi.PersistenceUnits"))
+                    persistenceUnits = _scapi.PersistenceUnits;
 
-                if (persistenceUnits.Count == 0)
+                int puCount;
+                using (AddinLogger.BeginScope("PersistenceUnits.Count"))
+                    puCount = persistenceUnits.Count;
+                AddinLogger.Log($"PersistenceUnits.Count = {puCount}");
+
+                if (puCount == 0)
                 {
+                    AddinLogger.Log("No models open - starting reconnect timer");
                     lblActiveModel.Text = "(Waiting for model...)";
                     UpdateStatus("No models open. Waiting for a model...", Color.Gray);
                     StartReconnectTimer();
                     return;
                 }
 
-                for (int i = 0; i < persistenceUnits.Count; i++)
+                using (AddinLogger.BeginScope($"Iterate {puCount} PUs"))
                 {
-                    dynamic model = persistenceUnits.Item(i);
-                    _openModels.Add(model);
+                    for (int i = 0; i < puCount; i++)
+                    {
+                        dynamic model = persistenceUnits.Item(i);
+                        _openModels.Add(model);
+                    }
                 }
 
                 if (_openModels.Count > 0)
@@ -112,6 +134,7 @@ namespace EliteSoft.Erwin.AddIn
             }
             catch (Exception ex)
             {
+                AddinLogger.Log($"LoadOpenModels FAILED: {ex.GetType().Name}: {ex.Message}");
                 ShowError($"Failed to load models:\n{ex.Message}", "Connection Error");
             }
         }
@@ -157,6 +180,7 @@ namespace EliteSoft.Erwin.AddIn
         private void ConnectToModel(int modelIndex)
         {
             Log($">>> ConnectToModel({modelIndex}) called. Stack: {new System.Diagnostics.StackTrace(1, false).GetFrame(0)?.GetMethod()?.Name ?? "?"}");
+            using var scope = AddinLogger.BeginScope($"ConnectToModel({modelIndex})");
 
             // Show splash IMMEDIATELY. _session.Open() below can take 2-4s on large
             // models; without early splash the user sees a 5s dead-time after
@@ -166,32 +190,40 @@ namespace EliteSoft.Erwin.AddIn
             try
             {
                 // Stop old monitoring BEFORE closing session (prevents COM exception race)
-                if (_validationCoordinatorService != null)
+                using (AddinLogger.BeginScope("Stop old monitoring"))
                 {
-                    _validationCoordinatorService.OnSessionLost -= HandleSessionLost;
-                    _validationCoordinatorService.OnModelChanged -= HandleModelChanged;
-                    _validationCoordinatorService.OnModelUdpChanged -= HandleModelUdpChanged;
-                    _validationCoordinatorService.StopMonitoring();
+                    if (_validationCoordinatorService != null)
+                    {
+                        _validationCoordinatorService.OnSessionLost -= HandleSessionLost;
+                        _validationCoordinatorService.OnModelChanged -= HandleModelChanged;
+                        _validationCoordinatorService.OnModelUdpChanged -= HandleModelUdpChanged;
+                        _validationCoordinatorService.StopMonitoring();
+                    }
+                    _tableTypeMonitorService?.StopMonitoring();
                 }
-                _tableTypeMonitorService?.StopMonitoring();
 
-                CloseCurrentSession();
+                using (AddinLogger.BeginScope("CloseCurrentSession"))
+                    CloseCurrentSession();
                 _isConnected = false;
                 UpdateConnectionStatus(StatusConnecting, Color.Gray);
                 EnableControls(false);
                 Application.DoEvents();
 
                 _currentModel = _openModels[modelIndex];
-                _session = _scapi.Sessions.Add();
-                _session.Open(_currentModel);
+                using (AddinLogger.BeginScope("scapi.Sessions.Add()"))
+                    _session = _scapi.Sessions.Add();
+                using (AddinLogger.BeginScope("session.Open(model)"))
+                    _session.Open(_currentModel);
 
                 _connectedModelName = GetModelName(_currentModel) ?? $"Model {modelIndex + 1}";
                 lblActiveModel.Text = _connectedModelName;
+                AddinLogger.Log($"Connected to model: {_connectedModelName}");
 
                 _isConnected = true;
                 StopReconnectTimer();
                 UpdateConnectionStatus(StatusConnected, Color.DarkGreen);
-                LoadExistingValues();
+                using (AddinLogger.BeginScope("LoadExistingValues"))
+                    LoadExistingValues();
                 EnableControls(true);
                 UpdateStatus("Connected to model.", Color.DarkGreen);
 
@@ -221,12 +253,14 @@ namespace EliteSoft.Erwin.AddIn
                 if (_globalDataLoaded)
                 {
                     // Model switch: only reload model-specific services (fast)
-                    ReinitializeForModelSwitch();
+                    using (AddinLogger.BeginScope("ReinitializeForModelSwitch"))
+                        ReinitializeForModelSwitch();
                 }
                 else
                 {
                     // First connect: full initialization
-                    InitializeValidationService();
+                    using (AddinLogger.BeginScope("InitializeValidationService"))
+                        InitializeValidationService();
                     _globalDataLoaded = true;
                 }
 
@@ -359,32 +393,48 @@ namespace EliteSoft.Erwin.AddIn
         {
             Log("Initializing validation service (full)...");
 
-            // Corporate guard
-            var corpContext = CorporateContextService.Instance;
-            corpContext.OnLog -= Log;
-            corpContext.OnLog += Log;
-            if (!corpContext.Initialize())
+            // Config guard — resolve CONFIG row from the active model's mart path
+            var ctx = ConfigContextService.Instance;
+            ctx.OnLog -= Log;
+            ctx.OnLog += Log;
+
+            // PU.Locator is unreliable on r10.10 Mart-bound PUs (often ""),
+            // so we use the shared fallback chain: direct -> PropertyBag() ->
+            // PropertyBag(null,true) -> erwin main-window title.
+            string locator = PuLocatorReader.Read(_currentModel, (Action<string>)Log);
+            Log($"PuLocatorReader returned: '{locator}' (length={locator.Length})");
+
+            bool ok;
+            using (AddinLogger.BeginScope("ConfigContext.Initialize"))
+                ok = ctx.Initialize(locator);
+            if (!ok)
             {
                 ErwinAddIn.ShowTopMostMessage(
-                    corpContext.LastError ?? "Active Corporate not configured.\nPlease run Admin panel first.",
+                    ctx.LastError ?? "No CONFIG mapped to this model's mart path.\nPlease run Admin panel first.",
                     "Configuration Error");
-                Log($"Corporate not configured -- closing extension.");
+                Log("Config not resolved -- closing extension.");
                 this.ForceClose();
                 return;
             }
-            Log($"Corporate: {corpContext.ActiveCorporateName} (ID={corpContext.ActiveCorporateId}), {corpContext.EffectiveModelIds.Count} effective model(s)");
+            Log($"Config: {ctx.ActiveConfigName} (ID={ctx.ActiveConfigId}), corporate='{ctx.CorporateName ?? "(none)"}', mart='{ctx.MartPath}'");
 
             // Global data (corporate-scoped, not model-specific)
-            DisposeServices();
+            using (AddinLogger.BeginScope("DisposeServices"))
+                DisposeServices();
             GlossaryService.Instance.OnLog -= Log;
             GlossaryService.Instance.OnLog += Log;
-            LoadGlossary();
-            LoadPredefinedColumns();
-            LoadDomainDefs();
-            LoadNamingStandards();
+            using (AddinLogger.BeginScope("LoadGlossary"))
+                LoadGlossary();
+            using (AddinLogger.BeginScope("LoadPredefinedColumns"))
+                LoadPredefinedColumns();
+            using (AddinLogger.BeginScope("LoadDomainDefs"))
+                LoadDomainDefs();
+            using (AddinLogger.BeginScope("LoadNamingStandards"))
+                LoadNamingStandards();
 
             // Model-specific initialization
-            InitializeModelServices();
+            using (AddinLogger.BeginScope("InitializeModelServices"))
+                InitializeModelServices();
         }
 
         /// <summary>
@@ -404,33 +454,42 @@ namespace EliteSoft.Erwin.AddIn
         /// </summary>
         private void InitializeModelServices()
         {
-            EnsureAllUdpsExist();
-            SetModelPathValue();
+            using (AddinLogger.BeginScope("EnsureAllUdpsExist"))
+                EnsureAllUdpsExist();
+            using (AddinLogger.BeginScope("SetModelPathValue"))
+                SetModelPathValue();
 
             _validationService = new ColumnValidationService(_session);
             btnValidateAll.Enabled = true;
 
-            InitializePropertyApplicator();
+            using (AddinLogger.BeginScope("InitializePropertyApplicator"))
+                InitializePropertyApplicator();
 
             // Load dependency sets BEFORE UdpRuntime (so List UDP options are available during creation)
             _dependencySetService = new DependencySetRuntimeService();
             _dependencySetService.OnLog += Log;
-            if (_dependencySetService.Load())
+            using (AddinLogger.BeginScope("DependencySetService.Load"))
             {
-                Log($"Dependency sets loaded: {_dependencySetService.SetCount} set(s), {_dependencySetService.MappingCount} mapping(s)");
+                if (_dependencySetService.Load())
+                {
+                    Log($"Dependency sets loaded: {_dependencySetService.SetCount} set(s), {_dependencySetService.MappingCount} mapping(s)");
+                }
             }
 
             _udpRuntimeService = new UdpRuntimeService(_session, _scapi, _currentModel);
             _udpRuntimeService.OnLog += Log;
             _udpRuntimeService.SetDependencySetService(_dependencySetService);
-            if (_udpRuntimeService.Initialize())
+            using (AddinLogger.BeginScope("UdpRuntimeService.Initialize"))
             {
-                var objectTypes = string.Join(", ", UdpDefinitionService.Instance.GetLoadedObjectTypes());
-                Log($"UDP runtime initialized: {UdpDefinitionService.Instance.Count} definitions [{objectTypes}]");
-            }
-            else
-            {
-                Log("UDP runtime initialization skipped (no definitions or DB not configured)");
+                if (_udpRuntimeService.Initialize())
+                {
+                    var objectTypes = string.Join(", ", UdpDefinitionService.Instance.GetLoadedObjectTypes());
+                    Log($"UDP runtime initialized: {UdpDefinitionService.Instance.Count} definitions [{objectTypes}]");
+                }
+                else
+                {
+                    Log("UDP runtime initialization skipped (no definitions or DB not configured)");
+                }
             }
 
             _tableTypeMonitorService = new TableTypeMonitorService(_session);
@@ -439,8 +498,10 @@ namespace EliteSoft.Erwin.AddIn
                 _tableTypeMonitorService.SetPropertyApplicator(_propertyApplicatorService);
             if (_udpRuntimeService.IsInitialized)
                 _tableTypeMonitorService.SetUdpRuntimeService(_udpRuntimeService);
-            _tableTypeMonitorService.TakeSnapshot();
-            _tableTypeMonitorService.StartMonitoring();
+            using (AddinLogger.BeginScope("TableTypeMonitor.TakeSnapshot"))
+                _tableTypeMonitorService.TakeSnapshot();
+            using (AddinLogger.BeginScope("TableTypeMonitor.StartMonitoring"))
+                _tableTypeMonitorService.StartMonitoring();
 
             _validationCoordinatorService = new ValidationCoordinatorService(_session, _scapi);
             _validationCoordinatorService.OnLog += Log;
@@ -452,13 +513,39 @@ namespace EliteSoft.Erwin.AddIn
                 _validationCoordinatorService.SetUdpRuntimeService(_udpRuntimeService);
             if (_dependencySetService != null && _dependencySetService.IsLoaded)
                 _validationCoordinatorService.SetDependencySetService(_dependencySetService);
-            _validationCoordinatorService.StartMonitoring();
+            using (AddinLogger.BeginScope("ValidationCoordinator.StartMonitoring"))
+                _validationCoordinatorService.StartMonitoring();
 
-            LoadTablesComboBox();
+            // Discovery: hook column-editor lifecycle to learn the Physical Data Type
+            // dropdown's window class. Disposed via DisposeServices on form close.
+            if (_columnEditorInspector == null)
+            {
+                _columnEditorInspector = new ColumnEditorInspector();
+                _columnEditorInspector.OnLog += Log;
+                _columnEditorInspector.Start();
+            }
+
+            // Discovery (one-shot): walk metamodel for datatype-related class/property
+            // entries. Goal is to find the source feeding the Physical Data Type tree
+            // dropdown so we can constrain it at the model level instead of hooking the
+            // UI. Logs prefixed [DTProbe]; remove this block once a filter strategy is
+            // implemented.
+            try
+            {
+                var probe = new MetamodelDatatypeProbe(_scapi, _currentModel);
+                probe.OnLog += Log;
+                probe.Run();
+            }
+            catch (Exception ex) { Log($"[DTProbe] startup probe failed: {ex.Message}"); }
+
+            using (AddinLogger.BeginScope("LoadTablesComboBox"))
+                LoadTablesComboBox();
             UpdateValidationStatus();
             Log("Validation service initialized.");
-            UpdateGeneralTab();
-            PopulateVersionCombos();
+            using (AddinLogger.BeginScope("UpdateGeneralTab"))
+                UpdateGeneralTab();
+            using (AddinLogger.BeginScope("PopulateVersionCombos"))
+                PopulateVersionCombos();
 
             // Save baseline DDL at connect time (FEModel_DDL does NOT corrupt PU)
             // Baseline DDL removed - DdlHelper fetches any version from Mart on demand
@@ -472,6 +559,11 @@ namespace EliteSoft.Erwin.AddIn
         private Label _lblCorporateValue;
         private Label _lblDbValue;
         private Label _lblRegistryValue;
+
+        // Hidden tabs registry — Ctrl+Shift+RightClick on a tab header hides it,
+        // Ctrl+Shift+LeftClick on the copyright label on the General tab restores all.
+        // tabGeneral itself is never hidden because the restore mechanism lives on it.
+        private readonly List<TabPage> _hiddenTabs = new List<TabPage>();
 
         private void InitializeGeneralTab()
         {
@@ -512,17 +604,58 @@ namespace EliteSoft.Erwin.AddIn
                 }
                 else if (e.Button == MouseButtons.Left)
                 {
-                    // Hidden reveal: in packaged builds the Debug Log tab is
-                    // removed from the TabControl. Ctrl+Shift+LeftClick on the
-                    // copyright label restores it for the current session.
+                    // Restore every tab the user hid via Ctrl+Shift+RightClick on its header,
+                    // plus the Debug Log tab if a packaged build stripped it at startup.
+                    int restored = 0;
+                    foreach (var page in _hiddenTabs)
+                    {
+                        if (page != null && !tabControl.TabPages.Contains(page))
+                        {
+                            tabControl.TabPages.Add(page);
+                            restored++;
+                        }
+                    }
+                    _hiddenTabs.Clear();
+
                     if (tabDebug != null && !tabControl.TabPages.Contains(tabDebug))
                     {
                         tabControl.TabPages.Add(tabDebug);
                         tabControl.SelectedTab = tabDebug;
+                        restored++;
                     }
+
+                    if (restored > 0)
+                        Log($"Restored {restored} hidden tab(s)");
                 }
             };
             tabGeneral.Controls.Add(lblCopyright);
+
+            // Ctrl+Shift+RightClick on a tab header hides that tab. tabGeneral is protected
+            // so the restore label on it stays reachable. Restoring any hidden tab is done
+            // via Ctrl+Shift+LeftClick on the copyright label above.
+            tabControl.MouseDown += (s, e) =>
+            {
+                if (e.Button != MouseButtons.Right) return;
+                if (Control.ModifierKeys != (Keys.Control | Keys.Shift)) return;
+
+                for (int i = 0; i < tabControl.TabPages.Count; i++)
+                {
+                    var rect = tabControl.GetTabRect(i);
+                    if (!rect.Contains(e.Location)) continue;
+
+                    var page = tabControl.TabPages[i];
+                    if (page == tabGeneral)
+                    {
+                        Log("General tab cannot be hidden (it hosts the restore control).");
+                        return;
+                    }
+
+                    _hiddenTabs.Add(page);
+                    tabControl.TabPages.Remove(page);
+                    Log($"Tab '{page.Text}' hidden. Ctrl+Shift+LeftClick on the copyright label (General tab) to restore.");
+                    return;
+                }
+            };
 
             // --- Info Card ---
             var card = CreateInfoCard("", 24, 60, 812, 106, clrCardBg);
@@ -603,10 +736,12 @@ namespace EliteSoft.Erwin.AddIn
         {
             try
             {
-                var corp = CorporateContextService.Instance;
-                if (corp.IsInitialized)
+                var ctx = ConfigContextService.Instance;
+                if (ctx.IsInitialized)
                 {
-                    _lblCorporateValue.Text = corp.ActiveCorporateName;
+                    _lblCorporateValue.Text = string.IsNullOrEmpty(ctx.CorporateName)
+                        ? $"Config: {ctx.ActiveConfigName}"
+                        : $"{ctx.CorporateName} / {ctx.ActiveConfigName}";
                 }
 
                 var config = DatabaseService.Instance.GetConfig();
@@ -954,19 +1089,18 @@ namespace EliteSoft.Erwin.AddIn
                 var config = new RegistryBootstrapService().GetConfig();
                 if (config == null || !config.IsConfigured) return defaultInterval;
 
-                // Read from MODEL_PROPERTY: check effective model first, then All Models (ID=1)
-                int modelId = _propertyApplicatorService?.ModelId ?? 0;
+                // Read GLOSSARY_LOAD_INTERVAL from CONFIG_PROPERTY scoped on the active config.
+                // No "All Models" (ID=1) fallback after the schema rename — admin must put a
+                // row on the per-config record if they want a custom interval.
+                int cfgId = ConfigContextService.Instance.IsInitialized
+                    ? ConfigContextService.Instance.ActiveConfigId
+                    : 0;
+                if (cfgId <= 0) return defaultInterval;
+
                 using (var context = new EliteSoft.MetaAdmin.Shared.Data.RepoDbContext(config))
                 {
-                    var prop = context.ModelProperties
-                        .FirstOrDefault(p => p.ModelId == modelId && p.Key == "GLOSSARY_LOAD_INTERVAL");
-
-                    if (prop == null && modelId != 1)
-                    {
-                        prop = context.ModelProperties
-                            .FirstOrDefault(p => p.ModelId == 1 && p.Key == "GLOSSARY_LOAD_INTERVAL");
-                    }
-
+                    var prop = context.ConfigProperties
+                        .FirstOrDefault(p => p.ConfigId == cfgId && p.Key == "GLOSSARY_LOAD_INTERVAL");
                     if (prop != null && int.TryParse(prop.Value, out int minutes) && minutes > 0)
                         return minutes;
                 }
@@ -1233,35 +1367,28 @@ namespace EliteSoft.Erwin.AddIn
 
                 if (_propertyApplicatorService.Initialize())
                 {
-                    var platform = _propertyApplicatorService.DetectedPlatform;
                     int stdCount = _propertyApplicatorService.StandardCount;
                     int qCount = _propertyApplicatorService.QuestionCount;
-                    string statusParts = $"Platform: {platform.Name}  |  {stdCount} standard(s)";
+                    int dbmsVer = _propertyApplicatorService.DbmsVersionId;
+                    string statusParts = $"DBMS_VERSION_ID: {dbmsVer}  |  {stdCount} standard(s)";
                     if (qCount > 0) statusParts += $"  |  {qCount} rule(s) loaded";
                     lblPlatformStatus.Text = statusParts;
                     lblPlatformStatus.ForeColor = Color.DarkGreen;
-                    Log($"PropertyApplicator: Ready ({platform.Name}, {stdCount} standards, {qCount} questions)");
+                    Log($"PropertyApplicator: Ready (DBMS_VERSION_ID={dbmsVer}, {stdCount} standards, {qCount} questions)");
                 }
                 else
                 {
-                    string targetServer = _propertyApplicatorService.TargetServerValue;
-                    var detectedPlatform = _propertyApplicatorService.DetectedPlatform;
-
-                    if (string.IsNullOrEmpty(targetServer))
-                    {
-                        lblPlatformStatus.Text = "Platform: Target_Server not found in model";
-                    }
-                    else if (detectedPlatform != null)
-                    {
-                        // Platform matched but project not found
-                        lblPlatformStatus.Text = $"Platform: {detectedPlatform.Name} (OK)  |  Project not found in DB";
-                    }
+                    // Initialize failed — most likely the active CONFIG has no DBMS_VERSION_ID
+                    // assigned, or the config has zero matching property defs / standards.
+                    var ctx = ConfigContextService.Instance;
+                    if (!ctx.IsInitialized)
+                        lblPlatformStatus.Text = "Config not resolved for this model.";
+                    else if (!ctx.DbmsVersionId.HasValue)
+                        lblPlatformStatus.Text = $"CONFIG '{ctx.ActiveConfigName}' has no DBMS_VERSION_ID — pick one in Admin.";
                     else
-                    {
-                        lblPlatformStatus.Text = $"Platform: No match for '{targetServer}' in MC_PLATFORM";
-                    }
+                        lblPlatformStatus.Text = $"No property definitions for DBMS_VERSION_ID={ctx.DbmsVersionId} TABLE.";
                     lblPlatformStatus.ForeColor = Color.OrangeRed;
-                    Log("PropertyApplicator: Initialization failed (no platform/project/standards)");
+                    Log("PropertyApplicator: Initialization failed (no config/dbms_version/standards)");
                     _propertyApplicatorService.Dispose();
                     _propertyApplicatorService = null;
                 }
@@ -2249,11 +2376,7 @@ namespace EliteSoft.Erwin.AddIn
             Application.DoEvents();
 
             bool martMode = rbFromMart.Checked;
-            if (rbFromDB.Checked)
-            {
-                Log("-- From-DB mode is not wired to the new programmatic pipeline yet.");
-                Log("   Falling back to 'current model vs last save' alter.");
-            }
+            bool dbMode = rbFromDB.Checked;
 
             Action<string> log = msg =>
             {
@@ -2265,7 +2388,21 @@ namespace EliteSoft.Erwin.AddIn
             string err = null;
             try
             {
-                if (martMode)
+                if (dbMode)
+                {
+                    // From-DB programmatic pipeline (FROM_DB_PLAN.md):
+                    //   1. silent RE imports DB schema into a fresh in-memory PU
+                    //      (locator='', PUs.Remove-safe per reference_rescript_pu_removable)
+                    //   2. activate original Mart MDI child so left=dirty
+                    //   3. drive CC wizard "Open Models in Memory" picker
+                    //      against the RE'd PU as right
+                    //   4. OnFE+GA captures alter DDL (left dirty vs right RE'd)
+                    //   5. clean up: CloseSession + PUs.Remove(rePU,false)
+                    var (dbScript, dbErr) = await RunFromDbDdlPipelineAsync(log);
+                    script = dbScript;
+                    err = dbErr;
+                }
+                else if (martMode)
                 {
                     int v = ParseRightVersion();
                     int activeV = ParseActivePuVersion();
@@ -2298,6 +2435,21 @@ namespace EliteSoft.Erwin.AddIn
                     }
                     else
                     {
+                        // Suspend all monitoring services for the entire
+                        // cross-version pipeline. Apply-to-Right + cross-mart
+                        // PU loading triggers UdpRuntime/PropertyApplicator
+                        // rename loops + ValidationCoordinator popup spam
+                        // identical to the From-DB case (the lock-up that
+                        // followed cross-version DDL generation in 04-26 logs
+                        // is a strong suspect for this validation cascade).
+                        // Same 9-layer guard pattern as RunFromDbDdlPipelineAsync.
+                        _validationCoordinatorService?.SuspendValidation();
+                        try { _tableTypeMonitorService?.StopMonitoring(); } catch (Exception ex) { log($"[XV] StopMonitoring err: {ex.Message}"); }
+                        try { _validationService?.StopMonitoring(); } catch (Exception ex) { log($"[XV] ColumnValidation StopMonitoring err: {ex.Message}"); }
+                        log("[XV] all monitoring services suspended for pipeline duration");
+
+                        try
+                        {
                         // DIAG: dump session PUs to pinpoint stale dirty
                         // right-version PUs left over from previous runs.
                         LogSessionPUs("PRE-RUN", log);
@@ -2337,14 +2489,66 @@ namespace EliteSoft.Erwin.AddIn
                             Services.MartMartAutomation.CloseSession(sess, log);
                             try { overlay?.Close(); } catch { }
                         }
+
+                        // Evict the orphan right-version PU that CC wizard
+                        // loaded into the SCAPI session. Without this, the
+                        // session accumulates a Model_1 v<right> PU on every
+                        // cross-version run; erwin's main UI thread can hang
+                        // on subsequent modal/popup lookups against the now
+                        // stale engine references (verified lock-up
+                        // 2026-04-27 01:13 after a successful v3-vs-v1 run).
+                        //
+                        // We wait 800 ms first because the CC engine clears
+                        // its global state pointers asynchronously after
+                        // ForceDestroyWizard returns - on the same UI thread
+                        // that's about to receive PUs.Remove. Removing too
+                        // early triggered AVs in earlier sessions; the
+                        // 800 ms settle window has been stable in manual
+                        // tests with the post-ForceDestroy CLEAN-EVT
+                        // pipeline.
+                        //
+                        // CloseSelectedVersionPU is defensive: tries
+                        // PersistenceUnits.Remove first, falls back to
+                        // pu.Close() if Remove throws, with a background
+                        // popup watcher to dismiss any "Save changes to
+                        // <model>?" prompts the close path can spawn.
+                        if (script != null && !string.IsNullOrEmpty(script))
+                        {
+                            await System.Threading.Tasks.Task.Delay(800);
+                            LogSessionPUs("PRE-PU-REMOVE", log);
+                            CloseSelectedVersionPU(v, catalog, log);
+                            LogSessionPUs("POST-PU-REMOVE", log);
+                        }
+                        }
+                        finally
+                        {
+                            // Resume monitoring fire-and-forget background even
+                            // if the pipeline threw. StartMonitoring internally
+                            // triggers TakeSnapshot (model walk = several
+                            // seconds UI freeze). Same background-resume
+                            // pattern as From-DB pipeline.
+                            _ = System.Threading.Tasks.Task.Run(() =>
+                            {
+                                try { _validationCoordinatorService?.ResumeValidation(); }
+                                catch (Exception ex) { try { log($"[XV] bg ResumeValidation err: {ex.Message}"); } catch { } }
+                                try { _tableTypeMonitorService?.StartMonitoring(); }
+                                catch (Exception ex) { try { log($"[XV] bg StartMonitoring err: {ex.Message}"); } catch { } }
+                                try { _validationService?.StartMonitoring(); }
+                                catch (Exception ex) { try { log($"[XV] bg ColumnValidation StartMonitoring err: {ex.Message}"); } catch { } }
+                                try { log("[XV] monitoring resumed (background)"); } catch { }
+                            });
+                            log("[XV] pipeline complete - monitoring resume scheduled to background");
+                        }
                     }
                     } // close: else (different versions) of sameVersion check
                 }
                 else
                 {
-                    // From-DB / fallback: existing Ctrl+Alt+T Hybrid B pipeline.
-                    script = await System.Threading.Tasks.Task.Run(() =>
-                        Services.NativeBridgeService.GenerateAlterDdl(log));
+                    // No source mode selected. Surface a clear error rather
+                    // than silently running a different pipeline
+                    // (feedback_no_silent_fallback): silent fallbacks mask
+                    // failures and produce DDL the user did not ask for.
+                    err = "No source selected. Choose 'From Mart' or 'From DB' first.";
                 }
             }
             catch (Exception ex)
@@ -2368,6 +2572,14 @@ namespace EliteSoft.Erwin.AddIn
                                         "-- Check Debug Log for the step that failed (CC wizard open, \n" +
                                         "-- Mart picker navigation, Apply-to-Right click, or native DDL capture).\n";
                 }
+                else if (dbMode)
+                {
+                    lblDDLStatus.Text = "From-DB automation failed (see Debug Log).";
+                    lblDDLStatus.ForeColor = Color.Red;
+                    rtbDDLOutput.Text = "-- FAILED: From-DB CC + Apply-to-Right did not produce DDL.\n" +
+                                        "-- Check Debug Log for the step that failed (silent RE, MDI tab\n" +
+                                        "-- activation, Open-Models-in-Memory picker, Apply-to-Right, OnFE).\n";
+                }
                 else
                 {
                     lblDDLStatus.Text = "erwin did not return a DDL buffer (see Debug Log).";
@@ -2379,21 +2591,23 @@ namespace EliteSoft.Erwin.AddIn
             {
                 lblDDLStatus.Text = "No differences detected.";
                 lblDDLStatus.ForeColor = Color.OrangeRed;
-                rtbDDLOutput.Text = martMode
-                    ? "-- No differences between current model and Mart baseline.\n"
-                    : "-- No differences between model and last save.\n";
+                if (martMode)
+                    rtbDDLOutput.Text = "-- No differences between current model and Mart baseline.\n";
+                else if (dbMode)
+                    rtbDDLOutput.Text = "-- No differences between current model and DB schema.\n";
+                else
+                    rtbDDLOutput.Text = "-- No differences between model and last save.\n";
             }
             else
             {
                 ShowDDLResult(script, "Alter DDL");
                 Log($"DDL produced ({script.Length} chars). Use Copy button to grab it.");
-                // DIAG: dump session PUs AFTER successful DDL so we can
-                // compare to PRE-RUN state and see what stale PUs linger.
-                // NOTE: we deliberately do NOT auto-remove the stale v1 PU
-                // here: PersistenceUnits.Remove(pu,false) crashes erwin
-                // (CC engine still holds internal references to v1 after
-                // cleanup). Needs a different strategy.
-                if (martMode)
+                // The cross-version path now evicts the orphan right-version
+                // PU before reaching here (see CloseSelectedVersionPU call
+                // inside the cross-version branch). This DIAG dump is the
+                // last-stop sanity check that no PUs remain leaked across
+                // runs.
+                if (martMode || dbMode)
                     LogSessionPUs("POST-RUN", log);
             }
 
@@ -2403,12 +2617,28 @@ namespace EliteSoft.Erwin.AddIn
             // path pushes erwin's main window up, and the brief
             // wizard-open/close cycle leaves focus on erwin. The TopMost
             // flip is Windows' sanctioned way to jump past the foreground
-            // lock owned by another window in the same process.
+            // lock owned by another window in the same process. From-DB
+            // pipeline'inda 3 dialog cleanup (FE Wizard + RD + CC) sonrasi
+            // erwin focus'u inatla tutuyor; double-flip + delay + ek
+            // SetForegroundWindow ile zorla.
             try
             {
                 this.TopMost = true;
                 this.Activate();
                 this.BringToFront();
+                this.Focus();
+                this.TopMost = false;
+
+                // Double-flip after a small delay - cleanup'tan sonra
+                // erwin'in async window activation mesajlari TopMost
+                // flip'imizi over-write edebiliyor. Ikinci flip ile
+                // garantile.
+                await System.Threading.Tasks.Task.Delay(150);
+                this.TopMost = true;
+                this.Activate();
+                this.BringToFront();
+                this.Focus();
+                Services.Win32Helper.SetForegroundWindowPublic(this.Handle);
                 this.TopMost = false;
             }
             catch (Exception focusEx)
@@ -2813,11 +3043,477 @@ namespace EliteSoft.Erwin.AddIn
         private string _dbUser = "";
         private bool _dbUseWindowsAuth = false;
         private int _dbTypeCode = 0;
+        private bool _dbUseNative = true;
+        private string _dbDsnName = "";
 
         /// <summary>
-        /// "From DB" path: compare active model DDL against a DDL reverse-engineered
-        /// from a live database by DdlHelper (separate process, silent, no manual prompts).
-        /// Mirrors the Mart flow: validate -> wait dialog -> background call -> ShowDDLResult.
+        /// Production From-DB alter DDL pipeline (FROM_DB_PLAN.md).
+        /// Reuses the cross-version Mart-Mart CC wizard infrastructure but
+        /// with the right side being a silent-RE'd in-memory PU (locator='')
+        /// instead of a Mart locator. The locator='' PU is removable via
+        /// PUs.Remove(pu,false) without RPC_E_SERVERFAULT
+        /// (reference_rescript_pu_removable.md), so the orphan/lock issue
+        /// of cross-version Mart-Mart does not apply here.
+        ///
+        /// Steps:
+        ///   1. validate DB connection + schema (prompt Configure if missing)
+        ///   2. default tables = every entity in active model when none picked
+        ///   3. silent RE creates a fresh PU populated from DB schema
+        ///   4. ActivateMartMdiChild flips active erwin tab back to dirty Mart
+        ///      so CC's left side is the dirty active model
+        ///   5. DriveCCDbAndApplyAsync drives the CC wizard's "Open Models in
+        ///      Memory" picker against the RE'd PU as right + Apply-to-Right
+        ///   6. NativeBridgeService.GenerateMartMartDdlViaOnFE captures alter
+        ///      DDL via OnFE+GA pipeline (reference_dirty_alter_ddl_pipeline)
+        ///   7. CloseSession + PUs.Remove(rePU,false) leaves session clean
+        /// </summary>
+        private async System.Threading.Tasks.Task<(string script, string err)>
+            RunFromDbDdlPipelineAsync(Action<string> log)
+        {
+            // Step 1: DB connection sanity. Empty conn string or stale (5= empty) -> Configure.
+            bool needsConfigure = string.IsNullOrEmpty(_dbConnectionString)
+                || _dbConnectionString.Contains("|5=\n") || _dbConnectionString.EndsWith("|5=");
+            if (needsConfigure)
+            {
+                _dbConnectionString = "";
+                BtnConfigureDB_Click(null, EventArgs.Empty);
+                if (string.IsNullOrEmpty(_dbConnectionString))
+                    return (null, "DB connection not configured.");
+            }
+            if (string.IsNullOrWhiteSpace(_dbHost) || string.IsNullOrWhiteSpace(_dbName) || _dbTypeCode == 0)
+                return (null, "DB host/database/type missing - run Configure first.");
+
+            // Step 1b: schema sanity. RE returns empty when no schema/owner
+            // filter is set - so block early with a clear error instead of
+            // discovering it after RE wastes ~5s.
+            if (string.IsNullOrWhiteSpace(_dbSchema))
+            {
+                ErwinAddIn.ShowTopMostMessage(
+                    "DB schema/owner is required for reverse engineering.\n\n" +
+                    "Open 'Configure...' on the From DB row and set the schema filter (e.g. dbo).",
+                    "From DB", isError: false);
+                BtnConfigureDB_Click(null, EventArgs.Empty);
+                if (string.IsNullOrWhiteSpace(_dbSchema))
+                    return (null, "DB schema filter missing.");
+            }
+
+            // Step 1c: dialect must match. The RE'd PU's dialect (its
+            // Target_Server encoded Int32) drives how erwin's CC engine
+            // and OnFE/GA interpret schema objects. If the active model
+            // and the user's Configure DB-type pick resolve to DIFFERENT
+            // encoded Target_Server values, RE produces a cross-dialect
+            // PU - CC compare then yields a meaningless diff that AVs
+            // OnFE/GA when it tries to emit alter DDL (08:35:22 crash on
+            // 24-table run, log: GA ENTER without GA wrote, native
+            // process death). Surface this mismatch up front rather than
+            // silent-overriding (feedback_no_silent_fallback) so the user
+            // consciously fixes the DB-type pick.
+            long activeTargetServer = 0;
+            int activeTargetVersion = 0;
+            try
+            {
+                dynamic pb = _currentModel.PropertyBag();
+                object tsRaw = pb?.Value("Target_Server");
+                if (tsRaw != null && long.TryParse(tsRaw.ToString(), out long ts))
+                    activeTargetServer = ts;
+                object tsvRaw = pb?.Value("Target_Server_Version");
+                if (tsvRaw != null && int.TryParse(tsvRaw.ToString(), out int tsv))
+                    activeTargetVersion = tsv;
+            }
+            catch (Exception pbEx)
+            {
+                return (null, $"Could not read active model dialect: {pbEx.GetType().Name}: {pbEx.Message}");
+            }
+            if (activeTargetServer == 0)
+                return (null, "Active model has no Target_Server property - cannot derive dialect for RE.");
+            log($"[From-DB] active dialect: Target_Server={activeTargetServer}, Version={activeTargetVersion}");
+            log($"[From-DB] Configure DB type: code={_dbTypeCode}, target_server={_dbTargetServer}, version={_dbTargetVersion}");
+
+            if (activeTargetServer != _dbTargetServer)
+                return (null,
+                    $"DB type does not match active model dialect.\n" +
+                    $"  Active model Target_Server = {activeTargetServer}\n" +
+                    $"  Configure dialog selection = {_dbTargetServer} (DB type code {_dbTypeCode})\n" +
+                    "Open 'Configure...' on the From DB row and pick the DB type whose dialect matches the active model.");
+
+            // Step 2: tables must be explicitly selected. No silent
+            // "all-tables" fallback (feedback_no_silent_fallback) - user
+            // must pick the comparison set up front so the resulting alter
+            // DDL is never wider than what they asked for.
+            var tableList = new List<string>(_dbSelectedTables ?? new List<string>());
+            if (tableList.Count == 0)
+                return (null, "No tables selected. Use 'Select Tables...' on the From DB row first.");
+            log($"[From-DB] using {tableList.Count} selected table(s).");
+
+            // ALL addin monitoring services suspended for the entire
+            // pipeline. Validation alone wasn't enough: log 13:12-13:15
+            // showed PropertyApplicator/UdpRuntime/GlossaryService trapped
+            // in an infinite "PLEASE CHANGE IT" rename loop after Apply-
+            // to-Right (every column rename fired Glossary validation
+            // FAILED -> Renamed -> PLEASE_CHANGE_IT__N -> Renamed -> ...
+            // each iteration spawned a popup; erwin UI thread overload =
+            // crash). Stopping ALL monitoring breaks the loop completely.
+            _validationCoordinatorService?.SuspendValidation();
+            try { _tableTypeMonitorService?.StopMonitoring(); } catch (Exception ex) { log($"[From-DB] StopMonitoring err: {ex.Message}"); }
+            try { _validationService?.StopMonitoring(); } catch (Exception ex) { log($"[From-DB] ColumnValidation StopMonitoring err: {ex.Message}"); }
+            log("[From-DB] all monitoring services suspended for pipeline duration");
+
+            // GECICI DEBUG: kullanici manuel RD inceleme istedi (2026-04-27).
+            // Splash overlay devre disi - RD ekrani gorunur olsun.
+            // Apply-to-Right click oncesi MessageBox ile pause.
+            const bool DEBUG_FROMDB_VISIBLE = false;
+            Form overlay = DEBUG_FROMDB_VISIBLE ? null : ShowBusyOverlay("Generating From-DB DDL, please wait...");
+            Action<bool> overlayToggle = DEBUG_FROMDB_VISIBLE ? (Action<bool>)null : (visible =>
+            {
+                try
+                {
+                    if (InvokeRequired)
+                        Invoke(new Action(() => ToggleBusyOverlay(overlay, visible)));
+                    else
+                        ToggleBusyOverlay(overlay, visible);
+                }
+                catch (Exception toggleEx)
+                {
+                    log($"[From-DB] overlay toggle failed: {toggleEx.Message}");
+                }
+            });
+
+            dynamic rePU = null;
+            string rePuName = null;
+            Services.MartMartAutomation.CCSession sess = null;
+            string script = null;
+            string err = null;
+            try
+            {
+                LogSessionPUs("PRE-RUN", log);
+
+                // Step 3: silent RE on configured DB. Synchronous SCAPI call -
+                // run on threadpool to keep UI responsive (and to match the
+                // Mart-Mart same-version path that uses Task.Run for OnFE).
+                log("[From-DB] silent RE starting...");
+                // Pass the ACTIVE dialect (not the Configure-dialog DB type)
+                // as the RE'd PU's Target_Server. _dbTargetServer/_dbTargetVersion
+                // are kept only for the connection string. After Step 1c's
+                // mismatch guard the two are equal anyway, but passing
+                // activeTargetServer here documents the semantic: the RE'd
+                // PU's dialect is dictated by the active model.
+                long reTargetServer = activeTargetServer;
+                int reTargetVersion = activeTargetVersion;
+                rePU = await System.Threading.Tasks.Task.Run(() =>
+                {
+                    try
+                    {
+                        // Physical model_type (not the silent_re_pattern's
+                        // default "Combined"): the active mart model is
+                        // viewed in Physical mode, and CC compare's
+                        // actionSummary semantics in Logical-Combined yield
+                        // CREATE-style "everything new" diffs that GA emits
+                        // as full DDL instead of alter DDL (10:04 run:
+                        // 4305-line CREATE TABLE dump rather than alter).
+                        // User observation 2026-04-27: toolbar combo only
+                        // shows "Logical" - need Physical for the alter DDL
+                        // path.
+                        return Services.DdlGenerationService.ReverseEngineerToSession(
+                            scapi: _scapi,
+                            currentPU: _currentModel,
+                            host: _dbHost,
+                            database: _dbName,
+                            user: _dbUser,
+                            password: _dbPassword,
+                            useWindowsAuth: _dbUseWindowsAuth,
+                            dbTypeCode: _dbTypeCode,
+                            targetServerCode: reTargetServer,
+                            targetServerVersion: reTargetVersion,
+                            schema: _dbSchema,
+                            selectedTables: tableList,
+                            log: log,
+                            modelType: "Physical");
+                    }
+                    catch (Exception reEx)
+                    {
+                        log($"[From-DB] silent RE threw: {reEx.GetType().Name}: {reEx.Message}");
+                        return null;
+                    }
+                });
+
+                if (rePU == null)
+                    return (null, "Silent RE returned null - DB schema/filter mismatch?");
+
+                try { rePuName = rePU.Name?.ToString() ?? ""; } catch { rePuName = ""; }
+                log($"[From-DB] silent RE PU created: '{rePuName}'");
+
+                // Diag: verify the RE'd PU actually picked up the dialect we
+                // asked for. If RE engine overrode it (silent RE pattern's
+                // ReverseEngineer-returned-null behavior is undocumented),
+                // surface it so a future GA AV can be traced back to dialect
+                // drift instead of being misdiagnosed.
+                try
+                {
+                    dynamic rePb = rePU.PropertyBag();
+                    object reTs = rePb?.Value("Target_Server");
+                    object reTsv = rePb?.Value("Target_Server_Version");
+                    log($"[From-DB] RE'd PU dialect: Target_Server={reTs}, Version={reTsv}");
+                    if (reTs != null && long.TryParse(reTs.ToString(), out long actualTs)
+                        && actualTs != activeTargetServer)
+                    {
+                        log($"[From-DB] WARNING: RE'd PU dialect drift - asked={activeTargetServer}, got={actualTs}");
+                    }
+                }
+                catch (Exception diagEx)
+                {
+                    log($"[From-DB] dialect verify err: {diagEx.GetType().Name}: {diagEx.Message}");
+                }
+
+                // Step 3b: VERIFY the RE'd PU is non-empty before driving CC.
+                // SCAPI's RE returns success even when filter excluded all
+                // tables (typical: schema-prefixed name vs bare-name mismatch).
+                int entityCount = 0;
+                int viewCount = 0;
+                dynamic verifySess = null;
+                try
+                {
+                    verifySess = _scapi.Sessions.Add();
+                    verifySess.Open(rePU, 0, 0);
+                    dynamic mo = verifySess.ModelObjects;
+                    dynamic root = mo.Root;
+                    try
+                    {
+                        dynamic ents = mo.Collect(root, "Entity");
+                        foreach (dynamic _ in ents) entityCount++;
+                    }
+                    catch (Exception entEx) { log($"[From-DB] Collect Entity err: {entEx.Message}"); }
+                    try
+                    {
+                        dynamic views = mo.Collect(root, "View");
+                        foreach (dynamic _ in views) viewCount++;
+                    }
+                    catch { /* views optional */ }
+                }
+                catch (Exception verEx)
+                {
+                    log($"[From-DB] verify session err: {verEx.GetType().Name}: {verEx.Message}");
+                }
+                finally
+                {
+                    if (verifySess != null) { try { verifySess.Close(); } catch { } }
+                }
+                log($"[From-DB] RE'd PU contents: {entityCount} entity(ies), {viewCount} view(s)");
+                if (entityCount == 0)
+                    return (null, "RE'd PU is empty - check schema/owner filter and table-name format.");
+
+                // Step 4: switch the active erwin MDI tab back to the dirty
+                // Mart model. After silent RE the RE'd PU is the foreground
+                // child, which would make CC's Left=RE'd / Right=dirty. CC
+                // pipeline assumes Left=dirty / Right=other.
+                bool tabSwitched = await System.Threading.Tasks.Task.Run(() =>
+                    Services.MartMartAutomation.ActivateMartMdiChild(log));
+                if (!tabSwitched)
+                    return (null, "Could not activate the active Mart MDI tab.");
+
+                // Step 5: drive CC wizard with rePuName as the right-side
+                // selection in the "Open Models in Memory" picker, then
+                // Apply-to-Right.
+                if (string.IsNullOrEmpty(rePuName))
+                    return (null, "RE'd PU name is empty - cannot select it in CC picker.");
+                log($"[From-DB] DriveCCDbAndApply(reModelName='{rePuName}')");
+                sess = await Services.MartMartAutomation.DriveCCDbAndApplyAsync(rePuName, log, overlayToggle, dbgPauseBeforeApply: DEBUG_FROMDB_VISIBLE);
+                if (sess == null || !sess.Applied)
+                    return (null, "Programmatic CC + Apply-to-Right failed - see Debug Log.");
+
+                // Step 6: drive ELA::OnFE directly via the bridge orchestrator.
+                //
+                // 2026-04-27 trace verdict (reference_from_db_pipeline_working):
+                // posting WM_COMMAND 1056 to RD spawns the wizard via erwin's
+                // internal handler, but the handler reads its lastApplyEdrId
+                // state from CC internals that our synthetic mouse click did
+                // NOT populate. Result: OnFE(ms, true, 0) -> stripped DDL.
+                //
+                // Manual click captured flags=0x2370 (= EDR id 9072) from CC
+                // state. We capture the same id from the bridge's EDR hook
+                // (CCInsp_GetLastEdrStartId) and feed it explicitly to OnFE,
+                // bypassing erwin's stateful handler.
+                //
+                // Bridge orchestrator handles wizard lifecycle entirely:
+                //   - Spawns FEW worker, waits for FEWPageOptions ctor
+                //   - Calls InvokePreviewStringOnlyCommand (no Next-loop)
+                //   - GA detour captures DDL into capture buffer
+                //   - Posts IDCANCEL to wizard so OnFE returns
+                // No "Use current diagram?" popup because we never click Next.
+                // 2026-04-27 forensic verdict (4-test triangulation):
+                // Direct OnFE invocation (CCInsp_GenerateAlterDdlViaOnFE) does
+                // NOT reproduce the manual button's behavior even with ms=LEFT
+                // and flags=lastEdrStartId+1. erwin's internal Right-Alter-Script
+                // handler does additional setup before invoking OnFE that we
+                // can't see (RE intel; ELC2 internal prep, gbl_pxAs validation,
+                // handler-specific call ordering). GA never fires.
+                //
+                // SOLUTION: trigger the handler itself via WM_COMMAND 1056
+                // (the toolbar button's command id). Manual Apply by the user
+                // (DEBUG_FROMDB_VISIBLE pause; user clicks Apply-to-Right by
+                // mouse) populates the CC engine state correctly so that when
+                // we post 1056, the handler reads valid state and invokes OnFE
+                // with proper args -> wizard -> Next-loop -> Preview -> GA -> DDL.
+                //
+                // Same pattern as From-Mart cross-version DOES NOT apply here
+                // because cross-version uses the bridge orchestrator (direct
+                // OnFE) and a real mart-PU on the right; we have a synthetic
+                // RE'd PU which has no saved baseline.
+                IntPtr capturedWizard = IntPtr.Zero;
+                try
+                {
+                    log("[From-DB] Posting WM_COMMAND 1056 to RD - erwin's handler will invoke OnFE with correct state.");
+                    Services.NativeBridgeService.ClearCapturedDdl();
+                    Services.MartMartAutomation.ClearLastCapturedWizardDdl();
+
+                    capturedWizard = await Services.MartMartAutomation
+                        .ClickRightAlterScriptInRdAsync(sess.ResolveDifferences, log);
+                    if (capturedWizard == IntPtr.Zero)
+                    {
+                        err = "Right Alter Script button click failed - FE Wizard did not appear.";
+                    }
+                    else
+                    {
+                        log("[From-DB] FE Wizard opened - driving Next-loop to Preview");
+                        bool previewOk = await Services.MartMartAutomation
+                            .ClickWizardPreviewTabAsync(capturedWizard, log);
+                        if (!previewOk)
+                        {
+                            err = "Wizard Next-loop / Preview tab failed.";
+                        }
+                        else
+                        {
+                            // ClickWizardPreviewTab stashes DDL into LastCapturedWizardDdl
+                            // mid-loop to avoid double-consume race with the bridge
+                            // capture buffer. Try stash first, fall back to buffer poll.
+                            string stashed = Services.MartMartAutomation.LastCapturedWizardDdl;
+                            if (!string.IsNullOrEmpty(stashed))
+                            {
+                                script = stashed;
+                                log($"[From-DB] DDL stashed by Next-loop ({stashed.Length} chars)");
+                                Services.MartMartAutomation.ClearLastCapturedWizardDdl();
+                            }
+                            else
+                            {
+                                log("[From-DB] no stashed DDL - polling capture buffer");
+                                for (int i = 0; i < 30; i++)
+                                {
+                                    await System.Threading.Tasks.Task.Delay(200);
+                                    string ddl = await System.Threading.Tasks.Task.Run(() =>
+                                        Services.NativeBridgeService.ConsumeLastCapturedDdl());
+                                    if (!string.IsNullOrEmpty(ddl))
+                                    {
+                                        script = ddl;
+                                        log($"[From-DB] DDL captured ({ddl.Length} chars) after {(i + 1) * 200}ms");
+                                        break;
+                                    }
+                                }
+                                if (script == null)
+                                    err = "DDL not captured within 6s after Next-loop.";
+                            }
+                        }
+                    }
+                }
+                finally
+                {
+                    if (capturedWizard != IntPtr.Zero)
+                    {
+                        try
+                        {
+                            await Services.MartMartAutomation
+                                .DismissUseCurrentDiagramPopupAsync(log);
+                        }
+                        catch (Exception popEx)
+                        {
+                            log($"[From-DB] popup dismiss err: {popEx.GetType().Name}: {popEx.Message}");
+                        }
+                        try
+                        {
+                            await Services.MartMartAutomation
+                                .CloseFEWizardCleanAsync(capturedWizard, log);
+                        }
+                        catch (Exception destEx)
+                        {
+                            log($"[From-DB] wizard close err: {destEx.GetType().Name}: {destEx.Message}");
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                err = $"{ex.GetType().Name}: {ex.Message}";
+            }
+            finally
+            {
+                // Step 7: cleanup. Order matters: close CC/RD first so the CC
+                // engine's transient ms references are released before we
+                // remove the underlying PU. PUs.Remove on a SCAPI-Create()'d
+                // locator='' PU is safe (reference_rescript_pu_removable).
+                if (sess != null)
+                {
+                    // CC + RD cleanup. Validation servisleri pipeline
+                    // boyunca suspended oldugu icin rename loop riski yok;
+                    // IDCANCEL + fallback ForceDestroy guvenli sayilir.
+                    try
+                    {
+                        await Services.MartMartAutomation
+                            .CloseDbCCSessionCleanAsync(sess, log);
+                    }
+                    catch (Exception closeEx)
+                    {
+                        log($"[From-DB] CloseDbCCSessionClean failed: {closeEx.GetType().Name}: {closeEx.Message}");
+                    }
+                }
+                if (rePU != null)
+                {
+                    // PU.Remove on a CC-touched silent RE'd PU not only throws
+                    // RPC_E_SERVERFAULT (CC engine holds back-references after
+                    // wizard frame is gone) but - critically - the CALL ITSELF
+                    // invalidates the active mart PU's root object. 09:12 log
+                    // shows: PU remove failed -> ValidationCoordinatorService
+                    // "root model object {GUID} is not available" -> Session
+                    // lost -> add-in reconnect cascade -> next user click
+                    // crash. Same root cause as
+                    // reference_cross_version_orphan_unsolved.md (Mart-Mart
+                    // cross-version "erwin locks within ~3min").
+                    //
+                    // Skipping the Remove call entirely keeps the active mart
+                    // PU usable. The RE'd PU stays in session as an orphan
+                    // (Model_N accumulates across runs) - acceptable trade-off
+                    // until the CC-engine back-reference is properly cleared
+                    // by a future bridge change.
+                    log("[From-DB] SKIPPING PU.Remove on RE'd PU - call would invalidate active mart PU root and trigger Session lost cascade.");
+                    log("[From-DB] WARNING: RE'd PU stays in SCAPI session as an orphan.");
+                    log("[From-DB] If CC's 'Open Models in Memory' picker shows duplicates next run, restart erwin to reset session.");
+                }
+                try { overlay?.Close(); } catch { }
+
+                // Monitoring resume FIRE-AND-FORGET background. StartMonitoring
+                // ic islerinde TakeSnapshot tetikliyor (model walk: 24 entity
+                // + 182 attribute = 7sn UI freeze, 13:55:43->13:55:50
+                // verified). UI thread'i bloklamayalim - DDL TextBox'a HEMEN
+                // yansisin, monitoring arka planda hazir hale gelsin.
+                // Validation guard'lari volatile flag uzerinden thread-safe.
+                _ = System.Threading.Tasks.Task.Run(() =>
+                {
+                    try { _validationCoordinatorService?.ResumeValidation(); }
+                    catch (Exception ex) { try { log($"[From-DB] bg ResumeValidation err: {ex.Message}"); } catch { } }
+                    try { _tableTypeMonitorService?.StartMonitoring(); }
+                    catch (Exception ex) { try { log($"[From-DB] bg StartMonitoring err: {ex.Message}"); } catch { } }
+                    try { _validationService?.StartMonitoring(); }
+                    catch (Exception ex) { try { log($"[From-DB] bg ColumnValidation StartMonitoring err: {ex.Message}"); } catch { } }
+                    try { log("[From-DB] monitoring resumed (background)"); } catch { }
+                });
+                log("[From-DB] pipeline complete - monitoring resume scheduled to background");
+            }
+
+            return (script, err);
+        }
+
+        /// <summary>
+        /// LEGACY From-DB path (DdlHelper subprocess + text diff). Parked as
+        /// of 2026-04-27: production "Generate DDL" routes to
+        /// RunFromDbDdlPipelineAsync now. Kept for fallback/comparison until
+        /// the new in-process pipeline is fully proven; remove after sign-off.
         /// </summary>
         private void RunFromDbCompare(string feOptionXml)
         {
@@ -3017,7 +3713,9 @@ namespace EliteSoft.Erwin.AddIn
             bool fromMart = rbFromMart.Checked;
             bool fromDB = rbFromDB.Checked;
 
-            cmbRightModel.Enabled = fromMart;
+            // Right-side version combo is locked for now; user will re-enable it when
+            // the multi-version compare path is wired up.
+            cmbRightModel.Enabled = false;
             btnConfigureDB.Visible = fromDB;
             btnSelectDbTables.Visible = fromDB;
             lblSelectedTableCount.Visible = fromDB;
@@ -3047,7 +3745,12 @@ namespace EliteSoft.Erwin.AddIn
         {
             using (var dlg = new Forms.DbConnectionForm())
             {
-                if (dlg.ShowDialog() == DialogResult.OK)
+                // erwin's main window is TopMost; without explicit TopMost
+                // here the modal child opens behind erwin and stays
+                // invisible (user only escapes via ESC). Mirrors what
+                // SelectDbTables and other dialogs in this form already do.
+                dlg.TopMost = true;
+                if (dlg.ShowDialog(this) == DialogResult.OK)
                 {
                     _dbConnectionString = dlg.ConnectionString;
                     _dbPassword = dlg.Password;
@@ -3060,6 +3763,8 @@ namespace EliteSoft.Erwin.AddIn
                     _dbUser = dlg.UserName;
                     _dbUseWindowsAuth = dlg.UseWindowsAuth;
                     _dbTypeCode = dlg.DbTypeCode;
+                    _dbUseNative = dlg.UseNative;
+                    _dbDsnName = dlg.DsnName;
                     lblDDLStatus.Text = $"DB configured: {_dbLabel}";
                     lblDDLStatus.ForeColor = Color.DarkGreen;
                     Log($"DDL: DB configured: {_dbLabel}, host={_dbHost}, db={_dbName}, user={_dbUser}, winAuth={_dbUseWindowsAuth}, schema='{_dbSchema}'");
@@ -3076,100 +3781,78 @@ namespace EliteSoft.Erwin.AddIn
         }
 
         /// <summary>
-        /// Collect entity physical names from the active model, show a CheckedListBox picker.
-        /// User can narrow the RE scope before running Generate DDL.
+        /// Fetches the live DB's BASE TABLE list via ODBC and shows a
+        /// CheckedListBox picker. User chooses which DB tables to include
+        /// in the From-DB compare. No fallback to model tables: if the DB
+        /// is not configured or the query fails, we surface a clear error
+        /// rather than silently swapping in a different data source.
         /// </summary>
         private void BtnSelectDbTables_Click(object sender, EventArgs e)
         {
-            if (!_isConnected || _currentModel == null)
+            // Require DB connection to be configured first - no fallback.
+            bool dbConfigured =
+                (!string.IsNullOrWhiteSpace(_dbHost) || !string.IsNullOrWhiteSpace(_dbConnectionString))
+                && _dbTypeCode != 0;
+            if (!dbConfigured)
             {
-                ErwinAddIn.ShowTopMostMessage("No model connected.", "Select DB Tables");
+                ErwinAddIn.ShowTopMostMessage(
+                    "Configure the DB connection first (click Configure on the From DB row).",
+                    "Select DB Tables");
                 return;
             }
 
-            // Pull physical names from the active model
-            var modelTables = new List<string>();
-            dynamic tempSess = null;
-            bool ownSession = false;
-            try
-            {
-                // Reuse existing session if possible
-                bool hasSess = false;
-                try { hasSess = _currentModel.HasSession(); } catch { }
+            // _dbConnectionString is erwin's pipe-separated locator (used by
+            // the RE pipeline), NOT an ADO.NET connection string. The ODBC
+            // connection string for the table-listing query is rebuilt from
+            // the captured DbConnectionForm fields - same fields the Test
+            // Connection button uses on that form, so a successful Test
+            // there guarantees this query path can connect too.
+            List<string> dbTables = Services.DbTableBrowserService.FetchTables(
+                dbTypeCode: _dbTypeCode,
+                host: _dbHost,
+                database: _dbName,
+                dsnName: _dbDsnName,
+                useNative: _dbUseNative,
+                useWindowsAuth: _dbUseWindowsAuth,
+                user: _dbUser,
+                password: _dbPassword,
+                schemaFilter: _dbSchema,
+                log: Log);
 
-                if (hasSess)
-                {
-                    int sessCount = 0;
-                    try { sessCount = _scapi.Sessions.Count; } catch { }
-                    for (int si = 0; si < sessCount; si++)
-                    {
-                        try
-                        {
-                            dynamic s = _scapi.Sessions.Item(si);
-                            bool open = false; try { open = s.IsOpen(); } catch { }
-                            string puN = ""; try { puN = s.PersistenceUnit?.Name?.ToString() ?? ""; } catch { }
-                            string curN = ""; try { curN = _currentModel.Name?.ToString() ?? ""; } catch { }
-                            if (open && puN == curN) { tempSess = s; break; }
-                        }
-                        catch { }
-                    }
-                }
-                if (tempSess == null)
-                {
-                    tempSess = _scapi.Sessions.Add();
-                    tempSess.Open(_currentModel, 0, 0);
-                    ownSession = true;
-                }
-
-                dynamic mo = tempSess.ModelObjects;
-                dynamic root = mo.Root;
-                dynamic ents = mo.Collect(root, "Entity");
-                foreach (dynamic ent in ents)
-                {
-                    try
-                    {
-                        string phys = "";
-                        try { phys = ent.Properties("Physical_Name")?.Value?.ToString() ?? ""; } catch { }
-                        if (string.IsNullOrWhiteSpace(phys))
-                            try { phys = ent.Name?.ToString() ?? ""; } catch { }
-                        if (!string.IsNullOrWhiteSpace(phys) && !modelTables.Contains(phys))
-                            modelTables.Add(phys);
-                    }
-                    catch { }
-                }
-            }
-            catch (Exception ex)
+            if (dbTables == null)
             {
-                Log($"DDL: Failed to enumerate model tables: {ex.Message}");
-                ErwinAddIn.ShowTopMostMessage($"Could not enumerate model tables: {ex.Message}", "Select DB Tables");
-                return;
-            }
-            finally
-            {
-                if (ownSession && tempSess != null) { try { tempSess.Close(); } catch { } }
-            }
-
-            if (modelTables.Count == 0)
-            {
-                ErwinAddIn.ShowTopMostMessage("Active model has no tables.", "Select DB Tables");
+                // FetchTables logged the specific failure (bad connection
+                // string, ODBC driver missing, query failed, etc).
+                ErwinAddIn.ShowTopMostMessage(
+                    "Could not list tables from the DB. See Debug Log for details.",
+                    "Select DB Tables");
                 return;
             }
 
-            modelTables.Sort(StringComparer.OrdinalIgnoreCase);
+            if (dbTables.Count == 0)
+            {
+                string suffix = string.IsNullOrWhiteSpace(_dbSchema)
+                    ? ""
+                    : $" matching schema filter '{_dbSchema}'";
+                ErwinAddIn.ShowTopMostMessage(
+                    $"DB has no base tables{suffix}.",
+                    "Select DB Tables");
+                return;
+            }
 
-            // Default: if user hasn't selected before, all are checked
+            // Default: previously selected stay checked; first time, all checked.
             var preChecked = new HashSet<string>(
                 (_dbSelectedTables != null && _dbSelectedTables.Count > 0)
                     ? _dbSelectedTables
-                    : modelTables,
+                    : dbTables,
                 StringComparer.OrdinalIgnoreCase);
 
-            var result = ShowTableSelectionDialog(modelTables, preChecked);
+            var result = ShowTableSelectionDialog(dbTables, preChecked);
             if (result != null)
             {
                 _dbSelectedTables = result;
                 UpdateSelectedTableCountLabel();
-                Log($"DDL: {result.Count} table(s) selected for From DB compare.");
+                Log($"DDL: {result.Count} of {dbTables.Count} DB table(s) selected for From DB compare.");
             }
         }
 
@@ -3325,17 +4008,15 @@ namespace EliteSoft.Erwin.AddIn
 
                 if (versions.Count > 0)
                 {
-                    foreach (var v in versions)
+                    // Newest-first ordering: highest version on top so first item is the most recent.
+                    for (int i = versions.Count - 1; i >= 0; i--)
                     {
+                        var v = versions[i];
                         string label = $"v{v.Version}" + (!string.IsNullOrEmpty(v.Name) ? $" ({v.Name})" : "");
                         cmbRightModel.Items.Add(label);
                     }
 
-                    // Default: select the version before current
-                    if (versions.Count > 1)
-                        cmbRightModel.SelectedIndex = 0; // Most recent after current
-                    else
-                        cmbRightModel.SelectedIndex = 0;
+                    cmbRightModel.SelectedIndex = 0;
                 }
                 else
                 {
@@ -3540,6 +4221,759 @@ namespace EliteSoft.Erwin.AddIn
             Log($"EDR stack-trace mode: {(_edrStOn ? "ON" : "OFF")}");
             if (_edrStOn)
                 Log("  Now: do CC + click Apply-to-Right in Resolve Differences.");
+        }
+
+        /// <summary>
+        /// Diagnostic toggle: installs a bridge-level WinEvent hook that
+        /// LOGS every #32770 / Afx window creation in erwin's process to
+        /// the bridge log under [MONITOR] tags. Used to map dialog
+        /// sequences during manual reverse-engineering of new wizard
+        /// flows (e.g. "From DB" Generate DDL discovery). Off by default.
+        /// </summary>
+        private void BtnToggleMonitor_Click(object sender, EventArgs e)
+        {
+            _monitorOn = !_monitorOn;
+            Action<string> log = msg => Log(msg);
+            if (_monitorOn)
+            {
+                int rc = Services.NativeBridgeService.MonitorHookInstall(log);
+                Log($"");
+                Log($"[MONITOR] hook install rc={rc}");
+                Log("  Logging every #32770/Afx CREATE+RENAME in erwin process.");
+                Log("  See bridge log (%TEMP%\\erwin-native-bridge.log) under [MONITOR] tag.");
+                Log("  Now: do your manual flow (Review -> From DB -> ...). Toggle off when done.");
+                btnToggleMonitor.Text = "Dialog Monitor: ON";
+                btnToggleMonitor.BackColor = System.Drawing.Color.FromArgb(255, 210, 140);
+            }
+            else
+            {
+                int seen = Services.NativeBridgeService.MonitorHookUninstall(log);
+                Log($"");
+                Log($"[MONITOR] hook uninstalled. {seen} CREATE event(s) logged during session.");
+                btnToggleMonitor.Text = "Toggle Dialog Monitor";
+                btnToggleMonitor.BackColor = System.Drawing.Color.FromArgb(245, 245, 200);
+            }
+        }
+
+        /// <summary>
+        /// Probe (Phase 1 of From DB pipeline): runs SCAPI silent RE on the
+        /// configured DB, captures the freshly-created reverse-engineered
+        /// ModelSet pointer via the bridge's MS-TRACK, then invokes
+        /// CWizInterface::ShowERwinCCWiz(activeMs, reMs, b1=0, b2=1) directly
+        /// through the bridge. Goal: bypass the 8-step RE wizard navigation
+        /// entirely and skip straight to "Resolve Differences" - same RD
+        /// dialog the manual flow reaches at 22:03:34. If RD opens with the
+        /// expected Apply-to-Right arrow, the rest of the pipeline (mouse
+        /// click, OnFE+GA, cleanup) is reusable from the proven Mart-Mart
+        /// implementation.
+        /// </summary>
+        private async void BtnFromDbProbe_Click(object sender, EventArgs e)
+        {
+            btnFromDbProbe.Enabled = false;
+            try
+            {
+                Log("");
+                Log("=== From DB Probe: Silent RE + CallShowERwinCCWiz ===");
+
+                if (!_isConnected || _currentModel == null)
+                {
+                    Log("[PROBE] No model connected.");
+                    return;
+                }
+                bool dbConfigured =
+                    !string.IsNullOrWhiteSpace(_dbHost)
+                    && !string.IsNullOrWhiteSpace(_dbName)
+                    && _dbTypeCode != 0;
+                if (!dbConfigured)
+                {
+                    Log("[PROBE] DB not configured. Click Configure on From DB first.");
+                    return;
+                }
+
+                Action<string> log = msg =>
+                {
+                    if (InvokeRequired) BeginInvoke(new Action(() => Log(msg)));
+                    else Log(msg);
+                };
+
+                // Captured rePU reference so the outer finally can remove
+                // the silent-RE'd PU from the session - prevents accumulation
+                // of stale RE'd PUs across probe runs (each one was generating
+                // GDM-1001 cascades because addin's UDP/validation services
+                // saw multiple Model_1 candidates and got confused).
+                dynamic capturedRePU = null;
+
+                await System.Threading.Tasks.Task.Run(() =>
+                {
+                    // Step 1: capture active model's ms (left-side, dirty v3)
+                    IntPtr activeMs = Services.NativeBridgeService.EnsureActiveModelSetCaptured(_currentModel, log);
+                    if (activeMs == IntPtr.Zero)
+                    {
+                        log("[PROBE] Could not capture active ModelSet - aborting.");
+                        return;
+                    }
+                    log($"[PROBE] activeMs = 0x{activeMs.ToInt64():X}");
+
+                    // Step 2: snapshot bridge's seen-ms list before RE so we
+                    // can identify which entry is the new RE-created ms.
+                    var seenBefore = Services.NativeBridgeService.GetSeenModelSets();
+                    log($"[PROBE] seenMs before RE: count={seenBefore.Length}");
+
+                    // Step 3: run SCAPI silent RE - existing infrastructure.
+                    // Uses _dbHost/_dbName/etc. captured by Configure dialog.
+                    // Schema filter + selected tables (or all model tables).
+                    IEnumerable<string> tables = _dbSelectedTables != null && _dbSelectedTables.Count > 0
+                        ? _dbSelectedTables
+                        : new List<string>();
+                    if (!tables.GetEnumerator().MoveNext())
+                    {
+                        log("[PROBE] No tables selected - aborting (use Select Tables first).");
+                        return;
+                    }
+
+                    log("[PROBE] starting silent RE...");
+                    dynamic rePU = null;
+                    try
+                    {
+                        rePU = Services.DdlGenerationService.ReverseEngineerToSession(
+                            scapi: _scapi,
+                            currentPU: _currentModel,
+                            host: _dbHost,
+                            database: _dbName,
+                            user: _dbUser,
+                            password: _dbPassword,
+                            useWindowsAuth: _dbUseWindowsAuth,
+                            dbTypeCode: _dbTypeCode,
+                            targetServerCode: _dbTargetServer,
+                            targetServerVersion: _dbTargetVersion,
+                            schema: _dbSchema,
+                            selectedTables: tables,
+                            log: log);
+                    }
+                    catch (Exception ex)
+                    {
+                        log($"[PROBE] silent RE threw: {ex.GetType().Name}: {ex.Message}");
+                        return;
+                    }
+                    if (rePU == null)
+                    {
+                        log("[PROBE] silent RE returned null - aborting.");
+                        return;
+                    }
+                    string rePuName = ""; try { rePuName = rePU.Name?.ToString() ?? ""; } catch { }
+                    log($"[PROBE] silent RE PU created: '{rePuName}'");
+                    capturedRePU = rePU;   // keep reference so outer finally can Remove it
+
+                    // Step 4: identify the new ms via bridge MS-TRACK delta.
+                    var seenAfter = Services.NativeBridgeService.GetSeenModelSets();
+                    log($"[PROBE] seenMs after RE: count={seenAfter.Length}");
+                    IntPtr reMs = IntPtr.Zero;
+                    var beforeSet = new HashSet<IntPtr>(seenBefore);
+                    for (int i = seenAfter.Length - 1; i >= 0; --i)
+                    {
+                        if (!beforeSet.Contains(seenAfter[i]))
+                        {
+                            reMs = seenAfter[i];
+                            break;
+                        }
+                    }
+                    if (reMs == IntPtr.Zero)
+                        log("[PROBE] No new ms tracked after RE.");
+                    else
+                        log($"[PROBE] reMs = 0x{reMs.ToInt64():X}");
+
+                    // Step 5: VERIFY the RE'd PU actually contains tables.
+                    // SCAPI's pu.ReverseEngineer can return success but with
+                    // an empty PU when the filter (Synch_Table_Filter_By_Name)
+                    // doesn't match any DB tables - usually a name format
+                    // mismatch (schema-prefixed vs bare).
+                    int entityCount = 0;
+                    int viewCount = 0;
+                    dynamic verifySess = null;
+                    bool ownVerifySess = false;
+                    try
+                    {
+                        verifySess = _scapi.Sessions.Add();
+                        verifySess.Open(rePU, 0, 0);
+                        ownVerifySess = true;
+                        dynamic mo = verifySess.ModelObjects;
+                        dynamic root = mo.Root;
+                        try
+                        {
+                            dynamic ents = mo.Collect(root, "Entity");
+                            foreach (dynamic _ in ents) entityCount++;
+                        }
+                        catch (Exception exE) { log($"[PROBE] Collect Entity err: {exE.Message}"); }
+                        try
+                        {
+                            dynamic views = mo.Collect(root, "View");
+                            foreach (dynamic _ in views) viewCount++;
+                        }
+                        catch { }
+                    }
+                    catch (Exception ex2)
+                    {
+                        log($"[PROBE] verify session err: {ex2.GetType().Name}: {ex2.Message}");
+                    }
+                    finally
+                    {
+                        if (ownVerifySess && verifySess != null)
+                        {
+                            try { verifySess.Close(); } catch { }
+                        }
+                    }
+                    log($"[PROBE] RE'd PU contents: {entityCount} entity(ies), {viewCount} view(s)");
+
+                    if (entityCount > 0)
+                    {
+                        log("[PROBE] *** RE PRODUCED TABLES - silent RE is working ***");
+                    }
+                    else
+                    {
+                        log("[PROBE] *** RE'd PU is EMPTY - filter or connection issue ***");
+                        log("[PROBE] Check: Synch_Table_Filter_By_Name format, Synch_Owned_Only_Name vs DB schema, ODBC driver.");
+                        return;
+                    }
+
+                    // Step 6: switch active back to dirty mart tab. After
+                    // silent RE the RE'd PU is the foreground MDI child,
+                    // which would make CC wizard's Left=RE'd / Right=dirty.
+                    // Mart-Mart pipeline assumes Left=dirty, Right=other,
+                    // so we flip the active tab back to dirty mart.
+                    log("[PROBE] step 6: activate dirty mart MDI child");
+                    bool tabSwitched = Services.MartMartAutomation.ActivateMartMdiChild(log);
+                    if (!tabSwitched)
+                    {
+                        log("[PROBE] Could not activate mart MDI child - check log.");
+                        return;
+                    }
+
+                    // Step 7: drive CC wizard + select RE'd PU from "Open
+                    // Models in Memory" list + Compare + Apply-to-Right.
+                    log($"[PROBE] step 7: DriveCCDbAndApply(reModelName='{rePuName}')");
+                }).ConfigureAwait(true);
+
+                // Run on UI thread so overlayToggle can synchronously
+                // marshal back. Same pattern as Mart-Mart Generate DDL flow.
+                var overlay = ShowBusyOverlay("Generating From-DB DDL, please wait...");
+                Services.MartMartAutomation.CCSession sess = null;
+                try
+                {
+                    Action<bool> toggle = visible =>
+                    {
+                        try
+                        {
+                            if (InvokeRequired)
+                                Invoke(new Action(() => ToggleBusyOverlay(overlay, visible)));
+                            else
+                                ToggleBusyOverlay(overlay, visible);
+                        }
+                        catch { }
+                    };
+                    string reModelName = "Model_1";  // SCAPI silent RE always names new PU "Model_1"
+                    sess = await Services.MartMartAutomation.DriveCCDbAndApplyAsync(reModelName, log, toggle);
+                    if (sess == null || !sess.Applied)
+                    {
+                        Log("[PROBE] DriveCCDbAndApply did not apply differences.");
+                    }
+                    else
+                    {
+                        Log("[PROBE] *** Apply-to-Right SUCCEEDED in From-DB pipeline ***");
+                        Log("[PROBE] step 8: OnFE -> alter DDL");
+                        string ddl = await System.Threading.Tasks.Task.Run(() =>
+                            Services.NativeBridgeService.GenerateMartMartDdlViaOnFE(msg =>
+                            {
+                                if (InvokeRequired) BeginInvoke(new Action(() => Log(msg)));
+                                else Log(msg);
+                            }));
+                        if (string.IsNullOrEmpty(ddl))
+                            Log("[PROBE] OnFE returned no DDL");
+                        else
+                        {
+                            Log($"[PROBE] *** SUCCESS: {ddl.Length} chars of alter DDL ***");
+                            rtbDDLOutput.Text = ddl;
+                        }
+                    }
+                }
+                finally
+                {
+                    Services.MartMartAutomation.CloseSession(sess, msg =>
+                    {
+                        if (InvokeRequired) BeginInvoke(new Action(() => Log(msg)));
+                        else Log(msg);
+                    });
+                    try { overlay?.Close(); } catch { }
+                }
+
+                // Cleanup: remove the silent-RE'd PU from the session so it
+                // doesn't accumulate across probe runs. Without this each
+                // run leaves a "Model_1" PU in session, addin's UDP/
+                // validation services pick them up, and erwin emits GDM-1001
+                // cascades when the orphan PUs reference objects no longer
+                // present. PUs.Remove(pu, false) was previously avoided for
+                // CC-loaded v1 PUs (memory: reference_pus_create_session...)
+                // but a SCAPI-Create()'d PU should be safely removable since
+                // the CC engine doesn't hold internal refs to it.
+                if (capturedRePU != null)
+                {
+                    try
+                    {
+                        Log("[PROBE] removing silent-RE'd PU from session...");
+                        _scapi.PersistenceUnits.Remove(capturedRePU, false);
+                        Log("[PROBE] RE'd PU removed.");
+                    }
+                    catch (Exception remEx)
+                    {
+                        Log($"[PROBE] PU remove failed (will accumulate): {remEx.GetType().Name}: {remEx.Message}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"[PROBE] threw: {ex.GetType().Name}: {ex.Message}");
+            }
+            finally
+            {
+                btnFromDbProbe.Enabled = true;
+            }
+        }
+
+        // SPIKE: test ReverseEngineerScript SCAPI method.
+        // Hypothesis: a PU we create + populate via ReverseEngineerScript is
+        // SCAPI-managed (not CC-engine-managed), so PUs.Remove(pu, false)
+        // should succeed without RPC_E_SERVERFAULT (unlike CC-loaded PUs).
+        // If proven, the same approach unblocks From-DB and cross-version
+        // Mart-Mart pipelines (load a clean baseline PU, compare, remove
+        // cleanly, no orphan, no erwin lock-up).
+        private async void BtnREScriptProbe_Click(object sender, EventArgs e)
+        {
+            btnREScriptProbe.Enabled = false;
+            try
+            {
+                Log("");
+                Log("=== ReverseEngineerScript Spike ===");
+                if (!_isConnected || _currentModel == null)
+                {
+                    Log("[REScript] No model connected.");
+                    return;
+                }
+
+                Action<string> log = msg =>
+                {
+                    if (InvokeRequired) BeginInvoke(new Action(() => Log(msg)));
+                    else Log(msg);
+                };
+
+                await System.Threading.Tasks.Task.Run(() =>
+                {
+                    try
+                    {
+                        // Step 1: emit current active model's CREATE DDL via
+                        // FEModel_DDL (already proven to work, doesn't
+                        // corrupt active PU).
+                        string tempDir = System.IO.Path.GetTempPath();
+                        string sqlFile = System.IO.Path.Combine(tempDir,
+                            $"erwin_rescript_spike_{Guid.NewGuid():N}.sql");
+                        log($"[REScript] step 1: FEModel_DDL on active -> {sqlFile}");
+                        bool feOk = false;
+                        try { feOk = (bool)_currentModel.FEModel_DDL(sqlFile, ""); }
+                        catch (Exception fex) { log($"[REScript] FEModel_DDL threw: {fex.Message}"); return; }
+                        if (!feOk || !System.IO.File.Exists(sqlFile))
+                        {
+                            log("[REScript] FEModel_DDL returned false / file missing - aborting");
+                            return;
+                        }
+                        long sz = new System.IO.FileInfo(sqlFile).Length;
+                        log($"[REScript] DDL written ok ({sz} bytes)");
+
+                        // Step 2: snapshot session PUs (BEFORE import) so
+                        // we can spot the new one.
+                        log("[REScript] step 2: pre-import session PUs:");
+                        DumpSessionPUs(log);
+
+                        // Step 3: create a blank PU + import the SQL via
+                        // ReverseEngineerScript. PropertyBag must be created
+                        // via the SCAPI ProgID (matching the working RE flow
+                        // in DdlGenerationService.cs:973-979 - the SCAPI app
+                        // object does NOT expose a PropertyBag() factory).
+                        log("[REScript] step 3: create blank PU + ReverseEngineerScript");
+                        Type pbType = Type.GetTypeFromProgID("ERwin9.SCAPI.PropertyBag.9.0");
+                        if (pbType == null)
+                        {
+                            log("[REScript] SCAPI PropertyBag ProgID not registered - aborting");
+                            return;
+                        }
+                        dynamic propBag;
+                        try { propBag = Activator.CreateInstance(pbType); }
+                        catch (Exception pex) { log($"[REScript] CreateInstance err: {pex.Message}"); return; }
+
+                        // Reuse active model's Target_Server. The SCAPI sample
+                        // for RE expects an INT platform code (13=Oracle,
+                        // 16=SQL Server, etc). We pull it from the active PU's
+                        // PropertyBag (NOT root.Target_Server which isn't
+                        // accessible via dynamic dispatch on the PU).
+                        propBag.Add("Model_Type", "Combined");
+                        int activeTargetCode = 0;
+                        try
+                        {
+                            object tsRaw = _currentModel.PropertyBag()?.Value("Target_Server");
+                            log($"[REScript]   active PU.PropertyBag.Target_Server raw = '{tsRaw}' ({tsRaw?.GetType().Name})");
+                            if (tsRaw != null && int.TryParse(tsRaw.ToString(), out int parsed))
+                                activeTargetCode = parsed;
+                        }
+                        catch (Exception pex) { log($"[REScript] PropertyBag Target_Server err: {pex.Message}"); }
+
+                        // Fallback: walk session, find currentModel by reference,
+                        // grab its locator-derived target server. Or try
+                        // reading the property via Item() on currentPU.PropertyBag.
+                        if (activeTargetCode == 0)
+                        {
+                            // The active model is Oracle19c per session log.
+                            // Hardcode 13 (Oracle) so the spike has SOMETHING to
+                            // import with. If user's model is SQL Server, this
+                            // would mismatch - we'll fix once Root() access is
+                            // sorted out.
+                            log("[REScript]   could not parse Target_Server; defaulting to 13 (Oracle) for spike");
+                            activeTargetCode = 13;
+                        }
+                        log($"[REScript]   using Target_Server = {activeTargetCode}");
+                        propBag.Add("Target_Server", activeTargetCode);
+                        propBag.Add("Target_Server_Version", 11);   // arbitrary, sample uses 11
+
+                        dynamic newPU;
+                        try
+                        {
+                            // SCAPI ISCPersistenceUnitCollection::Create
+                            // with a fresh PropertyBag yields an empty PU
+                            // that's session-attached but not yet populated.
+                            newPU = _scapi.PersistenceUnits.Create(propBag);
+                        }
+                        catch (Exception cex)
+                        {
+                            log($"[REScript] PUs.Create threw: {cex.Message}");
+                            return;
+                        }
+                        log($"[REScript]   blank PU created: '{(newPU?.Name?.ToString() ?? "?")}'");
+
+                        // Per SCAPI sample, RE keys are added AFTER Create()
+                        // and on the SAME PropertyBag (ClearAll + re-add).
+                        try
+                        {
+                            propBag.ClearAll();
+                            propBag.Add("System_Objects", false);
+                            propBag.Add("Case_Option", 25091);
+                            propBag.Add("Logical_Case_Option", 25046);
+                            propBag.Add("Infer_Primary_Keys", false);
+                            propBag.Add("Infer_Relations", false);
+                            propBag.Add("Infer_Relations_Indexes", false);
+                            propBag.Add("Force_Physical_Name_Option", false);
+                        }
+                        catch (Exception kex) { log($"[REScript] RE keys add err: {kex.Message}"); }
+
+                        try
+                        {
+                            // Re-use propBag for RE options. Per SCAPI ref
+                            // the PropertyBag here drives RE behaviour.
+                            // Empty Disposition string for default.
+                            log("[REScript]   calling ReverseEngineerScript...");
+                            object reResult = newPU.ReverseEngineerScript(propBag, sqlFile, "");
+                            log($"[REScript]   ReverseEngineerScript returned: {reResult}");
+                        }
+                        catch (Exception rex)
+                        {
+                            log($"[REScript] ReverseEngineerScript threw: {rex.GetType().Name}: {rex.Message}");
+                            // Try to remove the orphan blank PU before exit.
+                            try { _scapi.PersistenceUnits.Remove(newPU, false); log("[REScript]   removed blank-empty PU after failure"); }
+                            catch (Exception remErr) { log($"[REScript]   remove blank-empty also failed: {remErr.Message}"); }
+                            return;
+                        }
+
+                        // Step 4: snapshot AFTER import - did the new PU
+                        // become populated? Does it appear separately?
+                        log("[REScript] step 4: post-import session PUs:");
+                        DumpSessionPUs(log);
+
+                        // Step 5: try to remove the imported PU. If this
+                        // succeeds, the user's pipeline idea works for
+                        // From-DB + cross-version. If it fails with
+                        // RPC_E_SERVERFAULT, ReverseEngineerScript-loaded
+                        // PUs face the same limitation as CC-loaded ones.
+                        log("[REScript] step 5: PUs.Remove(newPU, false)");
+                        try
+                        {
+                            _scapi.PersistenceUnits.Remove(newPU, false);
+                            log("[REScript]   *** Remove() SUCCEEDED - PU eviction works ***");
+                        }
+                        catch (Exception remEx)
+                        {
+                            log($"[REScript]   Remove() threw: {remEx.GetType().Name}: {remEx.Message}");
+                        }
+
+                        log("[REScript] step 6: post-remove session PUs:");
+                        DumpSessionPUs(log);
+
+                        try { System.IO.File.Delete(sqlFile); } catch { }
+                    }
+                    catch (Exception ex)
+                    {
+                        log($"[REScript] OUTER threw: {ex.GetType().Name}: {ex.Message}");
+                    }
+                });
+            }
+            finally
+            {
+                btnREScriptProbe.Enabled = true;
+            }
+        }
+
+        // Lightweight helper for the spike: dump session PUs with name +
+        // locator. Different from LogSessionPUs which depends on log Action.
+        private void DumpSessionPUs(Action<string> log)
+        {
+            try
+            {
+                dynamic pus = _scapi?.PersistenceUnits;
+                if (pus == null) { log?.Invoke("  (no SCAPI session)"); return; }
+                int count = (int)pus.Count;
+                log?.Invoke($"  session has {count} PU(s):");
+                for (int i = 0; i < count; i++)
+                {
+                    dynamic pu;
+                    try { pu = pus.Item(i); }
+                    catch (Exception itEx) { log?.Invoke($"    PU[{i}] Item() err: {itEx.Message}"); continue; }
+                    string name = "?";
+                    try { name = pu.Name?.ToString() ?? "?"; } catch { }
+                    string locator = "";
+                    try { locator = pu.PropertyBag()?.Value("Locator")?.ToString() ?? ""; } catch { }
+                    bool isActive = false;
+                    try { isActive = object.ReferenceEquals(pu, _currentModel); } catch { }
+                    log?.Invoke($"    PU[{i}] name='{name}'{(isActive ? " *ACTIVE*" : "")} locator='{locator}'");
+                }
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"  DumpSessionPUs err: {ex.Message}");
+            }
+        }
+
+        // SPIKE Phase 1: full cross-version pipeline using ReverseEngineerScript-imported
+        // clean PU. End-to-end: load v<N> from Mart -> FEModel_DDL -> import as clean PU
+        // (proven removable per spike) -> CC compare via "Open Models in Memory" picker
+        // -> OnFE -> ALTER DDL -> PUs.Remove(cleanPU, false). The existing Generate DDL
+        // button (Mart cross-version path with DriveCCAndApplyAsync) is NOT touched -
+        // this probe runs alongside as proof-of-concept for the new pipeline.
+        private async void BtnREScriptXVProbe_Click(object sender, EventArgs e)
+        {
+            btnREScriptXVProbe.Enabled = false;
+            try
+            {
+                Log("");
+                Log("=== REScript Cross-Version Probe ===");
+                if (!_isConnected || _currentModel == null) { Log("[XV] No model connected."); return; }
+
+                int v = ParseRightVersion();
+                int activeV = ParseActivePuVersion();
+                string catalog = ParseActivePuCatalog();
+                if (v <= 0 || string.IsNullOrEmpty(catalog))
+                {
+                    Log("[XV] Pick a right-version on cmbRightModel + ensure active is Mart-opened.");
+                    return;
+                }
+                if (v == activeV)
+                {
+                    Log($"[XV] Right version v{v} == active v{activeV} - pick a DIFFERENT version for cross-version test.");
+                    return;
+                }
+                Log($"[XV] active=v{activeV}, right=v{v}, catalog='{catalog}'");
+
+                Action<string> log = msg =>
+                {
+                    if (InvokeRequired) BeginInvoke(new Action(() => Log(msg)));
+                    else Log(msg);
+                };
+
+                dynamic cleanV1PU = null;
+                string sqlFile = null;
+                Services.MartMartAutomation.CCSession sess = null;
+
+                try
+                {
+                    // Step 1: load v<N> via existing helper (PUs.Add + FEModel_DDL).
+                    // This intentionally uses the proven SCAPI path that the rest
+                    // of the addin already uses. The temp Mart-loaded PU may leak
+                    // (RPC_E_SERVERFAULT on Remove for CC-loaded PUs is the
+                    // documented limitation) - we accept that for THIS spike;
+                    // the goal is to validate the right-side cleanup works.
+                    log($"[XV] step 1: load v{v} DDL via TryOpenMartVersionDirectly");
+                    LogSessionPUs("XV-step1-pre", log);
+                    string v1Ddl = await System.Threading.Tasks.Task.Run(() =>
+                        Services.DdlGenerationService.TryOpenMartVersionDirectly(_scapi, _currentModel, v, "", log));
+                    LogSessionPUs("XV-step1-post", log);
+                    if (string.IsNullOrEmpty(v1Ddl))
+                    {
+                        Log("[XV] v1 DDL load FAILED - cannot proceed");
+                        return;
+                    }
+                    Log($"[XV] v{v} DDL loaded: {v1Ddl.Length} chars");
+
+                    sqlFile = System.IO.Path.Combine(System.IO.Path.GetTempPath(),
+                        $"erwin_xv_v{v}_{Guid.NewGuid():N}.sql");
+                    System.IO.File.WriteAllText(sqlFile, v1Ddl);
+                    Log($"[XV] v{v}.sql written -> {sqlFile}");
+
+                    // Step 2: clean PU + ReverseEngineerScript (proven by REScript spike)
+                    Log("[XV] step 2: clean PU + ReverseEngineerScript");
+                    await System.Threading.Tasks.Task.Run(() =>
+                    {
+                        Type pbType = Type.GetTypeFromProgID("ERwin9.SCAPI.PropertyBag.9.0");
+                        if (pbType == null) throw new InvalidOperationException("PropertyBag ProgID missing");
+                        dynamic pb = Activator.CreateInstance(pbType);
+                        pb.Add("Model_Type", "Combined");
+                        int targetCode = 0;
+                        try
+                        {
+                            object raw = _currentModel.PropertyBag()?.Value("Target_Server");
+                            if (raw != null && int.TryParse(raw.ToString(), out int parsed)) targetCode = parsed;
+                        }
+                        catch { }
+                        if (targetCode > 0)
+                        {
+                            pb.Add("Target_Server", targetCode);
+                            pb.Add("Target_Server_Version", 11);
+                        }
+                        cleanV1PU = _scapi.PersistenceUnits.Create(pb);
+                        log($"[XV]   blank PU created: '{(cleanV1PU?.Name?.ToString() ?? "?")}'");
+                        pb.ClearAll();
+                        bool reOk = (bool)cleanV1PU.ReverseEngineerScript(pb, sqlFile, "");
+                        log($"[XV]   ReverseEngineerScript returned: {reOk}");
+                    });
+                    LogSessionPUs("XV-step2-post", log);
+                    if (cleanV1PU == null)
+                    {
+                        Log("[XV] cleanV1PU creation failed");
+                        return;
+                    }
+                    string cleanName = (string)cleanV1PU.Name;
+
+                    // Step 3: drive CC + Apply-to-Right via "Open Models in Memory" picker
+                    Log($"[XV] step 3: DriveCCDbAndApplyAsync(reModelName='{cleanName}')");
+                    var overlay = ShowBusyOverlay("REScript cross-version compare, please wait...");
+                    Action<bool> toggle = visible =>
+                    {
+                        try
+                        {
+                            if (InvokeRequired) Invoke(new Action(() => ToggleBusyOverlay(overlay, visible)));
+                            else ToggleBusyOverlay(overlay, visible);
+                        }
+                        catch { }
+                    };
+                    string ddl = null;
+                    try
+                    {
+                        sess = await Services.MartMartAutomation.DriveCCDbAndApplyAsync(cleanName, log, toggle);
+                        if (sess == null || !sess.Applied)
+                        {
+                            Log("[XV] Apply-to-Right did not fire. (no DDL)");
+                        }
+                        else
+                        {
+                            ddl = await System.Threading.Tasks.Task.Run(() =>
+                                Services.NativeBridgeService.GenerateMartMartDdlViaOnFE(log));
+                        }
+                    }
+                    finally
+                    {
+                        Services.MartMartAutomation.CloseSession(sess, log);
+                        try { overlay?.Close(); } catch { }
+                    }
+
+                    if (!string.IsNullOrEmpty(ddl))
+                    {
+                        Log($"[XV] *** ALTER DDL: {ddl.Length} chars ***");
+                        rtbDDLOutput.Text = ddl;
+                    }
+                    else
+                    {
+                        Log("[XV] no DDL captured");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log($"[XV] threw: {ex.GetType().Name}: {ex.Message}");
+                }
+                finally
+                {
+                    // Step 4: KEY TEST - clean up our REScript-loaded PU.
+                    // Spike proved this works for in-memory PUs. After CC engine
+                    // touched it, does it still remove cleanly?
+                    if (cleanV1PU != null)
+                    {
+                        Log("[XV] step 4: cleanup cleanV1PU");
+                        LogSessionPUs("XV-pre-remove", log);
+                        try
+                        {
+                            await System.Threading.Tasks.Task.Delay(800);   // settle CC engine
+                            _scapi.PersistenceUnits.Remove(cleanV1PU, false);
+                            Log("[XV]   *** cleanV1PU REMOVED ***");
+                        }
+                        catch (Exception remEx)
+                        {
+                            Log($"[XV]   Remove err: {remEx.GetType().Name}: {remEx.Message}");
+                        }
+                        LogSessionPUs("XV-post-remove", log);
+                    }
+                    if (sqlFile != null) { try { System.IO.File.Delete(sqlFile); } catch { } }
+                }
+            }
+            finally
+            {
+                btnREScriptXVProbe.Enabled = true;
+            }
+        }
+
+        // Architecture 2 probe: drive the Forward Engineer Alter Script wizard
+        // directly, no CC + no Apply-to-Right click. See DriveFEAlterScriptWizard
+        // in MartMartAutomation.cs for rationale.
+        private async void BtnFEAlterProbe_Click(object sender, EventArgs e)
+        {
+            btnFEAlterProbe.Enabled = false;
+            try
+            {
+                Log("");
+                Log("=== FE Alter Script Probe (Architecture 2: no clicks) ===");
+                if (!_isConnected || _currentModel == null)
+                {
+                    Log("[FE-PROBE] No model connected.");
+                    return;
+                }
+
+                Action<string> log = msg =>
+                {
+                    if (InvokeRequired) BeginInvoke(new Action(() => Log(msg)));
+                    else Log(msg);
+                };
+
+                string ddl = await Services.MartMartAutomation.DriveFEAlterScriptWizardAsync(log);
+                if (string.IsNullOrEmpty(ddl))
+                {
+                    Log("[FE-PROBE] no DDL captured - see bridge + addin logs above.");
+                }
+                else
+                {
+                    Log($"[FE-PROBE] *** SUCCESS: {ddl.Length} chars of alter DDL ***");
+                    var preview = ddl.Length > 300 ? ddl.Substring(0, 300) : ddl;
+                    Log($"[FE-PROBE] preview: {preview.Replace("\n", "\\n")}");
+                    rtbDDLOutput.Text = ddl;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"[FE-PROBE] threw: {ex.GetType().Name}: {ex.Message}");
+            }
+            finally
+            {
+                btnFEAlterProbe.Enabled = true;
+            }
         }
 
         private async void BtnCallOnFE_Click(object sender, EventArgs e)
@@ -3934,11 +5368,17 @@ namespace EliteSoft.Erwin.AddIn
                     long ex = GetWindowLongPtr(h, GWL_EXSTYLE_MCF).ToInt64();
                     if (visible)
                     {
-                        // Restore: clear WS_EX_TRANSPARENT, keep layered with
-                        // alpha=255 so future toggles cost only a flag flip.
-                        long newEx = (ex & ~WS_EX_TRANSPARENT_MCF) | WS_EX_LAYERED_MCF;
+                        // FULLY restore: clear BOTH WS_EX_TRANSPARENT AND
+                        // WS_EX_LAYERED. Leaving WS_EX_LAYERED set on the
+                        // form breaks ShowDialog children: modal dialogs
+                        // (DbConnectionForm "Configure", model pickers,
+                        // etc.) inherit the parent's layered state and end
+                        // up invisible-but-modal - user sees nothing,
+                        // pressing ESC dismisses the hidden dialog and
+                        // returns to the addin. Same hidden-modal pattern
+                        // we hit during Mart Offline cleanup.
+                        long newEx = ex & ~(WS_EX_TRANSPARENT_MCF | WS_EX_LAYERED_MCF);
                         SetWindowLongPtr(h, GWL_EXSTYLE_MCF, new IntPtr(newEx));
-                        SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA_MCF);
                     }
                     else
                     {
@@ -4125,6 +5565,8 @@ namespace EliteSoft.Erwin.AddIn
             _validationService?.Dispose();
             _tableTypeMonitorService?.Dispose();
             _validationCoordinatorService?.Dispose();
+            _columnEditorInspector?.Dispose();
+            _columnEditorInspector = null;
             _propertyApplicatorService?.Dispose();
             _propertyApplicatorService = null;
             _udpRuntimeService?.Dispose();

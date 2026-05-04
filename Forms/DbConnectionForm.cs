@@ -26,6 +26,10 @@ namespace EliteSoft.Erwin.AddIn.Forms
         public bool UseWindowsAuth { get; private set; }
         /// <summary>The DB type code shown in connStr's SERVER=&lt;Code&gt;:... e.g. 16 for SQL Server.</summary>
         public int DbTypeCode { get; private set; }
+        /// <summary>True if the user picked Native (driver-built connection); false for ODBC DSN.</summary>
+        public bool UseNative { get; private set; }
+        /// <summary>The ODBC DSN name when UseNative=false; empty otherwise.</summary>
+        public string DsnName { get; private set; } = "";
 
         // DB type mapping: display name, RE conn code, default major version, erwin Target_Server constant.
         // MajorVer must be a value the installed erwin accepts at PersistenceUnits.Create() time —
@@ -69,7 +73,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
         private static bool _lastIsSqlAuth = true;
         private static string _lastUsername = "sa";
         private static string _lastPassword = "Elite12345";
-        private static string _lastSchemaFilter = "";
+        private static string _lastSchemaFilter = "dbo";
 
         public DbConnectionForm()
         {
@@ -535,6 +539,8 @@ namespace EliteSoft.Erwin.AddIn.Forms
             UserName = user;
             UseWindowsAuth = rbWinAuth.Checked;
             DbTypeCode = dbType.Code;
+            UseNative = rbNative.Checked;
+            DsnName = rbOdbc.Checked ? txtDsnName.Text.Trim() : "";
 
             this.DialogResult = DialogResult.OK;
         }

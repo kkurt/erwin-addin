@@ -9,14 +9,12 @@ namespace EliteSoft.Erwin.AddIn.Services
     /// Resolves and materializes RE/DDL option XML for ReverseEngineer / ForwardEngineer calls.
     ///
     /// Lookup chain (per <see cref="LoadAndWriteToTempFile"/>):
-    ///   1. XML_OPTION row matching MODEL_ID = active model's id (resolved via MODEL_PATH UDP)
-    ///   2. XML_OPTION row matching MODEL_ID = 1 (global "All Projects" fallback)
-    ///   3. Embedded default XML bundled inside this assembly
-    ///   4. Returns null — caller decides whether to skip the option path argument
+    ///   1. XML_OPTION row matching CONFIG_ID = active config's id
+    ///   2. Embedded default XML bundled inside this assembly (RE only)
+    ///   3. Returns null — caller decides whether to skip the option path argument
     /// </summary>
     public static class XmlOptionLoaderService
     {
-        private const int AllProjectsModelId = 1;
         private const string EmbeddedReResource =
             "EliteSoft.Erwin.AddIn.Resources.DefaultReverseOptions.xml";
         private const string EmbeddedDdlResource =
@@ -28,15 +26,15 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// Caller MUST delete the temp file in a finally block.
         /// </summary>
         /// <param name="conn">Open SQL connection (caller owns lifetime).</param>
-        /// <param name="modelId">Active-model id (or null to skip step 1).</param>
+        /// <param name="configId">Active config id (or null to skip DB lookup).</param>
         /// <param name="type">'RE' or 'DDL'.</param>
         /// <param name="log">Logger.</param>
-        public static string LoadAndWriteToTempFile(IDbConnection conn, int? modelId, string type, Action<string> log)
+        public static string LoadAndWriteToTempFile(IDbConnection conn, int? configId, string type, Action<string> log)
         {
-            string xml = ResolveXml(conn, modelId, type, log);
+            string xml = ResolveXml(conn, configId, type, log);
             if (string.IsNullOrEmpty(xml))
             {
-                log?.Invoke($"XmlOption: no XML resolved for type='{type}' modelId={modelId}, will skip option path");
+                log?.Invoke($"XmlOption: no XML resolved for type='{type}' configId={configId}, will skip option path");
                 return null;
             }
 
@@ -58,28 +56,20 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <summary>
         /// Run the lookup chain and return resolved XML (or null if even the embedded fallback fails).
         /// </summary>
-        public static string ResolveXml(IDbConnection conn, int? modelId, string type, Action<string> log)
+        public static string ResolveXml(IDbConnection conn, int? configId, string type, Action<string> log)
         {
-            // 1) Active-model specific row
-            if (modelId.HasValue)
+            // 1) Active-config specific row
+            if (configId.HasValue)
             {
-                string xml = ReadXmlOption(conn, modelId.Value, type, log);
+                string xml = ReadXmlOption(conn, configId.Value, type, log);
                 if (!string.IsNullOrEmpty(xml))
                 {
-                    log?.Invoke($"XmlOption: matched MODEL_ID={modelId.Value} TYPE='{type}'");
+                    log?.Invoke($"XmlOption: matched CONFIG_ID={configId.Value} TYPE='{type}'");
                     return xml;
                 }
             }
 
-            // 2) Global "All Projects" fallback (MODEL.ID = 1)
-            string globalXml = ReadXmlOption(conn, AllProjectsModelId, type, log);
-            if (!string.IsNullOrEmpty(globalXml))
-            {
-                log?.Invoke($"XmlOption: matched MODEL_ID={AllProjectsModelId} (All Projects) TYPE='{type}'");
-                return globalXml;
-            }
-
-            // 3) Embedded default — ONLY for RE. DDL embedded default has hardcoded
+            // 2) Embedded default — ONLY for RE. DDL embedded default has hardcoded
             // DBMSVersion which often mismatches the active model's target version
             // and triggers a "XML File is not compatible for Forward Engineering" popup.
             // For DDL, return null and let the caller pass "" so erwin uses its own defaults.
@@ -100,13 +90,13 @@ namespace EliteSoft.Erwin.AddIn.Services
             return null;
         }
 
-        private static string ReadXmlOption(IDbConnection conn, int modelId, string type, Action<string> log)
+        private static string ReadXmlOption(IDbConnection conn, int configId, string type, Action<string> log)
         {
             try
             {
                 using var cmd = conn.CreateCommand();
-                cmd.CommandText = "SELECT CONTENT FROM XML_OPTION WHERE MODEL_ID = @modelId AND TYPE = @type";
-                AddParam(cmd, "@modelId", modelId);
+                cmd.CommandText = "SELECT CONTENT FROM XML_OPTION WHERE CONFIG_ID = @cfgId AND TYPE = @type";
+                AddParam(cmd, "@cfgId", configId);
                 AddParam(cmd, "@type", type);
 
                 object result = cmd.ExecuteScalar();
@@ -116,7 +106,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
             catch (Exception ex)
             {
-                log?.Invoke($"XmlOption: ReadXmlOption(MODEL_ID={modelId}, TYPE='{type}') error: {ex.Message}");
+                log?.Invoke($"XmlOption: ReadXmlOption(CONFIG_ID={configId}, TYPE='{type}') error: {ex.Message}");
                 return null;
             }
         }
