@@ -115,6 +115,11 @@ if (-not (Test-Path $triggerDll)) {
 }
 
 while ($true) {
+  # Outer guard: any unhandled exception in the iteration body must NOT kill
+  # the watcher. Watcher silently died once on 2026-05-02 and only logon-cycle
+  # would have brought it back; we now log the failure and resume the loop so
+  # transient WMI / Get-Process / Start-Process glitches can't take us out.
+  try {
     # Skip if erwin is already running
     $existing = Get-MyErwin
     if (-not $existing) {
@@ -192,4 +197,14 @@ while ($true) {
     }
 
     Start-Sleep -Seconds 2
+  }
+  catch {
+    # Outer guard - swallowing here is intentional: alternative is silent script
+    # death (which is exactly the bug we're fixing). Type+message logged so we
+    # can still diagnose recurring failures.
+    $errType = $_.Exception.GetType().Name
+    $errMsg  = $_.Exception.Message
+    Write-Log "Outer loop error: ${errType}: ${errMsg}"
+    Start-Sleep -Seconds 2
+  }
 }

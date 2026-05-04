@@ -184,6 +184,44 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host "  COM registered" -ForegroundColor Green
 
+# --- Step 6: Auto-start watcher health check ---
+# Develop loop'unda watcher sessizce olebilir (process kill, OOM, vs). Build
+# bittiginde task var ama watcher process yok ise tetikle - addin auto-load
+# kanalinin acik kalmasini garanti et. Ayrica eski install'lardan kalma
+# RestartCount'suz task ayarini bir kerelik patch'le.
+Write-Host "`n[5/5] Watcher health check..." -ForegroundColor Yellow
+$watcherTaskName = 'EliteSoft Erwin AddIn AutoStart'
+$task = Get-ScheduledTask -TaskName $watcherTaskName -ErrorAction SilentlyContinue
+if (-not $task) {
+    Write-Host "  Auto-start task not configured (run scripts\install.ps1 once for full setup)" -ForegroundColor DarkGray
+} else {
+    # One-shot upgrade: ensure RestartCount is set on already-installed tasks
+    if ($task.Settings.RestartCount -lt 3) {
+        Write-Host "  Patching task with restart-on-failure (3 retries, 1 min apart)..." -ForegroundColor Gray
+        $newSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+            -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) `
+            -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+        Set-ScheduledTask -TaskName $watcherTaskName -Settings $newSettings | Out-Null
+    }
+
+    $watcherProc = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -match 'autostart-watcher' }
+    if ($watcherProc) {
+        Write-Host "  Watcher already running (PID=$($watcherProc.ProcessId))" -ForegroundColor Green
+    } else {
+        Write-Host "  Watcher dead - triggering ScheduledTask..." -ForegroundColor Yellow
+        Start-ScheduledTask -TaskName $watcherTaskName
+        Start-Sleep -Seconds 2
+        $watcherProc = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -match 'autostart-watcher' }
+        if ($watcherProc) {
+            Write-Host "  Watcher started (PID=$($watcherProc.ProcessId))" -ForegroundColor Green
+        } else {
+            Write-Host "  Watcher failed to start - check %LOCALAPPDATA%\EliteSoft\ErwinAddIn\autostart.log" -ForegroundColor Red
+        }
+    }
+}
+
 Write-Host "`nDone! Restart erwin to use the add-in." -ForegroundColor Green
 Write-Host "`nPress any key to exit..." -ForegroundColor Gray
 $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")

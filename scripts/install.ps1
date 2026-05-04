@@ -228,8 +228,12 @@ Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction Silent
 $action = New-ScheduledTaskAction -Execute "powershell.exe" `
     -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watcherTarget`""
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+# RestartCount/RestartInterval: if powershell host crashes / OOMs the watcher,
+# Task Scheduler relaunches it. Windows API minimum is PT1M (1 dakika); altina
+# inilemiyor. Ana savunma watcher'in icindeki try/catch outer guard, bu safety net.
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-    -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)
+    -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) `
+    -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
 
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
     -Settings $settings -Description "Auto-starts Elite Soft Erwin Add-In when erwin opens (WMI event)" | Out-Null
