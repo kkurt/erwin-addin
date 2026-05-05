@@ -1,14 +1,21 @@
 # Elite Soft Erwin Add-In - Build, Install & Register (Dev Workflow)
 #
 # Usage:
-#   .\build-and-run.ps1          Build + install + COM register
-#   .\build-and-run.ps1 -?       Show help
+#   .\build-and-run.ps1                       Build + install + COM register
+#   .\build-and-run.ps1 -KillAllErwinProcs    Same, but also kill other users' erwin
+#   .\build-and-run.ps1 -?                    Show help
 #
 # Requires: .NET 10 SDK, Administrator privileges
 
 param(
     [Alias('?')]
-    [switch]$Help
+    [switch]$Help,
+
+    # Force-kills erwin.exe / DdlHelper.exe / ErwinInjector.exe owned by ANY
+    # user, not just $env:USERNAME. Needed when a stale process from another
+    # session is holding our install dir or the COM host. Off by default
+    # because killing another logged-in user's editor session is destructive.
+    [switch]$KillAllErwinProcs
 )
 
 if ($Help) {
@@ -20,8 +27,9 @@ if ($Help) {
     Write-Host "and configures erwin Add-In Manager. For daily development use."
     Write-Host ""
     Write-Host "Usage:" -ForegroundColor Yellow
-    Write-Host "  .\build-and-run.ps1      Build + install + register"
-    Write-Host "  .\build-and-run.ps1 -?   Show this help"
+    Write-Host "  .\build-and-run.ps1                     Build + install + register"
+    Write-Host "  .\build-and-run.ps1 -KillAllErwinProcs  Also kill other users' erwin"
+    Write-Host "  .\build-and-run.ps1 -?                  Show this help"
     Write-Host ""
     Write-Host "For packaging (ZIP/EXE), use:" -ForegroundColor Yellow
     Write-Host "  .\package.ps1 -?"
@@ -43,7 +51,11 @@ trap {
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
     Write-Host "Requesting Administrator privileges..." -ForegroundColor Yellow
-    Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`"" -Verb RunAs
+    # Forward our switches across the elevation hop, otherwise -KillAllErwinProcs
+    # is silently lost when UAC respawns the script.
+    $forwardArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`""
+    if ($KillAllErwinProcs) { $forwardArgs += " -KillAllErwinProcs" }
+    Start-Process powershell.exe -ArgumentList $forwardArgs -Verb RunAs
     exit
 }
 
@@ -62,14 +74,24 @@ $installDir = Join-Path $env:LOCALAPPDATA "EliteSoft\ErwinAddIn"
 # System.Management.dll and make step 3 (Copy-Item) fail with 'file in use'.
 $myUser = $env:USERNAME
 function Stop-UserProcesses {
-    param([string]$name)
+    param(
+        [string]$name,
+        # When set, ignore ownership and kill every match. Used by
+        # -KillAllErwinProcs to wipe stale erwin sessions that another logged-in
+        # user owns - destructive, opt-in only.
+        [switch]$All
+    )
     $procs = Get-WmiObject Win32_Process -Filter "Name='$name.exe'" -ErrorAction SilentlyContinue
     if (-not $procs) { return }
     foreach ($p in $procs) {
         $owner = $null
         try { $owner = $p.GetOwner() } catch { $owner = $null }
         $ownerUser = if ($owner -and $owner.ReturnValue -eq 0) { $owner.User } else { $null }
-        if ($ownerUser -and $ownerUser -ieq $myUser) {
+        if ($All) {
+            $tag = if ($ownerUser) { "user=$ownerUser" } else { "owner unknown" }
+            Write-Host "  Killing ${name}.exe PID=$($p.ProcessId) ($tag, FORCE all-users, started $($p.ConvertToDateTime($p.CreationDate)))" -ForegroundColor Red
+            Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+        } elseif ($ownerUser -and $ownerUser -ieq $myUser) {
             Write-Host "  Killing ${name}.exe PID=$($p.ProcessId) (user=$ownerUser, started $($p.ConvertToDateTime($p.CreationDate)))" -ForegroundColor Yellow
             Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
         } elseif (-not $ownerUser) {
@@ -79,15 +101,19 @@ function Stop-UserProcesses {
             Write-Host "  Killing ${name}.exe PID=$($p.ProcessId) (owner unknown, started $($p.ConvertToDateTime($p.CreationDate)))" -ForegroundColor DarkYellow
             Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
         } else {
-            Write-Host "  Skipping ${name}.exe PID=$($p.ProcessId) (owner=$ownerUser, not ours)" -ForegroundColor Gray
+            Write-Host "  Skipping ${name}.exe PID=$($p.ProcessId) (owner=$ownerUser, not ours; pass -KillAllErwinProcs to override)" -ForegroundColor Gray
         }
     }
 }
 
-Write-Host "`nClosing erwin / DdlHelper / ErwinInjector (user=$myUser)..." -ForegroundColor Yellow
-Stop-UserProcesses "erwin"
-Stop-UserProcesses "DdlHelper"
-Stop-UserProcesses "ErwinInjector"
+if ($KillAllErwinProcs) {
+    Write-Host "`nClosing erwin / DdlHelper / ErwinInjector (ALL USERS, -KillAllErwinProcs)..." -ForegroundColor Red
+} else {
+    Write-Host "`nClosing erwin / DdlHelper / ErwinInjector (user=$myUser)..." -ForegroundColor Yellow
+}
+Stop-UserProcesses "erwin"          -All:$KillAllErwinProcs
+Stop-UserProcesses "DdlHelper"      -All:$KillAllErwinProcs
+Stop-UserProcesses "ErwinInjector"  -All:$KillAllErwinProcs
 Start-Sleep -Seconds 2
 
 # --- Step 2a: Build native bridge (cl.exe) ---
