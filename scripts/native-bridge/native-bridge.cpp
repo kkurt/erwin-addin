@@ -27,6 +27,8 @@
 #include <time.h>
 #include <stdint.h>
 #include <set>
+#include <map>
+#include <vector>
 #include <string.h>
 
 // Captured on DLL_PROCESS_ATTACH (DllMain). Used by SetWindowsHookEx in
@@ -359,6 +361,147 @@ static void StoreCapturedDdl(char* ddl /* takes ownership */) {
 // Forward declaration - definition lives further down in FAZ 2 section.
 static char* ConcatScriptVector(void* vecPtr);
 
+// Phase-C probe-5: forward decl so GA hook can call it; definition lives
+// further down with the other PROBE_* exports.
+extern "C" __declspec(dllexport) int __cdecl Probe_DumpAsContents(void* as);
+
+// Phase-F2: forward decl so InstallHook (auto-fires at addin startup) can
+// install the AddItem detour without waiting for InstallObserverHook (which
+// managed code never invokes today).
+extern "C" __declspec(dllexport) int __cdecl InstallAddItemHook(void);
+
+// Phase-C step-3: forward decl so GetChangedEntityIds (defined a few hundred
+// lines below) can call CCInsp_GetTrasactionSummary which is defined even
+// further down. C++ requires forward decls for ordering.
+extern "C" __declspec(dllexport) void* __cdecl CCInsp_GetTrasactionSummary(
+    unsigned int flags, void* ms);
+
+// Phase-C diag: resolve any code address to "module + RVA" so crash logs
+// can pinpoint which DLL was executing. Used by both LogStack callers and
+// the unhandled-exception filter installed below.
+static void LogAddressModule(const char* tag, const void* addr) {
+    if (!addr) { LogLine("[%s] (null)", tag); return; }
+    HMODULE m = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)addr, &m) && m) {
+        wchar_t modPath[MAX_PATH] = { 0 };
+        GetModuleFileNameW(m, modPath, MAX_PATH);
+        const wchar_t* base = wcsrchr(modPath, L'\\');
+        DWORD_PTR rva = (DWORD_PTR)addr - (DWORD_PTR)m;
+        LogLine("[%s] %p = %ls + 0x%llX", tag, addr, base ? base + 1 : modPath, (unsigned long long)rva);
+    } else {
+        LogLine("[%s] %p (no owning module)", tag, addr);
+    }
+}
+
+// Phase-C diag: top-level unhandled exception filter so that when erwin
+// crashes (e.g., column-add path AV), we capture the faulting address and
+// stack BEFORE Windows brings the process down. Without this we have no
+// way to tell which hook/code caused the crash; with it the bridge log
+// gets a "[CRASH] ..." block with module+RVA for the exception RIP plus a
+// few stack frames - enough to identify the culprit.
+//
+// IMPORTANT: top-level filter alone is insufficient because erwin /
+// third-party DLLs can replace it with their own SetUnhandledExceptionFilter,
+// AND because TerminateProcess / abort() bypass it entirely. We pair it
+// with a Vectored Exception Handler (AddVectoredExceptionHandler with
+// FirstHandler=1) which fires BEFORE any __try/__except chain - so even
+// if erwin's handler swallows the AV and calls ExitProcess we still get
+// the trace. VEH is throttled to avoid spam from the by-design AVs we
+// ignore in the Invoke-CString return path.
+static LPTOP_LEVEL_EXCEPTION_FILTER g_priorUnhandledFilter = nullptr;
+static PVOID g_veh = nullptr;
+static volatile LONG g_vehLogged = 0;
+
+static LONG WINAPI BridgeUnhandledExceptionFilter(EXCEPTION_POINTERS* ep) {
+    if (!ep || !ep->ExceptionRecord) {
+        return g_priorUnhandledFilter ? g_priorUnhandledFilter(ep) : EXCEPTION_CONTINUE_SEARCH;
+    }
+    LogLine("[CRASH] ============================================================");
+    LogLine("[CRASH] UNHANDLED EXCEPTION code=0x%08lX addr=%p",
+        ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress);
+    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION
+        && ep->ExceptionRecord->NumberParameters >= 2) {
+        const char* op = ep->ExceptionRecord->ExceptionInformation[0] == 0 ? "READ"
+                       : ep->ExceptionRecord->ExceptionInformation[0] == 1 ? "WRITE"
+                       : ep->ExceptionRecord->ExceptionInformation[0] == 8 ? "EXECUTE"
+                       : "?";
+        LogLine("[CRASH] AV %s offending=%p", op, (void*)ep->ExceptionRecord->ExceptionInformation[1]);
+    }
+    LogAddressModule("CRASH-RIP", ep->ExceptionRecord->ExceptionAddress);
+    // Some context registers can also help locate the faulting code - x64.
+    if (ep->ContextRecord) {
+        const CONTEXT* c = ep->ContextRecord;
+        LogLine("[CRASH] RAX=%p RCX=%p RDX=%p RBX=%p", (void*)c->Rax, (void*)c->Rcx, (void*)c->Rdx, (void*)c->Rbx);
+        LogLine("[CRASH] RSP=%p RBP=%p RSI=%p RDI=%p", (void*)c->Rsp, (void*)c->Rbp, (void*)c->Rsi, (void*)c->Rdi);
+        LogLine("[CRASH] R8=%p R9=%p R10=%p R11=%p",   (void*)c->R8,  (void*)c->R9,  (void*)c->R10, (void*)c->R11);
+    }
+    // Capture stack backtrace from the FAULTING thread (this filter runs on
+    // the same thread that raised the exception, so CaptureStackBackTrace
+    // gives us the right walk).
+    void* frames[24] = { 0 };
+    USHORT cap = CaptureStackBackTrace(0, 24, frames, nullptr);
+    for (USHORT i = 0; i < cap; ++i) {
+        char tag[32];
+        sprintf_s(tag, sizeof(tag), "CRASH-STK#%02u", (unsigned)i);
+        LogAddressModule(tag, frames[i]);
+    }
+    LogLine("[CRASH] ============================================================");
+    return g_priorUnhandledFilter ? g_priorUnhandledFilter(ep) : EXCEPTION_CONTINUE_SEARCH;
+}
+
+static LONG WINAPI BridgeVeh(EXCEPTION_POINTERS* ep) {
+    if (!ep || !ep->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    // Filter to fatal exceptions; ignore C++ throws and user-defined SEH
+    // codes that are routine (lots of code uses RaiseException for control
+    // flow). What we WANT: AV, stack overflow, illegal instruction,
+    // privileged instruction, fast-fail, heap corruption.
+    bool isCritical = false;
+    switch (code) {
+        case EXCEPTION_ACCESS_VIOLATION:
+        case EXCEPTION_STACK_OVERFLOW:
+        case EXCEPTION_PRIV_INSTRUCTION:
+        case EXCEPTION_ILLEGAL_INSTRUCTION:
+        case EXCEPTION_INT_DIVIDE_BY_ZERO:
+        case 0xC0000374L:   // STATUS_HEAP_CORRUPTION
+        case 0xC0000409L:   // STATUS_STACK_BUFFER_OVERRUN
+        case 0xC000041DL:   // STATUS_FATAL_USER_CALLBACK_EXCEPTION
+        case 0xC0000420L:   // STATUS_ASSERTION_FAILURE
+            isCritical = true; break;
+    }
+    if (!isCritical) return EXCEPTION_CONTINUE_SEARCH;
+
+    LONG seq = InterlockedIncrement(&g_vehLogged);
+    if (seq > 50) return EXCEPTION_CONTINUE_SEARCH;   // throttle, don't spam
+
+    LogLine("[VEH#%ld] === EXCEPTION === code=0x%08lX at %p",
+        seq, code, ep->ExceptionRecord->ExceptionAddress);
+    LogAddressModule("VEH-RIP", ep->ExceptionRecord->ExceptionAddress);
+    if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2) {
+        const char* op = ep->ExceptionRecord->ExceptionInformation[0] == 0 ? "READ"
+                       : ep->ExceptionRecord->ExceptionInformation[0] == 1 ? "WRITE"
+                       : ep->ExceptionRecord->ExceptionInformation[0] == 8 ? "EXECUTE"
+                       : "?";
+        LogLine("[VEH#%ld] AV %s offending=%p", seq, op, (void*)ep->ExceptionRecord->ExceptionInformation[1]);
+    }
+    if (ep->ContextRecord) {
+        const CONTEXT* c = ep->ContextRecord;
+        LogLine("[VEH#%ld] RAX=%p RCX=%p RDX=%p RBX=%p", seq, (void*)c->Rax, (void*)c->Rcx, (void*)c->Rdx, (void*)c->Rbx);
+        LogLine("[VEH#%ld] RSP=%p RBP=%p RSI=%p RDI=%p", seq, (void*)c->Rsp, (void*)c->Rbp, (void*)c->Rsi, (void*)c->Rdi);
+        LogLine("[VEH#%ld] R8=%p R9=%p R10=%p R11=%p",   seq, (void*)c->R8,  (void*)c->R9,  (void*)c->R10, (void*)c->R11);
+    }
+    void* frames[24] = { 0 };
+    USHORT cap = CaptureStackBackTrace(0, 24, frames, nullptr);
+    for (USHORT i = 0; i < cap; ++i) {
+        char tag[32];
+        sprintf_s(tag, sizeof(tag), "VEH#%ld-STK#%02u", seq, (unsigned)i);
+        LogAddressModule(tag, frames[i]);
+    }
+    LogLine("[VEH#%ld] === END ===", seq);
+    return EXCEPTION_CONTINUE_SEARCH;   // let normal handlers continue
+}
+
 // ---------------------------------------------------------------------------
 // FEProcessor::GenerateFEScript detour - silent pointer capture
 // ---------------------------------------------------------------------------
@@ -526,8 +669,44 @@ extern "C" __declspec(dllexport) int __cdecl CCInsp_InstallOnFeHook(void);
 extern "C" __declspec(dllexport) int __cdecl CCInsp_InstallEdrHooks(void);
 static void InstallEccPipelineHooks(void);
 
+// Forward decl for the probe invoked from InstallHook below.
+extern "C" __declspec(dllexport) int __cdecl Probe_DumpGdmActionSummaryExports(void);
+
 extern "C" __declspec(dllexport) int __cdecl InstallHook(void) {
     LogLine("====== InstallHook() v3 in PID %lu ======", GetCurrentProcessId());
+
+    // Phase-C diag: install our top-level unhandled exception filter so
+    // erwin crashes get logged with module + RVA + stack BEFORE Windows
+    // tears the process down. Idempotent: only register once.
+    if (!g_priorUnhandledFilter) {
+        g_priorUnhandledFilter = SetUnhandledExceptionFilter(BridgeUnhandledExceptionFilter);
+        LogLine("[CRASH-INIT] unhandled exception filter installed (prior=%p)", (void*)g_priorUnhandledFilter);
+    }
+    // VEH fires BEFORE the top-level filter and BEFORE __try/__except, so
+    // even if erwin replaces our top-level filter or aborts on a critical
+    // exception, we still capture the trace. FirstHandler=1 so we run
+    // first in the VEH chain.
+    if (!g_veh) {
+        g_veh = AddVectoredExceptionHandler(1, BridgeVeh);
+        LogLine("[CRASH-INIT] VEH installed (handle=%p)", g_veh);
+    }
+
+    // Phase-C probe-4: dump EM_GDM.dll exports related to GDMActionSummary
+    // exactly once at hook install, so on the next addin restart the bridge
+    // log contains the full mangled-name list. Used to identify the
+    // iteration API (GetCount / Iterator / GetItem-like methods) so the
+    // validation pipeline can extract changed-object IDs from the action
+    // summary instead of doing a full 8400-attribute walk.
+    Probe_DumpGdmActionSummaryExports();
+
+    // Phase-F2: install GDMActionSummary::AddItem detour right at startup.
+    // This hook captures every change record erwin appends to its action
+    // summary - the same data source that feeds erwin's Action Log pane.
+    // Per-property granularity: column edits, in-place renames, bulk edits,
+    // mart sync - they all funnel through AddItem. Failure is non-fatal,
+    // we just lose event-driven validation.
+    int addItemRc = InstallAddItemHook();
+    LogLine("[ADDITEM] InstallAddItemHook rc=%d", addItemRc);
 
     // ----- v2 chained callbacks (kept as diagnostic) ----------------------
     HMODULE ecx = GetModuleHandleW(L"EM_ECX.dll");
@@ -1543,6 +1722,48 @@ static void HideWizardAggressive(HWND hwnd) {
         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
+// Reverses HideWizardAggressive's WS_EX_LAYERED|WS_EX_TOOLWINDOW + alpha=0
+// state in a way that DWM actually releases the back-buffer surface BEFORE
+// the window is destroyed. The original "clear bit + SWP_FRAMECHANGED" fix
+// (commit ecd1995) was insufficient: DWM holds the layered surface until it
+// observes a final paint cycle on the layered window, so simply flipping the
+// style bit can leak the surface if MFC's destroy chain runs before DWM
+// notices the bit change. Generate DDL reproduces it every run.
+//
+// The fix sequence proven to release the surface even when MFC's destroy
+// chain unwinds via SEH (the IPS-CALL post-return AV we ignore for DDL
+// capture):
+//   1. SetLayeredWindowAttributes(alpha=255) - flushes the layered surface
+//      one more time AS OPAQUE so DWM resolves it back to the regular window
+//      surface; without this, DWM keeps the back-buffer mapped.
+//   2. Clear WS_EX_LAYERED|WS_EX_TOOLWINDOW from GWL_EXSTYLE.
+//   3. SetWindowPos with SWP_FRAMECHANGED - tells the compositor the style
+//      changed, must recompute non-client area.
+//   4. RedrawWindow with RDW_INVALIDATE|RDW_UPDATENOW|RDW_FRAME - forces a
+//      synchronous repaint cycle, which DWM uses as the trigger to release
+//      the layered back-buffer.
+// After step 4 the window can safely be destroyed without the compositor
+// leak that paints black rectangles process-wide.
+static void ClearWizardLayeredAndFlush(HWND hwnd, const char* tag) {
+    if (!IsWindow(hwnd)) return;
+    LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    if ((ex & WS_EX_LAYERED) == 0) return;
+
+    // Step 1: opaque alpha forces DWM to flush the layered back-buffer.
+    SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+    // Step 2: drop the layered/toolwindow ex-style we set on hide.
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE,
+        ex & ~(WS_EX_LAYERED | WS_EX_TOOLWINDOW));
+    // Step 3: tell the compositor the frame changed.
+    SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    // Step 4: synchronous redraw -> DWM observes paint cycle -> releases surface.
+    RedrawWindow(hwnd, NULL, NULL,
+        RDW_INVALIDATE | RDW_UPDATENOW | RDW_FRAME | RDW_ERASE);
+    LogLine("[LAYER-CLR] %s hwnd=%p flushed (alpha=255 + SWP_FRAMECHANGED + RedrawWindow)",
+        tag ? tag : "(?)", hwnd);
+}
+
 // WinEvent callback: fires as soon as erwin creates a new window / shows one
 // / changes its title. We use it to catch the Alter Script wizard the moment
 // it's born, BEFORE the first paint - eliminating flash.
@@ -1676,26 +1897,11 @@ extern "C" __declspec(dllexport) void __cdecl CloseHiddenWizard(void* hwnd) {
     HWND h = (HWND)hwnd;
     LogLine("[OPEN-WIZ] closing hwnd=%p (IDCANCEL)", hwnd);
 
-    // Clear the WS_EX_LAYERED|WS_EX_TOOLWINDOW we set in HideWizardAggressive
-    // BEFORE posting destroy messages. Reason: WS_EX_LAYERED puts the window
-    // into a desktop-compositor-managed back-buffer surface. If MFC's normal
-    // destroy chain stalls or unwinds partially (the IPS-CALL post-return
-    // SEH 0xC0000005 we ignore for DDL capture interrupts the Invoke call
-    // stack mid-flight), the compositor may not release that surface and
-    // erwin's GDI/text-rendering state stays polluted process-wide. User
-    // sees black rectangles on the leading edge of every text label across
-    // diagram entities AND ribbon menus until full erwin restart. Clearing
-    // the layered bit + SWP_FRAMECHANGED forces compositor recalc and surface
-    // release, decoupling the cleanup from MFC's potentially-broken unwind.
-    if (IsWindow(h)) {
-        LONG_PTR ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
-        if (ex & WS_EX_LAYERED) {
-            SetWindowLongPtrW(h, GWL_EXSTYLE, ex & ~(WS_EX_LAYERED | WS_EX_TOOLWINDOW));
-            SetWindowPos(h, NULL, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-            LogLine("[OPEN-WIZ] pre-close: cleared WS_EX_LAYERED|WS_EX_TOOLWINDOW");
-        }
-    }
+    // Clear the WS_EX_LAYERED state HideWizardAggressive set, BEFORE posting
+    // any destroy messages. See ClearWizardLayeredAndFlush comment for the
+    // alpha=255 + SWP_FRAMECHANGED + RedrawWindow sequence and why each step
+    // is required for DWM to actually release the back-buffer surface.
+    ClearWizardLayeredAndFlush(h, "[OPEN-WIZ] pre-close");
 
     PostMessage(h, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
     // Also post WM_CLOSE as a fallback in case IDCANCEL routes elsewhere.
@@ -1836,6 +2042,495 @@ extern "C" __declspec(dllexport) int __cdecl InstallObserverHook(void) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// PROBE-4: Walk EM_GDM.dll's PE Export Address Table and log every exported
+// symbol whose mangled name contains "ActionSummary". The goal is to find
+// the iteration / get-count / get-item methods exposed on GDMActionSummary
+// so we can extract changed-object IDs without having to reverse-engineer
+// the in-memory layout. Without PDBs we can't resolve unmangled names but
+// the mangled forms (?Method@GDMActionSummary@@QEAA...) are descriptive
+// enough to identify candidates.
+//
+// Filter terms: "ActionSummary" catches member methods on the class;
+// "ActSum" / "_AS" / "GdmAS" cover any abbreviated factories.
+// ---------------------------------------------------------------------------
+extern "C" __declspec(dllexport) int __cdecl Probe_DumpGdmActionSummaryExports(void) {
+    HMODULE m = GetModuleHandleW(L"EM_GDM.dll");
+    if (!m) m = LoadLibraryW(L"EM_GDM.dll");
+    if (!m) {
+        LogLine("[GDM-EXPORTS] EM_GDM.dll not loaded and LoadLibrary failed");
+        return -1;
+    }
+    LogLine("[GDM-EXPORTS] EM_GDM.dll base=%p", (void*)m);
+
+    BYTE* base = (BYTE*)m;
+    auto dosHdr = (PIMAGE_DOS_HEADER)base;
+    if (dosHdr->e_magic != IMAGE_DOS_SIGNATURE) {
+        LogLine("[GDM-EXPORTS] bad DOS signature");
+        return -2;
+    }
+    auto ntHdr = (PIMAGE_NT_HEADERS)(base + dosHdr->e_lfanew);
+    if (ntHdr->Signature != IMAGE_NT_SIGNATURE) {
+        LogLine("[GDM-EXPORTS] bad NT signature");
+        return -3;
+    }
+    DWORD expRVA = ntHdr->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    if (expRVA == 0) {
+        LogLine("[GDM-EXPORTS] no export directory");
+        return -4;
+    }
+    auto exp = (PIMAGE_EXPORT_DIRECTORY)(base + expRVA);
+    auto names = (DWORD*)(base + exp->AddressOfNames);
+    auto funcs = (DWORD*)(base + exp->AddressOfFunctions);
+    auto ords  = (WORD*) (base + exp->AddressOfNameOrdinals);
+
+    LogLine("[GDM-EXPORTS] total exported names = %u", exp->NumberOfNames);
+
+    int matched = 0;
+    for (DWORD i = 0; i < exp->NumberOfNames; ++i) {
+        const char* name = (const char*)(base + names[i]);
+        if (strstr(name, "ActionSummary") || strstr(name, "ActSum") ||
+            strstr(name, "GDMAS") || strstr(name, "@AS@")) {
+            DWORD ord = ords[i];
+            DWORD funcRVA = funcs[ord];
+            LogLine("[GDM-EXPORTS] +0x%06X  %s", funcRVA, name);
+            matched++;
+        }
+    }
+    LogLine("[GDM-EXPORTS] %d ActionSummary-related export(s) logged", matched);
+    return matched;
+}
+
+// ---------------------------------------------------------------------------
+// PROBE-5: Dump the contents of a live GDMActionSummary using the EM_GDM
+// exported accessors found in probe-4. Walks the Created / Deleted /
+// Modified maps + TouchedObjectIds set and logs counts + a sample of
+// per-item id/owner/type. If the layouts match what MSVC STL gives us
+// (likely - both bridge and EM_GDM compile with VS2017-era MSVC), we
+// can skip the full attribute-walk validation entirely and consume
+// only the items present in these collections.
+// ---------------------------------------------------------------------------
+typedef const std::set<unsigned int>&            (__cdecl* AsTouchedFn)(void* as);
+typedef const std::map<unsigned int, void*>&     (__cdecl* AsObjectsMapFn)(void* as);
+typedef unsigned int                             (__cdecl* ItemUintFn)(void* item);
+
+static AsTouchedFn      g_asTouched     = nullptr;
+static AsObjectsMapFn   g_asCreated     = nullptr;
+static AsObjectsMapFn   g_asDeleted     = nullptr;
+static AsObjectsMapFn   g_asModified    = nullptr;
+static ItemUintFn       g_itemId        = nullptr;
+static ItemUintFn       g_itemOwner     = nullptr;
+static ItemUintFn       g_itemType      = nullptr;
+static volatile LONG    g_asResolversReady = 0;
+
+static const char* kAsTouchedSym  = "?TouchedObjectIds@GDMActionSummary@@QEBAAEBV?$set@IU?$less@I@std@@V?$allocator@I@2@@std@@XZ";
+static const char* kAsCreatedSym  = "?CreatedObjects@GDMActionSummary@@QEBAAEBV?$map@IPEAVGDMActionSummaryItem@@U?$less@I@std@@V?$allocator@U?$pair@$$CBIPEAVGDMActionSummaryItem@@@std@@@3@@std@@XZ";
+static const char* kAsDeletedSym  = "?DeletedObjects@GDMActionSummary@@QEBAAEBV?$map@IPEAVGDMActionSummaryItem@@U?$less@I@std@@V?$allocator@U?$pair@$$CBIPEAVGDMActionSummaryItem@@@std@@@3@@std@@XZ";
+static const char* kAsModifiedSym = "?ModifiedObjects@GDMActionSummary@@QEBAAEBV?$map@IPEAVGDMActionSummaryItem@@U?$less@I@std@@V?$allocator@U?$pair@$$CBIPEAVGDMActionSummaryItem@@@std@@@3@@std@@XZ";
+static const char* kItemIdSym     = "?Id@GDMActionSummaryItem@@QEBAIXZ";
+static const char* kItemOwnerSym  = "?Owner@GDMActionSummaryItem@@QEBAIXZ";
+static const char* kItemTypeSym   = "?Type@GDMActionSummaryItem@@QEBAIXZ";
+
+static void EnsureAsResolvers(void) {
+    if (InterlockedCompareExchange(&g_asResolversReady, 0, 0) != 0) return;
+    HMODULE gdm = GetModuleHandleW(L"EM_GDM.dll");
+    if (!gdm) gdm = LoadLibraryW(L"EM_GDM.dll");
+    if (!gdm) { LogLine("[AS-DUMP] EM_GDM.dll not loaded"); return; }
+    g_asTouched  = (AsTouchedFn)   GetProcAddress(gdm, kAsTouchedSym);
+    g_asCreated  = (AsObjectsMapFn)GetProcAddress(gdm, kAsCreatedSym);
+    g_asDeleted  = (AsObjectsMapFn)GetProcAddress(gdm, kAsDeletedSym);
+    g_asModified = (AsObjectsMapFn)GetProcAddress(gdm, kAsModifiedSym);
+    g_itemId     = (ItemUintFn)    GetProcAddress(gdm, kItemIdSym);
+    g_itemOwner  = (ItemUintFn)    GetProcAddress(gdm, kItemOwnerSym);
+    g_itemType   = (ItemUintFn)    GetProcAddress(gdm, kItemTypeSym);
+    LogLine("[AS-DUMP] resolvers: touched=%p created=%p deleted=%p modified=%p item.id=%p .owner=%p .type=%p",
+        (void*)g_asTouched, (void*)g_asCreated, (void*)g_asDeleted, (void*)g_asModified,
+        (void*)g_itemId, (void*)g_itemOwner, (void*)g_itemType);
+    InterlockedExchange(&g_asResolversReady, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Phase-C step-3: production extraction of "which entities does the
+// validation pipeline need to re-walk this tick?".
+//
+// Reads the live GDMActionSummary via EDR's GetTrasactionSummary(0, ms),
+// walks the Created+Modified maps (skipping Deleted - no point validating
+// objects that no longer exist), and resolves each item to the entity
+// it belongs to:
+//   owner == 1   -> the item itself is an entity (model root is owner=1)
+//   owner == 0   -> auto-generated internal object (relationship/key/etc)
+//                   - skip; not user-visible
+//   owner != 0,1 -> the item is an attribute of entity = owner
+//
+// Returns a comma-separated string of distinct entity int-OIDs (e.g.
+// "391,466,475") via a static buffer. Caller does NOT free. Empty string
+// means no relevant changes detected. The buffer is 8KB which fits ~700
+// distinct entities - well above any realistic edit burst.
+// ---------------------------------------------------------------------------
+static char g_changedEntitiesBuf[8192];
+
+// SEH-only thunk: read AS map (member function) without C++ unwinding,
+// pass results back via a plain pointer-pair the caller can iterate later.
+// Returns nullptr if the call AVs.
+static const std::map<unsigned int, void*>* __stdcall SafeReadAsMap(
+    AsObjectsMapFn fn, void* as)
+{
+    if (!fn || !as) return nullptr;
+    __try {
+        return &fn(as);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+// SEH-only thunk for the EDR call so the C++ caller can stay clean of __try.
+static void* __stdcall SafeGetTrasactionSummary(void* ms) {
+    __try {
+        return CCInsp_GetTrasactionSummary(0, ms);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+// SEH-only thunks for item-getter calls. Each item.Id() / Owner() call
+// could AV if the item pointer is bad; isolate per-call.
+static unsigned int __stdcall SafeItemUint(ItemUintFn fn, void* item) {
+    if (!fn || !item) return 0;
+    __try {
+        return fn(item);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+static void ExtractEntityIdsFromAsMap(AsObjectsMapFn fn, void* as,
+                                      std::set<unsigned int>& outEntities)
+{
+    const auto* m = SafeReadAsMap(fn, as);
+    if (!m) return;
+    for (const auto& kv : *m) {
+        void* item = kv.second;
+        if (!item) continue;
+        unsigned int owner = SafeItemUint(g_itemOwner, item);
+        if (owner == 0) continue;            // auto-gen / model-root noise
+        if (owner == 1) {
+            unsigned int id = SafeItemUint(g_itemId, item);
+            if (id != 0) outEntities.insert(id);
+        } else {
+            outEntities.insert(owner);
+        }
+    }
+}
+
+// IMPORTANT: AS iteration disabled 2026-05-05 after a confirmed user crash.
+// Probe-5 proved the std::map walk works when called from inside the GA hook
+// (where erwin owns + protects the AS for the duration of the Generate DDL
+// flow), but calling it standalone from MonitorTimer mid-transaction crashes
+// erwin even with __try around the function-pointer call - the AV happens
+// inside the C++ tree iterator destructor on stack unwind, which cannot
+// share a frame with __try. Until we add a proper out-of-band copy step
+// (extract size + key/value array via member functions, then iterate the
+// pure-C array under SEH), keep this function returning empty so the
+// managed side falls back to its safe walk-all-entities path. Note that
+// the supporting code (resolver lookup, attr extractor) stays available
+// behind the kill-switch so re-enabling is a one-line change.
+static volatile LONG g_asIterationEnabled = 0;   // kill switch: 0 = disabled
+
+extern "C" __declspec(dllexport) const char* __cdecl GetChangedEntityIds(void* ms) {
+    g_changedEntitiesBuf[0] = 0;
+    if (InterlockedCompareExchange(&g_asIterationEnabled, 0, 0) == 0) {
+        return g_changedEntitiesBuf;   // kill switch active - empty result
+    }
+    if (!ms) return g_changedEntitiesBuf;
+
+    void* as = SafeGetTrasactionSummary(ms);
+    if (!as) return g_changedEntitiesBuf;
+
+    EnsureAsResolvers();
+    if (!g_itemId || !g_itemOwner) return g_changedEntitiesBuf;
+
+    std::set<unsigned int> entities;
+    ExtractEntityIdsFromAsMap(g_asCreated,  as, entities);
+    ExtractEntityIdsFromAsMap(g_asModified, as, entities);
+
+    // Build comma-separated string into the static buffer.
+    size_t off = 0;
+    for (unsigned int e : entities) {
+        if (off >= sizeof(g_changedEntitiesBuf) - 16) break;
+        int written = sprintf_s(g_changedEntitiesBuf + off,
+                                sizeof(g_changedEntitiesBuf) - off,
+                                off == 0 ? "%u" : ",%u", e);
+        if (written < 0) break;
+        off += (size_t)written;
+    }
+    return g_changedEntitiesBuf;
+}
+
+// Phase-C step-3 (companion): returns the actual attribute int-OIDs that
+// changed, not just their owning entities. Same source as GetChangedEntityIds
+// but here we keep the item.id (the attribute itself) instead of mapping
+// up to its owner. Validation walks affected entities (from the entity-id
+// list) but only processes attrs whose id is in THIS list, preventing
+// 30-attr-per-entity false-positive popups when only one column changed.
+static char g_changedAttrsBuf[16384];
+
+static void ExtractAttrIdsFromAsMap(AsObjectsMapFn fn, void* as,
+                                    std::set<unsigned int>& outAttrs)
+{
+    const auto* m = SafeReadAsMap(fn, as);
+    if (!m) return;
+    for (const auto& kv : *m) {
+        void* item = kv.second;
+        if (!item) continue;
+        unsigned int owner = SafeItemUint(g_itemOwner, item);
+        if (owner == 0 || owner == 1) continue;   // skip auto-gen + entities
+        unsigned int id = SafeItemUint(g_itemId, item);
+        if (id != 0) outAttrs.insert(id);
+    }
+}
+
+extern "C" __declspec(dllexport) const char* __cdecl GetChangedAttributeIds(void* ms) {
+    g_changedAttrsBuf[0] = 0;
+    // Same kill switch as GetChangedEntityIds - same iteration crash risk.
+    if (InterlockedCompareExchange(&g_asIterationEnabled, 0, 0) == 0) {
+        return g_changedAttrsBuf;
+    }
+    if (!ms) return g_changedAttrsBuf;
+
+    void* as = SafeGetTrasactionSummary(ms);
+    if (!as) return g_changedAttrsBuf;
+
+    EnsureAsResolvers();
+    if (!g_itemId || !g_itemOwner) return g_changedAttrsBuf;
+
+    std::set<unsigned int> attrs;
+    ExtractAttrIdsFromAsMap(g_asCreated,  as, attrs);
+    ExtractAttrIdsFromAsMap(g_asModified, as, attrs);
+
+    size_t off = 0;
+    for (unsigned int a : attrs) {
+        if (off >= sizeof(g_changedAttrsBuf) - 16) break;
+        int written = sprintf_s(g_changedAttrsBuf + off,
+                                sizeof(g_changedAttrsBuf) - off,
+                                off == 0 ? "%u" : ",%u", a);
+        if (written < 0) break;
+        off += (size_t)written;
+    }
+    return g_changedAttrsBuf;
+}
+
+// ---------------------------------------------------------------------------
+// Phase-F2: Hook GDMActionSummary::AddItem to capture every change record
+// at the moment erwin's transaction handler appends it to the action summary.
+//
+// This is the universal change-detection backbone that feeds erwin's own
+// Action Log pane. Hooking here means we observe EVERY edit path - column
+// editor, in-place rename, bulk edit, mart sync, anything - through one
+// chokepoint.
+//
+// We deliberately DO NOT iterate the AS std::map (probe-3 / step-3 crashed
+// during mid-transaction iteration). Instead we read the just-added item's
+// numerical fields (Id, Owner, Type) using member-function accessors that
+// were proven safe in probe-5. The (id, owner, type) tuple goes onto a
+// lock-protected ring buffer; managed code drains it via DequeueChangeRecord.
+//
+// Hook signature: AddItem is a __cdecl member function with this in RCX,
+// type (Types_e enum, 4 bytes) in EDX, item* in R8.
+// ---------------------------------------------------------------------------
+typedef void (__cdecl* GdmAsAddItemFn)(void* self, unsigned int type, void* item);
+static GdmAsAddItemFn g_origAddItem = nullptr;
+static const char* kGdmAsAddItemSym =
+    "?AddItem@GDMActionSummary@@QEAAXW4Types_e@1@PEAVGDMActionSummaryItem@@@Z";
+
+// Ring buffer of change records. Single producer (the hook fires on whatever
+// thread erwin uses for transactions - typically the UI thread, but treat
+// it as multi-producer to be safe). Single consumer (managed timer drains).
+struct GdmChangeRecord {
+    unsigned int id;
+    unsigned int owner;
+    unsigned int itemType;   // GDMActionSummaryItem::Type()
+    unsigned int actionType; // the Types_e arg to AddItem
+};
+static const size_t kGdmChangeRingSize = 4096;
+static GdmChangeRecord g_gdmChangeRing[kGdmChangeRingSize];
+static volatile LONG64 g_gdmChangeWriteIdx = 0;   // total writes (mod ring size on read)
+static volatile LONG64 g_gdmChangeReadIdx  = 0;   // total reads
+static CRITICAL_SECTION g_gdmChangeLock;
+static volatile LONG g_gdmChangeLockInit = 0;
+
+static void EnsureGdmChangeLock(void) {
+    if (InterlockedCompareExchange(&g_gdmChangeLockInit, 1, 0) == 0) {
+        InitializeCriticalSection(&g_gdmChangeLock);
+    }
+}
+
+// SEH-only thunk: read item field via member-function accessor without C++
+// unwinding (the C++ in this function avoids destructors so __try is fine,
+// but isolating per-call is cheap insurance).
+static unsigned int __stdcall SafeItemUintLocal(ItemUintFn fn, void* item) {
+    if (!fn || !item) return 0;
+    __try { return fn(item); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+static void __cdecl GdmAsAddItemHook(void* self, unsigned int type, void* item) {
+    // Capture the item's identity BEFORE forwarding to the original. After
+    // the original returns the item is owned by the AS map and reading it
+    // is still valid for a while, but this is cleaner.
+    unsigned int id    = SafeItemUintLocal(g_itemId,    item);
+    unsigned int owner = SafeItemUintLocal(g_itemOwner, item);
+    unsigned int itype = SafeItemUintLocal(g_itemType,  item);
+
+    EnsureGdmChangeLock();
+    EnterCriticalSection(&g_gdmChangeLock);
+    LONG64 w = g_gdmChangeWriteIdx;
+    g_gdmChangeRing[w % kGdmChangeRingSize] =
+        GdmChangeRecord{ id, owner, itype, type };
+    g_gdmChangeWriteIdx = w + 1;
+    LeaveCriticalSection(&g_gdmChangeLock);
+
+    LogLine("[ADDITEM] type=%u id=%u owner=%u itemType=%u (writeIdx=%lld)",
+        type, id, owner, itype, (long long)(w + 1));
+
+    if (g_origAddItem) {
+        __try { g_origAddItem(self, type, item); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { LogLine("[ADDITEM] trampoline SEH 0x%lX", GetExceptionCode()); }
+    }
+}
+
+// Drain one record from the ring buffer. Returns 1 if dequeued, 0 if empty.
+extern "C" __declspec(dllexport) int __cdecl DequeueChangeRecord(
+    unsigned int* outId, unsigned int* outOwner,
+    unsigned int* outItemType, unsigned int* outActionType)
+{
+    if (!outId || !outOwner || !outItemType || !outActionType) return 0;
+    EnsureGdmChangeLock();
+    EnterCriticalSection(&g_gdmChangeLock);
+    LONG64 r = g_gdmChangeReadIdx;
+    LONG64 w = g_gdmChangeWriteIdx;
+    int got = 0;
+    if (r < w) {
+        const GdmChangeRecord& rec = g_gdmChangeRing[r % kGdmChangeRingSize];
+        *outId         = rec.id;
+        *outOwner      = rec.owner;
+        *outItemType   = rec.itemType;
+        *outActionType = rec.actionType;
+        g_gdmChangeReadIdx = r + 1;
+        got = 1;
+    }
+    LeaveCriticalSection(&g_gdmChangeLock);
+    return got;
+}
+
+// Walk a chain of forwarding thunks to find the actual function body. Some
+// MSVC-emitted "exported" symbols (especially for member functions on
+// classes that inherit virtually) are tiny thunks that adjust 'this' and
+// JMP to the real implementation. Our 14-byte detour patch needs that
+// 14 bytes of code at the target - thunks are 5-9 bytes, too small.
+static void* ResolveThunk(void* addr, const char* tag) {
+    BYTE* p = (BYTE*)addr;
+    int hops = 0;
+    while (hops < 5) {
+        // Pattern A: pure JMP rel32 forwarder (5 bytes).
+        if (p[0] == 0xE9) {
+            int32_t rel = *(int32_t*)(p + 1);
+            BYTE* next = p + 5 + rel;
+            LogLine("[%s] thunk %p: E9-forwarder -> %p", tag, p, next);
+            p = next;
+            hops++;
+            continue;
+        }
+        // Pattern B: this-adjusting thunk with mov rcx, [rcx+disp8] + JMP rel32
+        // (9 bytes total). Encoding: 48 8B 49 XX  E9 RR RR RR RR
+        if (p[0] == 0x48 && p[1] == 0x8B && p[2] == 0x49 && p[4] == 0xE9) {
+            int32_t rel = *(int32_t*)(p + 5);
+            BYTE* next = p + 9 + rel;
+            LogLine("[%s] thunk %p: this-adjust [rcx+0x%02X] + jmp -> %p",
+                tag, p, p[3], next);
+            p = next;
+            hops++;
+            continue;
+        }
+        break;
+    }
+    return p;
+}
+
+extern "C" __declspec(dllexport) int __cdecl InstallAddItemHook(void) {
+    EnsureAsResolvers();
+    HMODULE gdm = GetModuleHandleW(L"EM_GDM.dll");
+    if (!gdm) gdm = LoadLibraryW(L"EM_GDM.dll");
+    if (!gdm) { LogLine("[ADDITEM] EM_GDM.dll not loaded"); return -1; }
+    void* rawTarget = (void*)GetProcAddress(gdm, kGdmAsAddItemSym);
+    if (!rawTarget) { LogLine("[ADDITEM] AddItem symbol not found"); return -2; }
+    LogLine("[ADDITEM] raw target=%p", rawTarget);
+
+    // Follow forwarding thunks. The exported symbol at +0x01B580 is a
+    // 9-byte this-adjusting thunk (mov rcx, [rcx+0x10]; jmp impl). We need
+    // >= 14 bytes of code at the patch site, so hook the impl directly.
+    void* target = ResolveThunk(rawTarget, "ADDITEM");
+    if (target != rawTarget) {
+        LogLine("[ADDITEM] resolved target=%p (was thunk at %p)", target, rawTarget);
+    }
+
+    void* tramp = nullptr;
+    if (!InstallInlineHook(target, (void*)&GdmAsAddItemHook, &tramp)) {
+        LogLine("[ADDITEM] InstallInlineHook failed");
+        return -3;
+    }
+    g_origAddItem = (GdmAsAddItemFn)tramp;
+    LogLine("[ADDITEM] hook installed, trampoline=%p", tramp);
+    return 0;
+}
+
+extern "C" __declspec(dllexport) int __cdecl Probe_DumpAsContents(void* as) {
+    if (!as) { LogLine("[AS-DUMP] null AS"); return -1; }
+    EnsureAsResolvers();
+
+    LogLine("[AS-DUMP] === AS=%p ===", as);
+
+    if (g_asTouched) {
+        __try {
+            const auto& touched = g_asTouched(as);
+            size_t n = touched.size();
+            LogLine("[AS-DUMP] TouchedObjectIds count=%zu", n);
+            int i = 0;
+            for (auto id : touched) {
+                if (i++ >= 20) { LogLine("[AS-DUMP]   ...(truncated at 20)"); break; }
+                LogLine("[AS-DUMP]   touched[%d] id=%u (0x%X)", i - 1, id, id);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            LogLine("[AS-DUMP] Touched SEH 0x%lX", GetExceptionCode());
+        }
+    }
+
+    auto dumpMap = [&](const char* label, AsObjectsMapFn fn) {
+        if (!fn) { LogLine("[AS-DUMP] %s: resolver missing", label); return; }
+        __try {
+            const auto& m = fn(as);
+            size_t n = m.size();
+            LogLine("[AS-DUMP] %s count=%zu", label, n);
+            int i = 0;
+            for (const auto& kv : m) {
+                if (i++ >= 10) { LogLine("[AS-DUMP]   ...(truncated at 10)"); break; }
+                unsigned int key  = kv.first;
+                void* item        = kv.second;
+                unsigned int iId  = (g_itemId    && item) ? g_itemId(item)    : 0;
+                unsigned int iOw  = (g_itemOwner && item) ? g_itemOwner(item) : 0;
+                unsigned int iTy  = (g_itemType  && item) ? g_itemType(item)  : 0;
+                LogLine("[AS-DUMP]   %s[%d] key=%u item.id=%u owner=%u type=%u  item=%p",
+                    label, i - 1, key, iId, iOw, iTy, item);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            LogLine("[AS-DUMP] %s SEH 0x%lX", label, GetExceptionCode());
+        }
+    };
+    dumpMap("Created",  g_asCreated);
+    dumpMap("Deleted",  g_asDeleted);
+    dumpMap("Modified", g_asModified);
+    return 0;
+}
+
 extern "C" __declspec(dllexport) const char* __cdecl GenerateAlterDdlForActiveModel(void* clientMs) {
     return (const char*)RunSilentAlterDdl(clientMs);
 }
@@ -1903,6 +2598,52 @@ static volatile LONG g_cleanupHookActive = 0;
 static HWINEVENTHOOK g_cleanupEvHook = nullptr;
 static int g_cleanupHidCount = 0;
 
+// Tracks every hwnd HideWizardAggressive set WS_EX_LAYERED on during the
+// cleanup cascade, so CCInsp_CleanupHookUninstall can flush each one through
+// ClearWizardLayeredAndFlush before MFC's destroy chain consumes them. Same
+// compositor-leak root cause as the Generate DDL path, just multiplied by N
+// dialogs (Mart Offline, Save As pickers, Close Model checklist, etc).
+static CRITICAL_SECTION g_cleanupHiddenLock;
+static bool g_cleanupHiddenLockInited = false;
+static std::vector<HWND> g_cleanupHiddenHwnds;
+
+static void EnsureCleanupHiddenLockInit() {
+    if (!g_cleanupHiddenLockInited) {
+        InitializeCriticalSection(&g_cleanupHiddenLock);
+        g_cleanupHiddenLockInited = true;
+    }
+}
+
+static void TrackCleanupHidden(HWND hwnd) {
+    EnsureCleanupHiddenLockInit();
+    EnterCriticalSection(&g_cleanupHiddenLock);
+    g_cleanupHiddenHwnds.push_back(hwnd);
+    LeaveCriticalSection(&g_cleanupHiddenLock);
+}
+
+static int FlushCleanupHidden() {
+    EnsureCleanupHiddenLockInit();
+    EnterCriticalSection(&g_cleanupHiddenLock);
+    int flushed = 0;
+    for (HWND h : g_cleanupHiddenHwnds) {
+        if (!IsWindow(h)) continue;
+        LONG_PTR ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+        if ((ex & WS_EX_LAYERED) == 0) continue;
+        ClearWizardLayeredAndFlush(h, "[CLEAN-EVT] uninstall");
+        flushed++;
+    }
+    g_cleanupHiddenHwnds.clear();
+    LeaveCriticalSection(&g_cleanupHiddenLock);
+    return flushed;
+}
+
+static void ResetCleanupHidden() {
+    EnsureCleanupHiddenLockInit();
+    EnterCriticalSection(&g_cleanupHiddenLock);
+    g_cleanupHiddenHwnds.clear();
+    LeaveCriticalSection(&g_cleanupHiddenLock);
+}
+
 static bool LooksLikeCleanupTarget(HWND hwnd) {
     char cls[64] = {0};
     GetClassNameA(hwnd, cls, sizeof(cls));
@@ -1935,6 +2676,7 @@ static void CALLBACK CleanupWinEventCb(
     }
 
     HideWizardAggressive(hwnd);
+    TrackCleanupHidden(hwnd);
     g_cleanupHidCount++;
     char title[128] = {0};
     GetWindowTextA(hwnd, title, sizeof(title));
@@ -1950,6 +2692,7 @@ extern "C" __declspec(dllexport) int __cdecl CCInsp_CleanupHookInstall(void) {
         return -1;
     }
     g_cleanupHidCount = 0;
+    ResetCleanupHidden();
     InterlockedExchange(&g_cleanupHookActive, 1);
     g_cleanupEvHook = SetWinEventHook(
         EVENT_OBJECT_CREATE, EVENT_OBJECT_NAMECHANGE,
@@ -1968,6 +2711,15 @@ extern "C" __declspec(dllexport) int __cdecl CCInsp_CleanupHookUninstall(void) {
         g_cleanupEvHook = nullptr;
         LogLine("[CLEAN-EVT] uninstall: hid %d dialog(s) during cleanup", hid);
     }
+    // Flush WS_EX_LAYERED on every dialog we hid via HideWizardAggressive so
+    // DWM releases the layered back-buffer surfaces before MFC tears the
+    // dialogs down. Without this the cleanup cascade leaks N compositor
+    // surfaces (one per cascade dialog) and the user sees black rectangles
+    // process-wide until full erwin restart - same root cause as the Generate
+    // DDL leak the CloseHiddenWizard fix targets.
+    int flushed = FlushCleanupHidden();
+    if (flushed > 0)
+        LogLine("[CLEAN-EVT] uninstall: flushed %d layered hwnd(s)", flushed);
     return hid;
 }
 
