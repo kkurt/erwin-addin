@@ -1673,10 +1673,33 @@ extern "C" __declspec(dllexport) void* __cdecl OpenAlterScriptWizardHidden(void)
 // is often ignored by modal dialogs.
 extern "C" __declspec(dllexport) void __cdecl CloseHiddenWizard(void* hwnd) {
     if (!hwnd) return;
+    HWND h = (HWND)hwnd;
     LogLine("[OPEN-WIZ] closing hwnd=%p (IDCANCEL)", hwnd);
-    PostMessage((HWND)hwnd, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
+
+    // Clear the WS_EX_LAYERED|WS_EX_TOOLWINDOW we set in HideWizardAggressive
+    // BEFORE posting destroy messages. Reason: WS_EX_LAYERED puts the window
+    // into a desktop-compositor-managed back-buffer surface. If MFC's normal
+    // destroy chain stalls or unwinds partially (the IPS-CALL post-return
+    // SEH 0xC0000005 we ignore for DDL capture interrupts the Invoke call
+    // stack mid-flight), the compositor may not release that surface and
+    // erwin's GDI/text-rendering state stays polluted process-wide. User
+    // sees black rectangles on the leading edge of every text label across
+    // diagram entities AND ribbon menus until full erwin restart. Clearing
+    // the layered bit + SWP_FRAMECHANGED forces compositor recalc and surface
+    // release, decoupling the cleanup from MFC's potentially-broken unwind.
+    if (IsWindow(h)) {
+        LONG_PTR ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+        if (ex & WS_EX_LAYERED) {
+            SetWindowLongPtrW(h, GWL_EXSTYLE, ex & ~(WS_EX_LAYERED | WS_EX_TOOLWINDOW));
+            SetWindowPos(h, NULL, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+            LogLine("[OPEN-WIZ] pre-close: cleared WS_EX_LAYERED|WS_EX_TOOLWINDOW");
+        }
+    }
+
+    PostMessage(h, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
     // Also post WM_CLOSE as a fallback in case IDCANCEL routes elsewhere.
-    PostMessage((HWND)hwnd, WM_CLOSE, 0, 0);
+    PostMessage(h, WM_CLOSE, 0, 0);
     InterlockedExchange64(&g_hiddenWizardHwnd, 0);
     // Invalidate the cached FEWPageOptions / FEWPagePreviewEx 'this' pointers.
     // The C++ objects are destroyed when the CPropertySheet modal loop exits;
