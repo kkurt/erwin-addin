@@ -96,6 +96,11 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // Step 1: Read DG_TABLE_MAPPING (MAPPING_CODE='GLOSSARY')
                 int? mappingId = null;
                 int? connectionDefId = null;
+                int? dataSourceId = null;
+                // Phase-4 (2026-05-07): when DATA_SOURCE_ID is set on the mapping, the
+                // explicit SQL_TEXT from DG_DATA_SOURCE replaces the implicit
+                // "SELECT ... FROM TABLE_NAME" path we used to build by hand.
+                string explicitGlossarySql = null;
 
                 using (var conn = DatabaseService.Instance.CreateConnection())
                 {
@@ -132,6 +137,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     mappingId = Convert.ToInt32(reader["ID"]);
                                     connectionDefId = reader["CONNECTION_DEF_ID"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["CONNECTION_DEF_ID"]);
                                     _tableName = reader["TABLE_NAME"]?.ToString()?.Trim() ?? "";
+                                    dataSourceId = reader["DATA_SOURCE_ID"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["DATA_SOURCE_ID"]);
                                 }
                             }
                         }
@@ -149,7 +155,65 @@ namespace EliteSoft.Erwin.AddIn.Services
                         return false;
                     }
 
-                    Log($"GlossaryService: Found mapping ID={mappingId}, table='{_tableName}', connDefId={connectionDefId}");
+                    Log($"GlossaryService: Found mapping ID={mappingId}, table='{_tableName}', connDefId={connectionDefId}, dataSourceId={(dataSourceId?.ToString() ?? "null")}");
+
+                    // Phase-4: when DATA_SOURCE_ID is set, fetch the named SQL + override
+                    // CONNECTION_DEF_ID from DG_DATA_SOURCE. The mapping row's own
+                    // CONNECTION_DEF_ID/TABLE_NAME stay informational only in this branch.
+                    if (dataSourceId != null)
+                    {
+                        string dsQuery = GetDataSourceQuery(repoDbType);
+                        using (var cmdDs = DatabaseService.Instance.CreateCommand(dsQuery, conn))
+                        {
+                            var pDs = cmdDs.CreateParameter();
+                            pDs.ParameterName = repoDbType == "ORACLE" ? ":dsId" : "@dsId";
+                            pDs.Value = dataSourceId.Value;
+                            cmdDs.Parameters.Add(pDs);
+
+                            using (var reader = cmdDs.ExecuteReader())
+                            {
+                                if (reader.Read())
+                                {
+                                    string dsName = reader["NAME"]?.ToString()?.Trim() ?? "";
+                                    int dsConnId = reader["CONNECTION_DEF_ID"] == DBNull.Value ? 0 : Convert.ToInt32(reader["CONNECTION_DEF_ID"]);
+                                    explicitGlossarySql = reader["SQL_TEXT"]?.ToString()?.Trim();
+
+                                    if (string.IsNullOrEmpty(explicitGlossarySql))
+                                    {
+                                        _lastError = $"DG_DATA_SOURCE ID={dataSourceId} has empty SQL_TEXT.";
+                                        _isLoaded = false;
+                                        Log($"GlossaryService: {_lastError}");
+                                        return false;
+                                    }
+                                    if (dsConnId == 0)
+                                    {
+                                        _lastError = $"DG_DATA_SOURCE ID={dataSourceId} has no CONNECTION_DEF_ID.";
+                                        _isLoaded = false;
+                                        Log($"GlossaryService: {_lastError}");
+                                        return false;
+                                    }
+
+                                    connectionDefId = dsConnId;
+                                    Log($"GlossaryService: Using DG_DATA_SOURCE '{dsName}' (id={dataSourceId}, connId={dsConnId}, sqlLen={explicitGlossarySql.Length})");
+                                }
+                                else
+                                {
+                                    _lastError = $"DG_DATA_SOURCE ID={dataSourceId} not found.";
+                                    _isLoaded = false;
+                                    Log($"GlossaryService: {_lastError}");
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                    else if (string.IsNullOrEmpty(_tableName))
+                    {
+                        // Neither path provided — admin says "fail loudly".
+                        _lastError = "Glossary mapping has neither TABLE_NAME nor DATA_SOURCE_ID configured.";
+                        _isLoaded = false;
+                        Log($"GlossaryService: {_lastError}");
+                        return false;
+                    }
 
                     // Step 2: Read DG_TABLE_MAPPING_COLUMN
                     string colQuery = GetMappingColumnQuery(repoDbType);
@@ -291,12 +355,17 @@ namespace EliteSoft.Erwin.AddIn.Services
                         return false;
                     }
 
-                    // Step 4: Load glossary data from external DB
-                    LoadGlossaryData(glossaryDbType, glossaryConnStr);
+                    // Step 4: Load glossary data from external DB.
+                    // explicitGlossarySql wins when DATA_SOURCE_ID is set (named-SQL path).
+                    // Otherwise build the legacy "SELECT cols FROM TABLE_NAME" query.
+                    LoadGlossaryData(glossaryDbType, glossaryConnStr, explicitGlossarySql);
                 }
 
                 _isLoaded = true;
-                Log($"GlossaryService: Loaded {_glossaryCache.Count} entries (table='{_tableName}', match='{_matchSourceColumn}')");
+                string sourceLabel = explicitGlossarySql != null
+                    ? $"data-source[{dataSourceId}]"
+                    : $"table='{_tableName}'";
+                Log($"GlossaryService: Loaded {_glossaryCache.Count} entries ({sourceLabel}, match='{_matchSourceColumn}')");
                 return true;
             }
             catch (Exception ex)
@@ -308,18 +377,31 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
         }
 
-        private void LoadGlossaryData(string dbType, string connectionString)
+        private void LoadGlossaryData(string dbType, string connectionString, string explicitSql = null)
         {
-            // Build dynamic SELECT with only needed columns
-            var allCols = new List<string> { _matchSourceColumn };
-            allCols.AddRange(_valueMappings.Select(m => m.sourceCol));
-            if (!string.IsNullOrEmpty(_termTypeColumn))
-                allCols.Add(_termTypeColumn);
-            var distinctCols = allCols.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            // Phase-4 (2026-05-07): two paths -
+            //   - explicitSql != null: DG_DATA_SOURCE.SQL_TEXT was provided. Use it as-is.
+            //     The admin author owns the column list there; the named SQL must include
+            //     every column referenced by mapping rows (match + value + term-type).
+            //   - explicitSql == null: legacy TABLE_NAME path. Build the SELECT ourselves
+            //     from the mapping columns we already parsed.
+            string query;
+            if (!string.IsNullOrEmpty(explicitSql))
+            {
+                query = explicitSql;
+            }
+            else
+            {
+                var allCols = new List<string> { _matchSourceColumn };
+                allCols.AddRange(_valueMappings.Select(m => m.sourceCol));
+                if (!string.IsNullOrEmpty(_termTypeColumn))
+                    allCols.Add(_termTypeColumn);
+                var distinctCols = allCols.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
 
-            string selectCols = string.Join(", ", distinctCols.Select(c => QuoteColumn(dbType, c)));
-            string fromTable = QuoteTable(dbType, _tableName);
-            string query = $"SELECT {selectCols} FROM {fromTable}";
+                string selectCols = string.Join(", ", distinctCols.Select(c => QuoteColumn(dbType, c)));
+                string fromTable = QuoteTable(dbType, _tableName);
+                query = $"SELECT {selectCols} FROM {fromTable}";
+            }
 
             using (var connection = DatabaseService.Instance.CreateConnection(dbType, connectionString))
             {
@@ -447,20 +529,46 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             // Single CONFIG_ID lookup — DG_TABLE_MAPPING is keyed on CONFIG_ID after the
             // MODEL→CONFIG rename, no IN-list, no fallback chain.
+            // Phase-4 (2026-05-07): also pulls DATA_SOURCE_ID. When that column is set,
+            // the mapping resolves its connection + SQL through DG_DATA_SOURCE instead
+            // of TABLE_NAME (named-SQL path - supports JOINs, computed columns, filters).
             switch (dbType?.ToUpper())
             {
                 case "POSTGRESQL":
-                    return @"SELECT ""ID"", ""CONNECTION_DEF_ID"", ""TABLE_NAME"" FROM ""DG_TABLE_MAPPING""
+                    return @"SELECT ""ID"", ""CONNECTION_DEF_ID"", ""TABLE_NAME"", ""DATA_SOURCE_ID"" FROM ""DG_TABLE_MAPPING""
                             WHERE ""MAPPING_CODE"" = 'GLOSSARY' AND ""CONFIG_ID"" = @cfgId
                             LIMIT 1";
                 case "ORACLE":
-                    return @"SELECT ID, CONNECTION_DEF_ID, TABLE_NAME FROM DG_TABLE_MAPPING
+                    return @"SELECT ID, CONNECTION_DEF_ID, TABLE_NAME, DATA_SOURCE_ID FROM DG_TABLE_MAPPING
                             WHERE MAPPING_CODE = 'GLOSSARY' AND CONFIG_ID = :cfgId
                             FETCH FIRST 1 ROWS ONLY";
                 case "MSSQL":
                 default:
-                    return @"SELECT TOP 1 [ID], [CONNECTION_DEF_ID], [TABLE_NAME] FROM [dbo].[DG_TABLE_MAPPING]
+                    return @"SELECT TOP 1 [ID], [CONNECTION_DEF_ID], [TABLE_NAME], [DATA_SOURCE_ID] FROM [dbo].[DG_TABLE_MAPPING]
                             WHERE [MAPPING_CODE] = 'GLOSSARY' AND [CONFIG_ID] = @cfgId";
+            }
+        }
+
+        /// <summary>
+        /// Phase-4 (2026-05-07): DG_DATA_SOURCE is a named SQL query bound to a
+        /// CONNECTION_DEF. When DG_TABLE_MAPPING.DATA_SOURCE_ID is set we resolve the
+        /// glossary connection and the SELECT statement through this row instead of
+        /// deriving them from TABLE_NAME.
+        /// </summary>
+        private string GetDataSourceQuery(string dbType)
+        {
+            switch (dbType?.ToUpper())
+            {
+                case "POSTGRESQL":
+                    return @"SELECT ""NAME"", ""CONNECTION_DEF_ID"", ""SQL_TEXT""
+                            FROM ""DG_DATA_SOURCE"" WHERE ""ID"" = @dsId";
+                case "ORACLE":
+                    return @"SELECT NAME, CONNECTION_DEF_ID, SQL_TEXT
+                            FROM DG_DATA_SOURCE WHERE ID = :dsId";
+                case "MSSQL":
+                default:
+                    return @"SELECT [NAME], [CONNECTION_DEF_ID], [SQL_TEXT]
+                            FROM [dbo].[DG_DATA_SOURCE] WHERE [ID] = @dsId";
             }
         }
 
