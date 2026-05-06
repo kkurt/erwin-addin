@@ -125,6 +125,13 @@ namespace EliteSoft.Erwin.AddIn.Services
         private delegate int DequeueChangeRecordFn(
             out uint id, out uint owner, out uint itemType, out uint actionType);
 
+        // Phase-2D step-2 (2026-05-06): probe whether a SCAPI dispatch pointer is
+        // binary-compatible with GDMObject. Bridge calls IsValid/IsNull/OwneeCount
+        // on the candidate inside __try and dumps the result. Used once at startup
+        // to find the entry point for a future native bulk walk.
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int ProbeTestRootAccessFn(IntPtr candidate);
+
         // Phase-C step-3: returns a comma-separated list of distinct entity
         // int-OIDs whose attributes/properties changed in the live action
         // summary on `ms`. Empty string if no change. The returned char* is
@@ -235,6 +242,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         private static GetChangedEntityIdsFn _getChangedEntityIds;
         private static GetChangedAttributeIdsFn _getChangedAttributeIds;
         private static DequeueChangeRecordFn _dequeueChangeRecord;
+        private static ProbeTestRootAccessFn _probeTestRootAccess;
         private static CCInspGetLastEdrStartIdFn _ccInspGetLastEdrStartId;
         private static CCInspGetLastEdrStartMsFn _ccInspGetLastEdrStartMs;
         private static CCInspGenerateAlterDdlViaOnFEFn _ccInspGenerateAlterDdlViaOnFE;
@@ -434,6 +442,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                     if (dequeueChange != IntPtr.Zero)
                         _dequeueChangeRecord = Marshal.GetDelegateForFunctionPointer<DequeueChangeRecordFn>(dequeueChange);
 
+                    IntPtr probeRoot = GetProcAddress(_bridgeModule, "Probe_TestRootAccess");
+                    if (probeRoot != IntPtr.Zero)
+                        _probeTestRootAccess = Marshal.GetDelegateForFunctionPointer<ProbeTestRootAccessFn>(probeRoot);
+
                     IntPtr ccGetLastEdrStartId = GetProcAddress(_bridgeModule, "CCInsp_GetLastEdrStartId");
                     if (ccGetLastEdrStartId != IntPtr.Zero)
                         _ccInspGetLastEdrStartId = Marshal.GetDelegateForFunctionPointer<CCInspGetLastEdrStartIdFn>(ccGetLastEdrStartId);
@@ -618,6 +630,20 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// deciding whether AddItem can replace the periodic full-model scan.
         /// Returns an empty list when the buffer is empty.
         /// </summary>
+        /// <summary>
+        /// Phase-2D step-2 (2026-05-06): one-shot diagnostic. Pass a SCAPI dispatch
+        /// pointer (typically the unwrapped IUnknown of <c>session.ModelObjects.Root</c>)
+        /// and the bridge tries to call GDMObject::IsValid / IsNull / OwneeCount on it.
+        /// Output goes to the bridge log under the [ROOT-PROBE] prefix. Return code:
+        ///   0  - candidate looks like a real GDMObject (call site usable)
+        ///   1  - calls ran but values look unrelated (wrapper layout differs)
+        ///   -* - missing symbols, null pointer, or AV before any call
+        /// </summary>
+        public static int ProbeTestRootAccess(IntPtr candidate)
+        {
+            return _probeTestRootAccess?.Invoke(candidate) ?? -99;
+        }
+
         public static List<(uint Id, uint Owner, uint ItemType, uint ActionType)> DrainChangeRecords()
         {
             var results = new List<(uint, uint, uint, uint)>();

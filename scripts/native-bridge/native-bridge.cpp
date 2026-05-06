@@ -671,6 +671,7 @@ static void InstallEccPipelineHooks(void);
 
 // Forward decl for the probe invoked from InstallHook below.
 extern "C" __declspec(dllexport) int __cdecl Probe_DumpGdmActionSummaryExports(void);
+extern "C" __declspec(dllexport) int __cdecl Probe_DumpModelObjectExports(void);
 
 extern "C" __declspec(dllexport) int __cdecl InstallHook(void) {
     LogLine("====== InstallHook() v3 in PID %lu ======", GetCurrentProcessId());
@@ -698,6 +699,11 @@ extern "C" __declspec(dllexport) int __cdecl InstallHook(void) {
     // validation pipeline can extract changed-object IDs from the action
     // summary instead of doing a full 8400-attribute walk.
     Probe_DumpGdmActionSummaryExports();
+
+    // Phase-2D groundwork: dump model-object accessor exports so we can plan
+    // a native bulk-walk that bypasses SCAPI COM marshaling for silent
+    // populate. One-time probe; the matches go into the bridge log.
+    Probe_DumpModelObjectExports();
 
     // Phase-F2: install GDMActionSummary::AddItem detour right at startup.
     // This hook captures every change record erwin appends to its action
@@ -2099,6 +2105,198 @@ extern "C" __declspec(dllexport) int __cdecl Probe_DumpGdmActionSummaryExports(v
     }
     LogLine("[GDM-EXPORTS] %d ActionSummary-related export(s) logged", matched);
     return matched;
+}
+
+// ---------------------------------------------------------------------------
+// Phase-2D probe (2026-05-06): dump every EM_GDM export whose mangled name
+// hits the patterns we expect on the model-object API. Goal is to find
+// the iteration / property accessors that let the bridge walk the whole
+// attribute set without going through SCAPI COM marshaling. Filters cover:
+//   - "Attribute" / "Entity" / "ModelObject" - the candidate classes
+//   - "Physical_Name" / "PhysicalName" - the accessor names we need
+//   - "GetName" / "GetValue" / "Properties" - the generic getters
+//   - "Iterate" / "Enumerate" / "First" / "Next" - iteration primitives
+// One log line per match. Filters run on the demangled-ish raw mangled
+// name; the patterns above all appear verbatim in MSVC's "?Foo@Bar@@..."
+// output.
+// ---------------------------------------------------------------------------
+extern "C" __declspec(dllexport) int __cdecl Probe_DumpModelObjectExports(void) {
+    HMODULE m = GetModuleHandleW(L"EM_GDM.dll");
+    if (!m) m = LoadLibraryW(L"EM_GDM.dll");
+    if (!m) {
+        LogLine("[GDM-MO-PROBE] EM_GDM.dll not loaded");
+        return -1;
+    }
+
+    BYTE* base = (BYTE*)m;
+    auto dosHdr = (PIMAGE_DOS_HEADER)base;
+    if (dosHdr->e_magic != IMAGE_DOS_SIGNATURE) return -2;
+    auto ntHdr = (PIMAGE_NT_HEADERS)(base + dosHdr->e_lfanew);
+    if (ntHdr->Signature != IMAGE_NT_SIGNATURE) return -3;
+    DWORD expRVA = ntHdr->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    if (expRVA == 0) return -4;
+    auto exp = (PIMAGE_EXPORT_DIRECTORY)(base + expRVA);
+    auto names = (DWORD*)(base + exp->AddressOfNames);
+    auto funcs = (DWORD*)(base + exp->AddressOfFunctions);
+    auto ords  = (WORD*) (base + exp->AddressOfNameOrdinals);
+
+    LogLine("[GDM-MO-PROBE] scanning %u exports for model-object accessors", exp->NumberOfNames);
+
+    // Patterns we want to log if seen anywhere in the symbol name.
+    static const char* kPatterns[] = {
+        "Attribute@@",       // class Attribute / methods on Attribute
+        "Entity@@",          // class Entity / methods on Entity
+        "ModelObject",       // class ModelObject / Iterator
+        "GDMObject@@",       // base class
+        "GDMNode@@",         // base class
+        "Physical_Name",     // common SCAPI property
+        "PhysicalName",      // alt spelling
+        "Physical_Data_Type",
+        "PhysicalDataType",
+        "Parent_Domain_Ref",
+        "ParentDomainRef",
+        "GetName@",          // generic getter
+        "GetPhysicalName",
+        "Iterator@",         // iteration primitive
+        "First@",
+        "Next@",
+        "Begin@",
+        "GetCount@",
+        "ChildCount@",
+        "FirstChild@",
+        "NextChild@"
+    };
+    const int N = sizeof(kPatterns) / sizeof(kPatterns[0]);
+
+    int matched = 0;
+    for (DWORD i = 0; i < exp->NumberOfNames; ++i) {
+        const char* nm = (const char*)(base + names[i]);
+        // Skip ActionSummary-related; we already logged those.
+        if (strstr(nm, "ActionSummary") || strstr(nm, "ActSum")) continue;
+
+        bool hit = false;
+        for (int k = 0; k < N; ++k) {
+            if (strstr(nm, kPatterns[k])) { hit = true; break; }
+        }
+        if (!hit) continue;
+
+        DWORD ord = ords[i];
+        DWORD funcRVA = funcs[ord];
+        LogLine("[GDM-MO-PROBE] +0x%06X  %s", funcRVA, nm);
+        matched++;
+        if (matched > 400) {
+            LogLine("[GDM-MO-PROBE] ... cap at 400 hits, stopping");
+            break;
+        }
+    }
+    LogLine("[GDM-MO-PROBE] %d model-object export(s) logged", matched);
+    return matched;
+}
+
+// ---------------------------------------------------------------------------
+// Phase-2D step-2 probe (2026-05-06): given an opaque pointer from managed
+// code (whatever Marshal.GetIUnknownForObject(_session.ModelObjects.Root)
+// returns), try to call a few GDMObject methods on it directly. If erwin's
+// SCAPI wrapper is binary-compatible with GDMObject (or has GDMObject at
+// offset 0), the calls succeed and we learn:
+//   - The reported OwneeCount on the root should match entity count
+//   - IsValid should be true on a live root
+// If the calls AV, the wrapper has a non-zero offset to the GDMObject and
+// we need a follow-up probe to find it (disassembly of one accessor).
+//
+// We deliberately call only methods that take no extra args and return
+// bool / size_t (avoiding the GDMId by-value return ABI complications of
+// Id() / Type()).
+// ---------------------------------------------------------------------------
+typedef bool   (__fastcall* GdmIsValidFn_t)   (void* self);
+typedef bool   (__fastcall* GdmIsNullFn_t)    (void* self);
+typedef size_t (__fastcall* GdmOwneeCountFn_t)(void* self);
+typedef size_t (__fastcall* GdmPropertyCountFn_t)(void* self);
+
+static int TryCallBoolGetter(const char* tag, void* fn, void* self, bool* out_value) {
+    if (!fn || !self) return -1;
+    __try {
+        *out_value = ((bool(__fastcall*)(void*))fn)(self);
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        LogLine("[ROOT-PROBE] %s AV (code=0x%08X)", tag, GetExceptionCode());
+        return -2;
+    }
+}
+static int TryCallSizeGetter(const char* tag, void* fn, void* self, size_t* out_value) {
+    if (!fn || !self) return -1;
+    __try {
+        *out_value = ((size_t(__fastcall*)(void*))fn)(self);
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        LogLine("[ROOT-PROBE] %s AV (code=0x%08X)", tag, GetExceptionCode());
+        return -2;
+    }
+}
+
+extern "C" __declspec(dllexport) int __cdecl Probe_TestRootAccess(void* candidate) {
+    if (!candidate) {
+        LogLine("[ROOT-PROBE] null pointer passed");
+        return -1;
+    }
+    LogLine("[ROOT-PROBE] === testing candidate=%p ===", candidate);
+
+    HMODULE gdm = GetModuleHandleW(L"EM_GDM.dll");
+    if (!gdm) gdm = LoadLibraryW(L"EM_GDM.dll");
+    if (!gdm) { LogLine("[ROOT-PROBE] EM_GDM.dll not loaded"); return -2; }
+
+    void* fnIsValid       = (void*)GetProcAddress(gdm, "?IsValid@GDMObject@@QEBA_NXZ");
+    void* fnIsNull        = (void*)GetProcAddress(gdm, "?IsNull@GDMObject@@QEBA_NXZ");
+    void* fnOwneeCount    = (void*)GetProcAddress(gdm, "?OwneeCount@GDMObject@@QEBA_KXZ");
+    void* fnPropertyCount = (void*)GetProcAddress(gdm, "?PropertyCount@GDMObject@@QEBA_KXZ");
+
+    LogLine("[ROOT-PROBE] symbols: IsValid=%p IsNull=%p OwneeCount=%p PropertyCount=%p",
+        fnIsValid, fnIsNull, fnOwneeCount, fnPropertyCount);
+    if (!fnIsValid || !fnIsNull || !fnOwneeCount) {
+        LogLine("[ROOT-PROBE] one or more symbols missing - aborting");
+        return -3;
+    }
+
+    // Hex-dump the first 64 bytes of the candidate so we can see the vtable
+    // pointer + a few member offsets. This lets us recognise the wrapper
+    // shape on follow-up probes.
+    BYTE* p = (BYTE*)candidate;
+    char hex[256] = {0};
+    int hp = 0;
+    __try {
+        for (int i = 0; i < 64 && hp < (int)sizeof(hex) - 4; ++i) {
+            int written = _snprintf_s(hex + hp, sizeof(hex) - hp, _TRUNCATE, "%02X ", p[i]);
+            if (written <= 0) break;
+            hp += written;
+        }
+        LogLine("[ROOT-PROBE] first 64 bytes: %s", hex);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        LogLine("[ROOT-PROBE] hex-dump AV (the pointer itself isn't readable)");
+        return -4;
+    }
+
+    bool   valid = false, isNull = true;
+    size_t owneeCount = 0, propCount = 0;
+
+    int r1 = TryCallBoolGetter ("IsValid()",       fnIsValid,       candidate, &valid);
+    int r2 = TryCallBoolGetter ("IsNull()",        fnIsNull,        candidate, &isNull);
+    int r3 = TryCallSizeGetter ("OwneeCount()",    fnOwneeCount,    candidate, &owneeCount);
+    int r4 = (fnPropertyCount != nullptr)
+        ? TryCallSizeGetter("PropertyCount()", fnPropertyCount, candidate, &propCount)
+        : -1;
+
+    LogLine("[ROOT-PROBE] results: IsValid=%s(rc=%d) IsNull=%s(rc=%d) OwneeCount=%zu(rc=%d) PropertyCount=%zu(rc=%d)",
+        valid ? "true" : "false", r1,
+        isNull ? "true" : "false", r2,
+        owneeCount, r3,
+        propCount, r4);
+    LogLine("[ROOT-PROBE] === probe complete ===");
+
+    // Return code: 0 if at least one getter succeeded with a sensible value
+    // (OwneeCount > 0 or IsValid==true on a non-null pointer).
+    if (r1 == 0 && valid) return 0;
+    if (r3 == 0 && owneeCount > 0) return 0;
+    return 1; // probe ran but nothing looked GDMObject-like
 }
 
 // ---------------------------------------------------------------------------

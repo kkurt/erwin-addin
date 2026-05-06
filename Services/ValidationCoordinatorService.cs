@@ -37,9 +37,9 @@ namespace EliteSoft.Erwin.AddIn.Services
         private bool _columnEditorWasOpen;
         private bool _sessionLost;
 
-        // Batch processing state - process entities in small chunks to avoid UI blocking
-        private int _scanEntityIndex;
-        private bool _scanCycleActive;
+        // (Phase-2D 2026-05-06: chunked-cycle batch state retired - the full-model
+        // periodic scan is gone, replaced by per-table lazy baseline. Snapshot dict
+        // and _tablesBaselined drive everything.)
 
         // Phase-2C active-editor scoped scan (2026-05-06):
         // While the user has the Column Editor open, MonitorTimer ignores the
@@ -50,13 +50,14 @@ namespace EliteSoft.Erwin.AddIn.Services
         // closes the field is cleared and the normal full-cycle scan resumes.
         private string _activeColumnEditorTable;
 
-        // Phase-1A startup optimization (2026-05-05):
-        // StartMonitoring no longer calls sync TakeSnapshot (was 25s on 8400-attribute models).
-        // Instead, MonitorTimer's first full cycle silently populates _attributeSnapshots
-        // without firing ProcessNewAttribute. This preserves "rules new/changed only" semantics
-        // (existing attributes are NOT retroactively validated) while delivering ~2s startup.
-        // After the first cycle completes, this flag flips to false and normal validation resumes.
-        private bool _initialScanCycle = true;
+        // Phase-2D per-table lazy baseline (2026-05-06):
+        // The startup-wide silent populate is gone. Each table is silently baselined
+        // the first time the user opens its Column Editor (~75 ms one-shot per table).
+        // From then on, scoped scan does diff detection against the per-table snapshot.
+        // This eliminates the 19-second background populate entirely - work is bounded
+        // by the tables the user actually touches.
+        private readonly HashSet<string> _tablesBaselined =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         // Win32 API for window enumeration
         [DllImport("user32.dll")]
@@ -90,20 +91,26 @@ namespace EliteSoft.Erwin.AddIn.Services
         // Pending validation results to show in single popup
         private List<CollectedValidationResult> _pendingResults;
 
-        // Monitor interval - 1000ms tick keeps STA breathing time high on large models
-        // (Phase-2A 2026-05-05). Per-tick work shrinks via the fingerprint pass below.
-        // Phase-2B (2026-05-06): raised MaxEntitiesPerTick 5 -> 30 now that fingerprint
-        // mismatches are rare (~2 properties read instead of 5+). Big-model full cycle
-        // drops from 280/5 = 56 ticks (56s) to 280/30 = 10 ticks (10s) - validation
-        // popup latency tightens proportionally. Per-tick work caps near 30 attrs * 30
-        // entities * 2 props * 0.5ms ~= 900ms, just under the 1000ms tick budget.
-        private const int MonitorIntervalMs = 1000;
-        private const int MaxEntitiesPerTick = 30;
+        // Monitor interval - Phase-2D (2026-05-07): with the chunked full-model scan
+        // retired and only scoped per-table scan running while a Column Editor is
+        // open, per-tick work is tiny (~30 ms for one entity). Drop tick to 250 ms
+        // so worst-case popup latency from edit to popup is ~250 ms (avg ~125 ms).
+        // CPU stays low because scoped scan is bounded.
+        private const int MonitorIntervalMs = 250;
+        private const int MaxEntitiesPerTick = 30; // unused after Phase-2D, kept for compat
 
         // Model change detection
         private string _lastKnownModelName;
         private int _modelCheckCounter;
         private const int ModelCheckEveryNTicks = 4; // Check every 2 seconds (4 * 500ms)
+
+        // (Phase-2D 2026-05-07: entity-level periodic walk removed. The 30-tick
+        // counter above made the 280-entity TableTypeMonitor scan fire every
+        // 7.5 s on big models, which user reported as "I cannot select tables
+        // immediately" - the STA was busy walking entities at unpredictable
+        // moments. Reactive trigger via entity-properties hook is the future
+        // path; for now, entity-level changes wait until user opens the
+        // corresponding editor.)
 
         // Model UDP change detection
         private Dictionary<string, string> _lastModelUdpValues;
@@ -136,7 +143,12 @@ namespace EliteSoft.Erwin.AddIn.Services
             _monitorTimer.Tick += MonitorTimer_Tick;
 
             _windowMonitorTimer = new Timer();
-            _windowMonitorTimer.Interval = 500;
+            // 100 ms keeps editor open/close transition latency tight.
+            // EnumWindows + GetWindowText is microsecond-scale on user32 - the per-tick
+            // cost is dominated by IsColumnEditorOpen's title parse (still <1 ms).
+            // Phase-2D close-race fix: with 100 ms detection + ~70 ms FinalValidate work,
+            // total Close-to-popup latency stays under ~200 ms.
+            _windowMonitorTimer.Interval = 100;
             _windowMonitorTimer.Tick += WindowMonitorTimer_Tick;
         }
 
@@ -180,16 +192,15 @@ namespace EliteSoft.Erwin.AddIn.Services
             // Initialize model UDP change tracking
             InitializeModelUdpTracking();
 
-            // Phase-1A: do NOT call sync TakeSnapshot here (was ~25s on 8400-attr models).
-            // The first MonitorTimer cycle will silently populate _attributeSnapshots with
-            // _initialScanCycle=true gating ProcessNewAttribute. Once the first full cycle
-            // completes, the flag flips and normal new/changed validation resumes.
-            _initialScanCycle = true;
+            // Phase-2D (2026-05-06): no startup baseline at all. Per-table silent
+            // populate happens on demand the first time the user opens that table's
+            // Column Editor (see MonitorTimer_Tick scoped path). Domain cache is
+            // still primed up front because validation lookups are cheap and rely
+            // on the cache being warm before the first edit.
             _attributeSnapshots.Clear();
             _keyGroupSnapshots.Clear();
             _domainCache.Clear();
-            // Domain cache must still be primed (lookups during validation rely on it).
-            // It's a per-domain dict (small N), not per-attribute, so cost is negligible.
+            _tablesBaselined.Clear();
             try
             {
                 dynamic mo = _session.ModelObjects;
@@ -200,7 +211,7 @@ namespace EliteSoft.Erwin.AddIn.Services
 
             _monitorTimer.Start();
             _windowMonitorTimer.Start();
-            Log("ValidationCoordinatorService: Monitoring started (Phase-1A: deferred snapshot, initial cycle silent)");
+            Log("ValidationCoordinatorService: Monitoring started (Phase-2D: per-table lazy baseline, no startup populate)");
         }
 
         public void StopMonitoring()
@@ -214,7 +225,6 @@ namespace EliteSoft.Erwin.AddIn.Services
         public void SuspendValidation()
         {
             _validationSuspended = true;
-            _scanCycleActive = false;
             // Suspend sirasinda biriken validation sonuclari temizle.
             // Aksi takdirde resume sonrasi timer tick'inde
             // ShowConsolidatedPopup eski sonuclari popup olarak goster
@@ -227,7 +237,6 @@ namespace EliteSoft.Erwin.AddIn.Services
         public void ResumeValidation()
         {
             _validationSuspended = false;
-            _scanCycleActive = false;
             // Resume oncesi pendingResults temizle.
             _pendingResults.Clear();
             // TakeSnapshot CAGRILMIYOR (kasitli):
@@ -252,18 +261,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             _attributeSnapshots.Clear();
             _keyGroupSnapshots.Clear();
             _domainCache.Clear();
-            _initialScanCycle = true;
-
-            // CRITICAL (2026-05-06): also reset the in-flight cycle state. Without this
-            // a Rebaseline that fires mid-cycle (eg. WindowMonitorTimer fires while
-            // MonitorTimer is partway through entities 0-280) leaves _scanEntityIndex
-            // pointing past the entities whose snapshots we just dropped. The cycle
-            // then "completes" without revisiting them, _initialScanCycle flips to
-            // false, and the next tick re-discovers those attrs as "new" -> spurious
-            // ValidateDomain / ValidateGlossary FAILED spam. Forcing a fresh cycle
-            // here makes the silent re-population walk every entity again from 0.
-            _scanEntityIndex = 0;
-            _scanCycleActive = false;
+            _tablesBaselined.Clear();
             _pendingResults.Clear();
 
             // BuildDomainCache must still be primed up front - downstream validation
@@ -591,19 +589,17 @@ namespace EliteSoft.Erwin.AddIn.Services
                 dynamic root = modelObjects.Root;
                 if (root == null) return;
 
-                // Phase-2C scoped scan: when the user has Column Editor open AND
-                // we successfully parsed the active table name from its title,
-                // skip the chunked full-cycle and check only that one entity.
-                // The silent-population gate must already be off (existing attrs
-                // need the full first cycle to baseline before scoped diffs make
-                // sense) and we only do this after _initialScanCycle has flipped.
-                if (!_initialScanCycle && !string.IsNullOrEmpty(_activeColumnEditorTable))
+                // Phase-2D (2026-05-06): scoped per-table path is the ONLY path.
+                // When a Column Editor is open, scan that one entity. The first time
+                // the table is touched in this session, do a silent populate of just
+                // its attrs (no validation), then mark the table as baselined. From
+                // then on, the same scoped scan does diff detection and fires popups.
+                if (!string.IsNullOrEmpty(_activeColumnEditorTable))
                 {
                     dynamic scopedEntities = modelObjects.Collect(root, "Entity");
                     if (scopedEntities == null) return;
                     try
                     {
-                        bool foundActive = false;
                         foreach (dynamic entity in scopedEntities)
                         {
                             if (entity == null) continue;
@@ -615,23 +611,27 @@ namespace EliteSoft.Erwin.AddIn.Services
                             }
                             catch { try { nameForMatch = entity.Name ?? ""; } catch { continue; } }
 
-                            if (string.Equals(nameForMatch, _activeColumnEditorTable, StringComparison.OrdinalIgnoreCase))
+                            if (!string.Equals(nameForMatch, _activeColumnEditorTable, StringComparison.OrdinalIgnoreCase))
+                                continue;
+
+                            // First-time touch for this table -> silent populate (no popups).
+                            // Cost ~75 ms for ~30 attrs; user is opening the editor anyway,
+                            // so the latency is masked by erwin's own dialog open animation.
+                            if (!_tablesBaselined.Contains(_activeColumnEditorTable))
                             {
-                                foundActive = true;
-                                _pendingResults.Clear();
-                                CheckEntityForChanges(entity, modelObjects);
-                                if (_pendingResults.Count > 0)
-                                    ShowConsolidatedPopup();
-                                break;
+                                SilentPopulateEntity(entity, modelObjects, nameForMatch);
+                                _tablesBaselined.Add(_activeColumnEditorTable);
+                                Log($"ValidationCoordinatorService: silent baselined '{_activeColumnEditorTable}' on first edit (count={_attributeSnapshots.Count})");
+                                return;
                             }
+
+                            _pendingResults.Clear();
+                            CheckEntityForChanges(entity, modelObjects);
+                            if (_pendingResults.Count > 0)
+                                ShowConsolidatedPopup();
+                            return;
                         }
-                        if (!foundActive)
-                        {
-                            // Title parsed but no entity matched (rare - maybe a fresh,
-                            // not-yet-saved table). Quietly skip this tick; the next one
-                            // will retry. Don't fall through to full cycle while editor
-                            // is still open or we'd reintroduce the 19s latency.
-                        }
+                        // Title parsed but no entity matched - skip this tick.
                         return;
                     }
                     finally
@@ -640,72 +640,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                     }
                 }
 
-                dynamic allEntities = modelObjects.Collect(root, "Entity");
-                if (allEntities == null) return;
-
-                try
-                {
-                    int entityCount = 0;
-                    try { entityCount = allEntities.Count; }
-                    catch (Exception ex) { Log($"MonitorTimer_Tick: Failed to get entity count: {ex.Message}"); return; }
-
-                    // Start new scan cycle if not in progress
-                    if (!_scanCycleActive)
-                    {
-                        _scanEntityIndex = 0;
-                        _scanCycleActive = true;
-                        _pendingResults.Clear();
-                    }
-
-                    // Process a small batch of entities using foreach with skip/limit
-                    // (SCAPI Collect() collections don't support Item(i) indexed access)
-                    int endIndex = Math.Min(_scanEntityIndex + MaxEntitiesPerTick, entityCount);
-                    int currentIndex = 0;
-
-                    foreach (dynamic entity in allEntities)
-                    {
-                        if (currentIndex >= endIndex) break;
-
-                        if (currentIndex >= _scanEntityIndex)
-                        {
-                            if (entity != null)
-                            {
-                                CheckEntityForChanges(entity, modelObjects);
-                            }
-                        }
-
-                        currentIndex++;
-                    }
-
-                    _scanEntityIndex = endIndex;
-
-                    // Scan cycle complete - show results and run table type check
-                    if (_scanEntityIndex >= entityCount)
-                    {
-                        _scanCycleActive = false;
-
-                        // Phase-1A: first full cycle was silent population. Flip flag so
-                        // subsequent cycles validate genuinely new/changed attributes normally.
-                        if (_initialScanCycle)
-                        {
-                            _initialScanCycle = false;
-                            Log($"ValidationCoordinatorService: Initial silent population complete - {_attributeSnapshots.Count} attributes baselined; live validation now active");
-                        }
-
-                        if (_pendingResults.Count > 0)
-                        {
-                            ShowConsolidatedPopup();
-                        }
-
-                        // TABLE_TYPE check runs once per full cycle (entity-only, lightweight)
-                        try { _tableTypeMonitor?.CheckForTableTypeChanges(allEntities); }
-                        catch (Exception ex) { Log($"MonitorTimer_Tick: TableType check error: {ex.Message}"); }
-                    }
-                }
-                finally
-                {
-                    ReleaseCom(allEntities);
-                }
+                // Editor closed: no scan at all. Phase-2D is purely reactive - any
+                // periodic full-model walk reintroduces UI hitches (the previous
+                // 7.5 s TableTypeMonitor walk made table selection feel sticky).
+                // Entity-level changes (entity rename, TABLE_TYPE UDP) trigger
+                // when the user opens the corresponding editor; pure-diagram
+                // renames without an editor open are an accepted blind spot.
+                // Future work: reactive hook on entity Properties dialog open.
             }
             catch (COMException) { HandleSessionLost(); }
             catch (InvalidComObjectException) { HandleSessionLost(); }
@@ -735,25 +676,35 @@ namespace EliteSoft.Erwin.AddIn.Services
             try
             {
                 bool editorIsOpen = IsColumnEditorOpen(out string activeTable);
-                // Phase-2C: capture the table name so MonitorTimer can scope-scan.
-                // Stored even when editor is opened on a different table (the field
-                // refreshes each tick). Cleared when the editor closes.
+                // Capture the table that was active BEFORE we overwrite the field,
+                // so the close-transition handler below can run a final scoped
+                // scan against it. This catches the "user typed and clicked Close
+                // without Tab/Enter" race - erwin commits the typed value as part
+                // of the Close click, but that commit lands AFTER the most recent
+                // MonitorTimer scoped tick, so the per-keystroke scan path missed
+                // it. The final pass below validates one last time against the
+                // (now-closed) table's snapshot.
+                string previousTable = _activeColumnEditorTable;
                 _activeColumnEditorTable = editorIsOpen ? activeTable : null;
 
                 if (_columnEditorWasOpen && !editorIsOpen)
                 {
-                    Log("Column Editor closed - checking for PLEASE CHANGE IT columns");
-                    DeletePleaseChangeItColumns();
-                    // Phase-2C (2026-05-06): NO rebaseline here. The previous
-                    // sync TakeSnapshot froze UI 21s; the deferred-rebaseline
-                    // version then silently re-baselined the user's just-edited
-                    // names as the new "known" state, suppressing the very
-                    // popup we wanted. Existing snapshots stay intact - the
-                    // active-editor scoped scan below kept them validated as
-                    // the user typed, so by the time the editor closes there
-                    // is nothing left to re-validate. Deleted "PLEASE CHANGE
-                    // IT" columns simply linger in the snapshot dict (harmless;
-                    // Collect("Attribute") only returns live attrs).
+                    Log("Column Editor closed - final validation pass + PLEASE CHANGE IT cleanup");
+
+                    // Final scoped validation for the just-closed table. Only runs
+                    // if the table was previously baselined (so a meaningful diff
+                    // can be computed); if user opened the editor and immediately
+                    // closed without baselining, there's nothing to validate.
+                    if (!string.IsNullOrEmpty(previousTable)
+                        && _tablesBaselined.Contains(previousTable))
+                    {
+                        try { FinalValidateClosedTable(previousTable); }
+                        catch (Exception ex) { Log($"FinalValidateClosedTable err: {ex.Message}"); }
+                    }
+
+                    // Scoped delete: walk only the just-closed table's attrs, not all
+                    // 280 * 30. Cuts the post-popup wait from ~5 s to ~30 ms.
+                    DeletePleaseChangeItColumns(previousTable);
                 }
 
                 _columnEditorWasOpen = editorIsOpen;
@@ -820,7 +771,15 @@ namespace EliteSoft.Erwin.AddIn.Services
             return foundTable != null;
         }
 
-        private void DeletePleaseChangeItColumns()
+        /// <summary>
+        /// Phase-2D scoped cleanup (2026-05-07): when scopeTable is non-empty, only
+        /// walk that single entity's attributes; otherwise walk all entities (legacy
+        /// fallback). The big-model close path used to walk all 280 * 30 = 8400 attrs
+        /// here just to find the 1-2 PLEASE CHANGE IT placeholders the user left in
+        /// the table they were editing - ~4-5 seconds of STA freeze right after the
+        /// popup OK click. Scoping to the closed editor's table cuts that to ~30 ms.
+        /// </summary>
+        private void DeletePleaseChangeItColumns(string scopeTable = null)
         {
             try
             {
@@ -838,6 +797,24 @@ namespace EliteSoft.Erwin.AddIn.Services
                     foreach (dynamic entity in allEntities)
                     {
                         if (entity == null) continue;
+
+                        // Phase-2D: when called for a specific table (the just-closed
+                        // editor's table), skip every other entity. The match is name-based
+                        // (Physical_Name with %generated fallback to entity.Name) so it
+                        // mirrors what IsColumnEditorOpen extracted from the editor title.
+                        if (!string.IsNullOrEmpty(scopeTable))
+                        {
+                            string entityName;
+                            try
+                            {
+                                string p = entity.Properties("Physical_Name").Value?.ToString() ?? "";
+                                entityName = (!string.IsNullOrEmpty(p) && !p.StartsWith("%")) ? p : (entity.Name ?? "");
+                            }
+                            catch { try { entityName = entity.Name ?? ""; } catch { continue; } }
+
+                            if (!string.Equals(entityName, scopeTable, StringComparison.OrdinalIgnoreCase))
+                                continue;
+                        }
 
                         dynamic entityAttrs = null;
                         try { entityAttrs = modelObjects.Collect(entity, "Attribute"); }
@@ -869,6 +846,9 @@ namespace EliteSoft.Erwin.AddIn.Services
                             }
                         }
                         finally { ReleaseCom(entityAttrs); }
+
+                        // When scoped, the matching entity is unique; bail after processing it.
+                        if (!string.IsNullOrEmpty(scopeTable)) break;
                     }
                 }
                 finally { ReleaseCom(allEntities); }
@@ -913,6 +893,135 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         #region Change Detection
 
+        /// <summary>
+        /// Phase-2D close-race fix (2026-05-07): final scoped validation pass on the
+        /// table whose Column Editor just closed. Required because erwin commits the
+        /// typed value when the user clicks Close without first pressing Tab/Enter,
+        /// and that commit lands AFTER the MonitorTimer's last scoped tick - leaving
+        /// the edit invisible to the per-keystroke scan path. Runs CheckEntityForChanges
+        /// once and shows any pending popups, then returns. Idempotent: if no diff,
+        /// nothing fires.
+        /// </summary>
+        private void FinalValidateClosedTable(string tableName)
+        {
+            if (string.IsNullOrEmpty(tableName)) return;
+            if (_validationSuspended) return;
+            if (_sessionLost || _disposed) return;
+
+            dynamic modelObjects = null;
+            dynamic root = null;
+            try
+            {
+                modelObjects = _session.ModelObjects;
+                root = modelObjects?.Root;
+            }
+            catch (Exception ex) { Log($"FinalValidateClosedTable: ModelObjects err: {ex.Message}"); return; }
+            if (root == null) return;
+
+            dynamic allEntities = null;
+            try { allEntities = modelObjects.Collect(root, "Entity"); }
+            catch (Exception ex) { Log($"FinalValidateClosedTable: Collect err: {ex.Message}"); return; }
+            if (allEntities == null) return;
+
+            try
+            {
+                foreach (dynamic entity in allEntities)
+                {
+                    if (entity == null) continue;
+                    string nameForMatch;
+                    try
+                    {
+                        string p = entity.Properties("Physical_Name").Value?.ToString() ?? "";
+                        nameForMatch = (!string.IsNullOrEmpty(p) && !p.StartsWith("%")) ? p : (entity.Name ?? "");
+                    }
+                    catch { try { nameForMatch = entity.Name ?? ""; } catch { continue; } }
+
+                    if (!string.Equals(nameForMatch, tableName, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    _pendingResults.Clear();
+                    CheckEntityForChanges(entity, modelObjects);
+                    if (_pendingResults.Count > 0)
+                        ShowConsolidatedPopup();
+                    return;
+                }
+            }
+            finally
+            {
+                ReleaseCom(allEntities);
+            }
+        }
+
+        /// <summary>
+        /// Phase-2D (2026-05-06): silently snapshot every attribute of a single entity
+        /// without firing ProcessNewAttribute / ProcessAttributeChanges. Used by the
+        /// per-table lazy baseline path in MonitorTimer_Tick: the first time the user
+        /// opens a Column Editor for a table, we capture its attrs as the "known good"
+        /// state so subsequent fingerprint diffs detect real edits. Cost ~30 attrs *
+        /// 5 properties * ~0.5 ms = ~75 ms; runs while erwin is opening the editor
+        /// dialog so the latency is masked.
+        /// </summary>
+        private void SilentPopulateEntity(dynamic entity, dynamic modelObjects, string tableName)
+        {
+            if (entity == null) return;
+            dynamic entityAttrs = null;
+            try { entityAttrs = modelObjects.Collect(entity, "Attribute"); }
+            catch (Exception ex) { Log($"SilentPopulateEntity: Collect failed: {ex.Message}"); return; }
+            if (entityAttrs == null) return;
+
+            try
+            {
+                int n = 0;
+                foreach (dynamic attr in entityAttrs)
+                {
+                    if (attr == null) continue;
+
+                    string objectId = "";
+                    try { objectId = attr.ObjectId?.ToString() ?? ""; }
+                    catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"SilentPopulate ObjectId: {ex.Message}"); continue; }
+                    if (string.IsNullOrEmpty(objectId)) continue;
+
+                    var snap = CreateSnapshot(attr, tableName, modelObjects);
+                    _attributeSnapshots[objectId] = snap;
+                    n++;
+                }
+                System.Diagnostics.Debug.WriteLine($"SilentPopulateEntity: '{tableName}' baselined {n} attributes");
+            }
+            finally
+            {
+                ReleaseCom(entityAttrs);
+            }
+
+            // Also baseline this entity's Key_Groups so naming-standard checks don't
+            // misfire on the next scoped scan (the existing CheckEntityKeyGroups logic
+            // treats unknown keys as "new" and silent-populates them anyway, but doing
+            // it here keeps the lazy-baseline contract explicit).
+            try
+            {
+                dynamic keyGroups = modelObjects.Collect(entity, "Key_Group");
+                if (keyGroups != null)
+                {
+                    try
+                    {
+                        foreach (dynamic kg in keyGroups)
+                        {
+                            if (kg == null) continue;
+                            try
+                            {
+                                string kgId = kg.ObjectId?.ToString() ?? "";
+                                string kgName = kg.Name ?? "";
+                                if (!string.IsNullOrEmpty(kgId))
+                                    _keyGroupSnapshots[kgId] = kgName;
+                            }
+                            catch { }
+                        }
+                    }
+                    finally { ReleaseCom(keyGroups); }
+                }
+            }
+            catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"SilentPopulateEntity Key_Group err: {ex.Message}"); }
+        }
+
         private void CheckEntityForChanges(dynamic entity, dynamic modelObjects)
         {
             if (_validationSuspended) return;
@@ -946,8 +1055,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                         // when nothing has changed (the common case). Skipped during initial
                         // silent population so existing attrs land in the snapshot dict via
                         // the slow path.
-                        if (!_initialScanCycle
-                            && _attributeSnapshots.TryGetValue(objectId, out var existingSnap))
+                        if (_attributeSnapshots.TryGetValue(objectId, out var existingSnap))
                         {
                             string fpRawPhys = null;
                             try { fpRawPhys = attr.Properties("Physical_Name").Value?.ToString(); }
@@ -984,16 +1092,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                         if (isNew)
                         {
                             _attributeSnapshots[objectId] = currentState;
-                            // Phase-1A: during initial silent population cycle, only baseline
-                            // existing attributes — do NOT validate or apply UDP defaults.
-                            // Skipping ProcessNewAttribute here protects pre-existing columns
-                            // from retroactive popups / UDP writes (rules new/changed only).
-                            // After the first full cycle, _initialScanCycle flips to false and
-                            // genuinely new attributes added by the user trigger normal handling.
-                            if (!_initialScanCycle)
-                            {
-                                ProcessNewAttribute(attr, currentState, predefinedColumnNames);
-                            }
+                            // Phase-2D: per-table silent populate happens BEFORE the first
+                            // CheckEntityForChanges call for a given table (see scoped path
+                            // in MonitorTimer_Tick). So when we reach this branch with isNew
+                            // true, the attribute genuinely DID NOT exist at baseline time -
+                            // it's user-added during the active edit session. Validate it.
+                            ProcessNewAttribute(attr, currentState, predefinedColumnNames);
                         }
                         else
                         {
@@ -1943,8 +2047,22 @@ namespace EliteSoft.Erwin.AddIn.Services
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Warning);
 
-                // After user clicks OK, rename glossary-failed columns to "PLEASE CHANGE IT"
-                RenameInvalidGlossaryColumns(glossaryResults);
+                // Dispatch based on editor state at popup dismissal:
+                //   - Editor still open (_activeColumnEditorTable set) -> rename to
+                //     "PLEASE CHANGE IT" so the user sees a placeholder in the live
+                //     editor and can fix it. WindowMonitor's close handler will
+                //     delete the placeholder when the editor finally closes.
+                //   - Editor closed (_activeColumnEditorTable null because the
+                //     WindowMonitor close-transition cleared it during the popup) ->
+                //     delete directly; there's no editor open to show a placeholder.
+                if (string.IsNullOrEmpty(_activeColumnEditorTable))
+                {
+                    DeleteInvalidGlossaryColumns(glossaryResults);
+                }
+                else
+                {
+                    RenameInvalidGlossaryColumns(glossaryResults);
+                }
             }
             finally
             {
@@ -1953,81 +2071,126 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
         }
 
+        /// <summary>
+        /// In-editor placeholder path: when the user dismisses the validation popup
+        /// while the Column Editor is still open, rename the offending columns to
+        /// "PLEASE CHANGE IT" so the placeholder is visible in the live editor and
+        /// the user can fix the name in place. WindowMonitor's scoped DeletePleaseChange
+        /// removes the placeholder when the editor finally closes.
+        /// Snapshot post-commit re-read is required because erwin enforces sibling-
+        /// unique attribute names and may auto-rename collisions to PLEASE_CHANGE_IT__NNN.
+        /// </summary>
         private void RenameInvalidGlossaryColumns(List<CollectedValidationResult> glossaryResults)
         {
             if (glossaryResults.Count == 0) return;
 
+            int transId;
+            try { transId = _session.BeginNamedTransaction("RenameInvalidColumns"); }
+            catch (Exception ex) { Log($"RenameInvalidGlossary: BeginTransaction failed: {ex.Message}"); return; }
+
             try
             {
-                int transId = _session.BeginNamedTransaction("RenameInvalidColumns");
-                try
+                foreach (var result in glossaryResults)
                 {
-                    foreach (var result in glossaryResults)
+                    if (result.Attribute == null) continue;
+                    try
                     {
-                        if (result.Attribute == null) continue;
-
-                        try
-                        {
-                            // Both logical and physical name must be set,
-                            // otherwise CheckForChanges reads stale Physical_Name and loops
-                            result.Attribute.Properties("Name").Value = "PLEASE CHANGE IT";
-                            try { result.Attribute.Properties("Physical_Name").Value = "PLEASE CHANGE IT"; }
-                            catch (Exception phEx) { Log($"RenameInvalidGlossary: Failed to set Physical_Name: {phEx.Message}"); }
-                            Log($"Renamed column {result.TableName}.{result.ColumnName} to 'PLEASE CHANGE IT'");
-                        }
-                        catch (Exception ex)
-                        {
-                            Log($"Error renaming column {result.ColumnName}: {ex.Message}");
-                        }
+                        // Both logical and physical name must be set, otherwise
+                        // CheckForChanges reads stale Physical_Name and loops.
+                        result.Attribute.Properties("Name").Value = "PLEASE CHANGE IT";
+                        try { result.Attribute.Properties("Physical_Name").Value = "PLEASE CHANGE IT"; }
+                        catch (Exception phEx) { Log($"RenameInvalidGlossary: Failed to set Physical_Name: {phEx.Message}"); }
+                        Log($"Renamed column {result.TableName}.{result.ColumnName} to 'PLEASE CHANGE IT'");
                     }
-
-                    _session.CommitTransaction(transId);
-
-                    // Snapshot update MUST happen post-commit. Reason: erwin enforces
-                    // sibling-unique attribute names within an entity. If two siblings
-                    // are both set to 'PLEASE CHANGE IT', erwin auto-renames the second
-                    // to e.g. 'PLEASE_CHANGE_IT__792'. If we naively store
-                    // 'PLEASE CHANGE IT' in the snapshot for both, the next tick reads
-                    // the actual physical_name on the renamed sibling, sees a diff
-                    // ('PLEASE CHANGE IT' -> 'PLEASE_CHANGE_IT__792'), re-triggers
-                    // ValidateGlossary, which fails again because '__792' isn't in the
-                    // glossary -> popup -> rename -> erwin uniqueness -> infinite loop.
-                    // Verified 01:04:23 -> 01:07:29 in logs. Read back the actual values.
-                    foreach (var result in glossaryResults)
+                    catch (Exception ex)
                     {
-                        if (result.Attribute == null) continue;
-                        if (string.IsNullOrEmpty(result.ObjectId)) continue;
-                        if (!_attributeSnapshots.ContainsKey(result.ObjectId)) continue;
-
-                        string actualName = "PLEASE CHANGE IT";
-                        string actualPhys = "PLEASE CHANGE IT";
-                        try { actualName = result.Attribute.Name?.ToString() ?? actualName; }
-                        catch (Exception ex) { Log($"RenameInvalidGlossary: read-back Name error: {ex.Message}"); }
-                        try
-                        {
-                            string val = result.Attribute.Properties("Physical_Name").Value?.ToString();
-                            if (!string.IsNullOrEmpty(val) && !val.StartsWith("%"))
-                                actualPhys = val;
-                        }
-                        catch (Exception ex) { Log($"RenameInvalidGlossary: read-back Physical_Name error: {ex.Message}"); }
-
-                        _attributeSnapshots[result.ObjectId].PhysicalName = actualPhys;
-                        _attributeSnapshots[result.ObjectId].AttributeName = actualName;
-
-                        if (!actualPhys.Equals("PLEASE CHANGE IT", StringComparison.OrdinalIgnoreCase))
-                            Log($"  erwin auto-renamed sibling collision: {result.TableName}.{result.ColumnName} -> {actualPhys}");
+                        Log($"Error renaming column {result.ColumnName}: {ex.Message}");
                     }
                 }
-                catch (Exception ex)
+
+                _session.CommitTransaction(transId);
+
+                // Sibling-collision read-back: if two siblings both got 'PLEASE CHANGE IT',
+                // erwin auto-renames the second to e.g. 'PLEASE_CHANGE_IT__792'. Without
+                // updating the snapshot to the actual name, the next monitor tick sees a
+                // diff and re-fires ValidateGlossary, which fails again because '__792'
+                // isn't in the glossary - infinite loop. Read back the actual values.
+                foreach (var result in glossaryResults)
                 {
-                    try { _session.RollbackTransaction(transId); }
-                    catch (Exception rbEx) { Log($"RenameInvalidGlossary: Rollback failed: {rbEx.Message}"); }
-                    Log($"RenameInvalidGlossaryColumns transaction error: {ex.Message}");
+                    if (result.Attribute == null) continue;
+                    if (string.IsNullOrEmpty(result.ObjectId)) continue;
+                    if (!_attributeSnapshots.ContainsKey(result.ObjectId)) continue;
+
+                    string actualName = "PLEASE CHANGE IT";
+                    string actualPhys = "PLEASE CHANGE IT";
+                    try { actualName = result.Attribute.Name?.ToString() ?? actualName; }
+                    catch (Exception ex) { Log($"RenameInvalidGlossary: read-back Name error: {ex.Message}"); }
+                    try
+                    {
+                        string val = result.Attribute.Properties("Physical_Name").Value?.ToString();
+                        if (!string.IsNullOrEmpty(val) && !val.StartsWith("%"))
+                            actualPhys = val;
+                    }
+                    catch (Exception ex) { Log($"RenameInvalidGlossary: read-back Physical_Name error: {ex.Message}"); }
+
+                    _attributeSnapshots[result.ObjectId].PhysicalName = actualPhys;
+                    _attributeSnapshots[result.ObjectId].AttributeName = actualName;
+
+                    if (!actualPhys.Equals("PLEASE CHANGE IT", StringComparison.OrdinalIgnoreCase))
+                        Log($"  erwin auto-renamed sibling collision: {result.TableName}.{result.ColumnName} -> {actualPhys}");
                 }
             }
             catch (Exception ex)
             {
-                Log($"RenameInvalidGlossaryColumns error: {ex.Message}");
+                try { _session.RollbackTransaction(transId); }
+                catch (Exception rbEx) { Log($"RenameInvalidGlossary: Rollback failed: {rbEx.Message}"); }
+                Log($"RenameInvalidGlossaryColumns transaction error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Close-time direct-delete path: when the user dismisses the validation popup
+        /// AFTER the Column Editor has already closed (and there is no editor to show
+        /// a PLEASE CHANGE IT placeholder in), simply remove the offending columns.
+        /// One transaction, no rename intermediary, no race with WindowMonitor cleanup.
+        /// </summary>
+        private void DeleteInvalidGlossaryColumns(List<CollectedValidationResult> glossaryResults)
+        {
+            if (glossaryResults.Count == 0) return;
+
+            int transId;
+            try { transId = _session.BeginNamedTransaction("DeleteInvalidGlossaryColumns"); }
+            catch (Exception ex) { Log($"DeleteInvalidGlossary: BeginTransaction failed: {ex.Message}"); return; }
+
+            try
+            {
+                dynamic mo = _session.ModelObjects;
+                int deletedCount = 0;
+                foreach (var result in glossaryResults)
+                {
+                    if (result.Attribute == null) continue;
+                    try
+                    {
+                        mo.Remove(result.Attribute);
+                        if (!string.IsNullOrEmpty(result.ObjectId))
+                            _attributeSnapshots.Remove(result.ObjectId);
+                        Log($"Deleted invalid column: {result.TableName}.{result.ColumnName}");
+                        deletedCount++;
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"DeleteInvalidGlossary: failed to delete '{result.TableName}.{result.ColumnName}': {ex.Message}");
+                    }
+                }
+                _session.CommitTransaction(transId);
+                if (deletedCount > 0)
+                    Log($"DeleteInvalidGlossary: removed {deletedCount} invalid column(s)");
+            }
+            catch (Exception ex)
+            {
+                try { _session.RollbackTransaction(transId); }
+                catch (Exception rbEx) { Log($"DeleteInvalidGlossary: Rollback failed: {rbEx.Message}"); }
+                Log($"DeleteInvalidGlossaryColumns transaction error: {ex.Message}");
             }
         }
 
