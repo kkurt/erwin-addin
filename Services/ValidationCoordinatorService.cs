@@ -41,6 +41,23 @@ namespace EliteSoft.Erwin.AddIn.Services
         private int _scanEntityIndex;
         private bool _scanCycleActive;
 
+        // Phase-2C active-editor scoped scan (2026-05-06):
+        // While the user has the Column Editor open, MonitorTimer ignores the
+        // chunked full-cycle and scans ONLY the entity whose name appears in the
+        // editor title. One entity * ~30 attrs * fingerprint pass = ~30 ms work,
+        // so the user sees validation popups within one tick (1 s) instead of
+        // waiting a full 280-entity cycle (~19 s worst case). When the editor
+        // closes the field is cleared and the normal full-cycle scan resumes.
+        private string _activeColumnEditorTable;
+
+        // Phase-1A startup optimization (2026-05-05):
+        // StartMonitoring no longer calls sync TakeSnapshot (was 25s on 8400-attribute models).
+        // Instead, MonitorTimer's first full cycle silently populates _attributeSnapshots
+        // without firing ProcessNewAttribute. This preserves "rules new/changed only" semantics
+        // (existing attributes are NOT retroactively validated) while delivering ~2s startup.
+        // After the first cycle completes, this flag flips to false and normal validation resumes.
+        private bool _initialScanCycle = true;
+
         // Win32 API for window enumeration
         [DllImport("user32.dll")]
         private static extern bool EnumWindows(EnumWindowsProc enumProc, IntPtr lParam);
@@ -73,9 +90,15 @@ namespace EliteSoft.Erwin.AddIn.Services
         // Pending validation results to show in single popup
         private List<CollectedValidationResult> _pendingResults;
 
-        // Monitor interval - short interval for smooth batch processing (5 entities per tick)
-        private const int MonitorIntervalMs = 500;
-        private const int MaxEntitiesPerTick = 5;
+        // Monitor interval - 1000ms tick keeps STA breathing time high on large models
+        // (Phase-2A 2026-05-05). Per-tick work shrinks via the fingerprint pass below.
+        // Phase-2B (2026-05-06): raised MaxEntitiesPerTick 5 -> 30 now that fingerprint
+        // mismatches are rare (~2 properties read instead of 5+). Big-model full cycle
+        // drops from 280/5 = 56 ticks (56s) to 280/30 = 10 ticks (10s) - validation
+        // popup latency tightens proportionally. Per-tick work caps near 30 attrs * 30
+        // entities * 2 props * 0.5ms ~= 900ms, just under the 1000ms tick budget.
+        private const int MonitorIntervalMs = 1000;
+        private const int MaxEntitiesPerTick = 30;
 
         // Model change detection
         private string _lastKnownModelName;
@@ -157,10 +180,27 @@ namespace EliteSoft.Erwin.AddIn.Services
             // Initialize model UDP change tracking
             InitializeModelUdpTracking();
 
-            TakeSnapshot();
+            // Phase-1A: do NOT call sync TakeSnapshot here (was ~25s on 8400-attr models).
+            // The first MonitorTimer cycle will silently populate _attributeSnapshots with
+            // _initialScanCycle=true gating ProcessNewAttribute. Once the first full cycle
+            // completes, the flag flips and normal new/changed validation resumes.
+            _initialScanCycle = true;
+            _attributeSnapshots.Clear();
+            _keyGroupSnapshots.Clear();
+            _domainCache.Clear();
+            // Domain cache must still be primed (lookups during validation rely on it).
+            // It's a per-domain dict (small N), not per-attribute, so cost is negligible.
+            try
+            {
+                dynamic mo = _session.ModelObjects;
+                dynamic root = mo?.Root;
+                if (root != null) BuildDomainCache(mo, root);
+            }
+            catch (Exception ex) { Log($"StartMonitoring: BuildDomainCache failed: {ex.Message}"); }
+
             _monitorTimer.Start();
             _windowMonitorTimer.Start();
-            Log("ValidationCoordinatorService: Monitoring started");
+            Log("ValidationCoordinatorService: Monitoring started (Phase-1A: deferred snapshot, initial cycle silent)");
         }
 
         public void StopMonitoring()
@@ -198,6 +238,46 @@ namespace EliteSoft.Erwin.AddIn.Services
             // 13:37:37 dogrulamasi: TakeSnapshot kaldirildiktan sonra
             // resume sonrasi popup beklenmiyor.
             Log("ValidationCoordinatorService: Validation resumed (pendingResults cleared, snapshot UNCHANGED)");
+        }
+
+        /// <summary>
+        /// Phase-1B (2026-05-06): drop the existing snapshot dictionaries and arm the
+        /// silent-population flag so the next MonitorTimer cycle re-baselines without
+        /// firing ProcessNewAttribute on existing attributes. Replaces sync TakeSnapshot()
+        /// in editor-close + bulk-create paths where the synchronous walk used to freeze
+        /// big-model UI for ~21 seconds.
+        /// </summary>
+        public void RebaselineDeferred()
+        {
+            _attributeSnapshots.Clear();
+            _keyGroupSnapshots.Clear();
+            _domainCache.Clear();
+            _initialScanCycle = true;
+
+            // CRITICAL (2026-05-06): also reset the in-flight cycle state. Without this
+            // a Rebaseline that fires mid-cycle (eg. WindowMonitorTimer fires while
+            // MonitorTimer is partway through entities 0-280) leaves _scanEntityIndex
+            // pointing past the entities whose snapshots we just dropped. The cycle
+            // then "completes" without revisiting them, _initialScanCycle flips to
+            // false, and the next tick re-discovers those attrs as "new" -> spurious
+            // ValidateDomain / ValidateGlossary FAILED spam. Forcing a fresh cycle
+            // here makes the silent re-population walk every entity again from 0.
+            _scanEntityIndex = 0;
+            _scanCycleActive = false;
+            _pendingResults.Clear();
+
+            // BuildDomainCache must still be primed up front - downstream validation
+            // lookups (Parent_Domain_Ref -> Domain Name) rely on the cache being warm
+            // even on the silent first cycle.
+            try
+            {
+                dynamic mo = _session.ModelObjects;
+                dynamic root = mo?.Root;
+                if (root != null) BuildDomainCache(mo, root);
+            }
+            catch (Exception ex) { Log($"RebaselineDeferred: BuildDomainCache failed: {ex.Message}"); }
+
+            Log("ValidationCoordinatorService: Snapshot dropped, deferred rebaseline scheduled (next cycle silent)");
         }
 
         public void TakeSnapshot()
@@ -511,6 +591,55 @@ namespace EliteSoft.Erwin.AddIn.Services
                 dynamic root = modelObjects.Root;
                 if (root == null) return;
 
+                // Phase-2C scoped scan: when the user has Column Editor open AND
+                // we successfully parsed the active table name from its title,
+                // skip the chunked full-cycle and check only that one entity.
+                // The silent-population gate must already be off (existing attrs
+                // need the full first cycle to baseline before scoped diffs make
+                // sense) and we only do this after _initialScanCycle has flipped.
+                if (!_initialScanCycle && !string.IsNullOrEmpty(_activeColumnEditorTable))
+                {
+                    dynamic scopedEntities = modelObjects.Collect(root, "Entity");
+                    if (scopedEntities == null) return;
+                    try
+                    {
+                        bool foundActive = false;
+                        foreach (dynamic entity in scopedEntities)
+                        {
+                            if (entity == null) continue;
+                            string nameForMatch;
+                            try
+                            {
+                                string p = entity.Properties("Physical_Name").Value?.ToString() ?? "";
+                                nameForMatch = (!string.IsNullOrEmpty(p) && !p.StartsWith("%")) ? p : (entity.Name ?? "");
+                            }
+                            catch { try { nameForMatch = entity.Name ?? ""; } catch { continue; } }
+
+                            if (string.Equals(nameForMatch, _activeColumnEditorTable, StringComparison.OrdinalIgnoreCase))
+                            {
+                                foundActive = true;
+                                _pendingResults.Clear();
+                                CheckEntityForChanges(entity, modelObjects);
+                                if (_pendingResults.Count > 0)
+                                    ShowConsolidatedPopup();
+                                break;
+                            }
+                        }
+                        if (!foundActive)
+                        {
+                            // Title parsed but no entity matched (rare - maybe a fresh,
+                            // not-yet-saved table). Quietly skip this tick; the next one
+                            // will retry. Don't fall through to full cycle while editor
+                            // is still open or we'd reintroduce the 19s latency.
+                        }
+                        return;
+                    }
+                    finally
+                    {
+                        ReleaseCom(scopedEntities);
+                    }
+                }
+
                 dynamic allEntities = modelObjects.Collect(root, "Entity");
                 if (allEntities == null) return;
 
@@ -555,6 +684,14 @@ namespace EliteSoft.Erwin.AddIn.Services
                     {
                         _scanCycleActive = false;
 
+                        // Phase-1A: first full cycle was silent population. Flip flag so
+                        // subsequent cycles validate genuinely new/changed attributes normally.
+                        if (_initialScanCycle)
+                        {
+                            _initialScanCycle = false;
+                            Log($"ValidationCoordinatorService: Initial silent population complete - {_attributeSnapshots.Count} attributes baselined; live validation now active");
+                        }
+
                         if (_pendingResults.Count > 0)
                         {
                             ShowConsolidatedPopup();
@@ -597,13 +734,26 @@ namespace EliteSoft.Erwin.AddIn.Services
 
             try
             {
-                bool editorIsOpen = IsColumnEditorOpen();
+                bool editorIsOpen = IsColumnEditorOpen(out string activeTable);
+                // Phase-2C: capture the table name so MonitorTimer can scope-scan.
+                // Stored even when editor is opened on a different table (the field
+                // refreshes each tick). Cleared when the editor closes.
+                _activeColumnEditorTable = editorIsOpen ? activeTable : null;
 
                 if (_columnEditorWasOpen && !editorIsOpen)
                 {
                     Log("Column Editor closed - checking for PLEASE CHANGE IT columns");
                     DeletePleaseChangeItColumns();
-                    TakeSnapshot();
+                    // Phase-2C (2026-05-06): NO rebaseline here. The previous
+                    // sync TakeSnapshot froze UI 21s; the deferred-rebaseline
+                    // version then silently re-baselined the user's just-edited
+                    // names as the new "known" state, suppressing the very
+                    // popup we wanted. Existing snapshots stay intact - the
+                    // active-editor scoped scan below kept them validated as
+                    // the user typed, so by the time the editor closes there
+                    // is nothing left to re-validate. Deleted "PLEASE CHANGE
+                    // IT" columns simply linger in the snapshot dict (harmless;
+                    // Collect("Attribute") only returns live attrs).
                 }
 
                 _columnEditorWasOpen = editorIsOpen;
@@ -620,26 +770,54 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         private bool IsColumnEditorOpen()
         {
-            bool found = false;
+            return IsColumnEditorOpen(out _);
+        }
+
+        /// <summary>
+        /// Phase-2C (2026-05-06): also extract the table name from the editor title.
+        /// erwin titles look like:
+        ///   "SQL Server Table 'TEST_DATA_TAB_178' Column 'ID' Editor"
+        ///   "Oracle Table 'Test_tablosu' Column 'Col2' Editor"
+        /// We pull the substring between the FIRST pair of single quotes - that is
+        /// the active table the user is editing. The MonitorTimer scopes its scan to
+        /// that one entity while the editor is open, dropping per-edit validation
+        /// latency from full-cycle (~19 s) to single-entity (~0.03 s).
+        /// </summary>
+        private bool IsColumnEditorOpen(out string activeTable)
+        {
+            string foundTable = null;
 
             EnumWindows((hWnd, lParam) =>
             {
                 if (!IsWindowVisible(hWnd)) return true;
 
-                StringBuilder title = new StringBuilder(256);
-                GetWindowText(hWnd, title, 256);
+                StringBuilder title = new StringBuilder(512);
+                GetWindowText(hWnd, title, 512);
                 string windowTitle = title.ToString();
 
                 if (windowTitle.Contains("Column") && windowTitle.Contains("Editor"))
                 {
-                    found = true;
+                    int firstQuote = windowTitle.IndexOf('\'');
+                    if (firstQuote >= 0)
+                    {
+                        int secondQuote = windowTitle.IndexOf('\'', firstQuote + 1);
+                        if (secondQuote > firstQuote + 1)
+                        {
+                            foundTable = windowTitle.Substring(firstQuote + 1, secondQuote - firstQuote - 1);
+                            return false;
+                        }
+                    }
+                    // Editor open but title couldn't be parsed - signal "open" with empty
+                    // name so the scoped path falls back to full-cycle.
+                    foundTable = string.Empty;
                     return false;
                 }
 
                 return true;
             }, IntPtr.Zero);
 
-            return found;
+            activeTable = foundTable;
+            return foundTable != null;
         }
 
         private void DeletePleaseChangeItColumns()
@@ -761,13 +939,61 @@ namespace EliteSoft.Erwin.AddIn.Services
                         catch (Exception ex) { Log($"CheckEntityForChanges: Failed to get ObjectId: {ex.Message}"); continue; }
                         if (string.IsNullOrEmpty(objectId)) continue;
 
+                        // Phase-2A fingerprint pass (2026-05-05): for known attributes, read
+                        // only Physical_Name + Physical_Data_Type (2 of the 5 fields full
+                        // CreateSnapshot reads) and short-circuit if both match the stored
+                        // snapshot. Eliminates ~60% of per-cycle COM traffic on big models
+                        // when nothing has changed (the common case). Skipped during initial
+                        // silent population so existing attrs land in the snapshot dict via
+                        // the slow path.
+                        if (!_initialScanCycle
+                            && _attributeSnapshots.TryGetValue(objectId, out var existingSnap))
+                        {
+                            string fpRawPhys = null;
+                            try { fpRawPhys = attr.Properties("Physical_Name").Value?.ToString(); }
+                            catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"CheckEntityForChanges: fingerprint Physical_Name error: {ex.Message}"); }
+
+                            string fpRawType = null;
+                            try { fpRawType = attr.Properties("Physical_Data_Type").Value?.ToString(); }
+                            catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"CheckEntityForChanges: fingerprint Physical_Data_Type error: {ex.Message}"); }
+
+                            if (fpRawPhys != null && fpRawType != null)
+                            {
+                                // Match the same '%generated' fallback semantics as CreateSnapshot.
+                                // We avoid an extra attr.Name read by reusing the previously
+                                // resolved AttributeName as the % fallback proxy: edits to the
+                                // attribute Name field while Physical_Name is '%generated' are an
+                                // accepted blind spot in the fast pass (rare for user-typed names).
+                                string fpResolvedPhys = (!string.IsNullOrEmpty(fpRawPhys) && !fpRawPhys.StartsWith("%"))
+                                    ? fpRawPhys
+                                    : (existingSnap.AttributeName ?? string.Empty);
+
+                                if (string.Equals(existingSnap.PhysicalName ?? string.Empty, fpResolvedPhys, StringComparison.Ordinal)
+                                    && string.Equals(existingSnap.PhysicalDataType ?? string.Empty, fpRawType ?? string.Empty, StringComparison.Ordinal))
+                                {
+                                    // No change in the two fields that drive validation —
+                                    // skip CreateSnapshot, ProcessAttributeChanges, etc.
+                                    continue;
+                                }
+                            }
+                        }
+
                         var currentState = CreateSnapshot(attr, tableName, modelObjects);
                         bool isNew = !_attributeSnapshots.ContainsKey(objectId);
 
                         if (isNew)
                         {
                             _attributeSnapshots[objectId] = currentState;
-                            ProcessNewAttribute(attr, currentState, predefinedColumnNames);
+                            // Phase-1A: during initial silent population cycle, only baseline
+                            // existing attributes — do NOT validate or apply UDP defaults.
+                            // Skipping ProcessNewAttribute here protects pre-existing columns
+                            // from retroactive popups / UDP writes (rules new/changed only).
+                            // After the first full cycle, _initialScanCycle flips to false and
+                            // genuinely new attributes added by the user trigger normal handling.
+                            if (!_initialScanCycle)
+                            {
+                                ProcessNewAttribute(attr, currentState, predefinedColumnNames);
+                            }
                         }
                         else
                         {

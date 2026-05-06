@@ -48,6 +48,12 @@ namespace EliteSoft.Erwin.AddIn
         private UdpRuntimeService _udpRuntimeService;
         private DependencySetRuntimeService _dependencySetService;
 
+        // Metamodel Property_Type names collected by EnsureAllUdpsExist; reused
+        // by UdpRuntimeService.Initialize so we don't pay for the same ~700ms
+        // metamodel walk twice during a single connect cycle. Reset on every
+        // connect so a fresh walk happens after model switches.
+        private HashSet<string> _cachedPropertyTypeNames;
+
         // State tracking
         private Timer _glossaryRefreshTimer;
         private Timer _reconnectTimer;
@@ -454,6 +460,30 @@ namespace EliteSoft.Erwin.AddIn
         /// </summary>
         private void InitializeModelServices()
         {
+            // New connect cycle - any previous cached metamodel walk belongs
+            // to the previous model and must be discarded.
+            _cachedPropertyTypeNames = null;
+
+            // Pre-warm AddInPropertyMetadataService.GetObjectTypes in the
+            // background. The first cold DB hit costs ~1.6s (EF first-query
+            // cost on a small static MC table); running it concurrently with
+            // the 700-900ms EnsureAllUdpsExist metamodel walk lets it finish
+            // off the critical path. Result is held in a static cache so
+            // PropertyApplicator's later GetObjectTypes() call is a HashSet
+            // hit rather than a SQL round-trip.
+            var dbPrewarmTask = System.Threading.Tasks.Task.Run(() =>
+            {
+                try
+                {
+                    var bs = new RegistryBootstrapService();
+                    new AddInPropertyMetadataService(bs).GetObjectTypes();
+                }
+                catch (Exception ex)
+                {
+                    AddinLogger.Log($"DB pre-warm failed (best-effort): {ex.GetType().Name}: {ex.Message}");
+                }
+            });
+
             using (AddinLogger.BeginScope("EnsureAllUdpsExist"))
                 EnsureAllUdpsExist();
             using (AddinLogger.BeginScope("SetModelPathValue"))
@@ -461,6 +491,13 @@ namespace EliteSoft.Erwin.AddIn
 
             _validationService = new ColumnValidationService(_session);
             btnValidateAll.Enabled = true;
+
+            // Make sure the background pre-warm has had a chance to complete
+            // before PropertyApplicator's first metadata call. Wait is bounded
+            // (3s) so a stalled DB connection does not deadlock the load - in
+            // that case PropertyApplicator falls back to its own DB call.
+            using (AddinLogger.BeginScope("Wait DB pre-warm"))
+                dbPrewarmTask.Wait(TimeSpan.FromSeconds(3));
 
             using (AddinLogger.BeginScope("InitializePropertyApplicator"))
                 InitializePropertyApplicator();
@@ -481,7 +518,7 @@ namespace EliteSoft.Erwin.AddIn
             _udpRuntimeService.SetDependencySetService(_dependencySetService);
             using (AddinLogger.BeginScope("UdpRuntimeService.Initialize"))
             {
-                if (_udpRuntimeService.Initialize())
+                if (_udpRuntimeService.Initialize(_cachedPropertyTypeNames))
                 {
                     var objectTypes = string.Join(", ", UdpDefinitionService.Instance.GetLoadedObjectTypes());
                     Log($"UDP runtime initialized: {UdpDefinitionService.Instance.Count} definitions [{objectTypes}]");
@@ -498,8 +535,10 @@ namespace EliteSoft.Erwin.AddIn
                 _tableTypeMonitorService.SetPropertyApplicator(_propertyApplicatorService);
             if (_udpRuntimeService.IsInitialized)
                 _tableTypeMonitorService.SetUdpRuntimeService(_udpRuntimeService);
-            using (AddinLogger.BeginScope("TableTypeMonitor.TakeSnapshot"))
-                _tableTypeMonitorService.TakeSnapshot();
+            // Phase-1A (2026-05-05): TakeSnapshot removed from startup path - the first
+            // CheckForTableTypeChanges call (driven by ValidationCoordinator's tick) now
+            // performs a silent baseline. Saves several seconds on large models without
+            // changing observable behavior for new/changed entities.
             using (AddinLogger.BeginScope("TableTypeMonitor.StartMonitoring"))
                 _tableTypeMonitorService.StartMonitoring();
 
@@ -516,27 +555,27 @@ namespace EliteSoft.Erwin.AddIn
             using (AddinLogger.BeginScope("ValidationCoordinator.StartMonitoring"))
                 _validationCoordinatorService.StartMonitoring();
 
-            // Discovery: hook column-editor lifecycle to learn the Physical Data Type
-            // dropdown's window class. Disposed via DisposeServices on form close.
-            if (_columnEditorInspector == null)
-            {
-                _columnEditorInspector = new ColumnEditorInspector();
-                _columnEditorInspector.OnLog += Log;
-                _columnEditorInspector.Start();
-            }
+            // Column Editor lifecycle hook (kept disabled).
+            // 2026-05-06: this Inspector is a discovery / diagnostic tool that
+            // only logs WinEvents and dumps the column editor window tree. It
+            // has NO validation logic - no glossary lookup, no ValidationCoord
+            // calls, no per-keystroke hook. Re-enabling adds verbose log noise
+            // (hundreds of lines per editor session) without delivering live
+            // validation. Live popups are driven by MonitorTimer's periodic
+            // scan; for finer latency, raise MaxEntitiesPerTick or wire a real
+            // EN_CHANGE subclass on the editor's text fields (separate task).
+            // if (_columnEditorInspector == null)
+            // {
+            //     _columnEditorInspector = new ColumnEditorInspector();
+            //     _columnEditorInspector.OnLog += Log;
+            //     _columnEditorInspector.Start();
+            // }
 
-            // Discovery (one-shot): walk metamodel for datatype-related class/property
-            // entries. Goal is to find the source feeding the Physical Data Type tree
-            // dropdown so we can constrain it at the model level instead of hooking the
-            // UI. Logs prefixed [DTProbe]; remove this block once a filter strategy is
-            // implemented.
-            try
-            {
-                var probe = new MetamodelDatatypeProbe(_scapi, _currentModel);
-                probe.OnLog += Log;
-                probe.Run();
-            }
-            catch (Exception ex) { Log($"[DTProbe] startup probe failed: {ex.Message}"); }
+            // DTProbe was a one-shot metamodel discovery spike (~5.7s on every connect).
+            // Output is deterministic per erwin install, not per model, so we no longer
+            // pay the cost on each load. The MetamodelDatatypeProbe class is preserved
+            // and can be invoked manually from a DEV button if the dropdown source
+            // question is revisited.
 
             using (AddinLogger.BeginScope("LoadTablesComboBox"))
                 LoadTablesComboBox();
@@ -1414,7 +1453,9 @@ namespace EliteSoft.Erwin.AddIn
                 dynamic mmObjects = metamodelSession.ModelObjects;
                 dynamic mmRoot = mmObjects.Root;
 
-                // Collect all existing Property_Type names in one pass
+                // Collect all existing Property_Type names in one pass.
+                // Stored on a field so UdpRuntimeService can reuse it instead of
+                // walking the same ~1500-entry metamodel collection again.
                 var existingUdps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 try
                 {
@@ -1430,6 +1471,7 @@ namespace EliteSoft.Erwin.AddIn
                     Log($"Metamodel Property_Type enumeration failed: {ex.Message}");
                 }
 
+                _cachedPropertyTypeNames = existingUdps;
                 Log($"Found {existingUdps.Count} existing Property_Type entries");
 
                 // TABLE_TYPE UDP is now managed by UdpRuntimeService (MC_UDP_DEFINITION)
@@ -1455,6 +1497,9 @@ namespace EliteSoft.Erwin.AddIn
                         TrySetProperty(udpType, "tag_Order", "999");
                         TrySetProperty(udpType, "tag_Is_Locally_Defined", true);
                         metamodelSession.CommitTransaction(transId);
+                        // Keep the cached set in sync with the metamodel so the
+                        // downstream UdpRuntimeService consumer sees the new entry.
+                        _cachedPropertyTypeNames?.Add("Model.Physical.MODEL_PATH");
                         Log($"MODEL_PATH UDP created (default='{modelPathForUdp ?? ""}')");
                     }
                     catch (Exception ex)
@@ -1999,10 +2044,15 @@ namespace EliteSoft.Erwin.AddIn
                     // loop (verified 01:04:05 log), and PropertyApplicator fires its question
                     // wizard for each new entity. Snapshot calls are safe while suspended:
                     // both timers are gated and the calls just clear-and-rebuild internal dicts.
-                    try { _tableTypeMonitorService?.TakeSnapshot(); }
-                    catch (Exception ex) { Log($"BtnCreateTables: TableTypeMonitor TakeSnapshot err: {ex.Message}"); }
-                    try { _validationCoordinatorService?.TakeSnapshot(); }
-                    catch (Exception ex) { Log($"BtnCreateTables: ValidationCoord TakeSnapshot err: {ex.Message}"); }
+                    // Phase-1B (2026-05-06): switched from sync TakeSnapshot to deferred
+                    // rebaseline. The bulk-create path used to freeze big-model UI for
+                    // ~21 seconds here; the new flag lets the next MonitorTimer cycle
+                    // silently re-baseline. Newly created entities are baselined the
+                    // same way startup-loaded ones are.
+                    try { _tableTypeMonitorService?.RebaselineDeferred(); }
+                    catch (Exception ex) { Log($"BtnCreateTables: TableTypeMonitor RebaselineDeferred err: {ex.Message}"); }
+                    try { _validationCoordinatorService?.RebaselineDeferred(); }
+                    catch (Exception ex) { Log($"BtnCreateTables: ValidationCoord RebaselineDeferred err: {ex.Message}"); }
 
                     _validationCoordinatorService?.ResumeValidation();
                 }

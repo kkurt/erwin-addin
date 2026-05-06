@@ -22,6 +22,24 @@ namespace EliteSoft.Erwin.AddIn.Services
         private int _cycleCount;
         private const int HeavyScanInterval = 4; // Every 4 cycles (2 seconds at 500ms tick)
 
+        // Phase-1A startup optimization (2026-05-05):
+        // Sync TakeSnapshot at startup (called from ModelConfigForm) used to walk all entities
+        // + ReadUdpValues each. On large models this added several seconds to a 27s freeze.
+        // We now skip the upfront TakeSnapshot; the first CheckForTableTypeChanges call
+        // (invoked at end of ValidationCoordinator's first full cycle) silently baselines
+        // _entitySnapshots without firing the heavy isNew branch (AddEntityToDiagram /
+        // ApplyStandardsToEntity / ApplyDefaults / ValidateNamingStandard). After the first
+        // call this flag flips and existing entities are treated as known.
+        private bool _initialScanCycle = true;
+
+        // Phase-1A UDP backfill: silent populate skips ReadUdpValues for speed (UI burst control).
+        // Once the initial scan completes, subsequent CheckForTableTypeChanges calls drain entities
+        // whose UdpValues snapshot is still empty, in chunks of UdpBackfillBatchSize per call,
+        // so UDP value-change detection re-activates for pre-existing entities without freezing
+        // the UI. Bounded work per tick keeps the cycle latency stable.
+        private bool _udpBackfillPending;
+        private const int UdpBackfillBatchSize = 30;
+
         // Snapshot of Key_Group (Index) names: ObjectId -> PhysicalName
         private Dictionary<string, string> _keyGroupSnapshots;
 
@@ -115,6 +133,21 @@ namespace EliteSoft.Erwin.AddIn.Services
         public void StopMonitoring()
         {
             _isMonitoring = false;
+        }
+
+        /// <summary>
+        /// Phase-1B (2026-05-06): drop the entity snapshot dictionary and arm the
+        /// silent-population flag so the next CheckForTableTypeChanges call re-baselines
+        /// without firing AddEntityToDiagram / ApplyStandardsToEntity / ApplyDefaults /
+        /// ValidateNamingStandard. Replaces sync TakeSnapshot() in bulk-create paths.
+        /// </summary>
+        public void RebaselineDeferred()
+        {
+            _entitySnapshots.Clear();
+            _keyGroupSnapshots.Clear();
+            _initialScanCycle = true;
+            _diagLoggedEmptyUdp.Clear();
+            Log("TableTypeMonitorService: Snapshot dropped, deferred rebaseline scheduled (next cycle silent)");
         }
 
         /// <summary>
@@ -248,6 +281,23 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// </summary>
         public void CheckForTableTypeChanges(dynamic allEntities)
         {
+            // Phase-1A: TakeSnapshot was deferred. On first call, capture MODEL_PATH baseline
+            // so EnforceModelPathReadOnly has something to restore against from this point on.
+            // (Pre-existing user changes to MODEL_PATH made before the addin loaded are
+            // accepted as the new baseline — same behavior as if the user opened erwin
+            // directly with that value.)
+            if (_initialScanCycle && _modelPathOriginalValue == null)
+            {
+                try
+                {
+                    dynamic mo = _session.ModelObjects;
+                    dynamic root = mo?.Root;
+                    if (root != null)
+                        _modelPathOriginalValue = root.Properties("Model.Physical.MODEL_PATH").Value?.ToString() ?? "";
+                }
+                catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"MODEL_PATH baseline error: {ex.Message}"); }
+            }
+
             // Read-only enforcement: restore MODEL_PATH if user changed it
             EnforceModelPathReadOnly();
 
@@ -301,12 +351,14 @@ namespace EliteSoft.Erwin.AddIn.Services
                         {
                             CheckForUdpValueChanges(entity, objectId, physicalName);
                         }
-                        else if (_diagLoggedEmptyUdp.Add(objectId))
+                        else if (!_udpBackfillPending && _diagLoggedEmptyUdp.Add(objectId))
                         {
                             // Diagnostic: snapshot has zero tracked UDP values for this entity.
                             // Means ReadUdpValues returned empty at snapshot time. Either
                             // UdpDefinitionService had no defs for "Table" then, or every
                             // Properties("Entity.Physical.<udp>") access threw and was swallowed.
+                            // Suppressed while Phase-1A UDP backfill is still pending — emptiness
+                            // there is expected, not a problem to flag.
                             Log($"[Diag] Skipping UDP check for '{physicalName}' (id={objectId.Substring(0, Math.Min(8, objectId.Length))}...): snapshot has 0 tracked UDP values");
                         }
                     }
@@ -321,40 +373,53 @@ namespace EliteSoft.Erwin.AddIn.Services
                             PhysicalName = physicalName
                         };
 
-                        // Add new entity to diagram automatically
-                        AddEntityToDiagram(entity, physicalName);
-
-                        // Apply model standard properties (LOGGING, COMPRESSION, etc.)
-                        if (_propertyApplicator != null && _propertyApplicator.IsInitialized)
+                        if (_initialScanCycle)
                         {
-                            _propertyApplicator.ApplyStandardsToEntity(entity, physicalName);
-
-                            // Delete auto-created PK index if model property is enabled
-                            if (_propertyApplicator.IsPropertyEnabled("DELETE_AUTO_CREATED_INDEX_PK"))
-                            {
-                                DeleteAutoCreatedPKIndex(entity, physicalName);
-                            }
+                            // Phase-1A initial silent population: this entity already existed
+                            // when the addin loaded. Do NOT apply standards / defaults / naming
+                            // validation retroactively (rules new/changed only). UDP values are
+                            // also NOT snapshotted here to keep the burst short — UDP change
+                            // detection for these entities will activate the next time
+                            // CheckForUdpValueChanges sees them with non-empty UdpValues, which
+                            // happens after a user-driven re-snapshot or rename.
                         }
-
-                        // Apply UDP defaults for new entity
-                        if (_udpRuntimeService != null && _udpRuntimeService.IsInitialized)
+                        else
                         {
-                            try
-                            {
-                                _udpRuntimeService.ApplyDefaults(entity);
-                                Log($"UDP defaults applied for new entity '{physicalName}'");
+                            // Add new entity to diagram automatically
+                            AddEntityToDiagram(entity, physicalName);
 
-                                // Snapshot UDP values after defaults applied (so first check doesn't re-trigger)
-                                _entitySnapshots[objectId].UdpValues = _udpRuntimeService.ReadUdpValues((object)entity);
-                            }
-                            catch (Exception ex)
+                            // Apply model standard properties (LOGGING, COMPRESSION, etc.)
+                            if (_propertyApplicator != null && _propertyApplicator.IsInitialized)
                             {
-                                Log($"UDP defaults error for '{physicalName}': {ex.Message}");
+                                _propertyApplicator.ApplyStandardsToEntity(entity, physicalName);
+
+                                // Delete auto-created PK index if model property is enabled
+                                if (_propertyApplicator.IsPropertyEnabled("DELETE_AUTO_CREATED_INDEX_PK"))
+                                {
+                                    DeleteAutoCreatedPKIndex(entity, physicalName);
+                                }
                             }
+
+                            // Apply UDP defaults for new entity
+                            if (_udpRuntimeService != null && _udpRuntimeService.IsInitialized)
+                            {
+                                try
+                                {
+                                    _udpRuntimeService.ApplyDefaults(entity);
+                                    Log($"UDP defaults applied for new entity '{physicalName}'");
+
+                                    // Snapshot UDP values after defaults applied (so first check doesn't re-trigger)
+                                    _entitySnapshots[objectId].UdpValues = _udpRuntimeService.ReadUdpValues((object)entity);
+                                }
+                                catch (Exception ex)
+                                {
+                                    Log($"UDP defaults error for '{physicalName}': {ex.Message}");
+                                }
+                            }
+
+                            // Validate Table naming standards for new entity (with auto-apply)
+                            ValidateNamingStandard("Table", physicalName, entity);
                         }
-
-                        // Validate Table naming standards for new entity (with auto-apply)
-                        ValidateNamingStandard("Table", physicalName, entity);
                     }
                 }
             }
@@ -368,6 +433,96 @@ namespace EliteSoft.Erwin.AddIn.Services
             if (_cycleCount % HeavyScanInterval == 0)
             {
                 CheckKeyGroupAndViewNaming();
+            }
+
+            // Phase-1A: first call was a silent baseline. Subsequent calls treat genuinely
+            // new entities normally (apply standards, defaults, naming validation, etc.).
+            if (_initialScanCycle)
+            {
+                _initialScanCycle = false;
+                Log($"TableTypeMonitorService: Initial silent population complete - {_entitySnapshots.Count} entities baselined; live entity validation now active");
+
+                // 2026-05-05: UDP value backfill DISABLED on big-model evidence. Per-entity
+                // ReadUdpValues was measured at ~1s on SQL_BUYUKMODEL (280 entities), so a
+                // batch of 30 produced ~30s STA-thread blocks every full cycle for ~10 minutes.
+                // erwin UI froze (right-click menus would not open). The backfill code below
+                // is preserved (unreachable) for reference; if value-change detection on
+                // pre-existing entities is needed later, it must be driven by a user-initiated
+                // refresh or a different (lighter) probe — not a periodic background walk.
+                // The pending flag remains false so BackfillUdpValuesChunk is never invoked.
+            }
+            // _udpBackfillPending is intentionally never set true under Phase-1A.
+        }
+
+        /// <summary>
+        /// Phase-1A: read UdpValues for up to UdpBackfillBatchSize entities per call whose
+        /// snapshot was created during the initial silent population (Count == 0). Walks the
+        /// caller-supplied allEntities collection, looks each entity up by ObjectId in the
+        /// snapshot dict, and fills it in via UdpRuntimeService.ReadUdpValues.
+        /// When no empty snapshots remain, the diag-logged set is cleared (so any later genuine
+        /// "0 UDPs" cases get a fresh diagnostic line) and the pending flag flips.
+        /// </summary>
+        private void BackfillUdpValuesChunk(dynamic allEntities)
+        {
+            if (_udpRuntimeService == null || !_udpRuntimeService.IsInitialized)
+            {
+                _udpBackfillPending = false;
+                return;
+            }
+
+            int processed = 0;
+            int remaining = 0;
+            int errors = 0;
+
+            try
+            {
+                foreach (dynamic entity in allEntities)
+                {
+                    if (entity == null) continue;
+
+                    string objectId = "";
+                    try { objectId = entity.ObjectId?.ToString() ?? ""; }
+                    catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"UDP backfill ObjectId read error: {ex.Message}"); continue; }
+                    if (string.IsNullOrEmpty(objectId)) continue;
+
+                    if (!_entitySnapshots.TryGetValue(objectId, out EntitySnapshot snap)) continue;
+                    if (snap.UdpValues != null && snap.UdpValues.Count > 0) continue;
+
+                    if (processed >= UdpBackfillBatchSize)
+                    {
+                        remaining++;
+                        continue;
+                    }
+
+                    try
+                    {
+                        snap.UdpValues = _udpRuntimeService.ReadUdpValues((object)entity);
+                        processed++;
+                    }
+                    catch (Exception ex)
+                    {
+                        errors++;
+                        Log($"UDP backfill failed for entity '{snap.PhysicalName}': {ex.Message}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"UDP backfill chunk error: {ex.Message}");
+                return;
+            }
+
+            if (processed > 0)
+                Log($"TableTypeMonitorService: UDP backfill processed {processed} entit{(processed == 1 ? "y" : "ies")}{(errors > 0 ? $" ({errors} error(s))" : string.Empty)}, {remaining} remaining");
+
+            if (remaining == 0)
+            {
+                _udpBackfillPending = false;
+                // Reset the diagnostic-logged set so any entity that legitimately has no UDP
+                // values (post-backfill) can produce a fresh log line on the next check.
+                _diagLoggedEmptyUdp.Clear();
+                int populated = _entitySnapshots.Values.Count(s => s.UdpValues.Count > 0);
+                Log($"TableTypeMonitorService: UDP value backfill complete - {populated}/{_entitySnapshots.Count} entit{(_entitySnapshots.Count == 1 ? "y" : "ies")} have tracked UDP values");
             }
         }
 

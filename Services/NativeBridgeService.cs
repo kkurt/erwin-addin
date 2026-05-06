@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
 
@@ -116,6 +117,31 @@ namespace EliteSoft.Erwin.AddIn.Services
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate int CCInspGetEdrTxCountFn();
 
+        // Phase-1C coverage test (2026-05-06): the bridge installs an inline detour on
+        // GDMActionSummary::AddItem and pushes (id, owner, itemType, actionType) into a
+        // ring buffer. DequeueChangeRecord pops one record from that buffer.
+        // Returns 1 if a record was dequeued, 0 if empty.
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int DequeueChangeRecordFn(
+            out uint id, out uint owner, out uint itemType, out uint actionType);
+
+        // Phase-C step-3: returns a comma-separated list of distinct entity
+        // int-OIDs whose attributes/properties changed in the live action
+        // summary on `ms`. Empty string if no change. The returned char* is
+        // owned by the bridge (static buffer, no free).
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        [return: MarshalAs(UnmanagedType.LPStr)]
+        private delegate string GetChangedEntityIdsFn(IntPtr ms);
+
+        // Phase-C step-3 companion: returns CSV of attribute int-OIDs that
+        // changed (owner-filtered). Used to filter the per-attr loop inside
+        // CheckEntityForChanges so only the user-touched attribute fires
+        // ProcessNewAttribute / ProcessAttributeChanges - the other ~29
+        // attrs in the entity stay quiet.
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        [return: MarshalAs(UnmanagedType.LPStr)]
+        private delegate string GetChangedAttributeIdsFn(IntPtr ms);
+
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate uint CCInspGetLastEdrStartIdFn();
 
@@ -206,6 +232,9 @@ namespace EliteSoft.Erwin.AddIn.Services
         private static CCInspGetLastOnFeMsFn _ccInspGetLastOnFeMs;
         private static CCInspGetLastEdrMsFn _ccInspGetLastEdrMs;
         private static CCInspGetEdrTxCountFn _ccInspGetEdrTxCount;
+        private static GetChangedEntityIdsFn _getChangedEntityIds;
+        private static GetChangedAttributeIdsFn _getChangedAttributeIds;
+        private static DequeueChangeRecordFn _dequeueChangeRecord;
         private static CCInspGetLastEdrStartIdFn _ccInspGetLastEdrStartId;
         private static CCInspGetLastEdrStartMsFn _ccInspGetLastEdrStartMs;
         private static CCInspGenerateAlterDdlViaOnFEFn _ccInspGenerateAlterDdlViaOnFE;
@@ -393,6 +422,18 @@ namespace EliteSoft.Erwin.AddIn.Services
                     if (ccGetEdrTxCount != IntPtr.Zero)
                         _ccInspGetEdrTxCount = Marshal.GetDelegateForFunctionPointer<CCInspGetEdrTxCountFn>(ccGetEdrTxCount);
 
+                    IntPtr getChangedEntities = GetProcAddress(_bridgeModule, "GetChangedEntityIds");
+                    if (getChangedEntities != IntPtr.Zero)
+                        _getChangedEntityIds = Marshal.GetDelegateForFunctionPointer<GetChangedEntityIdsFn>(getChangedEntities);
+
+                    IntPtr getChangedAttrs = GetProcAddress(_bridgeModule, "GetChangedAttributeIds");
+                    if (getChangedAttrs != IntPtr.Zero)
+                        _getChangedAttributeIds = Marshal.GetDelegateForFunctionPointer<GetChangedAttributeIdsFn>(getChangedAttrs);
+
+                    IntPtr dequeueChange = GetProcAddress(_bridgeModule, "DequeueChangeRecord");
+                    if (dequeueChange != IntPtr.Zero)
+                        _dequeueChangeRecord = Marshal.GetDelegateForFunctionPointer<DequeueChangeRecordFn>(dequeueChange);
+
                     IntPtr ccGetLastEdrStartId = GetProcAddress(_bridgeModule, "CCInsp_GetLastEdrStartId");
                     if (ccGetLastEdrStartId != IntPtr.Zero)
                         _ccInspGetLastEdrStartId = Marshal.GetDelegateForFunctionPointer<CCInspGetLastEdrStartIdFn>(ccGetLastEdrStartId);
@@ -543,6 +584,72 @@ namespace EliteSoft.Erwin.AddIn.Services
         public static int GetEdrTxCount()
         {
             return _ccInspGetEdrTxCount?.Invoke() ?? -1;
+        }
+
+        /// <summary>
+        /// Phase-C step-3: returns the set of entity int-OIDs whose
+        /// attributes/properties changed in the live action summary on
+        /// <paramref name="ms"/>. Empty array means no relevant change.
+        /// Used by the validation timer to walk only affected entities
+        /// instead of the full 280-entity model on every transaction.
+        /// </summary>
+        public static uint[] GetChangedEntityIds(IntPtr ms)
+        {
+            return ParseUintCsv(_getChangedEntityIds?.Invoke(ms));
+        }
+
+        /// <summary>
+        /// Phase-C step-3 companion: returns the changed attribute int-OIDs
+        /// alongside <see cref="GetChangedEntityIds"/>. Validation walks an
+        /// entity but only fires popups for attrs whose id is in this set,
+        /// preventing 30-popup-per-edit spam when only one column was
+        /// touched in a multi-column entity.
+        /// </summary>
+        public static uint[] GetChangedAttributeIds(IntPtr ms)
+        {
+            return ParseUintCsv(_getChangedAttributeIds?.Invoke(ms));
+        }
+
+        /// <summary>
+        /// Phase-1C coverage probe (2026-05-06): drain every record currently in the
+        /// AddItem ring buffer. Each record carries (id, owner, itemType, actionType)
+        /// captured at GDMActionSummary::AddItem call time. This data lets us learn
+        /// empirically WHICH user actions populate the action summary - critical for
+        /// deciding whether AddItem can replace the periodic full-model scan.
+        /// Returns an empty list when the buffer is empty.
+        /// </summary>
+        public static List<(uint Id, uint Owner, uint ItemType, uint ActionType)> DrainChangeRecords()
+        {
+            var results = new List<(uint, uint, uint, uint)>();
+            if (_dequeueChangeRecord == null) return results;
+
+            // Hard cap to prevent runaway loops if the bridge keeps producing records
+            // faster than we can drain (shouldn't happen, but defensive).
+            const int MaxDrainPerCall = 256;
+            for (int i = 0; i < MaxDrainPerCall; i++)
+            {
+                if (_dequeueChangeRecord(out uint id, out uint owner, out uint itemType, out uint actionType) == 0)
+                    break;
+                results.Add((id, owner, itemType, actionType));
+            }
+            return results;
+        }
+
+        private static uint[] ParseUintCsv(string csv)
+        {
+            if (string.IsNullOrEmpty(csv)) return Array.Empty<uint>();
+            string[] parts = csv.Split(',');
+            uint[] result = new uint[parts.Length];
+            int n = 0;
+            for (int i = 0; i < parts.Length; i++)
+            {
+                if (uint.TryParse(parts[i], out uint id) && id != 0)
+                    result[n++] = id;
+            }
+            if (n == result.Length) return result;
+            uint[] trimmed = new uint[n];
+            Array.Copy(result, trimmed, n);
+            return trimmed;
         }
 
         /// <summary>
