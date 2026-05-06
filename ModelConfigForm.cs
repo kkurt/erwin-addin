@@ -486,8 +486,6 @@ namespace EliteSoft.Erwin.AddIn
 
             using (AddinLogger.BeginScope("EnsureAllUdpsExist"))
                 EnsureAllUdpsExist();
-            using (AddinLogger.BeginScope("SetModelPathValue"))
-                SetModelPathValue();
 
             _validationService = new ColumnValidationService(_session);
             btnValidateAll.Enabled = true;
@@ -553,7 +551,7 @@ namespace EliteSoft.Erwin.AddIn
             if (_dependencySetService != null && _dependencySetService.IsLoaded)
                 _validationCoordinatorService.SetDependencySetService(_dependencySetService);
             using (AddinLogger.BeginScope("ValidationCoordinator.StartMonitoring"))
-                _validationCoordinatorService.StartMonitoring();
+                _validationCoordinatorService.StartMonitoring(_cachedPropertyTypeNames);
 
             // Column Editor lifecycle hook (kept disabled).
             // 2026-05-06: this Inspector is a discovery / diagnostic tool that
@@ -1474,43 +1472,12 @@ namespace EliteSoft.Erwin.AddIn
                 _cachedPropertyTypeNames = existingUdps;
                 Log($"Found {existingUdps.Count} existing Property_Type entries");
 
-                // TABLE_TYPE UDP is now managed by UdpRuntimeService (MC_UDP_DEFINITION)
-
-                // --- MODEL_PATH UDP (hidden, read-only — stores repository path) ---
-                // Determine model path BEFORE creating UDP (to set as default value in metamodel)
-                string modelPathForUdp = ReadModelPath();
-
-                if (!existingUdps.Contains("Model.Physical.MODEL_PATH"))
-                {
-                    int transId = metamodelSession.BeginNamedTransaction("CreateModelPathUDP");
-                    try
-                    {
-                        dynamic udpType = mmObjects.Add("Property_Type");
-                        udpType.Properties("Name").Value = "Model.Physical.MODEL_PATH";
-                        TrySetProperty(udpType, "tag_Udp_Owner_Type", "Model");
-                        TrySetProperty(udpType, "tag_Is_Physical", true);
-                        TrySetProperty(udpType, "tag_Is_Logical", false);
-                        TrySetProperty(udpType, "tag_Udp_Data_Type", 1); // Text type
-                        // Set model path as default value — ensures it's embedded even before model session can see the UDP
-                        if (!string.IsNullOrEmpty(modelPathForUdp))
-                            TrySetProperty(udpType, "tag_Udp_Default_Value", modelPathForUdp);
-                        TrySetProperty(udpType, "tag_Order", "999");
-                        TrySetProperty(udpType, "tag_Is_Locally_Defined", true);
-                        metamodelSession.CommitTransaction(transId);
-                        // Keep the cached set in sync with the metamodel so the
-                        // downstream UdpRuntimeService consumer sees the new entry.
-                        _cachedPropertyTypeNames?.Add("Model.Physical.MODEL_PATH");
-                        Log($"MODEL_PATH UDP created (default='{modelPathForUdp ?? ""}')");
-                    }
-                    catch (Exception ex)
-                    {
-                        try { metamodelSession.RollbackTransaction(transId); } catch (Exception rbEx) { Log($"MODEL_PATH rollback error: {rbEx.Message}"); }
-                        if (ex.Message.Contains("must be unique") || ex.Message.Contains("EBS-1057"))
-                            Log("MODEL_PATH UDP already exists (unique constraint)");
-                        else
-                            Log($"Error creating MODEL_PATH UDP: {ex.Message}");
-                    }
-                }
+                // TABLE_TYPE UDP is now managed by UdpRuntimeService (MC_UDP_DEFINITION).
+                // (MODEL_PATH UDP creation removed 2026-05-07 - the UDP value was set by
+                // a separate SetModelPathValue path that cost ~700-900 ms per startup
+                // probing 19 PU/root/session properties via dynamic dispatch, and
+                // downstream consumers - PropertyApplicator, DdlGenerationService -
+                // had already been refactored to derive their values without it.)
 
                 Log("All UDPs ensured");
             }
@@ -1525,185 +1492,6 @@ namespace EliteSoft.Erwin.AddIn
                     try { metamodelSession.Close(); } catch { }
                 }
             }
-        }
-
-        /// <summary>
-        /// Set MODEL_PATH UDP value from the model's repository or file path.
-        /// Only writes if the current value is empty (first time).
-        /// </summary>
-        private void SetModelPathValue()
-        {
-            // Use a fresh session to see newly created UDP (main session may have stale schema)
-            dynamic freshSession = null;
-            try
-            {
-                // Determine path first (before opening new session)
-                string modelPath = ReadModelPath();
-
-                freshSession = _scapi.Sessions.Add();
-                freshSession.Open(_currentModel);
-
-                dynamic modelObjects = freshSession.ModelObjects;
-                dynamic root = modelObjects.Root;
-                if (root == null)
-                {
-                    Log("MODEL_PATH: Fresh session root is null");
-                    return;
-                }
-
-                // Read current MODEL_PATH value
-                string currentModelPath = "";
-                try
-                {
-                    currentModelPath = root.Properties("Model.Physical.MODEL_PATH").Value?.ToString() ?? "";
-                }
-                catch (Exception ex)
-                {
-                    Log($"MODEL_PATH UDP not readable: {ex.Message}");
-                    return;
-                }
-
-                if (!string.IsNullOrEmpty(currentModelPath))
-                {
-                    Log($"MODEL_PATH already set: '{currentModelPath}'");
-                    return;
-                }
-
-                if (string.IsNullOrEmpty(modelPath))
-                {
-                    Log("MODEL_PATH: Could not determine model path");
-                    return;
-                }
-
-                // Write to UDP
-                int transId = freshSession.BeginNamedTransaction("SetModelPath");
-                try
-                {
-                    root.Properties("Model.Physical.MODEL_PATH").Value = modelPath;
-                    freshSession.CommitTransaction(transId);
-                    Log($"MODEL_PATH set to: '{modelPath}'");
-                }
-                catch (Exception ex)
-                {
-                    try { freshSession.RollbackTransaction(transId); } catch (Exception rbEx) { Log($"MODEL_PATH rollback error: {rbEx.Message}"); }
-                    Log($"MODEL_PATH write failed: {ex.Message}");
-                }
-            }
-            catch (Exception ex)
-            {
-                Log($"SetModelPathValue error: {ex.Message}");
-            }
-            finally
-            {
-                if (freshSession != null)
-                {
-                    try { freshSession.Close(); } catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"SetModelPath: Session close error: {ex.Message}"); }
-                }
-            }
-        }
-
-        /// <summary>
-        /// Read model full path from PersistenceUnit (repository) or file system.
-        /// Probes multiple COM properties to find the complete path including folder structure.
-        /// </summary>
-        private string ReadModelPath()
-        {
-            try
-            {
-                // Phase 1: Probe PersistenceUnit COM object for full path
-                if (_currentModel != null)
-                {
-                    // Try all possible PersistenceUnit properties that might contain full path
-                    string[] puProps = { "FullName", "Path", "Location", "ConnectionString",
-                                         "Source", "FileName", "FilePath", "URL", "URI" };
-                    foreach (var prop in puProps)
-                    {
-                        try
-                        {
-                            dynamic val = null;
-                            // Try as direct property first
-                            try { val = ((dynamic)_currentModel).GetType().GetProperty(prop)?.GetValue(_currentModel); } catch { }
-                            // Try as COM late-bound property
-                            if (val == null) try { val = ((dynamic)_currentModel).GetType().InvokeMember(prop, System.Reflection.BindingFlags.GetProperty, null, _currentModel, null); } catch { }
-
-                            string strVal = val?.ToString() ?? "";
-                            if (!string.IsNullOrEmpty(strVal) && strVal != _currentModel.Name?.ToString())
-                            {
-                                Log($"MODEL_PATH: PersistenceUnit.{prop} = '{strVal}'");
-                                return strVal;
-                            }
-                        }
-                        catch { }
-                    }
-
-                    // Log PersistenceUnit.Name for debugging
-                    try
-                    {
-                        string puName = _currentModel.Name?.ToString() ?? "";
-                        Log($"MODEL_PATH: PersistenceUnit.Name = '{puName}' (no full path found on PU)");
-                    }
-                    catch { }
-                }
-
-                // Phase 2: Try session/root properties for Mart path
-                dynamic modelObjects = _session.ModelObjects;
-                dynamic root = modelObjects.Root;
-
-                // Try Mart-specific properties on root
-                string[] rootProps = { "Long_Id", "Source_File_Name", "File_Name", "File_Path",
-                                        "Model_File_Name", "Mart_Model_Path", "Repository_Path" };
-                foreach (var propName in rootProps)
-                {
-                    try
-                    {
-                        string val = root.Properties(propName).Value?.ToString();
-                        if (!string.IsNullOrEmpty(val) && !val.StartsWith("%"))
-                        {
-                            Log($"MODEL_PATH: root.{propName} = '{val}'");
-                            // Skip Long_Id as path (it's a GUID), just log it
-                            if (propName == "Long_Id") continue;
-                            return val;
-                        }
-                    }
-                    catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"MODEL_PATH: root.{propName} error: {ex.Message}"); }
-                }
-
-                // Phase 3: Try to get Mart folder path from SCAPI session
-                try
-                {
-                    // Some erwin versions expose path on the session itself
-                    string[] sessionProps = { "ModelPath", "FileName", "Source" };
-                    foreach (var prop in sessionProps)
-                    {
-                        try
-                        {
-                            string val = _session.GetType().InvokeMember(prop, System.Reflection.BindingFlags.GetProperty, null, (object)_session, null)?.ToString();
-                            if (!string.IsNullOrEmpty(val))
-                            {
-                                Log($"MODEL_PATH: session.{prop} = '{val}'");
-                                return val;
-                            }
-                        }
-                        catch { }
-                    }
-                }
-                catch { }
-
-                // Phase 4: Fallback — use model root Name
-                try
-                {
-                    string modelName = root.Properties("Name").Value?.ToString();
-                    if (!string.IsNullOrEmpty(modelName))
-                    {
-                        Log($"MODEL_PATH: Fallback to root.Name = '{modelName}'");
-                        return modelName;
-                    }
-                }
-                catch (Exception ex) { Log($"MODEL_PATH: Name fallback error: {ex.Message}"); }
-
-                return null;
-            }
-            catch (Exception ex) { Log($"ReadModelPath error: {ex.Message}"); return null; }
         }
 
         #endregion

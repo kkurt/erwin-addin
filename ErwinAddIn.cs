@@ -114,7 +114,12 @@ namespace EliteSoft.Erwin.AddIn
                     Services.NativeBridgeService.Install(msg =>
                         System.Diagnostics.Debug.WriteLine(msg));
 
-                // License check
+                // License check on UI thread. Phase-3C parallel-on-thread-pool variant
+                // was tried 2026-05-07 but reverted: LicensingService's AntiTamper
+                // checks (debugger / timing fingerprints) misfire on a non-UI thread
+                // context inside erwin's host process and the addin reported a
+                // tampering-detected status to a paying user. The ~250 ms saving was
+                // not worth the false-positive risk; license stays sequential.
                 bool licenseOk;
                 using (Services.AddinLogger.BeginScope("CheckLicense"))
                     licenseOk = CheckLicense();
@@ -173,14 +178,31 @@ namespace EliteSoft.Erwin.AddIn
 
         /// <summary>
         /// Validates hardware license. Returns true if valid, false otherwise.
+        /// Wraps the UI-free check + shows the MessageBox on failure. Used by the
+        /// startup path; the failure message is displayed on the calling thread,
+        /// so this must be invoked from the UI thread (which Execute() is on).
         /// </summary>
         private bool CheckLicense()
         {
-            // Skip if already validated and cached
-            if (LicensingService.IsValid)
-                return true;
+            var (ok, failureMessage) = CheckLicenseStatus();
+            if (ok) return true;
 
-            // License file is in the same directory as the DLL
+            ShowTopMostMessage(failureMessage, "Elite Soft - License Error", isError: false);
+            return false;
+        }
+
+        /// <summary>
+        /// Phase-3C parallel-friendly variant: pure managed work (file read + decrypt),
+        /// no UI calls. Runs safely on a thread-pool worker so it can overlap with the
+        /// SCAPI activation + form constructor (~250 ms total) on the startup critical
+        /// path. Returns (true, null) on success or (false, userFacingMessage) on
+        /// failure; the caller renders the message on the UI thread.
+        /// </summary>
+        private static (bool ok, string failureMessage) CheckLicenseStatus()
+        {
+            if (LicensingService.IsValid)
+                return (true, null);
+
             var assemblyLocation = typeof(ErwinAddIn).Assembly.Location;
             if (string.IsNullOrEmpty(assemblyLocation))
                 assemblyLocation = AppContext.BaseDirectory;
@@ -190,7 +212,7 @@ namespace EliteSoft.Erwin.AddIn
             var status = LicensingService.Initialize(licensePath);
 
             if (status == LicenseStatus.Valid)
-                return true;
+                return (true, null);
 
             string message = status switch
             {
@@ -220,9 +242,7 @@ namespace EliteSoft.Erwin.AddIn
                     "Please contact Elite Soft for assistance."
             };
 
-            ShowTopMostMessage(message, "Elite Soft - License Error", isError: false);
-
-            return false;
+            return (false, message);
         }
 
         /// <summary>

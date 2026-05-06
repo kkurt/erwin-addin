@@ -174,7 +174,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             return _lastModelUdpValues ?? new Dictionary<string, string>();
         }
 
-        public void StartMonitoring()
+        public void StartMonitoring(HashSet<string> preFetchedPropertyTypeNames = null)
         {
             if (_isMonitoring) return;
             _isMonitoring = true;
@@ -189,25 +189,24 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
             catch { }
 
-            // Initialize model UDP change tracking
-            InitializeModelUdpTracking();
+            // Initialize model UDP change tracking. Pass the cached metamodel
+            // Property_Type set when available (populated earlier by
+            // EnsureAllUdpsExist) so we skip a duplicate ~700 ms metamodel walk
+            // here.
+            InitializeModelUdpTracking(preFetchedPropertyTypeNames);
 
             // Phase-2D (2026-05-06): no startup baseline at all. Per-table silent
             // populate happens on demand the first time the user opens that table's
-            // Column Editor (see MonitorTimer_Tick scoped path). Domain cache is
-            // still primed up front because validation lookups are cheap and rely
-            // on the cache being warm before the first edit.
+            // Column Editor.
+            // Phase-3B (2026-05-07): domain cache also lazy-populated. The previous
+            // upfront BuildDomainCache call cost ~300 ms walking every Domain in
+            // the model for a cache that GetDomainParentValue already fills on first
+            // miss. Same end state (warm cache after first few validations) without
+            // the startup tax.
             _attributeSnapshots.Clear();
             _keyGroupSnapshots.Clear();
             _domainCache.Clear();
             _tablesBaselined.Clear();
-            try
-            {
-                dynamic mo = _session.ModelObjects;
-                dynamic root = mo?.Root;
-                if (root != null) BuildDomainCache(mo, root);
-            }
-            catch (Exception ex) { Log($"StartMonitoring: BuildDomainCache failed: {ex.Message}"); }
 
             _monitorTimer.Start();
             _windowMonitorTimer.Start();
@@ -260,20 +259,12 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             _attributeSnapshots.Clear();
             _keyGroupSnapshots.Clear();
-            _domainCache.Clear();
             _tablesBaselined.Clear();
             _pendingResults.Clear();
-
-            // BuildDomainCache must still be primed up front - downstream validation
-            // lookups (Parent_Domain_Ref -> Domain Name) rely on the cache being warm
-            // even on the silent first cycle.
-            try
-            {
-                dynamic mo = _session.ModelObjects;
-                dynamic root = mo?.Root;
-                if (root != null) BuildDomainCache(mo, root);
-            }
-            catch (Exception ex) { Log($"RebaselineDeferred: BuildDomainCache failed: {ex.Message}"); }
+            // Phase-3B (2026-05-07): keep _domainCache populated across rebaselines.
+            // Domain ObjectId -> Name mapping is stable for the model session, and
+            // GetDomainParentValue lazy-fills cache misses anyway. The previous
+            // upfront BuildDomainCache rebuild here cost ~300 ms with no benefit.
 
             Log("ValidationCoordinatorService: Snapshot dropped, deferred rebaseline scheduled (next cycle silent)");
         }
@@ -388,7 +379,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <summary>
         /// Scan metamodel for Model.Physical.* Property_Type names and read initial values.
         /// </summary>
-        private void InitializeModelUdpTracking()
+        private void InitializeModelUdpTracking(HashSet<string> preFetchedPropertyTypeNames = null)
         {
             _modelUdpPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             _lastModelUdpValues = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -399,32 +390,50 @@ namespace EliteSoft.Erwin.AddIn.Services
                 dynamic root = modelObjects.Root;
                 if (root == null) return;
 
-                // Open metamodel to find Model.Physical.* Property_Type names
-                dynamic mmSession = null;
-                try
+                // Phase-3A (2026-05-07): if the caller already walked the metamodel
+                // (EnsureAllUdpsExist on the connect path), reuse that set instead of
+                // opening a second metamodel session here. The metamodel walk is the
+                // single biggest cost in StartMonitoring (~700 ms on r10.10 with ~1500
+                // Property_Type entries); skipping it shaves the same amount.
+                if (preFetchedPropertyTypeNames != null)
                 {
-                    mmSession = _scapi.Sessions.Add();
-                    mmSession.Open(_scapi.PersistenceUnits.Item(0), 1);
-                    dynamic mmObjects = mmSession.ModelObjects;
-                    dynamic mmRoot = mmObjects.Root;
-
-                    dynamic propertyTypes = mmObjects.Collect(mmRoot, "Property_Type");
-                    foreach (dynamic pt in propertyTypes)
+                    foreach (var name in preFetchedPropertyTypeNames)
                     {
-                        if (pt == null) continue;
-                        try
-                        {
-                            string name = pt.Name ?? "";
-                            if (name.StartsWith("Model.Physical.", StringComparison.OrdinalIgnoreCase))
-                                _modelUdpPaths.Add(name);
-                        }
-                        catch { }
+                        if (string.IsNullOrEmpty(name)) continue;
+                        if (name.StartsWith("Model.Physical.", StringComparison.OrdinalIgnoreCase))
+                            _modelUdpPaths.Add(name);
                     }
+                    Log($"InitializeModelUdpTracking: reused cached Property_Type set ({preFetchedPropertyTypeNames.Count} entries) - skipping metamodel walk");
                 }
-                catch { }
-                finally
+                else
                 {
-                    try { mmSession?.Close(); } catch { }
+                    // Fallback path: open metamodel session and walk.
+                    dynamic mmSession = null;
+                    try
+                    {
+                        mmSession = _scapi.Sessions.Add();
+                        mmSession.Open(_scapi.PersistenceUnits.Item(0), 1);
+                        dynamic mmObjects = mmSession.ModelObjects;
+                        dynamic mmRoot = mmObjects.Root;
+
+                        dynamic propertyTypes = mmObjects.Collect(mmRoot, "Property_Type");
+                        foreach (dynamic pt in propertyTypes)
+                        {
+                            if (pt == null) continue;
+                            try
+                            {
+                                string name = pt.Name ?? "";
+                                if (name.StartsWith("Model.Physical.", StringComparison.OrdinalIgnoreCase))
+                                    _modelUdpPaths.Add(name);
+                            }
+                            catch { }
+                        }
+                    }
+                    catch { }
+                    finally
+                    {
+                        try { mmSession?.Close(); } catch { }
+                    }
                 }
 
                 // Read initial values

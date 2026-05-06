@@ -43,47 +43,9 @@ namespace EliteSoft.Erwin.AddIn.Services
         // Snapshot of Key_Group (Index) names: ObjectId -> PhysicalName
         private Dictionary<string, string> _keyGroupSnapshots;
 
-        // MODEL_PATH read-only enforcement
-        private string _modelPathOriginalValue;
-
         // Diagnostic: log "skipped UDP check" reason at most once per entity per session
         // (so the user can see WHY nothing fires when they change a UDP value)
         private readonly HashSet<string> _diagLoggedEmptyUdp = new HashSet<string>();
-
-        /// <summary>
-        /// Silently restore MODEL_PATH if user changed it.
-        /// </summary>
-        private void EnforceModelPathReadOnly()
-        {
-            if (_modelPathOriginalValue == null) return;
-            try
-            {
-                dynamic modelObjects = _session.ModelObjects;
-                dynamic root = modelObjects.Root;
-                if (root == null) return;
-
-                string currentValue = "";
-                try { currentValue = root.Properties("Model.Physical.MODEL_PATH").Value?.ToString() ?? ""; }
-                catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"EnforceModelPath: Read failed: {ex.Message}"); return; }
-
-                if (currentValue != _modelPathOriginalValue)
-                {
-                    int transId = _session.BeginNamedTransaction("EnforceModelPath");
-                    try
-                    {
-                        root.Properties("Model.Physical.MODEL_PATH").Value = _modelPathOriginalValue;
-                        _session.CommitTransaction(transId);
-                        Log($"MODEL_PATH restored (user changed '{currentValue}' → '{_modelPathOriginalValue}')");
-                    }
-                    catch (Exception ex)
-                    {
-                        try { _session.RollbackTransaction(transId); } catch (Exception rbEx) { Log($"EnforceModelPath: Rollback failed: {rbEx.Message}"); }
-                        Log($"EnforceModelPath: Write failed: {ex.Message}");
-                    }
-                }
-            }
-            catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"EnforceModelPath error: {ex.Message}"); }
-        }
 
         // Property applicator for applying project standards to new tables
         private PropertyApplicatorService _propertyApplicator;
@@ -227,13 +189,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
                 catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"Key_Group snapshot error: {ex.Message}"); }
 
-                // Snapshot MODEL_PATH for read-only enforcement
-                try
-                {
-                    _modelPathOriginalValue = root.Properties("Model.Physical.MODEL_PATH").Value?.ToString() ?? "";
-                }
-                catch (Exception ex) { _modelPathOriginalValue = null; System.Diagnostics.Debug.WriteLine($"MODEL_PATH snapshot error: {ex.Message}"); }
-
                 int populatedCount = _entitySnapshots.Values.Count(s => s.UdpValues.Count > 0);
                 int emptyCount = _entitySnapshots.Count - populatedCount;
                 Log($"TableTypeMonitorService: Snapshot taken - {_entitySnapshots.Count} entities ({populatedCount} with UDP values tracked, {emptyCount} without), {_keyGroupSnapshots.Count} key groups");
@@ -281,25 +236,9 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// </summary>
         public void CheckForTableTypeChanges(dynamic allEntities)
         {
-            // Phase-1A: TakeSnapshot was deferred. On first call, capture MODEL_PATH baseline
-            // so EnforceModelPathReadOnly has something to restore against from this point on.
-            // (Pre-existing user changes to MODEL_PATH made before the addin loaded are
-            // accepted as the new baseline — same behavior as if the user opened erwin
-            // directly with that value.)
-            if (_initialScanCycle && _modelPathOriginalValue == null)
-            {
-                try
-                {
-                    dynamic mo = _session.ModelObjects;
-                    dynamic root = mo?.Root;
-                    if (root != null)
-                        _modelPathOriginalValue = root.Properties("Model.Physical.MODEL_PATH").Value?.ToString() ?? "";
-                }
-                catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"MODEL_PATH baseline error: {ex.Message}"); }
-            }
-
-            // Read-only enforcement: restore MODEL_PATH if user changed it
-            EnforceModelPathReadOnly();
+            // (MODEL_PATH baseline + read-only enforcement removed 2026-05-07 along
+            // with the SetModelPathValue startup write path - the UDP is no longer
+            // populated by the add-in, so there is nothing to enforce.)
 
             try
             {
