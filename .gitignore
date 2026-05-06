@@ -15,3 +15,10 @@ ErwinAlterDdl/artifacts/
 dist/
 certs/*.pfx
 .swarm/
+
+# Native bridge build artifacts
+scripts/native-bridge/*.map
+scripts/native-bridge/*.exp
+scripts/native-bridge/*.lib
+scripts/native-bridge/*.obj
+*.pdb

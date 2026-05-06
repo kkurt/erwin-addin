@@ -52,6 +52,8 @@ $clArgs = @(
     "/link",
     "/IMPLIB:`"$outLib`"",
     "/OUT:`"$outDll`"",
+    "/MAP",
+    "/MAPINFO:EXPORTS",
     "user32.lib"
 ) -join " "
 

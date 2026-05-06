@@ -96,7 +96,14 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// Initialize: load ALL UDP definitions and dependency rules from DB,
         /// then ensure all UDPs exist in the erwin model via metamodel session.
         /// </summary>
-        public bool Initialize()
+        /// <param name="preFetchedPropertyTypeNames">
+        /// Optional metamodel Property_Type name set already collected by an
+        /// earlier walk in the same connect cycle (e.g. by
+        /// <c>ModelConfigForm.EnsureAllUdpsExist</c>). When supplied, the
+        /// duplicate ~700ms metamodel walk inside this service is skipped;
+        /// the names list must be in OrdinalIgnoreCase comparer mode.
+        /// </param>
+        public bool Initialize(HashSet<string> preFetchedPropertyTypeNames = null)
         {
             try
             {
@@ -112,7 +119,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 Log($"UdpRuntime: Loaded {UdpDefinitionService.Instance.Count} UDP definitions for [{string.Join(", ", objectTypes)}]");
 
                 // Ensure all UDP definitions exist in the erwin model (all object types)
-                EnsureUdpsExistInModel();
+                EnsureUdpsExistInModel(preFetchedPropertyTypeNames);
 
                 _initialized = true;
                 return true;
@@ -168,7 +175,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// Opens a separate metamodel session (level 1) to create Property_Type objects.
         /// Handles all object types (Table→Entity, Column→Attribute, etc.)
         /// </summary>
-        private void EnsureUdpsExistInModel()
+        private void EnsureUdpsExistInModel(HashSet<string> preFetchedPropertyTypeNames = null)
         {
             var definitions = UdpDefinitionService.Instance.GetAll().ToList();
             if (definitions.Count == 0) return;
@@ -182,22 +189,33 @@ namespace EliteSoft.Erwin.AddIn.Services
                 dynamic mmObjects = metamodelSession.ModelObjects;
                 dynamic mmRoot = mmObjects.Root;
 
-                // Collect all existing Property_Type names in one pass
-                var existingUdpNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                try
+                // Reuse the caller's metamodel walk if provided (saves ~700ms on
+                // r10 against models with ~1500 Property_Type entries). Fall back
+                // to walking ourselves so the service stays usable standalone.
+                HashSet<string> existingUdpNames;
+                if (preFetchedPropertyTypeNames != null)
                 {
-                    dynamic propertyTypes = mmObjects.Collect(mmRoot, "Property_Type");
-                    foreach (dynamic pt in propertyTypes)
+                    existingUdpNames = preFetchedPropertyTypeNames;
+                    Log($"UdpRuntime: Using cached Property_Type set ({existingUdpNames.Count} entries) - skipping metamodel walk");
+                }
+                else
+                {
+                    existingUdpNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    try
                     {
-                        if (pt == null) continue;
-                        try { existingUdpNames.Add(pt.Name ?? ""); } catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"Property_Type name read error: {ex.Message}"); }
+                        dynamic propertyTypes = mmObjects.Collect(mmRoot, "Property_Type");
+                        foreach (dynamic pt in propertyTypes)
+                        {
+                            if (pt == null) continue;
+                            try { existingUdpNames.Add(pt.Name ?? ""); } catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"Property_Type name read error: {ex.Message}"); }
+                        }
                     }
+                    catch (Exception ex)
+                    {
+                        Log($"UdpRuntime: Metamodel Property_Type enumeration failed: {ex.Message}");
+                    }
+                    Log($"UdpRuntime: Found {existingUdpNames.Count} existing Property_Type entries");
                 }
-                catch (Exception ex)
-                {
-                    Log($"UdpRuntime: Metamodel Property_Type enumeration failed: {ex.Message}");
-                }
-                Log($"UdpRuntime: Found {existingUdpNames.Count} existing Property_Type entries");
 
                 // Read current model-level UDP values for cascade filtering
                 // Use existingUdpNames to find correct case for property paths

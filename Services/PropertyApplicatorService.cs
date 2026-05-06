@@ -64,7 +64,9 @@ namespace EliteSoft.Erwin.AddIn.Services
                 Log($"PropertyApplicator: config={_configId}, dbms_version={_dbmsVersionId}");
 
                 // TABLE object type
-                var objectTypes = _metadataService.GetObjectTypes();
+                List<ObjectType> objectTypes;
+                using (AddinLogger.BeginScope("metadataService.GetObjectTypes"))
+                    objectTypes = _metadataService.GetObjectTypes();
                 var tableType = objectTypes.FirstOrDefault(o => o.Name == "TABLE");
                 if (tableType == null)
                 {
@@ -77,11 +79,14 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // — MC_PROPERTY_DEF is global after the rename; the only scope key is
                 // (DBMS_VERSION_ID, OBJECT_TYPE_ID), with DBMS_VERSION_ID NULL meaning
                 // "applies to any DBMS").
-                _tablePropertyDefs = _metadataService.GetPropertyDefs(_dbmsVersionId, tableType.Id);
+                using (AddinLogger.BeginScope($"metadataService.GetPropertyDefs(dbms={_dbmsVersionId},obj={tableType.Id})"))
+                    _tablePropertyDefs = _metadataService.GetPropertyDefs(_dbmsVersionId, tableType.Id);
                 Log($"PropertyApplicator: Loaded {_tablePropertyDefs.Count} property definitions for DBMS_VERSION={_dbmsVersionId} TABLE");
 
                 // Model standards — these stay per-config (MC_MODEL_STANDARD.CONFIG_ID).
-                var standards = _metadataService.GetModelStandards(_configId);
+                List<ModelStandard> standards;
+                using (AddinLogger.BeginScope($"metadataService.GetModelStandards(config={_configId})"))
+                    standards = _metadataService.GetModelStandards(_configId);
                 Log($"PropertyApplicator: Raw standards from DB for CONFIG_ID={_configId}: {standards.Count} record(s)");
                 foreach (var s in standards)
                 {
@@ -97,7 +102,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                 Log($"PropertyApplicator: Loaded {_modelStandardMap.Count} model standards (after filter)");
 
                 // Question definitions for this DBMS version + TABLE
-                _questions = _metadataService.GetQuestions(_dbmsVersionId, tableType.Id);
+                using (AddinLogger.BeginScope($"metadataService.GetQuestions(dbms={_dbmsVersionId},obj={tableType.Id})"))
+                    _questions = _metadataService.GetQuestions(_dbmsVersionId, tableType.Id);
                 Log($"PropertyApplicator: Loaded {_questions.Count} question(s) for DBMS_VERSION={_dbmsVersionId} TABLE");
 
                 return true;

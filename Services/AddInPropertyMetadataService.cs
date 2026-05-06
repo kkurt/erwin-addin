@@ -17,6 +17,13 @@ namespace EliteSoft.Erwin.AddIn.Services
     {
         private readonly IBootstrapService _bootstrapService;
 
+        // Static MC table - rows change only when an admin edits the schema, which
+        // never happens during a single addin session. Cost was ~1600ms on the first
+        // hit (EF cold-start) and an MSSQL round-trip on each subsequent hit; this
+        // process-lifetime cache turns repeated reads into a HashSet lookup.
+        private static List<ObjectType> _objectTypesCache;
+        private static readonly object _objectTypesGate = new();
+
         public AddInPropertyMetadataService(IBootstrapService bootstrapService)
         {
             _bootstrapService = bootstrapService ?? throw new ArgumentNullException(nameof(bootstrapService));
@@ -47,8 +54,14 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         public List<ObjectType> GetObjectTypes()
         {
-            using (var context = CreateContext())
-                return context.ObjectTypes.OrderBy(o => o.Name).ToList();
+            if (_objectTypesCache != null) return _objectTypesCache;
+            lock (_objectTypesGate)
+            {
+                if (_objectTypesCache != null) return _objectTypesCache;
+                using (var context = CreateContext())
+                    _objectTypesCache = context.ObjectTypes.OrderBy(o => o.Name).ToList();
+                return _objectTypesCache;
+            }
         }
 
         public List<PropertyDef> GetPropertyDefs(int dbmsVersionId, int objectTypeId, bool erwinMode = false)
