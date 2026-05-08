@@ -42,7 +42,6 @@ namespace EliteSoft.Erwin.AddIn
             this.tabTableProcesses = new System.Windows.Forms.TabPage();
             this.tabApproval = new System.Windows.Forms.TabPage();
             this.tabAlterCompare = new System.Windows.Forms.TabPage();
-            this.tabDebug = new System.Windows.Forms.TabPage();
             // Alter Compare tab — inline UI (Phase 3.G)
             this.lblAlterActiveInfo = new System.Windows.Forms.Label();
             this.lblAlterDialectInfo = new System.Windows.Forms.Label();
@@ -107,12 +106,6 @@ namespace EliteSoft.Erwin.AddIn
             this.lblIsolatedSuffix = new System.Windows.Forms.Label();
 
             // Debug tab
-            this.grpDebugLog = new System.Windows.Forms.GroupBox();
-            this.txtDebugLog = new System.Windows.Forms.TextBox();
-            this.btnCopyLog = new System.Windows.Forms.Button();
-            this.btnClearLog = new System.Windows.Forms.Button();
-            this.txtLogSearch = new System.Windows.Forms.TextBox();
-            this.lblLogSearch = new System.Windows.Forms.Label();
 
             // Bottom
             this.pnlStatusBar = new System.Windows.Forms.Panel();
@@ -126,12 +119,10 @@ namespace EliteSoft.Erwin.AddIn
             this.tabGlossary.SuspendLayout();
             this.tabValidation.SuspendLayout();
             this.tabTableProcesses.SuspendLayout();
-            this.tabDebug.SuspendLayout();
             this.grpTableProcesses.SuspendLayout();
             this.grpModel.SuspendLayout();
             this.grpConfig.SuspendLayout();
             this.grpGlossary.SuspendLayout();
-            this.grpDebugLog.SuspendLayout();
             this.pnlStatusBar.SuspendLayout();
             this.SuspendLayout();
 
@@ -146,7 +137,6 @@ namespace EliteSoft.Erwin.AddIn
             this.tabControl.Controls.Add(this.tabTableProcesses);
             this.tabControl.Controls.Add(this.tabApproval);
             this.tabControl.Controls.Add(this.tabAlterCompare);
-            this.tabControl.Controls.Add(this.tabDebug);
             this.tabControl.Location = new System.Drawing.Point(16, 16);
             this.tabControl.Name = "tabControl";
             this.tabControl.SelectedIndex = 0;
@@ -712,14 +702,6 @@ namespace EliteSoft.Erwin.AddIn
             // ================================================================
             // TAB 6: DEBUG LOG
             // ================================================================
-            this.tabDebug.Controls.Add(this.grpDebugLog);
-            this.tabDebug.Location = new System.Drawing.Point(4, 26);
-            this.tabDebug.Name = "tabDebug";
-            this.tabDebug.Padding = new System.Windows.Forms.Padding(12);
-            this.tabDebug.Size = new System.Drawing.Size(860, 460);
-            this.tabDebug.TabIndex = 4;
-            this.tabDebug.Text = "Debug Log";
-            this.tabDebug.UseVisualStyleBackColor = true;
 
             // ===== DDL Generation tab — redesigned =====
             this.tabApproval.Padding = new System.Windows.Forms.Padding(12);
@@ -758,6 +740,25 @@ namespace EliteSoft.Erwin.AddIn
             this.cmbLeftModel.Font = fontCaption;
             this.cmbLeftModel.Visible = false;
             this.grpDdlSource.Controls.Add(this.cmbLeftModel);
+
+            // Restored 2026-05-07 per user request. Triggers erwin's native
+            // "Review" toolbar button via Win32 (Win32Helper.InvokeToolbarButton)
+            // so the user can reach the built-in Mart compare-with-last-saved
+            // dialog directly from the add-in. The smart-routing Generate DDL
+            // button does NOT make this obsolete - native Review opens erwin's
+            // own diff UI rather than emitting alter DDL.
+            this.btnMartReview = new System.Windows.Forms.Button();
+            this.btnMartReview.Location = new System.Drawing.Point(12, 48);
+            this.btnMartReview.Size = new System.Drawing.Size(110, 24);
+            this.btnMartReview.Text = "Review";
+            this.btnMartReview.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnMartReview.BackColor = System.Drawing.Color.White;
+            this.btnMartReview.ForeColor = clrTextPrimary;
+            this.btnMartReview.FlatAppearance.BorderColor = clrBorder;
+            this.btnMartReview.Font = fontCaption;
+            this.btnMartReview.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnMartReview.Click += new System.EventHandler(this.BtnMartReview_Click);
+            this.grpDdlSource.Controls.Add(this.btnMartReview);
 
             // ----- Group: Target (right side = Mart version OR DB) -----
             this.grpDdlTarget = new System.Windows.Forms.GroupBox();
@@ -919,191 +920,6 @@ namespace EliteSoft.Erwin.AddIn
             this.rtbDDLOutput.ForeColor = System.Drawing.Color.FromArgb(212, 212, 212);
             this.tabApproval.Controls.Add(this.rtbDDLOutput);
 
-            // ===== Debug Log tab — redesigned =====
-            this.grpDebugLog.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right | System.Windows.Forms.AnchorStyles.Bottom;
-            this.grpDebugLog.Location = new System.Drawing.Point(12, 12);
-            this.grpDebugLog.Name = "grpDebugLog";
-            this.grpDebugLog.Size = new System.Drawing.Size(833, 432);
-            this.grpDebugLog.TabIndex = 0;
-            this.grpDebugLog.TabStop = false;
-            this.grpDebugLog.Text = "Debug Output";
-
-            // Row 1 (y=24): log tools on the right.
-            this.btnCopyLog.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right;
-            this.btnCopyLog.Location = new System.Drawing.Point(420, 24);
-            this.btnCopyLog.Size = new System.Drawing.Size(70, 28);
-            this.btnCopyLog.Text = "Copy";
-            this.btnCopyLog.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnCopyLog.BackColor = System.Drawing.Color.White;
-            this.btnCopyLog.ForeColor = clrTextSecondary;
-            this.btnCopyLog.FlatAppearance.BorderColor = clrBorder;
-            this.btnCopyLog.Font = fontCaption;
-            this.btnCopyLog.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnCopyLog.Click += new System.EventHandler(this.BtnCopyLog_Click);
-            this.grpDebugLog.Controls.Add(this.btnCopyLog);
-
-            // Row 2 (y=56): known-working normal-alter path. Also seeds the
-            // GA-captured modelSet pointer as a side effect so subsequent
-            // Mart-Mart spike buttons have something to work with.
-            this.btnInvokePreviewDirect = new System.Windows.Forms.Button();
-            this.btnInvokePreviewDirect.Location = new System.Drawing.Point(16, 56);
-            this.btnInvokePreviewDirect.Size = new System.Drawing.Size(220, 28);
-            this.btnInvokePreviewDirect.Text = "Normal Alter DDL (dirty vs save)";
-            this.btnInvokePreviewDirect.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnInvokePreviewDirect.BackColor = System.Drawing.Color.FromArgb(255, 220, 180);
-            this.btnInvokePreviewDirect.FlatAppearance.BorderColor = clrBorder;
-            this.btnInvokePreviewDirect.Font = fontCaption;
-            this.btnInvokePreviewDirect.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnInvokePreviewDirect.Click += new System.EventHandler(this.BtnInvokePreviewDirect_Click);
-            this.grpDebugLog.Controls.Add(this.btnInvokePreviewDirect);
-
-            this.btnDumpCCState = new System.Windows.Forms.Button();
-            this.btnDumpCCState.Location = new System.Drawing.Point(244, 56);
-            this.btnDumpCCState.Size = new System.Drawing.Size(160, 28);
-            this.btnDumpCCState.Text = "Dump CC State";
-            this.btnDumpCCState.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnDumpCCState.BackColor = System.Drawing.Color.FromArgb(255, 225, 180);
-            this.btnDumpCCState.FlatAppearance.BorderColor = clrBorder;
-            this.btnDumpCCState.Font = fontCaption;
-            this.btnDumpCCState.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnDumpCCState.Click += new System.EventHandler(this.BtnDumpCCState_Click);
-            this.grpDebugLog.Controls.Add(this.btnDumpCCState);
-
-            // --- Visible debug toggle (kept) ---
-            this.btnToggleEdrST = new System.Windows.Forms.Button();
-            this.btnToggleEdrST.Location = new System.Drawing.Point(244, 120);
-            this.btnToggleEdrST.Size = new System.Drawing.Size(200, 28);
-            this.btnToggleEdrST.Text = "Toggle EDR stack-trace";
-            this.btnToggleEdrST.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnToggleEdrST.BackColor = System.Drawing.Color.FromArgb(245, 245, 200);
-            this.btnToggleEdrST.FlatAppearance.BorderColor = clrBorder;
-            this.btnToggleEdrST.Font = fontCaption;
-            this.btnToggleEdrST.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnToggleEdrST.Click += new System.EventHandler(this.BtnToggleEdrST_Click);
-            this.grpDebugLog.Controls.Add(this.btnToggleEdrST);
-
-            // --- Monitor toggle: logs every #32770/Afx dialog creation in
-            // erwin's process. Used to reverse-engineer new wizard flows
-            // (e.g. From-DB Generate DDL). Off by default. ---
-            this.btnToggleMonitor = new System.Windows.Forms.Button();
-            this.btnToggleMonitor.Location = new System.Drawing.Point(454, 120);
-            this.btnToggleMonitor.Size = new System.Drawing.Size(200, 28);
-            this.btnToggleMonitor.Text = "Toggle Dialog Monitor";
-            this.btnToggleMonitor.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnToggleMonitor.BackColor = System.Drawing.Color.FromArgb(245, 245, 200);
-            this.btnToggleMonitor.FlatAppearance.BorderColor = clrBorder;
-            this.btnToggleMonitor.Font = fontCaption;
-            this.btnToggleMonitor.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnToggleMonitor.Click += new System.EventHandler(this.BtnToggleMonitor_Click);
-            this.grpDebugLog.Controls.Add(this.btnToggleMonitor);
-
-            // --- From DB probe: silent RE + CallShowERwinCCWiz hybrid test ---
-            this.btnFromDbProbe = new System.Windows.Forms.Button();
-            this.btnFromDbProbe.Location = new System.Drawing.Point(16, 152);
-            this.btnFromDbProbe.Size = new System.Drawing.Size(280, 28);
-            this.btnFromDbProbe.Text = "From DB Probe: Silent RE + CC Wiz";
-            this.btnFromDbProbe.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnFromDbProbe.BackColor = System.Drawing.Color.FromArgb(200, 230, 255);
-            this.btnFromDbProbe.FlatAppearance.BorderColor = clrBorder;
-            this.btnFromDbProbe.Font = fontCaption;
-            this.btnFromDbProbe.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnFromDbProbe.Click += new System.EventHandler(this.BtnFromDbProbe_Click);
-            this.grpDebugLog.Controls.Add(this.btnFromDbProbe);
-
-            // --- FE Alter Script wizard probe (Architecture 2: no CC, no Apply click) ---
-            this.btnFEAlterProbe = new System.Windows.Forms.Button();
-            this.btnFEAlterProbe.Location = new System.Drawing.Point(304, 152);
-            this.btnFEAlterProbe.Size = new System.Drawing.Size(280, 28);
-            this.btnFEAlterProbe.Text = "FE Alter Script Probe (no clicks)";
-            this.btnFEAlterProbe.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnFEAlterProbe.BackColor = System.Drawing.Color.FromArgb(220, 250, 220);
-            this.btnFEAlterProbe.FlatAppearance.BorderColor = clrBorder;
-            this.btnFEAlterProbe.Font = fontCaption;
-            this.btnFEAlterProbe.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnFEAlterProbe.Click += new System.EventHandler(this.BtnFEAlterProbe_Click);
-            this.grpDebugLog.Controls.Add(this.btnFEAlterProbe);
-
-            // --- ReverseEngineerScript spike: import own DDL, test PUs.Remove ---
-            this.btnREScriptProbe = new System.Windows.Forms.Button();
-            this.btnREScriptProbe.Location = new System.Drawing.Point(16, 184);
-            this.btnREScriptProbe.Size = new System.Drawing.Size(280, 28);
-            this.btnREScriptProbe.Text = "REScript Probe (import + remove test)";
-            this.btnREScriptProbe.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnREScriptProbe.BackColor = System.Drawing.Color.FromArgb(255, 240, 200);
-            this.btnREScriptProbe.FlatAppearance.BorderColor = clrBorder;
-            this.btnREScriptProbe.Font = fontCaption;
-            this.btnREScriptProbe.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnREScriptProbe.Click += new System.EventHandler(this.BtnREScriptProbe_Click);
-            this.grpDebugLog.Controls.Add(this.btnREScriptProbe);
-
-            // --- REScript Cross-Version probe: full pipeline test (clean PU + CC compare + Remove) ---
-            this.btnREScriptXVProbe = new System.Windows.Forms.Button();
-            this.btnREScriptXVProbe.Location = new System.Drawing.Point(304, 184);
-            this.btnREScriptXVProbe.Size = new System.Drawing.Size(280, 28);
-            this.btnREScriptXVProbe.Text = "REScript Cross-Version Probe";
-            this.btnREScriptXVProbe.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnREScriptXVProbe.BackColor = System.Drawing.Color.FromArgb(255, 220, 180);
-            this.btnREScriptXVProbe.FlatAppearance.BorderColor = clrBorder;
-            this.btnREScriptXVProbe.Font = fontCaption;
-            this.btnREScriptXVProbe.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnREScriptXVProbe.Click += new System.EventHandler(this.BtnREScriptXVProbe_Click);
-            this.grpDebugLog.Controls.Add(this.btnREScriptXVProbe);
-
-            // --- Mart-Mart via ELA::OnFE (kept) ---
-            this.btnCallOnFE = new System.Windows.Forms.Button();
-            this.btnCallOnFE.Location = new System.Drawing.Point(244, 88);
-            this.btnCallOnFE.Size = new System.Drawing.Size(220, 28);
-            this.btnCallOnFE.Text = "Mart-Mart via ELA::OnFE";
-            this.btnCallOnFE.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnCallOnFE.BackColor = System.Drawing.Color.FromArgb(160, 210, 255);
-            this.btnCallOnFE.FlatAppearance.BorderColor = clrBorder;
-            this.btnCallOnFE.Font = fontCaption;
-            this.btnCallOnFE.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnCallOnFE.Click += new System.EventHandler(this.BtnCallOnFE_Click);
-            this.grpDebugLog.Controls.Add(this.btnCallOnFE);
-
-            this.btnClearLog.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right;
-            this.btnClearLog.Location = new System.Drawing.Point(498, 24);
-            this.btnClearLog.Size = new System.Drawing.Size(70, 28);
-            this.btnClearLog.Text = "Clear";
-            this.btnClearLog.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnClearLog.BackColor = System.Drawing.Color.White;
-            this.btnClearLog.ForeColor = clrTextSecondary;
-            this.btnClearLog.FlatAppearance.BorderColor = clrBorder;
-            this.btnClearLog.Font = fontCaption;
-            this.btnClearLog.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnClearLog.Click += new System.EventHandler(this.BtnClearLog_Click);
-            this.grpDebugLog.Controls.Add(this.btnClearLog);
-
-            this.lblLogSearch.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right;
-            this.lblLogSearch.AutoSize = true;
-            this.lblLogSearch.Location = new System.Drawing.Point(580, 30);
-            this.lblLogSearch.Text = "Search:";
-            this.lblLogSearch.ForeColor = clrTextSecondary;
-            this.lblLogSearch.Font = fontCaption;
-            this.grpDebugLog.Controls.Add(this.lblLogSearch);
-
-            this.txtLogSearch.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right;
-            this.txtLogSearch.Location = new System.Drawing.Point(630, 26);
-            this.txtLogSearch.Size = new System.Drawing.Size(187, 25);
-            this.txtLogSearch.Font = fontCaption;
-            this.txtLogSearch.PlaceholderText = "Filter log...";
-            this.txtLogSearch.TextChanged += new System.EventHandler(this.TxtLogSearch_TextChanged);
-            this.grpDebugLog.Controls.Add(this.txtLogSearch);
-
-            // Debug log — dark theme
-            this.txtDebugLog.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right | System.Windows.Forms.AnchorStyles.Bottom;
-            this.txtDebugLog.Location = new System.Drawing.Point(16, 60);
-            this.txtDebugLog.Multiline = true;
-            this.txtDebugLog.ReadOnly = true;
-            this.txtDebugLog.ScrollBars = System.Windows.Forms.ScrollBars.Both;
-            this.txtDebugLog.Size = new System.Drawing.Size(801, 360);
-            this.txtDebugLog.Font = new System.Drawing.Font("Consolas", 9F);
-            this.txtDebugLog.BackColor = System.Drawing.Color.FromArgb(30, 30, 30);
-            this.txtDebugLog.ForeColor = System.Drawing.Color.FromArgb(212, 212, 212);
-            this.txtDebugLog.WordWrap = false;
-            this.grpDebugLog.Controls.Add(this.txtDebugLog);
-
             // ================================================================
             // STATUS BAR (Bottom)
             // ================================================================
@@ -1164,7 +980,6 @@ namespace EliteSoft.Erwin.AddIn
             this.tabGlossary.ResumeLayout(false);
             this.tabValidation.ResumeLayout(false);
             this.tabTableProcesses.ResumeLayout(false);
-            this.tabDebug.ResumeLayout(false);
             this.grpTableProcesses.ResumeLayout(false);
             this.grpTableProcesses.PerformLayout();
             this.grpModel.ResumeLayout(false);
@@ -1173,8 +988,6 @@ namespace EliteSoft.Erwin.AddIn
             this.grpConfig.PerformLayout();
             this.grpGlossary.ResumeLayout(false);
             this.grpGlossary.PerformLayout();
-            this.grpDebugLog.ResumeLayout(false);
-            this.grpDebugLog.PerformLayout();
             this.pnlStatusBar.ResumeLayout(false);
             this.ResumeLayout(false);
         }
@@ -1201,6 +1014,7 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.Button btnCopyAlterSql;
         private System.Windows.Forms.Button btnSaveAlterSql;
         private System.Windows.Forms.Label lblOpenedModel;
+        private System.Windows.Forms.Button btnMartReview;
         private System.Windows.Forms.Button btnAlterWizardProd;
         private System.Windows.Forms.ComboBox cmbLeftModel;
         private System.Windows.Forms.ComboBox cmbRightModel;
@@ -1218,7 +1032,6 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.Label lblDDLStatus;
         private System.Windows.Forms.CheckBox chkFilterObjects;
         private System.Windows.Forms.RichTextBox rtbDDLOutput;
-        private System.Windows.Forms.TabPage tabDebug;
 
         private System.Windows.Forms.GroupBox grpModel;
         private System.Windows.Forms.Label lblModelName;
@@ -1255,23 +1068,6 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.CheckBox chkErrorsOnly;
         private System.Windows.Forms.Label lblFilterLabel;
 
-        private System.Windows.Forms.GroupBox grpDebugLog;
-        private System.Windows.Forms.TextBox txtDebugLog;
-        private System.Windows.Forms.Button btnCopyLog;
-        private System.Windows.Forms.Button btnClearLog;
-        private System.Windows.Forms.Button btnDumpCCState;
-        private System.Windows.Forms.Button btnCallOnFE;
-        private System.Windows.Forms.Button btnToggleEdrST;
-        private System.Windows.Forms.Button btnToggleMonitor;
-        private bool _monitorOn = false;
-        private System.Windows.Forms.Button btnFromDbProbe;
-        private System.Windows.Forms.Button btnFEAlterProbe;
-        private System.Windows.Forms.Button btnREScriptProbe;
-        private System.Windows.Forms.Button btnREScriptXVProbe;
-        private bool _edrStOn = false;
-        private System.Windows.Forms.Button btnInvokePreviewDirect;
-        private System.Windows.Forms.TextBox txtLogSearch;
-        private System.Windows.Forms.Label lblLogSearch;
 
         private System.Windows.Forms.TabPage tabTableProcesses;
         private System.Windows.Forms.GroupBox grpTableProcesses;

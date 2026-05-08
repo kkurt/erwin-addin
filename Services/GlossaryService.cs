@@ -155,7 +155,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                         return false;
                     }
 
-                    Log($"GlossaryService: Found mapping ID={mappingId}, table='{_tableName}', connDefId={connectionDefId}, dataSourceId={(dataSourceId?.ToString() ?? "null")}");
+                    AddinLogger.LogDebug($"GlossaryService: Found mapping ID={mappingId}, table='{_tableName}', connDefId={connectionDefId}, dataSourceId={(dataSourceId?.ToString() ?? "null")}");
 
                     // Phase-4: when DATA_SOURCE_ID is set, fetch the named SQL + override
                     // CONNECTION_DEF_ID from DG_DATA_SOURCE. The mapping row's own
@@ -194,7 +194,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     }
 
                                     connectionDefId = dsConnId;
-                                    Log($"GlossaryService: Using DG_DATA_SOURCE '{dsName}' (id={dataSourceId}, connId={dsConnId}, sqlLen={explicitGlossarySql.Length})");
+                                    AddinLogger.LogDebug($"GlossaryService: Using DG_DATA_SOURCE '{dsName}' (id={dataSourceId}, connId={dsConnId}, sqlLen={explicitGlossarySql.Length})");
                                 }
                                 else
                                 {
@@ -287,10 +287,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                         }
                     }
 
-                    Log($"GlossaryService: Match column='{_matchSourceColumn}', {_valueMappings.Count} value mapping(s): [{string.Join(", ", _valueMappings.Select(m => $"{m.sourceCol}→{m.targetType}:{m.targetField}"))}]");
+                    AddinLogger.LogDebug($"GlossaryService: Match column='{_matchSourceColumn}', {_valueMappings.Count} value mapping(s): [{string.Join(", ", _valueMappings.Select(m => $"{m.sourceCol}→{m.targetType}:{m.targetField}"))}]");
                     if (!string.IsNullOrEmpty(_termTypeColumn))
                     {
-                        Log($"GlossaryService: TermType column='{_termTypeColumn}', {_termTypeMap.Count} concept mapping(s): [{string.Join(", ", _termTypeMap.Select(kv => $"{kv.Key}->{kv.Value}"))}]");
+                        AddinLogger.LogDebug($"GlossaryService: TermType column='{_termTypeColumn}', {_termTypeMap.Count} concept mapping(s): [{string.Join(", ", _termTypeMap.Select(kv => $"{kv.Key}->{kv.Value}"))}]");
                     }
 
                     // Step 3: Read CONNECTION_DEF for glossary DB connection
@@ -342,7 +342,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 }
 
                                 glossaryConnStr = BuildConnectionString(glossaryDbType, host, port, dbSchema, username, password);
-                                Log($"GlossaryService: Connection = {glossaryDbType}, {host}/{dbSchema}");
+                                AddinLogger.LogDebug($"GlossaryService: Connection = {glossaryDbType}, {host}/{dbSchema}");
                             }
                         }
                     }

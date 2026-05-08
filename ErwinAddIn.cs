@@ -105,6 +105,32 @@ namespace EliteSoft.Erwin.AddIn
             using var _scope = Services.AddinLogger.BeginScope("ErwinAddIn.Execute");
             try
             {
+                // Suppress WinForms UIA event raise (Button.OnClick,
+                // TextBox.SetFocus, etc) BEFORE any control is created.
+                // erwin r10.10 vendor bug: EM_PSF/OLEACC NULL-deref on UIA
+                // events when active diagram has ~280 entities (verified
+                // 2026-05-05/06/07, three crashes at coreclr.dll+0x36852a).
+                // .NET 10 default raises these events; legacy switch makes
+                // WinForms skip them so the broadcast never reaches erwin's
+                // broken UIA proxy. Idempotent / safe to re-call. Wrapped
+                // in catch because addin must never fail to load over an
+                // accessibility-switch problem.
+                using (Services.AddinLogger.BeginScope("SuppressLegacyUiaEventRaise"))
+                {
+                    try
+                    {
+                        AppContext.SetSwitch("Switch.UseLegacyAccessibility", true);
+                        AppContext.SetSwitch("Switch.System.Windows.Forms.AccessibilityImprovements.UseLegacyAccessibilityFeatures", true);
+                        AppContext.SetSwitch("Switch.System.Windows.Forms.AccessibilityImprovements.UseLegacyAccessibilityFeatures.2", true);
+                        AppContext.SetSwitch("Switch.System.Windows.Forms.AccessibilityImprovements.UseLegacyAccessibilityFeatures.3", true);
+                        AppContext.SetSwitch("Switch.System.Windows.Forms.UseLegacyToolTipDisplay", true);
+                    }
+                    catch (Exception ex)
+                    {
+                        Services.AddinLogger.Log($"AppContext UIA-suppress switch failed (continuing): {ex.GetType().Name}: {ex.Message}");
+                    }
+                }
+
                 using (Services.AddinLogger.BeginScope("EnsureExceptionHandler"))
                     EnsureExceptionHandler();
 

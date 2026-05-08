@@ -93,6 +93,28 @@ namespace EliteSoft.Erwin.AddIn.Services
             GetWindowText(hWnd, sb, maxCount);
         }
 
+        [DllImport("user32.dll")]
+        private static extern bool IsWindowEnabled(IntPtr hWnd);
+
+        /// <summary>
+        /// Returns true when erwin's main window is currently disabled by a
+        /// modal child dialog (Mart Save, Mart Open, Print, Properties, ...).
+        /// Driving COM/SCAPI/NativeBridge actions while a modal is open is a
+        /// known crash trigger on r10.10: the addin's keystroke routes
+        /// (Ctrl+Alt+T) misroute to the modal dialog, and queued WinForms
+        /// accessibility events flush against erwin's broken UIA proxy when
+        /// the work returns - 0xC0000005 in coreclr.dll. Verified by the
+        /// 17:05:29 crash dump on 2026-05-07. Caller is expected to short
+        /// circuit any heavy work and surface a "close the dialog first"
+        /// warning instead.
+        /// </summary>
+        public static bool IsErwinMainWindowBlockedByModal()
+        {
+            IntPtr main = GetErwinMainWindow();
+            if (main == IntPtr.Zero) return false; // Can't determine; let caller proceed.
+            return !IsWindowEnabled(main);
+        }
+
         public static IntPtr GetErwinMainWindow()
         {
             IntPtr result = IntPtr.Zero;

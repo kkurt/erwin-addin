@@ -66,16 +66,41 @@ namespace EliteSoft.Erwin.AddIn.Services
                     File.AppendAllText(FilePath, line);
                 }
             }
-            catch { }
+            catch (Exception ex) { Debug.WriteLine($"AddinLogger.Log failed: {ex.Message}"); }
         }
 
         /// <summary>
-        /// Open a timed scope. Logs <c>&gt;&gt;&gt; name</c> on entry and
-        /// <c>&lt;&lt;&lt; name took Xms</c> on dispose, so phase boundaries
-        /// and durations are explicit in the log.
+        /// Verbose / development-only line. Compiled away in PACKAGED
+        /// builds (and any non-DEBUG configuration). Use this for traces
+        /// that are useful while iterating but pollute the shipped log
+        /// file: per-row glossary parse traces, per-refresh connection
+        /// summaries, per-property COM probes. Real one-line events
+        /// (load completed, validation failure, exception) stay on
+        /// <see cref="Log(string)"/>.
         /// </summary>
-        public static IDisposable BeginScope(string name) => new ScopedTimer(name);
+        [Conditional("DEBUG")]
+        public static void LogDebug(string message) => Log(message);
 
+        /// <summary>
+        /// Open a timed scope. In DEBUG builds logs <c>&gt;&gt;&gt; name</c>
+        /// on entry and <c>&lt;&lt;&lt; name took Xms</c> on dispose so phase
+        /// boundaries and durations are explicit in the log. In PACKAGED
+        /// (production) builds returns a no-op disposable - the 40+ scopes
+        /// across the connect cycle would otherwise dominate the shipped
+        /// log file with noise that is only meaningful during development.
+        /// Real one-line events (load completed, validation failure,
+        /// exception) still go through <see cref="Log(string)"/>.
+        /// </summary>
+        public static IDisposable BeginScope(string name)
+        {
+#if PACKAGED
+            return NoOpScope.Instance;
+#else
+            return new ScopedTimer(name);
+#endif
+        }
+
+#if !PACKAGED
         private sealed class ScopedTimer : IDisposable
         {
             private readonly string _name;
@@ -96,5 +121,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                 Log($"<<< {_name} took {_sw.ElapsedMilliseconds}ms");
             }
         }
+#else
+        private sealed class NoOpScope : IDisposable
+        {
+            public static readonly NoOpScope Instance = new NoOpScope();
+            private NoOpScope() { }
+            public void Dispose() { }
+        }
+#endif
     }
 }
