@@ -1,6 +1,7 @@
 using System;
 using System.Data.Common;
 using System.Text.RegularExpressions;
+using EliteSoft.MetaAdmin.Services;
 
 namespace EliteSoft.Erwin.AddIn.Services
 {
@@ -24,6 +25,15 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         public bool IsInitialized { get; private set; }
         public string LastError { get; private set; }
+        /// <summary>
+        /// Path-shaped value relevant to <see cref="LastError"/>: the raw
+        /// locator when the model was not Mart-bound, or the parsed mart
+        /// path when no CONFIG mapping exists. Empty when LastError is not
+        /// path-related (DB not configured, generic error). Surfaced in
+        /// the UI so admins can copy/paste it into the MODEL_CONFIG_MAPPING
+        /// configuration without retyping.
+        /// </summary>
+        public string LastErrorPath { get; private set; }
 
         /// <summary>CONFIG.ID resolved for the active mart path; -1 when not initialized.</summary>
         public int ActiveConfigId { get; private set; } = -1;
@@ -71,6 +81,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             {
                 IsInitialized = false;
                 LastError = null;
+                LastErrorPath = null;
                 ActiveConfigId = -1;
                 ActiveConfigName = null;
                 CorporateId = null;
@@ -80,7 +91,11 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                 if (!DatabaseService.Instance.IsConfigured)
                 {
-                    LastError = "Database not configured. Please run Admin panel to configure the database connection.";
+                    // MetaShared's RegistrySettingsService picks ONE hive at startup
+                    // based on the registry.scope file next to the addin DLL: "HKLM"
+                    // for Machine installs, otherwise HKCU. Surface that scope in the
+                    // warning so admins know which hive the addin actually probed.
+                    LastError = $"No configuration found in {RegistrySettingsService.CurrentScope}\\Software\\EliteSoft\\MetaRepo\\Bootstrap. Please run the installer to configure the add-in.";
                     Log($"ConfigContext: {LastError}");
                     return false;
                 }
@@ -88,8 +103,9 @@ namespace EliteSoft.Erwin.AddIn.Services
                 string martPath = ParseMartPath(locator);
                 if (string.IsNullOrEmpty(martPath))
                 {
-                    LastError = $"Active model is not on a Mart server (locator='{locator}'). Mart-bound models only.";
-                    Log($"ConfigContext: {LastError}");
+                    LastError = "No configuration is defined for the model you are trying to load. Add-in controls will be disabled.";
+                    LastErrorPath = locator ?? "";
+                    Log($"ConfigContext: not on Mart (locator='{locator}')");
                     return false;
                 }
                 MartPath = martPath;
@@ -100,8 +116,9 @@ namespace EliteSoft.Erwin.AddIn.Services
                 int? configId = LookupConfigId(dbType, martPath);
                 if (configId == null)
                 {
-                    LastError = $"No CONFIG mapped to mart path '{martPath}'. Add a MODEL_CONFIG_MAPPING row in Admin.";
-                    Log($"ConfigContext: {LastError}");
+                    LastError = "No configuration is defined for the model you are trying to load. Add-in controls will be disabled.";
+                    LastErrorPath = martPath;
+                    Log($"ConfigContext: no mapping for martPath='{martPath}'");
                     return false;
                 }
                 ActiveConfigId = configId.Value;

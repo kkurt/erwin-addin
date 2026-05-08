@@ -34,32 +34,26 @@ function Get-MyErwin {
     return Get-Process -Name "erwin" -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $mySessionId }
 }
 
-# erwin DM r10 Add-In discovery requires HKCU entries; HKLM alone is NOT
-# sufficient (empirically verified). On Machine-scope installs the admin writes
-# HKLM + their own HKCU, but every OTHER interactive user has empty HKCU for
-# erwin, so the add-in never appears in their Tools menu. This function
-# mirrors HKLM add-in entries to the CURRENT user's HKCU at watcher startup,
-# making auto-registration first-logon-and-done per user.
+# erwin DM r10 Add-In discovery only reads from HKCU. Watcher runs at every
+# user's logon (Scheduled Task with INTERACTIVE-group trigger on Machine
+# installs, per-user trigger on User installs), so each user gets their
+# HKCU populated exactly once at first logon and self-healed on every
+# subsequent logon if anything wipes it (profile reset, group policy, manual
+# deletion). Hardcoded version 10.10 matches the addin's compile-time target
+# - no version discovery needed (HKLM had stale 9.98 leftovers; HKCU was
+# empty for fresh users; both were unreliable).
+$erwinAddInVersion = "10.10"
 function Register-HKCUAddIn {
     try {
-        $erwinHKLM = "HKLM:\SOFTWARE\erwin\Data Modeler"
-        if (-not (Test-Path $erwinHKLM)) { return }
+        $hkcuAddIn = "HKCU:\SOFTWARE\erwin\Data Modeler\$erwinAddInVersion\Add-Ins\Elite Soft Erwin Addin"
+        if (Test-Path $hkcuAddIn) { return }
 
-        Get-ChildItem $erwinHKLM -ErrorAction SilentlyContinue | ForEach-Object {
-            $version = $_.PSChildName
-            $hklmAddIn = "$($_.PSPath)\Add-Ins\Elite Soft Erwin Addin"
-            if (Test-Path $hklmAddIn) {
-                $hkcuAddIn = "HKCU:\SOFTWARE\erwin\Data Modeler\$version\Add-Ins\Elite Soft Erwin Addin"
-                if (-not (Test-Path $hkcuAddIn)) {
-                    New-Item -Path $hkcuAddIn -Force -ErrorAction Stop | Out-Null
-                    Set-ItemProperty -Path $hkcuAddIn -Name "Menu Identifier" -Value 1 -Type DWord
-                    Set-ItemProperty -Path $hkcuAddIn -Name "ProgID" -Value "EliteSoft.Erwin.AddIn" -Type String
-                    Set-ItemProperty -Path $hkcuAddIn -Name "Invoke Method" -Value "Execute" -Type String
-                    Set-ItemProperty -Path $hkcuAddIn -Name "Invoke EXE" -Value 0 -Type DWord
-                    Write-Log "HKCU add-in entry written for erwin $version (first-time per-user registration)"
-                }
-            }
-        }
+        New-Item -Path $hkcuAddIn -Force -ErrorAction Stop | Out-Null
+        Set-ItemProperty -Path $hkcuAddIn -Name "Menu Identifier" -Value 1 -Type DWord
+        Set-ItemProperty -Path $hkcuAddIn -Name "ProgID" -Value "EliteSoft.Erwin.AddIn" -Type String
+        Set-ItemProperty -Path $hkcuAddIn -Name "Invoke Method" -Value "Execute" -Type String
+        Set-ItemProperty -Path $hkcuAddIn -Name "Invoke EXE" -Value 0 -Type DWord
+        Write-Log "HKCU add-in entry written for erwin $erwinAddInVersion (per-user self-heal)"
     } catch {
         Write-Log "HKCU add-in registration failed: $($_.Exception.Message)"
     }

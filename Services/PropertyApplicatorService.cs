@@ -6,6 +6,7 @@ using EliteSoft.MetaAdmin.Shared.Data;
 using EliteSoft.MetaAdmin.Shared.Data.Entities;
 using EliteSoft.MetaAdmin.Shared.Services;
 using EliteSoft.MetaAdmin.Shared.Models;
+using EliteSoft.MetaAdmin.Services;
 using EliteSoft.Erwin.AddIn.Forms;
 
 namespace EliteSoft.Erwin.AddIn.Services

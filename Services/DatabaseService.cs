@@ -5,6 +5,7 @@ using Npgsql;
 using Oracle.ManagedDataAccess.Client;
 using EliteSoft.MetaAdmin.Shared.Models;
 using EliteSoft.MetaAdmin.Shared.Services;
+using EliteSoft.MetaAdmin.Services;
 
 namespace EliteSoft.Erwin.AddIn.Services
 {

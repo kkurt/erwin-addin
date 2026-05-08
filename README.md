@@ -42,7 +42,7 @@ erwin-addin/
 │   ├── PropertyApplicatorService.cs     # Property uygulayıcı
 │   ├── UdpDefinitionService.cs / UdpRuntimeService.cs / UdpDependencyService.cs / UdpValidationEngine.cs
 │   ├── NamingStandardService.cs / NamingValidationEngine.cs
-│   ├── CorporateContextService.cs / RegistryBootstrapService.cs / PasswordEncryptionService.cs
+│   ├── CorporateContextService.cs                # Bootstrap reads: MetaShared.RegistryBootstrapService
 │   ├── AddInPropertyMetadataService.cs
 │   └── Win32Helper.cs                   # Win32/IAccessible yardımcıları
 ├── tools/

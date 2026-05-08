@@ -5,6 +5,7 @@ using System.Linq;
 using EliteSoft.MetaAdmin.Shared.Data;
 using EliteSoft.MetaAdmin.Shared.Data.Entities;
 using EliteSoft.MetaAdmin.Shared.Models;
+using EliteSoft.MetaAdmin.Services;
 using Microsoft.EntityFrameworkCore;
 
 namespace EliteSoft.Erwin.AddIn.Services

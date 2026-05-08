@@ -6,6 +6,7 @@ using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using EliteSoft.Erwin.AddIn.Services;
+using EliteSoft.MetaAdmin.Services;
 
 namespace EliteSoft.Erwin.AddIn
 {
@@ -423,13 +424,43 @@ namespace EliteSoft.Erwin.AddIn
                 // mart-bound or has no CONFIG mapping, so they can still use the
                 // non-validation features (DDL compare/version tabs, debug log, etc).
                 string reason = ctx.LastError
-                    ?? "No CONFIG mapped to this model's mart path.\nPlease run Admin panel first.";
-                Log($"Config not resolved: {reason} -- running in degraded mode (no validation/glossary).");
-                UpdateStatus("Connected (no config — validation disabled).", Color.DarkOrange);
+                    ?? "No configuration is defined for the model you are trying to load. Add-in controls will be disabled.";
+                string contextPath = ctx.LastErrorPath ?? "";
+                Log($"Config not resolved: {reason} (path='{contextPath}') -- running in degraded mode (no validation/glossary).");
+                UpdateStatus("Connected (no config — add-in controls disabled).", Color.DarkOrange);
                 btnValidateAll.Enabled = false;
+                // In degraded mode the active PU has no Mart locator. Calling
+                // dynamic dispatch SCAPI methods (PropertyBag().Value("Locator"),
+                // FEModel_DDL, ...) on a non-Mart PU triggers a NULL deref deep
+                // in EM_GDM/mfc140 whose IDispatchInvoke unwind crashes the host
+                // process (verified 2026-05-08 13:48 against a PowerDesigner-
+                // imported local .erwin file). Disable every action button that
+                // would touch SCAPI on the active PU, so the user can't trigger
+                // the AV from the UI. The form stays open for non-action surfaces
+                // (General tab, log file link, version compare for OTHER models).
+                btnAlterWizardProd.Enabled = false;
+                btnMartReview.Enabled = false;
+                lblDDLStatus.Text = "Disabled until a Mart-bound model with CONFIG mapping is loaded.";
+                lblDDLStatus.ForeColor = Color.DarkOrange;
                 using (AddinLogger.BeginScope("UpdateGeneralTab(degraded)"))
                     UpdateGeneralTab();
-                ErwinAddIn.ShowTopMostMessage(reason, "Configuration Warning", isError: false);
+                // Defer the modal dialog so Form.Load can finish and Show()
+                // can return - calling ShowDialog directly here would nest a
+                // modal pump inside the parent form's Load handler, the
+                // ModelConfigForm window would never finish painting, and
+                // the addin would appear "not loaded" with no visible
+                // warning. BeginInvoke lands the call back on the UI thread
+                // after the current message completes, by which time the
+                // form is fully shown and can host the modal child.
+                try
+                {
+                    BeginInvoke(new Action(() =>
+                    {
+                        try { ShowConfigWarningDialog(reason, contextPath); }
+                        catch (Exception ex) { Log($"ShowConfigWarningDialog (deferred) failed: {ex.Message}"); }
+                    }));
+                }
+                catch (Exception ex) { Log($"BeginInvoke for config warning failed: {ex.Message}"); }
                 return;
             }
             Log($"Config: {ctx.ActiveConfigName} (ID={ctx.ActiveConfigId}), corporate='{ctx.CorporateName ?? "(none)"}', mart='{ctx.MartPath}'");
@@ -717,6 +748,134 @@ namespace EliteSoft.Erwin.AddIn
             _lblRegistryValue.Text = "(not loaded)";
             _lblWarningsValue.Text = "(none)";
             _lblWarningsValue.ForeColor = Color.FromArgb(120, 120, 120);
+        }
+
+        /// <summary>
+        /// Show a friendly configuration-warning dialog with the relevant
+        /// path (locator or mart path) presented in a read-only textbox so
+        /// the admin can copy/paste it straight into the Admin panel's
+        /// MODEL_CONFIG_MAPPING configuration. Replaces the stock
+        /// MessageBox path that rendered the URI inline and was hard to
+        /// select. Shown TopMost so it surfaces over the erwin host.
+        /// </summary>
+        private void ShowConfigWarningDialog(string reason, string path)
+        {
+            try
+            {
+                using var dlg = new Form
+                {
+                    Text = "Configuration Warning",
+                    StartPosition = FormStartPosition.CenterScreen,
+                    FormBorderStyle = FormBorderStyle.FixedDialog,
+                    MaximizeBox = false,
+                    MinimizeBox = false,
+                    ShowInTaskbar = false,
+                    TopMost = true,
+                    ClientSize = new Size(560, 240),
+                    BackColor = Color.White,
+                    Padding = new Padding(20),
+                };
+
+                // Warning icon (SystemIcons.Warning) + heading row.
+                var iconBox = new PictureBox
+                {
+                    Image = SystemIcons.Warning.ToBitmap(),
+                    SizeMode = PictureBoxSizeMode.AutoSize,
+                    Location = new Point(20, 20),
+                };
+                dlg.Controls.Add(iconBox);
+
+                var lblHeading = new Label
+                {
+                    Text = "Add-in loaded with controls disabled",
+                    Font = new Font("Segoe UI", 11f, FontStyle.Bold),
+                    ForeColor = Color.FromArgb(60, 60, 60),
+                    AutoSize = true,
+                    Location = new Point(70, 22),
+                };
+                dlg.Controls.Add(lblHeading);
+
+                var lblReason = new Label
+                {
+                    Text = reason,
+                    Font = new Font("Segoe UI", 9.5f),
+                    ForeColor = Color.FromArgb(60, 60, 60),
+                    AutoSize = false,
+                    Size = new Size(460, 60),
+                    Location = new Point(70, 50),
+                };
+                dlg.Controls.Add(lblReason);
+
+                // Path label + selectable read-only textbox + Copy button.
+                var lblPathHdr = new Label
+                {
+                    Text = "Path (copy this into Admin to register the model):",
+                    Font = new Font("Segoe UI", 9f, FontStyle.Bold),
+                    ForeColor = Color.FromArgb(80, 80, 80),
+                    AutoSize = true,
+                    Location = new Point(20, 130),
+                };
+                dlg.Controls.Add(lblPathHdr);
+
+                var txtPath = new TextBox
+                {
+                    Text = path ?? "",
+                    Font = new Font("Consolas", 9.5f),
+                    ReadOnly = true,
+                    BorderStyle = BorderStyle.FixedSingle,
+                    BackColor = Color.FromArgb(248, 248, 248),
+                    Location = new Point(20, 152),
+                    Size = new Size(430, 24),
+                };
+                txtPath.GotFocus += (s, e) => txtPath.SelectAll();
+                dlg.Controls.Add(txtPath);
+
+                var btnCopy = new Button
+                {
+                    Text = "Copy",
+                    Location = new Point(456, 150),
+                    Size = new Size(80, 28),
+                    FlatStyle = FlatStyle.Flat,
+                    BackColor = Color.White,
+                };
+                btnCopy.FlatAppearance.BorderColor = Color.FromArgb(180, 180, 180);
+                btnCopy.Click += (s, e) =>
+                {
+                    try
+                    {
+                        if (!string.IsNullOrEmpty(txtPath.Text))
+                            Clipboard.SetText(txtPath.Text);
+                        btnCopy.Text = "Copied";
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"ShowConfigWarningDialog Copy failed: {ex.Message}");
+                    }
+                };
+                dlg.Controls.Add(btnCopy);
+
+                var btnOk = new Button
+                {
+                    Text = "OK",
+                    DialogResult = DialogResult.OK,
+                    Location = new Point(456, 195),
+                    Size = new Size(80, 30),
+                    FlatStyle = FlatStyle.Flat,
+                    BackColor = Color.FromArgb(0, 120, 212),
+                    ForeColor = Color.White,
+                    Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+                };
+                btnOk.FlatAppearance.BorderColor = Color.FromArgb(0, 100, 180);
+                dlg.Controls.Add(btnOk);
+                dlg.AcceptButton = btnOk;
+
+                dlg.ShowDialog(this);
+            }
+            catch (Exception ex)
+            {
+                Log($"ShowConfigWarningDialog failed: {ex.Message} - falling back to MessageBox");
+                ErwinAddIn.ShowTopMostMessage($"{reason}\n\n{path}", "Configuration Warning", isError: false);
+            }
         }
 
         /// <summary>
@@ -2111,6 +2270,18 @@ namespace EliteSoft.Erwin.AddIn
         /// </summary>
         private void BtnMartReview_Click(object sender, EventArgs e)
         {
+            // ConfigContext guard - mirrors BtnAlterWizardProd_Click. Native
+            // Review on a non-Mart PU triggers the same EM_GDM null-deref AV.
+            if (!ConfigContextService.Instance.IsInitialized)
+            {
+                ErwinAddIn.ShowTopMostMessage(
+                    "No configuration is defined for the model you are trying to load. Add-in controls will be disabled.",
+                    "Review",
+                    isError: false);
+                Log("[REVIEW] Aborted: ConfigContext not initialized (no Mart mapping).");
+                return;
+            }
+
             if (Services.Win32Helper.IsErwinMainWindowBlockedByModal())
             {
                 ErwinAddIn.ShowTopMostMessage(
@@ -2147,6 +2318,25 @@ namespace EliteSoft.Erwin.AddIn
             if (!_isConnected || _currentModel == null)
             {
                 ErwinAddIn.ShowTopMostMessage("No model connected.", "Generate DDL");
+                return;
+            }
+
+            // ConfigContext guard. The Generate DDL flow does dynamic SCAPI
+            // dispatch on the active PU (PropertyBag().Value("Locator"),
+            // FEModel_DDL, ...). On a non-Mart-bound PU (e.g. PowerDesigner-
+            // imported local .erwin) those calls crash deep in EM_GDM via
+            // IDispatchInvoke unwind. The ConnectToModel degraded path
+            // already disables btnAlterWizardProd in this case; this is a
+            // defensive belt - if anything ever re-enables the button while
+            // the context is still unresolved we still bail before touching
+            // SCAPI. Verified host crash 2026-05-08 13:48.
+            if (!ConfigContextService.Instance.IsInitialized)
+            {
+                ErwinAddIn.ShowTopMostMessage(
+                    "No configuration is defined for the model you are trying to load. Add-in controls will be disabled.",
+                    "Generate DDL",
+                    isError: false);
+                Log("[ROUTE] Aborted: ConfigContext not initialized (no Mart mapping).");
                 return;
             }
 
