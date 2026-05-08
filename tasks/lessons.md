@@ -42,6 +42,184 @@ masks the real failure that triggered the dispose in the first place.
 already has the guard. Any new lifecycle-event subscription on a long-lived
 form follows the same pattern.
 
+## 2026-05-07: Debug Log tab retired; use the file log
+
+**Rule:** there is no in-form Debug Log tab anymore. All log output goes to
+`%TEMP%\erwin-addin-debug.log` (path is also exposed as
+`AddinLogger.FilePath` and as a clickable "Log file" link on the General
+tab). New diagnostic surfaces must follow the same shape: never stream
+log lines into a WinForms control.
+
+**Why:** the live-streaming TextBox was the source of the 17:26:32 host
+crash (every `AppendText` raised a UIA TextChanged event that NULL-derefed
+erwin's UIA proxy, see the rule below). Replacing the streaming with a
+"Reload from file" button removed the timer-hot-path AppendText calls
+but the tab still hosted ten dev-only spike buttons (DumpCC State,
+Normal Alter DDL, Mart-Mart via OnFE, EDR stack-trace toggle, From-DB
+probe, REScript probe, REScript cross-version probe, FE alter probe,
+Dialog Monitor, Generate DDL via Invoke). Those were never meant to ship
+and crowded the layout. The full tab + handlers + Designer entries +
+service-layer no-longer-called helpers were removed; the underlying
+NativeBridge entry points stay so any future production button can wire
+straight into them again.
+
+**How to apply:** new troubleshooting features go into `AddinLogger.Log`
+(production-visible) or `AddinLogger.LogDebug` ([Conditional("DEBUG")],
+DEBUG-only). Scope timing uses `AddinLogger.BeginScope` which is a no-op
+under PACKAGED so the shipped log is event-only, not trace-by-trace.
+
+## 2026-05-07: Never write to a WinForms TextBox from the timer hot path on r10.10
+
+**Rule:** the add-in's `Log()` family must NEVER call `TextBoxBase.AppendText`,
+`TextBox.Text = ...`, or any other write that ends up raising a WinForms
+UIA event - especially not from anything reachable on
+`ValidationCoordinatorService.WindowMonitorTimer_Tick`. File is the only
+canonical sink. The Debug Log tab now reads from the on-disk log via an
+explicit "Reload" button (`BtnReloadLog_Click` -> `ReloadDebugLogFromFile`).
+
+**Why:** verified crash at 2026-05-07 17:26:32, on a 31-table model (so
+the 280-entity diagram threshold is NOT the trigger). The .NET Runtime
+1026 stack pinned the cause:
+```
+UiaRaiseAutomationEvent
+AccessibleObject.RaiseAutomationEvent
+TextBoxBase.AppendText(string)
+ModelConfigForm.Log(string)
+ValidationCoordinatorService.Log
+ValidationCoordinatorService.WindowMonitorTimer_Tick
+```
+Every `Log(...)` call appended one line to `txtDebugLog`; that
+`AppendText` raised a UIA `TextChanged` event; the broadcast crossed into
+erwin r10.10's broken EM_PSF/OLEACC UIA proxy and NULL-derefed at
+`coreclr.dll + 0x36852a`. The host process was killed mid-tick. The
+`ValidationCoordinatorService` timer fires multiple times per second on
+mouse hover paths, so the trigger was not a specific user action - just
+"any tick happened to log something".
+
+**`AppContext.SetSwitch` does NOT help.** The legacy-accessibility
+switches (`Switch.UseLegacyAccessibility`,
+`Switch.System.Windows.Forms.AccessibilityImprovements.UseLegacyAccessibilityFeatures`,
+plus `.2` and `.3` variants) were tried 2026-05-07 inside
+`ErwinAddIn.Execute` and are still wired there as defense-in-depth, but
+the same crash reproduced after they were set. .NET 10 WinForms ignores
+them for `UiaRaiseAutomationEvent` calls. Don't trust those switches as
+a sole mitigation.
+
+**How to apply:** `Log()` writes to `_addinLogPath` (file) only and
+keeps an in-memory `_fullLogText`. There is no streaming path into the
+TextBox. `BtnReloadLog_Click` rebuilds the TextBox content with a single
+`Text = ...` assignment (one UIA event, user-initiated, while no timer
+is competing with it - acceptable risk). Any future "live tail" features
+for the Debug Log tab must follow the same pattern: never write per-Log
+call, only on user demand. Equivalent rule applies to RichTextBox,
+ListBox, ListView, and DataGridView - if you'd be tempted to update them
+from a timer, route the data through a file/buffer instead and let the
+user explicitly refresh.
+
+## 2026-05-07: Block heavy add-in actions while a modal erwin dialog is open
+
+**Rule:** any add-in action that drives the host process via `NativeBridge`,
+synthetic keystrokes (`Ctrl+Alt+T`), `SCAPI` mutations, or anything that
+spans more than a few seconds on the UI thread MUST short-circuit when
+erwin's main window is disabled by a modal dialog. Use
+`Services.Win32Helper.IsErwinMainWindowBlockedByModal()` and surface a
+"close the dialog first" warning instead of proceeding.
+
+**Why:** verified crash on 2026-05-07 17:05:29. User had Mart Save open,
+switched to add-in, clicked Generate DDL. Sequence:
+1. `BtnAlterWizardProd_Click` set `btnAlterWizardProd.Enabled = false`,
+2. `NativeBridge.AutoOpenAlterScriptWizard` posted `Ctrl+Alt+T` which the
+   modal dialog absorbed (it had focus, not erwin main),
+3. `NativeBridge` polled for the wizard for 15 seconds and returned false,
+4. Click handler resumed and set `btnAlterWizardProd.Enabled = true`,
+5. WinForms 10 raised `UiaRaiseAutomationPropertyChangedEvent` for the
+   Enabled-property change,
+6. erwin's broken EM_PSF/OLEACC UIA proxy (active diagram ~280 entities,
+   memory `reference_em_psf_uia_av_big_model.md`) NULL-derefed inside
+   `coreclr.dll` at offset `0x36852a` — `0xC0000005`, process killed.
+
+Three crashes in the same session at the same offset confirmed UIA + the
+host's vendor bug, not a CLR or add-in bug. The trigger was concurrent
+modal + synthetic keystroke; the underlying NULL deref is the vendor's.
+
+**How to apply:** `Services/Win32Helper.cs:IsErwinMainWindowBlockedByModal`
+returns `!IsWindowEnabled(GetErwinMainWindow())`. Both
+`BtnAlterWizardProd_Click` and `BtnMartReview_Click` now check it as the
+very first line and bail with a Turkish warning. Apply the same guard to
+any future button that drives synchronous host work; cheap UI reads (combo
+box updates, validation list refresh) do not need it.
+
+## 2026-05-07: Suppress WinForms UIA event raise on add-in load
+
+**Rule:** the very first thing `ErwinAddIn.Execute` does is call
+`AppContext.SetSwitch` to flip WinForms accessibility into legacy mode.
+This must happen before any `Control` is constructed.
+
+**Why:** even with the modal-dialog guard above, any unrelated UIA event
+from add-in form controls (Button click, TextBox focus,
+PropertyChanged...) is a crash trigger when the host has a broken UIA
+proxy on a 280-entity diagram. The legacy-accessibility switches tell
+WinForms to skip the `UiaRaise*` calls entirely, so the broadcast never
+reaches erwin's broken proxy. NVDA/JAWS support for the add-in's own
+controls regresses slightly, but the alternative is the host process
+dying and the user losing unsaved work. Defense-in-depth alongside the
+modal guard.
+
+**How to apply:** `ErwinAddIn.Execute` line ~108. Five switches set inside
+a try/catch (the add-in must never fail to load because of an
+accessibility-switch problem). `Services.AddinLogger` records any failure
+but proceeds. Idempotent; safe to re-execute on every Execute call.
+
+## 2026-05-07: Service-load failures must surface to the user, not just the log
+
+**Rule:** when a startup-path data service (`NamingStandardService`,
+`GlossaryService`, `PredefinedColumnService`, `DomainDefService`, ...) returns
+`IsLoaded=false`, the failure reason must reach a visible UI surface, not only
+the debug log. Plumb it through `ModelConfigForm.AddConnectWarning` so it
+renders on the General tab Warnings row.
+
+**Why:** `MC_NAMING_STANDARD.OBJECT_TYPE` was renamed to `OBJECT_TYPE_ID` in
+admin's 2026-05-04 refactor. The addin's `LoadStandards` query still asked for
+the old column and threw `Invalid column name 'OBJECT_TYPE'`. The service
+caught the exception, set `_lastError`, returned `false`, and `Log()`'d a
+single line. The form's `LoadNamingStandards` re-logged the same message and
+moved on. Result: silent regression, no popup, no status, naming validation
+silently dead for a week. Detected only when the user happened to grep the
+debug log. The DB-shape contract changes more often than any other surface
+since admin and addin schemas evolve together; this UI contract must be
+load-bearing.
+
+**How to apply:** all four loaders in `InitializeValidationService`
+(`LoadGlossary`/`LoadPredefinedColumns`/`LoadDomainDefs`/`LoadNamingStandards`)
+now call `AddConnectWarning($"<service>: <reason>")` on `IsLoaded=false` and
+on caught exceptions. `_connectWarnings.Clear()` resets at the start of every
+connect cycle. Future startup-path services follow the same pattern; the
+Warnings row is the canonical spot for "thing X silently failed to load".
+
+## 2026-05-07: Sync init failures must degrade, never ForceClose
+
+**Rule:** when a step on the synchronous startup path (Form.Load handlers, COM
+session init, ConfigContext resolution) hits a non-fatal failure, surface the
+warning and return cleanly. Do not call `ForceClose()` / `Close()` from inside
+that path.
+
+**Why:** `ModelConfigForm` is shown via `_activeForm.Show()` from
+`ErwinAddIn.Execute()`. `Show()` pumps `Load -> LoadOpenModels ->
+ConnectToModel -> InitializeValidationService` synchronously. Calling
+`ForceClose()` mid-pump disposes the form before `Show()` returns; the
+post-Load processing then raises `ObjectDisposedException`, which `Execute()`
+re-reports as "Add-In Error: Cannot access a disposed object" - the real
+reason (e.g. local-file model, no MODEL_CONFIG_MAPPING row) is lost. Verified
+against a PowerDesigner-imported local `.erwin` file on 2026-05-07.
+
+**How to apply:** in `ModelConfigForm.InitializeValidationService` the
+ConfigContext-failed branch now returns after showing a warning, sets
+`UpdateStatus("Connected (no config - validation disabled)")` and lets
+`UpdateGeneralTab` render the reason inline. Validation services stay
+uninitialized; non-validation tabs (DDL compare, debug log, version compare)
+remain usable. Same pattern applies to any future startup-path failure: log,
+inline status, no Dispose.
+
 ## 2026-05-05: MART_PATH stem must match admin's parser exactly
 
 **Rule:** when extracting the mart path from a locator, use the same regex
