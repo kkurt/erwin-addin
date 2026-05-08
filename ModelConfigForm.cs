@@ -2215,8 +2215,30 @@ namespace EliteSoft.Erwin.AddIn
                         // the proven flash-free path used by Debug Log's
                         // "Normal Alter DDL (dirty vs save)" button.
                         log($"[ROUTE] Same version v{v} on both sides - OnFE fast path (dirty vs last saved, no flashes)");
-                        script = await System.Threading.Tasks.Task.Run(() =>
-                            Services.NativeBridgeService.GenerateAlterDdl(log));
+                        // Splash: the Next-loop + GA detour takes ~1-3 s on
+                        // Mart-bound models; without the overlay the user
+                        // sees a frozen ribbon and may double-click. Cross-
+                        // version + From-DB paths already use the same
+                        // ShowBusyOverlay helper - we just hadn't wired it
+                        // into the fast path. Restored 2026-05-08.
+                        var fastOverlay = ShowBusyOverlay("Generating DDL, please wait...");
+                        try
+                        {
+                            script = await System.Threading.Tasks.Task.Run(() =>
+                                Services.NativeBridgeService.GenerateAlterDdl(log));
+                        }
+                        finally
+                        {
+                            try
+                            {
+                                if (fastOverlay != null && !fastOverlay.IsDisposed)
+                                {
+                                    if (InvokeRequired) Invoke(new Action(() => { fastOverlay.Close(); fastOverlay.Dispose(); }));
+                                    else { fastOverlay.Close(); fastOverlay.Dispose(); }
+                                }
+                            }
+                            catch (Exception ex) { log($"[ROUTE] fast-path overlay close err: {ex.Message}"); }
+                        }
                     }
                     else
                     {

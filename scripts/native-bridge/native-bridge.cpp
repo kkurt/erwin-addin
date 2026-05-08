@@ -341,6 +341,13 @@ static volatile LONG   g_feCallCount          = 0;
 // via ConsumeLastCapturedDdl() which atomically swaps pointer out.
 static CRITICAL_SECTION g_ddlLock;
 static char*           g_lastCapturedDdl = nullptr;   // protected by g_ddlLock
+// Set by GenerateAlterHook when GenerateAlterScript completed but the
+// returned vector was empty (no actionable schema diff). The IPS-CALL
+// Next-loop polls this flag so it can break out of the loop and IDCANCEL
+// the hidden wizard BEFORE the wizard's own Generate button fires the
+// "No schema to generate" modal popup. Reset to 0 at the start of every
+// CallInvokePreviewOnCaptured run.
+static volatile LONG   g_gaFiredEmpty = 0;
 static bool            g_ddlLockInited   = false;
 
 static void EnsureDdlLockInit() {
@@ -640,7 +647,8 @@ static int __cdecl GenerateAlterHook(void* self, void* modelSet, void* actionSum
                 LogLine("[GA] stored captured DDL (%zu chars) for managed consumer", strlen(ddl));
                 StoreCapturedDdl(ddl);   // takes ownership
             } else {
-                LogLine("[GA] ConcatScriptVector returned null - not storing");
+                LogLine("[GA] ConcatScriptVector returned null - flagging empty (IPS-CALL will exit early)");
+                InterlockedExchange(&g_gaFiredEmpty, 1);
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             LogLine("[GA] GetScript SEH 0x%08lX", GetExceptionCode());
@@ -1717,6 +1725,46 @@ static bool LooksLikeAlterScriptWizard(HWND hwnd) {
             strstr(title, "Schema Generation") != nullptr);
 }
 
+// Dismisses erwin's "No schema to generate" OK-only popup that fires when
+// the wizard's Generate button completes against an empty action summary.
+// Without this dismiss the popup blocks erwin's wizard-finish path; a plain
+// IDCANCEL on the wizard does NOT count as a finish, leaving erwin's
+// "alter wizard active" global flag set and the next Ctrl+Alt+T silently
+// yutuluyor for ~30+ seconds afterward (verified 2026-05-08 second click
+// timeout 15s after empty-result first click). Targets popups whose title
+// is "erwin Data Modeler" and whose ONLY button is OK / Tamam - that
+// pattern is unique to alert-style messages, so this won't accidentally
+// dismiss Yes/No prompts (those go through DismissDiagramSelectionPopup).
+static bool DismissOkOnlyPopup() {
+    auto dialogs = EnumerateVisibleDialogs();
+    for (HWND popup : dialogs) {
+        wchar_t title[256] = {0};
+        GetWindowTextW(popup, title, 255);
+        if (wcsstr(title, L"erwin Data Modeler") == nullptr) continue;
+        // Count buttons - skip if more than one (would be Yes/No or similar).
+        int buttonCount = 0;
+        HWND okBtn = nullptr;
+        HWND child = nullptr;
+        while ((child = FindWindowExW(popup, child, L"Button", nullptr)) != nullptr) {
+            ++buttonCount;
+            wchar_t btxt[64] = {0};
+            GetWindowTextW(child, btxt, 63);
+            if (!okBtn && (
+                wcsstr(btxt, L"OK") || wcsstr(btxt, L"Ok") ||
+                wcsstr(btxt, L"&OK") || wcsstr(btxt, L"Tamam") ||
+                wcsstr(btxt, L"&Tamam"))) {
+                okBtn = child;
+            }
+        }
+        if (buttonCount != 1 || !okBtn) continue;
+        LogLine("[POPUP-DISMISS] OK-only popup hwnd=%p title='%ls' (clicking OK)", popup, title);
+        PostMessage(popup, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), (LPARAM)okBtn);
+        PostMessage(okBtn, BM_CLICK, 0, 0);
+        return true;
+    }
+    return false;
+}
+
 // Dismisses erwin's "Use current diagram selections? You have N entity
 // selected" popup that the Object Filter wizard page raises when the user
 // has table(s) selected on the active diagram. Manual flow: click No to
@@ -2062,6 +2110,8 @@ extern "C" __declspec(dllexport) const char* __cdecl CallInvokePreviewOnCaptured
     EnterCriticalSection(&g_ddlLock);
     if (g_lastCapturedDdl) { free(g_lastCapturedDdl); g_lastCapturedDdl = nullptr; }
     LeaveCriticalSection(&g_ddlLock);
+    // Reset the empty-fire flag - GA detour sets it on this run only.
+    InterlockedExchange(&g_gaFiredEmpty, 0);
 
     LogLine("[IPS-CALL] driving wizard to Preview via WM_COMMAND Next-loop (FEWPO=%p)", self);
     // 2026-05-08: replaced direct g_directInvokePreview(self) call. The MSVC
@@ -2084,6 +2134,7 @@ extern "C" __declspec(dllexport) const char* __cdecl CallInvokePreviewOnCaptured
     const int CMD_FE_WIZARD_NEXT = 1766;
     const int MAX_PAGES = 8;
     int posted = 0;
+    bool emptyConfirmed = false;
     for (int page = 0; page < MAX_PAGES; ++page) {
         // GA detour writes g_lastCapturedDdl as soon as a non-empty alter
         // script is produced. Check after each Next so we exit early on
@@ -2094,6 +2145,18 @@ extern "C" __declspec(dllexport) const char* __cdecl CallInvokePreviewOnCaptured
         LeaveCriticalSection(&g_ddlLock);
         if (haveDdl) {
             LogLine("[IPS-CALL] DDL captured after %d Next click(s)", page);
+            break;
+        }
+        // GA fired with an empty vector (no actionable diff). Stop the
+        // Next-loop immediately - if we keep clicking Next the wizard's
+        // own Generate button eventually fires "No schema to generate"
+        // modal popup which leaves erwin's internal alter-wizard state
+        // stuck and blocks the next Ctrl+Alt+T (verified 2026-05-08:
+        // OPEN-WIZ timeout 15s on the second Generate DDL click after a
+        // no-change first click).
+        if (InterlockedCompareExchange(&g_gaFiredEmpty, 0, 0) != 0) {
+            LogLine("[IPS-CALL] GA fired empty vector - exiting Next-loop early to avoid 'No schema to generate' popup");
+            emptyConfirmed = true;
             break;
         }
 
@@ -2124,18 +2187,57 @@ extern "C" __declspec(dllexport) const char* __cdecl CallInvokePreviewOnCaptured
         }
         DismissDiagramSelectionPopup();
     }
-    LogLine("[IPS-CALL] Next-loop done (posted=%d)", posted);
+    LogLine("[IPS-CALL] Next-loop done (posted=%d, emptyConfirmed=%d)", posted, (int)emptyConfirmed);
 
-    // Final settle: GA may fire on the Preview page initialization, which
-    // can lag the last Next click by a few hundred ms.
-    Sleep(400);
-    MSG settleMsg;
-    while (PeekMessageW(&settleMsg, nullptr, 0, 0, PM_REMOVE)) {
-        TranslateMessage(&settleMsg);
-        DispatchMessageW(&settleMsg);
+    if (emptyConfirmed) {
+        // Drive erwin's wizard-finish state machine to completion. Plain
+        // IDCANCEL on an alter-script wizard that captured an empty result
+        // is NOT enough - erwin keeps an internal "alter wizard active"
+        // flag set, and the next Ctrl+Alt+T is silently dropped for ~30 s
+        // (verified 2026-05-08 OPEN-WIZ 15 s timeout twice in a row after
+        // an empty-result first click). The natural manual flow that
+        // clears the flag is: user clicks Generate -> wizard fires
+        // "No schema to generate" alert -> user clicks OK -> wizard
+        // closes itself. We replicate that here: post the Generate
+        // command (CMD_FE_WIZARD_GENERATE = 1760), then probe for the
+        // OK-only popup and auto-dismiss it. The wizard's own finish path
+        // releases the flag.
+        const int CMD_FE_WIZARD_GENERATE = 1760;
+        LogLine("[IPS-CALL] empty path: posting CMD_FE_WIZARD_GENERATE (%d) to fire 'No schema' alert", CMD_FE_WIZARD_GENERATE);
+        PostMessage(wizard, WM_COMMAND, MAKEWPARAM(CMD_FE_WIZARD_GENERATE, BN_CLICKED), 0);
+
+        bool dismissed = false;
+        for (int i = 0; i < 30 && !dismissed; ++i) {
+            Sleep(100);
+            MSG m;
+            while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&m);
+                DispatchMessageW(&m);
+            }
+            dismissed = DismissOkOnlyPopup();
+        }
+        if (!dismissed) {
+            LogLine("[IPS-CALL] empty path: 'No schema' popup did not appear within 3s - wizard may close on its own");
+        }
+        // Give the wizard a moment to actually close after the popup OK.
+        Sleep(300);
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    } else {
+        // Non-empty path: GA fired with DDL but the actual Preview page
+        // initialization can lag the last Next click by a few hundred ms.
+        Sleep(400);
+        MSG settleMsg;
+        while (PeekMessageW(&settleMsg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&settleMsg);
+            DispatchMessageW(&settleMsg);
+        }
+        // One last dismiss in case the diagram-selection popup snuck in.
+        DismissDiagramSelectionPopup();
     }
-    // One last dismiss in case the popup snuck in during the settle window.
-    DismissDiagramSelectionPopup();
 
     // Read and consume whatever the GA detour captured.
     EnsureDdlLockInit();
@@ -2145,9 +2247,59 @@ extern "C" __declspec(dllexport) const char* __cdecl CallInvokePreviewOnCaptured
     g_lastCapturedDdl = nullptr;
     LeaveCriticalSection(&g_ddlLock);
 
-    if (ddl) LogLine("[IPS-CALL] SUCCESS - %zu chars of DDL via GA detour", strlen(ddl));
-    else     LogLine("[IPS-CALL] no DDL captured (GA did not fire?)");
-    return ddl;
+    // Force-finish the wizard before returning. Without this loop the
+    // managed-side CloseHiddenWizard fires PostMessage IDCANCEL but
+    // returns immediately, the modal pump may not yet have dispatched it,
+    // and the next Generate DDL click finds erwin's "alter wizard active"
+    // global flag still set (Ctrl+Alt+T silently dropped, OPEN-WIZ 15 s
+    // timeout). Verified 2026-05-08 third-click stall after one full and
+    // one empty Generate DDL run. We post IDCANCEL ourselves, dismiss any
+    // confirm/save popup that appears during teardown, and wait until
+    // IsWindow returns false - that's the only signal we have that erwin
+    // actually completed the wizard's destroy chain and released the flag.
+    LogLine("[IPS-CALL] forcing wizard finish before return (hwnd=%p)", wizard);
+    PostMessage(wizard, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
+    PostMessage(wizard, WM_CLOSE, 0, 0);
+    int waitTotal = 0;
+    while (IsWindow(wizard) && waitTotal < 3000) {
+        Sleep(100);
+        waitTotal += 100;
+        MSG m;
+        while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+        // Any OK-only or Yes/No popup that pops up during teardown will
+        // block destruction; auto-dismiss both shapes.
+        DismissOkOnlyPopup();
+        DismissDiagramSelectionPopup();
+    }
+    if (IsWindow(wizard)) {
+        LogLine("[IPS-CALL] wizard still alive after %dms wait - leaving for managed CloseHiddenWizard", waitTotal);
+    } else {
+        LogLine("[IPS-CALL] wizard destroyed after %dms wait - alter-wizard flag should be clear", waitTotal);
+        // Wizard is gone; clear the cached hwnd so the WinEvent hook re-arms
+        // for the next OpenAlterScriptWizardHidden call.
+        InterlockedExchange64(&g_hiddenWizardHwnd, 0);
+    }
+
+    if (ddl) {
+        LogLine("[IPS-CALL] SUCCESS - %zu chars of DDL via GA detour", strlen(ddl));
+        return ddl;
+    }
+    if (emptyConfirmed) {
+        LogLine("[IPS-CALL] no DDL - GA fired with empty vector (no schema diff to generate)");
+        // Return an empty-string sentinel (Length=0) instead of nullptr.
+        // Managed BtnAlterWizardProd_Click already special-cases
+        // script.Length == 0 with "No differences detected" status; nullptr
+        // would be interpreted as a programmatic failure. Caller frees via
+        // FreeDdlBuffer.
+        char* empty = (char*)malloc(1);
+        if (empty) empty[0] = '\0';
+        return empty;
+    }
+    LogLine("[IPS-CALL] no DDL captured (GA did not fire on any page within Next-loop budget)");
+    return nullptr;
 }
 
 extern "C" __declspec(dllexport) int __cdecl InstallObserverHook(void) {
