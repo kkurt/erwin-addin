@@ -35,6 +35,25 @@ namespace EliteSoft.Erwin.AddIn.Services
         private bool _popupVisible;
         private volatile bool _isCheckingForChanges;
         private bool _columnEditorWasOpen;
+        // Entity Editor (Table Properties dialog) lifecycle + live UDP
+        // snapshot. Title shape is "SQL Server Table 'TableName' Editor" -
+        // same #32770 dialog class as the Column Editor but without
+        // "Column 'X'" in the title. While the editor is open we read the
+        // entity's UDP values every tick and re-run the scoped naming check
+        // the moment any tracked UDP changes - mirrors the Glossary flow
+        // that fires on Physical_Name change rather than on editor close.
+        // Snapshot is keyed on UDP name (case-insensitive); cleared on
+        // editor close so the next open re-baselines.
+        private bool _entityEditorWasOpen;
+        private string _activeEntityEditorTable;
+        private Dictionary<string, string> _entityEditorUdpSnapshot;
+        // Reentrancy guard. MessageBox.Show pumps the message loop while
+        // modal, which fires this same WindowMonitorTimer again. Without
+        // this flag the second tick re-enters RunScopedTableNamingCheck
+        // (snapshot still old) and stacks another popup, then a third,
+        // ad infinitum. Verified 2026-05-07: 30+ nested popups in one
+        // session of clicking the TABLE_TYPE combo to "LOG".
+        private bool _scopedCheckInProgress;
         private bool _sessionLost;
 
         // (Phase-2D 2026-05-06: chunked-cycle batch state retired - the full-model
@@ -696,6 +715,19 @@ namespace EliteSoft.Erwin.AddIn.Services
                 string previousTable = _activeColumnEditorTable;
                 _activeColumnEditorTable = editorIsOpen ? activeTable : null;
 
+                // Glossary-style scoped check: when the user opens the Column
+                // Editor on a table, evaluate naming standards for that table
+                // (UDP-conditional rules in particular - e.g. TABLE_TYPE='LOG'
+                // -> 'LOG_' prefix). Without this, conditional table-level
+                // rules only fire for newly-created entities or via a periodic
+                // scan, both of which were dropped in Phase-1A. We do NOT walk
+                // every entity - only the one currently in focus.
+                if (!_columnEditorWasOpen && editorIsOpen && !string.IsNullOrEmpty(activeTable))
+                {
+                    try { RunScopedTableNamingCheck(activeTable); }
+                    catch (Exception ex) { Log($"RunScopedTableNamingCheck err: {ex.Message}"); }
+                }
+
                 if (_columnEditorWasOpen && !editorIsOpen)
                 {
                     Log("Column Editor closed - final validation pass + PLEASE CHANGE IT cleanup");
@@ -717,6 +749,53 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
 
                 _columnEditorWasOpen = editorIsOpen;
+
+                // --- Entity Editor (Table Properties) live UDP watcher ---
+                // Same #32770 dialog class as Column Editor, title lacks
+                // "Column 'X'". User opens it to change Entity-level UDPs
+                // (TABLE_TYPE etc). We mirror the Glossary live-fire model:
+                // every tick, read the entity's tracked UDP values and run
+                // the naming check the moment any of them differs from the
+                // open-time baseline. Eliminates the "wait until close"
+                // delay - popup appears as soon as the UDP combo selection
+                // commits.
+                bool entityEditorIsOpen = IsEntityEditorOpen(out string entityActiveTable);
+                _activeEntityEditorTable = entityEditorIsOpen ? entityActiveTable : null;
+
+                if (entityEditorIsOpen && !string.IsNullOrEmpty(entityActiveTable)
+                    && !_scopedCheckInProgress)
+                {
+                    var currentUdps = ReadEntityRelevantUdpValues(entityActiveTable);
+                    if (_entityEditorUdpSnapshot == null)
+                    {
+                        // Just-opened baseline. Establish snapshot, don't
+                        // fire (open-time UDP value is the user's existing
+                        // state, not a change they performed in this
+                        // session of the editor).
+                        _entityEditorUdpSnapshot = currentUdps;
+                    }
+                    else if (HasUdpDelta(_entityEditorUdpSnapshot, currentUdps))
+                    {
+                        // CRITICAL: refresh the snapshot BEFORE invoking the
+                        // naming check. RunScopedTableNamingCheck calls into
+                        // MessageBox.Show which pumps the message loop while
+                        // modal - this same timer re-fires and would re-enter
+                        // here with the OLD snapshot, stacking another popup
+                        // ad infinitum. The reentrancy guard inside
+                        // RunScopedTableNamingCheck is a belt to this
+                        // suspenders.
+                        _entityEditorUdpSnapshot = currentUdps;
+                        Log($"Entity Editor: UDP change on '{entityActiveTable}' - running scoped naming check");
+                        try { RunScopedTableNamingCheck(entityActiveTable); }
+                        catch (Exception ex) { Log($"RunScopedTableNamingCheck (entity-live) err: {ex.Message}"); }
+                    }
+                }
+                else if (!entityEditorIsOpen && _entityEditorUdpSnapshot != null)
+                {
+                    _entityEditorUdpSnapshot = null;
+                }
+
+                _entityEditorWasOpen = entityEditorIsOpen;
             }
             catch (COMException) { HandleSessionLost(); }
             catch (InvalidComObjectException) { HandleSessionLost(); }
@@ -769,6 +848,54 @@ namespace EliteSoft.Erwin.AddIn.Services
                     }
                     // Editor open but title couldn't be parsed - signal "open" with empty
                     // name so the scoped path falls back to full-cycle.
+                    foundTable = string.Empty;
+                    return false;
+                }
+
+                return true;
+            }, IntPtr.Zero);
+
+            activeTable = foundTable;
+            return foundTable != null;
+        }
+
+        /// <summary>
+        /// Detects the Entity Editor (Table Properties) dialog on the same
+        /// <c>#32770</c> class the Column Editor uses. Title shape verified
+        /// 2026-05-07 against erwin r10.10 with English UI:
+        ///   "SQL Server Table 'TEST_DATA_TAB_178' Editor"
+        /// Distinguishing feature: <b>no</b> "Column '<i>name</i>'" segment.
+        /// We extract the table name from the first single-quoted token; if
+        /// the title is unparseable we still report "open" with an empty
+        /// name so the close-transition handler can no-op cleanly.
+        /// </summary>
+        private bool IsEntityEditorOpen(out string activeTable)
+        {
+            string foundTable = null;
+
+            EnumWindows((hWnd, lParam) =>
+            {
+                if (!IsWindowVisible(hWnd)) return true;
+
+                StringBuilder title = new StringBuilder(512);
+                GetWindowText(hWnd, title, 512);
+                string windowTitle = title.ToString();
+
+                // Entity Editor: "Table '...' Editor" with NO "Column '...'".
+                if (windowTitle.Contains("Table '")
+                    && windowTitle.EndsWith("Editor", StringComparison.Ordinal)
+                    && !windowTitle.Contains("Column '"))
+                {
+                    int firstQuote = windowTitle.IndexOf('\'');
+                    if (firstQuote >= 0)
+                    {
+                        int secondQuote = windowTitle.IndexOf('\'', firstQuote + 1);
+                        if (secondQuote > firstQuote + 1)
+                        {
+                            foundTable = windowTitle.Substring(firstQuote + 1, secondQuote - firstQuote - 1);
+                            return false;
+                        }
+                    }
                     foundTable = string.Empty;
                     return false;
                 }
@@ -911,6 +1038,147 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// once and shows any pending popups, then returns. Idempotent: if no diff,
         /// nothing fires.
         /// </summary>
+        /// <summary>
+        /// Scoped naming-standard check on the table the user just opened in
+        /// the Column Editor. Mirrors the Glossary flow that scopes work to
+        /// the active editor's parent: we walk Entities once, find the match
+        /// by Physical_Name (case-insensitive), then delegate to
+        /// <see cref="TableTypeMonitorService.ValidateNamingStandard"/> which
+        /// owns the AUTO_APPLY=true silent path, AUTO_APPLY=false YesNo
+        /// prompt, and the final regex/length warning. UDP-conditional rules
+        /// (DEPENDS_ON_UDP_ID) read live UDP values off the entity and apply
+        /// only when the condition matches.
+        /// </summary>
+        private void RunScopedTableNamingCheck(string tableName)
+        {
+            if (string.IsNullOrEmpty(tableName)) return;
+            if (_validationSuspended) return;
+            if (_sessionLost || _disposed) return;
+            if (_tableTypeMonitor == null) return;
+            if (!NamingStandardService.Instance.IsLoaded) return;
+            // Reentrancy guard. The downstream ValidateNamingStandard opens
+            // MessageBox.Show whose modal pump fires our WindowMonitorTimer
+            // again - re-entry would stack popups indefinitely.
+            if (_scopedCheckInProgress) return;
+            _scopedCheckInProgress = true;
+            try { RunScopedTableNamingCheckCore(tableName); }
+            finally { _scopedCheckInProgress = false; }
+        }
+
+        private void RunScopedTableNamingCheckCore(string tableName)
+        {
+
+            dynamic modelObjects = null;
+            dynamic root = null;
+            try
+            {
+                modelObjects = _session.ModelObjects;
+                root = modelObjects?.Root;
+            }
+            catch (Exception ex) { Log($"RunScopedTableNamingCheck: ModelObjects err: {ex.Message}"); return; }
+            if (root == null) return;
+
+            dynamic allEntities = null;
+            try { allEntities = modelObjects.Collect(root, "Entity"); }
+            catch (Exception ex) { Log($"RunScopedTableNamingCheck: Collect err: {ex.Message}"); return; }
+            if (allEntities == null) return;
+
+            try
+            {
+                foreach (dynamic entity in allEntities)
+                {
+                    if (entity == null) continue;
+                    string nameForMatch;
+                    try
+                    {
+                        string p = entity.Properties("Physical_Name").Value?.ToString() ?? "";
+                        nameForMatch = (!string.IsNullOrEmpty(p) && !p.StartsWith("%")) ? p : (entity.Name ?? "");
+                    }
+                    catch { try { nameForMatch = entity.Name ?? ""; } catch { continue; } }
+
+                    if (!string.Equals(nameForMatch, tableName, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    Log($"Scoped naming check on '{nameForMatch}'");
+                    _tableTypeMonitor.ValidateNamingStandard("Table", nameForMatch, entity);
+                    return;
+                }
+            }
+            catch (Exception ex) { Log($"RunScopedTableNamingCheck err: {ex.Message}"); }
+        }
+
+        /// <summary>
+        /// Read every UDP value the active naming-standard rules condition on
+        /// for the entity matching <paramref name="tableName"/>. Returns an
+        /// empty dictionary if nothing matches or if no rules carry a UDP
+        /// condition. Case-insensitive on both UDP name and table name.
+        /// Called every tick while the Entity Editor is open, so the body is
+        /// kept lean: no rule load, just one Collect + filter + targeted
+        /// property reads per relevant UDP.
+        /// </summary>
+        private Dictionary<string, string> ReadEntityRelevantUdpValues(string tableName)
+        {
+            var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (string.IsNullOrEmpty(tableName)) return result;
+
+            var udpNames = NamingStandardService.Instance.GetRelevantUdpNames();
+            if (udpNames.Count == 0) return result;
+
+            try
+            {
+                dynamic modelObjects = _session?.ModelObjects;
+                dynamic root = modelObjects?.Root;
+                if (root == null) return result;
+                dynamic entities = modelObjects.Collect(root, "Entity");
+                if (entities == null) return result;
+
+                foreach (dynamic entity in entities)
+                {
+                    if (entity == null) continue;
+                    string physName;
+                    try
+                    {
+                        string p = entity.Properties("Physical_Name").Value?.ToString() ?? "";
+                        physName = (!string.IsNullOrEmpty(p) && !p.StartsWith("%")) ? p : (entity.Name ?? "");
+                    }
+                    catch { continue; }
+
+                    if (!string.Equals(physName, tableName, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    foreach (var udp in udpNames)
+                    {
+                        try
+                        {
+                            string val = entity.Properties($"Entity.Physical.{udp}").Value?.ToString() ?? "";
+                            result[udp] = val;
+                        }
+                        catch { result[udp] = ""; }
+                    }
+                    break;
+                }
+            }
+            catch (Exception ex) { Log($"ReadEntityRelevantUdpValues err: {ex.Message}"); }
+            return result;
+        }
+
+        /// <summary>
+        /// Returns true if any tracked UDP value differs between the two
+        /// snapshots. New keys appearing on the right side count as a delta;
+        /// missing keys do not (rule set may have shrunk between ticks).
+        /// </summary>
+        private static bool HasUdpDelta(Dictionary<string, string> oldSnap, Dictionary<string, string> newSnap)
+        {
+            if (newSnap == null) return false;
+            foreach (var kv in newSnap)
+            {
+                oldSnap.TryGetValue(kv.Key, out var oldVal);
+                if (!string.Equals(oldVal ?? "", kv.Value ?? "", StringComparison.Ordinal))
+                    return true;
+            }
+            return false;
+        }
+
         private void FinalValidateClosedTable(string tableName)
         {
             if (string.IsNullOrEmpty(tableName)) return;
@@ -2064,14 +2332,22 @@ namespace EliteSoft.Erwin.AddIn.Services
                 //   - Editor closed (_activeColumnEditorTable null because the
                 //     WindowMonitor close-transition cleared it during the popup) ->
                 //     delete directly; there's no editor open to show a placeholder.
-                if (string.IsNullOrEmpty(_activeColumnEditorTable))
-                {
-                    DeleteInvalidGlossaryColumns(glossaryResults);
-                }
-                else
+                // 2026-05-07: explicit timing markers around the post-OK work so the
+                // user can see exactly how long delete / rename takes vs how long
+                // the popup itself was on-screen.
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                bool editorOpen = !string.IsNullOrEmpty(_activeColumnEditorTable);
+                Log($"[POPUP] OK clicked - dispatching {(editorOpen ? "rename" : "delete")} for {glossaryResults.Count} column(s)");
+                if (editorOpen)
                 {
                     RenameInvalidGlossaryColumns(glossaryResults);
                 }
+                else
+                {
+                    DeleteInvalidGlossaryColumns(glossaryResults);
+                }
+                sw.Stop();
+                Log($"[POPUP] post-OK action took {sw.ElapsedMilliseconds} ms");
             }
             finally
             {

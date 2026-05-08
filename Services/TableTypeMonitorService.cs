@@ -826,8 +826,11 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// Validate naming standards and apply prefix/suffix.
         /// AUTO_APPLY=true rules are applied silently (no popup).
         /// AUTO_APPLY=false rules that would change the name prompt the user before applying.
+        /// Exposed as internal so ValidationCoordinator can reuse it on the
+        /// Column-Editor-open transition for the parent entity (Glossary-style
+        /// scoped check on the table currently in focus).
         /// </summary>
-        private void ValidateNamingStandard(string objectType, string physicalName, dynamic scapiObject = null)
+        internal void ValidateNamingStandard(string objectType, string physicalName, dynamic scapiObject = null)
         {
             if (!NamingStandardService.Instance.IsLoaded) return;
 
