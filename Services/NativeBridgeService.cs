@@ -57,8 +57,6 @@ namespace EliteSoft.Erwin.AddIn.Services
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate IntPtr CallInvokePreviewFn();
 
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        private delegate IntPtr GenerateAlterDdlStandaloneFn(IntPtr clientMs);
 
         // F2-PAIR: takes BOTH ModelSet pointers, skips PrepareServerModelSet.
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
@@ -95,15 +93,11 @@ namespace EliteSoft.Erwin.AddIn.Services
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate IntPtr CCInspGenerateMartMartDdlViaOnFEFn(IntPtr ms);
 
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        private delegate int CCInspTestPSMFn(IntPtr ms);
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate int CCInspInstallOnFeHookFn();
         private delegate int CCInspCleanupHookInstallFn();
         private delegate int CCInspCleanupHookUninstallFn();
-        private delegate int CCInspMonitorHookInstallFn();
-        private delegate int CCInspMonitorHookUninstallFn();
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate int CCInspForceDestroyWizardFn(IntPtr hwnd);
@@ -136,7 +130,6 @@ namespace EliteSoft.Erwin.AddIn.Services
         // int-OIDs whose attributes/properties changed in the live action
         // summary on `ms`. Empty string if no change. The returned char* is
         // owned by the bridge (static buffer, no free).
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         [return: MarshalAs(UnmanagedType.LPStr)]
         private delegate string GetChangedEntityIdsFn(IntPtr ms);
 
@@ -145,7 +138,6 @@ namespace EliteSoft.Erwin.AddIn.Services
         // CheckEntityForChanges so only the user-touched attribute fires
         // ProcessNewAttribute / ProcessAttributeChanges - the other ~29
         // attrs in the entity stay quiet.
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         [return: MarshalAs(UnmanagedType.LPStr)]
         private delegate string GetChangedAttributeIdsFn(IntPtr ms);
 
@@ -191,17 +183,9 @@ namespace EliteSoft.Erwin.AddIn.Services
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate long CCInspReplayMsgMapFn(IntPtr a1, IntPtr a2, IntPtr a3, IntPtr a4);
 
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        private delegate int CCInspCallShowERwinCCWizFn(IntPtr ms1, IntPtr ms2, int b1, int b2);
 
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        private delegate IntPtr CCInspGetSeenMsFn(int index);
 
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        private delegate int CCInspGetSeenMsCountFn();
 
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        private delegate void CCInspSetEdrStackTraceFn(int enable);
 
         // Cached delegates, populated after Install() succeeds.
         private static GetLastCapturedModelSetFn _getLastCapturedModelSet;
@@ -212,7 +196,6 @@ namespace EliteSoft.Erwin.AddIn.Services
         private static ConsumeLastCapturedDdlFn _consumeLastDdl;
         private static ClearCapturedDdlFn _clearCapturedDdl;
         private static CallInvokePreviewFn _callInvokePreview;
-        private static GenerateAlterDdlStandaloneFn _generateAlterStandalone;
         private static GenerateAlterDdlWithServerMsFn _generateAlterWithServerMs;
         private static OpenAlterScriptWizardHiddenFn _openHiddenWizard;
         private static CloseHiddenWizardFn _closeHiddenWizard;
@@ -229,12 +212,9 @@ namespace EliteSoft.Erwin.AddIn.Services
         private static CCInspSetGlobalPxAsFn _ccInspSetGlobalPxAs;
         private static CCInspCallOnFeFn _ccInspCallOnFe;
         private static CCInspGenerateMartMartDdlViaOnFEFn _ccInspGenerateMartMartDdlViaOnFE;
-        private static CCInspTestPSMFn _ccInspTestPSM;
         private static CCInspInstallOnFeHookFn _ccInspInstallOnFeHook;
         private static CCInspCleanupHookInstallFn _ccInspCleanupHookInstall;
         private static CCInspCleanupHookUninstallFn _ccInspCleanupHookUninstall;
-        private static CCInspMonitorHookInstallFn _ccInspMonitorHookInstall;
-        private static CCInspMonitorHookUninstallFn _ccInspMonitorHookUninstall;
         private static CCInspForceDestroyWizardFn _ccInspForceDestroyWizard;
         private static CCInspGetLastOnFeMsFn _ccInspGetLastOnFeMs;
         private static CCInspGetLastEdrMsFn _ccInspGetLastEdrMs;
@@ -257,10 +237,6 @@ namespace EliteSoft.Erwin.AddIn.Services
         private static CCInspHookMsgMapFn _ccInspHookMsgMap;
         private static CCInspGetMsgMapArgsFn _ccInspGetMsgMapArgs;
         private static CCInspReplayMsgMapFn _ccInspReplayMsgMap;
-        private static CCInspCallShowERwinCCWizFn _ccInspCallShowERwinCCWiz;
-        private static CCInspGetSeenMsFn _ccInspGetSeenMs;
-        private static CCInspGetSeenMsCountFn _ccInspGetSeenMsCount;
-        private static CCInspSetEdrStackTraceFn _ccInspSetEdrStackTrace;
 
         /// <summary>
         /// Returns the absolute path where ErwinNativeBridge.dll is expected to live.
@@ -345,9 +321,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                     if (invokeProc != IntPtr.Zero)
                         _callInvokePreview = Marshal.GetDelegateForFunctionPointer<CallInvokePreviewFn>(invokeProc);
 
-                    IntPtr standaloneProc = GetProcAddress(_bridgeModule, "GenerateAlterDdlStandalone");
-                    if (standaloneProc != IntPtr.Zero)
-                        _generateAlterStandalone = Marshal.GetDelegateForFunctionPointer<GenerateAlterDdlStandaloneFn>(standaloneProc);
 
                     IntPtr serverMsProc = GetProcAddress(_bridgeModule, "GenerateAlterDdlWithServerMs");
                     if (serverMsProc != IntPtr.Zero)
@@ -392,9 +365,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                     if (ccMMOrch != IntPtr.Zero)
                         _ccInspGenerateMartMartDdlViaOnFE = Marshal.GetDelegateForFunctionPointer<CCInspGenerateMartMartDdlViaOnFEFn>(ccMMOrch);
 
-                    IntPtr ccTestPsm = GetProcAddress(_bridgeModule, "CCInsp_TestPSM");
-                    if (ccTestPsm != IntPtr.Zero)
-                        _ccInspTestPSM = Marshal.GetDelegateForFunctionPointer<CCInspTestPSMFn>(ccTestPsm);
 
                     IntPtr ccOnFeHk = GetProcAddress(_bridgeModule, "CCInsp_InstallOnFeHook");
                     if (ccOnFeHk != IntPtr.Zero)
@@ -407,12 +377,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                     if (ccCleanUn != IntPtr.Zero)
                         _ccInspCleanupHookUninstall = Marshal.GetDelegateForFunctionPointer<CCInspCleanupHookUninstallFn>(ccCleanUn);
 
-                    IntPtr ccMonInst = GetProcAddress(_bridgeModule, "CCInsp_MonitorHookInstall");
-                    if (ccMonInst != IntPtr.Zero)
-                        _ccInspMonitorHookInstall = Marshal.GetDelegateForFunctionPointer<CCInspMonitorHookInstallFn>(ccMonInst);
-                    IntPtr ccMonUn = GetProcAddress(_bridgeModule, "CCInsp_MonitorHookUninstall");
-                    if (ccMonUn != IntPtr.Zero)
-                        _ccInspMonitorHookUninstall = Marshal.GetDelegateForFunctionPointer<CCInspMonitorHookUninstallFn>(ccMonUn);
 
                     IntPtr ccForceDestroy = GetProcAddress(_bridgeModule, "CCInsp_ForceDestroyWizard");
                     if (ccForceDestroy != IntPtr.Zero)
@@ -501,18 +465,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                     IntPtr ccReplayMsgMap = GetProcAddress(_bridgeModule, "CCInsp_ReplayMsgMap");
                     if (ccReplayMsgMap != IntPtr.Zero)
                         _ccInspReplayMsgMap = Marshal.GetDelegateForFunctionPointer<CCInspReplayMsgMapFn>(ccReplayMsgMap);
-
-                    IntPtr ccCCWiz = GetProcAddress(_bridgeModule, "CCInsp_CallShowERwinCCWiz");
-                    if (ccCCWiz != IntPtr.Zero)
-                        _ccInspCallShowERwinCCWiz = Marshal.GetDelegateForFunctionPointer<CCInspCallShowERwinCCWizFn>(ccCCWiz);
-
-                    IntPtr ccSeenMs = GetProcAddress(_bridgeModule, "CCInsp_GetSeenMs");
-                    IntPtr ccSeenMsCount = GetProcAddress(_bridgeModule, "CCInsp_GetSeenMsCount");
-                    if (ccSeenMs != IntPtr.Zero) _ccInspGetSeenMs = Marshal.GetDelegateForFunctionPointer<CCInspGetSeenMsFn>(ccSeenMs);
-                    if (ccSeenMsCount != IntPtr.Zero) _ccInspGetSeenMsCount = Marshal.GetDelegateForFunctionPointer<CCInspGetSeenMsCountFn>(ccSeenMsCount);
-
-                    IntPtr ccEdrST = GetProcAddress(_bridgeModule, "CCInsp_SetEdrStackTrace");
-                    if (ccEdrST != IntPtr.Zero) _ccInspSetEdrStackTrace = Marshal.GetDelegateForFunctionPointer<CCInspSetEdrStackTraceFn>(ccEdrST);
 
                     log?.Invoke($"NativeBridge: capture API bound (get={getProc != IntPtr.Zero}, reset={resetProc != IntPtr.Zero}, gen={genProc != IntPtr.Zero}, free={freeProc != IntPtr.Zero}, obs={obsProc != IntPtr.Zero}, consume={consumeProc != IntPtr.Zero}, clear={clearProc != IntPtr.Zero}, invoke={invokeProc != IntPtr.Zero}).");
                 }
@@ -830,79 +782,6 @@ namespace EliteSoft.Erwin.AddIn.Services
             return _ccInspReplayMsgMap?.Invoke(a1, a2, a3, a4) ?? -9999;
         }
 
-        /// <summary>D4-spike: list of distinct modelSets seen by any hook.
-        /// Order is chronological: index 0 is the first MS seen, index 1 the
-        /// second, etc. Max 16 entries.</summary>
-        /// <summary>Toggle stack-trace logging on EDR RegsiterStartTransactionId
-        /// so we can identify the ELC2 internal function that triggers Apply-to-Right
-        /// transactions.</summary>
-        public static void SetEdrStackTrace(bool enable)
-        {
-            _ccInspSetEdrStackTrace?.Invoke(enable ? 1 : 0);
-        }
-
-        public static IntPtr[] GetSeenModelSets()
-        {
-            int count = _ccInspGetSeenMsCount?.Invoke() ?? 0;
-            var result = new IntPtr[count];
-            for (int i = 0; i < count; ++i)
-                result[i] = _ccInspGetSeenMs?.Invoke(i) ?? IntPtr.Zero;
-            return result;
-        }
-
-        /// <summary>
-        /// Returns the i'th model-set pointer captured by the bridge's EDR
-        /// hook, or <see cref="IntPtr.Zero"/> if <paramref name="index"/> is
-        /// out of range.
-        /// </summary>
-        public static IntPtr GetSeenModelSet(int index)
-        {
-            int count = _ccInspGetSeenMsCount?.Invoke() ?? 0;
-            if (index < 0 || index >= count) return IntPtr.Zero;
-            return _ccInspGetSeenMs?.Invoke(index) ?? IntPtr.Zero;
-        }
-
-        /// <summary>D4-spike: call EM_ECC!CWizInterface::ShowERwinCCWiz
-        /// with pre-populated ms2 (right model) and both bools. If erwin
-        /// interprets this as a silent / auto-apply path we get full
-        /// automation; otherwise it just opens the CC wizard UI.</summary>
-        public static int CallShowERwinCCWiz(IntPtr ms1, IntPtr ms2, bool b1, bool b2)
-        {
-            return _ccInspCallShowERwinCCWiz?.Invoke(ms1, ms2, b1 ? 1 : 0, b2 ? 1 : 0) ?? -10000;
-        }
-
-        /// <summary>
-        /// D1-spike: calls ELA::OnFE(ms, false, flags). This is the exact handler
-        /// fired by the 'Right Alter Script' toolbar button in Resolve Differences.
-        /// Internally computes the CC-context AS, writes gbl_pxActionSummary,
-        /// and opens the alter wizard modally.
-        /// </summary>
-        /// <summary>
-        /// Probe PrepareServerModelSet on a captured mart-bound ModelSet pointer.
-        /// Returns 1 if as1 is produced (F2/MCX path is open), 0 if PSM ran but
-        /// returned null, -1 if PSM symbol unresolved or ms is null, -2 on SEH.
-        /// All diagnostics emit to bridge log under [PSM-PROBE].
-        /// </summary>
-        public static int TestPSM(IntPtr ms, Action<string> log = null)
-        {
-            if (_ccInspTestPSM == null)
-            {
-                log?.Invoke("TestPSM: bridge export not bound (rebuild bridge?).");
-                return -1;
-            }
-            if (ms == IntPtr.Zero)
-            {
-                log?.Invoke("TestPSM: ms pointer is zero.");
-                return -1;
-            }
-            try { return _ccInspTestPSM(ms); }
-            catch (Exception ex)
-            {
-                log?.Invoke($"TestPSM threw: {ex.GetType().Name}: {ex.Message}");
-                return -1;
-            }
-        }
-
         public static int CallOnFE(IntPtr ms, bool flag, uint flags)
         {
             return _ccInspCallOnFe?.Invoke(ms, flag ? 1 : 0, flags) ?? -10000;
@@ -933,26 +812,6 @@ namespace EliteSoft.Erwin.AddIn.Services
             if (_ccInspCleanupHookUninstall == null) { log?.Invoke("CleanupHookUninstall: bridge export not bound."); return -1; }
             try { return _ccInspCleanupHookUninstall(); }
             catch (Exception ex) { log?.Invoke($"CleanupHookUninstall threw: {ex.Message}"); return -1; }
-        }
-
-        /// <summary>
-        /// Diagnostic-only WinEvent hook that LOGS every #32770 / Afx window
-        /// creation in erwin's process WITHOUT hiding anything. Used during
-        /// manual reverse-engineering of new wizard flows so we can capture
-        /// dialog title/class sequences. Pair with <see cref="MonitorHookUninstall"/>.
-        /// </summary>
-        public static int MonitorHookInstall(Action<string> log = null)
-        {
-            if (_ccInspMonitorHookInstall == null) { log?.Invoke("MonitorHookInstall: bridge export not bound (rebuild bridge?)."); return -1; }
-            try { return _ccInspMonitorHookInstall(); }
-            catch (Exception ex) { log?.Invoke($"MonitorHookInstall threw: {ex.Message}"); return -1; }
-        }
-
-        public static int MonitorHookUninstall(Action<string> log = null)
-        {
-            if (_ccInspMonitorHookUninstall == null) { log?.Invoke("MonitorHookUninstall: bridge export not bound."); return -1; }
-            try { return _ccInspMonitorHookUninstall(); }
-            catch (Exception ex) { log?.Invoke($"MonitorHookUninstall threw: {ex.Message}"); return -1; }
         }
 
         /// <summary>
@@ -1136,24 +995,6 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// D1-spike: snapshot of CC-related global state. Returns a formatted
-        /// multi-line report so the caller can log it directly.
-        /// </summary>
-        public static string DumpCCState()
-        {
-            IntPtr fedAs = _ccInspGetFEDataAs?.Invoke() ?? IntPtr.Zero;
-            IntPtr fedMs = _ccInspGetFEDataMs?.Invoke() ?? IntPtr.Zero;
-            IntPtr elc2As = _ccInspGetELC2As?.Invoke() ?? IntPtr.Zero;
-            IntPtr capMs = GetLastCapturedModelSet();
-            return
-                $"CC state snapshot:\n" +
-                $"  CERwinFEData.ActionSummary = 0x{fedAs.ToInt64():X16}\n" +
-                $"  CERwinFEData.ModelSet      = 0x{fedMs.ToInt64():X16}\n" +
-                $"  EM_ELC2.gbl_pxActionSummary = 0x{elc2As.ToInt64():X16}\n" +
-                $"  GA-detour captured MS      = 0x{capMs.ToInt64():X16}";
-        }
-
-        /// <summary>
         /// Reads and clears the most-recent alter DDL captured by the
         /// GenerateAlterScript detour. Returns null if nothing captured.
         /// </summary>
@@ -1182,65 +1023,6 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// new wizard run to avoid reading stale data.
         /// </summary>
         public static void ClearCapturedDdl() => _clearCapturedDdl?.Invoke();
-
-        /// <summary>
-        /// Directly invokes FEWPageOptions::InvokePreviewStringOnlyCommand on
-        /// the most-recently-captured FEWPageOptions* pointer (populated when
-        /// the user opens the Alter Script wizard). Returns the DDL string,
-        /// or null if no wizard has been opened in this session or the call
-        /// fails. Caller must free via the bridge's FreeDdlBuffer (handled
-        /// here internally).
-        /// </summary>
-        /// <summary>
-        /// Experimental: generate alter DDL by constructing FEWPageOptions
-        /// standalone (no wizard UI). Requires that the user has opened the
-        /// Alter Script wizard at least ONCE during this erwin session to
-        /// seed the feParam + wsfBase template the native bridge clones.
-        /// After that, any number of calls can be made without re-opening.
-        /// Returns the DDL string or null if anything fails.
-        /// </summary>
-        public static string GenerateAlterDdlStandalone(dynamic currentPU, Action<string> log = null)
-        {
-            if (_generateAlterStandalone == null || _freeDdlBuffer == null)
-            {
-                log?.Invoke("NativeBridge: standalone export not bound.");
-                return null;
-            }
-            // Need the modelSet pointer for the current dirty PU.
-            IntPtr ms = EnsureActiveModelSetCaptured(currentPU, log);
-            if (ms == IntPtr.Zero)
-            {
-                log?.Invoke("NativeBridge: could not capture modelSet for standalone alter.");
-                return null;
-            }
-
-            IntPtr ptr = IntPtr.Zero;
-            try
-            {
-                log?.Invoke($"NativeBridge: invoking GenerateAlterDdlStandalone(ms=0x{ms.ToInt64():X})...");
-                ptr = _generateAlterStandalone(ms);
-                if (ptr == IntPtr.Zero)
-                {
-                    log?.Invoke("NativeBridge: standalone returned null. See bridge log.");
-                    return null;
-                }
-                string ddl = Marshal.PtrToStringAnsi(ptr);
-                log?.Invoke($"NativeBridge: standalone returned {ddl?.Length ?? 0} chars.");
-                return ddl;
-            }
-            catch (Exception ex)
-            {
-                log?.Invoke($"NativeBridge: standalone threw: {ex.GetType().Name}: {ex.Message}");
-                return null;
-            }
-            finally
-            {
-                if (ptr != IntPtr.Zero)
-                {
-                    try { _freeDdlBuffer(ptr); } catch { }
-                }
-            }
-        }
 
         /// <summary>
         /// Unified programmatic alter-DDL entry point. Orchestrates:
