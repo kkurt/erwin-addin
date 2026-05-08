@@ -27,6 +27,14 @@ namespace EliteSoft.Erwin.AddIn.Services
     /// </summary>
     public static class NamingValidationEngine
     {
+        // Default property the addin validates for every object type. Schema
+        // post-2026-05-04 keys rules on (OBJECT_TYPE, PROPERTY_CODE); the
+        // addin's call sites always validate the SCAPI "Physical_Name"
+        // equivalent (entity.Name, attribute.PhysicalName, key_group.Name,
+        // ...). Other property codes (Logical_Name, Definition) require
+        // distinct SCAPI reads and are deferred until a use case appears.
+        private const string DefaultPropertyCode = "Physical_Name";
+
         /// <summary>
         /// Validate an object name against naming standard rules.
         /// Rules with DEPENDS_ON_UDP_ID are only applied if the object's UDP value matches.
@@ -34,14 +42,15 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <param name="objectType">Object type: "Table", "Column", "Index", "View"</param>
         /// <param name="objectName">Physical name of the object</param>
         /// <param name="scapiObject">erwin SCAPI object for reading UDP values (null = skip conditional rules)</param>
-        public static List<NamingValidationResult> ValidateObjectName(string objectType, string objectName, dynamic scapiObject = null)
+        /// <param name="propertyCode">Property whose value is being validated; defaults to "Physical_Name".</param>
+        public static List<NamingValidationResult> ValidateObjectName(string objectType, string objectName, dynamic scapiObject = null, string propertyCode = DefaultPropertyCode)
         {
             var results = new List<NamingValidationResult>();
 
             if (string.IsNullOrEmpty(objectName)) return results;
             if (!NamingStandardService.Instance.IsLoaded) return results;
 
-            var rules = NamingStandardService.Instance.GetByObjectType(objectType);
+            var rules = NamingStandardService.Instance.GetByObjectTypeAndProperty(objectType, propertyCode);
 
             foreach (var rule in rules)
             {
@@ -61,14 +70,21 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// silent auto-apply path. When autoOnly=false, ALL applicable rules are applied — used by
         /// the "ask user" path so we can compute what the name would look like with manual rules.
         /// </summary>
-        public static string ApplyNamingStandards(string objectType, string objectName, dynamic scapiObject = null, bool autoOnly = true)
+        public static string ApplyNamingStandards(string objectType, string objectName, dynamic scapiObject = null, bool autoOnly = true, string propertyCode = DefaultPropertyCode)
         {
             if (string.IsNullOrEmpty(objectName)) return objectName;
             if (!NamingStandardService.Instance.IsLoaded) return objectName;
 
-            IEnumerable<NamingStandardRule> rules = NamingStandardService.Instance.GetByObjectType(objectType);
-            if (autoOnly)
-                rules = rules.Where(r => r.AutoApply);
+            // Important: do NOT filter the rule set up-front by AutoApply.
+            // The autoOnly contract gates only the FORWARD apply branch
+            // (adding a prefix/suffix). The reverse-strip branch must run
+            // for every conditional rule regardless of AutoApply, so that
+            // a now-stale decoration (e.g. user flipped TABLE_TYPE from
+            // LOG to HISTORY, leaving an obsolete 'LOG_' prefix) is removed
+            // silently as bookkeeping. Re-asking the user every time the
+            // conditioning UDP changes was rejected as a UX regression
+            // 2026-05-07.
+            IEnumerable<NamingStandardRule> rules = NamingStandardService.Instance.GetByObjectTypeAndProperty(objectType, propertyCode);
 
             string result = objectName;
 
@@ -79,7 +95,12 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                 if (applicable)
                 {
-                    // Add prefix/suffix if missing
+                    // Forward apply: ADD prefix/suffix. Honour autoOnly so
+                    // AUTO_APPLY=false rules are deferred to the ask-user
+                    // path (the caller invokes us a second time with
+                    // autoOnly=false and prompts on diff).
+                    if (autoOnly && !rule.AutoApply) continue;
+
                     if (!string.IsNullOrEmpty(rule.Prefix) &&
                         !result.StartsWith(rule.Prefix, StringComparison.OrdinalIgnoreCase))
                     {
@@ -94,11 +115,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
                 else if (isConditional)
                 {
-                    // Reverse direction: a conditional rule (DependsOnUdpId) no longer matches the
-                    // entity's current UDP value, so any prefix/suffix it had previously added must
-                    // come off (e.g. user flips TABLE_TYPE from LOG to HISTORY: strip 'LOG_' here,
-                    // then the HISTORY rule below adds '_HST'). Only conditional rules strip — a
-                    // non-conditional baseline prefix should never be auto-stripped by us.
+                    // Reverse strip: ALWAYS silent. The conditioning UDP no
+                    // longer matches, so any prefix/suffix the rule had
+                    // previously added is stale; removing it does not need
+                    // user confirmation regardless of AUTO_APPLY. Only
+                    // conditional rules strip - a non-conditional baseline
+                    // prefix is never auto-removed.
                     if (!string.IsNullOrEmpty(rule.Prefix) &&
                         result.StartsWith(rule.Prefix, StringComparison.OrdinalIgnoreCase))
                     {
@@ -120,12 +142,12 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// Check if applying naming standards would change the given name.
         /// autoOnly=true → only AUTO_APPLY rules; autoOnly=false → all rules.
         /// </summary>
-        public static bool HasAutoApplyChanges(string objectType, string objectName, dynamic scapiObject = null, bool autoOnly = true)
+        public static bool HasAutoApplyChanges(string objectType, string objectName, dynamic scapiObject = null, bool autoOnly = true, string propertyCode = DefaultPropertyCode)
         {
             if (string.IsNullOrEmpty(objectName)) return false;
             if (!NamingStandardService.Instance.IsLoaded) return false;
 
-            string applied = ApplyNamingStandards(objectType, objectName, scapiObject, autoOnly);
+            string applied = ApplyNamingStandards(objectType, objectName, scapiObject, autoOnly, propertyCode);
             return !string.Equals(applied, objectName, StringComparison.Ordinal);
         }
 
