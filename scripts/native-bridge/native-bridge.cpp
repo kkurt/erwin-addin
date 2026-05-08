@@ -1717,6 +1717,54 @@ static bool LooksLikeAlterScriptWizard(HWND hwnd) {
             strstr(title, "Schema Generation") != nullptr);
 }
 
+// Dismisses erwin's "Use current diagram selections? You have N entity
+// selected" popup that the Object Filter wizard page raises when the user
+// has table(s) selected on the active diagram. Manual flow: click No to
+// keep the wizard's "all changed objects" filter; clicking Yes scopes the
+// alter script to only the selected entities, which produces a stripped
+// DDL most callers don't want. Returns true if a popup was found and
+// dismissed.
+//
+// Used by both the OnFE-WORKER-NEXT Mart-Mart pipeline and the IPS-CALL
+// same-version Next-loop. Originally a lambda inside OnFeWorkerProc; lifted
+// to top-level so the IPS-CALL Next-loop can reuse it without duplicating
+// the title-match + button-find logic.
+static bool DismissDiagramSelectionPopup() {
+    auto dialogs = EnumerateVisibleDialogs();
+    for (HWND popup : dialogs) {
+        wchar_t title[256] = {0};
+        GetWindowTextW(popup, title, 255);
+        if (wcsstr(title, L"erwin Data Modeler") == nullptr) continue;
+        // Search for a 'No' button child to confirm it's a Yes/No popup.
+        HWND noBtn = FindWindowExW(popup, nullptr, L"Button", L"&No");
+        if (!noBtn) noBtn = FindWindowExW(popup, nullptr, L"Button", L"No");
+        if (!noBtn) noBtn = FindWindowExW(popup, nullptr, L"Button", L"&Hayır");
+        if (!noBtn) noBtn = FindWindowExW(popup, nullptr, L"Button", L"Hayır");
+        if (!noBtn) {
+            // Some erwin popups use unicode ampersand-prefixed text; try
+            // enumerating Button children to find one whose text starts with N.
+            HWND child = nullptr;
+            while ((child = FindWindowExW(popup, child, L"Button", nullptr)) != nullptr) {
+                wchar_t btxt[64] = {0};
+                GetWindowTextW(child, btxt, 63);
+                if (btxt[0] == L'N' || btxt[0] == L'n' ||
+                    (btxt[0] == L'&' && (btxt[1] == L'N' || btxt[1] == L'n')) ||
+                    wcsstr(btxt, L"Hayır") || wcsstr(btxt, L"Hayir"))
+                { noBtn = child; break; }
+            }
+        }
+        if (!noBtn) continue;
+        LogLine("[POPUP-DISMISS] 'erwin Data Modeler' popup hwnd=%p title='%ls' (clicking No)", popup, title);
+        PostMessage(popup, WM_COMMAND, MAKEWPARAM(IDNO, BN_CLICKED), (LPARAM)noBtn);
+        // Also send BM_CLICK directly to the button as a backup - some custom
+        // dialogs don't honor IDNO unless the message targets the button hwnd
+        // specifically.
+        PostMessage(noBtn, BM_CLICK, 0, 0);
+        return true;
+    }
+    return false;
+}
+
 // Hide a wizard window aggressively: make it transparent (alpha=0) AND move
 // off-screen. Using WS_EX_LAYERED with alpha=0 ensures it's not drawn at all
 // even momentarily, so no flash is perceptible.
@@ -2015,20 +2063,79 @@ extern "C" __declspec(dllexport) const char* __cdecl CallInvokePreviewOnCaptured
     if (g_lastCapturedDdl) { free(g_lastCapturedDdl); g_lastCapturedDdl = nullptr; }
     LeaveCriticalSection(&g_ddlLock);
 
-    LogLine("[IPS-CALL] triggering Invoke on FEWPageOptions=%p (DDL via GA-detour)", self);
-    __try {
-        // Call with RCX=self. We ignore the return value (ABI is non-trivial
-        // for CString — MSVC may use RAX or hidden ptr; both gave AV/SEH when
-        // we tried to read them). What matters is the SIDE EFFECT: Invoke
-        // runs, internally calls FEProcessor::GenerateAlterScript, our GA
-        // detour captures the DDL into g_lastCapturedDdl.
-        InvokeFn fn = (InvokeFn)g_directInvokePreview;
-        fn(self);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        // Expected: SEH may fire on the return-value path. Doesn't matter.
-        LogLine("[IPS-CALL] post-return SEH 0x%08lX (ignored - DDL already captured)",
-            GetExceptionCode());
+    LogLine("[IPS-CALL] driving wizard to Preview via WM_COMMAND Next-loop (FEWPO=%p)", self);
+    // 2026-05-08: replaced direct g_directInvokePreview(self) call. The MSVC
+    // x64 ABI for FEWPageOptions::InvokePreviewStringOnlyCommand could not
+    // be matched without symbol info: single-arg `InvokeFn(self)` AV'd in
+    // unwind at mfc140+0xDBB9 and the sret retry AV'd on entry at
+    // EM_EOU+0x262105. Both shapes corrupted state enough to skip the GA
+    // detour fire. The WM_COMMAND Next-loop path is verified-working from
+    // the OnFE-WORKER-NEXT pipeline (Mart-Mart Generate DDL): the hidden
+    // wizard processes Next clicks, traverses Overview -> Options -> ... ->
+    // Preview, and during the Preview-page setup MFC calls
+    // GenerateAlterScript natively which our GA detour captures into
+    // g_lastCapturedDdl. Coordinate-free, DPI-free, ABI-free.
+    HWND wizard = (HWND)InterlockedCompareExchange64(&g_hiddenWizardHwnd, 0, 0);
+    if (!wizard || !IsWindow(wizard)) {
+        LogLine("[IPS-CALL] no hidden wizard hwnd to drive (FEWPO=%p, wizard=%p) - cannot proceed", self, wizard);
+        return nullptr;
     }
+
+    const int CMD_FE_WIZARD_NEXT = 1766;
+    const int MAX_PAGES = 8;
+    int posted = 0;
+    for (int page = 0; page < MAX_PAGES; ++page) {
+        // GA detour writes g_lastCapturedDdl as soon as a non-empty alter
+        // script is produced. Check after each Next so we exit early on
+        // the page that triggers it.
+        EnsureDdlLockInit();
+        EnterCriticalSection(&g_ddlLock);
+        bool haveDdl = (g_lastCapturedDdl != nullptr);
+        LeaveCriticalSection(&g_ddlLock);
+        if (haveDdl) {
+            LogLine("[IPS-CALL] DDL captured after %d Next click(s)", page);
+            break;
+        }
+
+        LogLine("[IPS-CALL] page %d: posting WM_COMMAND %d (Next) to wizard %p", page, CMD_FE_WIZARD_NEXT, wizard);
+        PostMessage(wizard, WM_COMMAND, MAKEWPARAM(CMD_FE_WIZARD_NEXT, BN_CLICKED), 0);
+        ++posted;
+
+        // Pump our message queue so the worker thread's PostMessage actually
+        // gets dispatched into the wizard's window proc. The Object Filter
+        // page raises a diagram-selection popup ("Use current diagram
+        // selections? You have N entity selected") when the user has tables
+        // highlighted on the active diagram. Without dismissing it the
+        // wizard stalls and subsequent Next posts go nowhere - reproduced
+        // 2026-05-08 on second consecutive Generate DDL click. Sleep is
+        // split so the dismiss probe runs both early (popup just appeared)
+        // and late (popup paint finished, button accepts BM_CLICK).
+        Sleep(150);
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        DismissDiagramSelectionPopup();
+        Sleep(200);
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        DismissDiagramSelectionPopup();
+    }
+    LogLine("[IPS-CALL] Next-loop done (posted=%d)", posted);
+
+    // Final settle: GA may fire on the Preview page initialization, which
+    // can lag the last Next click by a few hundred ms.
+    Sleep(400);
+    MSG settleMsg;
+    while (PeekMessageW(&settleMsg, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&settleMsg);
+        DispatchMessageW(&settleMsg);
+    }
+    // One last dismiss in case the popup snuck in during the settle window.
+    DismissDiagramSelectionPopup();
 
     // Read and consume whatever the GA detour captured.
     EnsureDdlLockInit();

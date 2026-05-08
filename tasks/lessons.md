@@ -4,6 +4,75 @@ A running log of corrections and non-obvious findings that future sessions
 should not have to rediscover. Each entry is a short rule, the reason, and
 how to apply it.
 
+## 2026-05-08: Generate DDL fast-path uses WM_COMMAND Next-loop, not direct InvokePreview
+
+**Rule:** for the Generate DDL same-version "dirty vs last saved" pipeline
+in `CallInvokePreviewOnCaptured`, drive the hidden wizard with
+`WM_COMMAND CMD_FE_WIZARD_NEXT (1766)` posts. The GA detour fires when
+MFC initializes the Preview page and writes `g_lastCapturedDdl`. Do NOT
+re-introduce a direct `g_directInvokePreview(self)` call.
+
+**Why:** the direct call to
+`FEWPageOptions::InvokePreviewStringOnlyCommand` AV'd at
+`mfc140.dll + 0xDBB9` for two days, masked by the WS_EX_LAYERED
+compositor flush. The MSVC x64 ABI for the function's CString return
+could not be matched without symbol info: the standard sret guess
+(`retBuf RCX, this RDX`) produced a different AV at
+`EM_EOU.dll + 0x262105` with RDX=0 and broke the GA detour entirely
+(no DDL captured). The WM_COMMAND Next-loop sidesteps the ABI question:
+it does not call into the C++ method directly - MFC's own page-init
+code does, and it has the right `this` because MFC dispatched through
+its CPropertySheet message map.
+
+**How to apply:** see
+[IPS-CALL CString return ABI sidestepped via WM_COMMAND](../../../.claude/projects/c--Users-Kursat-Repos-erwin-addin/memory/project_ips_call_cstring_abi_pending.md)
+for the full code snippet and verification log signals. If a future
+attempt to reintroduce direct calls becomes attractive (perf, finer
+control), the prerequisite is dia2dump output proving the actual ABI -
+no more guessing.
+
+## 2026-05-08: Don't guess MSVC x64 ABI - read the symbol or sidestep the call
+
+**Rule:** when patching a raw-function-pointer call to fix an AV, do NOT
+swap the calling-convention shape on a hypothesis without first
+confirming the actual ABI. Either run `dia2dump` against the owning
+module's PDB, dump the function prologue under a debugger, or pick a
+sidestep path (post WM_COMMAND, drive via UIA) that avoids guessing.
+
+**Why:** 2026-05-08 attempted to fix the long-standing
+`mfc140.dll + 0xDBB9` AV in `CallInvokePreviewOnCaptured` by switching
+from single-arg `InvokeFn(self)` to the classic MSVC x64 sret pattern
+`g_directInvokePreview(retBuf, self)` (RCX=retBuf, RDX=this). The
+hypothesis was reasonable - `CStringT<char>` is conceptually non-POD -
+but the actual lowering on this MFC build returns the CString as an
+8-byte pointer in RAX, not via sret. The patched call put retBuf in
+RCX where the function expected `this`, the function then dereferenced
+RDX (now 0) as `this`, and produced a NEW AV at `EM_EOU.dll + 0x262105`
+on entry instead of the old one in unwind. Worse: the GA-detour path
+that captures DDL fired BEFORE the original AV but AFTER the new one,
+so the patched build returned no DDL at all. User saw "DDL stopped
+working" within minutes of installing.
+
+The patch was reverted same session. The single-arg call with
+`__try/__except` swallowing the post-return SEH is back. DDL works,
+black-rectangle compositor leak works on big-model + click. Net regression
+prevented; lesson recorded so the next attempt does not repeat the same
+sret guess.
+
+**How to apply:**
+- For native ABI work, the sequence is: dump the symbol, read the
+  prologue, write the typedef. Skipping straight to step 3 wastes a
+  build/install/test cycle and risks shipping a worse failure mode.
+- For the IPS-CALL bug specifically, the recommended next attempt is
+  WM_COMMAND-driven Preview click (memory
+  `reference_alter_script_wizard_automation`) which sidesteps the
+  ABI question entirely.
+- Memory record: see
+  [IPS-CALL CString return ABI fix pending - sret hypothesis FALSIFIED](../../../.claude/projects/c--Users-Kursat-Repos-erwin-addin/memory/project_ips_call_cstring_abi_pending.md)
+  for the full ABI evidence dump.
+
+
+
 ## 2026-05-05: PU.Locator is unreliable on r10.10 Mart-bound PUs
 
 **Rule:** never read `pu.Locator?.ToString()` directly when the model lives
