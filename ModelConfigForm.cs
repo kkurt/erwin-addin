@@ -35,6 +35,17 @@ namespace EliteSoft.Erwin.AddIn
         private readonly List<dynamic> _openModels = new List<dynamic>();
         private string _connectedModelName;
         private bool _globalDataLoaded;
+        // Degraded-mode tracking. _inDegradedMode is true when ConnectToModel
+        // succeeded at the SCAPI level but ConfigContext.Initialize failed
+        // (model not Mart-bound, or Mart path has no MODEL_CONFIG_MAPPING
+        // row). _lastDegradedLocator is the PU locator we degraded on, used
+        // by the reconnect timer to ignore subsequent ticks while the same
+        // unmapped model stays open and to fire the moment the user closes
+        // it and opens a different one (e.g. a Mart-bound model with a
+        // valid CONFIG mapping). Without this pair the form sticks in
+        // degraded UI forever after the user switches to a good model.
+        private bool _inDegradedMode;
+        private string _lastDegradedLocator;
 
         // Services
         private ColumnValidationService _validationService;
@@ -72,6 +83,29 @@ namespace EliteSoft.Erwin.AddIn
                 InitializeGeneralTab();
             using (AddinLogger.BeginScope("InitializeGlossaryRefreshTimer"))
                 InitializeGlossaryRefreshTimer();
+
+            // Focus-stealing diagnostic. User reported (2026-05-09) the
+            // ModelConfigForm losing foreground spontaneously while idle - the
+            // form pops behind erwin "as if a diagram click happened" without
+            // any user input. Hooking Activated/Deactivate logs the foreground
+            // change with the new foreground window's hwnd / class / title /
+            // pid so the next reproduction tells us exactly which window
+            // grabbed focus. Cheap (~1 line per transition); removable later.
+            this.Activated += (s, ev) => Log("[FOCUS] form Activated");
+            this.Deactivate += (s, ev) =>
+            {
+                try
+                {
+                    IntPtr fg = Services.Win32Helper.GetForegroundWindowPublic();
+                    var classSb = new System.Text.StringBuilder(128);
+                    var titleSb = new System.Text.StringBuilder(256);
+                    Services.Win32Helper.GetClassNamePublic(fg, classSb, classSb.Capacity);
+                    Services.Win32Helper.GetWindowTextPublic(fg, titleSb, titleSb.Capacity);
+                    uint fgPid = Services.Win32Helper.GetWindowThreadProcessIdPublic(fg);
+                    Log($"[FOCUS] form Deactivate -> fg=0x{fg.ToInt64():X} class='{classSb}' title='{titleSb}' pid={fgPid}");
+                }
+                catch (Exception ex) { Log($"[FOCUS] Deactivate diag failed: {ex.Message}"); }
+            };
         }
 
         #endregion
@@ -209,7 +243,6 @@ namespace EliteSoft.Erwin.AddIn
                     CloseCurrentSession();
                 _isConnected = false;
                 UpdateConnectionStatus(StatusConnecting, Color.Gray);
-                EnableControls(false);
                 Application.DoEvents();
 
                 _currentModel = _openModels[modelIndex];
@@ -225,9 +258,6 @@ namespace EliteSoft.Erwin.AddIn
                 _isConnected = true;
                 StopReconnectTimer();
                 UpdateConnectionStatus(StatusConnected, Color.DarkGreen);
-                using (AddinLogger.BeginScope("LoadExistingValues"))
-                    LoadExistingValues();
-                EnableControls(true);
                 UpdateStatus("Connected to model.", Color.DarkGreen);
 
                 // Skip validations for RE models (temporary models created by Reverse Engineer)
@@ -264,7 +294,14 @@ namespace EliteSoft.Erwin.AddIn
                     // First connect: full initialization
                     using (AddinLogger.BeginScope("InitializeValidationService"))
                         InitializeValidationService();
-                    _globalDataLoaded = true;
+                    // Only mark global data loaded when the connect actually
+                    // populated it. In degraded mode InitializeValidationService
+                    // returns early (no glossary/UDP/etc loaded); flagging it
+                    // anyway would fool the next connect into taking the fast
+                    // ReinitializeForModelSwitch path and skip the corporate /
+                    // glossary load that the new Mart-bound model needs.
+                    if (Services.ConfigContextService.Instance.IsInitialized)
+                        _globalDataLoaded = true;
                 }
 
                 // If ForceClose was triggered during init, stop further processing
@@ -275,7 +312,6 @@ namespace EliteSoft.Erwin.AddIn
             {
                 _isConnected = false;
                 UpdateConnectionStatus(StatusDisconnected, Color.Red);
-                EnableControls(false);
                 UpdateStatus($"Error: {ex.Message}", Color.Red);
             }
             finally
@@ -350,7 +386,12 @@ namespace EliteSoft.Erwin.AddIn
 
         private void ReconnectTimer_Tick(object sender, EventArgs e)
         {
-            if (_isConnected)
+            // The timer normally runs only while we are NOT connected, but
+            // degraded mode is a special case: SCAPI session is open but the
+            // CONFIG mapping is missing, and we want to detect when the user
+            // closes the unmapped model and opens a properly-mapped one. So
+            // bail out only when we are connected AND not degraded.
+            if (_isConnected && !_inDegradedMode)
             {
                 StopReconnectTimer();
                 return;
@@ -360,22 +401,43 @@ namespace EliteSoft.Erwin.AddIn
             {
                 dynamic persistenceUnits = _scapi.PersistenceUnits;
                 int count = persistenceUnits.Count;
-                if (count > 0)
-                {
-                    Log($"Model detected ({count} open). Reconnecting...");
-                    StopReconnectTimer();
+                if (count == 0) return;
 
-                    _openModels.Clear();
+                // In degraded mode we only want to react when a NEW locator
+                // appears - otherwise every tick would yank the user back into
+                // the same broken connect loop on the same unmapped PU.
+                if (_inDegradedMode && !string.IsNullOrEmpty(_lastDegradedLocator))
+                {
+                    bool sawDifferent = false;
                     for (int i = 0; i < count; i++)
                     {
-                        dynamic model = persistenceUnits.Item(i);
-                        _openModels.Add(model);
+                        string loc = Services.PuLocatorReader.Read(persistenceUnits.Item(i)) ?? "";
+                        if (!string.Equals(loc, _lastDegradedLocator, StringComparison.OrdinalIgnoreCase))
+                        {
+                            sawDifferent = true;
+                            break;
+                        }
                     }
+                    if (!sawDifferent) return;
+                    Log($"Reconnect: locator changed from degraded '{_lastDegradedLocator}' - attempting fresh connect.");
+                }
+                else
+                {
+                    Log($"Model detected ({count} open). Reconnecting...");
+                }
 
-                    if (_openModels.Count > 0)
-                    {
-                        ConnectToModel(0);
-                    }
+                StopReconnectTimer();
+
+                _openModels.Clear();
+                for (int i = 0; i < count; i++)
+                {
+                    dynamic model = persistenceUnits.Item(i);
+                    _openModels.Add(model);
+                }
+
+                if (_openModels.Count > 0)
+                {
+                    ConnectToModel(0);
                 }
             }
             catch (Exception ex)
@@ -400,6 +462,20 @@ namespace EliteSoft.Erwin.AddIn
             // model's warnings don't bleed into this one. AddConnectWarning calls
             // from downstream loaders re-populate it; UpdateGeneralTab renders.
             _connectWarnings.Clear();
+
+            // Reset action-buttons + status messages to "normal connect"
+            // defaults. Degraded mode (below) overrides them when the active
+            // model has no CONFIG mapping. Without this reset a previous
+            // degraded run leaves disabled buttons + the orange "Disabled
+            // until ..." DDL status hint visible after the user switches to
+            // a Mart-bound model that DOES have a config (bug observed
+            // 2026-05-09 10:43: General tab refreshed correctly but DDL
+            // Generation tab kept the old warning).
+            btnValidateAll.Enabled = true;
+            btnAlterWizardProd.Enabled = true;
+            btnMartReview.Enabled = true;
+            lblDDLStatus.Text = "";
+            lblDDLStatus.ForeColor = Color.FromArgb(120, 120, 120);
 
             // Config guard — resolve CONFIG row from the active model's mart path
             var ctx = ConfigContextService.Instance;
@@ -461,9 +537,24 @@ namespace EliteSoft.Erwin.AddIn
                     }));
                 }
                 catch (Exception ex) { Log($"BeginInvoke for config warning failed: {ex.Message}"); }
+
+                // Track this degraded locator and re-arm the reconnect timer so
+                // we can detect when the user closes this unmapped model and
+                // opens a Mart-bound one with a valid CONFIG mapping. Without
+                // these two lines the form stays stuck in degraded mode UI
+                // forever after the user switches models, which was the bug
+                // reported on 2026-05-09 (local model -> Mart model still
+                // showed "no config" + Glossary "(not loaded)").
+                _inDegradedMode = true;
+                _lastDegradedLocator = locator ?? "";
+                StartReconnectTimer();
                 return;
             }
             Log($"Config: {ctx.ActiveConfigName} (ID={ctx.ActiveConfigId}), corporate='{ctx.CorporateName ?? "(none)"}', mart='{ctx.MartPath}'");
+            // Successful config resolution: clear degraded markers so the
+            // reconnect timer (if still running) won't immediately re-arm.
+            _inDegradedMode = false;
+            _lastDegradedLocator = null;
 
             // Global data (corporate-scoped, not model-specific)
             using (AddinLogger.BeginScope("DisposeServices"))
@@ -638,21 +729,40 @@ namespace EliteSoft.Erwin.AddIn
         {
             var font = new Font("Segoe UI", 9.5f);
             var fontBold = new Font("Segoe UI", 9.5f, FontStyle.Bold);
-            var fontTitle = new Font("Segoe UI", 14f, FontStyle.Bold);
-            var clrAccent = Color.FromArgb(0, 120, 212);
+            var fontTitle = new Font("Segoe UI", 16f, FontStyle.Bold);
+            var fontSubtitle = new Font("Segoe UI", 9f);
+            var clrAccent = Color.FromArgb(0, 102, 204);
             var clrCardBg = Color.White;
-            var clrLabelDim = Color.FromArgb(100, 100, 100);
+            var clrCardHeader = Color.FromArgb(60, 60, 60);
 
-            // --- Header ---
+            // --- Header (title + subtitle stacked, accent underline) ---
             var lblTitle = new Label
             {
                 Text = "Elite Soft Erwin AddIn",
                 Font = fontTitle,
                 ForeColor = clrAccent,
                 AutoSize = true,
-                Location = new Point(24, 20)
+                Location = new Point(24, 16)
             };
             tabGeneral.Controls.Add(lblTitle);
+
+            var lblSubtitle = new Label
+            {
+                Text = "Model configuration, glossary status, and quick diagnostics",
+                Font = fontSubtitle,
+                ForeColor = Color.FromArgb(120, 120, 120),
+                AutoSize = true,
+                Location = new Point(26, 46)
+            };
+            tabGeneral.Controls.Add(lblSubtitle);
+
+            var pnlAccent = new Panel
+            {
+                Location = new Point(24, 68),
+                Size = new Size(64, 3),
+                BackColor = clrAccent
+            };
+            tabGeneral.Controls.Add(pnlAccent);
 
             var lblCopyright = new Label
             {
@@ -661,7 +771,7 @@ namespace EliteSoft.Erwin.AddIn
                 ForeColor = Color.FromArgb(160, 160, 160),
                 AutoSize = true,
                 Anchor = AnchorStyles.Bottom | AnchorStyles.Left,
-                Location = new Point(24, 430)
+                Location = new Point(24, 432)
             };
             lblCopyright.MouseDown += (s, e) =>
             {
@@ -719,35 +829,112 @@ namespace EliteSoft.Erwin.AddIn
                 }
             };
 
-            // --- Info Card ---
-            var card = CreateInfoCard("", 24, 60, 812, 158, clrCardBg);
-            AddCardRow(card, "Corporate:", "", fontBold, font, 0, out _, out _lblCorporateValue);
-            AddCardRow(card, "Database:", "", fontBold, font, 1, out _, out _lblDbValue);
-            AddCardRow(card, "Registry:", "", fontBold, font, 2, out _, out _lblRegistryValue);
+            // Card sizing constants - kept in sync across the three sections so
+            // the layout reads as a single column. Card width is the tab width
+            // minus the 24px left/right padding the tabGeneral page already has.
+            const int cardX = 24;
+            const int cardW = 892;
+
+            // --- Top Card: Repository / Connection / Diagnostics ---
+            // 5 rows fit comfortably in 158px (5 * 26 + 28 padding).
+            const int repoY = 84;
+            const int repoH = 158;
+            var card = CreateSectionCard("Repository", cardX, repoY, cardW, repoH, clrCardBg, clrCardHeader);
+            AddCardRow(card, "Corporate:", "(not loaded)", fontBold, font, 0, out _, out _lblCorporateValue);
+            AddCardRow(card, "Database:",  "(not loaded)", fontBold, font, 1, out _, out _lblDbValue);
+            AddCardRow(card, "Registry:",  "(not loaded)", fontBold, font, 2, out _, out _lblRegistryValue);
             // Warnings row surfaces any service-load failure (schema mismatch,
             // missing rows, ConfigContext degraded mode, ...) so the user does
             // not have to dig through the log file to discover that a
             // background service silently no-op'd. Width is wide because the
             // text can carry multiple semicolon-separated reasons.
-            AddCardRow(card, "Warnings:", "", fontBold, font, 3, out _, out _lblWarningsValue);
-            _lblWarningsValue.MaximumSize = new Size(680, 0);
+            AddCardRow(card, "Warnings:",  "(none)",       fontBold, font, 3, out _, out _lblWarningsValue);
+            _lblWarningsValue.MaximumSize = new Size(cardW - 160, 0);
             _lblWarningsValue.AutoSize = true;
+            _lblWarningsValue.ForeColor = Color.FromArgb(120, 120, 120);
             // Log file row: clickable link that opens the folder in Explorer
             // with the log file pre-selected. The Debug Log tab was removed
             // 2026-05-07 (UIA event raise from TextBox.AppendText crashed
             // erwin host); the link is the supported way to view the log.
-            AddCardRow(card, "Log file:", AddinLogger.FilePath, fontBold, font, 4, out _, out _lblLogPathValue);
-            _lblLogPathValue.ForeColor = Color.FromArgb(0, 102, 204);
+            AddCardRow(card, "Log file:",  AddinLogger.FilePath, fontBold, font, 4, out _, out _lblLogPathValue);
+            _lblLogPathValue.ForeColor = clrAccent;
             _lblLogPathValue.Cursor = Cursors.Hand;
             _lblLogPathValue.Click += (s, ev) => OpenLogFolder();
             tabGeneral.Controls.Add(card);
 
-            // Initial state
-            _lblCorporateValue.Text = "(not loaded)";
-            _lblDbValue.Text = "(not loaded)";
-            _lblRegistryValue.Text = "(not loaded)";
-            _lblWarningsValue.Text = "(none)";
-            _lblWarningsValue.ForeColor = Color.FromArgb(120, 120, 120);
+            // --- Middle Card: Active Model ---
+            // The legacy grpModel GroupBox sat here with an etched-border that
+            // jarred against the modern card chrome above and below. We unhost
+            // its child labels and re-place them inside a section card body so
+            // the visual rhythm stays consistent. grpModel itself is no longer
+            // added to the tab.
+            const int modelY = repoY + repoH + 30 + 16;  // +30 for card chrome, +16 spacing
+            const int modelH = 60;
+            var modelCard = CreateSectionCard("Active Model", cardX, modelY, cardW, modelH, clrCardBg, clrCardHeader);
+            var modelBody = modelCard.Tag as Panel;
+
+            grpModel.Controls.Remove(lblModelName);
+            grpModel.Controls.Remove(lblActiveModel);
+            grpModel.Controls.Remove(lblConnectionStatus);
+            grpModel.Controls.Remove(lblPlatformStatus);
+
+            lblModelName.Location = new Point(16, 14);
+            lblModelName.Font = font;
+            lblModelName.ForeColor = Color.FromArgb(80, 80, 80);
+            lblModelName.Text = "Model:";
+            modelBody.Controls.Add(lblModelName);
+
+            lblActiveModel.Location = new Point(120, 14);
+            lblActiveModel.Font = fontBold;
+            lblActiveModel.ForeColor = Color.FromArgb(40, 40, 40);
+            lblActiveModel.AutoSize = true;
+            modelBody.Controls.Add(lblActiveModel);
+
+            lblConnectionStatus.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            lblConnectionStatus.Location = new Point(cardW - 220, 14);
+            lblConnectionStatus.AutoSize = false;
+            lblConnectionStatus.Size = new Size(200, 20);
+            lblConnectionStatus.TextAlign = ContentAlignment.MiddleRight;
+            modelBody.Controls.Add(lblConnectionStatus);
+
+            lblPlatformStatus.Location = new Point(16, 38);
+            lblPlatformStatus.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+            lblPlatformStatus.AutoSize = false;
+            lblPlatformStatus.Size = new Size(cardW - 36, 18);
+            lblPlatformStatus.Font = new Font("Segoe UI", 8.5f);
+            lblPlatformStatus.ForeColor = Color.FromArgb(120, 120, 120);
+            modelBody.Controls.Add(lblPlatformStatus);
+
+            tabGeneral.Controls.Add(modelCard);
+
+            // --- Bottom Card: Glossary status (formerly the Glossary tab) ---
+            // The glossary is metadata that decorates validation results and
+            // table-mapping lookups, so its load state belongs alongside the
+            // repo/connection card on the General tab. We surface just two
+            // pieces of information: current status and last refresh.
+            const int glossY = modelY + modelH + 30 + 16;
+            const int glossH = 70;
+            var glossCard = CreateSectionCard("Glossary", cardX, glossY, cardW, glossH, clrCardBg, clrCardHeader);
+            AddCardRow(glossCard, "Status:",       "(not loaded)", fontBold, font, 0, out _, out lblGlossaryStatus);
+            AddCardRow(glossCard, "Last refresh:", "(not yet)",    fontBold, font, 1, out _, out lblLastRefreshValue);
+            lblGlossaryStatus.ForeColor = Color.FromArgb(120, 120, 120);
+            lblLastRefreshValue.ForeColor = Color.FromArgb(120, 120, 120);
+            tabGeneral.Controls.Add(glossCard);
+
+            // Reposition copyright label dynamically below the last card.
+            lblCopyright.Location = new Point(24, glossY + glossH + 30 + 12);
+
+            // Hide Alter Compare tab on startup. The feature is functional but
+            // the multi-version compare flow (PlanTargetVersions) is not yet
+            // wired up for production usage and the tab adds visual noise.
+            // Adding it to _hiddenTabs makes it restorable via the Ctrl+Shift+
+            // LeftClick gesture on the copyright label below, same as any
+            // other manually-hidden tab.
+            if (tabAlterCompare != null && tabControl.TabPages.Contains(tabAlterCompare))
+            {
+                tabControl.TabPages.Remove(tabAlterCompare);
+                _hiddenTabs.Add(tabAlterCompare);
+            }
         }
 
         /// <summary>
@@ -930,8 +1117,71 @@ namespace EliteSoft.Erwin.AddIn
             return card;
         }
 
+        /// <summary>
+        /// CreateInfoCard with a small section header band along the top so
+        /// rows below can start under it without overlapping. The first
+        /// AddCardRow call places its label at y=14 within the card; the
+        /// header band sits in y=0..30 area separated by a 1px tinted strip.
+        /// Used by the new General-tab layout to label the Repository and
+        /// Glossary sections without resorting to GroupBox borders, which
+        /// look heavy next to the card chrome.
+        /// </summary>
+        private Panel CreateSectionCard(string sectionTitle, int x, int y, int w, int h, Color bgColor, Color headerColor)
+        {
+            var card = new Panel
+            {
+                Location = new Point(x, y),
+                Size = new Size(w, h + 30),
+                BackColor = bgColor,
+                BorderStyle = BorderStyle.FixedSingle
+            };
+
+            var header = new Label
+            {
+                Text = sectionTitle,
+                Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+                ForeColor = headerColor,
+                AutoSize = false,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Location = new Point(0, 0),
+                Size = new Size(w - 2, 26),
+                BackColor = Color.FromArgb(247, 249, 252),
+                Padding = new Padding(16, 0, 0, 0)
+            };
+            card.Controls.Add(header);
+
+            var divider = new Panel
+            {
+                Location = new Point(0, 26),
+                Size = new Size(w - 2, 1),
+                BackColor = Color.FromArgb(228, 231, 236)
+            };
+            card.Controls.Add(divider);
+
+            var body = new Panel
+            {
+                Location = new Point(0, 27),
+                Size = new Size(w - 2, h),
+                BackColor = bgColor
+            };
+            card.Controls.Add(body);
+
+            // Track the body so AddCardRow targets it instead of the card
+            // chrome. We do this by tagging the card with the body reference;
+            // AddCardRow looks at the tag and falls back to the card itself
+            // when it is null (preserving the legacy CreateInfoCard call sites).
+            card.Tag = body;
+
+            return card;
+        }
+
         private void AddCardRow(Panel card, string label, string value, Font labelFont, Font valueFont, int row, out Label lblLabel, out Label lblValue)
         {
+            // CreateSectionCard tags the card with its body Panel so the rows
+            // skip the section-header band along the top. CreateInfoCard sets
+            // no Tag, so we fall back to the card itself - existing call sites
+            // keep their original visual layout.
+            var host = card.Tag as Panel ?? card;
             int y = 14 + row * 26;
 
             lblLabel = new Label
@@ -942,7 +1192,7 @@ namespace EliteSoft.Erwin.AddIn
                 AutoSize = true,
                 Location = new Point(16, y)
             };
-            card.Controls.Add(lblLabel);
+            host.Controls.Add(lblLabel);
 
             lblValue = new Label
             {
@@ -952,7 +1202,7 @@ namespace EliteSoft.Erwin.AddIn
                 AutoSize = true,
                 Location = new Point(120, y)
             };
-            card.Controls.Add(lblValue);
+            host.Controls.Add(lblValue);
         }
 
         /// <summary>
@@ -1025,13 +1275,57 @@ namespace EliteSoft.Erwin.AddIn
 
         private void InitializeValidationUI()
         {
-            listValidationResults.Columns.Add("Type", 70);
+            // Severity icons rendered onto the leading column via SmallImageList.
+            // Two indices: 0 = success (green check), 1 = error (red x). Drawn
+            // at runtime so the form has no PNG/icon resource dependency.
+            listValidationResults.SmallImageList = CreateValidationImageList();
+
+            // Type column widened slightly because it now hosts the severity
+            // icon to the left of the type text. The dedicated "" status icon
+            // column from before was redundant and is removed.
+            listValidationResults.Columns.Add("Type", 100);
             listValidationResults.Columns.Add("Object Name", 220);
             listValidationResults.Columns.Add("Rule", 110);
-            listValidationResults.Columns.Add("", 36);     // Status icon column (narrow)
-            listValidationResults.Columns.Add("Message", 380);
+            listValidationResults.Columns.Add("Message", 400);
 
             btnValidateAll.Enabled = false;
+        }
+
+        private static ImageList CreateValidationImageList()
+        {
+            var imgs = new ImageList
+            {
+                ImageSize = new Size(16, 16),
+                ColorDepth = ColorDepth.Depth32Bit
+            };
+            imgs.Images.Add(MakeSeverityIcon(Color.FromArgb(0, 138, 62),  "✓")); // 0 success ✓
+            imgs.Images.Add(MakeSeverityIcon(Color.FromArgb(204, 0, 0),   "×")); // 1 error    ×
+            return imgs;
+        }
+
+        private static Bitmap MakeSeverityIcon(Color bg, string glyph)
+        {
+            var bmp = new Bitmap(16, 16);
+            using (var g = Graphics.FromImage(bmp))
+            {
+                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+                using (var brush = new SolidBrush(bg))
+                {
+                    g.FillEllipse(brush, 0, 0, 15, 15);
+                }
+                using (var font = new Font("Segoe UI", 8.5f, FontStyle.Bold))
+                using (var fb = new SolidBrush(Color.White))
+                {
+                    var sf = new StringFormat
+                    {
+                        Alignment = StringAlignment.Center,
+                        LineAlignment = StringAlignment.Center
+                    };
+                    g.DrawString(glyph, font, fb, new RectangleF(0, 0, 16, 16), sf);
+                }
+            }
+            return bmp;
         }
 
         private void BtnValidateAll_Click(object sender, EventArgs e)
@@ -1247,13 +1541,15 @@ namespace EliteSoft.Erwin.AddIn
                     catch { }
                 }
 
-                // Apply "Errors Only" checkbox filter
+                // Apply "Errors Only" checkbox filter. Severity is now carried
+                // by ImageIndex (0 = success, 1 = error) instead of a dedicated
+                // SubItems[3] glyph column.
                 if (chkErrorsOnly.Checked)
                 {
                     var toRemove = new List<ListViewItem>();
                     foreach (ListViewItem item in listValidationResults.Items)
                     {
-                        if (item.SubItems[3].Text == "\u2713") toRemove.Add(item);
+                        if (item.ImageIndex == 0) toRemove.Add(item);
                     }
                     foreach (var item in toRemove) listValidationResults.Items.Remove(item);
                 }
@@ -1268,12 +1564,19 @@ namespace EliteSoft.Erwin.AddIn
 
         private void AddValidationRow(string objectType, string objectName, string rule, bool isValid, string message)
         {
-            var item = new ListViewItem(objectType);
+            // Severity is now carried by the ImageIndex (rendered as the row
+            // icon left of the Type cell) rather than the dedicated symbol
+            // column or whole-row foreground color. Errors stay readable on
+            // the new flat-no-gridlines list - the red icon is the primary
+            // signal, the message text in normal foreground keeps things
+            // accessible at any zoom level.
+            var item = new ListViewItem(objectType)
+            {
+                ImageIndex = isValid ? 0 : 1
+            };
             item.SubItems.Add(objectName);
             item.SubItems.Add(rule);
-            item.SubItems.Add(isValid ? "\u2713" : "\u2717");
             item.SubItems.Add(isValid ? "" : message);
-            item.ForeColor = isValid ? Color.DarkGreen : Color.Red;
             listValidationResults.Items.Add(item);
         }
 
@@ -1436,87 +1739,12 @@ namespace EliteSoft.Erwin.AddIn
             }
         }
 
-        private void BtnTestConnection_Click(object sender, EventArgs e)
-        {
-            try
-            {
-                lblGlossaryStatus.Text = "Testing glossary connection...";
-                lblGlossaryStatus.ForeColor = Color.DarkBlue;
-                Application.DoEvents();
-
-                if (!DatabaseService.Instance.IsConfigured)
-                {
-                    lblGlossaryStatus.Text = "Repository database not configured. Please configure in ErwinAdmin.";
-                    lblGlossaryStatus.ForeColor = Color.Red;
-                    return;
-                }
-
-                // Test glossary loading via DG_TABLE_MAPPING
-                var glossary = GlossaryService.Instance;
-                glossary.LoadGlossary();
-
-                if (glossary.IsLoaded)
-                {
-                    lblGlossaryStatus.Text = $"Glossary connection successful! ({glossary.Count} entries)";
-                    lblGlossaryStatus.ForeColor = Color.DarkGreen;
-                }
-                else
-                {
-                    lblGlossaryStatus.Text = $"Glossary: {glossary.LastError}";
-                    lblGlossaryStatus.ForeColor = Color.Red;
-                }
-            }
-            catch (Exception ex)
-            {
-                lblGlossaryStatus.Text = $"Connection failed: {ex.Message}";
-                lblGlossaryStatus.ForeColor = Color.Red;
-            }
-        }
-
-        private void BtnReloadGlossary_Click(object sender, EventArgs e)
-        {
-            try
-            {
-                lblGlossaryStatus.Text = "Reconnecting to glossary database...";
-                lblGlossaryStatus.ForeColor = Color.DarkBlue;
-                Application.DoEvents();
-
-                DatabaseService.Instance.ClearCache();
-
-                if (!DatabaseService.Instance.IsConfigured)
-                {
-                    lblGlossaryStatus.Text = "Repository database not configured. Please configure in ErwinAdmin.";
-                    lblGlossaryStatus.ForeColor = Color.Red;
-                    ClearGlossaryConnectionLabels();
-                    return;
-                }
-
-                lblGlossaryStatus.Text = "Loading glossary...";
-                Application.DoEvents();
-
-                GlossaryService.Instance.Reload();
-
-                if (GlossaryService.Instance.IsLoaded)
-                {
-                    lblGlossaryStatus.Text = $"Glossary loaded: {GlossaryService.Instance.Count} entries";
-                    lblGlossaryStatus.ForeColor = Color.DarkGreen;
-
-                    _lastGlossaryRefreshTime = DateTime.Now;
-                    UpdateLastRefreshLabel();
-                    UpdateValidationStatus();
-                }
-                else
-                {
-                    lblGlossaryStatus.Text = $"Failed to load glossary: {GlossaryService.Instance.LastError}";
-                    lblGlossaryStatus.ForeColor = Color.Red;
-                }
-            }
-            catch (Exception ex)
-            {
-                lblGlossaryStatus.Text = $"Error: {ex.Message}";
-                lblGlossaryStatus.ForeColor = Color.Red;
-            }
-        }
+        // BtnTestConnection_Click and BtnReloadGlossary_Click removed (2026-05-09):
+        // the buttons used to live on the Glossary tab, but that tab is gone -
+        // the glossary status is now a passive section on the General tab.
+        // Glossary loading runs automatically when the model loads or when
+        // DatabaseService.ClearCache is invoked elsewhere; manual reload is no
+        // longer surfaced.
 
         private void LoadGlossary()
         {
@@ -1526,7 +1754,6 @@ namespace EliteSoft.Erwin.AddIn
                 {
                     lblGlossaryStatus.Text = "Repository database not configured. Please configure in ErwinAdmin.";
                     lblGlossaryStatus.ForeColor = Color.Red;
-                    ClearGlossaryConnectionLabels();
                     return;
                 }
 
@@ -1536,49 +1763,35 @@ namespace EliteSoft.Erwin.AddIn
                     glossary.LoadGlossary();
                 }
 
-                UpdateGlossaryConnectionLabels();
-
                 if (glossary.IsLoaded)
                 {
-                    lblGlossaryStatus.Text = $"Glossary loaded: {glossary.Count} entries";
-                    lblGlossaryStatus.ForeColor = Color.DarkGreen;
+                    lblGlossaryStatus.Text = $"Loaded ({glossary.Count} entries)";
+                    lblGlossaryStatus.ForeColor = Color.FromArgb(0, 138, 62);
+                    _lastGlossaryRefreshTime = DateTime.Now;
+                    UpdateLastRefreshLabel();
                 }
                 else
                 {
-                    lblGlossaryStatus.Text = $"Glossary not loaded: {glossary.LastError}";
-                    lblGlossaryStatus.ForeColor = Color.Red;
+                    lblGlossaryStatus.Text = $"Not loaded - {glossary.LastError}";
+                    lblGlossaryStatus.ForeColor = Color.FromArgb(204, 0, 0);
                     AddConnectWarning($"Glossary: {glossary.LastError}");
                 }
             }
             catch (Exception ex)
             {
                 Log($"LoadGlossary error: {ex.Message}");
-                lblGlossaryStatus.Text = $"Error: {ex.Message}";
-                lblGlossaryStatus.ForeColor = Color.Red;
+                lblGlossaryStatus.Text = $"Error - {ex.Message}";
+                lblGlossaryStatus.ForeColor = Color.FromArgb(204, 0, 0);
                 AddConnectWarning($"Glossary: {ex.Message}");
             }
         }
 
-        private void UpdateGlossaryConnectionLabels()
-        {
-            if (GlossaryService.Instance.IsLoaded)
-            {
-                lblHostValue.Text = "Configured";
-                lblPortValue.Text = "-";
-                lblDatabaseValue.Text = $"{GlossaryService.Instance.Count} entries";
-            }
-            else
-            {
-                ClearGlossaryConnectionLabels();
-            }
-        }
-
-        private void ClearGlossaryConnectionLabels()
-        {
-            lblHostValue.Text = "(not loaded)";
-            lblPortValue.Text = "-";
-            lblDatabaseValue.Text = "(not loaded)";
-        }
+        // UpdateGlossaryConnectionLabels / ClearGlossaryConnectionLabels removed
+        // (2026-05-09): the host/port/database labels they wrote to lived on
+        // the retired Glossary tab and only ever surfaced placeholder values
+        // ("Configured", "-", "(N entries)") instead of real connection
+        // metadata. The General tab's Glossary card surfaces just the load
+        // status and last refresh time, both managed by LoadGlossary directly.
 
         #endregion
 
@@ -2122,143 +2335,11 @@ namespace EliteSoft.Erwin.AddIn
 
         #endregion
 
-        #region Configuration Tab
-
-        private void LoadExistingValues()
-        {
-            try
-            {
-                dynamic modelObjects = _session.ModelObjects;
-                dynamic rootObj = GetRootObject(modelObjects);
-
-                if (rootObj != null)
-                {
-                    try
-                    {
-                        string modelName = rootObj.Properties("Name").Value?.ToString();
-                        if (!string.IsNullOrEmpty(modelName))
-                        {
-                            txtName.Text = modelName;
-                        }
-                    }
-                    catch { }
-                }
-            }
-            catch (Exception ex)
-            {
-                Log($"LoadExistingValues error: {ex.Message}");
-            }
-        }
-
-        private void OnConfigChanged(object sender, EventArgs e)
-        {
-            string dbName = txtDatabaseName.Text.Trim();
-            string schemaName = txtSchemaName.Text.Trim();
-
-            if (!string.IsNullOrEmpty(dbName) && !string.IsNullOrEmpty(schemaName))
-            {
-                txtName.Text = $"{dbName}.{schemaName}";
-            }
-            else if (!string.IsNullOrEmpty(dbName))
-            {
-                txtName.Text = dbName;
-            }
-            else if (!string.IsNullOrEmpty(schemaName))
-            {
-                txtName.Text = schemaName;
-            }
-            else
-            {
-                txtName.Text = "";
-            }
-        }
-
-        private void BtnApply_Click(object sender, EventArgs e)
-        {
-            if (!_isConnected)
-            {
-                MessageBox.Show("Not connected to a model.", "Warning", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
-            }
-
-            if (string.IsNullOrWhiteSpace(txtDatabaseName.Text))
-            {
-                MessageBox.Show("Database Name cannot be empty.", "Validation Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                txtDatabaseName.Focus();
-                return;
-            }
-
-            if (string.IsNullOrWhiteSpace(txtSchemaName.Text))
-            {
-                MessageBox.Show("Schema Name cannot be empty.", "Validation Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                txtSchemaName.Focus();
-                return;
-            }
-
-            try
-            {
-                UpdateStatus("Saving...", Color.DarkBlue);
-                Application.DoEvents();
-
-                int transId = _session.BeginNamedTransaction("SaveConfig");
-
-                try
-                {
-                    dynamic modelObjects = _session.ModelObjects;
-                    dynamic rootObj = GetRootObject(modelObjects);
-
-                    bool nameSaved = false;
-
-                    if (rootObj != null && !string.IsNullOrWhiteSpace(txtName.Text))
-                    {
-                        try
-                        {
-                            rootObj.Properties("Name").Value = txtName.Text.Trim();
-                            nameSaved = true;
-                        }
-                        catch { }
-                    }
-
-                    _session.CommitTransaction(transId);
-
-                    bool modelSaved = false;
-                    try
-                    {
-                        _currentModel.Save();
-                        modelSaved = true;
-                    }
-                    catch { }
-
-                    if (nameSaved && modelSaved)
-                    {
-                        UpdateStatus("Saved!", Color.DarkGreen);
-                        MessageBox.Show(
-                            $"Configuration saved successfully!\n\nDatabase: {txtDatabaseName.Text}\nSchema: {txtSchemaName.Text}\nName: {txtName.Text}",
-                            "Success", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                    }
-                    else
-                    {
-                        UpdateStatus("Warning!", Color.Orange);
-                        string msg = "Values could not be saved:\n";
-                        if (!nameSaved) msg += "- Name property could not be saved\n";
-                        if (!modelSaved) msg += "- Model could not be saved\n";
-                        MessageBox.Show(msg, "Warning", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                    }
-                }
-                catch
-                {
-                    try { _session.RollbackTransaction(transId); } catch { }
-                    throw;
-                }
-            }
-            catch (Exception ex)
-            {
-                UpdateStatus("Error!", Color.Red);
-                MessageBox.Show($"Error: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-        }
-
-        #endregion
+        // Configuration Tab region removed (2026-05-09):
+        //   - The Database/Schema/Name editor duplicated erwin's own model
+        //     property editors and forced a redundant Save round-trip.
+        //   - Methods LoadExistingValues, OnConfigChanged, BtnApply_Click and
+        //     the EnableControls helper were retired with the tab.
 
         #region Approval / Review
 
@@ -2768,22 +2849,28 @@ namespace EliteSoft.Erwin.AddIn
             return sb.ToString();
         }
 
-        private void ApplySqlHighlighting(string sql)
+        private void ApplySqlHighlighting(string sql) => ApplySqlHighlighting(rtbDDLOutput, sql);
+
+        // Generic helper: applies VS-Code-flavored SQL syntax highlighting to
+        // any RichTextBox. The DDL Generation tab and the Alter Compare tab
+        // both render alter scripts and reuse this so their dark-theme output
+        // stays visually identical (same keyword/type/comment/diff colors).
+        private void ApplySqlHighlighting(RichTextBox rtb, string sql)
         {
-            rtbDDLOutput.SuspendLayout();
-            rtbDDLOutput.Clear();
+            rtb.SuspendLayout();
+            rtb.Clear();
             // Pad with trailing blank lines so the last real line isn't
             // clipped at the bottom of the RichTextBox viewport when the
             // user scrolls all the way down (common RTB rendering issue).
-            rtbDDLOutput.Text = sql + "\n\n\n";
+            rtb.Text = sql + "\n\n\n";
 
             // Set default color
-            rtbDDLOutput.SelectAll();
-            rtbDDLOutput.SelectionColor = Color.FromArgb(220, 220, 220);
+            rtb.SelectAll();
+            rtb.SelectionColor = Color.FromArgb(220, 220, 220);
 
             // IMPORTANT: Use RichTextBox's own text for regex matching
             // RichTextBox converts \r\n to \n internally, so indices differ from original string
-            string rtbText = rtbDDLOutput.Text;
+            string rtbText = rtb.Text;
 
             var clrKeyword = Color.FromArgb(86, 156, 214);     // VS Code blue
             var clrType = Color.FromArgb(78, 201, 176);         // VS Code teal
@@ -2797,37 +2884,37 @@ namespace EliteSoft.Erwin.AddIn
             var clrSection = Color.FromArgb(220, 220, 100);     // Yellow
 
             // 1. Keywords (blue)
-            HighlightRegex(rtbText, @"\b(CREATE|ALTER|DROP|TABLE|ADD|COLUMN|CONSTRAINT|PRIMARY|KEY|FOREIGN|REFERENCES|NOT|NULL|DEFAULT|IDENTITY|CLUSTERED|NONCLUSTERED|INDEX|UNIQUE|ON|DELETE|UPDATE|CASCADE|SET|CHECK|WITH|ASC|DESC|BEGIN|END|DECLARE|IF|EXISTS|SELECT|FROM|WHERE|AND|OR|RETURN|GOTO|TRIGGER|FOR|INSERT|AS|RAISERROR|ROLLBACK|TRANSACTION|INTO|ACTION)\b", clrKeyword);
+            HighlightRegex(rtb, rtbText, @"\b(CREATE|ALTER|DROP|TABLE|ADD|COLUMN|CONSTRAINT|PRIMARY|KEY|FOREIGN|REFERENCES|NOT|NULL|DEFAULT|IDENTITY|CLUSTERED|NONCLUSTERED|INDEX|UNIQUE|ON|DELETE|UPDATE|CASCADE|SET|CHECK|WITH|ASC|DESC|BEGIN|END|DECLARE|IF|EXISTS|SELECT|FROM|WHERE|AND|OR|RETURN|GOTO|TRIGGER|FOR|INSERT|AS|RAISERROR|ROLLBACK|TRANSACTION|INTO|ACTION)\b", clrKeyword);
 
             // 2. Data types (teal)
-            HighlightRegex(rtbText, @"\b(int|bigint|smallint|tinyint|bit|varchar|nvarchar|char|nchar|text|ntext|datetime|smalldatetime|date|time|timestamp|decimal|numeric|float|real|money|smallmoney|varbinary|binary|image|uniqueidentifier|VARCHAR2|NUMBER|CLOB|BLOB|COLLATE)\b", clrType);
+            HighlightRegex(rtb, rtbText, @"\b(int|bigint|smallint|tinyint|bit|varchar|nvarchar|char|nchar|text|ntext|datetime|smalldatetime|date|time|timestamp|decimal|numeric|float|real|money|smallmoney|varbinary|binary|image|uniqueidentifier|VARCHAR2|NUMBER|CLOB|BLOB|COLLATE)\b", clrType);
 
             // 3. Numbers (light green)
-            HighlightRegex(rtbText, @"(?<![a-zA-Z_])\d+(?![a-zA-Z_])", clrNumber);
+            HighlightRegex(rtb, rtbText, @"(?<![a-zA-Z_])\d+(?![a-zA-Z_])", clrNumber);
 
             // 4. GO (purple)
-            HighlightRegex(rtbText, @"(?m)^go$", clrGo);
+            HighlightRegex(rtb, rtbText, @"(?m)^go$", clrGo);
 
             // 5. String literals (orange)
-            HighlightRegex(rtbText, @"'[^']*'", clrString);
+            HighlightRegex(rtb, rtbText, @"'[^']*'", clrString);
 
             // 6. Comments (green) - overrides keywords inside comments
-            HighlightRegex(rtbText, @"--[^\n]*", clrComment);
+            HighlightRegex(rtb, rtbText, @"--[^\n]*", clrComment);
 
             // 7. Diff markers (override comment color)
-            HighlightRegex(rtbText, @"-- NEW:.*", clrDiffNew);
-            HighlightRegex(rtbText, @"-- DROPPED:.*", clrDiffDrop);
-            HighlightRegex(rtbText, @"-- CHANGED:.*", clrDiffChange);
-            HighlightRegex(rtbText, @"-- =+.*=+", clrSection);
-            HighlightRegex(rtbText, @"-- Summary:.*", clrSection);
-            HighlightRegex(rtbText, @"-- WARNING:.*", clrDiffDrop);
+            HighlightRegex(rtb, rtbText, @"-- NEW:.*", clrDiffNew);
+            HighlightRegex(rtb, rtbText, @"-- DROPPED:.*", clrDiffDrop);
+            HighlightRegex(rtb, rtbText, @"-- CHANGED:.*", clrDiffChange);
+            HighlightRegex(rtb, rtbText, @"-- =+.*=+", clrSection);
+            HighlightRegex(rtb, rtbText, @"-- Summary:.*", clrSection);
+            HighlightRegex(rtb, rtbText, @"-- WARNING:.*", clrDiffDrop);
 
-            rtbDDLOutput.SelectionStart = 0;
-            rtbDDLOutput.SelectionLength = 0;
-            rtbDDLOutput.ResumeLayout();
+            rtb.SelectionStart = 0;
+            rtb.SelectionLength = 0;
+            rtb.ResumeLayout();
         }
 
-        private void HighlightRegex(string rtbText, string pattern, Color color)
+        private static void HighlightRegex(RichTextBox rtb, string rtbText, string pattern, Color color)
         {
             try
             {
@@ -2836,8 +2923,8 @@ namespace EliteSoft.Erwin.AddIn
                         System.Text.RegularExpressions.RegexOptions.IgnoreCase |
                         System.Text.RegularExpressions.RegexOptions.Multiline))
                 {
-                    rtbDDLOutput.Select(m.Index, m.Length);
-                    rtbDDLOutput.SelectionColor = color;
+                    rtb.Select(m.Index, m.Length);
+                    rtb.SelectionColor = color;
                 }
             }
             catch { }
@@ -4567,19 +4654,10 @@ namespace EliteSoft.Erwin.AddIn
             lblStatus.ForeColor = color;
         }
 
-        private void EnableControls(bool enabled)
-        {
-            txtDatabaseName.Enabled = enabled;
-            txtSchemaName.Enabled = enabled;
-            txtName.Enabled = enabled;
-            btnApply.Enabled = enabled;
-        }
-
         private void ShowError(string message, string title)
         {
             UpdateConnectionStatus(StatusDisconnected, Color.Red);
             _isConnected = false;
-            EnableControls(false);
             UpdateStatus("Connection failed.", Color.Red);
             MessageBox.Show(this, message, title, MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
@@ -4814,7 +4892,6 @@ namespace EliteSoft.Erwin.AddIn
 
                 // Reset UI to disconnected state
                 UpdateConnectionStatus(StatusDisconnected, Color.Red);
-                EnableControls(false);
                 btnValidateAll.Enabled = false;
                 lblPlatformStatus.Text = "";
                 UpdateStatus("Model closed. Waiting for a model to open...", Color.Gray);
@@ -4868,7 +4945,16 @@ namespace EliteSoft.Erwin.AddIn
         {
             try
             {
-                if (tabControl.SelectedTab != tabAlterCompare) return;
+                // Defensive: log every tab transition so a future erwin AV can
+                // be correlated to the tab the user was on. Earlier crashes
+                // (2026-05-09, coreclr AV during Alter Compare entry) had no
+                // log breadcrumbs - the addin's own Execute log ended cleanly,
+                // and only the Windows WER report identified the host module.
+                // Logging here gives us a definitive last-tab marker.
+                var sel = tabControl.SelectedTab;
+                Log($"[TAB] -> {sel?.Text ?? "(null)"} ({sel?.Name ?? "-"})");
+
+                if (sel != tabAlterCompare) return;
 
                 // First entry, or active model changed since last init.
                 bool needsInit = !ReferenceEquals(_alterTabInitFor, _currentModel as object);
@@ -4927,6 +5013,32 @@ namespace EliteSoft.Erwin.AddIn
                     lblAlterCompareStatus.Text = "Open a model to begin.";
                     // Stale results from a different model would mislead the
                     // user, so clear them when there is no model anymore.
+                    lvAlterChanges.Items.Clear();
+                    txtAlterSql.Clear();
+                    _alterLastSql = string.Empty;
+                    btnSaveAlterSql.Enabled = false;
+                    btnCopyAlterSql.Enabled = false;
+                    return;
+                }
+
+                // Degraded mode (ConfigContext failed to resolve a Mart CONFIG
+                // mapping for this model) means the active PU is non-Mart or
+                // unmapped. Calling SCAPI dispatch (PropertyBag, version
+                // queries, dialect probing) on such a PU triggers a NULL deref
+                // deep in EM_GDM whose IDispatchInvoke unwind crashes erwin -
+                // verified 2026-05-09 10:34 against the same PowerDesigner-
+                // imported local file path that already crashed the host on
+                // 2026-05-08. Show a plain "config required" stub instead of
+                // running the SCAPI calls that would AV.
+                if (!Services.ConfigContextService.Instance.IsInitialized)
+                {
+                    lblAlterActiveInfo.Text = "Active: (model loaded, but no CONFIG mapping)";
+                    lblAlterDialectInfo.Text = "Dialect: - (config required)";
+                    cmbAlterTargetVersion.Items.Clear();
+                    _alterTargetVersions.Clear();
+                    btnAlterCompare.Enabled = false;
+                    lblAlterCompareStatus.Text =
+                        "Alter Compare is disabled until a Mart-bound model with a CONFIG mapping is open.";
                     lvAlterChanges.Items.Clear();
                     txtAlterSql.Clear();
                     _alterLastSql = string.Empty;
@@ -5069,6 +5181,9 @@ namespace EliteSoft.Erwin.AddIn
             }
             _alterLastSql = sb.ToString();
             _alterLastDialect = outcome.Dialect;
+            // Plain TextBox - syntax highlighting reverted (see Designer.cs note
+            // on the txtAlterSql declaration: RichTextBox.Clear() during tab
+            // refresh raised a UIA event that crashed erwin host).
             txtAlterSql.Text = _alterLastSql;
             txtAlterSql.SelectionStart = 0;
             txtAlterSql.ScrollToCaret();

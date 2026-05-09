@@ -36,11 +36,9 @@ namespace EliteSoft.Erwin.AddIn
             // === Control Instantiation ===
             this.tabControl = new System.Windows.Forms.TabControl();
             this.tabGeneral = new System.Windows.Forms.TabPage();
-            this.tabConfiguration = new System.Windows.Forms.TabPage();
-            this.tabGlossary = new System.Windows.Forms.TabPage();
             this.tabValidation = new System.Windows.Forms.TabPage();
             this.tabTableProcesses = new System.Windows.Forms.TabPage();
-            this.tabApproval = new System.Windows.Forms.TabPage();
+            this.tabDdlGeneration = new System.Windows.Forms.TabPage();
             this.tabAlterCompare = new System.Windows.Forms.TabPage();
             // Alter Compare tab — inline UI (Phase 3.G)
             this.lblAlterActiveInfo = new System.Windows.Forms.Label();
@@ -62,29 +60,12 @@ namespace EliteSoft.Erwin.AddIn
             this.lblModelName = new System.Windows.Forms.Label();
             this.lblPlatformStatus = new System.Windows.Forms.Label();
 
-            // Configuration tab
-            this.grpConfig = new System.Windows.Forms.GroupBox();
-            this.lblDatabaseName = new System.Windows.Forms.Label();
-            this.txtDatabaseName = new System.Windows.Forms.TextBox();
-            this.lblSchemaName = new System.Windows.Forms.Label();
-            this.txtSchemaName = new System.Windows.Forms.TextBox();
-            this.lblName = new System.Windows.Forms.Label();
-            this.txtName = new System.Windows.Forms.TextBox();
-            this.btnApply = new System.Windows.Forms.Button();
-
-            // Glossary tab
-            this.grpGlossary = new System.Windows.Forms.GroupBox();
-            this.lblHost = new System.Windows.Forms.Label();
-            this.lblHostValue = new System.Windows.Forms.Label();
-            this.lblPort = new System.Windows.Forms.Label();
-            this.lblPortValue = new System.Windows.Forms.Label();
-            this.lblGlossaryDatabase = new System.Windows.Forms.Label();
-            this.lblDatabaseValue = new System.Windows.Forms.Label();
-            this.btnTestConnection = new System.Windows.Forms.Button();
-            this.btnReloadGlossary = new System.Windows.Forms.Button();
-            this.lblGlossaryStatus = new System.Windows.Forms.Label();
-            this.lblLastRefresh = new System.Windows.Forms.Label();
-            this.lblLastRefreshValue = new System.Windows.Forms.Label();
+            // Configuration tab + grpConfig removed: the Database/Schema/Name
+            // editor was retired (it duplicated erwin's own model property
+            // editors). Glossary status moved into the General tab as a card
+            // section (lblGlossaryStatus + lblLastRefreshValue still live on
+            // this form; they're created and positioned at runtime by
+            // InitializeGeneralTab so no design-time declarations are needed).
 
             // Validation tab — nested tabs removed, single list + filter
             this.listValidationResults = new System.Windows.Forms.ListView();
@@ -115,14 +96,10 @@ namespace EliteSoft.Erwin.AddIn
 
             this.tabControl.SuspendLayout();
             this.tabGeneral.SuspendLayout();
-            this.tabConfiguration.SuspendLayout();
-            this.tabGlossary.SuspendLayout();
             this.tabValidation.SuspendLayout();
             this.tabTableProcesses.SuspendLayout();
             this.grpTableProcesses.SuspendLayout();
             this.grpModel.SuspendLayout();
-            this.grpConfig.SuspendLayout();
-            this.grpGlossary.SuspendLayout();
             this.pnlStatusBar.SuspendLayout();
             this.SuspendLayout();
 
@@ -131,16 +108,14 @@ namespace EliteSoft.Erwin.AddIn
             // ================================================================
             this.tabControl.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right | System.Windows.Forms.AnchorStyles.Bottom;
             this.tabControl.Controls.Add(this.tabGeneral);
-            this.tabControl.Controls.Add(this.tabConfiguration);
-            this.tabControl.Controls.Add(this.tabGlossary);
             this.tabControl.Controls.Add(this.tabValidation);
             this.tabControl.Controls.Add(this.tabTableProcesses);
-            this.tabControl.Controls.Add(this.tabApproval);
+            this.tabControl.Controls.Add(this.tabDdlGeneration);
             this.tabControl.Controls.Add(this.tabAlterCompare);
             this.tabControl.Location = new System.Drawing.Point(16, 16);
             this.tabControl.Name = "tabControl";
             this.tabControl.SelectedIndex = 0;
-            this.tabControl.Size = new System.Drawing.Size(868, 490);
+            this.tabControl.Size = new System.Drawing.Size(948, 580);
             this.tabControl.TabIndex = 0;
             this.tabControl.Font = fontBody;
             this.tabControl.SelectedIndexChanged += new System.EventHandler(this.tabControl_SelectedIndexChanged);
@@ -151,28 +126,25 @@ namespace EliteSoft.Erwin.AddIn
             this.tabGeneral.Location = new System.Drawing.Point(4, 26);
             this.tabGeneral.Name = "tabGeneral";
             this.tabGeneral.Padding = new System.Windows.Forms.Padding(20);
-            this.tabGeneral.Size = new System.Drawing.Size(860, 460);
+            this.tabGeneral.Size = new System.Drawing.Size(940, 550);
             this.tabGeneral.TabIndex = 10;
             this.tabGeneral.Text = "General";
             this.tabGeneral.UseVisualStyleBackColor = true;
 
-            // --- General tab content (header/info card built at runtime in InitializeGeneralTab) ---
-            // Active Model groupbox (formerly the standalone "Model" tab) lives below the info card.
-            this.tabGeneral.Controls.Add(this.grpModel);
-
-            // grpModel — Platform status moved inside
-            this.grpModel.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
+            // --- General tab content (built at runtime in InitializeGeneralTab) ---
+            // grpModel was the legacy "Active Model" GroupBox; it is no longer
+            // added to tabGeneral - the runtime builder lifts its child labels
+            // (lblModelName / lblActiveModel / lblConnectionStatus /
+            // lblPlatformStatus) out of grpModel and re-hosts them on a section
+            // card that matches the Repository / Glossary card chrome. We keep
+            // grpModel as a zombie holder so existing references don't break,
+            // but it isn't displayed.
             this.grpModel.Controls.Add(this.lblActiveModel);
             this.grpModel.Controls.Add(this.lblConnectionStatus);
             this.grpModel.Controls.Add(this.lblModelName);
             this.grpModel.Controls.Add(this.lblPlatformStatus);
-            this.grpModel.Location = new System.Drawing.Point(24, 180);
             this.grpModel.Name = "grpModel";
-            this.grpModel.Size = new System.Drawing.Size(812, 95);
-            this.grpModel.TabIndex = 0;
-            this.grpModel.TabStop = false;
-            this.grpModel.Text = "Active Model";
-            this.grpModel.Font = fontBody;
+            this.grpModel.Visible = false;
 
             // lblModelName
             this.lblModelName.AutoSize = true;
@@ -214,191 +186,17 @@ namespace EliteSoft.Erwin.AddIn
             this.lblPlatformStatus.Font = fontCaption;
 
             // ================================================================
-            // TAB 2: CONFIGURATION
+            // (Configuration + Glossary tabs were retired - Configuration was a
+            // duplicate of erwin's own model property editors, and the Glossary
+            // tab's read-only status fields are now rendered as a section on the
+            // General tab via InitializeGeneralTab. The Test Connection / Reload
+            // Glossary buttons and their handlers were removed; the glossary
+            // reloads automatically when the model loads or when DatabaseService
+            // reconnects.)
             // ================================================================
-            this.tabConfiguration.Controls.Add(this.grpConfig);
-            this.tabConfiguration.Location = new System.Drawing.Point(4, 26);
-            this.tabConfiguration.Name = "tabConfiguration";
-            this.tabConfiguration.Padding = new System.Windows.Forms.Padding(12);
-            this.tabConfiguration.Size = new System.Drawing.Size(860, 460);
-            this.tabConfiguration.TabIndex = 1;
-            this.tabConfiguration.Text = "Configuration";
-            this.tabConfiguration.UseVisualStyleBackColor = true;
-
-            // grpConfig
-            this.grpConfig.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
-            this.grpConfig.Controls.Add(this.lblDatabaseName);
-            this.grpConfig.Controls.Add(this.txtDatabaseName);
-            this.grpConfig.Controls.Add(this.lblSchemaName);
-            this.grpConfig.Controls.Add(this.txtSchemaName);
-            this.grpConfig.Controls.Add(this.lblName);
-            this.grpConfig.Controls.Add(this.txtName);
-            this.grpConfig.Controls.Add(this.btnApply);
-            this.grpConfig.Location = new System.Drawing.Point(12, 12);
-            this.grpConfig.Name = "grpConfig";
-            this.grpConfig.Size = new System.Drawing.Size(833, 175);
-            this.grpConfig.TabIndex = 0;
-            this.grpConfig.TabStop = false;
-            this.grpConfig.Text = "Model Configuration";
-
-            this.lblDatabaseName.AutoSize = true;
-            this.lblDatabaseName.Location = new System.Drawing.Point(16, 32);
-            this.lblDatabaseName.Text = "Database:";
-            this.lblDatabaseName.ForeColor = clrTextPrimary;
-
-            this.txtDatabaseName.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
-            this.txtDatabaseName.Location = new System.Drawing.Point(100, 28);
-            this.txtDatabaseName.Size = new System.Drawing.Size(440, 25);
-            this.txtDatabaseName.TabIndex = 1;
-            this.txtDatabaseName.TextChanged += new System.EventHandler(this.OnConfigChanged);
-
-            this.lblSchemaName.AutoSize = true;
-            this.lblSchemaName.Location = new System.Drawing.Point(16, 64);
-            this.lblSchemaName.Text = "Schema:";
-            this.lblSchemaName.ForeColor = clrTextPrimary;
-
-            this.txtSchemaName.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
-            this.txtSchemaName.Location = new System.Drawing.Point(100, 60);
-            this.txtSchemaName.Size = new System.Drawing.Size(440, 25);
-            this.txtSchemaName.TabIndex = 3;
-            this.txtSchemaName.TextChanged += new System.EventHandler(this.OnConfigChanged);
-
-            this.lblName.AutoSize = true;
-            this.lblName.Location = new System.Drawing.Point(16, 96);
-            this.lblName.Text = "Name:";
-            this.lblName.ForeColor = clrTextPrimary;
-
-            // txtName — read-only computed field styled differently
-            this.txtName.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
-            this.txtName.Location = new System.Drawing.Point(100, 92);
-            this.txtName.Size = new System.Drawing.Size(440, 25);
-            this.txtName.TabIndex = 5;
-            this.txtName.ReadOnly = true;
-            this.txtName.BackColor = clrSurfaceAlt;
-            this.txtName.ForeColor = clrTextSecondary;
-            this.txtName.Font = new System.Drawing.Font("Segoe UI", 9.5F, System.Drawing.FontStyle.Italic);
-            this.txtName.BorderStyle = System.Windows.Forms.BorderStyle.FixedSingle;
-
-            // btnApply — Primary button style, right-aligned
-            this.btnApply.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right;
-            this.btnApply.Location = new System.Drawing.Point(710, 132);
-            this.btnApply.Name = "btnApply";
-            this.btnApply.Size = new System.Drawing.Size(110, 32);
-            this.btnApply.TabIndex = 6;
-            this.btnApply.Text = "Apply to Model";
-            this.btnApply.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnApply.BackColor = clrPrimary;
-            this.btnApply.ForeColor = System.Drawing.Color.White;
-            this.btnApply.Font = fontBodyBold;
-            this.btnApply.FlatAppearance.BorderSize = 0;
-            this.btnApply.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnApply.Click += new System.EventHandler(this.BtnApply_Click);
 
             // ================================================================
-            // TAB 3: GLOSSARY
-            // ================================================================
-            this.tabGlossary.Controls.Add(this.grpGlossary);
-            this.tabGlossary.Location = new System.Drawing.Point(4, 26);
-            this.tabGlossary.Name = "tabGlossary";
-            this.tabGlossary.Padding = new System.Windows.Forms.Padding(12);
-            this.tabGlossary.Size = new System.Drawing.Size(860, 460);
-            this.tabGlossary.TabIndex = 2;
-            this.tabGlossary.Text = "Glossary";
-            this.tabGlossary.UseVisualStyleBackColor = true;
-
-            this.grpGlossary.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
-            this.grpGlossary.Controls.Add(this.lblHost);
-            this.grpGlossary.Controls.Add(this.lblHostValue);
-            this.grpGlossary.Controls.Add(this.lblPort);
-            this.grpGlossary.Controls.Add(this.lblPortValue);
-            this.grpGlossary.Controls.Add(this.lblGlossaryDatabase);
-            this.grpGlossary.Controls.Add(this.lblDatabaseValue);
-            this.grpGlossary.Controls.Add(this.btnTestConnection);
-            this.grpGlossary.Controls.Add(this.btnReloadGlossary);
-            this.grpGlossary.Controls.Add(this.lblGlossaryStatus);
-            this.grpGlossary.Controls.Add(this.lblLastRefresh);
-            this.grpGlossary.Controls.Add(this.lblLastRefreshValue);
-            this.grpGlossary.Location = new System.Drawing.Point(12, 12);
-            this.grpGlossary.Name = "grpGlossary";
-            this.grpGlossary.Size = new System.Drawing.Size(833, 210);
-            this.grpGlossary.TabIndex = 0;
-            this.grpGlossary.TabStop = false;
-            this.grpGlossary.Text = "Glossary Database Connection";
-
-            this.lblHost.AutoSize = true;
-            this.lblHost.Location = new System.Drawing.Point(16, 32);
-            this.lblHost.Text = "Host:";
-            this.lblHost.ForeColor = clrTextPrimary;
-
-            this.lblHostValue.AutoSize = true;
-            this.lblHostValue.Font = fontBodyBold;
-            this.lblHostValue.Location = new System.Drawing.Point(100, 32);
-            this.lblHostValue.Text = "(not loaded)";
-            this.lblHostValue.ForeColor = clrTextDisabled;
-
-            this.lblPort.AutoSize = true;
-            this.lblPort.Location = new System.Drawing.Point(320, 32);
-            this.lblPort.Text = "Port:";
-            this.lblPort.ForeColor = clrTextPrimary;
-
-            this.lblPortValue.AutoSize = true;
-            this.lblPortValue.Font = fontBodyBold;
-            this.lblPortValue.Location = new System.Drawing.Point(360, 32);
-            this.lblPortValue.Text = "-";
-            this.lblPortValue.ForeColor = clrTextDisabled;
-
-            this.lblGlossaryDatabase.AutoSize = true;
-            this.lblGlossaryDatabase.Location = new System.Drawing.Point(16, 58);
-            this.lblGlossaryDatabase.Text = "Database:";
-            this.lblGlossaryDatabase.ForeColor = clrTextPrimary;
-
-            this.lblDatabaseValue.AutoSize = true;
-            this.lblDatabaseValue.Font = fontBodyBold;
-            this.lblDatabaseValue.Location = new System.Drawing.Point(100, 58);
-            this.lblDatabaseValue.Text = "(not loaded)";
-            this.lblDatabaseValue.ForeColor = clrTextDisabled;
-
-            this.lblLastRefresh.AutoSize = true;
-            this.lblLastRefresh.Location = new System.Drawing.Point(16, 84);
-            this.lblLastRefresh.Text = "Last Refresh:";
-            this.lblLastRefresh.ForeColor = clrTextPrimary;
-
-            this.lblLastRefreshValue.AutoSize = true;
-            this.lblLastRefreshValue.Font = fontBodyBold;
-            this.lblLastRefreshValue.Location = new System.Drawing.Point(100, 84);
-            this.lblLastRefreshValue.Text = "(not yet)";
-            this.lblLastRefreshValue.ForeColor = clrTextDisabled;
-
-            // Glossary status
-            this.lblGlossaryStatus.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
-            this.lblGlossaryStatus.Location = new System.Drawing.Point(16, 112);
-            this.lblGlossaryStatus.Size = new System.Drawing.Size(800, 24);
-            this.lblGlossaryStatus.Text = "";
-            this.lblGlossaryStatus.ForeColor = clrTextSecondary;
-
-            // Glossary buttons — Secondary style
-            this.btnTestConnection.Location = new System.Drawing.Point(16, 145);
-            this.btnTestConnection.Size = new System.Drawing.Size(120, 32);
-            this.btnTestConnection.Text = "Test Connection";
-            this.btnTestConnection.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnTestConnection.BackColor = System.Drawing.Color.White;
-            this.btnTestConnection.ForeColor = clrTextPrimary;
-            this.btnTestConnection.FlatAppearance.BorderColor = clrBorder;
-            this.btnTestConnection.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnTestConnection.Click += new System.EventHandler(this.BtnTestConnection_Click);
-
-            this.btnReloadGlossary.Location = new System.Drawing.Point(146, 145);
-            this.btnReloadGlossary.Size = new System.Drawing.Size(130, 32);
-            this.btnReloadGlossary.Text = "Reload Glossary";
-            this.btnReloadGlossary.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnReloadGlossary.BackColor = System.Drawing.Color.White;
-            this.btnReloadGlossary.ForeColor = clrTextPrimary;
-            this.btnReloadGlossary.FlatAppearance.BorderColor = clrBorder;
-            this.btnReloadGlossary.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnReloadGlossary.Click += new System.EventHandler(this.BtnReloadGlossary_Click);
-
-            // ================================================================
-            // TAB 4: VALIDATION
+            // TAB 1: VALIDATION
             // ================================================================
             // Toolbar panel (top strip)
             var pnlValidationToolbar = new System.Windows.Forms.Panel();
@@ -458,10 +256,14 @@ namespace EliteSoft.Erwin.AddIn
                 this.chkErrorsOnly.Location = new System.Drawing.Point(this.lblFilterLabel.Left - this.chkErrorsOnly.Width - 18, 12);
             };
 
-            // Results ListView
+            // Results ListView - GridLines turned off because the per-row
+            // grid stripes felt dated next to the modern card chrome on
+            // other tabs. The severity icon (added at runtime via SmallImageList
+            // in InitializeValidationUI) gives the row a clear visual anchor
+            // without needing the cell borders to separate columns.
             this.listValidationResults.Dock = System.Windows.Forms.DockStyle.Fill;
             this.listValidationResults.FullRowSelect = true;
-            this.listValidationResults.GridLines = true;
+            this.listValidationResults.GridLines = false;
             this.listValidationResults.UseCompatibleStateImageBehavior = false;
             this.listValidationResults.View = System.Windows.Forms.View.Details;
             this.listValidationResults.Font = fontBody;
@@ -664,6 +466,16 @@ namespace EliteSoft.Erwin.AddIn
             this.tabAlterCompare.Controls.Add(this.lvAlterChanges);
 
             // Row 6: alter SQL output
+            // Reverted from RichTextBox to TextBox after a 2026-05-09 erwin
+            // crash (coreclr.dll AV at 0x36852a) reproduced when switching
+            // into the Alter Compare tab. RefreshAlterCompareTab calls
+            // txtAlterSql.Clear() during tab activation; on a RichTextBox
+            // that triggers a UIA TextChanged event that erwin's host listener
+            // surfaces unsafely (same family as the Debug Log AppendText AV
+            // documented in memory/reference_winforms_shown_after_dispose).
+            // SQL syntax highlighting via RichTextBox stays in place for
+            // rtbDDLOutput on the DDL Generation tab where there has been no
+            // observed AV.
             this.txtAlterSql.Location = new System.Drawing.Point(20, 270);
             this.txtAlterSql.Name = "txtAlterSql";
             this.txtAlterSql.Size = new System.Drawing.Size(820, 145);
@@ -704,10 +516,10 @@ namespace EliteSoft.Erwin.AddIn
             // ================================================================
 
             // ===== DDL Generation tab — redesigned =====
-            this.tabApproval.Padding = new System.Windows.Forms.Padding(12);
-            this.tabApproval.Size = new System.Drawing.Size(860, 460);
-            this.tabApproval.Text = "DDL Generation";
-            this.tabApproval.UseVisualStyleBackColor = true;
+            this.tabDdlGeneration.Padding = new System.Windows.Forms.Padding(12);
+            this.tabDdlGeneration.Size = new System.Drawing.Size(860, 460);
+            this.tabDdlGeneration.Text = "DDL Generation";
+            this.tabDdlGeneration.UseVisualStyleBackColor = true;
 
             // ----- Group: Source (left model = active model) -----
             this.grpDdlSource = new System.Windows.Forms.GroupBox();
@@ -716,7 +528,7 @@ namespace EliteSoft.Erwin.AddIn
             this.grpDdlSource.Text = "Source (Left)";
             this.grpDdlSource.Font = fontCaption;
             this.grpDdlSource.ForeColor = clrTextSecondary;
-            this.tabApproval.Controls.Add(this.grpDdlSource);
+            this.tabDdlGeneration.Controls.Add(this.grpDdlSource);
 
             // Single read-only label replaces the previous "Active Model:" caption
             // + combo. The active model is implicit (only one PU is in focus) so
@@ -767,7 +579,7 @@ namespace EliteSoft.Erwin.AddIn
             this.grpDdlTarget.Text = "Target (Right)";
             this.grpDdlTarget.Font = fontCaption;
             this.grpDdlTarget.ForeColor = clrTextSecondary;
-            this.tabApproval.Controls.Add(this.grpDdlTarget);
+            this.tabDdlGeneration.Controls.Add(this.grpDdlTarget);
 
             this.rbFromMart = new System.Windows.Forms.RadioButton();
             this.rbFromMart.Location = new System.Drawing.Point(12, 22);
@@ -837,7 +649,7 @@ namespace EliteSoft.Erwin.AddIn
             this.grpDdlOptions.Text = "Options";
             this.grpDdlOptions.Font = fontCaption;
             this.grpDdlOptions.ForeColor = clrTextSecondary;
-            this.tabApproval.Controls.Add(this.grpDdlOptions);
+            this.tabDdlGeneration.Controls.Add(this.grpDdlOptions);
 
             this.chkFilterObjects = new System.Windows.Forms.CheckBox();
             this.chkFilterObjects.Location = new System.Drawing.Point(12, 24);
@@ -885,7 +697,7 @@ namespace EliteSoft.Erwin.AddIn
             this.btnCopyDDL.Font = fontCaption;
             this.btnCopyDDL.Cursor = System.Windows.Forms.Cursors.Hand;
             this.btnCopyDDL.Click += new System.EventHandler(this.BtnCopyDDL_Click);
-            this.tabApproval.Controls.Add(this.btnCopyDDL);
+            this.tabDdlGeneration.Controls.Add(this.btnCopyDDL);
 
             this.btnAlterWizardProd = new System.Windows.Forms.Button();
             this.btnAlterWizardProd.Location = new System.Drawing.Point(12, 172);
@@ -897,7 +709,7 @@ namespace EliteSoft.Erwin.AddIn
             this.btnAlterWizardProd.Font = new System.Drawing.Font("Segoe UI", 9.5f, System.Drawing.FontStyle.Bold);
             this.btnAlterWizardProd.Cursor = System.Windows.Forms.Cursors.Hand;
             this.btnAlterWizardProd.Click += new System.EventHandler(this.BtnAlterWizardProd_Click);
-            this.tabApproval.Controls.Add(this.btnAlterWizardProd);
+            this.tabDdlGeneration.Controls.Add(this.btnAlterWizardProd);
 
             this.lblDDLStatus = new System.Windows.Forms.Label();
             this.lblDDLStatus.Location = new System.Drawing.Point(290, 180);
@@ -905,7 +717,7 @@ namespace EliteSoft.Erwin.AddIn
             this.lblDDLStatus.Text = "";
             this.lblDDLStatus.Font = fontCaption;
             this.lblDDLStatus.ForeColor = clrTextSecondary;
-            this.tabApproval.Controls.Add(this.lblDDLStatus);
+            this.tabDdlGeneration.Controls.Add(this.lblDDLStatus);
 
             // ----- DDL output (anchor=All, fills remaining space) -----
             this.rtbDDLOutput = new System.Windows.Forms.RichTextBox();
@@ -918,7 +730,7 @@ namespace EliteSoft.Erwin.AddIn
             this.rtbDDLOutput.Font = new System.Drawing.Font("Consolas", 9.5f);
             this.rtbDDLOutput.BackColor = System.Drawing.Color.FromArgb(30, 30, 30);
             this.rtbDDLOutput.ForeColor = System.Drawing.Color.FromArgb(212, 212, 212);
-            this.tabApproval.Controls.Add(this.rtbDDLOutput);
+            this.tabDdlGeneration.Controls.Add(this.rtbDDLOutput);
 
             // ================================================================
             // STATUS BAR (Bottom)
@@ -959,7 +771,7 @@ namespace EliteSoft.Erwin.AddIn
             // ================================================================
             this.AutoScaleDimensions = new System.Drawing.SizeF(7F, 17F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
-            this.ClientSize = new System.Drawing.Size(900, 570);
+            this.ClientSize = new System.Drawing.Size(980, 660);
             this.Controls.Add(this.tabControl);
             this.Controls.Add(this.pnlStatusSep);
             this.Controls.Add(this.pnlStatusBar);
@@ -976,18 +788,12 @@ namespace EliteSoft.Erwin.AddIn
 
             this.tabControl.ResumeLayout(false);
             this.tabGeneral.ResumeLayout(false);
-            this.tabConfiguration.ResumeLayout(false);
-            this.tabGlossary.ResumeLayout(false);
             this.tabValidation.ResumeLayout(false);
             this.tabTableProcesses.ResumeLayout(false);
             this.grpTableProcesses.ResumeLayout(false);
             this.grpTableProcesses.PerformLayout();
             this.grpModel.ResumeLayout(false);
             this.grpModel.PerformLayout();
-            this.grpConfig.ResumeLayout(false);
-            this.grpConfig.PerformLayout();
-            this.grpGlossary.ResumeLayout(false);
-            this.grpGlossary.PerformLayout();
             this.pnlStatusBar.ResumeLayout(false);
             this.ResumeLayout(false);
         }
@@ -996,10 +802,8 @@ namespace EliteSoft.Erwin.AddIn
 
         private System.Windows.Forms.TabControl tabControl;
         private System.Windows.Forms.TabPage tabGeneral;
-        private System.Windows.Forms.TabPage tabConfiguration;
-        private System.Windows.Forms.TabPage tabGlossary;
         private System.Windows.Forms.TabPage tabValidation;
-        private System.Windows.Forms.TabPage tabApproval;
+        private System.Windows.Forms.TabPage tabDdlGeneration;
         private System.Windows.Forms.TabPage tabAlterCompare;
         // Alter Compare tab — inline UI
         private System.Windows.Forms.Label lblAlterActiveInfo;
@@ -1039,26 +843,13 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.Label lblConnectionStatus;
         private System.Windows.Forms.Label lblPlatformStatus;
 
-        private System.Windows.Forms.GroupBox grpConfig;
-        private System.Windows.Forms.Label lblDatabaseName;
-        private System.Windows.Forms.TextBox txtDatabaseName;
-        private System.Windows.Forms.Label lblSchemaName;
-        private System.Windows.Forms.TextBox txtSchemaName;
-        private System.Windows.Forms.Label lblName;
-        private System.Windows.Forms.TextBox txtName;
-        private System.Windows.Forms.Button btnApply;
-
-        private System.Windows.Forms.GroupBox grpGlossary;
-        private System.Windows.Forms.Label lblHost;
-        private System.Windows.Forms.Label lblHostValue;
-        private System.Windows.Forms.Label lblPort;
-        private System.Windows.Forms.Label lblPortValue;
-        private System.Windows.Forms.Label lblGlossaryDatabase;
-        private System.Windows.Forms.Label lblDatabaseValue;
-        private System.Windows.Forms.Button btnTestConnection;
-        private System.Windows.Forms.Button btnReloadGlossary;
+        // Glossary status fields used by LoadGlossary / UpdateLastRefreshLabel.
+        // Created and laid out at runtime by InitializeGeneralTab so they sit
+        // inside the General tab's "Glossary" card rather than on a separate
+        // tab. Keeping them as form-level fields preserves the existing call
+        // sites (lblGlossaryStatus.Text = ..., etc.) without requiring a wider
+        // refactor.
         private System.Windows.Forms.Label lblGlossaryStatus;
-        private System.Windows.Forms.Label lblLastRefresh;
         private System.Windows.Forms.Label lblLastRefreshValue;
 
         private System.Windows.Forms.ListView listValidationResults;

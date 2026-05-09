@@ -1,11 +1,13 @@
 # Elite Soft Erwin Add-In - Build, Install & Register (Dev Workflow)
 #
 # Usage:
-#   .\build-and-run.ps1                       Build + install + COM register
-#   .\build-and-run.ps1 -KillAllErwinProcs    Same, but also kill other users' erwin
+#   .\build-and-run.ps1                       Build + install + COM register (User scope, no UAC)
+#   .\build-and-run.ps1 -KillAllErwinProcs    Same, but also kill other users' erwin (needs admin)
 #   .\build-and-run.ps1 -?                    Show help
 #
-# Requires: .NET 10 SDK, Administrator privileges
+# Requires: .NET 10 SDK. NO admin needed for the default flow - everything is
+#           User scope (LOCALAPPDATA + HKCU). Admin is only required when
+#           -KillAllErwinProcs is passed (cross-user process termination).
 
 param(
     [Alias('?')]
@@ -23,8 +25,9 @@ if ($Help) {
     Write-Host "Elite Soft Erwin Add-In - Dev Build Script" -ForegroundColor Cyan
     Write-Host "===========================================" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "Builds the project, installs to Program Files, registers COM host,"
-    Write-Host "and configures erwin Add-In Manager. For daily development use."
+    Write-Host "Builds the project, installs to %LOCALAPPDATA%\EliteSoft\ErwinAddIn,"
+    Write-Host "registers COM host in HKCU, and configures erwin Add-In Manager."
+    Write-Host "Fully User-scoped: no admin / UAC needed for the default flow."
     Write-Host ""
     Write-Host "Usage:" -ForegroundColor Yellow
     Write-Host "  .\build-and-run.ps1                     Build + install + register"
@@ -47,25 +50,66 @@ trap {
     exit 1
 }
 
-# --- Auto-elevate to Administrator ---
+# Dev workflow is fully User-scoped now: files go to %LOCALAPPDATA%, COM is
+# registered in HKCU\Software\Classes (not via regsvr32), Add-Ins manager
+# entry is HKCU, Scheduled Task is per-user. None of these need admin so
+# we no longer auto-elevate. Side effect: -KillAllErwinProcs (cross-user
+# kill) needs admin and will warn-and-skip when invoked from a non-elevated
+# shell. The previous regsvr32 path also wrote stale HKLM CLSID entries
+# that conflicted with install.ps1's User-scope COM registration; the new
+# pattern keeps HKLM untouched.
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $isAdmin) {
-    Write-Host "Requesting Administrator privileges..." -ForegroundColor Yellow
-    # Forward our switches across the elevation hop, otherwise -KillAllErwinProcs
-    # is silently lost when UAC respawns the script.
-    $forwardArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`""
-    if ($KillAllErwinProcs) { $forwardArgs += " -KillAllErwinProcs" }
-    Start-Process powershell.exe -ArgumentList $forwardArgs -Verb RunAs
-    exit
+if ($KillAllErwinProcs -and -not $isAdmin) {
+    Write-Host "WARNING: -KillAllErwinProcs needs admin to terminate other users' processes." -ForegroundColor Yellow
+    Write-Host "         Continuing without it; only your own erwin/DdlHelper/Injector will be stopped." -ForegroundColor Yellow
+    $KillAllErwinProcs = $false
 }
 
 Write-Host "=== Elite Soft Erwin Add-In - Build & Run ===" -ForegroundColor Cyan
-Write-Host "Running as Administrator" -ForegroundColor Green
+if ($isAdmin) {
+    Write-Host "Running as Administrator (elevated; not required)" -ForegroundColor Gray
+} else {
+    Write-Host "Running as standard user (User scope, no UAC needed)" -ForegroundColor Green
+}
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $scriptDir
 
 $installDir = Join-Path $env:LOCALAPPDATA "EliteSoft\ErwinAddIn"
+$progId     = "EliteSoft.Erwin.AddIn"
+# CLSID must mirror the [Guid(...)] attribute on ErwinAddIn class in
+# ErwinAddIn.cs:17 (also referenced from install.ps1).
+$clsid      = '{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}'
+
+# HKCU COM (un)registration helpers - same layout install.ps1 uses for
+# User-scope installs. Replicates what regsvr32 + .NET comhost would write
+# to HKLM\Software\Classes, but in HKCU so no admin is needed. erwin's
+# CLSIDFromProgID resolves through HKEY_CLASSES_ROOT (HKCU∪HKLM) so the
+# addin loads identically for the current user.
+function Register-ComUserScope([string]$comHostPath) {
+    $clsidBase   = "HKCU:\Software\Classes\CLSID\$clsid"
+    $inprocPath  = "$clsidBase\InProcServer32"
+    $clsidProgId = "$clsidBase\ProgId"
+    $progIdBase  = "HKCU:\Software\Classes\$progId"
+    $progIdClsid = "$progIdBase\CLSID"
+
+    New-Item -Path $inprocPath  -Force | Out-Null
+    New-Item -Path $clsidProgId -Force | Out-Null
+    New-Item -Path $progIdClsid -Force | Out-Null
+
+    Set-ItemProperty -Path $clsidBase   -Name "(Default)"      -Value $progId
+    Set-ItemProperty -Path $inprocPath  -Name "(Default)"      -Value $comHostPath
+    Set-ItemProperty -Path $inprocPath  -Name "ThreadingModel" -Value "Both"
+    Set-ItemProperty -Path $clsidProgId -Name "(Default)"      -Value $progId
+    Set-ItemProperty -Path $progIdBase  -Name "(Default)"      -Value $progId
+    Set-ItemProperty -Path $progIdClsid -Name "(Default)"      -Value $clsid
+}
+function Unregister-ComUserScope {
+    $clsidBase  = "HKCU:\Software\Classes\CLSID\$clsid"
+    $progIdBase = "HKCU:\Software\Classes\$progId"
+    if (Test-Path -LiteralPath $clsidBase)  { Remove-Item -LiteralPath $clsidBase  -Recurse -Force -ErrorAction SilentlyContinue }
+    if (Test-Path -LiteralPath $progIdBase) { Remove-Item -LiteralPath $progIdBase -Recurse -Force -ErrorAction SilentlyContinue }
+}
 
 # --- Step 1: Close processes that might hold our DLLs (CURRENT USER ONLY) ---
 # Use WMI GetOwner so we catch processes whose UserName PowerShell can't
@@ -81,27 +125,36 @@ function Stop-UserProcesses {
         # user owns - destructive, opt-in only.
         [switch]$All
     )
-    $procs = Get-WmiObject Win32_Process -Filter "Name='$name.exe'" -ErrorAction SilentlyContinue
+    # Get-CimInstance returns native DateTime for CreationDate and exposes
+    # methods through Invoke-CimMethod, so the legacy Get-WmiObject pattern
+    # ($p.ConvertToDateTime / $p.GetOwner) - which fails as soon as the
+    # object is deserialized in PS7 - is replaced here.
+    $procs = Get-CimInstance Win32_Process -Filter "Name='$name.exe'" -ErrorAction SilentlyContinue
     if (-not $procs) { return }
     foreach ($p in $procs) {
-        $owner = $null
-        try { $owner = $p.GetOwner() } catch { $owner = $null }
-        $ownerUser = if ($owner -and $owner.ReturnValue -eq 0) { $owner.User } else { $null }
+        $ownerUser = $null
+        try {
+            $ownerResult = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction Stop
+            if ($ownerResult -and $ownerResult.ReturnValue -eq 0) { $ownerUser = $ownerResult.User }
+        } catch { $ownerUser = $null }
+
+        $started = if ($p.CreationDate -is [DateTime]) { $p.CreationDate.ToString('HH:mm:ss') } else { '?' }
+        $ownerLabel = if ($ownerUser) { $ownerUser } else { 'unknown' }
+
         if ($All) {
-            $tag = if ($ownerUser) { "user=$ownerUser" } else { "owner unknown" }
-            Write-Host "  Killing ${name}.exe PID=$($p.ProcessId) ($tag, FORCE all-users, started $($p.ConvertToDateTime($p.CreationDate)))" -ForegroundColor Red
+            Write-Host "  Killing ${name}.exe PID=$($p.ProcessId) (user=$ownerLabel, FORCE all-users, started $started)" -ForegroundColor Red
             Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
         } elseif ($ownerUser -and $ownerUser -ieq $myUser) {
-            Write-Host "  Killing ${name}.exe PID=$($p.ProcessId) (user=$ownerUser, started $($p.ConvertToDateTime($p.CreationDate)))" -ForegroundColor Yellow
-            Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
-        } elseif (-not $ownerUser) {
-            # Ambiguous ownership - treat as ours if there's no cleaner signal.
-            # Running elevated, so we have the rights. A stale process left
-            # over from a prior login will otherwise hold our install dir.
-            Write-Host "  Killing ${name}.exe PID=$($p.ProcessId) (owner unknown, started $($p.ConvertToDateTime($p.CreationDate)))" -ForegroundColor DarkYellow
+            Write-Host "  Killing ${name}.exe PID=$($p.ProcessId) (user=$ownerUser, started $started)" -ForegroundColor Yellow
             Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
         } else {
-            Write-Host "  Skipping ${name}.exe PID=$($p.ProcessId) (owner=$ownerUser, not ours; pass -KillAllErwinProcs to override)" -ForegroundColor Gray
+            # Default: never kill another user's (or owner-unknown) process.
+            # Earlier versions guessed "treat as ours when owner can't be
+            # resolved", which silently terminated cross-user erwin sessions
+            # the moment GetOwner failed (WMI deserialize bug, missing privs).
+            # Skip safely; -KillAllErwinProcs is the explicit opt-in for the
+            # cross-user reset.
+            Write-Host "  Skipping ${name}.exe PID=$($p.ProcessId) (user=$ownerLabel, not ours; pass -KillAllErwinProcs to override)" -ForegroundColor Gray
         }
     }
 }
@@ -170,14 +223,15 @@ if (-not (Test-Path (Join-Path $buildOutputDir "EliteSoft.Erwin.AddIn.dll"))) {
 }
 
 # --- Step 3: Unregister old version ---
-Write-Host "`n[2/5] Unregistering old version..." -ForegroundColor Yellow
-$oldComHost = Join-Path $installDir "EliteSoft.Erwin.AddIn.comhost.dll"
-if (Test-Path $oldComHost) {
-    regsvr32.exe /u /s $oldComHost 2>&1 | Out-Null
-    Write-Host "  Old COM host unregistered" -ForegroundColor Green
-} else {
-    Write-Host "  No previous installation (OK)" -ForegroundColor Gray
-}
+# Strip any HKCU CLSID/ProgID entries from a previous run so the fresh
+# Step 5 write below points at the just-copied comhost.dll. We do NOT touch
+# HKLM here - earlier builds may have used regsvr32 (HKLM Software\Classes)
+# but going forward all dev installs are HKCU-only. Leftover HKLM entries
+# don't hurt because erwin reads HKCR (HKCU wins on read), but they can be
+# cleaned manually with regsvr32 /u in an elevated shell if desired.
+Write-Host "`n[2/5] Unregistering old COM (HKCU)..." -ForegroundColor Yellow
+Unregister-ComUserScope
+Write-Host "  HKCU CLSID/ProgID entries cleared" -ForegroundColor Green
 
 # --- Step 4: Copy files ---
 Write-Host "`n[3/5] Installing to $installDir..." -ForegroundColor Yellow
@@ -189,37 +243,105 @@ if (-not (Test-Path $installDir)) {
 }
 
 Copy-Item -Path "$buildOutputDir\*" -Destination $installDir -Recurse -Force
-$copiedCount = (Get-ChildItem -Path $installDir -Recurse -File).Count
+
+# autostart-watcher.ps1 lives under scripts/ (not bin/), so the bin->install
+# copy above misses it. Without this explicit refresh the install dir keeps
+# whatever watcher version was first deployed (often the very first one),
+# meaning auto-load improvements made in the repo never reach the running
+# Scheduled Task. We restart the task at the end of build-and-run, so
+# whatever sits at this path is what runs next - keep it in sync.
+$watcherSrc = Join-Path $scriptDir "scripts\autostart-watcher.ps1"
+$watcherDst = Join-Path $installDir "autostart-watcher.ps1"
+if (Test-Path -LiteralPath $watcherSrc) {
+    [System.IO.File]::Copy($watcherSrc, $watcherDst, $true)
+    Write-Host "  Refreshed autostart-watcher.ps1 from scripts/" -ForegroundColor Gray
+} else {
+    Write-Host "  WARNING: $watcherSrc missing - keeping installed watcher" -ForegroundColor Yellow
+}
+
+$copiedCount = (Get-ChildItem -LiteralPath $installDir -Recurse -File).Count
 Write-Host "  Copied $copiedCount files" -ForegroundColor Green
+# icacls grant skipped: $installDir lives under %LOCALAPPDATA% which the
+# current user owns and can read/execute by default. The grant only
+# mattered when the previous version dropped binaries into Program Files.
 
-# Permissions
-icacls $installDir /grant "Users:(OI)(CI)RX" /T /Q 2>&1 | Out-Null
-Write-Host "  Permissions set" -ForegroundColor Green
-
-# --- Step 5: Register COM ---
-Write-Host "`n[4/5] Registering COM host..." -ForegroundColor Yellow
+# --- Step 5: Register COM (HKCU, no UAC) ---
+Write-Host "`n[4/5] Registering COM host (HKCU\Software\Classes)..." -ForegroundColor Yellow
 $comHost = Join-Path $installDir "EliteSoft.Erwin.AddIn.comhost.dll"
-if (-not (Test-Path $comHost)) {
-    Write-Host "  comhost.dll not found!" -ForegroundColor Red
+if (-not (Test-Path -LiteralPath $comHost)) {
+    Write-Host "  comhost.dll not found at $comHost" -ForegroundColor Red
     Write-Host "`nPress any key to exit..." -ForegroundColor Gray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown"); exit 1
 }
-regsvr32.exe /s $comHost
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "  COM registration failed!" -ForegroundColor Red
+try {
+    Register-ComUserScope -comHostPath $comHost
+    Write-Host "  COM registered (HKCU; no UAC needed)" -ForegroundColor Green
+} catch {
+    Write-Host "  COM registration failed: $($_.Exception.Message)" -ForegroundColor Red
     Write-Host "`nPress any key to exit..." -ForegroundColor Gray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown"); exit 1
 }
-Write-Host "  COM registered" -ForegroundColor Green
+
+# --- Step 5b: Write erwin Add-In Manager entry (HKCU) ---
+# Register-ComUserScope only writes the COM CLSID/ProgID. erwin DM r10 ALSO
+# requires a per-user Add-Ins entry in its own registry tree to surface the
+# addin in the Tools menu - HKLM Add-Ins are invisible there (empirically
+# verified). Without this step the COM registration succeeds but erwin
+# can't discover the addin so it never loads. install.ps1 writes the same
+# entry; we mirror it here so the dev loop is self-sufficient.
+Write-Host "`n[5b/5] Registering in erwin Add-In Manager (HKCU)..." -ForegroundColor Yellow
+$addInPath = "HKCU:\SOFTWARE\erwin\Data Modeler\10.10\Add-Ins\Elite Soft Erwin Addin"
+if (-not (Test-Path -LiteralPath $addInPath)) {
+    New-Item -Path $addInPath -Force | Out-Null
+}
+Set-ItemProperty -LiteralPath $addInPath -Name "Menu Identifier" -Value 1                       -Type DWord
+Set-ItemProperty -LiteralPath $addInPath -Name "ProgID"          -Value "EliteSoft.Erwin.AddIn" -Type String
+Set-ItemProperty -LiteralPath $addInPath -Name "Invoke Method"   -Value "Execute"               -Type String
+Set-ItemProperty -LiteralPath $addInPath -Name "Invoke EXE"      -Value 0                       -Type DWord
+Write-Host "  HKCU Add-In entry written" -ForegroundColor Green
 
 # --- Step 6: Auto-start watcher health check ---
 # Develop loop'unda watcher sessizce olebilir (process kill, OOM, vs). Build
 # bittiginde task var ama watcher process yok ise tetikle - addin auto-load
 # kanalinin acik kalmasini garanti et. Ayrica eski install'lardan kalma
-# RestartCount'suz task ayarini bir kerelik patch'le.
+# RestartCount'suz task ayarini bir kerelik patch'le. Eskiden burada "task
+# yoksa run install.ps1" diyip cikiyorduk; bu dev workflow'unu yariya
+# birakiyordu (HKCU Add-Ins yazildigi halde watcher yokken erwin acilinca
+# DLL injection tetiklenmiyor, Execute() cagrilmiyor). Simdi yoksa burada
+# yaratiyoruz - User scope, $env:USERNAME suffix'li tek kullaniciya ozel
+# task. install.ps1'in Step 5 logic'i ile birebir ayni.
 Write-Host "`n[5/5] Watcher health check..." -ForegroundColor Yellow
-$watcherTaskName = 'EliteSoft Erwin AddIn AutoStart'
-$task = Get-ScheduledTask -TaskName $watcherTaskName -ErrorAction SilentlyContinue
+$userTaskName   = "EliteSoft Erwin AddIn AutoStart - $env:USERNAME"
+$sharedTaskName = "EliteSoft Erwin AddIn AutoStart"
+$task = Get-ScheduledTask -TaskName $userTaskName -ErrorAction SilentlyContinue
+if (-not $task) { $task = Get-ScheduledTask -TaskName $sharedTaskName -ErrorAction SilentlyContinue }
+$watcherTaskName = if ($task) { $task.TaskName } else { $userTaskName }
+
 if (-not $task) {
-    Write-Host "  Auto-start task not configured (run scripts\install.ps1 once for full setup)" -ForegroundColor DarkGray
+    Write-Host "  No auto-start task found - registering '$watcherTaskName' (User scope)..." -ForegroundColor Yellow
+    $watcherTarget = Join-Path $installDir "autostart-watcher.ps1"
+    if (-not (Test-Path -LiteralPath $watcherTarget)) {
+        Write-Host "  ERROR: $watcherTarget missing - cannot register watcher task." -ForegroundColor Red
+    } else {
+        try {
+            $action   = New-ScheduledTaskAction -Execute 'powershell.exe' `
+                -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watcherTarget`""
+            $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) `
+                -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+            $trigger  = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+            Register-ScheduledTask -TaskName $watcherTaskName -Action $action -Trigger $trigger `
+                -Settings $settings -Description 'Auto-starts Elite Soft Erwin Add-In when erwin opens (User scope, dev)' -ErrorAction Stop | Out-Null
+            Write-Host "  Task '$watcherTaskName' created" -ForegroundColor Green
+            Start-ScheduledTask -TaskName $watcherTaskName
+            Start-Sleep -Seconds 2
+        } catch {
+            Write-Host "  ERROR: Could not register task: $($_.Exception.Message)" -ForegroundColor Red
+        }
+    }
+    $task = Get-ScheduledTask -TaskName $watcherTaskName -ErrorAction SilentlyContinue
+}
+
+if (-not $task) {
+    Write-Host "  Auto-start task still not configured; addin will not auto-load on model open." -ForegroundColor Red
 } else {
     # One-shot upgrade: ensure RestartCount is set on already-installed tasks
     if ($task.Settings.RestartCount -lt 3) {
@@ -230,21 +352,33 @@ if (-not $task) {
         Set-ScheduledTask -TaskName $watcherTaskName -Settings $newSettings | Out-Null
     }
 
-    $watcherProc = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -match 'autostart-watcher' }
-    if ($watcherProc) {
-        Write-Host "  Watcher already running (PID=$($watcherProc.ProcessId))" -ForegroundColor Green
-    } else {
-        Write-Host "  Watcher dead - triggering ScheduledTask..." -ForegroundColor Yellow
-        Start-ScheduledTask -TaskName $watcherTaskName
-        Start-Sleep -Seconds 2
-        $watcherProc = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -match 'autostart-watcher' }
-        if ($watcherProc) {
-            Write-Host "  Watcher started (PID=$($watcherProc.ProcessId))" -ForegroundColor Green
-        } else {
-            Write-Host "  Watcher failed to start - check %LOCALAPPDATA%\EliteSoft\ErwinAddIn\autostart.log" -ForegroundColor Red
+    # ALWAYS recycle the watcher process. PowerShell loads a script into
+    # memory once at process start, so a refreshed autostart-watcher.ps1
+    # on disk (Step 3 just copied the new version) won't take effect
+    # until the running watcher is killed and the task starts a fresh
+    # PS process. Without this recycle the dev loop keeps running the
+    # original watcher version that was deployed first - any subsequent
+    # change to scripts/autostart-watcher.ps1 silently has no effect.
+    $existingWatchers = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -match 'autostart-watcher' })
+    if ($existingWatchers.Count -gt 0) {
+        foreach ($wp in $existingWatchers) {
+            Write-Host "  Killing stale watcher PID=$($wp.ProcessId) (will be replaced with refreshed script)" -ForegroundColor Gray
+            Stop-Process -Id $wp.ProcessId -Force -ErrorAction SilentlyContinue
         }
+        Start-Sleep -Seconds 1
+    }
+
+    Write-Host "  Triggering ScheduledTask '$watcherTaskName'..." -ForegroundColor Gray
+    Stop-ScheduledTask -TaskName $watcherTaskName -ErrorAction SilentlyContinue
+    Start-ScheduledTask  -TaskName $watcherTaskName
+    Start-Sleep -Seconds 2
+    $watcherProc = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -match 'autostart-watcher' } | Select-Object -First 1
+    if ($watcherProc) {
+        Write-Host "  Watcher running (PID=$($watcherProc.ProcessId))" -ForegroundColor Green
+    } else {
+        Write-Host "  Watcher failed to start - check $(Join-Path $installDir 'autostart.log')" -ForegroundColor Red
     }
 }
 

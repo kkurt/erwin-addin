@@ -93,6 +93,22 @@ namespace EliteSoft.Erwin.AddIn.Services
             GetWindowText(hWnd, sb, maxCount);
         }
 
+        public static void GetClassNamePublic(IntPtr hWnd, System.Text.StringBuilder sb, int maxCount)
+        {
+            GetClassName(hWnd, sb, maxCount);
+        }
+
+        public static uint GetWindowThreadProcessIdPublic(IntPtr hWnd)
+        {
+            GetWindowThreadProcessId(hWnd, out uint pid);
+            return pid;
+        }
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+
+        public static IntPtr GetForegroundWindowPublic() => GetForegroundWindow();
+
         [DllImport("user32.dll")]
         private static extern bool IsWindowEnabled(IntPtr hWnd);
 
