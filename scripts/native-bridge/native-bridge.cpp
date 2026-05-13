@@ -22,6 +22,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <dwmapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -1699,6 +1700,51 @@ static std::set<HWND> EnumerateVisibleDialogs(void) {
     return result;
 }
 
+// Diagnostic helper (not called by production code). Kept available for
+// future investigations of "invisible" popups - i.e. dialogs that fire
+// during a pipeline phase but whose title doesn't match our auto-dismiss
+// helpers ("erwin Data Modeler"). Original use case 2026-05-13: Oracle
+// Connection child dialog raised by CMD_FE_WIZARD_GENERATE on Oracle
+// target models with no cached DB connection - fix landed by skipping
+// that command entirely; this helper is what surfaced the trigger.
+//
+// Format per row: hwnd, position (x,y w*h), title, class, ex-style flags
+// of interest, owner. Skips main XTPMainFrame to keep the log focused on
+// transient dialogs.
+static void LogAllVisibleDialogs(const char* tag) {
+    auto dialogs = EnumerateVisibleDialogs();
+    HWND mainHwnd = FindErwinMain();
+    int count = 0;
+    for (HWND h : dialogs) {
+        if (h == mainHwnd) continue;
+        wchar_t title[256] = {0};
+        GetWindowTextW(h, title, 255);
+        wchar_t cls[64] = {0};
+        GetClassNameW(h, cls, 63);
+        RECT rc = {0,0,0,0};
+        GetWindowRect(h, &rc);
+        LONG_PTR ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+        LONG_PTR st = GetWindowLongPtrW(h, GWL_STYLE);
+        HWND owner = GetWindow(h, GW_OWNER);
+        char flags[64];
+        sprintf_s(flags, "%s%s%s%s%s",
+            (ex & WS_EX_LAYERED)    ? "L" : "-",
+            (ex & WS_EX_TOOLWINDOW) ? "T" : "-",
+            (ex & WS_EX_DLGMODALFRAME) ? "M" : "-",
+            (st & WS_POPUP)         ? "P" : "-",
+            (st & WS_CHILD)         ? "C" : "-");
+        LogLine("[VIS-DLG] %s hwnd=%p pos=(%ld,%ld %ldx%ld) flags=%s owner=%p class='%ls' title='%ls'",
+            tag ? tag : "(?)",
+            h,
+            rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
+            flags, owner, cls, title);
+        ++count;
+    }
+    if (count == 0) {
+        LogLine("[VIS-DLG] %s no transient dialogs visible", tag ? tag : "(?)");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Auto-open the Alter Script wizard silently and hide it off-screen.
 //
@@ -1832,38 +1878,67 @@ static void HideWizardAggressive(HWND hwnd) {
 // style bit can leak the surface if MFC's destroy chain runs before DWM
 // notices the bit change. Generate DDL reproduces it every run.
 //
-// The fix sequence proven to release the surface even when MFC's destroy
-// chain unwinds via SEH (the IPS-CALL post-return AV we ignore for DDL
-// capture):
-//   1. SetLayeredWindowAttributes(alpha=255) - flushes the layered surface
-//      one more time AS OPAQUE so DWM resolves it back to the regular window
-//      surface; without this, DWM keeps the back-buffer mapped.
-//   2. Clear WS_EX_LAYERED|WS_EX_TOOLWINDOW from GWL_EXSTYLE.
-//   3. SetWindowPos with SWP_FRAMECHANGED - tells the compositor the style
+// 2026-05-13 update: the previous "alpha=255 + clear LAYERED + SWP_FRAMECHANGED
+// + RedrawWindow" sequence (commit 9708412) still leaked because the wizard
+// is at (-32000, -32000) when ClearWizardLayeredAndFlush runs - HideWizardAggressive
+// parked it there and nothing moves it back. DWM clips composition to the
+// visible desktop region, so an off-screen RedrawWindow never produces an
+// observable paint cycle from the compositor's perspective. The layered
+// back-buffer surface is never released, and the next ribbon/diagram paint
+// leaks black rectangles across the process.
+//
+// New sequence:
+//   1. SetWindowPos to (0, 0) with a 1x1 size - moves the window into the
+//      visible desktop region so DWM will actually composite it. 1x1 at the
+//      top-left corner is virtually imperceptible (the wizard's WS_EX_LAYERED
+//      with alpha=0 is still in effect at this point, so nothing draws yet).
+//   2. SetLayeredWindowAttributes(alpha=255) - opaque, forces DWM to resolve
+//      the layered surface back to the regular window surface.
+//   3. Clear WS_EX_LAYERED|WS_EX_TOOLWINDOW from GWL_EXSTYLE.
+//   4. SetWindowPos SWP_FRAMECHANGED - tells the compositor the ex-style
 //      changed, must recompute non-client area.
-//   4. RedrawWindow with RDW_INVALIDATE|RDW_UPDATENOW|RDW_FRAME - forces a
-//      synchronous repaint cycle, which DWM uses as the trigger to release
-//      the layered back-buffer.
-// After step 4 the window can safely be destroyed without the compositor
-// leak that paints black rectangles process-wide.
+//   5. RedrawWindow with RDW_INVALIDATE|RDW_UPDATENOW|RDW_FRAME|RDW_ERASE -
+//      synchronous repaint while window is on-screen at 1x1 size. DWM observes
+//      a real composition cycle.
+//   6. DwmFlush - explicit DWM composition sync; blocks ~16ms (one frame)
+//      until the compositor has processed our paint and released the
+//      layered surface. Belt-and-suspenders.
+// After step 6 the caller posts IDCANCEL/WM_CLOSE; the wizard destroys
+// within ~100 ms with no leftover compositor mapping.
 static void ClearWizardLayeredAndFlush(HWND hwnd, const char* tag) {
     if (!IsWindow(hwnd)) return;
     LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
     if ((ex & WS_EX_LAYERED) == 0) return;
 
-    // Step 1: opaque alpha forces DWM to flush the layered back-buffer.
+    // Capture original position so we can log what HideWizardAggressive did.
+    RECT rcOrig = {0,0,0,0};
+    GetWindowRect(hwnd, &rcOrig);
+
+    // Step 1: park the window in the visible desktop region at 1x1. Still
+    // layered with alpha=0, so nothing draws. DWM now considers the window
+    // part of the composed surface hierarchy.
+    SetWindowPos(hwnd, NULL, 0, 0, 1, 1,
+        SWP_NOZORDER | SWP_NOACTIVATE);
+    // Step 2: opaque alpha forces DWM to flush the layered back-buffer.
     SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
-    // Step 2: drop the layered/toolwindow ex-style we set on hide.
+    // Step 3: drop the layered/toolwindow ex-style we set on hide.
     SetWindowLongPtrW(hwnd, GWL_EXSTYLE,
         ex & ~(WS_EX_LAYERED | WS_EX_TOOLWINDOW));
-    // Step 3: tell the compositor the frame changed.
+    // Step 4: tell the compositor the frame changed.
     SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-    // Step 4: synchronous redraw -> DWM observes paint cycle -> releases surface.
+    // Step 5: synchronous redraw -> DWM observes paint cycle -> releases surface.
     RedrawWindow(hwnd, NULL, NULL,
         RDW_INVALIDATE | RDW_UPDATENOW | RDW_FRAME | RDW_ERASE);
-    LogLine("[LAYER-CLR] %s hwnd=%p flushed (alpha=255 + SWP_FRAMECHANGED + RedrawWindow)",
-        tag ? tag : "(?)", hwnd);
+    // Step 6: explicit DWM composition flush. Blocks for at most one frame
+    // (~16ms at 60Hz) until the compositor has processed our paint. Returns
+    // S_OK on success; HRESULT ignored intentionally since failure here just
+    // means we fall back to the previous best-effort behavior.
+    DwmFlush();
+    LogLine("[LAYER-CLR] %s hwnd=%p flushed (orig=(%ld,%ld %ldx%ld) -> 1x1@(0,0) opaque + clear LAYERED + SWP_FRAMECHANGED + RedrawWindow + DwmFlush)",
+        tag ? tag : "(?)", hwnd,
+        rcOrig.left, rcOrig.top,
+        rcOrig.right - rcOrig.left, rcOrig.bottom - rcOrig.top);
 }
 
 // WinEvent callback: fires as soon as erwin creates a new window / shows one
@@ -2190,42 +2265,28 @@ extern "C" __declspec(dllexport) const char* __cdecl CallInvokePreviewOnCaptured
     LogLine("[IPS-CALL] Next-loop done (posted=%d, emptyConfirmed=%d)", posted, (int)emptyConfirmed);
 
     if (emptyConfirmed) {
-        // Drive erwin's wizard-finish state machine to completion. Plain
-        // IDCANCEL on an alter-script wizard that captured an empty result
-        // is NOT enough - erwin keeps an internal "alter wizard active"
-        // flag set, and the next Ctrl+Alt+T is silently dropped for ~30 s
-        // (verified 2026-05-08 OPEN-WIZ 15 s timeout twice in a row after
-        // an empty-result first click). The natural manual flow that
-        // clears the flag is: user clicks Generate -> wizard fires
-        // "No schema to generate" alert -> user clicks OK -> wizard
-        // closes itself. We replicate that here: post the Generate
-        // command (CMD_FE_WIZARD_GENERATE = 1760), then probe for the
-        // OK-only popup and auto-dismiss it. The wizard's own finish path
-        // releases the flag.
-        const int CMD_FE_WIZARD_GENERATE = 1760;
-        LogLine("[IPS-CALL] empty path: posting CMD_FE_WIZARD_GENERATE (%d) to fire 'No schema' alert", CMD_FE_WIZARD_GENERATE);
-        PostMessage(wizard, WM_COMMAND, MAKEWPARAM(CMD_FE_WIZARD_GENERATE, BN_CLICKED), 0);
-
-        bool dismissed = false;
-        for (int i = 0; i < 30 && !dismissed; ++i) {
-            Sleep(100);
-            MSG m;
-            while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {
-                TranslateMessage(&m);
-                DispatchMessageW(&m);
-            }
-            dismissed = DismissOkOnlyPopup();
-        }
-        if (!dismissed) {
-            LogLine("[IPS-CALL] empty path: 'No schema' popup did not appear within 3s - wizard may close on its own");
-        }
-        // Give the wizard a moment to actually close after the popup OK.
-        Sleep(300);
-        MSG msg;
-        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
+        // Empty-path teardown - 2026-05-13 simplification.
+        //
+        // History: 2026-05-08 added a CMD_FE_WIZARD_GENERATE (1760) post
+        // here to drive the wizard's self-close path because plain IDCANCEL
+        // alone left erwin's internal "alter wizard active" flag set and
+        // silently dropped the next Ctrl+Alt+T for ~30 seconds. Verified
+        // 2026-05-13 (diagnostic log): on Oracle-target models with no
+        // cached DB connection, that Generate post triggers an unintended
+        // side-effect - erwin's native Generate handler progresses to its
+        // "apply to target database" cleanup step after the "No schema"
+        // alert, opening an Oracle Connection child dialog (owner=wizard,
+        // class='#32770') that we cannot avoid via the wizard's own UI.
+        //
+        // Trial: skip the Generate post entirely and rely on the common
+        // force-finish path below (IDCANCEL + WM_CLOSE + 3s settle). If the
+        // alter-wizard flag-stuck issue resurfaces on the next consecutive
+        // Generate DDL click, the [OPEN-WIZ] phase 1 ctorFired path will
+        // time out at 15s - that's the canary we'll watch for. Trading the
+        // (silent, model-target-specific) Oracle Connection prompt against
+        // the (loud, predictable, recoverable via app restart) flag-stuck
+        // issue. The flag-stuck case is also avoidable by waiting ~30s.
+        LogLine("[IPS-CALL] empty path: skipping CMD_FE_WIZARD_GENERATE post (avoids Oracle Connection side-effect 2026-05-13); relying on common IDCANCEL+WM_CLOSE force-finish below");
     } else {
         // Non-empty path: GA fired with DDL but the actual Preview page
         // initialization can lag the last Next click by a few hundred ms.
@@ -2257,6 +2318,17 @@ extern "C" __declspec(dllexport) const char* __cdecl CallInvokePreviewOnCaptured
     // confirm/save popup that appears during teardown, and wait until
     // IsWindow returns false - that's the only signal we have that erwin
     // actually completed the wizard's destroy chain and released the flag.
+    //
+    // Compositor flush MUST happen here (not in the managed-side
+    // CloseHiddenWizard) because the wizard is typically destroyed within
+    // ~100 ms of the IDCANCEL post, well before .NET reacquires control.
+    // Verified 2026-05-12: bridge log shows wizard destroyed at +100 ms,
+    // [OPEN-WIZ] closing... call lands AFTER that and the helper sees
+    // IsWindow=false and no-ops. WS_EX_LAYERED was still set at destroy
+    // and DWM never released the back-buffer surface, leaving the
+    // process-wide black-rectangle GDI corruption that re-triggered on
+    // every Generate DDL run.
+    ClearWizardLayeredAndFlush(wizard, "[IPS-CALL] pre-IDCANCEL");
     LogLine("[IPS-CALL] forcing wizard finish before return (hwnd=%p)", wizard);
     PostMessage(wizard, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
     PostMessage(wizard, WM_CLOSE, 0, 0);
@@ -4432,6 +4504,12 @@ static DWORD WINAPI OnFeWorkerProcViaNext(LPVOID lp) {
 
     // Phase 5: close wizard so OnFE returns. IDCANCEL is the clean MFC path
     // (matches reference_from_db_pipeline_working IDCANCEL recipe).
+    //
+    // Compositor flush BEFORE the IDCANCEL post - the wizard was hidden
+    // with WS_EX_LAYERED via HideWizardAggressive and the managed-side
+    // CloseHiddenWizard cannot reach it in time (worker thread destroys
+    // it within ~100 ms). Same surface-leak fix as CallInvokePreviewOnCaptured.
+    ClearWizardLayeredAndFlush(wizard, "[ONFE-WORKER-NEXT] pre-IDCANCEL");
     LogLine("[ONFE-WORKER-NEXT] posting IDCANCEL to wizard hwnd=%p", wizard);
     PostMessage(wizard, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
     PostMessage(wizard, WM_CLOSE, 0, 0);

@@ -54,7 +54,8 @@ $clArgs = @(
     "/OUT:`"$outDll`"",
     "/MAP",
     "/MAPINFO:EXPORTS",
-    "user32.lib"
+    "user32.lib",
+    "dwmapi.lib"
 ) -join " "
 
 $cmd = "call `"$vcvars`" >nul && cl.exe $clArgs"

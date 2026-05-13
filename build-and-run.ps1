@@ -56,7 +56,7 @@ trap {
 # we no longer auto-elevate. Side effect: -KillAllErwinProcs (cross-user
 # kill) needs admin and will warn-and-skip when invoked from a non-elevated
 # shell. The previous regsvr32 path also wrote stale HKLM CLSID entries
-# that conflicted with install.ps1's User-scope COM registration; the new
+# that conflicted with install-impl.ps1's User-scope COM registration; the new
 # pattern keeps HKLM untouched.
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if ($KillAllErwinProcs -and -not $isAdmin) {
@@ -78,10 +78,10 @@ Set-Location $scriptDir
 $installDir = Join-Path $env:LOCALAPPDATA "EliteSoft\ErwinAddIn"
 $progId     = "EliteSoft.Erwin.AddIn"
 # CLSID must mirror the [Guid(...)] attribute on ErwinAddIn class in
-# ErwinAddIn.cs:17 (also referenced from install.ps1).
+# ErwinAddIn.cs:17 (also referenced from install-impl.ps1).
 $clsid      = '{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}'
 
-# HKCU COM (un)registration helpers - same layout install.ps1 uses for
+# HKCU COM (un)registration helpers - same layout install-impl.ps1 uses for
 # User-scope installs. Replicates what regsvr32 + .NET comhost would write
 # to HKLM\Software\Classes, but in HKCU so no admin is needed. erwin's
 # CLSIDFromProgID resolves through HKEY_CLASSES_ROOT (HKCU∪HKLM) so the
@@ -199,6 +199,11 @@ if (Test-Path $bridgeScript) {
 # --- Step 2b: Build managed code ---
 Write-Host "`n[1b/5] Building project..." -ForegroundColor Yellow
 dotnet clean erwin-addin.sln 2>&1 | Out-Null
+# Explicit restore between clean and build. `dotnet build` does implicit
+# restore but it sometimes misses cross-repo ProjectReferences (e.g.
+# ..\erwin-admin\MetaShared) after clean wipes their obj/ folders, producing
+# NETSDK1004 "Assets file ... not found". Verified 2026-05-13.
+dotnet restore erwin-addin.sln 2>&1 | Out-Null
 dotnet build erwin-addin.sln -c Release
 
 if ($LASTEXITCODE -ne 0) {
@@ -285,7 +290,7 @@ try {
 # requires a per-user Add-Ins entry in its own registry tree to surface the
 # addin in the Tools menu - HKLM Add-Ins are invisible there (empirically
 # verified). Without this step the COM registration succeeds but erwin
-# can't discover the addin so it never loads. install.ps1 writes the same
+# can't discover the addin so it never loads. install-impl.ps1 writes the same
 # entry; we mirror it here so the dev loop is self-sufficient.
 Write-Host "`n[5b/5] Registering in erwin Add-In Manager (HKCU)..." -ForegroundColor Yellow
 $addInPath = "HKCU:\SOFTWARE\erwin\Data Modeler\10.10\Add-Ins\Elite Soft Erwin Addin"
@@ -303,11 +308,11 @@ Write-Host "  HKCU Add-In entry written" -ForegroundColor Green
 # bittiginde task var ama watcher process yok ise tetikle - addin auto-load
 # kanalinin acik kalmasini garanti et. Ayrica eski install'lardan kalma
 # RestartCount'suz task ayarini bir kerelik patch'le. Eskiden burada "task
-# yoksa run install.ps1" diyip cikiyorduk; bu dev workflow'unu yariya
+# yoksa run install-impl.ps1" diyip cikiyorduk; bu dev workflow'unu yariya
 # birakiyordu (HKCU Add-Ins yazildigi halde watcher yokken erwin acilinca
 # DLL injection tetiklenmiyor, Execute() cagrilmiyor). Simdi yoksa burada
 # yaratiyoruz - User scope, $env:USERNAME suffix'li tek kullaniciya ozel
-# task. install.ps1'in Step 5 logic'i ile birebir ayni.
+# task. install-impl.ps1'in Step 5 logic'i ile birebir ayni.
 Write-Host "`n[5/5] Watcher health check..." -ForegroundColor Yellow
 $userTaskName   = "EliteSoft Erwin AddIn AutoStart - $env:USERNAME"
 $sharedTaskName = "EliteSoft Erwin AddIn AutoStart"
