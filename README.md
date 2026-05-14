@@ -54,7 +54,9 @@ erwin-addin/
 │   ├── autostart-watcher.ps1            # Otomatik başlatma watcher
 │   └── erwin-injector/                  # DLL injection auto-load (NativeAOT)
 ├── installer/
-│   └── install.ps1                      # Paketlenmiş installer scripti
+│   ├── install.bat                      # Son kullanıcı icin cift tikla kurulum
+│   ├── uninstall.bat                    # Son kullanıcı icin cift tikla uninstall
+│   └── install-impl.ps1                 # Asil kurulum scripti (.bat'in cagirdigi)
 └── README.md
 ```
 

@@ -22,8 +22,25 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// Returns the active locator for <paramref name="pu"/>, or
         /// <see cref="string.Empty"/> when nothing is readable. <paramref name="log"/>
         /// receives one line per failed attempt for diagnostics.
+        ///
+        /// Default behavior keeps the window-title fallback active for backward
+        /// compatibility (Mart-bound PUs whose PU.Locator returns "" on r10.10
+        /// rely on it). Callers iterating over multiple PUs MUST pass
+        /// <paramref name="allowWindowTitleFallback"/> = false: the window
+        /// title is a GLOBAL erwin state, not per-PU, so using it during
+        /// iteration would attribute the active window's locator to every PU
+        /// in the collection - including unrelated side-by-side local models -
+        /// and poison switch detection.
         /// </summary>
-        public static string Read(dynamic pu, Action<string> log = null)
+        public static string Read(dynamic pu, Action<string> log = null) =>
+            Read(pu, true, log);
+
+        /// <summary>
+        /// Overload with explicit control over the window-title fallback.
+        /// Pass false when reading locators for multiple PUs in a loop
+        /// (known-locator seeding, reconnect-timer iteration, etc.).
+        /// </summary>
+        public static string Read(dynamic pu, bool allowWindowTitleFallback, Action<string> log = null)
         {
             if (pu == null) return string.Empty;
 
@@ -35,6 +52,8 @@ namespace EliteSoft.Erwin.AddIn.Services
 
             value = ReadPropertyBag(pu, true, log);
             if (!string.IsNullOrEmpty(value)) return value;
+
+            if (!allowWindowTitleFallback) return string.Empty;
 
             value = ReadFromWindowTitle();
             if (!string.IsNullOrEmpty(value))

@@ -5,13 +5,14 @@ using Npgsql;
 using Oracle.ManagedDataAccess.Client;
 using EliteSoft.MetaAdmin.Shared.Models;
 using EliteSoft.MetaAdmin.Shared.Services;
-using EliteSoft.MetaAdmin.Services;
 
 namespace EliteSoft.Erwin.AddIn.Services
 {
     /// <summary>
     /// Database service for multi-provider support (MSSQL, PostgreSQL, Oracle).
-    /// Reads config from Registry first (erwin-admin's current storage), falls back to bootstrap.json.
+    /// Reads bootstrap config via <see cref="HklmFirstBootstrapReader"/>: probes
+    /// HKLM first (LocalMachine DPAPI), then HKCU (CurrentUser DPAPI). See
+    /// docs/INSTALL.md for the load decision tree.
     /// </summary>
     public class DatabaseService
     {
@@ -44,17 +45,15 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         private DatabaseService()
         {
-            // Try Registry first (erwin-admin migrated config from JSON to Registry)
-            var registryService = new RegistryBootstrapService();
-            if (registryService.IsConfigured())
-            {
-                _bootstrapService = registryService;
-            }
-            else
-            {
-                // Fall back to legacy bootstrap.json
-                _bootstrapService = new BootstrapService();
-            }
+            // HklmFirstBootstrapReader probes HKLM first (LocalMachine DPAPI),
+            // then HKCU (CurrentUser DPAPI). See docs/INSTALL.md for the full
+            // decision tree and DPAPI scope rules. We no longer fall back to
+            // bootstrap.json - the installer is the single source of truth and
+            // it always writes the registry, never a JSON file. (The legacy
+            // BootstrapService JSON path migrated to registry years ago via
+            // RegistryBootstrapService.MigrateFromJsonIfNeeded; that migration
+            // still runs in erwin-admin if a stale bootstrap.json lingers.)
+            _bootstrapService = new HklmFirstBootstrapReader();
         }
 
         /// <summary>

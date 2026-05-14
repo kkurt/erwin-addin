@@ -6,29 +6,25 @@
 #   .\package.ps1 -Zip -License HWID                             Embed hardware license
 #   .\package.ps1 -PackageName ErwinAddIn-TTKOM                  Folder output to C:\EliteSoft\ErwinAddIn-TTKOM
 #   .\package.ps1 -PackageName ErwinAddIn-TTKOM -Zip             ZIP at C:\EliteSoft\ErwinAddIn-TTKOM\ErwinAddIn-TTKOM.zip
-#   .\package.ps1 -Scope Machine -DBHost srv -DBName MetaRepo \  Bake DB bootstrap into the package
-#                 -DBUserName sa -DBPassword Elite12345          (install.ps1 will write to HKLM/HKCU and
-#                                                                 DPAPI-encrypt at install time)
+#   .\package.ps1 -DBHost srv -DBName MetaRepo \                 Bake DB bootstrap into the package
+#                 -DBUserName sa -DBPassword Elite12345          (install-impl.ps1 writes HKCU and DPAPI-encrypts
+#                                                                 at install time on the target machine)
 #   .\package.ps1 -?                                             Show help
+#
+# Every produced package installs per-user via install-impl.ps1 (no -Scope flag).
+# install-impl.ps1 picks HKCU as the target hive automatically and reads HKLM
+# first at runtime, so the same package works on both personal machines and
+# corporate-seeded ones. See docs/INSTALL.md for the full reference.
 
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', 'DBPassword',
-    Justification='Plaintext seed required because DPAPI keys are bound to the install host, not the build host. install.ps1 encrypts before writing to the registry and deletes the seed file.')]
+    Justification='Plaintext seed required because DPAPI keys are bound to the install host, not the build host. install-impl.ps1 encrypts before writing to the registry and deletes the seed file.')]
 param(
     [switch]$Zip,
     [string]$License,
-    # Scope is REQUIRED. We can't use [Parameter(Mandatory=$true)] because PS
-    # would prompt before the script body runs - including for `-?` and
-    # `-Help`, which would block the help text from rendering. Instead we
-    # validate manually after the Help block (see below). The value is
-    # baked into bootstrap.seed.json (Scope field) and forwarded to
-    # install.ps1 via auto-elevation; install.ps1 reads it from the seed
-    # if no explicit -Scope is passed at install time.
-    [ValidateSet("User", "Machine")]
-    [string]$Scope,
     # MetaRepo bootstrap seed. Param names (-DBHost, -DBPort, -DBName, -DBUserName,
     # -DBPassword, -DBType) match the registry value names under
     # SOFTWARE\EliteSoft\MetaRepo\Bootstrap. PowerShell parameter binding is
-    # case-insensitive so `$DBHost` accepts `-DBHost`, `-dbhost`, etc. — no
+    # case-insensitive so `$DBHost` accepts `-DBHost`, `-dbhost`, etc. - no
     # [Alias] attributes are needed (and adding them with the same name
     # collapses to "alias conflicts with parameter" at runtime). $DBHost is
     # also distinct from PowerShell's $Host automatic variable, so no
@@ -56,14 +52,14 @@ if ($Help) {
     Write-Host "==========================================" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "Usage:" -ForegroundColor Yellow
-    Write-Host "  .\package.ps1 -Scope <User|Machine>                    Publish to default folder (no compression)"
-    Write-Host "  .\package.ps1 -Scope <User|Machine> -Zip               Create ZIP at <scriptDir>\dist"
-    Write-Host "  .\package.ps1 -Scope Machine -Zip -License HWID        Embed hardware license"
-    Write-Host "  .\package.ps1 -Scope User -PackageName MyDevPkg        Folder output to C:\EliteSoft\MyDevPkg"
-    Write-Host "  .\package.ps1 -Scope User -PackageName MyDevPkg -Zip   ZIP at C:\EliteSoft\MyDevPkg\MyDevPkg.zip"
-    Write-Host "  .\package.ps1 -Scope Machine -DBHost srv -DBName MR \  Bake bootstrap config (DB connection)"
-    Write-Host "                -DBUserName sa -DBPassword Pwd             into the package; install.ps1 writes"
-    Write-Host "                                                           it to HKLM/HKCU and DPAPI-encrypts."
+    Write-Host "  .\package.ps1                                    Publish to default folder (no compression)"
+    Write-Host "  .\package.ps1 -Zip                               Create ZIP at <scriptDir>\dist"
+    Write-Host "  .\package.ps1 -Zip -License HWID                 Embed hardware license"
+    Write-Host "  .\package.ps1 -PackageName MyDevPkg              Folder output to C:\EliteSoft\MyDevPkg"
+    Write-Host "  .\package.ps1 -PackageName MyDevPkg -Zip         ZIP at C:\EliteSoft\MyDevPkg\MyDevPkg.zip"
+    Write-Host "  .\package.ps1 -DBHost srv -DBName MR \           Bake bootstrap config (DB connection) into"
+    Write-Host "                -DBUserName sa -DBPassword Pwd       the package; install-impl.ps1 writes HKCU and"
+    Write-Host "                                                     DPAPI-encrypts on the target machine."
     Write-Host ""
     Write-Host "Bootstrap params (all map 1:1 to registry values under" -ForegroundColor Yellow
     Write-Host "SOFTWARE\EliteSoft\MetaRepo\Bootstrap):" -ForegroundColor Yellow
@@ -73,38 +69,28 @@ if ($Help) {
     Write-Host "  -DBUserName  DB user (DPAPI-encrypted at install time)"
     Write-Host "  -DBPassword  DB password (DPAPI-encrypted at install time)"
     Write-Host "  -DBType      MSSQL | ORACLE | POSTGRESQL (default MSSQL)"
-    Write-Host "  -Scope       Machine | User (REQUIRED; baked into seed and forwarded to install.ps1)"
     Write-Host ""
     Write-Host "Output location:" -ForegroundColor Yellow
     Write-Host "  Default               : C:\EliteSoft\ErwinAddIn (folder)  +  <scriptDir>\dist\ErwinAddIn-1.0.0.zip"
     Write-Host "  -PackageName ""X""      : C:\EliteSoft\X        (folder)  or  C:\EliteSoft\X\X.zip (-Zip mode)"
     Write-Host ""
+    Write-Host "Notes:" -ForegroundColor Yellow
+    Write-Host "  - Every produced package is per-user. install-impl.ps1 has no -Scope flag and never elevates."
+    Write-Host "  - HKLM bootstrap (if corporate IT seeded it) wins at runtime, so the same package serves"
+    Write-Host "    both personal and corporate-seeded machines without re-packaging."
+    Write-Host ""
     exit 0
 }
 
-# Manual mandatory check for $Scope. We don't use [Parameter(Mandatory)]
-# because that would prompt before the Help block had a chance to print.
-if ([string]::IsNullOrEmpty($Scope)) {
-    Write-Host ""
-    Write-Host "  ERROR: -Scope is required (User or Machine)." -ForegroundColor Red
-    Write-Host "         Examples:" -ForegroundColor Yellow
-    Write-Host "           .\package.ps1 -Scope User -Zip" -ForegroundColor Cyan
-    Write-Host "           .\package.ps1 -Scope Machine -DBHost srv -DBName MR -DBUserName sa -DBPassword Pwd" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "         Run .\package.ps1 -? for full help." -ForegroundColor Yellow
-    Write-Host ""
-    exit 1
-}
-
-# --- Auto-elevate to Administrator (required for writing to C:\EliteSoft\) ---
+# Auto-elevate to Administrator (required for writing to C:\EliteSoft\).
+# Packaging output lives under C:\EliteSoft regardless of who runs it, so
+# the build step still needs admin; install-impl.ps1 itself does not.
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
     Write-Host "Requesting Administrator privileges..." -ForegroundColor Yellow
     $elevateArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`""
     if ($Zip)                                  { $elevateArgs += " -Zip" }
     if ($License)                              { $elevateArgs += " -License `"$License`"" }
-    # $Scope is mandatory; always forward it so the elevated process keeps the chosen value.
-    $elevateArgs += " -Scope `"$Scope`""
     if ($DBHost)                               { $elevateArgs += " -DBHost `"$DBHost`"" }
     if ($DBPort)                               { $elevateArgs += " -DBPort `"$DBPort`"" }
     if ($DBName)                               { $elevateArgs += " -DBName `"$DBName`"" }
@@ -257,17 +243,24 @@ $injectorSource = Join-Path $scriptDir "scripts\erwin-injector\bin\Release\net10
 [System.IO.File]::Copy($injectorSource, (Join-Path $publishDir "ErwinInjector.exe"), $true)
 Write-Host "  ErwinInjector.exe published" -ForegroundColor Green
 
-# STEP 5: Copy install script + watcher
-[System.IO.File]::Copy((Join-Path $scriptDir "installer\install.ps1"), (Join-Path $publishDir "install.ps1"), $true)
+# STEP 5: Copy install scripts + double-click wrappers + watcher.
+# The .bat files exist so the end user can extract the ZIP and double-click
+# without manually opening PowerShell. They forward to install-impl.ps1 with
+# -NoProfile -ExecutionPolicy Bypass (per-process, GPO-safe) and pass through
+# any extra args, so packagers can still call install-impl.ps1 directly with CLI
+# overrides during testing.
+[System.IO.File]::Copy((Join-Path $scriptDir "installer\install-impl.ps1"),    (Join-Path $publishDir "install-impl.ps1"),    $true)
+[System.IO.File]::Copy((Join-Path $scriptDir "installer\install.bat"),    (Join-Path $publishDir "install.bat"),    $true)
+[System.IO.File]::Copy((Join-Path $scriptDir "installer\uninstall.bat"),  (Join-Path $publishDir "uninstall.bat"),  $true)
 [System.IO.File]::Copy((Join-Path $scriptDir "scripts\autostart-watcher.ps1"), (Join-Path $publishDir "autostart-watcher.ps1"), $true)
 
 # STEP 6: Bake bootstrap seed (DB connection) into the package when any of the
 # bootstrap params were supplied. Plaintext is unavoidable here: DPAPI keys are
-# bound to the build host and cannot survive transit. install.ps1 reads this
-# file on the target machine, encrypts Username/Password with the chosen DPAPI
-# scope, writes the registry, and deletes the seed file on success so the
-# plaintext is short-lived. The seed always carries the chosen Scope so a
-# default install.ps1 invocation (no -Scope flag) lands in the correct hive.
+# bound to the build host and cannot survive transit. install-impl.ps1 reads this
+# file on the target machine, encrypts Username/Password with DPAPI CurrentUser,
+# writes HKCU, and deletes the seed file on success so the plaintext is
+# short-lived. install-impl.ps1 has no -Scope flag, so the seed carries only the
+# six DB* fields.
 $bootstrapSeedPath = Join-Path $publishDir "bootstrap.seed.json"
 $hasBootstrap = $DBHost -or $DBName -or $DBUserName -or $DBPassword -or $DBType -or $DBPort
 if ($hasBootstrap) {
@@ -278,7 +271,6 @@ if ($hasBootstrap) {
         exit 1
     }
     $seedObj = [ordered]@{
-        Scope      = $Scope
         DBType     = if ($DBType) { $DBType } else { "MSSQL" }
         DBHost     = $DBHost
         DBPort     = if ($DBPort) { $DBPort } else { "1433" }
@@ -289,32 +281,17 @@ if ($hasBootstrap) {
     $seedJson = $seedObj | ConvertTo-Json -Depth 3
     Set-Content -LiteralPath $bootstrapSeedPath -Value $seedJson -Encoding UTF8
     Write-Host "  Bootstrap seed written: $bootstrapSeedPath" -ForegroundColor Green
-    Write-Host "    Scope=$Scope DBType=$($seedObj.DBType) DBHost=$DBHost DBPort=$($seedObj.DBPort) DBName=$DBName" -ForegroundColor Gray
+    Write-Host "    DBType=$($seedObj.DBType) DBHost=$DBHost DBPort=$($seedObj.DBPort) DBName=$DBName" -ForegroundColor Gray
     Write-Host "    NOTE: contains plaintext credentials; delete after install or treat the package as sensitive." -ForegroundColor Yellow
 } elseif (Test-Path -LiteralPath $bootstrapSeedPath) {
     Remove-Item -LiteralPath $bootstrapSeedPath -Force
     Write-Host "  Removed stale bootstrap.seed.json (no -DBHost/-DBName supplied this run)" -ForegroundColor Gray
 }
 
-# STEP 7: Create uninstall script in package
-$uninstallScript = @'
-# Elite Soft Erwin Add-In - Uninstaller
-# Run: .\uninstall.ps1
-
-$installScript = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "install.ps1"
-if (Test-Path $installScript) {
-    & $installScript -Uninstall
-} else {
-    $installDir = Join-Path $env:LOCALAPPDATA "EliteSoft\ErwinAddIn"
-    $installed = Join-Path $installDir "install.ps1"
-    if (Test-Path $installed) {
-        & $installed -Uninstall
-    } else {
-        Write-Host "install.ps1 not found!" -ForegroundColor Red
-    }
-}
-'@
-Set-Content -LiteralPath (Join-Path $publishDir "uninstall.ps1") -Value $uninstallScript -Encoding UTF8
+# STEP 7: (intentionally empty) - uninstall.bat from STEP 5 already wraps
+# "install-impl.ps1 -Uninstall", so we no longer ship a separate uninstall-impl.ps1.
+# Keeping a single source of truth for the install/uninstall logic avoids
+# the two-file drift the old inline-generated uninstall.ps1 was prone to.
 
 # STEP 8: Create package (or just leave folder)
 # Ensure the directory the ZIP will land in exists. For the default flow this
@@ -382,8 +359,10 @@ if ($Zip) {
 
 Write-Host "`nInstall on target:" -ForegroundColor Yellow
 Write-Host "  1. Copy folder (or extract ZIP)" -ForegroundColor White
-Write-Host "  2. PowerShell as Admin: .\install.ps1" -ForegroundColor White
-Write-Host "  3. Run Admin tool to configure DB connection" -ForegroundColor White
+Write-Host "  2. Double-click install.bat   (no admin needed)" -ForegroundColor White
+Write-Host "     (or run .\install-impl.ps1 from PowerShell for CLI overrides)" -ForegroundColor DarkGray
+Write-Host "  3. If no DB seed was baked, install.bat will prompt for credentials" -ForegroundColor White
+Write-Host "  Uninstall: double-click uninstall.bat" -ForegroundColor Gray
 
 Write-Host "`nPress any key to exit..." -ForegroundColor Gray
 $null = (Get-Host).UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')

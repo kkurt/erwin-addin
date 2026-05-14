@@ -35,6 +35,13 @@ namespace EliteSoft.Erwin.AddIn
         private readonly List<dynamic> _openModels = new List<dynamic>();
         private string _connectedModelName;
         private bool _globalDataLoaded;
+        // Set by ErwinAddIn.Execute() when it shows a splash BEFORE this form
+        // is constructed (license check + ctor + Show overhead is ~1.5s).
+        // ConnectToModel uses this instead of creating its own loading dialog
+        // so we keep ONE splash for the whole startup path. Once consumed it
+        // is cleared so subsequent ConnectToModel calls (model switch via
+        // reconnect timer, manual reload, etc.) create a fresh dialog.
+        private Form _earlySplash;
         // Degraded-mode tracking. _inDegradedMode is true when ConnectToModel
         // succeeded at the SCAPI level but ConfigContext.Initialize failed
         // (model not Mart-bound, or Mart path has no MODEL_CONFIG_MAPPING
@@ -46,6 +53,60 @@ namespace EliteSoft.Erwin.AddIn
         // degraded UI forever after the user switches to a good model.
         private bool _inDegradedMode;
         private string _lastDegradedLocator;
+
+        // Connected-mode locator tracking (2026-05-14). Mirror of
+        // _lastDegradedLocator for the success path: set after ConnectToModel
+        // finishes a non-degraded connect, cleared on disconnect / session
+        // loss. The reconnect timer compares this against every open PU's
+        // locator on each tick; if a NEW locator shows up (sequential model
+        // switch OR side-by-side new model created in the same erwin
+        // session) the timer fires ConnectToModel against that locator's
+        // index so ConfigContext is re-resolved for the new model.
+        // Without this the add-in keeps validating against the original
+        // model's config indefinitely, ignoring whatever the user just
+        // created.
+        private string _lastConnectedLocator;
+
+        // Known-locator set (2026-05-14). Loop fix for side-by-side model
+        // scenarios: with a single tracked locator the reconnect timer
+        // ping-pongs between two open PUs (whichever we bind to becomes
+        // tracked, the other always looks divergent, so the tick flips us
+        // back and forth forever). This set holds every PU locator the
+        // add-in has already observed at the end of a ConnectToModel cycle;
+        // the tick only fires a switch when at least one open PU's locator
+        // is NOT in the set - i.e. a genuinely NEW model was opened. Re-
+        // populated from PersistenceUnits on every successful connect so a
+        // closed PU drops out automatically. Cleared on disconnect and
+        // session loss so the next connect starts from scratch.
+        private readonly HashSet<string> _knownLocators = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // Count of PUs open at the end of the last successful connect cycle.
+        // The reconnect timer uses this to detect when a PU is CLOSED: closing
+        // a side-by-side local model does not introduce a new locator, it only
+        // removes one from the set, and the remaining PU keeps the same
+        // (empty) locator on r10.10. Without this counter the add-in stayed
+        // degraded forever after the user closed the unmapped model and went
+        // back to the Mart-bound one (verified 2026-05-14 11:46).
+        private int _lastConnectPuCount;
+
+        // Active-window-title locator observed at the end of the last connect
+        // cycle. erwin's MDI tab switch (between two open PUs, no count
+        // change, no per-PU locator change) is invisible to PU-set diffing -
+        // the only signal that "the user is now looking at a different model"
+        // is the main-window title flipping to the other model's path.
+        // The reconnect timer polls this on every tick (count > 1 only -
+        // single-PU runs cannot tab-switch) and forces a reconnect when the
+        // current title locator differs from what we recorded. Verified
+        // 2026-05-14 11:59: with Mart + side-by-side local Model_12 open,
+        // tabbing back to Mart used to leave the add-in stuck in degraded
+        // mode because no PU set element changed.
+        private string _lastObservedTitleLocator = string.Empty;
+
+        // Diagnostic counter for the tab-switch polling heartbeat; bumps once
+        // per reconnect tick when count>1 and rolls over every ~10 s to emit a
+        // single [TabPoll] log line. Kept on the form so the heartbeat
+        // survives across timer Tick handlers but is reset on disconnect.
+        private int _tabPollDebugTickCounter;
 
         // Services
         private ColumnValidationService _validationService;
@@ -112,6 +173,17 @@ namespace EliteSoft.Erwin.AddIn
 
         #region Form Lifecycle
 
+        /// <summary>
+        /// Hand off a loading-splash form that was created by the caller (e.g.
+        /// ErwinAddIn.Execute) BEFORE this form was shown. ConnectToModel will
+        /// reuse it instead of creating its own, so the user sees one continuous
+        /// splash from add-in start to model connection complete.
+        /// </summary>
+        internal void AttachEarlySplash(Form splash)
+        {
+            _earlySplash = splash;
+        }
+
         private void ModelConfigForm_Load(object sender, EventArgs e)
         {
             using (AddinLogger.BeginScope("ModelConfigForm_Load"))
@@ -135,7 +207,13 @@ namespace EliteSoft.Erwin.AddIn
             {
                 UpdateConnectionStatus(StatusLoading, Color.Gray);
                 _openModels.Clear();
-                Application.DoEvents();
+                // Note: previous Application.DoEvents() here was removed
+                // 2026-05-14. It was meant to repaint the "Loading..." label
+                // before the COM call, but on this STA-shared-with-erwin
+                // thread it pumped erwin's entire model-load message queue
+                // before returning - up to 40s wait verified in logs. The
+                // label render lag (~1 frame) is acceptable; the splash
+                // shown by ConnectToModel below provides the real feedback.
 
                 dynamic persistenceUnits;
                 using (AddinLogger.BeginScope("scapi.PersistenceUnits"))
@@ -222,7 +300,23 @@ namespace EliteSoft.Erwin.AddIn
             // Show splash IMMEDIATELY. _session.Open() below can take 2-4s on large
             // models; without early splash the user sees a 5s dead-time after
             // opening a model in erwin before any add-in feedback appears.
-            Form loadingDialog = ShowLoadingDialog("Please wait...");
+            // If ErwinAddIn.Execute already opened one before this form was
+            // constructed (covering ~1.5s of license + ctor + Show overhead),
+            // reuse it; otherwise create a new one. The field is cleared on
+            // consume so model-switch / reconnect-timer reconnects produce a
+            // fresh dialog.
+            Form loadingDialog = _earlySplash;
+            if (loadingDialog != null && !loadingDialog.IsDisposed)
+            {
+                _earlySplash = null;
+                UpdateLoadingMessage(loadingDialog, "Please wait...");
+                AddinLogger.Log("ConnectToModel: reusing early splash from ErwinAddIn.Execute");
+            }
+            else
+            {
+                _earlySplash = null;
+                loadingDialog = ShowLoadingDialog("Please wait...");
+            }
 
             try
             {
@@ -242,6 +336,10 @@ namespace EliteSoft.Erwin.AddIn
                 using (AddinLogger.BeginScope("CloseCurrentSession"))
                     CloseCurrentSession();
                 _isConnected = false;
+                // Drop the previous connected-locator marker before the new
+                // session opens; otherwise a half-completed switch could leave
+                // a stale value that confuses the reconnect timer's diff.
+                _lastConnectedLocator = null;
                 UpdateConnectionStatus(StatusConnecting, Color.Gray);
                 Application.DoEvents();
 
@@ -256,21 +354,117 @@ namespace EliteSoft.Erwin.AddIn
                 AddinLogger.Log($"Connected to model: {_connectedModelName}");
 
                 _isConnected = true;
-                StopReconnectTimer();
+
+                // Read the active PU locator FIRST so the reconnect timer has
+                // something to track against on its very next tick - otherwise
+                // the long init sequence below (~1.5 s) lets the timer fire
+                // with _lastConnectedLocator still empty, which the tick
+                // treats as "no model yet" and re-triggers ConnectToModel in
+                // a loop. PuLocatorReader's multi-stage fallback handles
+                // Mart-bound PUs whose PropertyBag('Locator') is empty on
+                // r10.10. RE models legitimately return '' here; the tick's
+                // divergence check treats '' == '' as "no change" so the
+                // loop is harmless there too.
+                //
+                // Window-title fallback is gated on PU count: only safe when a
+                // SINGLE PU is open (the title is then unambiguously about that
+                // PU). With multiple PUs the title still points at whichever
+                // tab erwin painted last, which can be a different model from
+                // the one we just bound to (verified 2026-05-14 11:07 against
+                // Mart + side-by-side local Model_12). In that case we read
+                // PU-only and let an empty locator flow into ConfigContext,
+                // which correctly drops the add-in into degraded mode and
+                // fires the "configuration not found" dialog.
+                int openPuCount = 1;
+                try { openPuCount = (int)_scapi.PersistenceUnits.Count; }
+                catch (Exception ex) { Log($"ConnectToModel: PU count read failed: {ex.Message}"); }
+                bool allowTitleFallback = openPuCount <= 1;
+                string puLocator = Services.PuLocatorReader.Read(
+                    _currentModel,
+                    allowTitleFallback,
+                    (Action<string>)Log) ?? "";
+                Log($"ConnectToModel: PU[{modelIndex}] locator='{puLocator}' (titleFallback={(allowTitleFallback ? "on" : "off")}, openPuCount={openPuCount})");
+                _lastConnectedLocator = puLocator;
+
+                // Rebuild the known-locators set from EVERY currently open PU
+                // (not just the one we just bound to). The tick uses this to
+                // distinguish "user added a brand-new model" from "the tick is
+                // looking at another already-open model the add-in just hasn't
+                // bound to". Without this, the tick would treat the OTHER open
+                // PU as divergent and flip the add-in back and forth between
+                // them indefinitely (loop reproduced 2026-05-14 10:50 with a
+                // Mart model + a side-by-side RE model). Empty locators are
+                // kept in the set with the empty string entry so RE models do
+                // not look "new" on every tick either.
+                _knownLocators.Clear();
+                try
+                {
+                    dynamic puColl = _scapi.PersistenceUnits;
+                    int puCount = puColl.Count;
+                    for (int i = 0; i < puCount; i++)
+                    {
+                        // PU iteration MUST disable the window-title fallback.
+                        // The title is a GLOBAL erwin state - using it here
+                        // would attribute the active window's locator to every
+                        // PU in the collection (verified 2026-05-14 11:07: a
+                        // local Model_12 came back as the Mart locator because
+                        // the focused diagram tab was still the Mart model),
+                        // poisoning the known set and hiding genuine switches.
+                        string loc = Services.PuLocatorReader.Read(
+                            puColl.Item(i),
+                            allowWindowTitleFallback: false) ?? string.Empty;
+                        _knownLocators.Add(loc);
+                    }
+                }
+                catch (Exception kex)
+                {
+                    Log($"ConnectToModel: failed to seed known-locators set: {kex.Message}");
+                    // Defensive: ensure at least the active locator is recorded
+                    // so the tick has SOMETHING to compare against.
+                    _knownLocators.Add(puLocator);
+                }
+
+                // Record the open PU count so the tick can detect a PU being
+                // CLOSED (the locator-diff path only catches PUs being added).
+                _lastConnectPuCount = openPuCount;
+
+                // Snapshot the current active-window-title locator so the tick
+                // can detect a user-driven MDI tab switch between two open
+                // PUs without a PU set change. Reading the title here (not in
+                // the tick body alone) ensures the baseline matches the PU we
+                // just bound to.
+                _lastObservedTitleLocator = Services.PuLocatorReader.ReadFromWindowTitle() ?? string.Empty;
+
+                // Keep the reconnect timer alive even after a successful
+                // connect so it can act as a model-state monitor: the tick
+                // now compares each open PU's locator against
+                // _lastConnectedLocator and fires a fresh connect when the
+                // user creates a NEW model in the same erwin session
+                // (side-by-side) or closes this one and opens a different
+                // one (sequential). StartReconnectTimer is idempotent
+                // (Stop + recreate), so calling it here on every connect is
+                // safe whether the timer was already running (we re-armed
+                // ourselves) or stopped (first connect after startup).
+                StartReconnectTimer();
                 UpdateConnectionStatus(StatusConnected, Color.DarkGreen);
                 UpdateStatus("Connected to model.", Color.DarkGreen);
 
-                // Skip validations for RE models (temporary models created by Reverse Engineer)
-                // RE models are detected by: no Locator AND model name starts with "Model_"
-                // Normal local models get validations via MODEL_PATH UDP matching
-                string puLocator = "";
-                try { puLocator = _currentModel.PropertyBag().Value("Locator")?.ToString() ?? ""; } catch { }
+                // Skip validations for RE models (temporary models created by
+                // Reverse Engineer). RE models share the same shape as a fresh
+                // File > New Model (empty locator + auto-name "Model_NN"), so
+                // we additionally require openPuCount == 1 to qualify: an RE
+                // run replaces the single previous PU, while a side-by-side
+                // File > New leaves the existing Mart model open and adds a
+                // second PU. Without this guard the switch path was treating
+                // every user-created local model as an RE temp and skipping
+                // the degraded-mode dialog (verified 2026-05-14 11:31).
                 bool isReModel = string.IsNullOrEmpty(puLocator) &&
-                    (_connectedModelName.StartsWith("Model_") || _connectedModelName.StartsWith("Model "));
+                    (_connectedModelName.StartsWith("Model_") || _connectedModelName.StartsWith("Model ")) &&
+                    openPuCount <= 1;
 
                 if (isReModel)
                 {
-                    Log($"Skipping validations for RE model '{_connectedModelName}'");
+                    Log($"Skipping validations for RE model '{_connectedModelName}' (openPuCount={openPuCount})");
                     // Still populate DDL combos for RE models
                     cmbLeftModel.Items.Clear();
                     cmbLeftModel.Items.Add($"Active Model ({_connectedModelName})");
@@ -311,6 +505,8 @@ namespace EliteSoft.Erwin.AddIn
             catch (Exception ex)
             {
                 _isConnected = false;
+                _lastConnectedLocator = null;
+                _knownLocators.Clear();
                 UpdateConnectionStatus(StatusDisconnected, Color.Red);
                 UpdateStatus($"Error: {ex.Message}", Color.Red);
             }
@@ -325,7 +521,13 @@ namespace EliteSoft.Erwin.AddIn
         }
 
         /// <summary>Updates the big message label inside the splash, if present.</summary>
-        private static void UpdateLoadingMessage(Form loadingDialog, string newMessage)
+        // internal so ErwinAddIn.Execute can update the early splash message
+        // during license check / form construction phases. Application.DoEvents
+        // here is INTENTIONAL and SAFE: limited to repainting our own loading
+        // form; the heavy-pump variant that caused the model-load wait (40s
+        // outlier) was in LoadOpenModels, removed 2026-05-14. This call only
+        // flushes WM_PAINT for our small splash dialog.
+        internal static void UpdateLoadingMessage(Form loadingDialog, string newMessage)
         {
             if (loadingDialog == null || loadingDialog.IsDisposed) return;
             try
@@ -361,6 +563,137 @@ namespace EliteSoft.Erwin.AddIn
             catch { return null; }
         }
 
+        /// <summary>
+        /// Finds the PU index whose locator matches the active window-title
+        /// locator (2026-05-14). The mapping is the only signal that survives
+        /// erwin r10.10's habit of returning the SAME pu.Name="Model_N" for
+        /// every open PU when a side-by-side local model is created next to
+        /// a Mart-bound one.
+        ///
+        /// Title locator forms (post PuLocatorReader.ReadFromWindowTitle):
+        ///   "Mart://Mart/&lt;path&gt;?VNO=N"   active tab is a Mart model
+        ///   ""                                  active tab is a local model
+        ///                                       (title bracket has no Mart://)
+        /// Per-PU locator forms (post PuLocatorReader.Read with title
+        /// fallback OFF):
+        ///   "erwin://Mart://Mart/&lt;path&gt;?&amp;version=N&amp;modelLongId=..."
+        ///                                       Mart PU
+        ///   ""                                  local-unsaved PU
+        ///
+        /// Match rule: extract the "Mart://Mart/&lt;path&gt;" stem from both
+        /// sides (strip optional "erwin://" prefix + any query string) and
+        /// case-insensitive compare. When the title locator is empty, match
+        /// the PU whose locator is also empty (the local model).
+        ///
+        /// Returns -1 when nothing matches; caller is expected to fall back
+        /// to a locator-different heuristic before giving up.
+        /// </summary>
+        private int FindPuIndexMatchingTitleLocator(string titleLocator, dynamic persistenceUnits, int count)
+        {
+            string titleStem = ExtractMartStem(titleLocator);
+
+            for (int i = 0; i < count; i++)
+            {
+                string puLoc = string.Empty;
+                try { puLoc = Services.PuLocatorReader.Read(persistenceUnits.Item(i), allowWindowTitleFallback: false) ?? string.Empty; }
+                catch (Exception ex) { Log($"TabSwitch: PU[{i}] locator read error: {ex.Message}"); }
+
+                string puStem = ExtractMartStem(puLoc);
+
+                // Both empty -> local-PU match.
+                // Both non-empty + equal stem -> Mart-PU match.
+                if (string.IsNullOrEmpty(titleStem) && string.IsNullOrEmpty(puStem))
+                {
+                    Log($"TabSwitch: matched local-unsaved PU[{i}] (both stems empty)");
+                    return i;
+                }
+                if (!string.IsNullOrEmpty(titleStem) &&
+                    string.Equals(titleStem, puStem, StringComparison.OrdinalIgnoreCase))
+                {
+                    Log($"TabSwitch: matched PU[{i}] by Mart stem '{puStem}'");
+                    return i;
+                }
+            }
+            return -1;
+        }
+
+        /// <summary>
+        /// Normalises a Mart-style locator down to its "Mart://Mart/&lt;path&gt;"
+        /// stem so locators from two different sources (active window title vs
+        /// PU.PropertyBag) can be compared. Drops the optional leading
+        /// "erwin://" prefix that PropertyBag adds and strips any query string
+        /// (?VNO=N, ?&amp;version=N&amp;modelLongId=..., etc).
+        /// Returns empty for empty input and for inputs that don't look like
+        /// Mart locators - the caller treats both empty + non-Mart strings as
+        /// "local model" and routes to the PU with an empty locator.
+        /// </summary>
+        private static string ExtractMartStem(string locator)
+        {
+            if (string.IsNullOrEmpty(locator)) return string.Empty;
+            string s = locator;
+            // erwin's PropertyBag locator carries the duplicate "erwin://"
+            // prefix; the title-parsed locator does not. Strip so both shapes
+            // share the same root.
+            if (s.StartsWith("erwin://", StringComparison.OrdinalIgnoreCase))
+                s = s.Substring("erwin://".Length);
+            // Only Mart locators are meaningful for tab-switch matching. A
+            // local model bound via File > New has no locator at all; treat
+            // "anything that isn't Mart://" as empty so the empty-vs-empty
+            // branch above catches it.
+            if (!s.StartsWith("Mart://", StringComparison.OrdinalIgnoreCase))
+                return string.Empty;
+            int q = s.IndexOf('?');
+            if (q >= 0) s = s.Substring(0, q);
+            return s.TrimEnd('/');
+        }
+
+        /// <summary>
+        /// Ground-truth diagnostic for tab-switch debugging (2026-05-14).
+        /// Logs every signal we could possibly use to decide which open PU
+        /// the user is currently looking at:
+        ///   - the raw erwin main-window title (full string, no parsing)
+        ///   - per-PU index, Name (via GetModelName), raw Locator readings
+        ///     from PuLocatorReader (window-title fallback OFF so per-PU
+        ///     reads don't all alias to the active title)
+        ///   - the add-in's currently bound model name
+        ///   - the parsed Mart-title locator (what _lastObservedTitleLocator
+        ///     gets written from)
+        /// Intended use: collect log evidence in the user-reported "tab-switch
+        /// goes unnoticed / lands on wrong PU" repro, decide which signal
+        /// uniquely identifies the active tab on r10.10, then build the
+        /// matcher around it. Heavy; only called at heartbeat (every 10 s)
+        /// and at actual tab-switch firings.
+        /// </summary>
+        private void DumpDiagnosticsForTabSwitch(string tag, dynamic persistenceUnits, int count)
+        {
+            try
+            {
+                // 1. Raw main-window title (no regex, no bracket extraction).
+                IntPtr hWnd = Services.Win32Helper.GetErwinMainWindow();
+                string rawTitle = hWnd != IntPtr.Zero ? Services.Win32Helper.GetWindowTextSafe(hWnd) : "(no erwin main window)";
+                Log($"{tag}: rawTitle='{rawTitle}'");
+                Log($"{tag}: parsedTitleLoc='{Services.PuLocatorReader.ReadFromWindowTitle() ?? string.Empty}' boundName='{_connectedModelName ?? string.Empty}'");
+
+                // 2. Per-PU dump. Locator read MUST disable window-title
+                //    fallback - otherwise every PU appears to have the
+                //    active-window locator and the dump becomes useless.
+                for (int i = 0; i < count; i++)
+                {
+                    string puName = "(name read failed)";
+                    string puLoc = "(loc read failed)";
+                    try { puName = GetModelName(persistenceUnits.Item(i)) ?? "(null)"; }
+                    catch (Exception ex) { puName = $"(name err: {ex.GetType().Name})"; }
+                    try { puLoc = Services.PuLocatorReader.Read(persistenceUnits.Item(i), allowWindowTitleFallback: false) ?? "(null)"; }
+                    catch (Exception ex) { puLoc = $"(loc err: {ex.GetType().Name})"; }
+                    Log($"{tag}: PU[{i}] name='{puName}' locator='{puLoc}'");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"{tag}: DumpDiagnosticsForTabSwitch FAILED: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
         #endregion
 
         #region Reconnect Timer
@@ -386,59 +719,251 @@ namespace EliteSoft.Erwin.AddIn
 
         private void ReconnectTimer_Tick(object sender, EventArgs e)
         {
-            // The timer normally runs only while we are NOT connected, but
-            // degraded mode is a special case: SCAPI session is open but the
-            // CONFIG mapping is missing, and we want to detect when the user
-            // closes the unmapped model and opens a properly-mapped one. So
-            // bail out only when we are connected AND not degraded.
-            if (_isConnected && !_inDegradedMode)
-            {
-                StopReconnectTimer();
-                return;
-            }
-
+            // Unified model-state monitor (2026-05-14). The timer is kept alive
+            // in every state (disconnected, degraded, connected) and reacts
+            // when an open PU's locator diverges from what we last successfully
+            // tracked. Four scenarios share this code path:
+            //   1. Disconnected -> a model opens                  (tracked = "")
+            //   2. Degraded     -> user closes unmapped, opens mapped
+            //   3. Connected    -> user closes current, opens different model
+            //   4. Connected    -> user creates a new model in the same erwin
+            //                      session (old + new PUs both live; we detect
+            //                      the new locator and switch to it so
+            //                      ConfigContext is re-resolved)
+            //
+            // Removing the original "if connected && !degraded -> stop" branch
+            // was the fix for scenario 4 - the add-in used to keep validating
+            // the original model's config indefinitely after a side-by-side
+            // create, with no UI hint that anything was stale.
             try
             {
                 dynamic persistenceUnits = _scapi.PersistenceUnits;
                 int count = persistenceUnits.Count;
                 if (count == 0) return;
 
-                // In degraded mode we only want to react when a NEW locator
-                // appears - otherwise every tick would yank the user back into
-                // the same broken connect loop on the same unmapped PU.
-                if (_inDegradedMode && !string.IsNullOrEmpty(_lastDegradedLocator))
+                // Disconnected path: we have no connect cycle yet, no known
+                // locators are recorded - just bind to PU 0 and let
+                // ConnectToModel seed the set.
+                if (!_isConnected)
                 {
-                    bool sawDifferent = false;
+                    Log($"Model detected ({count} open). Connecting...");
+
+                    _openModels.Clear();
                     for (int i = 0; i < count; i++)
-                    {
-                        string loc = Services.PuLocatorReader.Read(persistenceUnits.Item(i)) ?? "";
-                        if (!string.Equals(loc, _lastDegradedLocator, StringComparison.OrdinalIgnoreCase))
-                        {
-                            sawDifferent = true;
-                            break;
-                        }
-                    }
-                    if (!sawDifferent) return;
-                    Log($"Reconnect: locator changed from degraded '{_lastDegradedLocator}' - attempting fresh connect.");
-                }
-                else
-                {
-                    Log($"Model detected ({count} open). Reconnecting...");
+                        _openModels.Add(persistenceUnits.Item(i));
+
+                    if (_openModels.Count > 0)
+                        ConnectToModel(0);
+                    return;
                 }
 
-                StopReconnectTimer();
+                // PU count drop detection: when count < known-set size, the
+                // user just closed at least one PU. The add-in's _currentModel
+                // may now point at the closed PU or a stale CONFIG (verified
+                // 2026-05-14 11:46: degraded on Model_12, user closed it and
+                // switched focus back to the Mart model, but tick saw every
+                // remaining PU's locator empty and treated it as "no change",
+                // leaving the add-in stuck in degraded mode). Force a full
+                // re-init so ConfigContext re-resolves against whatever PU is
+                // still open. ConnectToModel(0) is the simplest pick because
+                // titleFallback becomes safe again when only one PU remains.
+                if (count < _knownLocators.Count)
+                {
+                    Log($"PU count dropped {_knownLocators.Count} -> {count}; clearing _globalDataLoaded and reconnecting active PU so ConfigContext re-resolves.");
+                    _globalDataLoaded = false;
+
+                    _openModels.Clear();
+                    for (int i = 0; i < count; i++)
+                        _openModels.Add(persistenceUnits.Item(i));
+
+                    if (_openModels.Count > 0)
+                        ConnectToModel(0);
+                    return;
+                }
+
+                // Connected (mapped or degraded) path. The add-in records every
+                // PU it has seen at the end of a successful connect cycle in
+                // _knownLocators. The tick only fires a switch when an open PU
+                // has a locator NOT in the set - i.e. a genuinely new model
+                // appeared since the last connect. This avoids the ping-pong
+                // loop where a single tracked locator would always classify
+                // the OTHER already-open PU as divergent.
+                int newIndex = -1;
+                string newLocator = null;
+                for (int i = 0; i < count; i++)
+                {
+                    // Same window-title-fallback guard as the seed loop in
+                    // ConnectToModel: never let the global active-window
+                    // locator masquerade as a per-PU locator during iteration.
+                    string loc = Services.PuLocatorReader.Read(
+                        persistenceUnits.Item(i),
+                        allowWindowTitleFallback: false) ?? string.Empty;
+                    if (!_knownLocators.Contains(loc))
+                    {
+                        newIndex = i;
+                        newLocator = loc;
+                        break;
+                    }
+                }
+                if (newIndex < 0)
+                {
+                    // No NEW locator showed up, but a previously-open PU may
+                    // have been closed. PU-close is invisible to the locator
+                    // diff above (closing a side-by-side local model does not
+                    // introduce a new locator, only removes one), so we cross
+                    // check against the saved count. If something went away,
+                    // re-bind to PU 0 with a full re-init so ConfigContext is
+                    // re-resolved against whatever remains - this is what
+                    // pulls the add-in out of degraded mode when the user
+                    // closes the unmapped local model and goes back to the
+                    // Mart-bound one.
+                    if (count < _lastConnectPuCount)
+                    {
+                        Log($"PU closed: count {_lastConnectPuCount} -> {count}; reconnecting to PU 0 with full re-init.");
+                        _globalDataLoaded = false;
+                        _openModels.Clear();
+                        for (int i = 0; i < count; i++)
+                            _openModels.Add(persistenceUnits.Item(i));
+                        ConnectToModel(0);
+                        return;
+                    }
+
+                    // MDI tab-switch detection: with multiple PUs open, the
+                    // user can tab between them without any SCAPI-visible
+                    // change (PU count and per-PU locators both stay
+                    // identical). The only signal is the erwin main-window
+                    // title flipping to the other model's path. We compare
+                    // that title locator against the snapshot taken on the
+                    // last connect; if it changed, the user is now looking at
+                    // a different PU and ConfigContext must be re-resolved.
+                    // Skipped at count==1 because a single-PU run cannot tab
+                    // switch, and the locator-only-diff path already covers
+                    // count==2 -> count==1 transitions via PU-close.
+                    if (count > 1)
+                    {
+                        string currentTitleLoc = Services.PuLocatorReader.ReadFromWindowTitle() ?? string.Empty;
+
+                        // Diagnostic heartbeat: log the title locator every
+                        // ~10 s (20 ticks at 500 ms) so we can see WHAT
+                        // ReadFromWindowTitle is returning when the user
+                        // claims a tab switch went unnoticed. Without this,
+                        // a silent log makes both "user did not switch tabs"
+                        // and "we read the wrong title locator" look identical.
+                        _tabPollDebugTickCounter++;
+                        if (_tabPollDebugTickCounter >= 20)
+                        {
+                            _tabPollDebugTickCounter = 0;
+                            // One-line summary on idle. Full ground-truth dump
+                            // (raw title + per-PU name/locator) is reserved
+                            // for actual tab-switch firings - cheap there
+                            // because it runs at most a few times per minute.
+                            // The previous per-heartbeat dump produced 4
+                            // log lines every 10 s for the lifetime of the
+                            // process; trimmed 2026-05-14 once the locator
+                            // matcher proved stable in production logs.
+                            Log($"[TabPoll] count={count} titleLoc='{currentTitleLoc}' boundName='{_connectedModelName}'");
+                        }
+
+                        if (!string.Equals(currentTitleLoc, _lastObservedTitleLocator, StringComparison.OrdinalIgnoreCase))
+                        {
+                            Log($"Active tab switch detected: window title locator '{_lastObservedTitleLocator}' -> '{currentTitleLoc}'; reconnecting with full re-init.");
+                            DumpDiagnosticsForTabSwitch("[TabSwitch] pre-reconnect ground truth", persistenceUnits, count);
+                            _globalDataLoaded = false;
+                            _openModels.Clear();
+                            for (int i = 0; i < count; i++)
+                                _openModels.Add(persistenceUnits.Item(i));
+
+                            // Pick the target PU by LOCATOR, not by name.
+                            // 2026-05-14 ground-truth log proved BOTH PUs in
+                            // the user's Mart + side-by-side local repro come
+                            // back as pu.Name='Model_1' (erwin r10.10 reuses
+                            // the same display name for the new local model
+                            // and the bound Mart model). Name-diff therefore
+                            // selects nothing and the old code fell back to
+                            // PU[0] - which is the same Mart PU we are
+                            // already bound to, so degraded mode never lifted.
+                            //
+                            // Per-PU locator from PuLocatorReader (window
+                            // title fallback OFF) IS reliable on this build:
+                            // Mart PU returns "erwin://Mart://Mart/<path>?...",
+                            // local-unsaved PU returns "". The parsed window
+                            // title (currentTitleLoc) likewise returns the
+                            // Mart stem "Mart://Mart/<path>?VNO=N" when the
+                            // active tab is the Mart model, "" when the
+                            // active tab is the local model. We match the
+                            // two by normalised Mart stem (strip leading
+                            // "erwin://" and any query string), and treat
+                            // empty locator + empty title as the local-PU
+                            // match. This works regardless of how many PUs
+                            // share the same display name.
+                            int targetIndex = FindPuIndexMatchingTitleLocator(
+                                currentTitleLoc, persistenceUnits, count);
+
+                            if (targetIndex < 0)
+                            {
+                                // No locator match - either the title isn't
+                                // a Mart stem and no PU has an empty locator,
+                                // or two PUs hit the same Mart stem (rare:
+                                // same model opened twice from different
+                                // versions). Fall back to "the other PU"
+                                // heuristic: pick the FIRST PU index whose
+                                // locator differs from the one we are bound
+                                // to right now. Still better than blindly
+                                // re-selecting PU[0] which is the entrenched
+                                // failure mode this branch fixes.
+                                string boundLoc = _lastConnectedLocator ?? string.Empty;
+                                for (int i = 0; i < count; i++)
+                                {
+                                    string loc = Services.PuLocatorReader.Read(
+                                        persistenceUnits.Item(i),
+                                        allowWindowTitleFallback: false) ?? string.Empty;
+                                    if (!string.Equals(loc, boundLoc, StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        targetIndex = i;
+                                        Log($"TabSwitch: locator-different fallback targeting PU[{i}] loc='{loc}' (was bound to '{boundLoc}')");
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if (targetIndex < 0)
+                            {
+                                targetIndex = 0;
+                                Log("TabSwitch: no locator-different PU either; last-ditch fallback to PU[0].");
+                            }
+                            ConnectToModel(targetIndex);
+                            return;
+                        }
+                    }
+
+                    // All open PUs are already in the known set; idle tick.
+                    return;
+                }
+
+                if (_inDegradedMode)
+                    Log($"Reconnect: new PU detected while degraded ('{newLocator}' at index {newIndex}) - reattempting connect.");
+                else
+                    Log($"Model switch detected: new PU locator '{newLocator}' at index {newIndex} not in known set - reconnecting so ConfigContext is re-resolved.");
+
+                // Force the next ConnectToModel onto the full-init path so
+                // ConfigContext.Initialize runs against the new locator.
+                // Otherwise ReinitializeForModelSwitch keeps the previous
+                // model's resolved CONFIG row alive (verified 2026-05-14 11:21:
+                // switch fired, Connected to model: Model_1, but ShowConfigWarningDialog
+                // never opened because the cached FIBA_Default mapping was
+                // still considered valid). Resetting the flag also re-triggers
+                // glossary / naming-standards / predefined-column loads, which
+                // is correct because the new model may live under a different
+                // corporate root with different data-governance config.
+                _globalDataLoaded = false;
+                Log("Model switch: cleared _globalDataLoaded so InitializeValidationService runs against the new locator.");
 
                 _openModels.Clear();
                 for (int i = 0; i < count; i++)
-                {
-                    dynamic model = persistenceUnits.Item(i);
-                    _openModels.Add(model);
-                }
+                    _openModels.Add(persistenceUnits.Item(i));
 
-                if (_openModels.Count > 0)
-                {
-                    ConnectToModel(0);
-                }
+                if (_openModels.Count > newIndex)
+                    ConnectToModel(newIndex);
             }
             catch (Exception ex)
             {
@@ -485,8 +1010,16 @@ namespace EliteSoft.Erwin.AddIn
             // PU.Locator is unreliable on r10.10 Mart-bound PUs (often ""),
             // so we use the shared fallback chain: direct -> PropertyBag() ->
             // PropertyBag(null,true) -> erwin main-window title.
-            string locator = PuLocatorReader.Read(_currentModel, (Action<string>)Log);
-            Log($"PuLocatorReader returned: '{locator}' (length={locator.Length})");
+            // Window-title fallback is only safe when a single PU is open;
+            // with multiple PUs the title can belong to a different tab than
+            // the one we just bound to, attributing the wrong locator to
+            // _currentModel (see matching guard in ConnectToModel).
+            int openPuCount = 1;
+            try { openPuCount = (int)_scapi.PersistenceUnits.Count; }
+            catch (Exception ex) { Log($"InitializeValidationService: PU count read failed: {ex.Message}"); }
+            bool allowTitleFallback = openPuCount <= 1;
+            string locator = PuLocatorReader.Read(_currentModel, allowTitleFallback, (Action<string>)Log);
+            Log($"PuLocatorReader returned: '{locator}' (length={locator.Length}, titleFallback={(allowTitleFallback ? "on" : "off")}, openPuCount={openPuCount})");
 
             bool ok;
             using (AddinLogger.BeginScope("ConfigContext.Initialize"))
@@ -503,7 +1036,7 @@ namespace EliteSoft.Erwin.AddIn
                     ?? "No configuration is defined for the model you are trying to load. Add-in controls will be disabled.";
                 string contextPath = ctx.LastErrorPath ?? "";
                 Log($"Config not resolved: {reason} (path='{contextPath}') -- running in degraded mode (no validation/glossary).");
-                UpdateStatus("Connected (no config — add-in controls disabled).", Color.DarkOrange);
+                UpdateStatus("Connected (no config: add-in controls disabled).", Color.Red);
                 btnValidateAll.Enabled = false;
                 // In degraded mode the active PU has no Mart locator. Calling
                 // dynamic dispatch SCAPI methods (PropertyBag().Value("Locator"),
@@ -517,7 +1050,7 @@ namespace EliteSoft.Erwin.AddIn
                 btnAlterWizardProd.Enabled = false;
                 btnMartReview.Enabled = false;
                 lblDDLStatus.Text = "Disabled until a Mart-bound model with CONFIG mapping is loaded.";
-                lblDDLStatus.ForeColor = Color.DarkOrange;
+                lblDDLStatus.ForeColor = Color.Red;
                 using (AddinLogger.BeginScope("UpdateGeneralTab(degraded)"))
                     UpdateGeneralTab();
                 // Defer the modal dialog so Form.Load can finish and Show()
@@ -555,6 +1088,12 @@ namespace EliteSoft.Erwin.AddIn
             // reconnect timer (if still running) won't immediately re-arm.
             _inDegradedMode = false;
             _lastDegradedLocator = null;
+            // Remember the locator we successfully connected to. The reconnect
+            // timer (kept alive even in connected mode) compares this against
+            // every open PU on each tick and fires a fresh ConnectToModel when
+            // a new locator appears - covers both sequential model switches
+            // and side-by-side new-model creation.
+            _lastConnectedLocator = locator ?? "";
 
             // Global data (corporate-scoped, not model-specific)
             using (AddinLogger.BeginScope("DisposeServices"))
@@ -1215,18 +1754,36 @@ namespace EliteSoft.Erwin.AddIn
                 var ctx = ConfigContextService.Instance;
                 if (ctx.IsInitialized)
                 {
-                    _lblCorporateValue.Text = string.IsNullOrEmpty(ctx.CorporateName)
+                    // Resolved config: green = "validation is live". DB type
+                    // is appended in parens so the user can sanity-check at
+                    // a glance which back-end the Mart row lives on (the
+                    // Database card row still carries the full host/catalog).
+                    // ForeColor MUST be reset here - a prior degraded cycle
+                    // would have left the label red, and skipping the reset
+                    // was the user-reported 2026-05-14 bug ("bağlanınca da
+                    // kırmızı kalıyor").
+                    string corpLabel = string.IsNullOrEmpty(ctx.CorporateName)
                         ? $"Config: {ctx.ActiveConfigName}"
                         : $"{ctx.CorporateName} / {ctx.ActiveConfigName}";
+                    string dbType = null;
+                    try { dbType = DatabaseService.Instance.GetDbType(); } catch { }
+                    if (!string.IsNullOrEmpty(dbType))
+                        corpLabel += $" ({dbType})";
+                    _lblCorporateValue.Text = corpLabel;
+                    _lblCorporateValue.ForeColor = Color.DarkGreen;
                 }
                 else
                 {
                     // Degraded mode: surface the config-resolution failure inline so
                     // the user can see WHY validation is disabled without re-opening
-                    // the warning dialog.
+                    // the warning dialog. Red text emphasizes the missing-config
+                    // state more strongly than the previous amber (user feedback
+                    // 2026-05-14: amber read as a warning, but this is the actual
+                    // reason every action button is disabled).
                     _lblCorporateValue.Text = string.IsNullOrEmpty(ctx.LastError)
                         ? "(no config for this model)"
-                        : $"(no config — {ctx.LastError})";
+                        : $"(no config: {ctx.LastError})";
+                    _lblCorporateValue.ForeColor = Color.Red;
                 }
 
                 var config = DatabaseService.Instance.GetConfig();
@@ -4557,7 +5114,12 @@ namespace EliteSoft.Erwin.AddIn
             catch { }
         }
 
-        private Form ShowLoadingDialog(string message)
+        // Static so ErwinAddIn.Execute() can show the splash before the
+        // ModelConfigForm instance exists - covers the ~1.5s of
+        // CheckLicense + ctor + Show overhead with visible feedback.
+        // Caller is responsible for closing the returned form (typically
+        // handed off to ConnectToModel which disposes it in finally).
+        internal static Form ShowLoadingDialog(string message)
         {
             var assembly = System.Reflection.Assembly.GetExecutingAssembly();
             System.IO.Stream imgStream = null;
@@ -4878,6 +5440,8 @@ namespace EliteSoft.Erwin.AddIn
                 _session = null;
                 _currentModel = null;
                 _isConnected = false;
+                _lastConnectedLocator = null;
+                _knownLocators.Clear();
 
                 // Clear stale model references to prevent user from selecting dead COM objects
                 _openModels.Clear();
@@ -4885,8 +5449,12 @@ namespace EliteSoft.Erwin.AddIn
                 _globalDataLoaded = false;
                 lblActiveModel.Text = "(Waiting for model...)";
 
-                // Reset General tab info
+                // Reset General tab info. ForeColor MUST be reset too -
+                // a prior degraded-mode cycle would have left Corporate red,
+                // and the disconnect path would otherwise paint "-" in red
+                // until the next successful connect repaints it.
                 _lblCorporateValue.Text = "-";
+                _lblCorporateValue.ForeColor = Color.FromArgb(120, 120, 120);
                 _lblDbValue.Text = "-";
                 _lblRegistryValue.Text = "-";
 

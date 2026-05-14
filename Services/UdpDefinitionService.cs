@@ -17,6 +17,17 @@ namespace EliteSoft.Erwin.AddIn.Services
         public string UdpType { get; set; }
         public string DefaultValue { get; set; }
         public bool IsRequired { get; set; }
+
+        /// <summary>
+        /// Admin-side lock flag (MC_UDP_DEFINITION.IS_LOCKED). When true the add-in
+        /// refuses end-user changes to a non-empty value: initial assignment
+        /// (NULL/empty -> first value) is allowed so wizards and ApplyDefaults can
+        /// seed the field, but every subsequent edit is reverted to the previous
+        /// value and the user is notified. Enforcement lives in
+        /// TableTypeMonitorService.CheckForUdpValueChanges (Table scope today).
+        /// </summary>
+        public bool IsLocked { get; set; }
+
         public int? MinValue { get; set; }
         public int? MaxValue { get; set; }
         public int? MaxLength { get; set; }
@@ -155,6 +166,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                                         UdpType = reader["UDP_TYPE"]?.ToString()?.Trim() ?? "",
                                         DefaultValue = reader["DEFAULT_VALUE"]?.ToString() ?? "",
                                         IsRequired = Convert.ToBoolean(reader["IS_REQUIRED"]),
+                                        IsLocked = Convert.ToBoolean(reader["IS_LOCKED"]),
                                         MinValue = reader["MIN_VALUE"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["MIN_VALUE"]),
                                         MaxValue = reader["MAX_VALUE"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["MAX_VALUE"]),
                                         MaxLength = reader["MAX_LENGTH"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["MAX_LENGTH"]),
@@ -230,7 +242,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                         ? @"WHERE d.""CONFIG_ID"" = @cfgId AND d.""OBJECT_TYPE"" = @objectType"
                         : @"WHERE d.""CONFIG_ID"" = @cfgId";
                     return $@"SELECT d.""ID"" AS ""DEF_ID"", d.""NAME"", d.""DESCRIPTION"", d.""OBJECT_TYPE"", d.""UDP_TYPE"",
-                            d.""DEFAULT_VALUE"", d.""IS_REQUIRED"", d.""MIN_VALUE"", d.""MAX_VALUE"", d.""MAX_LENGTH"",
+                            d.""DEFAULT_VALUE"", d.""IS_REQUIRED"", d.""IS_LOCKED"", d.""MIN_VALUE"", d.""MAX_VALUE"", d.""MAX_LENGTH"",
                             d.""VALIDATION_OPERATOR"", d.""VALIDATION_VALUE"", d.""ERROR_MESSAGE"", d.""APPLY_ON"", d.""SORT_ORDER"",
                             d.""CONFIG_ID"",
 
@@ -245,7 +257,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                         ? "WHERE d.CONFIG_ID = :cfgId AND d.OBJECT_TYPE = :objectType"
                         : "WHERE d.CONFIG_ID = :cfgId";
                     return $@"SELECT d.ID AS DEF_ID, d.NAME, d.DESCRIPTION, d.OBJECT_TYPE, d.UDP_TYPE,
-                            d.DEFAULT_VALUE, d.IS_REQUIRED, d.MIN_VALUE, d.MAX_VALUE, d.MAX_LENGTH,
+                            d.DEFAULT_VALUE, d.IS_REQUIRED, d.IS_LOCKED, d.MIN_VALUE, d.MAX_VALUE, d.MAX_LENGTH,
                             d.VALIDATION_OPERATOR, d.VALIDATION_VALUE, d.ERROR_MESSAGE, d.APPLY_ON, d.SORT_ORDER,
                             d.CONFIG_ID,
 
@@ -261,7 +273,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                         ? "WHERE d.[CONFIG_ID] = @cfgId AND d.[OBJECT_TYPE] = @objectType"
                         : "WHERE d.[CONFIG_ID] = @cfgId";
                     return $@"SELECT d.[ID] AS [DEF_ID], d.[NAME], d.[DESCRIPTION], d.[OBJECT_TYPE], d.[UDP_TYPE],
-                            d.[DEFAULT_VALUE], d.[IS_REQUIRED], d.[MIN_VALUE], d.[MAX_VALUE], d.[MAX_LENGTH],
+                            d.[DEFAULT_VALUE], d.[IS_REQUIRED], d.[IS_LOCKED], d.[MIN_VALUE], d.[MAX_VALUE], d.[MAX_LENGTH],
                             d.[VALIDATION_OPERATOR], d.[VALIDATION_VALUE], d.[ERROR_MESSAGE], d.[APPLY_ON], d.[SORT_ORDER],
                             d.[CONFIG_ID],
 
@@ -301,6 +313,22 @@ namespace EliteSoft.Erwin.AddIn.Services
             if (_byObjectType.TryGetValue(objectType, out var list))
                 return list.OrderBy(d => d.SortOrder);
             return Enumerable.Empty<UdpDefinitionRuntime>();
+        }
+
+        /// <summary>
+        /// Get only the IsLocked=true UDP definitions for a specific object type,
+        /// materialised into a List so ValidationCoordinator can iterate it every
+        /// tick without re-running the LINQ filter on each call. The lock check
+        /// runs in the hot Column-Editor-open path (~250 ms tick budget), so we
+        /// want O(1) lookup of "which Column UDPs do I have to enforce" rather
+        /// than O(N) over the full definition set.
+        /// </summary>
+        public List<UdpDefinitionRuntime> GetLockedByObjectType(string objectType)
+        {
+            if (string.IsNullOrEmpty(objectType)) return new List<UdpDefinitionRuntime>();
+            if (_byObjectType.TryGetValue(objectType, out var list))
+                return list.Where(d => d.IsLocked).ToList();
+            return new List<UdpDefinitionRuntime>();
         }
 
         /// <summary>

@@ -377,13 +377,31 @@ if (-not $task) {
     Write-Host "  Triggering ScheduledTask '$watcherTaskName'..." -ForegroundColor Gray
     Stop-ScheduledTask -TaskName $watcherTaskName -ErrorAction SilentlyContinue
     Start-ScheduledTask  -TaskName $watcherTaskName
-    Start-Sleep -Seconds 2
-    $watcherProc = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -match 'autostart-watcher' } | Select-Object -First 1
+    # Poll for the watcher to come up. Empirically takes 3-10 s on this
+    # box (cold PowerShell start + script preload). The previous fixed
+    # Start-Sleep -Seconds 2 tripped a false-failure path because the
+    # watcher just had not spawned yet (verified 2026-05-14: build-and-run
+    # reported "failed to start" 9 s before the watcher actually wrote
+    # its "Watcher started" line to the log). Cap at 20 s.
+    $watcherProc = $null
+    $maxWaitSec = 20
+    $waited = 0
+    while ($waited -lt $maxWaitSec -and -not $watcherProc) {
+        Start-Sleep -Seconds 1
+        $waited++
+        $watcherProc = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -match 'autostart-watcher' } | Select-Object -First 1
+    }
     if ($watcherProc) {
-        Write-Host "  Watcher running (PID=$($watcherProc.ProcessId))" -ForegroundColor Green
+        Write-Host "  Watcher running (PID=$($watcherProc.ProcessId), startup took ${waited}s)" -ForegroundColor Green
     } else {
-        Write-Host "  Watcher failed to start - check $(Join-Path $installDir 'autostart.log')" -ForegroundColor Red
+        # autostart-watcher.ps1 routes its log to
+        # %LOCALAPPDATA%\EliteSoft\ErwinAddIn-Logs\ regardless of install
+        # dir (so Machine-scope Program Files install does not need write
+        # access there). The old "$installDir\autostart.log" hint was
+        # stale - that file has not been written since the log relocation.
+        $watcherLog = Join-Path $env:LOCALAPPDATA 'EliteSoft\ErwinAddIn-Logs\autostart.log'
+        Write-Host "  Watcher failed to start within ${maxWaitSec}s - check $watcherLog" -ForegroundColor Red
     }
 }
 

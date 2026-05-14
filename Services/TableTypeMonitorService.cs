@@ -80,6 +80,93 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// Apply new-entity side effects for an entity that the diagram heartbeat
+        /// has just detected as newly seen with a real (non-placeholder) name:
+        /// diagram add, model standard properties + question wizard, optional
+        /// PK-index cleanup, and UDP defaults.
+        ///
+        /// Why this lives here and not in ValidationCoordinator:
+        ///   The legacy isNew branch in <see cref="CheckForTableTypeChanges()"/>
+        ///   owned this whole pipeline. Phase-2D (2026-05-06) removed the
+        ///   periodic full-model scan that used to drive that call, but the
+        ///   diagram-side discovery in ValidationCoordinator only kept the
+        ///   naming-check delegation - the wizard / standards / UDP path was
+        ///   silently dropped. Keeping the pipeline in this service preserves
+        ///   single-responsibility (Coordinator decides "when", Monitor knows
+        ///   "what to do") and matches the existing
+        ///   <see cref="ValidateNamingStandard"/> delegation pattern.
+        ///
+        /// Snapshot/baseline bookkeeping is intentionally NOT done here -
+        /// ValidationCoordinator's <c>_entityIdSnapshot</c> already drives the
+        /// "newly seen" decision and updates per tick. Re-baselining inside
+        /// this method would duplicate that state.
+        /// </summary>
+        public void OnNewEntityDetected(dynamic entity, string physicalName)
+        {
+            if (entity == null || string.IsNullOrEmpty(physicalName)) return;
+
+            try
+            {
+                AddEntityToDiagram(entity, physicalName);
+            }
+            catch (Exception ex)
+            {
+                Log($"OnNewEntityDetected: AddEntityToDiagram error for '{physicalName}': {ex.Message}");
+            }
+
+            // Standards + question wizard. ApplyStandardsToEntity opens the
+            // wizard modally when MC_QUESTION_DEF rows exist for the active
+            // config + DBMS version; user answers map to property values.
+            if (_propertyApplicator != null && _propertyApplicator.IsInitialized)
+            {
+                try
+                {
+                    _propertyApplicator.ApplyStandardsToEntity(entity, physicalName);
+
+                    if (_propertyApplicator.IsPropertyEnabled("DELETE_AUTO_CREATED_INDEX_PK"))
+                    {
+                        DeleteAutoCreatedPKIndex(entity, physicalName);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log($"OnNewEntityDetected: ApplyStandardsToEntity error for '{physicalName}': {ex.Message}");
+                }
+            }
+
+            if (_udpRuntimeService != null && _udpRuntimeService.IsInitialized)
+            {
+                try
+                {
+                    _udpRuntimeService.ApplyDefaults(entity);
+                    Log($"UDP defaults applied for new entity '{physicalName}'");
+                }
+                catch (Exception ex)
+                {
+                    Log($"OnNewEntityDetected: UDP defaults error for '{physicalName}': {ex.Message}");
+                }
+            }
+
+            // Unconditional predefined columns (admin's 2026-05-14 extension).
+            // Conditional columns are still added later when CheckForUdpValueChanges
+            // fires for the UDP cascades that ApplyDefaults seeded - separate path,
+            // separate gate. Unconditional rows have no UDP gate, so the timer
+            // path will never pick them up; they must be applied here, on the
+            // single "new entity" event, or they'll never land on the table.
+            // Idempotent: ApplyPredefinedColumnsToEntity skips columns already
+            // present on the entity, so a re-fire from a rebaseline cycle is
+            // a no-op.
+            try
+            {
+                AddUnconditionalPredefinedColumns(entity, physicalName);
+            }
+            catch (Exception ex)
+            {
+                Log($"OnNewEntityDetected: AddUnconditionalPredefinedColumns error for '{physicalName}': {ex.Message}");
+            }
+        }
+
+        /// <summary>
         /// Start monitoring entity changes (timer managed by ValidationCoordinatorService)
         /// </summary>
         public void StartMonitoring()
@@ -931,12 +1018,70 @@ namespace EliteSoft.Erwin.AddIn.Services
                     Log($"Naming standard violation ({f.RuleName}): '{nameToValidate}' — {f.ErrorMessage}");
                 }
 
+                // Phase-2H (2026-05-13): if ANY failing rule is AUTO_APPLY=true,
+                // rewrite the object name to "PLEASE_CHANGE_IT" instead of
+                // showing the warning popup. Same UX pattern the glossary path
+                // already uses for failing columns: the auto-applied rule
+                // already gave the user one transformation attempt (Step 1
+                // above); if the result still violates the rule, the rule's
+                // intent is "I will fix this for you" and the strongest
+                // fallback that fits the regex-cant-fix-it case is to force
+                // the user to retype the name.
+                //
+                // Only renames when we have a scapiObject to write back to
+                // (the live-fire paths always pass one; static external callers
+                // that pass null fall through to the popup as before).
+                bool anyAutoApplyFailing = scapiObject != null
+                    && failures.Any(f => f.Rule != null && f.Rule.AutoApply);
+
+                // Phase-2H popup-then-rename ordering (2026-05-13): show the
+                // violation message BEFORE rewriting the name, so the user
+                // first reads "this name is invalid" and then sees the
+                // PLEASE_CHANGE_IT placeholder land in the table after they
+                // dismiss the popup. The reversed order (rename then popup)
+                // confused users because the popup talked about a name they
+                // could no longer see in the diagram.
                 string messages = string.Join("\n", failures.Select(f => $"• {f.ErrorMessage}"));
+                string popupBody = anyAutoApplyFailing
+                    ? $"Naming standard violation(s) for '{nameToValidate}':\n\n{messages}\n\n" +
+                      $"The name will be reset to 'PLEASE_CHANGE_IT'. Please choose a name that matches the standard."
+                    : $"Naming standard violation(s) for '{nameToValidate}':\n\n{messages}";
                 System.Windows.Forms.MessageBox.Show(
-                    $"Naming standard violation(s) for '{nameToValidate}':\n\n{messages}",
+                    popupBody,
                     "Naming Standard",
                     System.Windows.Forms.MessageBoxButtons.OK,
                     System.Windows.Forms.MessageBoxIcon.Warning);
+
+                if (anyAutoApplyFailing)
+                {
+                    string placeholder = "PLEASE_CHANGE_IT";
+                    int transId = _session.BeginNamedTransaction("ApplyPleaseChangeItOnAutoFail");
+                    try
+                    {
+                        scapiObject.Properties("Physical_Name").Value = placeholder;
+                        try { scapiObject.Properties("Name").Value = placeholder; }
+                        catch (Exception nameEx) { Log($"PLEASE_CHANGE_IT: Failed to set Name on '{nameToValidate}': {nameEx.Message}"); }
+                        _session.CommitTransaction(transId);
+                        Log($"Naming standard auto-fail fallback: '{nameToValidate}' -> '{placeholder}' (popup acknowledged, name reset)");
+
+                        // Update entity snapshot so the next monitor tick
+                        // doesn't see this as a fresh rename and loop back
+                        // through ValidateNamingStandard.
+                        string objectId = "";
+                        try { objectId = scapiObject.ObjectId?.ToString() ?? ""; }
+                        catch (Exception idEx) { Log($"PLEASE_CHANGE_IT: ObjectId read failed: {idEx.Message}"); }
+                        if (!string.IsNullOrEmpty(objectId) && _entitySnapshots.ContainsKey(objectId))
+                        {
+                            _entitySnapshots[objectId].PhysicalName = placeholder;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        try { _session.RollbackTransaction(transId); }
+                        catch (Exception rbEx) { Log($"ApplyPleaseChangeItOnAutoFail rollback error: {rbEx.Message}"); }
+                        Log($"PLEASE_CHANGE_IT rename failed for '{nameToValidate}': {ex.Message}");
+                    }
+                }
             }
         }
 
@@ -964,6 +1109,72 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                     if (kvp.Value != oldValue)
                     {
+                        // Locked-UDP enforcement: admin marks a UDP as locked via
+                        // MC_UDP_DEFINITION.IS_LOCKED. The first non-empty assignment
+                        // is allowed (so wizards and ApplyDefaults can seed the
+                        // field) but every subsequent edit is reverted to the
+                        // previous value. Initial set is detected by an empty
+                        // oldValue - the snapshot for new entities is populated
+                        // immediately after ApplyDefaults so the next tick already
+                        // sees the seeded value as "old".
+                        //
+                        // User-only intent (confirmed 2026-05-13): Lock must NOT
+                        // block system writes (dependency cascade via
+                        // HandleUdpValueChange, ApplyDefaults, glossary auto-fill).
+                        // This semantic is currently preserved by timing rather
+                        // than an explicit "system write" flag:
+                        //
+                        //   1. currentValues is read ONCE per tick BEFORE the
+                        //      HandleUdpValueChange / AddPredefinedColumnsForUdp
+                        //      calls inside this foreach. Any UDP that dependency
+                        //      logic writes downstream lands in the model AFTER
+                        //      currentValues was read, so this foreach iteration
+                        //      will not observe it as a diff against snapshot.
+                        //   2. The "if (anyChanged) -> re-read updatedValues"
+                        //      block below the foreach captures those dependency
+                        //      writes into the snapshot SILENTLY, never routing
+                        //      them through this lock check.
+                        //   3. ApplyDefaults only writes when current value is
+                        //      empty (see UdpRuntimeService.ApplyDefaults), so
+                        //      it can only ever execute the "initial set"
+                        //      branch and oldValue stays "" -> not blocked.
+                        //
+                        // DO NOT reorder this foreach with the re-read block, and
+                        // DO NOT call HandleUdpValueChange BEFORE the foreach is
+                        // built. Doing either would route dependency-driven writes
+                        // through this lock and revert them, breaking the
+                        // user-only intent. If a future refactor needs that
+                        // ordering, switch to an explicit "system write"
+                        // suppression flag on WriteUdpValues instead.
+                        var udpDef = UdpDefinitionService.Instance.IsLoaded
+                            ? UdpDefinitionService.Instance.GetByName("Table", kvp.Key)
+                            : null;
+                        if (udpDef != null && udpDef.IsLocked && !string.IsNullOrEmpty(oldValue))
+                        {
+                            try
+                            {
+                                _udpRuntimeService.WriteUdpValues(
+                                    entity,
+                                    new Dictionary<string, string> { [kvp.Key] = oldValue },
+                                    "Table");
+                                Log($"UDP '{kvp.Key}' is locked on '{physicalName}' - reverted '{kvp.Value}' -> '{oldValue}'");
+
+                                System.Windows.Forms.MessageBox.Show(
+                                    $"'{kvp.Key}' UDP'si kilitli. Yeni deger ('{kvp.Value}') reddedildi; '{oldValue}' olarak korundu.",
+                                    "UDP Kilitli",
+                                    System.Windows.Forms.MessageBoxButtons.OK,
+                                    System.Windows.Forms.MessageBoxIcon.Warning);
+                            }
+                            catch (Exception revertEx)
+                            {
+                                Log($"UDP lock revert failed for '{kvp.Key}' on '{physicalName}': {revertEx.Message}");
+                            }
+                            // Snapshot stays at oldValue; do NOT run dependency
+                            // evaluation, predefined-column hooks, or naming
+                            // validation for a change we just rejected.
+                            continue;
+                        }
+
                         anyChanged = true;
                         Log($"UDP '{kvp.Key}' changed on '{physicalName}': '{oldValue}' -> '{kvp.Value}'");
 
@@ -1018,120 +1229,304 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
 
                 var predefinedColumns = PredefinedColumnService.Instance.GetByUdpCondition(udpName, udpValue);
-                if (!predefinedColumns.Any())
-                {
-                    return;
-                }
+                if (!predefinedColumns.Any()) return;
 
-                // Get existing attributes (columns) of the entity
-                dynamic modelObjects = _session.ModelObjects;
-                var existingColumnNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-                try
-                {
-                    dynamic attributes = modelObjects.Collect(entity, "Attribute");
-                    if (attributes != null)
-                    {
-                        foreach (dynamic attr in attributes)
-                        {
-                            try
-                            {
-                                string attrName = attr.Name ?? "";
-                                if (!string.IsNullOrEmpty(attrName))
-                                {
-                                    existingColumnNames.Add(attrName);
-                                }
-                            }
-                            catch (Exception ex) { Log($"AddPredefinedForUdp: Error reading attr name: {ex.Message}"); }
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Log($"Error getting existing columns for '{physicalName}': {ex.Message}");
-                }
-
-                int addedCount = 0;
-                foreach (var col in predefinedColumns)
-                {
-                    // Skip if column already exists
-                    if (existingColumnNames.Contains(col.ColumnName))
-                    {
-                        Log($"Column '{col.ColumnName}' already exists on '{physicalName}', skipping");
-                        continue;
-                    }
-
-                    try
-                    {
-                        dynamic newAttribute = ErwinUtilities.CreateAttribute(_session, entity, col.ColumnName);
-
-                        if (newAttribute != null)
-                        {
-                            int transId = _session.BeginNamedTransaction("SetPredefinedColumnProperties");
-                            try
-                            {
-                                // Set physical name
-                                try
-                                {
-                                    newAttribute.Properties("Physical_Name").Value = col.ColumnName;
-                                }
-                                catch (Exception ex) { Log($"AddPredefinedForUdp: Failed to set Physical_Name for '{col.ColumnName}': {ex.Message}"); }
-
-                                // Set data type
-                                try
-                                {
-                                    newAttribute.Properties("Physical_Data_Type").Value = col.DataType;
-                                }
-                                catch (Exception ex) { Log($"AddPredefinedForUdp: Failed to set Physical_Data_Type for '{col.ColumnName}': {ex.Message}"); }
-
-                                // Set nullability
-                                try
-                                {
-                                    newAttribute.Properties("Null_Option_Type").Value = col.Nullable ? 0 : 1;
-                                }
-                                catch (Exception ex) { Log($"AddPredefinedForUdp: Failed to set Null_Option_Type for '{col.ColumnName}': {ex.Message}"); }
-
-                                // Set default value if specified
-                                if (!string.IsNullOrEmpty(col.DefaultValue))
-                                {
-                                    try
-                                    {
-                                        newAttribute.Properties("Physical_Default_Value").Value = col.DefaultValue;
-                                    }
-                                    catch (Exception ex) { Log($"AddPredefinedForUdp: Failed to set default value for '{col.ColumnName}': {ex.Message}"); }
-                                }
-
-                                _session.CommitTransaction(transId);
-                            }
-                            catch (Exception ex)
-                            {
-                                try { _session.RollbackTransaction(transId); }
-                                catch (Exception rbEx) { Log($"AddPredefinedForUdp: Rollback failed: {rbEx.Message}"); }
-                                Log($"AddPredefinedForUdp: Transaction failed for '{col.ColumnName}': {ex.Message}");
-                            }
-
-                            addedCount++;
-                            Log($"Added predefined column '{col.ColumnName}' ({col.DataType}) for UDP '{udpName}'='{udpValue}'");
-                        }
-                        else
-                        {
-                            Log($"Failed to create attribute '{col.ColumnName}'");
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Log($"Error adding predefined column '{col.ColumnName}': {ex.Message}");
-                    }
-                }
-
-                if (addedCount > 0)
-                {
-                    Log($"Added {addedCount} predefined column(s) to '{physicalName}' for UDP '{udpName}'='{udpValue}'");
-                }
+                string context = $"UDP '{udpName}'='{udpValue}'";
+                ApplyPredefinedColumnsToEntity(entity, predefinedColumns, physicalName, context);
             }
             catch (Exception ex)
             {
                 Log($"AddPredefinedColumnsForUdp error for '{physicalName}': {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Add the config's UNCONDITIONAL predefined columns to <paramref name="entity"/>.
+        /// Called once when a brand-new entity is first detected so the
+        /// "always apply" rows admin authored (DEPENDS_ON_UDP_ID = NULL,
+        /// 2026-05-14 schema extension) land on every new table independently
+        /// of UDP cascades. Idempotent through the in-entity name check inside
+        /// <see cref="ApplyPredefinedColumnsToEntity"/>, so re-firing on a
+        /// rebaseline cycle does not duplicate columns.
+        /// </summary>
+        private void AddUnconditionalPredefinedColumns(dynamic entity, string physicalName)
+        {
+            try
+            {
+                if (!PredefinedColumnService.Instance.IsLoaded)
+                {
+                    PredefinedColumnService.Instance.LoadPredefinedColumns();
+                }
+
+                var unconditional = PredefinedColumnService.Instance.GetUnconditional();
+                if (!unconditional.Any()) return;
+
+                ApplyPredefinedColumnsToEntity(entity, unconditional, physicalName, "unconditional");
+            }
+            catch (Exception ex)
+            {
+                Log($"AddUnconditionalPredefinedColumns error for '{physicalName}': {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Shared "create + populate attributes" loop for both conditional and
+        /// unconditional predefined-column flows. Reads the entity's existing
+        /// attribute names once, then for each input column either skips
+        /// (already present) or creates the attribute and sets
+        /// Physical_Name / Physical_Data_Type / Null_Option_Type / default
+        /// inside a single named transaction. Logs every per-column success +
+        /// failure so a missing column on a new table is traceable from the
+        /// debug log alone. <paramref name="contextLabel"/> is appended to
+        /// log lines so it is clear from the log which branch fired.
+        /// </summary>
+        private void ApplyPredefinedColumnsToEntity(
+            dynamic entity,
+            IEnumerable<PredefinedColumn> columnsToApply,
+            string physicalName,
+            string contextLabel)
+        {
+            // Snapshot the entity's current attribute names so we can skip any
+            // pre-existing ones (the user may have hand-added them, or a
+            // previous tick may have applied the conditional version).
+            dynamic modelObjects = _session.ModelObjects;
+            var existingColumnNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            try
+            {
+                dynamic attributes = modelObjects.Collect(entity, "Attribute");
+                if (attributes != null)
+                {
+                    foreach (dynamic attr in attributes)
+                    {
+                        try
+                        {
+                            string attrName = attr.Name ?? "";
+                            if (!string.IsNullOrEmpty(attrName))
+                                existingColumnNames.Add(attrName);
+                        }
+                        catch (Exception ex) { Log($"ApplyPredefined({contextLabel}): Error reading attr name: {ex.Message}"); }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"ApplyPredefined({contextLabel}): existing-columns read failed on '{physicalName}': {ex.Message}");
+            }
+
+            int addedCount = 0;
+            foreach (var col in columnsToApply)
+            {
+                if (existingColumnNames.Contains(col.ColumnName))
+                {
+                    Log($"ApplyPredefined({contextLabel}): '{col.ColumnName}' already exists on '{physicalName}', skipping");
+                    continue;
+                }
+
+                try
+                {
+                    dynamic newAttribute = ErwinUtilities.CreateAttribute(_session, entity, col.ColumnName);
+                    if (newAttribute == null)
+                    {
+                        Log($"ApplyPredefined({contextLabel}): CreateAttribute returned null for '{col.ColumnName}' on '{physicalName}'");
+                        continue;
+                    }
+
+                    int transId = _session.BeginNamedTransaction("SetPredefinedColumnProperties");
+                    try
+                    {
+                        try { newAttribute.Properties("Physical_Name").Value = col.ColumnName; }
+                        catch (Exception ex) { Log($"ApplyPredefined({contextLabel}): set Physical_Name '{col.ColumnName}': {ex.Message}"); }
+
+                        try { newAttribute.Properties("Physical_Data_Type").Value = col.DataType; }
+                        catch (Exception ex) { Log($"ApplyPredefined({contextLabel}): set Physical_Data_Type '{col.ColumnName}': {ex.Message}"); }
+
+                        try { newAttribute.Properties("Null_Option_Type").Value = col.Nullable ? 0 : 1; }
+                        catch (Exception ex) { Log($"ApplyPredefined({contextLabel}): set Null_Option_Type '{col.ColumnName}': {ex.Message}"); }
+
+                        if (!string.IsNullOrEmpty(col.DefaultValue))
+                        {
+                            try { newAttribute.Properties("Physical_Default_Value").Value = col.DefaultValue; }
+                            catch (Exception ex) { Log($"ApplyPredefined({contextLabel}): set default '{col.ColumnName}': {ex.Message}"); }
+                        }
+
+                        _session.CommitTransaction(transId);
+                    }
+                    catch (Exception ex)
+                    {
+                        try { _session.RollbackTransaction(transId); }
+                        catch (Exception rbEx) { Log($"ApplyPredefined({contextLabel}): rollback failed: {rbEx.Message}"); }
+                        Log($"ApplyPredefined({contextLabel}): transaction failed on '{col.ColumnName}': {ex.Message}");
+                        continue; // do not count a failed transaction as added
+                    }
+
+                    // PK membership runs OUTSIDE the property-setting transaction
+                    // above because the Key_Group_Member.Add call commits its
+                    // own enclosed transaction; nesting them caused erwin r10.10
+                    // to reject the parent commit with "ESX-3 transaction not
+                    // open" on a 2026-05-14 dry run. Failure here is logged but
+                    // does not roll back the attribute itself - a PK-less
+                    // predefined column is still a valid (and recoverable)
+                    // outcome that the user can fix by hand.
+                    if (col.IsPrimaryKey)
+                    {
+                        try { MakeAttributePrimaryKey(entity, newAttribute, col.ColumnName, contextLabel); }
+                        catch (Exception ex) { Log($"ApplyPredefined({contextLabel}): PK promote failed for '{col.ColumnName}': {ex.Message}"); }
+                    }
+
+                    addedCount++;
+                    string pkSuffix = col.IsPrimaryKey ? " [PK]" : "";
+                    Log($"ApplyPredefined({contextLabel}): added '{col.ColumnName}' ({col.DataType}){pkSuffix} to '{physicalName}'");
+                }
+                catch (Exception ex)
+                {
+                    Log($"ApplyPredefined({contextLabel}): error adding '{col.ColumnName}' to '{physicalName}': {ex.Message}");
+                }
+            }
+
+            if (addedCount > 0)
+                Log($"ApplyPredefined({contextLabel}): added {addedCount} column(s) to '{physicalName}'");
+        }
+
+        /// <summary>
+        /// Promote <paramref name="newAttribute"/> into <paramref name="entity"/>'s
+        /// Primary Key Key_Group. erwin auto-creates exactly one Key_Group with
+        /// Key_Group_Type == "PK" when an entity is first created, so we find
+        /// that group and append a new Key_Group_Member that references the
+        /// attribute via Attribute_Ref (the property name erwin uses on
+        /// EMX:Key_Group_Member - verified against real .erwin XML 2026-05-14
+        /// in ErwinAlterDdl/test_files/erwin/backup_dont_consider).
+        ///
+        /// Idempotent: if a member already exists for this attribute the
+        /// method exits without throwing or duplicating. If no PK Key_Group
+        /// is present yet (unusual - happens when an entity is mid-creation
+        /// and erwin hasn't seeded its default key group yet), we create one
+        /// in-place; the resulting group inherits the entity's owning model
+        /// scope automatically through Collect(entity).Add("Key_Group").
+        /// </summary>
+        private void MakeAttributePrimaryKey(dynamic entity, dynamic newAttribute, string columnName, string contextLabel)
+        {
+            string attrObjectId = null;
+            try { attrObjectId = newAttribute.ObjectId?.ToString(); }
+            catch (Exception ex)
+            {
+                Log($"ApplyPredefined({contextLabel}): PK promote skipped - cannot read attribute ObjectId for '{columnName}': {ex.Message}");
+                return;
+            }
+            if (string.IsNullOrEmpty(attrObjectId))
+            {
+                Log($"ApplyPredefined({contextLabel}): PK promote skipped - empty attribute ObjectId for '{columnName}'");
+                return;
+            }
+
+            dynamic modelObjects = _session.ModelObjects;
+
+            // 1) Find the entity's PK Key_Group. erwin creates this lazily,
+            //    so we accept "not found" and create one below; on any
+            //    existing entity it is always present.
+            dynamic pkGroup = null;
+            try
+            {
+                dynamic groups = modelObjects.Collect(entity, "Key_Group");
+                if (groups != null)
+                {
+                    foreach (dynamic kg in groups)
+                    {
+                        string kgType = null;
+                        try { kgType = kg.Properties("Key_Group_Type").Value?.ToString(); }
+                        catch (Exception ex) { Log($"ApplyPredefined({contextLabel}): Key_Group_Type read err for '{columnName}': {ex.Message}"); }
+                        if (string.Equals(kgType, "PK", StringComparison.OrdinalIgnoreCase))
+                        {
+                            pkGroup = kg;
+                            break;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"ApplyPredefined({contextLabel}): Key_Group enumerate err for '{columnName}': {ex.Message}");
+            }
+
+            // 2) Create a PK group only if the entity truly has none.
+            if (pkGroup == null)
+            {
+                int kgTransId = _session.BeginNamedTransaction("CreatePkKeyGroup");
+                try
+                {
+                    pkGroup = modelObjects.Collect(entity).Add("Key_Group");
+                    if (pkGroup != null)
+                    {
+                        try { pkGroup.Properties("Key_Group_Type").Value = "PK"; }
+                        catch (Exception ex) { Log($"ApplyPredefined({contextLabel}): set Key_Group_Type=PK err for '{columnName}': {ex.Message}"); }
+                    }
+                    _session.CommitTransaction(kgTransId);
+                }
+                catch (Exception ex)
+                {
+                    try { _session.RollbackTransaction(kgTransId); }
+                    catch (Exception rbEx) { Log($"ApplyPredefined({contextLabel}): PK Key_Group rollback err: {rbEx.Message}"); }
+                    Log($"ApplyPredefined({contextLabel}): could not create PK Key_Group for '{columnName}': {ex.Message}");
+                    return;
+                }
+            }
+            if (pkGroup == null)
+            {
+                Log($"ApplyPredefined({contextLabel}): no PK Key_Group available for '{columnName}'");
+                return;
+            }
+
+            // 3) Idempotency: bail if the attribute is already a member.
+            try
+            {
+                dynamic existingMembers = modelObjects.Collect(pkGroup, "Key_Group_Member");
+                if (existingMembers != null)
+                {
+                    foreach (dynamic m in existingMembers)
+                    {
+                        string memberAttrRef = null;
+                        try { memberAttrRef = m.Properties("Attribute_Ref").Value?.ToString(); }
+                        catch { /* try next */ }
+                        if (string.Equals(memberAttrRef, attrObjectId, StringComparison.OrdinalIgnoreCase))
+                        {
+                            Log($"ApplyPredefined({contextLabel}): '{columnName}' already a PK member, skipping promote");
+                            return;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"ApplyPredefined({contextLabel}): PK member enumerate err for '{columnName}': {ex.Message}");
+            }
+
+            // 4) Append the member. Attribute_Ref carries the ObjectId of the
+            //    target attribute (a GUID-shaped string in erwin's storage).
+            int memberTransId = _session.BeginNamedTransaction("AddPkKeyGroupMember");
+            try
+            {
+                dynamic newMember = modelObjects.Collect(pkGroup).Add("Key_Group_Member");
+                if (newMember == null)
+                {
+                    _session.RollbackTransaction(memberTransId);
+                    Log($"ApplyPredefined({contextLabel}): Key_Group_Member.Add returned null for '{columnName}'");
+                    return;
+                }
+                try { newMember.Properties("Attribute_Ref").Value = attrObjectId; }
+                catch (Exception ex)
+                {
+                    _session.RollbackTransaction(memberTransId);
+                    Log($"ApplyPredefined({contextLabel}): set Attribute_Ref err for '{columnName}': {ex.Message}");
+                    return;
+                }
+                _session.CommitTransaction(memberTransId);
+                Log($"ApplyPredefined({contextLabel}): '{columnName}' promoted to PK");
+            }
+            catch (Exception ex)
+            {
+                try { _session.RollbackTransaction(memberTransId); }
+                catch (Exception rbEx) { Log($"ApplyPredefined({contextLabel}): PK member rollback err: {rbEx.Message}"); }
+                Log($"ApplyPredefined({contextLabel}): Key_Group_Member.Add failed for '{columnName}': {ex.Message}");
             }
         }
 

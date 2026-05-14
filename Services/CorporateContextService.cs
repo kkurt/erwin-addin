@@ -1,7 +1,6 @@
 using System;
 using System.Data.Common;
 using System.Text.RegularExpressions;
-using EliteSoft.MetaAdmin.Services;
 
 namespace EliteSoft.Erwin.AddIn.Services
 {
@@ -91,11 +90,13 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                 if (!DatabaseService.Instance.IsConfigured)
                 {
-                    // MetaShared's RegistrySettingsService picks ONE hive at startup
-                    // based on the registry.scope file next to the addin DLL: "HKLM"
-                    // for Machine installs, otherwise HKCU. Surface that scope in the
-                    // warning so admins know which hive the addin actually probed.
-                    LastError = $"No configuration found in {RegistrySettingsService.CurrentScope}\\Software\\EliteSoft\\MetaRepo\\Bootstrap. Please run the installer to configure the add-in.";
+                    // The HklmFirstBootstrapReader probes both hives in order
+                    // (HKLM then HKCU). Neither yielded a populated config, so
+                    // surface both candidate paths so the user/admin can decide
+                    // which one to seed. install.bat (calling install-impl.ps1)
+                    // owns the HKCU write path; corporate IT typically seeds
+                    // HKLM with its own tooling.
+                    LastError = "No configuration found in HKLM\\Software\\EliteSoft\\MetaRepo\\Bootstrap or HKCU\\Software\\EliteSoft\\MetaRepo\\Bootstrap. Please run install.bat to configure the add-in.";
                     Log($"ConfigContext: {LastError}");
                     return false;
                 }

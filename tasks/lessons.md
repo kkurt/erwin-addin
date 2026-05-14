@@ -4,6 +4,46 @@ A running log of corrections and non-obvious findings that future sessions
 should not have to rediscover. Each entry is a short rule, the reason, and
 how to apply it.
 
+## 2026-05-14: Tab-switch matching - use Mart locator stem, never pu.Name
+
+**Rule:** when picking which PU the user just tabbed to among multiple open
+PersistenceUnits, NEVER compare `pu.Name`. erwin r10.10 returns
+`Name = "Model_1"` (the auto-name) for BOTH the Mart-bound PU and the
+side-by-side local-unsaved PU created via File > New. Name-based
+disambiguation degenerates to "no PU different" and the fallback
+re-binds to PU[0], which is exactly the failure case the matcher is
+trying to fix. Use `PuLocatorReader.Read(pu, allowWindowTitleFallback: false)`
+to read each PU's locator, normalise to the `Mart://Mart/<path>` stem
+(strip optional `erwin://` prefix + any query string) and compare the
+stem against the parsed window-title locator. Empty title stem + empty
+PU locator -> local PU match. Helper lives at
+[ModelConfigForm.FindPuIndexMatchingTitleLocator](../ModelConfigForm.cs)
+together with `ExtractMartStem`.
+
+**Why:** verified 2026-05-14 with [TabSwitch] pre-reconnect ground-truth
+dumps on a Mart + side-by-side local repro:
+```
+PU[0] name='Model_1' locator='erwin://Mart://Mart/Kursat/MetaRepo?...'
+PU[1] name='Model_1' locator=''
+boundName='Model_1' parsedTitleLoc=''  (user is on local PU[1])
+-> previous code: "no name-differing PU found" -> ConnectToModel(0)
+-> reconnect lands on Mart again, addin stays bound to wrong PU,
+   user never sees config refresh
+```
+After the locator-stem matcher landed, the same scenario produced
+`TabSwitch: matched PU[0] by Mart stem 'Mart://Mart/Kursat/MetaRepo'`
+on Mart return and `TabSwitch: matched local-unsaved PU[1] (both stems
+empty)` on the way back. Round-trip ~140-190 ms.
+
+**How to apply:** any future "which PU is the user looking at right now"
+question needs locator comparison, not name comparison. The per-PU
+locator path (`pu.PropertyBag().Value("Locator")`) works on r10.10
+even though the direct `pu.Locator` accessor throws RuntimeBinderException -
+PuLocatorReader's fallback chain handles that transparently. The window
+title's bracket content (`erwin DM - [Mart://... : vN : Model]` vs
+`erwin DM - [Model1 : <diagram> * ]`) gives the active tab's identity
+when parsed through `ReadFromWindowTitle`.
+
 ## 2026-05-08: Generate DDL fast-path uses WM_COMMAND Next-loop, not direct InvokePreview
 
 **Rule:** for the Generate DDL same-version "dirty vs last saved" pipeline

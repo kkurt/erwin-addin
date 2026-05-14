@@ -1,4 +1,4 @@
-.\package.ps1 -Zip -Scope User `
+.\package.ps1 -Zip `
     -DBType "POSTGRESQL" `
     -DBHost "localhost" `
     -DBPort 5433 `

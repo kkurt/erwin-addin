@@ -103,6 +103,16 @@ namespace EliteSoft.Erwin.AddIn
         {
             Services.AddinLogger.StartSession();
             using var _scope = Services.AddinLogger.BeginScope("ErwinAddIn.Execute");
+            // Splash shown BEFORE every heavy step so the user gets immediate
+            // feedback. Without this the user saw a 1.5-7 sec dead-time between
+            // erwin's model-load completing and the add-in's first paint
+            // (CheckLicense ~1s + ctor ~500ms + Show ~200ms + LoadOpenModels
+            // model-dependent wait). Form is disposed by ConnectToModel after
+            // it consumes it via AttachEarlySplash; if anything aborts before
+            // then, the catch / early-return branches dispose it explicitly.
+            Form earlySplash = null;
+            try { earlySplash = ModelConfigForm.ShowLoadingDialog("Initializing add-in..."); }
+            catch (Exception ex) { Services.AddinLogger.Log($"Early splash creation failed (non-fatal): {ex.GetType().Name}: {ex.Message}"); }
             try
             {
                 // Suppress WinForms UIA event raise (Button.OnClick,
@@ -140,6 +150,8 @@ namespace EliteSoft.Erwin.AddIn
                     Services.NativeBridgeService.Install(msg =>
                         System.Diagnostics.Debug.WriteLine(msg));
 
+                ModelConfigForm.UpdateLoadingMessage(earlySplash, "Verifying license...");
+
                 // License check on UI thread. Phase-3C parallel-on-thread-pool variant
                 // was tried 2026-05-07 but reverted: LicensingService's AntiTamper
                 // checks (debugger / timing fingerprints) misfire on a non-UI thread
@@ -152,6 +164,7 @@ namespace EliteSoft.Erwin.AddIn
                 if (!licenseOk)
                 {
                     Services.AddinLogger.Log("CheckLicense returned false - aborting load");
+                    DisposeEarlySplash(ref earlySplash);
                     return;
                 }
 
@@ -163,8 +176,11 @@ namespace EliteSoft.Erwin.AddIn
                     _activeForm.BringToFront();
                     _activeForm.Activate();
                     _activeForm.TopMost = false;
+                    DisposeEarlySplash(ref earlySplash);
                     return;
                 }
+
+                ModelConfigForm.UpdateLoadingMessage(earlySplash, "Loading model configuration...");
 
                 // Create SCAPI connection
                 Type scapiType;
@@ -173,6 +189,7 @@ namespace EliteSoft.Erwin.AddIn
                 if (scapiType == null)
                 {
                     Services.AddinLogger.Log("erwin9.SCAPI ProgID not registered - aborting");
+                    DisposeEarlySplash(ref earlySplash);
                     ShowTopMostMessage("Could not find erwin SCAPI!", "Error");
                     return;
                 }
@@ -192,14 +209,37 @@ namespace EliteSoft.Erwin.AddIn
                     var form = (Form)s;
                     if (!form.IsDisposed) form.TopMost = false;
                 };
+                // Hand the splash to the form so its first ConnectToModel reuses
+                // it (one continuous splash from add-in start to model open).
+                // After this call ownership transfers to ModelConfigForm.
+                _activeForm.AttachEarlySplash(earlySplash);
+                earlySplash = null;
                 using (Services.AddinLogger.BeginScope("ModelConfigForm.Show"))
                     _activeForm.Show();
             }
             catch (Exception ex)
             {
+                DisposeEarlySplash(ref earlySplash);
                 Services.AddinLogger.Log($"Execute() FAILED: {ex.GetType().Name}: {ex.Message}");
                 ShowTopMostMessage("Add-In Error: " + ex.Message, "Error");
             }
+        }
+
+        // Defensive cleanup for the early splash on Execute() error / early-return
+        // paths. After AttachEarlySplash hands it to ModelConfigForm, ownership
+        // transfers (caller sets local to null) and this is a no-op.
+        private static void DisposeEarlySplash(ref Form splash)
+        {
+            try
+            {
+                if (splash != null && !splash.IsDisposed)
+                {
+                    splash.Close();
+                    splash.Dispose();
+                }
+            }
+            catch (Exception ex) { Services.AddinLogger.Log($"DisposeEarlySplash err (non-fatal): {ex.GetType().Name}: {ex.Message}"); }
+            finally { splash = null; }
         }
 
         /// <summary>
@@ -207,11 +247,50 @@ namespace EliteSoft.Erwin.AddIn
         /// Wraps the UI-free check + shows the MessageBox on failure. Used by the
         /// startup path; the failure message is displayed on the calling thread,
         /// so this must be invoked from the UI thread (which Execute() is on).
+        ///
+        /// Retry policy: on LicenseStatus.ValidationTransient, silently retry once
+        /// after a 1.5 s pause. xLicense returns ValidationTransient when its
+        /// timing window check (AntiTamper.CheckGroup2_Timing) trips without a
+        /// real debugger present — caused by AV first-scan, .NET tiered JIT,
+        /// COM/SCAPI cold-init contention, or GC compaction. xLicense's
+        /// HwidGenerator caches WMI results for the AppDomain, so the retry
+        /// validates in &lt; 1 s. TamperingDetected (real debugger via
+        /// CheckGroup1/CheckGroup3) gets no retry; the popup is correct there.
         /// </summary>
         private bool CheckLicense()
         {
-            var (ok, failureMessage) = CheckLicenseStatus();
-            if (ok) return true;
+            var sw = Stopwatch.StartNew();
+            var (status, failureMessage) = CheckLicenseStatus();
+            sw.Stop();
+
+            if (status == LicenseStatus.Valid) return true;
+
+            Services.AddinLogger.Log($"License check failed: status={status}, elapsed={sw.ElapsedMilliseconds}ms");
+
+            // ValidationTransient = xLicense timing-window check fired but no real
+            // debugger was detected (AntiTamper.CheckGroup2_Timing). Caused by AV
+            // first-scan, GC compaction, COM/SCAPI cold-init contention. With the
+            // HwidGenerator WMI cache the second Validate hits zero WMI calls, so
+            // retry resolves in well under a second. TamperingDetected (real debugger
+            // detection from CheckGroup1/CheckGroup3) gets no retry — the popup is
+            // the correct outcome there.
+            if (status == LicenseStatus.ValidationTransient)
+            {
+                Services.AddinLogger.Log("ValidationTransient - retrying once after 1500 ms");
+                Thread.Sleep(1500);
+
+                var retrySw = Stopwatch.StartNew();
+                var (retryStatus, retryMessage) = CheckLicenseStatus();
+                retrySw.Stop();
+
+                Services.AddinLogger.Log($"License retry: status={retryStatus}, elapsed={retrySw.ElapsedMilliseconds}ms");
+
+                if (retryStatus == LicenseStatus.Valid) return true;
+
+                // Retry produced a different failure (or persistent transient).
+                // Prefer the retry's message; it reflects the steady-state cause.
+                failureMessage = retryMessage;
+            }
 
             ShowTopMostMessage(failureMessage, "Elite Soft - License Error", isError: false);
             return false;
@@ -221,13 +300,13 @@ namespace EliteSoft.Erwin.AddIn
         /// Phase-3C parallel-friendly variant: pure managed work (file read + decrypt),
         /// no UI calls. Runs safely on a thread-pool worker so it can overlap with the
         /// SCAPI activation + form constructor (~250 ms total) on the startup critical
-        /// path. Returns (true, null) on success or (false, userFacingMessage) on
-        /// failure; the caller renders the message on the UI thread.
+        /// path. Returns (LicenseStatus.Valid, null) on success or (status, userFacingMessage)
+        /// on failure; the caller renders the message on the UI thread.
         /// </summary>
-        private static (bool ok, string failureMessage) CheckLicenseStatus()
+        private static (LicenseStatus status, string failureMessage) CheckLicenseStatus()
         {
             if (LicensingService.IsValid)
-                return (true, null);
+                return (LicenseStatus.Valid, null);
 
             var assemblyLocation = typeof(ErwinAddIn).Assembly.Location;
             if (string.IsNullOrEmpty(assemblyLocation))
@@ -238,7 +317,7 @@ namespace EliteSoft.Erwin.AddIn
             var status = LicensingService.Initialize(licensePath);
 
             if (status == LicenseStatus.Valid)
-                return (true, null);
+                return (LicenseStatus.Valid, null);
 
             string message = status switch
             {
@@ -263,12 +342,15 @@ namespace EliteSoft.Erwin.AddIn
                 LicenseStatus.TamperingDetected =>
                     "License validation failed due to security check.\n\n" +
                     "Please close any debugging tools and try again.",
+                LicenseStatus.ValidationTransient =>
+                    "License validation could not complete due to system load.\n\n" +
+                    "Please close other heavy applications and try opening the add-in again.",
                 _ =>
                     "License validation failed.\n\n" +
                     "Please contact Elite Soft for assistance."
             };
 
-            return (false, message);
+            return (status, message);
         }
 
         /// <summary>

@@ -154,19 +154,38 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         /// <summary>
         /// Map admin UDP_TYPE to erwin metamodel tag_Udp_Data_Type integer.
-        /// erwin data types: 1=Text, 2=Integer, 3=DateTime, 4=Float, 6=List
+        /// Per erwin API Reference 15 (page 169, tag_Udp_Data_Type table):
+        ///   1 = Integer, 2 = Text, 3 = Date, 4 = Command, 5 = Real, 6 = List.
+        /// Default is Text (2) - the same fallback erwin itself documents
+        /// ("Assumes the Text type if it is not specified.").
+        ///
+        /// Boolean has no native erwin datatype; the convention here is to
+        /// store it as Text so values like 'True'/'False' remain readable.
+        /// Admins who want a dropdown should pick List in MC_UDP_DEFINITION
+        /// and supply 'True,False' as the list options instead.
         /// </summary>
         private int MapUdpTypeToErwinDataTypeId(string udpType)
         {
             switch (udpType?.ToLower())
             {
-                case "int": return 2;
-                case "real": return 4;
-                case "date": return 3;
-                case "bool": return 2;  // Boolean stored as integer 0/1
-                case "list": return 6;
+                case "int":
+                case "integer":
+                    return 1;
                 case "text":
-                default: return 1;
+                    return 2;
+                case "date":
+                case "datetime":
+                    return 3;
+                case "command":
+                    return 4;
+                case "real":
+                case "float":
+                case "decimal":
+                    return 5;
+                case "list":
+                    return 6;
+                default:
+                    return 2;
             }
         }
 
@@ -261,6 +280,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                 {
                     UpdateExistingListUdps(mmObjects, mmRoot, existingListUdpsToUpdate, metamodelSession, modelUdpValues);
                 }
+
+                // Sync UDP datatype for already-existing Property_Types so admin's
+                // MC_UDP_DEFINITION.UDP_TYPE changes propagate (an erwin UDP created
+                // once as Int stays Int forever otherwise, even after admin retypes
+                // it to Text). Runs even when missingDefs is empty - drift is the
+                // common case after an admin retypes an existing UDP.
+                SyncExistingUdpTypeDrift(mmObjects, mmRoot, metamodelSession, definitions);
 
                 if (missingDefs.Count == 0 && existingListUdpsToUpdate.Count == 0)
                 {
@@ -381,7 +407,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 int dataTypeId = MapUdpTypeToErwinDataTypeId(def.UdpType);
                 TrySetProperty(udpType, "tag_Udp_Data_Type", dataTypeId);
 
-                // For List-type UDPs, set valid values as comma-separated string
+                // For List-type UDPs, set valid values as comma-separated string.
                 if (def.UdpType?.Equals("List", StringComparison.OrdinalIgnoreCase) == true)
                 {
                     string validValues = null;
@@ -452,6 +478,163 @@ namespace EliteSoft.Erwin.AddIn.Services
             {
                 Log($"UdpRuntime: Could not set {propertyName}: {ex.Message}");
             }
+        }
+
+        /// <summary>
+        /// Sync the erwin metamodel's tag_Udp_Data_Type for every UDP that already
+        /// exists in the model so that admin-side UDP_TYPE changes propagate. Without
+        /// this pass, EnsureUdpsExistInModel's "already exists - skipping" branch
+        /// leaves an existing UDP at its original datatype forever (verified bug:
+        /// OWNER was created as Int once, admin later changed UDP_TYPE to Text, the
+        /// erwin Column Editor kept rejecting non-numeric input on OWNER).
+        ///
+        /// Idempotent: only writes when the metamodel value differs from the DB value.
+        /// Walks Property_Type once per call; on big-model machines this is ~150-700 ms
+        /// against ~1500 Property_Type entries. List values are NOT touched here -
+        /// UpdateExistingListUdps owns the list-options column.
+        /// </summary>
+        private void SyncExistingUdpTypeDrift(
+            dynamic mmObjects,
+            dynamic mmRoot,
+            dynamic metamodelSession,
+            List<UdpDefinitionRuntime> definitions)
+        {
+            Log($"UdpRuntime: SyncExistingUdpTypeDrift start (definitions={definitions?.Count ?? 0})");
+            if (definitions == null || definitions.Count == 0)
+            {
+                Log("UdpRuntime: SyncExistingUdpTypeDrift skipped (no definitions)");
+                return;
+            }
+
+            // Build a lookup of fullName -> expected datatype id from the DB side.
+            var expected = new Dictionary<string, (int dataTypeId, UdpDefinitionRuntime def)>(StringComparer.OrdinalIgnoreCase);
+            foreach (var def in definitions)
+            {
+                string ownerClass = GetScapiOwnerClass(def.ObjectType);
+                if (ownerClass == null)
+                {
+                    Log($"UdpRuntime: SyncExistingUdpTypeDrift: no owner class for '{def.ObjectType}' on UDP '{def.Name}'");
+                    continue;
+                }
+                string fullName = $"{ownerClass}.Physical.{def.Name}";
+                int expectedId = MapUdpTypeToErwinDataTypeId(def.UdpType);
+                expected[fullName] = (expectedId, def);
+                Log($"UdpRuntime: SyncExistingUdpTypeDrift expect {fullName} = {expectedId} ('{def.UdpType}')");
+            }
+
+            dynamic propertyTypes = null;
+            try { propertyTypes = mmObjects.Collect(mmRoot, "Property_Type"); }
+            catch (Exception ex)
+            {
+                Log($"UdpRuntime: SyncExistingUdpTypeDrift Property_Type collect failed: {ex.Message}");
+                return;
+            }
+            if (propertyTypes == null)
+            {
+                Log("UdpRuntime: SyncExistingUdpTypeDrift skipped (Property_Type collection null)");
+                return;
+            }
+
+            int drifted = 0;
+            int matched = 0;
+            int seen = 0;
+            try
+            {
+                foreach (dynamic pt in propertyTypes)
+                {
+                    seen++;
+                    if (pt == null) continue;
+                    string ptName;
+                    try { ptName = pt.Name ?? ""; }
+                    catch { continue; }
+                    if (string.IsNullOrEmpty(ptName)) continue;
+                    if (!expected.TryGetValue(ptName, out var match)) continue;
+                    matched++;
+
+                    int currentDataTypeId;
+                    try
+                    {
+                        var raw = pt.Properties("tag_Udp_Data_Type")?.Value;
+                        if (raw == null)
+                        {
+                            Log($"UdpRuntime: SyncExistingUdpTypeDrift {ptName} has null tag_Udp_Data_Type");
+                            continue;
+                        }
+                        currentDataTypeId = Convert.ToInt32(raw);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"UdpRuntime: drift read failed for {ptName}: {ex.Message}");
+                        continue;
+                    }
+
+                    // For List-type UDPs we also keep the values string aligned
+                    // with MC_UDP_LIST_OPTION. Without this, an admin that
+                    // retypes a UDP into List (e.g. KVKK Int -> List) sees the
+                    // datatype flip but the Column Editor dropdown stays empty
+                    // because tag_Udp_Values_List was never populated. Skipped
+                    // when a dependency set owns this UDP's list values - that
+                    // path is handled in UpdateExistingListUdps with the
+                    // cascade-filtered options.
+                    bool isStaticList =
+                        match.dataTypeId == 6
+                        && match.def.ListOptions != null
+                        && match.def.ListOptions.Count > 0
+                        && (_dependencySetService == null
+                            || !_dependencySetService.IsLoaded
+                            || _dependencySetService.GetListUdpOptions(match.def.Name, null) == null
+                            || _dependencySetService.GetListUdpOptions(match.def.Name, null).Count == 0);
+
+                    string expectedListValues = isStaticList
+                        ? string.Join(",", match.def.ListOptions.Select(o => o.Value))
+                        : null;
+                    string currentListValues = null;
+                    if (isStaticList)
+                    {
+                        try { currentListValues = pt.Properties("tag_Udp_Values_List")?.Value?.ToString() ?? ""; }
+                        catch { currentListValues = ""; }
+                    }
+
+                    bool typeOk = currentDataTypeId == match.dataTypeId;
+                    bool listOk = !isStaticList || string.Equals(currentListValues ?? string.Empty, expectedListValues ?? string.Empty, StringComparison.Ordinal);
+
+                    if (typeOk && listOk)
+                    {
+                        Log($"UdpRuntime: SyncExistingUdpTypeDrift {ptName} already at {currentDataTypeId} ('{match.def.UdpType}') - ok");
+                        continue;
+                    }
+
+                    int transId = metamodelSession.BeginNamedTransaction($"SyncUdpType_{match.def.Name}");
+                    try
+                    {
+                        if (!typeOk)
+                            TrySetProperty(pt, "tag_Udp_Data_Type", match.dataTypeId);
+                        if (isStaticList && !listOk)
+                            TrySetProperty(pt, "tag_Udp_Values_List", expectedListValues);
+                        metamodelSession.CommitTransaction(transId);
+                        drifted++;
+                        if (!typeOk && isStaticList && !listOk)
+                            Log($"UdpRuntime: {ptName} drift fixed (type erwin={currentDataTypeId} -> DB={match.dataTypeId} '{match.def.UdpType}', list='{currentListValues}' -> '{expectedListValues}')");
+                        else if (!typeOk)
+                            Log($"UdpRuntime: {ptName} type drift fixed (erwin={currentDataTypeId} -> DB={match.dataTypeId} '{match.def.UdpType}')");
+                        else
+                            Log($"UdpRuntime: {ptName} list-values drift fixed ('{currentListValues}' -> '{expectedListValues}')");
+                    }
+                    catch (Exception ex)
+                    {
+                        try { metamodelSession.RollbackTransaction(transId); } catch { }
+                        Log($"UdpRuntime: drift sync failed for {ptName}: {ex.Message}");
+                    }
+                }
+            }
+            finally
+            {
+                // Property_Type collection - mirror the release pattern used in
+                // UpdateExistingListUdps (no explicit ReleaseCom there either; the
+                // metamodel session disposal in the caller handles it).
+            }
+
+            Log($"UdpRuntime: SyncExistingUdpTypeDrift done (seen={seen}, matched={matched}, drifted={drifted})");
         }
 
         #endregion

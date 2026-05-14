@@ -93,6 +93,139 @@ namespace EliteSoft.Erwin.AddIn.Services
         // Snapshot of all attributes
         private Dictionary<string, AttributeValidationSnapshot> _attributeSnapshots;
 
+        // Phase-2E (2026-05-12): diagram-side heartbeat for add detection when no
+        // editor dialog is open. Pure count snapshots, no per-property reads -
+        // the eliminated Phase-2D full-walk was expensive because it read every
+        // attribute's full property set every tick. Count-only walk on a 280-entity
+        // model is ~5 ms; we run it once per second (every 4 ticks) so amortized
+        // cost is negligible. Covers: diagram inline add, Model Explorer "New
+        // Column" / "New Table", reverse engineer batches, anything that mutates
+        // the model from outside the Column/Entity Editor dialogs.
+        //
+        // Snapshot key: entity ObjectId (string form). The first cut used
+        // Physical_Name and broke when an entity's name resolution changed
+        // between ticks (e.g. erwin's default "%Entity1" placeholder converts
+        // to a real Physical_Name on first rename, which made the SAME entity
+        // look "new" on the next heartbeat - log "silent baselined new/unseen
+        // entity 'TEST_DATA_TAB_1'" with entities=0 delta, 2026-05-12). ObjectId
+        // is invariant for the lifetime of the entity so it sidesteps the race.
+        private long _lastTotalAttributeCount = -1;
+        private long _lastTotalEntityCount = -1;
+        private readonly Dictionary<string, int> _entityAttrCountSnapshot =
+            new Dictionary<string, int>(StringComparer.Ordinal); // ObjectId key, case-sensitive
+        private readonly HashSet<string> _entityIdSnapshot =
+            new HashSet<string>(StringComparer.Ordinal);
+        // Per-entity attribute ObjectId set, populated only on count-delta ticks.
+        // SCAPI ObjectId is a GUID-shaped string (NOT a numeric SC_OBJID; the
+        // 2026-05-12 log proved long.TryParse fails on every attribute), so the
+        // earlier "strip the highest numeric id" trick was broken. With set
+        // semantics we instead compute current.Except(previous) to learn EXACTLY
+        // which attrs are new on a given tick, regardless of id encoding.
+        private readonly Dictionary<string, HashSet<string>> _entityAttrIdSnapshot =
+            new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+        // Per-entity set of attribute ObjectIds whose Physical_Name is still a
+        // placeholder (empty / '<default>' / 'PLEASE CHANGE IT'). Model Explorer
+        // "New Column" creates the attribute with name '<default>' first and
+        // then the user types the real name as a separate edit - this rename
+        // does NOT change the attribute count, so the count-delta heartbeat
+        // never fires for it. We track the placeholder attrs here so the
+        // heartbeat keeps rescanning their owner entity until the name resolves
+        // (whereupon CheckEntityForChanges' fingerprint diff trips
+        // ProcessAttributeChanges -> ValidateGlossary). Verified 2026-05-12 log
+        // line 18:14:35: 'physName=<default> isNew=True ... ValidateGlossary
+        // skipped' produced zero validation result on a Model Explorer flow.
+        private readonly Dictionary<string, HashSet<string>> _pendingNamedAttrs =
+            new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+        // Timestamp of when each pending attribute was first seen, used to
+        // tell apart "user is still typing" from "user committed the
+        // placeholder and walked away". The inline-edit close detector in
+        // WindowMonitorTimer_Tick uses this together with the focused-window
+        // class to decide whether to force-validate. See ValidateCommittedPendingAttrs.
+        private readonly Dictionary<string, DateTime> _pendingAttrAddedAt =
+            new Dictionary<string, DateTime>(StringComparer.Ordinal);
+        private int _heartbeatTickCounter;
+        private const int HeartbeatEveryNTicks = 4; // 250 ms * 4 = 1 s
+
+        // Inline-edit state machine for the Model Explorer "New Column" and
+        // diagram in-place-edit flows. Both spawn a Win32 Edit control while
+        // the user is typing; when the user commits (Enter/Tab/click-away)
+        // the Edit window is destroyed. We watch the transition open->closed
+        // to fire ValidateCommittedPendingAttrs: any attr still wearing its
+        // placeholder name at that moment was committed as-is and needs the
+        // glossary popup (which ValidateGlossary normally skips on placeholders).
+        private bool _wasInlineEditOpen;
+
+        // Phase-2G entity-level mirror of Phase-2E/2F (2026-05-13):
+        // - _entityDisplayNameSnapshot lets us spot Entity renames at heartbeat
+        //   time (count delta won't fire on a pure rename - Physical_Name
+        //   changes but Attribute/Entity counts stay constant).
+        // - _pendingNamedEntities tracks newly-seen entities still wearing a
+        //   placeholder Physical_Name. They are held back from
+        //   RunScopedTableNamingCheck until inline-edit close so we don't
+        //   pop a "name does not match naming standard" warning while the
+        //   user is still typing.
+        private readonly Dictionary<string, string> _entityDisplayNameSnapshot =
+            new Dictionary<string, string>(StringComparer.Ordinal);
+        private readonly HashSet<string> _pendingNamedEntities =
+            new HashSet<string>(StringComparer.Ordinal);
+
+        /// <summary>
+        /// True when the column's Physical_Name is still in erwin's
+        /// placeholder state (just created, no user-typed name yet).
+        /// Mirrors the early-return guard in ValidateGlossary so the
+        /// pending tracker uses the same criterion.
+        /// </summary>
+        private static bool IsPlaceholderColumnName(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return true;
+            if (name.Equals("<default>", StringComparison.OrdinalIgnoreCase)) return true;
+            if (name.StartsWith("<default>", StringComparison.OrdinalIgnoreCase)) return true;
+            if (name.StartsWith("PLEASE CHANGE IT", StringComparison.OrdinalIgnoreCase)) return true;
+            if (name.StartsWith("PLEASE_CHANGE_IT", StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+
+        /// <summary>
+        /// True when the entity's Physical_Name is one of erwin's auto-assigned
+        /// defaults that the user has not yet renamed. Empirically these are:
+        ///   "E/284", "E/285", ...     diagram "New Entity" placeholder
+        ///   "<default>"                Model Explorer "New Entity" placeholder
+        ///   ""                         pre-commit state
+        /// We hold these in _pendingNamedEntities and skip RunScopedTableNamingCheck
+        /// until the user commits a real name, otherwise the naming standard
+        /// regex either flags the default as a violation (annoying popup the
+        /// user will fix in the same gesture) or accepts the default and the
+        /// user never sees their real name validated.
+        /// </summary>
+        private static bool IsPlaceholderEntityName(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return true;
+            if (name.Equals("<default>", StringComparison.OrdinalIgnoreCase)) return true;
+            if (name.StartsWith("<default>", StringComparison.OrdinalIgnoreCase)) return true;
+            // PLEASE_CHANGE_IT / PLEASE CHANGE IT - the auto-applied placeholder
+            // we write when an AUTO_APPLY=true naming rule fails (Phase-2H).
+            // Treat it as a placeholder so the next heartbeat tick doesn't see
+            // it as a "rename" and re-queue another naming check, infinitely.
+            if (name.StartsWith("PLEASE CHANGE IT", StringComparison.OrdinalIgnoreCase)) return true;
+            if (name.StartsWith("PLEASE_CHANGE_IT", StringComparison.OrdinalIgnoreCase)) return true;
+            // erwin's diagram-side auto name pattern: "E/<number>" (uppercase
+            // E, forward slash, integer suffix). Verified 2026-05-13 log:
+            // "[NAMING] newly seen entity 'E/284'" right after a diagram New
+            // Entity click. Match conservatively (exact prefix + digits-only
+            // tail) so user-typed names like "E/B Test" or "E/123_FOO" still
+            // count as real.
+            if (name.Length >= 3 && name[0] == 'E' && name[1] == '/')
+            {
+                bool allDigits = true;
+                for (int i = 2; i < name.Length; i++)
+                {
+                    if (!char.IsDigit(name[i])) { allDigits = false; break; }
+                }
+                if (allDigits) return true;
+            }
+            return false;
+        }
+
         // Term-type policy popup deduplication. erwin's Column Editor combo commits the
         // same user pick twice (combo commit + later sync), so without this we revert + popup
         // for the same attempt twice in ~3 seconds. Key = attribute ObjectId, value = the
@@ -668,13 +801,25 @@ namespace EliteSoft.Erwin.AddIn.Services
                     }
                 }
 
-                // Editor closed: no scan at all. Phase-2D is purely reactive - any
-                // periodic full-model walk reintroduces UI hitches (the previous
-                // 7.5 s TableTypeMonitor walk made table selection feel sticky).
-                // Entity-level changes (entity rename, TABLE_TYPE UDP) trigger
-                // when the user opens the corresponding editor; pure-diagram
-                // renames without an editor open are an accepted blind spot.
-                // Future work: reactive hook on entity Properties dialog open.
+                // Editor closed: diagram heartbeat (Phase-2E, 2026-05-12).
+                // The Phase-2D blind spot (pure-diagram / Model Explorer add) is
+                // closed by a count-only delta check every HeartbeatEveryNTicks
+                // ticks. We deliberately do NOT read attribute property sets here -
+                // the old 7.5 s freeze came from full-property walks. A count walk
+                // on a 280-entity model is ~5 ms; only when a delta is detected
+                // do we run the existing scoped (~30 ms) scan on the changed
+                // entities. AddItem hook covers macro-level transaction commits
+                // (model open, editor open) but inline diagram edits and Model
+                // Explorer New Column / New Table do NOT route through it (D2
+                // spike, 2026-05-12 - empirically verified that only 5 records
+                // fire across 5 add scenarios). Count delta is the universal
+                // sensor regardless of which UI path the user took.
+                _heartbeatTickCounter++;
+                if (_heartbeatTickCounter >= HeartbeatEveryNTicks)
+                {
+                    _heartbeatTickCounter = 0;
+                    DiagramHeartbeatTick(modelObjects, root);
+                }
             }
             catch (COMException) { HandleSessionLost(); }
             catch (InvalidComObjectException) { HandleSessionLost(); }
@@ -691,6 +836,399 @@ namespace EliteSoft.Erwin.AddIn.Services
             finally
             {
                 _isCheckingForChanges = false;
+            }
+        }
+
+        /// <summary>
+        /// Phase-2E heartbeat (2026-05-12). Detects model mutations performed
+        /// outside the Column/Entity Editor dialogs (diagram inline add, Model
+        /// Explorer New Column, Model Explorer New Entity, RE batches, anything
+        /// else that bypasses our editor-scoped scan path).
+        ///
+        /// Strategy:
+        ///   1. Read TWO cheap totals: Attribute count and Entity count across
+        ///      the whole model. SCAPI ICollection.Count is internal, no
+        ///      property reads, so this is the single fastest delta signal.
+        ///   2. If both totals match the previous tick AND the entity set is
+        ///      identical, there is no change - bail.
+        ///   3. Otherwise walk entities once, compute per-entity attribute
+        ///      counts, diff against the saved per-entity snapshot, and run
+        ///      the existing scoped validation path against any entity whose
+        ///      count grew (added attribute) or which is newly present.
+        ///   4. Refresh totals + snapshots so the next tick is back to the
+        ///      cheap-early-exit path.
+        ///
+        /// The first call after StartMonitoring sees -1/-1 and silently
+        /// populates the snapshot without validating (the model's existing
+        /// columns are not "new" from the user's perspective; only changes
+        /// after monitoring started count).
+        /// </summary>
+        private void DiagramHeartbeatTick(dynamic modelObjects, dynamic root)
+        {
+            long totalAttrs;
+            long totalEntities;
+            dynamic attrCollection = null;
+            dynamic entityCollection = null;
+            try
+            {
+                attrCollection = modelObjects.Collect(root, "Attribute");
+                entityCollection = modelObjects.Collect(root, "Entity");
+                if (attrCollection == null || entityCollection == null) return;
+                totalAttrs = (long)attrCollection.Count;
+                totalEntities = (long)entityCollection.Count;
+            }
+            catch (Exception ex)
+            {
+                Log($"DiagramHeartbeat: count read err: {ex.Message}");
+                ReleaseCom(attrCollection);
+                ReleaseCom(entityCollection);
+                return;
+            }
+
+            // First tick after monitoring started: baseline silently.
+            bool isFirstTick = (_lastTotalAttributeCount < 0 || _lastTotalEntityCount < 0);
+            // Phase-2G (2026-05-13): the old count-only early-exit silently
+            // dropped entity-name renames because a rename produces zero
+            // count delta. Verified by 13:49:35 log: user renamed 'E/284' ->
+            // '123' between two tablo-add events and the rename was only
+            // detected when the SECOND tablo-add forced a walk (the rename
+            // fire arrived ~2 minutes late, surfaced alongside the second
+            // tablo's check). We now walk every heartbeat tick regardless of
+            // count delta - the per-entity work is one Physical_Name read +
+            // one Collect("Attribute").Count, ~140ms on a 280-entity model.
+            // needsIdWalk (per-attribute ObjectId enumeration) still only
+            // fires on count delta, so the expensive walk path is unchanged.
+            //
+            // The historical 7.5s freeze that motivated the early-exit came
+            // from a different per-property scan, NOT from the count read.
+
+            try
+            {
+                long delta = totalAttrs - _lastTotalAttributeCount;
+                long entityDelta = totalEntities - _lastTotalEntityCount;
+                if (!isFirstTick)
+                {
+                    Log($"DiagramHeartbeat: delta detected attrs={delta:+#;-#;0} entities={entityDelta:+#;-#;0} (was {_lastTotalAttributeCount}/{_lastTotalEntityCount}, now {totalAttrs}/{totalEntities})");
+                }
+
+                var currentEntityIds = new HashSet<string>(StringComparer.Ordinal);
+                // (entity dispatch, displayName, entityId, kind, newAttrIds)
+                //   kind 'A' = attr count grew on a known entity (most common),
+                //   kind 'N' = newly-seen entity.
+                // newAttrIds: ObjectIds present now but absent from the previous
+                // tick's per-entity id set. Used to strip exactly the right
+                // entries from _attributeSnapshots so CheckEntityForChanges sees
+                // them as new without false-positive spam on pre-existing attrs.
+                var entitiesToRescan = new List<(dynamic entity, string name, string id, char kind, HashSet<string> newAttrIds)>();
+                // Phase-2G (2026-05-13): table-name validation queue. Filled
+                // by the entity-level diff inside the walk (newly-seen entity
+                // with a non-placeholder name OR entity Physical_Name changed
+                // since the last tick), drained after the walk so we never
+                // call RunScopedTableNamingCheck while still iterating the
+                // COM collection - it Collects("Entity") itself and the
+                // re-entry can wedge the COM enumerator.
+                var entitiesToNamingCheck = new List<string>();
+
+                foreach (dynamic entity in entityCollection)
+                {
+                    if (entity == null) continue;
+                    string entityId;
+                    try { entityId = entity.ObjectId?.ToString() ?? ""; }
+                    catch { continue; }
+                    if (string.IsNullOrEmpty(entityId)) continue;
+
+                    string displayName;
+                    try
+                    {
+                        string p = entity.Properties("Physical_Name").Value?.ToString() ?? "";
+                        displayName = (!string.IsNullOrEmpty(p) && !p.StartsWith("%")) ? p : (entity.Name ?? entityId);
+                    }
+                    catch { try { displayName = entity.Name ?? entityId; } catch { displayName = entityId; } }
+
+                    currentEntityIds.Add(entityId);
+
+                    bool isKnownEntity = _entityIdSnapshot.Contains(entityId);
+                    int prevCount = _entityAttrCountSnapshot.TryGetValue(entityId, out int p2) ? p2 : -1;
+
+                    // Fast path: count-only read (cheap, no per-attr iteration)
+                    // until we know we need to do a set diff. Most entities show
+                    // no count delta tick to tick, so we skip the per-attr walk.
+                    int currentAttrCount = 0;
+                    HashSet<string> currentAttrIds = null;
+                    dynamic entityAttrs = null;
+                    try
+                    {
+                        entityAttrs = modelObjects.Collect(entity, "Attribute");
+                        if (entityAttrs != null) currentAttrCount = (int)entityAttrs.Count;
+                    }
+                    catch (Exception ex) { Log($"DiagramHeartbeat: per-entity count err for '{displayName}': {ex.Message}"); }
+
+                    bool attrsGrew = isKnownEntity && currentAttrCount > prevCount;
+                    bool isNewlySeenEntity = !isKnownEntity;
+                    bool isPendingOwner = _pendingNamedAttrs.ContainsKey(entityId);
+                    // Walk attribute ids whenever the entity hasn't been
+                    // snapshotted yet OR its count grew. Critically we run the
+                    // walk on the FIRST tick too (when no previous snapshot
+                    // exists for any entity), otherwise the next tick's diff
+                    // would see "no prior ids" and treat every existing attr
+                    // as new - producing a popup for every column in the table
+                    // (verified 2026-05-12: log "stripped 31 new attr(s)" then
+                    // "diff fired 31 result(s)" on a 31-attr table after a 1-
+                    // attr add). We do not validate on the first tick - just
+                    // snapshot - so the cost is one ObjectId read per attr per
+                    // entity, paid once at start.
+                    bool needsIdWalk = attrsGrew || isNewlySeenEntity;
+
+                    HashSet<string> newAttrIds = null;
+                    if (needsIdWalk && entityAttrs != null)
+                    {
+                        currentAttrIds = new HashSet<string>(StringComparer.Ordinal);
+                        try
+                        {
+                            foreach (dynamic a in entityAttrs)
+                            {
+                                string aid;
+                                try { aid = a.ObjectId?.ToString(); }
+                                catch (Exception aex) { Log($"DiagramHeartbeat: attr id read err on '{displayName}': {aex.Message}"); continue; }
+                                if (!string.IsNullOrEmpty(aid)) currentAttrIds.Add(aid);
+                            }
+                        }
+                        catch (Exception walkEx) { Log($"DiagramHeartbeat: attr walk err on '{displayName}': {walkEx.Message}"); }
+
+                        if (_entityAttrIdSnapshot.TryGetValue(entityId, out var prevIds))
+                        {
+                            newAttrIds = new HashSet<string>(currentAttrIds, StringComparer.Ordinal);
+                            newAttrIds.ExceptWith(prevIds);
+                        }
+                        else
+                        {
+                            // No prior set means either (a) the very first
+                            // heartbeat after monitoring started, or (b) a
+                            // brand-new entity created later. In case (a) the
+                            // attrs are pre-existing and should NOT validate;
+                            // case (b) actually wants every attr validated.
+                            // We rely on isFirstTick to disambiguate below.
+                            newAttrIds = new HashSet<string>(currentAttrIds, StringComparer.Ordinal);
+                        }
+                    }
+                    ReleaseCom(entityAttrs);
+
+                    // Validation only fires AFTER the first tick (we want to
+                    // baseline the pre-existing model silently on startup).
+                    // Three triggers for rescan:
+                    //   'A' attrsGrew      - new attr appeared since last tick
+                    //   'N' isNewlySeenEntity - entity not in our snapshot yet
+                    //   'P' isPendingOwner - entity has a placeholder-named
+                    //                        attribute we're still watching for
+                    //                        a rename (Model Explorer flow).
+                    // The pending-owner trigger fires WITHOUT requiring a count
+                    // delta, so a rename inside the entity gets caught by
+                    // CheckEntityForChanges' fingerprint diff.
+                    if (!isFirstTick && (newAttrIds != null && newAttrIds.Count > 0 || isPendingOwner))
+                    {
+                        char kind = attrsGrew ? 'A' : (isNewlySeenEntity ? 'N' : 'P');
+                        entitiesToRescan.Add((entity, displayName, entityId, kind, newAttrIds ?? new HashSet<string>(StringComparer.Ordinal)));
+                    }
+
+                    _entityAttrCountSnapshot[entityId] = currentAttrCount;
+                    if (currentAttrIds != null)
+                    {
+                        _entityAttrIdSnapshot[entityId] = currentAttrIds;
+                    }
+
+                    // Phase-2G: entity-name validation routing. Three cases
+                    // matter after the very first tick:
+                    //   1) newly-seen entity + real name -> fire naming check now
+                    //   2) newly-seen entity + placeholder name -> hold in
+                    //      _pendingNamedEntities; the user is still naming the
+                    //      table from inline edit. ValidateCommittedPendingAttrs
+                    //      drains it when the user commits.
+                    //   3) known entity, name changed -> fire naming check now
+                    //      (also clears pending if the previous name was a
+                    //      placeholder).
+                    bool prevNameKnown = _entityDisplayNameSnapshot.TryGetValue(entityId, out var prevDisplayName);
+                    if (!isFirstTick)
+                    {
+                        if (isNewlySeenEntity)
+                        {
+                            if (IsPlaceholderEntityName(displayName))
+                            {
+                                _pendingNamedEntities.Add(entityId);
+                                Log($"[PENDING-ENTITY] entityId={entityId} name='{displayName}' - placeholder, holding for inline-edit commit / rename");
+                            }
+                            else
+                            {
+                                entitiesToNamingCheck.Add(displayName);
+                                Log($"[NAMING] newly seen entity '{displayName}' - queuing naming check");
+                                FireNewEntityPipeline(entity, displayName);
+                            }
+                        }
+                        else if (prevNameKnown && !string.Equals(prevDisplayName, displayName, StringComparison.Ordinal))
+                        {
+                            // Rename. If the new name is STILL a placeholder
+                            // (rare - user just shuffled defaults), stay
+                            // pending. Otherwise fire the naming check now
+                            // and drop the pending entry.
+                            if (IsPlaceholderEntityName(displayName))
+                            {
+                                _pendingNamedEntities.Add(entityId);
+                                Log($"[PENDING-ENTITY] entityId={entityId} '{prevDisplayName}' -> '{displayName}' (still placeholder) - keeping pending");
+                            }
+                            else
+                            {
+                                entitiesToNamingCheck.Add(displayName);
+                                Log($"[NAMING] entity renamed '{prevDisplayName}' -> '{displayName}' - queuing naming check");
+
+                                bool wasPending = _pendingNamedEntities.Remove(entityId);
+                                if (wasPending)
+                                {
+                                    Log($"[PENDING-ENTITY] entityId={entityId} dropped from pending after rename to '{displayName}'");
+                                    // The entity was first seen with a placeholder name, so
+                                    // the new-entity pipeline was deferred. Fire it now that
+                                    // we have a real physical name to feed the wizard.
+                                    FireNewEntityPipeline(entity, displayName);
+                                }
+                            }
+                        }
+                    }
+                    _entityDisplayNameSnapshot[entityId] = displayName;
+                }
+
+                // Garbage collect snapshot entries for entities that no longer exist.
+                if (_entityIdSnapshot.Count > 0)
+                {
+                    var removed = new List<string>();
+                    foreach (var prev in _entityIdSnapshot)
+                    {
+                        if (!currentEntityIds.Contains(prev))
+                            removed.Add(prev);
+                    }
+                    foreach (var id in removed)
+                    {
+                        _entityIdSnapshot.Remove(id);
+                        _entityAttrCountSnapshot.Remove(id);
+                        _entityAttrIdSnapshot.Remove(id);
+                        _entityDisplayNameSnapshot.Remove(id);
+                        _pendingNamedEntities.Remove(id);
+                        // Drop pending attr timestamps belonging to the
+                        // disappearing entity so the dictionary doesn't grow
+                        // unbounded across long sessions.
+                        if (_pendingNamedAttrs.TryGetValue(id, out var orphanedAttrs))
+                        {
+                            foreach (var orphAttrId in orphanedAttrs) _pendingAttrAddedAt.Remove(orphAttrId);
+                        }
+                        _pendingNamedAttrs.Remove(id);
+                    }
+                }
+                _entityIdSnapshot.Clear();
+                foreach (var id in currentEntityIds) _entityIdSnapshot.Add(id);
+                _lastTotalAttributeCount = totalAttrs;
+                _lastTotalEntityCount = totalEntities;
+
+                // Validate the entities flagged as changed. Two cases:
+                //
+                //   kind 'A' (attr count grew on a KNOWN entity):
+                //     Existing scoped pipeline (silent populate -> diff ->
+                //     validate). _attributeSnapshots may not have this entity's
+                //     attrs yet IF the entity was never opened in the Column
+                //     Editor (Phase-2D's _tablesBaselined doesn't cover diagram-
+                //     only flow). In that case CheckEntityForChanges will mark
+                //     ALL existing attrs as new and fire glossary popups for
+                //     each, which is excessive false-positive noise. So we
+                //     silent-baseline FIRST when _tablesBaselined doesn't know
+                //     this table, then a follow-up tick (~1 s) will catch the
+                //     real delta when the user keeps adding columns.
+                //
+                //     But for the FIRST added column we must avoid the one-tick
+                //     miss: pre-baseline-then-diff produces zero diff. Trick:
+                //     drive CheckEntityForChanges directly. Its diff logic
+                //     against _attributeSnapshots (per-attribute-id keyed)
+                //     treats any attr whose ID is missing as new. With no
+                //     baseline taken yet, every existing attr is "new" - the
+                //     pre-existing 30 columns spam glossary popups. Not OK.
+                //
+                //     So we baseline first (to anchor the existing 30), then
+                //     bump the per-entity count snapshot DOWN by 1 to force the
+                //     next heartbeat to re-detect growth. That guarantees the
+                //     user sees the popup on the next heartbeat (~1 s
+                //     latency). Acceptable trade-off for now; a future native
+                //     hook can drop it to ~30 ms.
+                //
+                //   kind 'N' (entity newly seen by us - could be brand-new in
+                //     model OR an entity whose ID wasn't in our snapshot yet
+                //     because we missed it on the first walk):
+                //     Same trick - silent baseline + nudge count snapshot so
+                //     the next heartbeat fires if the user keeps adding.
+                foreach (var (entity, name, id, kind, newAttrIds) in entitiesToRescan)
+                {
+                    try
+                    {
+                        bool needBaseline = !_tablesBaselined.Contains(name);
+                        if (needBaseline)
+                        {
+                            // No baseline yet (Column Editor never opened this
+                            // table). SilentPopulate writes every current attr
+                            // including the just-added ones - if we leave it
+                            // at that, CheckEntityForChanges sees zero diff
+                            // and skips validation. We then strip exactly the
+                            // attrs we know are new from _attributeSnapshots
+                            // (set-diff between this tick's ObjectIds and the
+                            // previous tick's). The diff sees those as missing
+                            // and fires ProcessNewAttribute -> ValidateGlossary
+                            // on each, producing a single consolidated popup
+                            // through ShowConsolidatedPopup.
+                            SilentPopulateEntity(entity, modelObjects, name);
+                            _tablesBaselined.Add(name);
+                        }
+
+                        // Strip the known-new ObjectIds from _attributeSnapshots
+                        // whether or not we just baselined - the snapshot may
+                        // have been written by the Column Editor scoped path
+                        // before the user added the column outside the editor,
+                        // and in that case the new attr is ALREADY baselined
+                        // and would otherwise stay silent.
+                        int stripped = 0;
+                        foreach (var newId in newAttrIds)
+                        {
+                            if (_attributeSnapshots.Remove(newId)) stripped++;
+                        }
+                        if (stripped > 0)
+                        {
+                            Log($"DiagramHeartbeat: stripped {stripped} new attr(s) from baseline on '{name}' kind={kind}");
+                        }
+                        else
+                        {
+                            Log($"DiagramHeartbeat: nothing to strip on '{name}' kind={kind} newAttrIds={newAttrIds.Count} (snapshot may be empty)");
+                        }
+
+                        _pendingResults.Clear();
+                        CheckEntityForChanges(entity, modelObjects);
+                        if (_pendingResults.Count > 0)
+                        {
+                            Log($"DiagramHeartbeat: diff fired {_pendingResults.Count} result(s) on '{name}' kind={kind}");
+                            ShowConsolidatedPopup();
+                        }
+                    }
+                    catch (Exception ex) { Log($"DiagramHeartbeat: rescan err for '{name}': {ex.Message}"); }
+                }
+
+                // Phase-2G: drain the entity-naming queue. RunScopedTableNamingCheck
+                // re-opens its own Collect("Entity") iterator, so we must be out
+                // of the heartbeat walk before calling it - otherwise the second
+                // enumerator on the same COM collection can return inconsistent
+                // results on r10.10. Reentrancy guard inside
+                // RunScopedTableNamingCheck (_scopedCheckInProgress) protects
+                // against the modal popup pumping our own timer back into here.
+                foreach (var entityName in entitiesToNamingCheck)
+                {
+                    try { RunScopedTableNamingCheck(entityName); }
+                    catch (Exception ex) { Log($"DiagramHeartbeat: naming check err for '{entityName}': {ex.Message}"); }
+                }
+            }
+            finally
+            {
+                ReleaseCom(attrCollection);
+                ReleaseCom(entityCollection);
             }
         }
 
@@ -796,6 +1334,37 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
 
                 _entityEditorWasOpen = entityEditorIsOpen;
+
+                // --- Inline-edit (Model Explorer label edit + diagram column
+                // inline edit) close detection (Phase-2F, 2026-05-13).
+                //
+                // When the user adds a new column from Model Explorer or
+                // double-clicks a column in the diagram, erwin pops up a
+                // standard Win32 Edit class control. Typing happens in this
+                // Edit window; pressing Enter / Tab / clicking-away destroys
+                // it AND commits the value (or accepts the default name
+                // unchanged - the bug we are fixing). We treat the transition
+                // open -> closed as "the user committed", and force-validate
+                // any pending placeholder-named attribute on the spot.
+                //
+                // The reason this is needed even with the existing pending
+                // mechanism: when the user accepts the placeholder name as-is,
+                // the attribute's Physical_Name never changes, so the
+                // CheckEntityForChanges fingerprint diff never trips
+                // ProcessAttributeChanges, and ValidateGlossary stays in its
+                // placeholder-skip branch forever. The close-transition signal
+                // is the missing UI commit edge that lets us tell apart "user
+                // is still typing" from "user walked away".
+                IntPtr erwinHwnd = IntPtr.Zero;
+                try { erwinHwnd = System.Diagnostics.Process.GetCurrentProcess().MainWindowHandle; }
+                catch { /* leave zero - IsInlineEditActive bails on zero */ }
+                bool inlineEditOpen = Win32Helper.IsInlineEditActive(erwinHwnd);
+                if (_wasInlineEditOpen && !inlineEditOpen)
+                {
+                    try { ValidateCommittedPendingAttrs(); }
+                    catch (Exception ex) { Log($"ValidateCommittedPendingAttrs err: {ex.Message}"); }
+                }
+                _wasInlineEditOpen = inlineEditOpen;
             }
             catch (COMException) { HandleSessionLost(); }
             catch (InvalidComObjectException) { HandleSessionLost(); }
@@ -804,6 +1373,228 @@ namespace EliteSoft.Erwin.AddIn.Services
                 if (ex is System.Runtime.InteropServices.ExternalException ||
                     ex.Message.Contains("RPC") || ex.Message.Contains("0x800"))
                     HandleSessionLost();
+            }
+        }
+
+        /// <summary>
+        /// Phase-2F (2026-05-13): force-validate every pending placeholder-named
+        /// attribute. Called by WindowMonitorTimer_Tick when an inline-edit
+        /// (Model Explorer label edit / diagram column inline edit) closes -
+        /// that is the moment the user committed the attribute, with whatever
+        /// name was in the edit box (including the unchanged "_default_"
+        /// placeholder, which is the bug we are closing).
+        ///
+        /// For every pending attr we:
+        ///   - locate the owner entity via Collect(root, "Entity") and match by
+        ///     ObjectId (single linear walk, ~280 entities, ~5 ms);
+        ///   - locate the attr inside it via Collect(entity, "Attribute");
+        ///   - build a fresh AttributeValidationSnapshot for the current state;
+        ///   - call ValidateGlossary with bypassPlaceholderSkip=true so the
+        ///     placeholder name itself triggers the "not in glossary" popup;
+        ///   - drop the entry from _pendingNamedAttrs / _pendingAttrAddedAt.
+        ///
+        /// We do NOT update _attributeSnapshots here - the existing record was
+        /// written when CheckEntityForChanges first saw the attr, and the only
+        /// thing that may have changed is that the user committed without
+        /// editing. The next heartbeat (or Column Editor scoped scan) catches
+        /// any real follow-up edit through the normal fingerprint diff path.
+        /// </summary>
+        private void ValidateCommittedPendingAttrs()
+        {
+            // Entity-level commit edge work also lives here (Phase-2G) so the
+            // entry guard checks BOTH pending sets.
+            if (_pendingNamedAttrs.Count == 0 && _pendingNamedEntities.Count == 0) return;
+            if (_validationSuspended) return;
+            if (_session == null || _sessionLost) return;
+
+            dynamic modelObjects = null;
+            dynamic root = null;
+            dynamic allEntities = null;
+            try
+            {
+                try { modelObjects = _session.ModelObjects; root = modelObjects?.Root; }
+                catch (Exception ex) { Log($"ValidateCommittedPendingAttrs: ModelObjects err: {ex.Message}"); return; }
+                if (root == null) return;
+                try { allEntities = modelObjects.Collect(root, "Entity"); }
+                catch (Exception ex) { Log($"ValidateCommittedPendingAttrs: entity collect err: {ex.Message}"); return; }
+                if (allEntities == null) return;
+
+                // Snapshot the owner keys so we can mutate _pendingNamedAttrs
+                // while iterating without throwing on a modified collection.
+                var ownerIds = new List<string>(_pendingNamedAttrs.Keys);
+
+                int totalFired = 0;
+                _pendingResults.Clear();
+                // Queue table-name validations for after the walk - same reason
+                // as DiagramHeartbeatTick: RunScopedTableNamingCheck reopens
+                // its own Collect("Entity") enumerator.
+                var entitiesToNamingCheck = new List<string>();
+
+                foreach (dynamic entity in allEntities)
+                {
+                    if (entity == null) continue;
+                    string entityId = null;
+                    try { entityId = entity.ObjectId?.ToString(); } catch { continue; }
+                    if (string.IsNullOrEmpty(entityId)) continue;
+                    bool hasPendingAttrs = _pendingNamedAttrs.TryGetValue(entityId, out var pendSet)
+                                           && pendSet != null && pendSet.Count > 0;
+                    bool hasPendingEntity = _pendingNamedEntities.Contains(entityId);
+                    if (!hasPendingAttrs && !hasPendingEntity) continue;
+
+                    string tableName = GetTableName(entity);
+
+                    // Phase-2G: entity-level commit edge. Read the live name
+                    // off the entity (don't use the cached snapshot, the user
+                    // may have just renamed it) and queue a naming check
+                    // regardless of placeholder state - the naming standard
+                    // regex will reject the placeholder deterministically and
+                    // accept a real name. Either result is the right one.
+                    if (hasPendingEntity)
+                    {
+                        string liveEntityName = tableName;
+                        Log($"[PENDING-ENTITY] commit edge for entityId={entityId} liveName='{liveEntityName}' - queuing naming check");
+                        entitiesToNamingCheck.Add(liveEntityName);
+                        _pendingNamedEntities.Remove(entityId);
+
+                        // Fire the new-entity pipeline (model standards,
+                        // question wizard, UDP defaults, unconditional
+                        // predefined columns, PK promotion) NOW that the
+                        // inline-edit Win32 Edit control closed. The close
+                        // is an explicit user gesture (Enter / Tab / click
+                        // away), so whatever liveEntityName is at this
+                        // point is what the user committed - even a
+                        // placeholder-shaped name like "E/38" counts,
+                        // because the user pressed Enter to accept it.
+                        // Verified missing-fire on 2026-05-14: accepting
+                        // 'E/38' as-is left the table with no predefined
+                        // columns, while renaming to 'DENEME' fired the
+                        // pipeline correctly. Without this every "accept
+                        // default name" path silently skipped standards,
+                        // UDP defaults, unconditional predefined columns,
+                        // and PK promotion. The naming standard regex
+                        // still runs alongside (entitiesToNamingCheck) and
+                        // will flag the placeholder name with a separate
+                        // warning - both outcomes are independent.
+                        FireNewEntityPipeline(entity, liveEntityName);
+                    }
+
+                    if (!hasPendingAttrs) continue; // entity-only pending was handled above
+                    var predefined = GetPredefinedColumnNames(entity);
+
+                    dynamic entityAttrs = null;
+                    try { entityAttrs = modelObjects.Collect(entity, "Attribute"); }
+                    catch (Exception ex) { Log($"ValidateCommittedPendingAttrs: attr collect err on '{tableName}': {ex.Message}"); continue; }
+                    if (entityAttrs == null) continue;
+
+                    try
+                    {
+                        foreach (dynamic attr in entityAttrs)
+                        {
+                            if (attr == null) continue;
+                            string aid = null;
+                            try { aid = attr.ObjectId?.ToString(); } catch { continue; }
+                            if (string.IsNullOrEmpty(aid)) continue;
+                            if (!pendSet.Contains(aid)) continue;
+
+                            var snapshot = CreateSnapshot(attr, tableName, modelObjects);
+                            string currentName = snapshot?.PhysicalName ?? "";
+
+                            if (!IsPlaceholderColumnName(currentName))
+                            {
+                                // The user typed a real name. The heartbeat
+                                // would normally catch this through
+                                // CheckEntityForChanges' fingerprint diff
+                                // (rename branch fires ValidateGlossary), but
+                                // the inline-edit close edge arrives before
+                                // the next heartbeat tick - and if we just
+                                // clean up here the heartbeat will never see
+                                // this entity as pending again, so the rename
+                                // would slip through unvalidated. Drive
+                                // ProcessAttributeChanges ourselves using the
+                                // stored placeholder snapshot as the previous
+                                // state. Carry over UDP / term-type fields
+                                // the same way CheckEntityForChanges does.
+                                if (_attributeSnapshots.TryGetValue(aid, out var previousState))
+                                {
+                                    snapshot.TermTypeCanonical = previousState.TermTypeCanonical;
+                                    foreach (var kvp in previousState.UdpValues)
+                                        snapshot.UdpValues[kvp.Key] = kvp.Value;
+                                    if (string.IsNullOrEmpty(snapshot.PhysicalDataType))
+                                        snapshot.PhysicalDataType = previousState.PhysicalDataType;
+
+                                    Log($"[PENDING-NAME] entity='{tableName}' attr id={aid} renamed to '{currentName}' during inline-edit - running rename validation");
+                                    ProcessAttributeChanges(attr, previousState, snapshot, predefined);
+                                    _attributeSnapshots[aid] = snapshot;
+                                }
+                                else
+                                {
+                                    // No baseline (race?). Run new-attribute
+                                    // validation to be safe; ProcessNewAttribute
+                                    // handles the glossary vs domain branch.
+                                    Log($"[PENDING-NAME] entity='{tableName}' attr id={aid} renamed to '{currentName}' (no prior snapshot) - running new-attr validation");
+                                    _attributeSnapshots[aid] = snapshot;
+                                    ProcessNewAttribute(attr, snapshot, predefined);
+                                }
+
+                                pendSet.Remove(aid);
+                                _pendingAttrAddedAt.Remove(aid);
+                                totalFired += _pendingResults.Count;
+                                continue;
+                            }
+
+                            Log($"[PENDING-NAME] entity='{tableName}' attr id={aid} committed with placeholder name='{currentName}' - force-validating glossary");
+                            ValidateGlossary(attr, snapshot, predefined, bypassPlaceholderSkip: true);
+                            totalFired += _pendingResults.Count;
+
+                            pendSet.Remove(aid);
+                            _pendingAttrAddedAt.Remove(aid);
+                        }
+                    }
+                    finally { ReleaseCom(entityAttrs); }
+
+                    if (pendSet.Count == 0) _pendingNamedAttrs.Remove(entityId);
+                }
+
+                // Owners whose entities were not found in the walk above are
+                // stale; clear them too so the dict doesn't accumulate ghosts.
+                foreach (var orphanOwner in ownerIds)
+                {
+                    if (!_pendingNamedAttrs.ContainsKey(orphanOwner)) continue;
+                    // We did not visit this owner above (entity disappeared);
+                    // drop its pending attrs from the timestamp dict.
+                    foreach (var aid in _pendingNamedAttrs[orphanOwner]) _pendingAttrAddedAt.Remove(aid);
+                    _pendingNamedAttrs.Remove(orphanOwner);
+                    Log($"[PENDING-NAME] cleared stale pending owner entityId={orphanOwner} (entity no longer in model)");
+                }
+
+                if (_pendingResults.Count > 0)
+                {
+                    Log($"ValidateCommittedPendingAttrs: fired {_pendingResults.Count} result(s) on inline-edit close");
+                    ShowConsolidatedPopup();
+                }
+                else if (totalFired == 0 && _pendingNamedAttrs.Count == 0)
+                {
+                    // Pure-cleanup path: every pending entry was already renamed
+                    // before the close edge fired. Nothing to surface.
+                }
+
+                // Phase-2G: drain table-name validation queue after the walk
+                // and after the popup. RunScopedTableNamingCheck itself shows
+                // its own modal popup; sequencing this AFTER ShowConsolidatedPopup
+                // keeps the two streams (glossary results from attrs, naming
+                // standard result from the entity) from racing the same modal
+                // pump and re-entering the timer through the message loop.
+                foreach (var entityName in entitiesToNamingCheck)
+                {
+                    try { RunScopedTableNamingCheck(entityName); }
+                    catch (Exception ex) { Log($"ValidateCommittedPendingAttrs: naming check err for '{entityName}': {ex.Message}"); }
+                }
+            }
+            finally
+            {
+                ReleaseCom(allEntities);
+                ReleaseCom(root);
+                ReleaseCom(modelObjects);
             }
         }
 
@@ -1028,6 +1819,32 @@ namespace EliteSoft.Erwin.AddIn.Services
         #endregion
 
         #region Change Detection
+
+        /// <summary>
+        /// Forward a "new entity discovered with a real name" event to
+        /// <see cref="TableTypeMonitorService.OnNewEntityDetected"/>. Restores the
+        /// wizard / model-standards / UDP-defaults pipeline that the legacy
+        /// <c>TableTypeMonitorService.CheckForTableTypeChanges</c> isNew branch
+        /// used to drive; that periodic path was removed in Phase-2D (2026-05-06)
+        /// but the diagram-side replacement only kept the naming-check delegation.
+        ///
+        /// Errors are swallowed at this boundary because the caller is in the
+        /// middle of walking COM enumerators and a wizard-side exception must
+        /// not abort the rest of the heartbeat tick (other entities still need
+        /// their snapshots updated).
+        /// </summary>
+        private void FireNewEntityPipeline(dynamic entity, string physicalName)
+        {
+            if (_tableTypeMonitor == null) return;
+            try
+            {
+                _tableTypeMonitor.OnNewEntityDetected(entity, physicalName);
+            }
+            catch (Exception ex)
+            {
+                Log($"FireNewEntityPipeline error on '{physicalName}': {ex.Message}");
+            }
+        }
 
         /// <summary>
         /// Phase-2D close-race fix (2026-05-07): final scoped validation pass on the
@@ -1259,6 +2076,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                     if (string.IsNullOrEmpty(objectId)) continue;
 
                     var snap = CreateSnapshot(attr, tableName, modelObjects);
+                    // Capture current values of locked Column UDPs so the first
+                    // diff in CheckEntityForChanges has something non-empty to
+                    // compare against. CreateSnapshot intentionally skips UDP
+                    // reads (lazy-on-demand on big models); the locked subset is
+                    // small enough to read up-front without breaking that budget.
+                    BaselineLockedAttributeUdps(attr, snap);
                     _attributeSnapshots[objectId] = snap;
                     n++;
                 }
@@ -1358,6 +2181,14 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 {
                                     // No change in the two fields that drive validation —
                                     // skip CreateSnapshot, ProcessAttributeChanges, etc.
+                                    //
+                                    // BUT: locked Column UDP enforcement must still run.
+                                    // Editing a UDP cell in the Column Editor does NOT
+                                    // touch Physical_Name or Physical_Data_Type, so the
+                                    // Phase-2A short-circuit hides every UDP change from
+                                    // the slow path below. Run the lock check here before
+                                    // continuing so locked UDPs are still reverted.
+                                    EnforceLockedAttributeUdps(attr, objectId, existingSnap.PhysicalName);
                                     continue;
                                 }
                             }
@@ -1375,6 +2206,30 @@ namespace EliteSoft.Erwin.AddIn.Services
                             // true, the attribute genuinely DID NOT exist at baseline time -
                             // it's user-added during the active edit session. Validate it.
                             ProcessNewAttribute(attr, currentState, predefinedColumnNames);
+
+                            // Phase-2E pending-name tracking. Model Explorer's "New Column"
+                            // creates the attribute with name '<default>' as a distinct edit
+                            // from the user typing the real name, so ValidateGlossary skipped
+                            // it on this tick. Remember the entity so the heartbeat keeps
+                            // rescanning until the user types something - the next tick's
+                            // CheckEntityForChanges fingerprint diff will then fire
+                            // ProcessAttributeChanges (rename branch) on the rename.
+                            if (IsPlaceholderColumnName(currentState.PhysicalName))
+                            {
+                                string entOwnerId = null;
+                                try { entOwnerId = entity.ObjectId?.ToString(); } catch { /* tracked below */ }
+                                if (!string.IsNullOrEmpty(entOwnerId))
+                                {
+                                    if (!_pendingNamedAttrs.TryGetValue(entOwnerId, out var pendSet))
+                                    {
+                                        pendSet = new HashSet<string>(StringComparer.Ordinal);
+                                        _pendingNamedAttrs[entOwnerId] = pendSet;
+                                    }
+                                    pendSet.Add(objectId);
+                                    _pendingAttrAddedAt[objectId] = DateTime.UtcNow;
+                                    Log($"[PENDING-NAME] entity='{tableName}' attr id={objectId} name='{currentState.PhysicalName}' - heartbeat will keep watching until renamed");
+                                }
+                            }
                         }
                         else
                         {
@@ -1393,7 +2248,36 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                             ProcessAttributeChanges(attr, previousState, currentState, predefinedColumnNames);
                             _attributeSnapshots[objectId] = currentState;
+
+                            // Pending cleanup: was the attr's name a placeholder and is
+                            // it now resolved? Drop it from the watch list so we stop
+                            // forcing rescans on this entity.
+                            if (IsPlaceholderColumnName(previousState.PhysicalName) && !IsPlaceholderColumnName(currentState.PhysicalName))
+                            {
+                                string entOwnerId = null;
+                                try { entOwnerId = entity.ObjectId?.ToString(); } catch { /* best effort */ }
+                                if (!string.IsNullOrEmpty(entOwnerId) && _pendingNamedAttrs.TryGetValue(entOwnerId, out var pendSet))
+                                {
+                                    if (pendSet.Remove(objectId))
+                                    {
+                                        Log($"[PENDING-NAME] entity='{tableName}' attr id={objectId} resolved to '{currentState.PhysicalName}' - removed from pending");
+                                        if (pendSet.Count == 0) _pendingNamedAttrs.Remove(entOwnerId);
+                                    }
+                                }
+                                _pendingAttrAddedAt.Remove(objectId);
+                            }
                         }
+
+                        // Locked Column UDP enforcement runs BEFORE the
+                        // dependency cascade check on purpose: dependency
+                        // writes done by CheckAttributeUdpDependencies update
+                        // the snapshot inline, so by the time the next tick's
+                        // enforcement runs, current == snapshot for those
+                        // system writes - they bypass the lock. Reordering
+                        // these two calls would route dependency-driven writes
+                        // through the lock and revert them, breaking the
+                        // user-only intent.
+                        EnforceLockedAttributeUdps(attr, objectId, currentState.PhysicalName);
 
                         // Check column-level UDP changes for dependency cascade
                         CheckAttributeUdpDependencies(attr, objectId, currentState.PhysicalName);
@@ -1452,6 +2336,121 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
             }
             catch { }
+        }
+
+        /// <summary>
+        /// One-shot baseline of every IsLocked=true Column UDP for the given
+        /// attribute. Called from <see cref="SilentPopulateEntity"/> right after
+        /// the attribute's <see cref="AttributeValidationSnapshot"/> is created,
+        /// so the first follow-up tick has a non-empty "previous value" to
+        /// compare against. Without this baseline, the very first time a user
+        /// touches a locked UDP we would see (snapshot="" -> current="X") and
+        /// classify it as an initial assignment, missing the intended block.
+        ///
+        /// Cost: O(locked UDP count) property reads per attribute baselined.
+        /// Locked UDPs are a small subset of the definition table; a typical
+        /// config has 0-5 of them.
+        /// </summary>
+        private void BaselineLockedAttributeUdps(dynamic attr, AttributeValidationSnapshot snapshot)
+        {
+            if (attr == null || snapshot == null) return;
+            if (!UdpDefinitionService.Instance.IsLoaded) return;
+
+            var lockedDefs = UdpDefinitionService.Instance.GetLockedByObjectType("Column");
+            if (lockedDefs.Count == 0) return;
+
+            foreach (var def in lockedDefs)
+            {
+                try
+                {
+                    string path = $"Attribute.Physical.{def.Name}";
+                    string currentVal = attr.Properties(path)?.Value?.ToString() ?? "";
+                    snapshot.UdpValues[def.Name] = currentVal;
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"BaselineLockedAttributeUdps: '{def.Name}' read err: {ex.Message}");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Lock enforcement for IsLocked=true Column UDPs. Runs from
+        /// <see cref="CheckEntityForChanges"/>, BEFORE
+        /// <see cref="CheckAttributeUdpDependencies"/>: this ordering matters
+        /// because the dependency cascade can write into a locked UDP as a
+        /// system side-effect, and the same-tick re-read inside
+        /// CheckAttributeUdpDependencies absorbs that write into the snapshot
+        /// silently. Running enforcement first means we only ever see the
+        /// user-initiated diff here; system writes flow past the lock check
+        /// untouched. This mirrors the user-only-intent contract already
+        /// documented for the (now dead) TableTypeMonitor path.
+        ///
+        /// Semantic per UDP:
+        ///   snapshot empty + current empty   -> nothing to do
+        ///   snapshot empty + current non-empty -> "initial set", accept and
+        ///                                        update snapshot
+        ///   snapshot non-empty + current == snapshot -> no change
+        ///   snapshot non-empty + current != snapshot -> revert via
+        ///                                        WriteUdpValues + MessageBox,
+        ///                                        snapshot stays at old value
+        /// </summary>
+        private void EnforceLockedAttributeUdps(dynamic attr, string objectId, string columnName)
+        {
+            if (_udpRuntimeService == null || !_udpRuntimeService.IsInitialized) return;
+            if (!UdpDefinitionService.Instance.IsLoaded) return;
+
+            var lockedDefs = UdpDefinitionService.Instance.GetLockedByObjectType("Column");
+            if (lockedDefs.Count == 0) return;
+
+            if (!_attributeSnapshots.TryGetValue(objectId, out var snapshot)) return;
+
+            foreach (var def in lockedDefs)
+            {
+                string currentVal;
+                try
+                {
+                    string path = $"Attribute.Physical.{def.Name}";
+                    currentVal = attr.Properties(path)?.Value?.ToString() ?? "";
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"EnforceLockedAttributeUdps: '{def.Name}' read err: {ex.Message}");
+                    continue;
+                }
+
+                string prevVal = "";
+                snapshot.UdpValues.TryGetValue(def.Name, out prevVal);
+                prevVal = prevVal ?? "";
+
+                if (currentVal == prevVal) continue;
+
+                if (string.IsNullOrEmpty(prevVal))
+                {
+                    // Initial assignment from glossary/wizard/manual seed - accept.
+                    snapshot.UdpValues[def.Name] = currentVal;
+                    Log($"Locked Column UDP '{def.Name}' initial set on '{columnName}': '' -> '{currentVal}' (accepted)");
+                    continue;
+                }
+
+                // User edit on a non-empty locked UDP - revert.
+                try
+                {
+                    _udpRuntimeService.WriteUdpValues(
+                        attr,
+                        new Dictionary<string, string> { [def.Name] = prevVal },
+                        "Column");
+                    Log($"Locked Column UDP '{def.Name}' on '{columnName}' reverted '{currentVal}' -> '{prevVal}'");
+
+                    Forms.LockedUdpDialog.Show(def.Name, currentVal, prevVal);
+                }
+                catch (Exception ex)
+                {
+                    Log($"Locked Column UDP revert failed for '{def.Name}' on '{columnName}': {ex.Message}");
+                }
+                // Snapshot stays at prevVal so the next tick sees the
+                // re-applied revert value and treats it as "no change".
+            }
         }
 
         private void ProcessNewAttribute(dynamic attr, AttributeValidationSnapshot currentState, HashSet<string> predefinedColumnNames)
@@ -1684,15 +2683,32 @@ namespace EliteSoft.Erwin.AddIn.Services
                 || name.StartsWith("PLEASE_CHANGE_IT", StringComparison.OrdinalIgnoreCase);
         }
 
-        private void ValidateGlossary(dynamic attr, AttributeValidationSnapshot state, HashSet<string> predefinedColumnNames)
+        private void ValidateGlossary(dynamic attr, AttributeValidationSnapshot state, HashSet<string> predefinedColumnNames, bool bypassPlaceholderSkip = false)
         {
-            if (_validationSuspended) return;
-            // Skip special names
-            if (string.IsNullOrEmpty(state.PhysicalName) ||
-                state.PhysicalName.Equals("<default>", StringComparison.OrdinalIgnoreCase) ||
-                state.PhysicalName.StartsWith("<default>", StringComparison.OrdinalIgnoreCase) ||
-                IsPleaseChangeItPlaceholder(state.PhysicalName))
+            if (_validationSuspended) { Log($"ValidateGlossary skipped (suspended) on {state?.TableName}.{state?.PhysicalName}"); return; }
+            // Skip special names UNLESS bypassPlaceholderSkip is set. The
+            // bypass path is used by the inline-edit close detection in
+            // WindowMonitorTimer_Tick: when the user commits a column whose
+            // name is still a placeholder (Enter without typing), the
+            // committed-state validation must surface the "not in glossary"
+            // popup with the placeholder text instead of silently skipping.
+            if (!bypassPlaceholderSkip)
             {
+                if (string.IsNullOrEmpty(state.PhysicalName) ||
+                    state.PhysicalName.Equals("<default>", StringComparison.OrdinalIgnoreCase) ||
+                    state.PhysicalName.StartsWith("<default>", StringComparison.OrdinalIgnoreCase) ||
+                    IsPleaseChangeItPlaceholder(state.PhysicalName))
+                {
+                    Log($"ValidateGlossary skipped (placeholder/empty name='{state.PhysicalName ?? "<null>"}') on {state?.TableName}");
+                    return;
+                }
+            }
+            else if (string.IsNullOrEmpty(state.PhysicalName))
+            {
+                // Even in bypass mode we cannot validate a truly empty name;
+                // there is no string to look up. Log so the caller can see
+                // that the bypass attempt was a no-op and skip cleanly.
+                Log($"ValidateGlossary skipped (bypass: name still null/empty) on {state?.TableName}");
                 return;
             }
 
@@ -2121,6 +3137,17 @@ namespace EliteSoft.Erwin.AddIn.Services
 
             if (!DomainDefService.Instance.IsLoaded)
             {
+                return;
+            }
+
+            // Phase-2I: admin flag gate. When USE_EXTERNAL_DOMAIN is OFF the
+            // service still reports IsLoaded=true (so callers don't keep
+            // retrying the load) but holds zero entries and answers "skip".
+            // IsValidDomain also short-circuits on this; the check here is a
+            // belt-and-suspenders guard for direct callers.
+            if (!DomainDefService.Instance.IsExternalEnabled)
+            {
+                Log($"ValidateDomain skipped (USE_EXTERNAL_DOMAIN=false) on {state?.TableName}.{state?.PhysicalName}");
                 return;
             }
 
@@ -2651,6 +3678,14 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         private bool IsValidDomain(string domainValue)
         {
+            // Phase-2I (2026-05-13): the USE_EXTERNAL_DOMAIN admin flag gates
+            // domain validation as a whole. When it is OFF, we report every
+            // domain as "not valid for validation purposes" so the caller
+            // (ProcessNewAttribute / ProcessAttributeChanges) falls through to
+            // the glossary branch. The column's actual erwin domain field is
+            // untouched; we just refuse to act on it.
+            if (!DomainDefService.Instance.IsExternalEnabled) return false;
+
             return !string.IsNullOrEmpty(domainValue) &&
                    domainValue != "(SELECT)" &&
                    domainValue != "<default>" &&

@@ -13,12 +13,17 @@ namespace EliteSoft.Erwin.AddIn.Services
         public bool IsValid { get; set; }
         public string RuleName { get; set; }
         public string ErrorMessage { get; set; }
+        // Reference to the rule the check came from (Phase-2H, 2026-05-13).
+        // Needed by the table-side auto-rename-to-PLEASE_CHANGE_IT path so it
+        // can read .AutoApply per failing rule without re-querying the rule
+        // store by name (RuleName here is the check kind, not the rule key).
+        public NamingStandardRule Rule { get; set; }
 
-        public static NamingValidationResult Valid(string ruleName) =>
-            new NamingValidationResult { IsValid = true, RuleName = ruleName };
+        public static NamingValidationResult Valid(string ruleName, NamingStandardRule rule = null) =>
+            new NamingValidationResult { IsValid = true, RuleName = ruleName, Rule = rule };
 
-        public static NamingValidationResult Invalid(string ruleName, string message) =>
-            new NamingValidationResult { IsValid = false, RuleName = ruleName, ErrorMessage = message };
+        public static NamingValidationResult Invalid(string ruleName, string message, NamingStandardRule rule = null) =>
+            new NamingValidationResult { IsValid = false, RuleName = ruleName, ErrorMessage = message, Rule = rule };
     }
 
     /// <summary>
@@ -214,7 +219,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     results.Add(NamingValidationResult.Invalid("Prefix",
                         !string.IsNullOrEmpty(rule.ErrorMessage)
                             ? rule.ErrorMessage
-                            : $"Name must start with '{rule.Prefix}'"));
+                            : $"Name must start with '{rule.Prefix}'", rule));
                 }
             }
 
@@ -226,7 +231,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     results.Add(NamingValidationResult.Invalid("Suffix",
                         !string.IsNullOrEmpty(rule.ErrorMessage)
                             ? rule.ErrorMessage
-                            : $"Name must end with '{rule.Suffix}'"));
+                            : $"Name must end with '{rule.Suffix}'", rule));
                 }
             }
 
@@ -248,7 +253,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     results.Add(NamingValidationResult.Invalid("Length",
                         !string.IsNullOrEmpty(rule.ErrorMessage)
                             ? rule.ErrorMessage
-                            : $"Name length must be {rule.LengthOperator} {rule.LengthValue}"));
+                            : $"Name length must be {rule.LengthOperator} {rule.LengthValue}", rule));
                 }
             }
 
@@ -262,7 +267,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                         results.Add(NamingValidationResult.Invalid("Regexp",
                             !string.IsNullOrEmpty(rule.ErrorMessage)
                                 ? rule.ErrorMessage
-                                : $"Name does not match pattern '{rule.RegexpPattern}'"));
+                                : $"Name does not match pattern '{rule.RegexpPattern}'", rule));
                     }
                 }
                 catch (Exception ex)

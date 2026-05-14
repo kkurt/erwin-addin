@@ -110,6 +110,76 @@ namespace EliteSoft.Erwin.AddIn.Services
         public static IntPtr GetForegroundWindowPublic() => GetForegroundWindow();
 
         [DllImport("user32.dll")]
+        private static extern IntPtr GetFocus();
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetParent(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetCurrentThreadId();
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct GUITHREADINFO
+        {
+            public int cbSize;
+            public int flags;
+            public IntPtr hwndActive;
+            public IntPtr hwndFocus;
+            public IntPtr hwndCapture;
+            public IntPtr hwndMenuOwner;
+            public IntPtr hwndMoveSize;
+            public IntPtr hwndCaret;
+            public RECT rcCaret;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RECT { public int Left, Top, Right, Bottom; }
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool GetGUIThreadInfo(uint idThread, ref GUITHREADINFO lpgui);
+
+        /// <summary>
+        /// True when erwin's foreground UI thread has focus on a Win32 "Edit"
+        /// class control - the in-place TreeView label editor (Model Explorer
+        /// inline rename / new column) and the diagram canvas inline column
+        /// editor both create a standard Edit control on top of the parent
+        /// window while the user is typing. The class name check is enough to
+        /// disambiguate edit-mode from committed state because erwin only spawns
+        /// Edit controls for these transient inline-edit moments; Column Editor
+        /// dialog hosts its own grid cell editors with different class names
+        /// (XTPListBox / Static).
+        ///
+        /// Why this works (test 2026-05-13): Model Explorer "New Column" pops a
+        /// Win32 Edit class window with text "default" selected; the moment the
+        /// user hits Enter or Tab the Edit window is destroyed and the
+        /// TreeView label flips to the committed display string ("_default_").
+        /// We use a foreground-thread-focus probe (GetGUIThreadInfo on erwin's
+        /// foreground thread) rather than GetFocus on the calling thread; the
+        /// addin's WindowMonitorTimer fires on a different thread that has no
+        /// own focused window, so a bare GetFocus would always return 0.
+        /// </summary>
+        public static bool IsInlineEditActive(IntPtr erwinHwnd)
+        {
+            if (erwinHwnd == IntPtr.Zero) return false;
+            uint erwinThreadId = GetWindowThreadProcessId(erwinHwnd, out _);
+            if (erwinThreadId == 0) return false;
+
+            var gti = new GUITHREADINFO { cbSize = Marshal.SizeOf<GUITHREADINFO>() };
+            if (!GetGUIThreadInfo(erwinThreadId, ref gti)) return false;
+            if (gti.hwndFocus == IntPtr.Zero) return false;
+
+            var sb = new StringBuilder(64);
+            int len = GetClassName(gti.hwndFocus, sb, sb.Capacity);
+            if (len <= 0) return false;
+
+            // Standard Win32 TreeView label editor + diagram inline editor are
+            // both plain "Edit" class. erwin's own grid cells use XTPGridControl
+            // family class names (verified Phase-2D), so a strict "Edit" match
+            // does not collide with the Column Editor edit-grid.
+            return string.Equals(sb.ToString(), "Edit", StringComparison.Ordinal);
+        }
+
+        [DllImport("user32.dll")]
         private static extern bool IsWindowEnabled(IntPtr hWnd);
 
         /// <summary>

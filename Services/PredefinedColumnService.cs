@@ -5,7 +5,14 @@ using System.Linq;
 namespace EliteSoft.Erwin.AddIn.Services
 {
     /// <summary>
-    /// Represents a PREDEFINED_COLUMN entry with UDP condition support.
+    /// Represents a PREDEFINED_COLUMN entry. The UDP-condition fields are
+    /// nullable to support BOTH shapes admin can author:
+    ///   * conditional   : both DependsOnUdpId and DependsOnUdpValue set,
+    ///                     column added only when the named UDP takes the
+    ///                     listed value on a new table.
+    ///   * unconditional : DependsOnUdpId == null (DEPENDS_ON_UDP_ID stored
+    ///                     as SQL NULL); column added to EVERY new table
+    ///                     under this config regardless of UDP state.
     /// </summary>
     public class PredefinedColumn
     {
@@ -14,14 +21,32 @@ namespace EliteSoft.Erwin.AddIn.Services
         public string ColumnName { get; set; }
         public string DataType { get; set; }
         public bool Nullable { get; set; }
+        /// <summary>
+        /// When true, after the attribute is created on the new entity we
+        /// add it to the entity's Primary Key Key_Group (Key_Group_Type="PK").
+        /// Matches admin's IS_PRIMARY_KEY column (2026-05-14 schema extension).
+        /// Combines naturally with Nullable=false in admin (PK columns are
+        /// not nullable) but the addin does NOT enforce that constraint -
+        /// it trusts whatever shape the admin row carries.
+        /// </summary>
+        public bool IsPrimaryKey { get; set; }
         public string DefaultValue { get; set; }
-        public int DependsOnUdpId { get; set; }
+        // Nullable to match admin's schema (admin authored 2026-05-14:
+        // "rule-independent predefined columns"). HasValue==false means
+        // the column is unconditional and should be added to every new
+        // table; HasValue==true means it is gated by a UDP/value match.
+        public int? DependsOnUdpId { get; set; }
         public string DependsOnUdpValue { get; set; }
         public string DependsOnUdpName { get; set; } // Resolved from JOIN
-        public string DbType { get; set; }
         public int SortOrder { get; set; }
 
-        // Backward compat — old code uses .Name
+        /// <summary>
+        /// True when the row carries no UDP gating - applies to every
+        /// new entity unconditionally.
+        /// </summary>
+        public bool IsUnconditional => !DependsOnUdpId.HasValue;
+
+        // Backward compat - old code uses .Name
         public string Name => ColumnName;
     }
 
@@ -65,8 +90,16 @@ namespace EliteSoft.Erwin.AddIn.Services
         public string LastError => _lastError;
 
         /// <summary>
-        /// Load predefined columns filtered by project and DB type.
+        /// Load predefined columns for the active config.
         /// </summary>
+        /// <remarks>
+        /// The legacy <c>platformDbType</c> parameter is kept for source-compat
+        /// with older call sites; it is ignored. Admin's 2026-05-14 schema
+        /// refactor dropped the per-row <c>DB_TYPE</c> column entirely (the
+        /// "this column only applies to Oracle vs MSSQL" filter migrated to
+        /// the UDP-condition flow + IsPrimaryKey flag), so there is nothing
+        /// to filter against here anymore.
+        /// </remarks>
         public bool LoadPredefinedColumns(string platformDbType = null)
         {
             try
@@ -109,15 +142,26 @@ namespace EliteSoft.Erwin.AddIn.Services
                             while (reader.Read())
                             {
                                 int rowConfigId = Convert.ToInt32(reader["CONFIG_ID"]);
-                                string rowDbType = reader["DB_TYPE"] == DBNull.Value ? "" : reader["DB_TYPE"]?.ToString()?.Trim() ?? "";
-
-                                // DB_TYPE filter: match platform or empty (all platforms)
-                                if (!string.IsNullOrEmpty(platformDbType) && !string.IsNullOrEmpty(rowDbType) &&
-                                    !rowDbType.Equals(platformDbType, StringComparison.OrdinalIgnoreCase))
-                                    continue;
 
                                 string colName = reader["COLUMN_NAME"]?.ToString()?.Trim() ?? "";
                                 if (string.IsNullOrEmpty(colName)) continue;
+
+                                // DEPENDS_ON_UDP_ID is read as nullable so the
+                                // unconditional shape (SQL NULL) is preserved.
+                                // Treating SQL NULL as the sentinel 0 was
+                                // ambiguous because some test runs returned 0
+                                // from a legitimately-zero UDP id in another
+                                // codebase; null is the unambiguous "no UDP
+                                // gate" marker that admin's schema commits to.
+                                int? dependsOnUdpId = reader["DEPENDS_ON_UDP_ID"] == DBNull.Value
+                                    ? (int?)null
+                                    : Convert.ToInt32(reader["DEPENDS_ON_UDP_ID"]);
+
+                                // IS_PRIMARY_KEY is admin's 2026-05-14 flag; rows
+                                // authored before that migration store it as NULL
+                                // which we treat as false (the historical default).
+                                bool isPrimaryKey = reader["IS_PRIMARY_KEY"] != DBNull.Value &&
+                                                    Convert.ToBoolean(reader["IS_PRIMARY_KEY"]);
 
                                 _columns.Add(new PredefinedColumn
                                 {
@@ -126,11 +170,11 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     ColumnName = colName,
                                     DataType = reader["DATA_TYPE"]?.ToString()?.Trim() ?? "",
                                     Nullable = reader["NULLABLE"] != DBNull.Value && Convert.ToBoolean(reader["NULLABLE"]),
+                                    IsPrimaryKey = isPrimaryKey,
                                     DefaultValue = reader["DEFAULT_VALUE"] == DBNull.Value ? "" : reader["DEFAULT_VALUE"]?.ToString() ?? "",
-                                    DependsOnUdpId = reader["DEPENDS_ON_UDP_ID"] == DBNull.Value ? 0 : Convert.ToInt32(reader["DEPENDS_ON_UDP_ID"]),
+                                    DependsOnUdpId = dependsOnUdpId,
                                     DependsOnUdpValue = reader["DEPENDS_ON_UDP_VALUE"] == DBNull.Value ? "" : reader["DEPENDS_ON_UDP_VALUE"]?.ToString()?.Trim() ?? "",
                                     DependsOnUdpName = reader["UDP_NAME"] == DBNull.Value ? "" : reader["UDP_NAME"]?.ToString()?.Trim() ?? "",
-                                    DbType = rowDbType,
                                     SortOrder = reader["SORT_ORDER"] == DBNull.Value ? 0 : Convert.ToInt32(reader["SORT_ORDER"])
                                 });
                             }
@@ -157,8 +201,9 @@ namespace EliteSoft.Erwin.AddIn.Services
             {
                 case "POSTGRESQL":
                     return @"SELECT pc.""ID"", pc.""CONFIG_ID"", pc.""COLUMN_NAME"", pc.""DATA_TYPE"", pc.""NULLABLE"",
+                            pc.""IS_PRIMARY_KEY"",
                             pc.""DEFAULT_VALUE"", pc.""DEPENDS_ON_UDP_ID"", pc.""DEPENDS_ON_UDP_VALUE"",
-                            pc.""DB_TYPE"", pc.""SORT_ORDER"",
+                            pc.""SORT_ORDER"",
                             udp.""NAME"" AS ""UDP_NAME""
                             FROM ""PREDEFINED_COLUMN"" pc
                             LEFT JOIN ""MC_UDP_DEFINITION"" udp ON pc.""DEPENDS_ON_UDP_ID"" = udp.""ID""
@@ -167,8 +212,9 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                 case "ORACLE":
                     return @"SELECT pc.ID, pc.CONFIG_ID, pc.COLUMN_NAME, pc.DATA_TYPE, pc.NULLABLE,
+                            pc.IS_PRIMARY_KEY,
                             pc.DEFAULT_VALUE, pc.DEPENDS_ON_UDP_ID, pc.DEPENDS_ON_UDP_VALUE,
-                            pc.DB_TYPE, pc.SORT_ORDER,
+                            pc.SORT_ORDER,
                             udp.NAME AS UDP_NAME
                             FROM PREDEFINED_COLUMN pc
                             LEFT JOIN MC_UDP_DEFINITION udp ON pc.DEPENDS_ON_UDP_ID = udp.ID
@@ -178,8 +224,9 @@ namespace EliteSoft.Erwin.AddIn.Services
                 case "MSSQL":
                 default:
                     return @"SELECT pc.[ID], pc.[CONFIG_ID], pc.[COLUMN_NAME], pc.[DATA_TYPE], pc.[NULLABLE],
+                            pc.[IS_PRIMARY_KEY],
                             pc.[DEFAULT_VALUE], pc.[DEPENDS_ON_UDP_ID], pc.[DEPENDS_ON_UDP_VALUE],
-                            pc.[DB_TYPE], pc.[SORT_ORDER],
+                            pc.[SORT_ORDER],
                             udp.[NAME] AS [UDP_NAME]
                             FROM [dbo].[PREDEFINED_COLUMN] pc
                             LEFT JOIN [dbo].[MC_UDP_DEFINITION] udp ON pc.[DEPENDS_ON_UDP_ID] = udp.[ID]
@@ -215,6 +262,19 @@ namespace EliteSoft.Erwin.AddIn.Services
                 !string.IsNullOrEmpty(c.DependsOnUdpName) &&
                 c.DependsOnUdpName.Equals(udpName, StringComparison.OrdinalIgnoreCase))
                 .OrderBy(c => c.SortOrder);
+        }
+
+        /// <summary>
+        /// Get unconditional predefined columns (no UDP gate). Added to every
+        /// new entity regardless of UDP values - the "always apply" rows
+        /// admin authored 2026-05-14 alongside the existing UDP-conditional
+        /// shape. Result is SortOrder-sorted so deterministic column order
+        /// is preserved across runs.
+        /// </summary>
+        public IEnumerable<PredefinedColumn> GetUnconditional()
+        {
+            if (!_isLoaded) return Enumerable.Empty<PredefinedColumn>();
+            return _columns.Where(c => c.IsUnconditional).OrderBy(c => c.SortOrder);
         }
 
         /// <summary>

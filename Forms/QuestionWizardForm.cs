@@ -37,7 +37,6 @@ namespace EliteSoft.Erwin.AddIn.Forms
         private Panel pnlAnswerArea;
         private Panel pnlFooter;
         private Panel pnlSteps;
-        private Button btnBack;
         private Button btnNext;
         private Label lblSummaryTitle;
         private ComboBox cmbColumnSelect; // For COLUMN_SELECT answer type
@@ -187,23 +186,10 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 Padding = new Padding(16, 8, 16, 8)
             };
 
-            // Back — Secondary style
-            btnBack = new Button
-            {
-                Text = "< Back",
-                Size = new Size(100, 32),
-                FlatStyle = FlatStyle.Flat,
-                BackColor = Color.White,
-                ForeColor = ClrTextPrimary,
-                Font = new Font("Segoe UI", 9.5F),
-                Enabled = false,
-                Cursor = Cursors.Hand,
-                Anchor = AnchorStyles.Right | AnchorStyles.Bottom
-            };
-            btnBack.FlatAppearance.BorderColor = ClrBorder;
-            btnBack.Click += BtnBack_Click;
-
-            // Next — Primary style
+            // Next — Primary style. No Back button: backward navigation removed
+            // 2026-05-13 per UX feedback (one-way wizard, user closes via [X]
+            // to cancel). The previous Back / RemoveSubQuestions / RestoreAnswer
+            // path is gone with it.
             btnNext = new Button
             {
                 Text = "Next >",
@@ -218,11 +204,9 @@ namespace EliteSoft.Erwin.AddIn.Forms
             btnNext.FlatAppearance.BorderSize = 0;
             btnNext.Click += BtnNext_Click;
 
-            // Position buttons — only Back + Next
             btnNext.Location = new Point(pnlFooter.Width - 126, 9);
-            btnBack.Location = new Point(btnNext.Left - 108, 9);
 
-            pnlFooter.Controls.AddRange(new Control[] { btnBack, btnNext });
+            pnlFooter.Controls.Add(btnNext);
 
             // Add controls in reverse dock order
             this.Controls.Add(pnlContent);
@@ -232,11 +216,9 @@ namespace EliteSoft.Erwin.AddIn.Forms
             this.Controls.Add(footerSep);
             this.Controls.Add(pnlFooter);
 
-            // Reposition buttons on resize
             pnlFooter.Resize += (s, e) =>
             {
                 btnNext.Location = new Point(pnlFooter.Width - 126, 9);
-                btnBack.Location = new Point(btnNext.Left - 108, 9);
             };
         }
 
@@ -295,15 +277,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 BuildColumnSelectAnswer(step);
             }
 
-            // Button states
-            btnBack.Enabled = index > 0;
             btnNext.Text = "Next >";
-
-            // Restore previous answer selection if going back
-            if (_answers.ContainsKey(step.Question.Id))
-            {
-                RestoreAnswer(step, _answers[step.Question.Id]);
-            }
 
             UpdateNextButtonState();
         }
@@ -368,7 +342,6 @@ namespace EliteSoft.Erwin.AddIn.Forms
             }
 
             btnNext.Text = "OK";
-            btnBack.Enabled = _steps.Count > 0;
 
             UpdateStepIndicator();
         }
@@ -623,28 +596,6 @@ namespace EliteSoft.Erwin.AddIn.Forms
             pnlAnswerArea.Controls.Add(cmbColumnSelect);
         }
 
-        private void RestoreAnswer(QuestionStep step, string answerValue)
-        {
-            if (step.Question.AnswerType == "COLUMN_SELECT" && cmbColumnSelect != null)
-            {
-                int idx = cmbColumnSelect.Items.IndexOf(answerValue);
-                if (idx >= 0)
-                    cmbColumnSelect.SelectedIndex = idx;
-                else
-                    cmbColumnSelect.Text = answerValue;
-                return;
-            }
-
-            foreach (Control c in pnlAnswerArea.Controls)
-            {
-                if (c is RadioButton rb && rb.Tag?.ToString() == answerValue)
-                {
-                    rb.Checked = true;
-                    break;
-                }
-            }
-        }
-
         private string GetSelectedAnswer()
         {
             // Check COLUMN_SELECT ComboBox first
@@ -720,41 +671,6 @@ namespace EliteSoft.Erwin.AddIn.Forms
             }
         }
 
-        private void BtnBack_Click(object sender, EventArgs e)
-        {
-            if (_currentStepIndex >= _steps.Count)
-            {
-                // From summary, go back to last step
-                ShowStep(_steps.Count - 1);
-                return;
-            }
-
-            if (_currentStepIndex > 0)
-            {
-                // 1. Remove current step's answer and sub-questions (if answered)
-                var currentStep = _steps[_currentStepIndex];
-                if (_answers.ContainsKey(currentStep.Question.Id))
-                {
-                    RemoveSubQuestions(currentStep.Question.Id);
-                    RemoveRulesForAnswer(currentStep.Question.Id);
-                    _answers.Remove(currentStep.Question.Id);
-                }
-
-                // 2. Go to previous step — remove its sub-questions and answer too
-                //    so user can re-answer it (sub-questions will be re-inserted on Next)
-                int prevIdx = _currentStepIndex - 1;
-                var prevStep = _steps[prevIdx];
-                RemoveSubQuestions(prevStep.Question.Id);
-                if (_answers.ContainsKey(prevStep.Question.Id))
-                {
-                    RemoveRulesForAnswer(prevStep.Question.Id);
-                    _answers.Remove(prevStep.Question.Id);
-                }
-
-                ShowStep(prevIdx);
-            }
-        }
-
         #endregion
 
         #region Rule Processing
@@ -777,17 +693,6 @@ namespace EliteSoft.Erwin.AddIn.Forms
                     propertyValue = propertyValue.Replace("{ANSWER}", answerValue);
 
                 PropertyValues[rule.PropertyDefId] = propertyValue;
-            }
-        }
-
-        private void RemoveRulesForAnswer(int questionDefId)
-        {
-            var question = _allQuestions.FirstOrDefault(q => q.Id == questionDefId);
-            if (question?.QuestionRules == null) return;
-
-            foreach (var rule in question.QuestionRules)
-            {
-                PropertyValues.Remove(rule.PropertyDefId);
             }
         }
 
@@ -816,29 +721,6 @@ namespace EliteSoft.Erwin.AddIn.Forms
                     ParentQuestionId = parentQuestionId
                 });
                 insertIndex++;
-            }
-        }
-
-        private void RemoveSubQuestions(int parentQuestionId)
-        {
-            // Remove all steps that were added as sub-questions of this parent
-            var toRemove = _steps
-                .Where(s => s.ParentQuestionId == parentQuestionId)
-                .ToList();
-
-            foreach (var step in toRemove)
-            {
-                // Also remove their sub-questions recursively
-                RemoveSubQuestions(step.Question.Id);
-
-                // Remove answer and rules
-                if (_answers.ContainsKey(step.Question.Id))
-                {
-                    RemoveRulesForAnswer(step.Question.Id);
-                    _answers.Remove(step.Question.Id);
-                }
-
-                _steps.Remove(step);
             }
         }
 

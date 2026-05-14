@@ -44,6 +44,15 @@ namespace EliteSoft.Erwin.AddIn.Services
             _isLoaded = false;
         }
 
+        // Phase-2I (2026-05-13): admin-side flag (CONFIG_PROPERTY.KEY =
+        // 'USE_EXTERNAL_DOMAIN') gating domain validation as a whole. When
+        // unset / false the addin behaves as if no domain rules existed -
+        // ValidateDomain becomes a no-op and the regular glossary path takes
+        // over. Read once at LoadDomainDefs and cached. Mirrors the
+        // USE_TERM_TYPE_MAPPING toggle that GlossaryService already honours.
+        private bool _isExternalEnabled;
+        public bool IsExternalEnabled => _isExternalEnabled;
+
         /// <summary>
         /// Load domain definitions from database using DatabaseService configuration
         /// </summary>
@@ -53,6 +62,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             {
                 _domainDefs.Clear();
                 _lastError = null;
+                _isExternalEnabled = false;
 
                 if (!DatabaseService.Instance.IsConfigured)
                 {
@@ -68,6 +78,25 @@ namespace EliteSoft.Erwin.AddIn.Services
                 using (var connection = DatabaseService.Instance.CreateConnection())
                 {
                     connection.Open();
+
+                    // Read the USE_EXTERNAL_DOMAIN toggle FIRST so we can short
+                    // circuit the rest of the loader when domain validation is
+                    // disabled. We still set _isLoaded=true at the end so the
+                    // service reports "loaded" (callers query IsExternalEnabled
+                    // separately to decide whether to actually validate).
+                    _isExternalEnabled = ReadConfigPropertyBool(connection, dbType, "USE_EXTERNAL_DOMAIN");
+                    System.Diagnostics.Debug.WriteLine($"DomainDefService: USE_EXTERNAL_DOMAIN = {_isExternalEnabled}");
+
+                    if (!_isExternalEnabled)
+                    {
+                        // No point reading DOMAIN_DEF rows the validator will
+                        // ignore. Mark loaded (= "we've completed initialization")
+                        // and bail. ValidateDomain returns early on
+                        // IsExternalEnabled=false.
+                        _isLoaded = true;
+                        System.Diagnostics.Debug.WriteLine("DomainDefService: external domain disabled, skipping DOMAIN_DEF read");
+                        return true;
+                    }
 
                     using (var command = DatabaseService.Instance.CreateCommand(query, connection))
                     {
@@ -106,6 +135,66 @@ namespace EliteSoft.Erwin.AddIn.Services
                 _lastError = ex.Message;
                 _isLoaded = false;
                 System.Diagnostics.Debug.WriteLine($"DomainDefService.LoadDomainDefs error: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Read a boolean CONFIG_PROPERTY value scoped to the active config.
+        /// Mirrors GlossaryService.ReadModelPropertyBool - same convention.
+        /// Returns false when the row is missing or the value is anything
+        /// other than 'Yes' / 'True' / '1'.
+        /// </summary>
+        private bool ReadConfigPropertyBool(System.Data.Common.DbConnection conn, string repoDbType, string key)
+        {
+            try
+            {
+                var ctx = ConfigContextService.Instance;
+                if (!ctx.IsInitialized) return false;
+
+                string query;
+                switch (repoDbType?.ToUpper())
+                {
+                    case "POSTGRESQL":
+                        query = @"SELECT ""VALUE"" FROM ""CONFIG_PROPERTY""
+                                  WHERE ""KEY"" = @key AND ""CONFIG_ID"" = @cfgId
+                                  LIMIT 1";
+                        break;
+                    case "ORACLE":
+                        query = @"SELECT VALUE FROM CONFIG_PROPERTY
+                                  WHERE KEY = :key AND CONFIG_ID = :cfgId
+                                  FETCH FIRST 1 ROWS ONLY";
+                        break;
+                    case "MSSQL":
+                    default:
+                        query = @"SELECT TOP 1 [VALUE] FROM [dbo].[CONFIG_PROPERTY]
+                                  WHERE [KEY] = @key AND [CONFIG_ID] = @cfgId";
+                        break;
+                }
+
+                using (var cmd = DatabaseService.Instance.CreateCommand(query, conn))
+                {
+                    var pKey = cmd.CreateParameter();
+                    pKey.ParameterName = repoDbType == "ORACLE" ? ":key" : "@key";
+                    pKey.Value = key;
+                    cmd.Parameters.Add(pKey);
+
+                    var pCfg = cmd.CreateParameter();
+                    pCfg.ParameterName = repoDbType == "ORACLE" ? ":cfgId" : "@cfgId";
+                    pCfg.Value = ctx.ActiveConfigId;
+                    cmd.Parameters.Add(pCfg);
+
+                    var result = cmd.ExecuteScalar();
+                    if (result == null || result == DBNull.Value) return false;
+                    string value = result.ToString().Trim();
+                    return value.Equals("Yes", StringComparison.OrdinalIgnoreCase)
+                        || value.Equals("True", StringComparison.OrdinalIgnoreCase)
+                        || value == "1";
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"DomainDefService: ReadConfigPropertyBool('{key}') error: {ex.Message}");
                 return false;
             }
         }
