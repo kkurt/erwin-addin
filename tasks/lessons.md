@@ -4,6 +4,105 @@ A running log of corrections and non-obvious findings that future sessions
 should not have to rediscover. Each entry is a short rule, the reason, and
 how to apply it.
 
+## 2026-05-16: SCAPI dynamic property reads are 0.85-3ms each - filter walks aggressively
+
+**Rule:** when walking a `mmObjects.Collect(parent, classKey)` result, only
+read per-item properties (`pt.Properties("tag_*").Value`) on items you
+actually care about. Iterating a 1500-entry collection and reading 4
+properties on every item costs ~18 seconds via COM dynamic dispatch. Reading
+only `pt.Name` to filter, then reading details on the small matching
+subset, drops the cost to ~1.3 seconds (still mostly the Name read overhead).
+
+**Why:** verified 2026-05-16 against a 1517-entry metamodel during the
+UDP sync feature. Before optimisation:
+```
+[01:04:35.224] UdpSyncEngine.FetchSnapshot: 5 definition(s) loaded
+[01:04:53.997] UdpSyncEngine.WalkModelUdps: 1517 Property_Type entries
+[01:04:54.010] <<< FetchSnapshot took 18795ms
+```
+After `WalkModelUdps(namesOfInterest)`:
+```
+[01:10:36.496] FetchSnapshot: 5 definition(s) loaded
+[01:10:37.791] WalkModelUdps: 5 entries read (seen=1517, filter=5)
+[01:10:37.800] <<< FetchSnapshot took 1308ms
+```
+14x speedup. Same Collect pass, same number of items walked, but only 5x4
+property reads instead of 1517x4. The walking-only-for-Name cost is the
+floor for SCAPI dynamic-dispatch + COM marshalling on this codebase.
+
+**How to apply:** see
+[UdpSyncEngine.WalkModelUdps](../Services/UdpSyncEngine.cs) and its caller
+[ModelConfigForm.RunUdpSyncIfNeeded](../ModelConfigForm.cs). Any future
+metamodel-spanning code that needs only a subset of Property_Types must
+take a filter parameter. If two consumers need the same walk, share the
+walk result through a struct return (see `ModelWalkResult`) rather than
+calling Collect twice.
+
+## 2026-05-16: erwin has no native Boolean UDP - normalize to List at the snapshot boundary
+
+**Rule:** admin's `Boolean` UDP type does not map to any `tag_Udp_Data_Type`
+value. Mapping it to Text (2) loses the dropdown UX users expect. The
+convention is to surface admin Booleans as `List` with two options
+`True,False`. Do the rewrite at the snapshot boundary
+(`UdpSyncEngine.NormalizeBooleanToList`) so every downstream layer
+(ComputeDiff, Apply, the dialog) stays Boolean-unaware.
+
+**Why:** verified 2026-05-16 with `KVKK` and `PCIDSS` UDPs defined as
+`Boolean` in admin's UI. Before the fix, the sync dialog said
+"Type: Integer -> Text" and Apply wrote `tag_Udp_Data_Type=2` to the
+metamodel; Column Editor showed a free TextBox instead of a dropdown.
+After normalisation the dialog says "Type: Integer -> List", Apply writes
+`tag_Udp_Data_Type=6` + `tag_Udp_Values_List="True,False"`, and the
+Column Editor renders a dropdown.
+
+**How to apply:** any future admin UDP type that does not map to erwin's
+metamodel datatype set (1=Integer / 2=Text / 3=Date / 4=Command / 5=Real
+/ 6=List) needs the same boundary rewrite. The normaliser is per-row and
+runs unconditionally - just add the case.
+
+## 2026-05-16: Cancel-no-state is fine - users get the same diff next open
+
+**Rule:** for sync features that show a "Apply or Cancel" prompt every
+model open, do NOT store last-seen state on the model side. Cancel
+becomes "do nothing"; the next open recomputes the same diff and shows
+the dialog again. Stateless cancel is exactly what users want for
+indecisive cases ("I will look at this later") and removes an entire
+class of bugs (last-seen drift, CONFIG_ID rebind, fingerprint stale).
+
+**Why:** the original UDP sync plan had a version-counter / fingerprint
+mechanism for "I have seen this version, do not bother me again". Two
+review iterations with the user (2026-05-15) showed:
+1. The fingerprint did not buy any work-skipping - both the admin fetch
+   and the model walk happened anyway as part of other connect flow.
+2. The cancel-but-pretend-I-applied UX was rejected: users wanted the
+   dialog to keep reminding them until they actually decided.
+3. Cancel-with-state added 5 edge cases (CONFIG_ID switch invalidates,
+   fingerprint hash collisions, where to store, multi-model semantics)
+   for no real benefit.
+
+**How to apply:** when in doubt, prefer stateless. Make sure the
+diff/snapshot pipeline is cheap enough that recomputing on every open
+is acceptable - if it is not, fix the cost (see filtered walk above),
+do not bolt on caching.
+
+## 2026-05-16: SCAPI Property_Type.Name iteration is the only fast way to find a UDP
+
+**Rule:** there is no `mmObjects.GetByName("Entity.Physical.OWNER")`
+direct lookup on metamodel level. To find a Property_Type by its
+canonical name, you walk `mmObjects.Collect(mmRoot, "Property_Type")`
+and compare `pt.Name`. ~1.3 seconds for 1500 entries is the floor.
+
+**Why:** verified 2026-05-16 looking for an index-by-name short-circuit
+to drop the WalkModelUdps cost below 1.3 s. SCAPI Find / GetByName /
+LookupByName methods do not exist on metamodel sessions in r10.10. The
+only public access pattern is Collect + iterate.
+
+**How to apply:** budget for the per-walk cost up front. Do not promise
+"this will be milliseconds" if you have to find Property_Types by name.
+The filtered walk is the practical optimisation; sub-second access
+needs an architectural change (e.g. cache Property_Type ObjectIds at
+first walk and reuse via the COM-level `GetById` if that exists).
+
 ## 2026-05-14: Tab-switch matching - use Mart locator stem, never pu.Name
 
 **Rule:** when picking which PU the user just tabbed to among multiple open
