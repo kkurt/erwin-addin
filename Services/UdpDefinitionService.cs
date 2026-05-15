@@ -234,13 +234,17 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         private string GetDefinitionQuery(string dbType, bool filterByType)
         {
+            // Hide soft-deleted rows (IS_DELETED=1) from the runtime defaults /
+            // validation flow. UdpSyncEngine fetches its own snapshot WITHOUT this
+            // filter so that admin tombstones surface as Delete entries in the diff
+            // popup. See plan: docs/ARCHITECTURE.md (UDP sync).
             string whereClause;
             switch (dbType?.ToUpper())
             {
                 case "POSTGRESQL":
                     whereClause = filterByType
-                        ? @"WHERE d.""CONFIG_ID"" = @cfgId AND d.""OBJECT_TYPE"" = @objectType"
-                        : @"WHERE d.""CONFIG_ID"" = @cfgId";
+                        ? @"WHERE d.""CONFIG_ID"" = @cfgId AND d.""IS_DELETED"" = false AND d.""OBJECT_TYPE"" = @objectType"
+                        : @"WHERE d.""CONFIG_ID"" = @cfgId AND d.""IS_DELETED"" = false";
                     return $@"SELECT d.""ID"" AS ""DEF_ID"", d.""NAME"", d.""DESCRIPTION"", d.""OBJECT_TYPE"", d.""UDP_TYPE"",
                             d.""DEFAULT_VALUE"", d.""IS_REQUIRED"", d.""IS_LOCKED"", d.""MIN_VALUE"", d.""MAX_VALUE"", d.""MAX_LENGTH"",
                             d.""VALIDATION_OPERATOR"", d.""VALIDATION_VALUE"", d.""ERROR_MESSAGE"", d.""APPLY_ON"", d.""SORT_ORDER"",
@@ -254,8 +258,8 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                 case "ORACLE":
                     whereClause = filterByType
-                        ? "WHERE d.CONFIG_ID = :cfgId AND d.OBJECT_TYPE = :objectType"
-                        : "WHERE d.CONFIG_ID = :cfgId";
+                        ? "WHERE d.CONFIG_ID = :cfgId AND d.IS_DELETED = 0 AND d.OBJECT_TYPE = :objectType"
+                        : "WHERE d.CONFIG_ID = :cfgId AND d.IS_DELETED = 0";
                     return $@"SELECT d.ID AS DEF_ID, d.NAME, d.DESCRIPTION, d.OBJECT_TYPE, d.UDP_TYPE,
                             d.DEFAULT_VALUE, d.IS_REQUIRED, d.IS_LOCKED, d.MIN_VALUE, d.MAX_VALUE, d.MAX_LENGTH,
                             d.VALIDATION_OPERATOR, d.VALIDATION_VALUE, d.ERROR_MESSAGE, d.APPLY_ON, d.SORT_ORDER,
@@ -270,8 +274,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                 case "MSSQL":
                 default:
                     whereClause = filterByType
-                        ? "WHERE d.[CONFIG_ID] = @cfgId AND d.[OBJECT_TYPE] = @objectType"
-                        : "WHERE d.[CONFIG_ID] = @cfgId";
+                        ? "WHERE d.[CONFIG_ID] = @cfgId AND d.[IS_DELETED] = 0 AND d.[OBJECT_TYPE] = @objectType"
+                        : "WHERE d.[CONFIG_ID] = @cfgId AND d.[IS_DELETED] = 0";
                     return $@"SELECT d.[ID] AS [DEF_ID], d.[NAME], d.[DESCRIPTION], d.[OBJECT_TYPE], d.[UDP_TYPE],
                             d.[DEFAULT_VALUE], d.[IS_REQUIRED], d.[IS_LOCKED], d.[MIN_VALUE], d.[MAX_VALUE], d.[MAX_LENGTH],
                             d.[VALIDATION_OPERATOR], d.[VALIDATION_VALUE], d.[ERROR_MESSAGE], d.[APPLY_ON], d.[SORT_ORDER],
