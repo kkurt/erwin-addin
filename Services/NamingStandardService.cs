@@ -283,6 +283,24 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// Distinct PROPERTY_CODE values that have at least one active rule
+        /// for the given object type. Used by the new-entity validation path
+        /// in <c>TableTypeMonitorService</c> so it can iterate every property
+        /// the admin defined a rule against, not just Physical_Name.
+        /// Returns empty when nothing is loaded or no rules target the type.
+        /// </summary>
+        public IReadOnlyList<string> GetPropertyCodes(string objectType)
+        {
+            if (string.IsNullOrEmpty(objectType)) return Array.Empty<string>();
+            return _byKey
+                .Where(kv => string.Equals(kv.Key.objectType, objectType, StringComparison.OrdinalIgnoreCase))
+                .Select(kv => kv.Key.propertyCode)
+                .Where(pc => !string.IsNullOrEmpty(pc))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        /// <summary>
         /// Distinct UDP names referenced by any active rule's
         /// <c>DEPENDS_ON_UDP_NAME</c> condition. Used by the live Entity
         /// Editor watcher to know which UDPs to snapshot/diff each tick;

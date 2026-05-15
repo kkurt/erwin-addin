@@ -52,7 +52,13 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             var results = new List<NamingValidationResult>();
 
-            if (string.IsNullOrEmpty(objectName)) return results;
+            // Empty string is a legitimate value to validate (e.g. admin's
+            // "Length > 0" rule on Table.Owner should fire when the user
+            // leaves Owner blank on a new table). Pre-2026-05-16 the
+            // engine skipped empty here and the missing-required-field
+            // bug went undetected. Null still skips - that signals a
+            // programmer error (no value to compare against).
+            objectName ??= "";
             if (!NamingStandardService.Instance.IsLoaded) return results;
 
             var rules = NamingStandardService.Instance.GetByObjectTypeAndProperty(objectType, propertyCode);

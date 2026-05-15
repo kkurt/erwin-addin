@@ -1112,6 +1112,36 @@ namespace EliteSoft.Erwin.AddIn.Services
             var results = NamingValidationEngine.ValidateObjectName(objectType, nameToValidate, scapiBoxed);
             var failures = results.Where(r => !r.IsValid).ToList();
 
+            // Step 3b (2026-05-16): the admin can author rules on any
+            // PROPERTY_DEF, not just Physical_Name. Iterate every property
+            // code that has rules for this object type, read the live
+            // value, and accumulate failures. Without this, rules on
+            // Table.Owner / Column.Definition / etc. loaded fine but
+            // never fired against an actual entity.
+            if (scapiObject != null)
+            {
+                foreach (var propertyCode in NamingStandardService.Instance.GetPropertyCodes(objectType))
+                {
+                    if (string.Equals(propertyCode, "Physical_Name", StringComparison.OrdinalIgnoreCase))
+                        continue; // already covered by the Physical_Name run above
+
+                    string propValue;
+                    try
+                    {
+                        propValue = scapiObject.Properties(propertyCode)?.Value?.ToString() ?? "";
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"Naming standard: failed to read {objectType}.{propertyCode}: {ex.Message}");
+                        continue;
+                    }
+
+                    var extraResults = NamingValidationEngine.ValidateObjectName(
+                        objectType, propValue, scapiBoxed, propertyCode);
+                    failures.AddRange(extraResults.Where(r => !r.IsValid));
+                }
+            }
+
             if (failures.Count > 0)
             {
                 foreach (var f in failures)
@@ -1146,8 +1176,15 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // Only renames when we have a scapiObject to write back to
                 // (the live-fire paths always pass one; static external callers
                 // that pass null fall through to the popup as before).
+                // Only Physical_Name failures can trigger the PLEASE_CHANGE_IT
+                // auto-rename: the placeholder makes sense as a name override
+                // but is meaningless for other properties (Owner, Definition,
+                // ...). Non-Physical_Name AUTO_APPLY failures surface in the
+                // popup only - the user must fix them manually.
                 bool anyAutoApplyFailing = scapiObject != null
-                    && failures.Any(f => f.Rule != null && f.Rule.AutoApply);
+                    && failures.Any(f => f.Rule != null
+                                         && f.Rule.AutoApply
+                                         && string.Equals(f.Rule.PropertyCode, "Physical_Name", StringComparison.OrdinalIgnoreCase));
 
                 // Phase-2H popup-then-rename ordering (2026-05-13): show the
                 // violation message BEFORE rewriting the name, so the user
