@@ -55,6 +55,15 @@ namespace EliteSoft.Erwin.AddIn
         private bool _inDegradedMode;
         private string _lastDegradedLocator;
 
+        // Race guard for the UDP sync dialog (Phase 5, 2026-05-16). The
+        // dialog is opened via BeginInvoke from InitializeModelServices so
+        // it does not deadlock Form.Load; a fast model switch could queue
+        // a second BeginInvoke while the first dialog is still up. Without
+        // this flag two dialogs stack and the second one resolves against
+        // a stale UdpSyncEngine. Set true around the BeginInvoke-posted
+        // ShowDialog scope; the inner finally always clears it.
+        private bool _udpSyncDialogOpen;
+
         // Connected-mode locator tracking (2026-05-14). Mirror of
         // _lastDegradedLocator for the success path: set after ConnectToModel
         // finishes a non-degraded connect, cleared on disconnect / session
@@ -118,10 +127,13 @@ namespace EliteSoft.Erwin.AddIn
         private UdpRuntimeService _udpRuntimeService;
         private DependencySetRuntimeService _dependencySetService;
 
-        // Metamodel Property_Type names collected by EnsureAllUdpsExist; reused
-        // by UdpRuntimeService.Initialize so we don't pay for the same ~700ms
-        // metamodel walk twice during a single connect cycle. Reset on every
-        // connect so a fresh walk happens after model switches.
+        // Metamodel Property_Type name set collected during the UDP sync
+        // engine's WalkModelUdps pass (2026-05-16) and reused by
+        // ValidationCoordinator.StartMonitoring so the connect path walks
+        // the ~1500-entry collection once, not twice. Null when sync was
+        // skipped (DB offline / degraded mode); the coordinator then walks
+        // metamodel itself as a fallback. Reset on every connect so a fresh
+        // walk happens after model switches.
         private HashSet<string> _cachedPropertyTypeNames;
 
         // State tracking
@@ -1156,8 +1168,16 @@ namespace EliteSoft.Erwin.AddIn
                 }
             });
 
-            using (AddinLogger.BeginScope("EnsureAllUdpsExist"))
-                EnsureAllUdpsExist();
+            // EnsureAllUdpsExist used to walk Property_Type here just to
+            // populate _cachedPropertyTypeNames. After the 2026-05-16
+            // refactor that responsibility moved into UdpSyncEngine.WalkModelUdps
+            // which now returns both the filtered model snapshot AND the
+            // full names set in a single walk - saving ~2.2 s on big
+            // metamodels. When sync runs (normal mode) the cache is filled
+            // by RunUdpSyncIfNeeded below. When sync is skipped (DB
+            // offline, degraded mode) the cache stays null and
+            // ValidationCoordinator falls back to its own walk via
+            // InitializeModelUdpTracking.
 
             _validationService = new ColumnValidationService(_session);
             btnValidateAll.Enabled = true;
@@ -1183,12 +1203,25 @@ namespace EliteSoft.Erwin.AddIn
                 }
             }
 
+            // Admin -> Model UDP sync (Phase 5, 2026-05-16). Runs BEFORE
+            // UdpRuntime.Initialize so the metamodel is consistent before
+            // any downstream value-level consumer (ApplyDefaults,
+            // ValidationCoordinator) reads it. The sync engine computes the
+            // diff in-line; if it finds anything, the user-facing dialog is
+            // deferred via BeginInvoke (same pattern as ShowConfigWarningDialog
+            // at line ~1066 - direct ShowDialog from Form.Load deadlocks the
+            // form's paint cycle, lesson 2026-05-07). Errors (DB offline,
+            // metamodel session failure, etc.) skip the sync and surface
+            // via AddConnectWarning so the General tab Warnings row tells
+            // the user why their definitions did not refresh.
+            RunUdpSyncIfNeeded();
+
             _udpRuntimeService = new UdpRuntimeService(_session, _scapi, _currentModel);
             _udpRuntimeService.OnLog += Log;
             _udpRuntimeService.SetDependencySetService(_dependencySetService);
             using (AddinLogger.BeginScope("UdpRuntimeService.Initialize"))
             {
-                if (_udpRuntimeService.Initialize(_cachedPropertyTypeNames))
+                if (_udpRuntimeService.Initialize())
                 {
                     var objectTypes = string.Join(", ", UdpDefinitionService.Instance.GetLoadedObjectTypes());
                     Log($"UDP runtime initialized: {UdpDefinitionService.Instance.Count} definitions [{objectTypes}]");
@@ -1243,6 +1276,162 @@ namespace EliteSoft.Erwin.AddIn
             // Save baseline DDL at connect time (FEModel_DDL does NOT corrupt PU)
             // Baseline DDL removed - DdlHelper fetches any version from Mart on demand
 
+        }
+
+        /// <summary>
+        /// Compute the admin-vs-model UDP diff and, when non-empty, deferred-
+        /// show the <see cref="UdpSyncDialog"/> for user consent. Errors are
+        /// surfaced via <see cref="AddConnectWarning"/> and DO NOT block model
+        /// load - the model still opens, just without UDP definition updates.
+        ///
+        /// Synchronous within <see cref="InitializeModelServices"/> for the
+        /// diff calculation; only the dialog ShowDialog + Apply path is
+        /// deferred via BeginInvoke. This matches the existing
+        /// <c>ShowConfigWarningDialog</c> pattern (see line ~1066) where
+        /// modal interaction during Form.Load deadlocks form painting.
+        /// </summary>
+        private void RunUdpSyncIfNeeded()
+        {
+            var ctx = ConfigContextService.Instance;
+            if (!ctx.IsInitialized || ctx.ActiveConfigId <= 0)
+            {
+                Log("UDP sync skipped: no active CONFIG");
+                return;
+            }
+
+            UdpSyncEngine syncEngine;
+            UdpDiff diff;
+            try
+            {
+                syncEngine = new UdpSyncEngine(_session, _scapi, _currentModel, ctx.ActiveConfigId);
+                syncEngine.OnLog += Log;
+                using (AddinLogger.BeginScope("UdpSyncEngine.FetchSnapshot"))
+                {
+                    var snapshot = syncEngine.FetchSnapshot();
+                    // Filter the model walk to admin-defined names only.
+                    // Erwin models can hold ~1500 Property_Type entries while
+                    // admin defines a handful; reading 4 tag_* properties on
+                    // every entry costs ~18 s via COM marshalling. Filtering
+                    // drops detail reads to milliseconds (verified 2026-05-16).
+                    var expected = UdpSyncEngine.ExpectedFullNames(snapshot);
+                    var walk = syncEngine.WalkModelUdps(expected);
+
+                    // Share the all-names set with the connect-level cache so
+                    // ValidationCoordinator does not redo the walk. Saves the
+                    // 2.2 s EnsureAllUdpsExist pass we used to run separately.
+                    _cachedPropertyTypeNames = walk.AllNames;
+
+                    diff = UdpSyncEngine.ComputeDiff(snapshot, walk.Map);
+                    Log($"UDP sync diff: creates={diff.Creates.Count}, updates={diff.Updates.Count}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"UDP sync skipped: {ex.Message}");
+                AddConnectWarning($"UDP sync skipped: {ex.Message}");
+                return;
+            }
+
+            if (diff.IsEmpty)
+            {
+                Log("UDP defs already in sync");
+                return;
+            }
+
+            if (_udpSyncDialogOpen)
+            {
+                // Race guard: a previous BeginInvoke for an earlier connect
+                // cycle has a dialog open right now. Drop this trigger so
+                // the user does not see two stacked dialogs against stale
+                // engines. The earlier dialog runs to completion against
+                // its own engine; on the NEXT model open the diff will be
+                // recomputed fresh against current state.
+                Log("UDP sync dialog already open - skipping this trigger (race guard)");
+                return;
+            }
+
+            // Capture the engine + diff in locals so the BeginInvoke closure
+            // sees the same instances even if a subsequent connect cycle
+            // overwrites the field-level ones.
+            var engineLocal = syncEngine;
+            var diffLocal = diff;
+            try
+            {
+                BeginInvoke(new Action(() =>
+                {
+                    if (IsDisposed) return;
+                    _udpSyncDialogOpen = true;
+                    try
+                    {
+                        bool apply = UdpSyncDialog.ShowFor(diffLocal, this);
+                        if (!apply)
+                        {
+                            Log($"UDP sync cancelled by user (creates={diffLocal.Creates.Count}, updates={diffLocal.Updates.Count})");
+                            return;
+                        }
+
+                        // Apply blocks the UI thread for the duration of the
+                        // metamodel transaction (SCAPI calls are STA-bound).
+                        // Show a busy overlay first + DoEvents so the user
+                        // sees "please wait" instead of an apparently-frozen
+                        // application. Same pattern as Reload Config.
+                        Form overlay = null;
+                        ApplyResult result;
+                        try
+                        {
+                            overlay = ShowBusyOverlay("Applying config UDP definitions to the model, please wait...");
+                            Application.DoEvents();
+                            result = engineLocal.Apply(diffLocal);
+                        }
+                        finally
+                        {
+                            if (overlay != null && !overlay.IsDisposed)
+                            {
+                                try { overlay.Close(); } catch (Exception ex) { Log($"UDP sync overlay close failed: {ex.Message}"); }
+                            }
+                        }
+
+                        if (result.Success)
+                        {
+                            Log($"UDP sync applied: created={result.CreatedCount}, updated={result.UpdatedCount}");
+                        }
+                        else
+                        {
+                            Log($"UDP sync apply FAILED: {result.Error}");
+                            AddConnectWarning($"UDP sync apply failed: {result.Error}");
+                        }
+
+                        // Cascade refresh AFTER apply so the dependency-set
+                        // list values reflect any UDPs the user just
+                        // accepted from the dialog. Independent of result
+                        // - even on failure we want the runtime cascade to
+                        // re-run against whatever made it to the metamodel.
+                        try
+                        {
+                            if (_udpRuntimeService != null && _udpRuntimeService.IsInitialized)
+                                _udpRuntimeService.UpdateDependencySetListValues();
+                        }
+                        catch (Exception ex)
+                        {
+                            Log($"UDP sync post-apply cascade refresh failed: {ex.Message}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"UdpSyncDialog flow error: {ex.Message}");
+                        AddConnectWarning($"UDP sync dialog error: {ex.Message}");
+                    }
+                    finally
+                    {
+                        _udpSyncDialogOpen = false;
+                    }
+                }));
+            }
+            catch (Exception ex)
+            {
+                Log($"UdpSync BeginInvoke failed: {ex.Message}");
+                AddConnectWarning($"UDP sync deferral failed: {ex.Message}");
+            }
         }
 
 
@@ -2529,64 +2718,6 @@ namespace EliteSoft.Erwin.AddIn
             catch (Exception ex)
             {
                 Log($"InitializePropertyApplicator error: {ex.Message}");
-            }
-        }
-
-        /// <summary>
-        /// Ensures all UDPs exist using a SINGLE metamodel session.
-        /// Creates TABLE_TYPE (Entity, List) and OWNER/KVKK/PCIDSS/CLASSIFICATION (Attribute, Text).
-        /// </summary>
-        private void EnsureAllUdpsExist()
-        {
-            dynamic metamodelSession = null;
-            try
-            {
-                metamodelSession = _scapi.Sessions.Add();
-                metamodelSession.Open(_currentModel, 1); // SCD_SL_M1 = Metamodel level
-
-                dynamic mmObjects = metamodelSession.ModelObjects;
-                dynamic mmRoot = mmObjects.Root;
-
-                // Collect all existing Property_Type names in one pass.
-                // Stored on a field so UdpRuntimeService can reuse it instead of
-                // walking the same ~1500-entry metamodel collection again.
-                var existingUdps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                try
-                {
-                    dynamic propertyTypes = mmObjects.Collect(mmRoot, "Property_Type");
-                    foreach (dynamic pt in propertyTypes)
-                    {
-                        if (pt == null) continue;
-                        try { existingUdps.Add(pt.Name ?? ""); } catch { }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Log($"Metamodel Property_Type enumeration failed: {ex.Message}");
-                }
-
-                _cachedPropertyTypeNames = existingUdps;
-                Log($"Found {existingUdps.Count} existing Property_Type entries");
-
-                // TABLE_TYPE UDP is now managed by UdpRuntimeService (MC_UDP_DEFINITION).
-                // (MODEL_PATH UDP creation removed 2026-05-07 - the UDP value was set by
-                // a separate SetModelPathValue path that cost ~700-900 ms per startup
-                // probing 19 PU/root/session properties via dynamic dispatch, and
-                // downstream consumers - PropertyApplicator, DdlGenerationService -
-                // had already been refactored to derive their values without it.)
-
-                Log("All UDPs ensured");
-            }
-            catch (Exception ex)
-            {
-                Log($"EnsureAllUdpsExist error: {ex.Message}");
-            }
-            finally
-            {
-                if (metamodelSession != null)
-                {
-                    try { metamodelSession.Close(); } catch { }
-                }
             }
         }
 

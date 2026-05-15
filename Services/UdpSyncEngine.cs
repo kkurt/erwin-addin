@@ -7,10 +7,11 @@ namespace EliteSoft.Erwin.AddIn.Services
 {
     /// <summary>
     /// Snapshot of a single UDP definition as it lives in the admin DB
-    /// (MC_UDP_DEFINITION + MC_UDP_LIST_OPTION). Unlike
-    /// <see cref="UdpDefinitionRuntime"/>, this snapshot includes tombstoned
-    /// (IS_DELETED=1) rows so that <see cref="UdpSyncEngine.ComputeDiff"/> can
-    /// emit Delete entries when the admin removes a UDP.
+    /// (MC_UDP_DEFINITION + MC_UDP_LIST_OPTION). Admin-side removal is a
+    /// plain DELETE on the row - no tombstone column - so a missing row in
+    /// the snapshot does NOT mean "user should remove this from the model".
+    /// See <see cref="UdpSyncEngine.ComputeDiff"/> for the orphan-untouched
+    /// rule.
     /// </summary>
     public class UdpDefinitionSnapshot
     {
@@ -20,7 +21,6 @@ namespace EliteSoft.Erwin.AddIn.Services
         public string UdpType { get; set; } = "";
         public string DefaultValue { get; set; } = "";
         public string Description { get; set; } = "";
-        public bool IsDeleted { get; set; }
         public List<UdpListOptionSnapshot> ListOptions { get; set; } = new List<UdpListOptionSnapshot>();
     }
 
@@ -71,7 +71,6 @@ namespace EliteSoft.Erwin.AddIn.Services
     {
         Create,
         Update,
-        Delete
     }
 
     /// <summary>Per-field change flags inside an Update entry.</summary>
@@ -86,9 +85,9 @@ namespace EliteSoft.Erwin.AddIn.Services
     }
 
     /// <summary>
-    /// One row of the diff: a single Create / Update / Delete operation.
-    /// Carries enough context for the dialog to render a human-readable
-    /// description and for the Apply path to mutate the metamodel.
+    /// One row of the diff: a single Create or Update operation. Carries
+    /// enough context for the dialog to render a human-readable description
+    /// and for the Apply path to mutate the metamodel.
     /// </summary>
     public class UdpDiffEntry
     {
@@ -103,47 +102,60 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <summary>Admin's object type string, e.g. "Table", "Column".</summary>
         public string ObjectType { get; set; } = "";
 
-        /// <summary>The admin row driving Create / Update. Null only for orphan-Delete (currently not emitted).</summary>
+        /// <summary>The admin row driving Create / Update.</summary>
         public UdpDefinitionSnapshot? AdminUdp { get; set; }
 
-        /// <summary>The existing model UDP being updated/deleted. Null for Create.</summary>
+        /// <summary>The existing model UDP being updated. Null for Create.</summary>
         public ModelUdpSnapshot? ExistingUdp { get; set; }
 
         /// <summary>Which fields changed (Update only).</summary>
         public UdpUpdateChanges Changes { get; set; }
 
-        /// <summary>
-        /// True when an Update requires delete+recreate because the type change
-        /// is not in-place compatible. Carries the "values will be lost" warning
-        /// to the dialog. Conservative default during Phase 1: any TypeChange
-        /// sets this true (see <see cref="ErwinSupportsInPlaceTypeChange"/>).
-        /// </summary>
-        public bool RecreatesValues { get; set; }
-
         /// <summary>One-line human-readable summary for the dialog row.</summary>
         public string Details { get; set; } = "";
     }
 
-    /// <summary>Result of a diff computation.</summary>
+    /// <summary>
+    /// Outcome of <see cref="UdpSyncEngine.Apply"/>. Carries success flag,
+    /// per-action counts (so caller can log "created=N, updated=M"), and an
+    /// error message when the transaction had to roll back.
+    /// </summary>
+    public class ApplyResult
+    {
+        public bool Success { get; set; }
+        public int CreatedCount { get; set; }
+        public int UpdatedCount { get; set; }
+        public string Error { get; set; } = "";
+
+        public static ApplyResult Ok(int created, int updated) =>
+            new ApplyResult { Success = true, CreatedCount = created, UpdatedCount = updated };
+
+        public static ApplyResult Fail(string error) =>
+            new ApplyResult { Success = false, Error = error };
+    }
+
+    /// <summary>Result of a diff computation. Holds Create + Update entries
+    /// only - the sync feature never emits Delete (see <see cref="UdpSyncEngine"/>).</summary>
     public class UdpDiff
     {
         public List<UdpDiffEntry> Creates { get; set; } = new List<UdpDiffEntry>();
         public List<UdpDiffEntry> Updates { get; set; } = new List<UdpDiffEntry>();
-        public List<UdpDiffEntry> Deletes { get; set; } = new List<UdpDiffEntry>();
 
-        public int TotalCount => Creates.Count + Updates.Count + Deletes.Count;
+        public int TotalCount => Creates.Count + Updates.Count;
         public bool IsEmpty => TotalCount == 0;
-        public IEnumerable<UdpDiffEntry> AllEntries => Creates.Concat(Updates).Concat(Deletes);
+        public IEnumerable<UdpDiffEntry> AllEntries => Creates.Concat(Updates);
     }
 
     /// <summary>
     /// Sync orchestrator for admin UDP definitions vs. the active erwin model.
-    /// Three responsibilities:
-    ///   1. <see cref="FetchSnapshot"/> - read admin DB (includes IS_DELETED rows).
+    /// Four responsibilities:
+    ///   1. <see cref="FetchSnapshot"/> - read admin DB.
     ///   2. <see cref="WalkModelUdps"/> - walk metamodel Property_Type entries.
-    ///   3. <see cref="ComputeDiff"/> (static, pure) - produce a Create/Update/Delete list.
-    /// Apply path (metamodel mutation) lands in Phase 3 - this class only
-    /// observes the model in Phase 1.
+    ///   3. <see cref="ComputeDiff"/> (static, pure) - produce Create + Update entries.
+    ///   4. <see cref="Apply"/> - mutate the metamodel inside a single transaction.
+    /// Note: Delete entries are never emitted - admin schema has no tombstone
+    /// column and silent removal would risk destroying user-authored UDPs.
+    /// Users delete UDPs themselves through erwin's UDP editor.
     /// </summary>
     public class UdpSyncEngine
     {
@@ -216,28 +228,22 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
         }
 
-        /// <summary>
-        /// Whether erwin r10.10 supports an in-place change between two
-        /// metamodel datatype ids. Phase 1 always returns false - every type
-        /// change is treated as delete+recreate (with the values-lost warning
-        /// in the dialog). The Phase 3 spike will widen this once specific
-        /// transitions are empirically verified.
-        /// </summary>
-        public static bool ErwinSupportsInPlaceTypeChange(int fromTypeId, int toTypeId)
-        {
-            if (fromTypeId == toTypeId) return true;
-            return false;
-        }
-
         #endregion
 
         #region Snapshot fetch (admin DB)
 
         /// <summary>
-        /// Read every MC_UDP_DEFINITION row for the bound config, INCLUDING
-        /// soft-deleted rows. Joined with MC_UDP_LIST_OPTION so List UDPs come
-        /// back with their options. Returns an empty list (and logs) when the
-        /// DB is not configured.
+        /// Read every MC_UDP_DEFINITION row for the bound config, joined with
+        /// MC_UDP_LIST_OPTION so List UDPs come back with their options.
+        /// Returns an empty list (and logs) when the DB is not configured.
+        ///
+        /// Note (2026-05-16): the admin schema does NOT carry an IS_DELETED
+        /// tombstone column. Admin-side UDP removal is a plain DELETE - the
+        /// row simply disappears from the snapshot. We deliberately do NOT
+        /// emit Delete entries for "row missing from snapshot but present in
+        /// model" because that is indistinguishable from "user manually
+        /// created a UDP the admin never knew about" and we would silently
+        /// destroy user data on every connect. Deletes are user-driven only.
         /// </summary>
         public List<UdpDefinitionSnapshot> FetchSnapshot()
         {
@@ -279,7 +285,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     UdpType = reader["UDP_TYPE"]?.ToString()?.Trim() ?? "",
                                     DefaultValue = reader["DEFAULT_VALUE"]?.ToString() ?? "",
                                     Description = reader["DESCRIPTION"]?.ToString() ?? "",
-                                    IsDeleted = Convert.ToBoolean(reader["IS_DELETED"]),
                                 };
                                 byId[defId] = def;
                                 result.Add(def);
@@ -303,24 +308,47 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
             }
 
-            // Stable list-option ordering for downstream comparison.
             foreach (var def in result)
+            {
                 def.ListOptions = def.ListOptions.OrderBy(o => o.SortOrder).ToList();
+                NormalizeBooleanToList(def);
+            }
 
-            Log($"UdpSyncEngine.FetchSnapshot: {result.Count} definition(s) loaded for config {_configId} (incl. tombstones)");
+            Log($"UdpSyncEngine.FetchSnapshot: {result.Count} definition(s) loaded for config {_configId}");
             return result;
+        }
+
+        /// <summary>
+        /// Admin's <c>Boolean</c> UDP type has no native erwin counterpart -
+        /// the metamodel has no Bit/Boolean tag_Udp_Data_Type. The convention
+        /// is to surface it as a two-value List (True / False) so users get a
+        /// dropdown in the Column Editor. Normalizing at the snapshot
+        /// boundary keeps every downstream layer (ComputeDiff, Apply,
+        /// UdpSyncDialog) Boolean-unaware - they only ever see List.
+        /// Public so unit tests can exercise it without a live DB.
+        /// </summary>
+        public static void NormalizeBooleanToList(UdpDefinitionSnapshot def)
+        {
+            if (!string.Equals(def.UdpType, "Boolean", StringComparison.OrdinalIgnoreCase))
+                return;
+            def.UdpType = "List";
+            // Wipe any list options the DB might have (a Boolean row should
+            // not have MC_UDP_LIST_OPTION rows, but defensive) and seed the
+            // canonical True/False set.
+            def.ListOptions = new List<UdpListOptionSnapshot>
+            {
+                new UdpListOptionSnapshot { Value = "True",  DisplayText = "True",  SortOrder = 0 },
+                new UdpListOptionSnapshot { Value = "False", DisplayText = "False", SortOrder = 1 },
+            };
         }
 
         private static string BuildSnapshotQuery(string? dbType)
         {
-            // Mirrors UdpDefinitionService.GetDefinitionQuery shape but WITHOUT
-            // the IS_DELETED filter - the sync engine must see tombstones to
-            // emit Delete diff entries.
             switch (dbType?.ToUpperInvariant())
             {
                 case "POSTGRESQL":
                     return @"SELECT d.""ID"" AS ""DEF_ID"", d.""NAME"", d.""DESCRIPTION"", d.""OBJECT_TYPE"", d.""UDP_TYPE"",
-                            d.""DEFAULT_VALUE"", d.""IS_DELETED"",
+                            d.""DEFAULT_VALUE"",
                             o.""VALUE"" AS ""OPT_VALUE"", o.""DISPLAY_TEXT"" AS ""OPT_DISPLAY"", o.""SORT_ORDER"" AS ""OPT_ORDER""
                             FROM ""MC_UDP_DEFINITION"" d
                             LEFT JOIN ""MC_UDP_LIST_OPTION"" o ON o.""UDP_DEFINITION_ID"" = d.""ID""
@@ -329,7 +357,7 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                 case "ORACLE":
                     return @"SELECT d.ID AS DEF_ID, d.NAME, d.DESCRIPTION, d.OBJECT_TYPE, d.UDP_TYPE,
-                            d.DEFAULT_VALUE, d.IS_DELETED,
+                            d.DEFAULT_VALUE,
                             o.VALUE AS OPT_VALUE, o.DISPLAY_TEXT AS OPT_DISPLAY, o.SORT_ORDER AS OPT_ORDER
                             FROM MC_UDP_DEFINITION d
                             LEFT JOIN MC_UDP_LIST_OPTION o ON o.UDP_DEFINITION_ID = d.ID
@@ -339,7 +367,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 case "MSSQL":
                 default:
                     return @"SELECT d.[ID] AS [DEF_ID], d.[NAME], d.[DESCRIPTION], d.[OBJECT_TYPE], d.[UDP_TYPE],
-                            d.[DEFAULT_VALUE], d.[IS_DELETED],
+                            d.[DEFAULT_VALUE],
                             o.[VALUE] AS [OPT_VALUE], o.[DISPLAY_TEXT] AS [OPT_DISPLAY], o.[SORT_ORDER] AS [OPT_ORDER]
                             FROM [dbo].[MC_UDP_DEFINITION] d
                             LEFT JOIN [dbo].[MC_UDP_LIST_OPTION] o ON o.[UDP_DEFINITION_ID] = d.[ID]
@@ -353,15 +381,47 @@ namespace EliteSoft.Erwin.AddIn.Services
         #region Model walk (erwin metamodel)
 
         /// <summary>
-        /// Open a level-1 metamodel session and read every Property_Type entry
-        /// into a <see cref="ModelUdpSnapshot"/> map keyed by FullName.
-        /// Caller may pass a pre-collected name set to skip the metamodel walk
-        /// when it has already been done in the same connect cycle (e.g. by
-        /// <c>ModelConfigForm.EnsureAllUdpsExist</c>).
+        /// Carrier for <see cref="UdpSyncEngine.WalkModelUdps"/> output. Bundles
+        /// both the filter-resolved model snapshots (for diff computation) and
+        /// the full Property_Type name set (so the caller can populate the
+        /// connect-level metamodel-names cache without re-walking).
         /// </summary>
-        public Dictionary<string, ModelUdpSnapshot> WalkModelUdps()
+        public class ModelWalkResult
         {
-            var map = new Dictionary<string, ModelUdpSnapshot>(StringComparer.OrdinalIgnoreCase);
+            public Dictionary<string, ModelUdpSnapshot> Map { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+            public HashSet<string> AllNames { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Open a level-1 metamodel session and walk Property_Type entries
+        /// once, returning both a filter-resolved <see cref="ModelUdpSnapshot"/>
+        /// map (for diff) and the full Name set (for the connect-level
+        /// metamodel-names cache consumed by ValidationCoordinator).
+        /// <para>
+        /// When <paramref name="namesOfInterest"/> is supplied, only entries
+        /// whose Name appears in that set get the per-tag detail read. Erwin
+        /// models can carry ~1500 Property_Type entries while admin defines
+        /// only a handful; reading 4 tag_* properties on every entry costs
+        /// ~3 ms each via COM marshalling = ~18 s in the wild (verified
+        /// 2026-05-16). Filtering drops detail reads to the handful of
+        /// matches while still iterating the full collection for the names
+        /// cache.
+        /// </para>
+        /// Orphans (Property_Types in the model that admin doesn't know
+        /// about) are intentionally left out of the map - the diff only
+        /// considers admin's snapshot and never deletes orphans, so reading
+        /// their tags would be wasted work. Orphan Names still appear in
+        /// <see cref="ModelWalkResult.AllNames"/> because the cache consumer
+        /// (ValidationCoordinator) cares about every UDP in the model.
+        /// </para>
+        /// </summary>
+        public ModelWalkResult WalkModelUdps(IEnumerable<string>? namesOfInterest = null)
+        {
+            var result = new ModelWalkResult();
+            HashSet<string>? filter = namesOfInterest != null
+                ? new HashSet<string>(namesOfInterest, StringComparer.OrdinalIgnoreCase)
+                : null;
+
             dynamic? metamodelSession = null;
             try
             {
@@ -376,16 +436,26 @@ namespace EliteSoft.Erwin.AddIn.Services
                 catch (Exception ex)
                 {
                     Log($"UdpSyncEngine.WalkModelUdps: Property_Type collect failed: {ex.Message}");
-                    return map;
+                    return result;
                 }
 
+                int seen = 0;
+                int detail = 0;
                 foreach (dynamic pt in propertyTypes)
                 {
+                    seen++;
                     if (pt == null) continue;
                     string fullName;
                     try { fullName = pt.Name ?? ""; }
                     catch { continue; }
                     if (string.IsNullOrEmpty(fullName)) continue;
+
+                    result.AllNames.Add(fullName);
+
+                    // Cheap filter first: skip detail reads when admin
+                    // doesn't care about this name. Names cache still
+                    // captures every entry above.
+                    if (filter != null && !filter.Contains(fullName)) continue;
 
                     var snap = new ModelUdpSnapshot
                     {
@@ -397,10 +467,11 @@ namespace EliteSoft.Erwin.AddIn.Services
                         CurrentListValues = ReadStringProperty(pt, "tag_Udp_Values_List"),
                         CurrentDescription = ReadStringProperty(pt, "Definition"),
                     };
-                    map[fullName] = snap;
+                    result.Map[fullName] = snap;
+                    detail++;
                 }
 
-                Log($"UdpSyncEngine.WalkModelUdps: {map.Count} Property_Type entry/entries collected");
+                Log($"UdpSyncEngine.WalkModelUdps: seen={seen}, detailReads={detail}, namesCached={result.AllNames.Count}, filter={(filter != null ? filter.Count.ToString() : "none")}");
             }
             catch (Exception ex)
             {
@@ -414,7 +485,24 @@ namespace EliteSoft.Erwin.AddIn.Services
                     catch (Exception ex) { Log($"UdpSyncEngine.WalkModelUdps: metamodel session close error: {ex.Message}"); }
                 }
             }
-            return map;
+            return result;
+        }
+
+        /// <summary>
+        /// Compute the FullName set the engine cares about for a given
+        /// snapshot. Used by callers to pre-filter the metamodel walk
+        /// (see <see cref="WalkModelUdps"/>) so the COM-heavy property
+        /// reads run only against admin-known UDPs.
+        /// </summary>
+        public static IEnumerable<string> ExpectedFullNames(IEnumerable<UdpDefinitionSnapshot> snapshot)
+        {
+            if (snapshot == null) yield break;
+            foreach (var def in snapshot)
+            {
+                string? ownerClass = MapObjectTypeToOwnerClass(def.ObjectType);
+                if (ownerClass == null) continue;
+                yield return $"{ownerClass}.Physical.{def.Name}";
+            }
         }
 
         private static string ExtractOwnerClass(string fullName)
@@ -493,24 +581,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                 string fullName = $"{ownerClass}.Physical.{adminUdp.Name}";
                 modelLookup.TryGetValue(fullName, out var match);
 
-                if (adminUdp.IsDeleted)
-                {
-                    if (match != null)
-                    {
-                        diff.Deletes.Add(new UdpDiffEntry
-                        {
-                            Action = UdpDiffAction.Delete,
-                            FullName = fullName,
-                            UdpName = adminUdp.Name,
-                            ObjectType = adminUdp.ObjectType,
-                            AdminUdp = adminUdp,
-                            ExistingUdp = match,
-                            Details = "(admin removed)"
-                        });
-                    }
-                    // else: already absent on both sides - no-op
-                    continue;
-                }
+                // Delete is intentionally NEVER emitted (2026-05-16). Admin
+                // schema has no tombstone column - a model UDP missing from
+                // the snapshot is indistinguishable from a user-authored
+                // UDP, so silently dropping it would risk destroying user
+                // data on every connect. Users remove unwanted UDPs through
+                // erwin's own UDP editor; the addin never deletes for them.
 
                 if (match == null)
                 {
@@ -566,11 +642,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                 if (changes == UdpUpdateChanges.None)
                     continue;
 
-                bool recreates = (changes & UdpUpdateChanges.Type) != 0
-                                 && !ErwinSupportsInPlaceTypeChange(match.CurrentDataTypeId, expectedType);
-                if (recreates)
-                    detailParts.Add("will recreate, existing values will be lost");
-
                 diff.Updates.Add(new UdpDiffEntry
                 {
                     Action = UdpDiffAction.Update,
@@ -580,7 +651,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                     AdminUdp = adminUdp,
                     ExistingUdp = match,
                     Changes = changes,
-                    RecreatesValues = recreates,
                     Details = string.Join("; ", detailParts)
                 });
             }
@@ -618,6 +688,251 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             if (string.IsNullOrEmpty(s)) return s ?? "";
             return s.Length <= maxLen ? s : s.Substring(0, maxLen - 1) + "...";
+        }
+
+        #endregion
+
+        #region Apply (metamodel mutation)
+
+        /// <summary>
+        /// Apply a previously-computed diff to the active erwin model.
+        /// Opens a level-1 metamodel session, runs Updates then Creates
+        /// inside a single named transaction, and either commits the whole
+        /// set or rolls back on the first failure.
+        ///
+        /// Type changes are done in-place - the existing drift sync had
+        /// proved this safe before this feature shipped. List option
+        /// content (<c>tag_Udp_Values_List</c>) is overwritten with the
+        /// admin's full comma-joined value list, so additions and removals
+        /// propagate symmetrically - admin is the source of truth.
+        ///
+        /// Rename is NOT supported (no stable ID linking model -> admin in
+        /// the simplified design). An admin-side rename surfaces as
+        /// Create(new); the old UDP stays in the model until the user
+        /// removes it via erwin's UDP editor.
+        /// </summary>
+        public ApplyResult Apply(UdpDiff diff)
+        {
+            if (diff == null) return ApplyResult.Fail("diff is null");
+            if (diff.IsEmpty) return ApplyResult.Ok(0, 0);
+
+            dynamic? metamodelSession = null;
+            int transId = 0;
+            bool transOpen = false;
+            int created = 0, updated = 0;
+
+            try
+            {
+                metamodelSession = _scapi.Sessions.Add();
+                metamodelSession.Open(_currentModel, 1); // SCD_SL_M1 = Metamodel level
+
+                dynamic mmObjects = metamodelSession.ModelObjects;
+                dynamic mmRoot = mmObjects.Root;
+
+                // Build a one-pass lookup of existing Property_Type objects
+                // keyed by their canonical Name. Used by Update to find the
+                // target without re-collecting on each entry.
+                var ptByName = new Dictionary<string, dynamic>(StringComparer.OrdinalIgnoreCase);
+                try
+                {
+                    dynamic propertyTypes = mmObjects.Collect(mmRoot, "Property_Type");
+                    foreach (dynamic pt in propertyTypes)
+                    {
+                        if (pt == null) continue;
+                        string ptName;
+                        try { ptName = pt.Name ?? ""; } catch { continue; }
+                        if (string.IsNullOrEmpty(ptName)) continue;
+                        if (!ptByName.ContainsKey(ptName))
+                            ptByName[ptName] = pt;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    return ApplyResult.Fail($"Property_Type enumeration failed: {ex.Message}");
+                }
+
+                transId = metamodelSession.BeginNamedTransaction("AdminUdpSync");
+                transOpen = true;
+
+                // === Updates (in-place) ===
+                // Every Update is in-place: type/default/list/description
+                // are set on the existing Property_Type. If the target
+                // happens to be missing (rare race - someone deleted it
+                // between the diff and the apply), fall back to Create so
+                // the metamodel still ends up at the admin's expected state.
+                foreach (var entry in diff.Updates)
+                {
+                    if (!ptByName.TryGetValue(entry.FullName, out var pt))
+                    {
+                        Log($"UdpSyncEngine.Apply: Update target '{entry.FullName}' missing - treating as Create");
+                        var createdPt = CreatePropertyType(mmObjects, entry);
+                        if (createdPt == null)
+                            return ApplyResult.Fail($"Update->Create fallback failed for {entry.FullName}");
+                        ptByName[entry.FullName] = createdPt;
+                        updated++;
+                        continue;
+                    }
+
+                    try
+                    {
+                        ApplyUpdateInPlace(pt, entry);
+                        updated++;
+                        Log($"UdpSyncEngine.Apply: Updated {entry.FullName} ({entry.Changes})");
+                    }
+                    catch (Exception ex)
+                    {
+                        return ApplyResult.Fail($"Update failed for {entry.FullName}: {ex.Message}");
+                    }
+                }
+
+                // === Creates ===
+                foreach (var entry in diff.Creates)
+                {
+                    if (ptByName.ContainsKey(entry.FullName))
+                    {
+                        Log($"UdpSyncEngine.Apply: Create target '{entry.FullName}' already exists - skipping");
+                        continue;
+                    }
+                    var pt = CreatePropertyType(mmObjects, entry);
+                    if (pt == null)
+                        return ApplyResult.Fail($"Create failed for {entry.FullName}");
+                    ptByName[entry.FullName] = pt;
+                    created++;
+                    Log($"UdpSyncEngine.Apply: Created {entry.FullName}");
+                }
+
+                metamodelSession.CommitTransaction(transId);
+                transOpen = false;
+                Log($"UdpSyncEngine.Apply: transaction committed (created={created}, updated={updated})");
+                return ApplyResult.Ok(created, updated);
+            }
+            catch (Exception ex)
+            {
+                Log($"UdpSyncEngine.Apply: unexpected failure: {ex.Message}");
+                if (transOpen && metamodelSession != null)
+                {
+                    try { metamodelSession!.RollbackTransaction(transId); transOpen = false; }
+                    catch (Exception rbEx) { Log($"UdpSyncEngine.Apply: rollback failed: {rbEx.Message}"); }
+                }
+                return ApplyResult.Fail(ex.Message);
+            }
+            finally
+            {
+                if (transOpen && metamodelSession != null)
+                {
+                    // Reached only when an inner return paths out of the try
+                    // without committing - rollback to leave the metamodel
+                    // clean. The `!` suppresses CS8602: the null analyzer
+                    // does not narrow `dynamic?` through the != null check.
+                    try { metamodelSession!.RollbackTransaction(transId); }
+                    catch (Exception rbEx) { Log($"UdpSyncEngine.Apply: finally-rollback failed: {rbEx.Message}"); }
+                }
+                if (metamodelSession != null)
+                {
+                    try { metamodelSession!.Close(); }
+                    catch (Exception ex) { Log($"UdpSyncEngine.Apply: session close failed: {ex.Message}"); }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Create a Property_Type in the open metamodel session for the
+        /// given Create / Update-recreate entry. Returns the new object on
+        /// success, null on failure. All tag_Udp_* properties are set via
+        /// <see cref="SetPropertyTypeTags"/>.
+        /// </summary>
+        private dynamic? CreatePropertyType(dynamic mmObjects, UdpDiffEntry entry)
+        {
+            if (entry.AdminUdp == null) return null;
+            try
+            {
+                dynamic pt = mmObjects.Add("Property_Type");
+                pt.Properties("Name").Value = entry.FullName;
+                SetPropertyTypeTags(pt, entry.AdminUdp);
+                return pt;
+            }
+            catch (Exception ex)
+            {
+                // Most common cause: erwin's EBS-1057 "must be unique"
+                // constraint when the Property_Type already exists from a
+                // previous run (race with the legacy silent path). The
+                // UdpRuntimeService.CreateUdpInMetamodel pattern treats
+                // EBS-1057 as success-equivalent; we mirror that here so
+                // a partial commit from before doesn't poison a fresh
+                // Apply.
+                if (ex.Message.Contains("must be unique") || ex.Message.Contains("EBS-1057"))
+                {
+                    Log($"UdpSyncEngine.CreatePropertyType: '{entry.FullName}' already exists (unique constraint) - treating as success");
+                    return null;
+                }
+                Log($"UdpSyncEngine.CreatePropertyType: '{entry.FullName}' failed: {ex.Message}");
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Set every tag_Udp_* property + Definition on an existing
+        /// Property_Type from the admin snapshot. Used by both Create
+        /// (fresh) and Update (in-place) paths so the property set stays
+        /// in sync between the two code paths.
+        /// </summary>
+        private void SetPropertyTypeTags(dynamic pt, UdpDefinitionSnapshot adminUdp)
+        {
+            string? ownerClass = MapObjectTypeToOwnerClass(adminUdp.ObjectType);
+            if (ownerClass != null)
+                TrySetProperty(pt, "tag_Udp_Owner_Type", ownerClass);
+            TrySetProperty(pt, "tag_Is_Physical", true);
+            TrySetProperty(pt, "tag_Is_Logical", false);
+
+            int dataTypeId = MapUdpTypeToErwinDataTypeId(adminUdp.UdpType);
+            TrySetProperty(pt, "tag_Udp_Data_Type", dataTypeId);
+
+            // List options - empty list options for List type results in an
+            // empty value list (the user will see an empty dropdown until
+            // admin adds options). erwin accepts empty string fine.
+            if (string.Equals(adminUdp.UdpType, "List", StringComparison.OrdinalIgnoreCase))
+            {
+                string validValues = adminUdp.ListOptions.Count > 0
+                    ? string.Join(",", adminUdp.ListOptions.ConvertAll(o => o.Value))
+                    : "";
+                TrySetProperty(pt, "tag_Udp_Values_List", validValues);
+            }
+
+            // Default value: write empty string to clear when admin removed
+            // the default (matches Create + Update parity).
+            TrySetProperty(pt, "tag_Udp_Default_Value", adminUdp.DefaultValue ?? "");
+
+            // Description goes into Property_Type.Definition (the field
+            // shown in erwin's UDP editor). No sentinel - the simplified
+            // design has no owner-tag in the model.
+            TrySetProperty(pt, "Definition", adminUdp.Description ?? "");
+
+            TrySetProperty(pt, "tag_Order", "1");
+            TrySetProperty(pt, "tag_Is_Locally_Defined", true);
+        }
+
+        /// <summary>
+        /// In-place update of an existing Property_Type. Re-uses
+        /// <see cref="SetPropertyTypeTags"/> so the property set stays
+        /// identical to the Create path - admin's snapshot is the single
+        /// source of truth for every tag.
+        /// </summary>
+        private void ApplyUpdateInPlace(dynamic pt, UdpDiffEntry entry)
+        {
+            if (entry.AdminUdp == null) return;
+            SetPropertyTypeTags(pt, entry.AdminUdp);
+        }
+
+        private void TrySetProperty(dynamic obj, string propertyName, object value)
+        {
+            try
+            {
+                obj.Properties(propertyName).Value = value;
+            }
+            catch (Exception ex)
+            {
+                Log($"UdpSyncEngine: Could not set {propertyName}: {ex.Message}");
+            }
         }
 
         #endregion

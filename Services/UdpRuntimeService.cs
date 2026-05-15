@@ -82,9 +82,6 @@ namespace EliteSoft.Erwin.AddIn.Services
             return values;
         }
 
-        // Track which UDPs have been verified/created in the erwin model
-        private HashSet<string> _verifiedUdps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
         public UdpRuntimeService(dynamic session, dynamic scapi, dynamic currentModel)
         {
             _session = session ?? throw new ArgumentNullException(nameof(session));
@@ -93,21 +90,36 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// Initialize: load ALL UDP definitions and dependency rules from DB,
-        /// then ensure all UDPs exist in the erwin model via metamodel session.
+        /// Initialize: load all UDP definitions from the admin DB and apply
+        /// the per-connect dependency-set cascade refresh to existing
+        /// Property_Type entries.
         /// </summary>
+        /// <remarks>
+        /// As of 2026-05-16 (Phase 4 of the Admin -> Model UDP sync feature)
+        /// this service no longer creates / updates / deletes UDPs by itself.
+        /// That responsibility moved to <see cref="UdpSyncEngine"/>, which
+        /// runs ahead of <see cref="Initialize"/> in
+        /// <c>ModelConfigForm.InitializeModelServices</c> and obtains user
+        /// consent via the sync dialog before touching the metamodel.
+        ///
+        /// What remains here is the runtime cascade: when a model UDP value
+        /// changes, dependent List UDPs need their <c>tag_Udp_Values_List</c>
+        /// recomputed from the currently-applicable cascade rule. That
+        /// recompute is admin-diff-independent and must run on every
+        /// connect, which is why it lives here next to the value-level
+        /// <see cref="ApplyDefaults"/> / <see cref="WriteUdpValues"/> APIs.
+        /// </remarks>
         /// <param name="preFetchedPropertyTypeNames">
-        /// Optional metamodel Property_Type name set already collected by an
-        /// earlier walk in the same connect cycle (e.g. by
-        /// <c>ModelConfigForm.EnsureAllUdpsExist</c>). When supplied, the
-        /// duplicate ~700ms metamodel walk inside this service is skipped;
-        /// the names list must be in OrdinalIgnoreCase comparer mode.
+        /// Legacy parameter from the silent ensure/drift era; ignored after
+        /// the Phase 4 refactor. Kept on the signature so the caller in
+        /// <c>ModelConfigForm</c> compiles unchanged until Phase 5 removes
+        /// the argument.
         /// </param>
         public bool Initialize(HashSet<string> preFetchedPropertyTypeNames = null)
         {
+            _ = preFetchedPropertyTypeNames; // intentionally unused; see remarks
             try
             {
-                // Load ALL object types (Table, Column, View, etc.)
                 bool defLoaded = UdpDefinitionService.Instance.LoadDefinitions();
                 if (!defLoaded)
                 {
@@ -118,10 +130,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                 var objectTypes = UdpDefinitionService.Instance.GetLoadedObjectTypes().ToList();
                 Log($"UdpRuntime: Loaded {UdpDefinitionService.Instance.Count} UDP definitions for [{string.Join(", ", objectTypes)}]");
 
-                // Ensure all UDP definitions exist in the erwin model (all object types)
-                EnsureUdpsExistInModel(preFetchedPropertyTypeNames);
-
                 _initialized = true;
+
+                // Apply runtime dependency-set cascade values. Independent of
+                // admin diff; needs to run on every connect because the active
+                // cascade depends on the current model UDP values.
+                UpdateDependencySetListValues();
+
                 return true;
             }
             catch (Exception ex)
@@ -190,12 +205,36 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// Ensure all UDP definitions from DB exist in the erwin model.
-        /// Opens a separate metamodel session (level 1) to create Property_Type objects.
-        /// Handles all object types (Table→Entity, Column→Attribute, etc.)
+        /// Refresh <c>tag_Udp_Values_List</c> on every existing Property_Type
+        /// whose dependency-set rule produces a non-empty option list for the
+        /// current model UDP state. This is the runtime cascade: an admin
+        /// might define List UDP "DOMAIN" whose available options depend on
+        /// the value of model-level UDP "ENVIRONMENT" - flipping ENVIRONMENT
+        /// from DEV to PROD changes which DOMAIN values are valid. The diff
+        /// path in <see cref="UdpSyncEngine"/> handles static admin-side
+        /// changes; this method handles the dynamic side that cannot be
+        /// computed without reading the model.
         /// </summary>
-        private void EnsureUdpsExistInModel(HashSet<string> preFetchedPropertyTypeNames = null)
+        /// <remarks>
+        /// Self-contained: opens its own level-1 metamodel session, walks
+        /// Property_Type once, applies per-UDP transactions, closes the
+        /// session. Safe to call from any connect path. Returns silently
+        /// when no dependency-set service is configured.
+        /// </remarks>
+        public void UpdateDependencySetListValues()
         {
+            if (_dependencySetService == null || !_dependencySetService.IsLoaded)
+                return;
+            // Short-circuit when no mappings are configured. Without this,
+            // a fresh dev DB with 0 dep-sets still pays the metamodel
+            // session-open + Property_Type Collect cost (~1.7 s against
+            // a 1500-entry model, verified 2026-05-16) for nothing.
+            if (_dependencySetService.MappingCount == 0)
+            {
+                Log("UdpRuntime.UpdateDependencySetListValues: no dep-set mappings configured - skipping metamodel walk");
+                return;
+            }
+
             var definitions = UdpDefinitionService.Instance.GetAll().ToList();
             if (definitions.Count == 0) return;
 
@@ -203,268 +242,92 @@ namespace EliteSoft.Erwin.AddIn.Services
             try
             {
                 metamodelSession = _scapi.Sessions.Add();
-                metamodelSession.Open(_currentModel, 1); // 1 = SCD_SL_M1 = Metamodel level
+                metamodelSession.Open(_currentModel, 1); // SCD_SL_M1
 
                 dynamic mmObjects = metamodelSession.ModelObjects;
                 dynamic mmRoot = mmObjects.Root;
 
-                // Reuse the caller's metamodel walk if provided (saves ~700ms on
-                // r10 against models with ~1500 Property_Type entries). Fall back
-                // to walking ourselves so the service stays usable standalone.
-                HashSet<string> existingUdpNames;
-                if (preFetchedPropertyTypeNames != null)
+                var existingByName = new Dictionary<string, dynamic>(StringComparer.OrdinalIgnoreCase);
+                var existingNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                try
                 {
-                    existingUdpNames = preFetchedPropertyTypeNames;
-                    Log($"UdpRuntime: Using cached Property_Type set ({existingUdpNames.Count} entries) - skipping metamodel walk");
-                }
-                else
-                {
-                    existingUdpNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                    try
+                    dynamic propertyTypes = mmObjects.Collect(mmRoot, "Property_Type");
+                    foreach (dynamic pt in propertyTypes)
                     {
-                        dynamic propertyTypes = mmObjects.Collect(mmRoot, "Property_Type");
-                        foreach (dynamic pt in propertyTypes)
+                        if (pt == null) continue;
+                        string n;
+                        try { n = pt.Name ?? ""; }
+                        catch { continue; }
+                        if (string.IsNullOrEmpty(n)) continue;
+                        if (!existingByName.ContainsKey(n))
                         {
-                            if (pt == null) continue;
-                            try { existingUdpNames.Add(pt.Name ?? ""); } catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"Property_Type name read error: {ex.Message}"); }
+                            existingByName[n] = pt;
+                            existingNames.Add(n);
                         }
                     }
-                    catch (Exception ex)
-                    {
-                        Log($"UdpRuntime: Metamodel Property_Type enumeration failed: {ex.Message}");
-                    }
-                    Log($"UdpRuntime: Found {existingUdpNames.Count} existing Property_Type entries");
+                }
+                catch (Exception ex)
+                {
+                    Log($"UdpRuntime.UpdateDependencySetListValues: Property_Type enumeration failed: {ex.Message}");
+                    return;
                 }
 
-                // Read current model-level UDP values for cascade filtering
-                // Use existingUdpNames to find correct case for property paths
-                var modelUdpValues = ReadModelUdpValues(existingUdpNames);
+                // The cascade evaluator filters on the current model-level UDP
+                // values. ReadModelUdpValues uses the existingNames set to find
+                // the correct case-sensitive Property_Type paths.
+                var modelUdpValues = ReadModelUdpValues(existingNames);
                 if (modelUdpValues.Count > 0)
                     Log($"UdpRuntime: Model UDP values for cascade: {string.Join(", ", modelUdpValues.Select(kv => $"{kv.Key}='{kv.Value}'"))}");
 
-                // Check which UDPs need to be created, and which existing List UDPs need value updates
-                var missingDefs = new List<UdpDefinitionRuntime>();
-                var existingListUdpsToUpdate = new List<(UdpDefinitionRuntime def, string fullName)>();
-
+                int updated = 0;
                 foreach (var def in definitions)
                 {
-                    string defOwnerClass = GetScapiOwnerClass(def.ObjectType);
-                    if (defOwnerClass == null) continue;
+                    string ownerClass = GetScapiOwnerClass(def.ObjectType);
+                    if (ownerClass == null) continue;
+                    string fullName = $"{ownerClass}.Physical.{def.Name}";
+                    if (!existingByName.TryGetValue(fullName, out var targetPt)) continue;
 
-                    string fullName = $"{defOwnerClass}.Physical.{def.Name}";
-                    if (existingUdpNames.Contains(fullName))
+                    var depOptions = _dependencySetService.GetListUdpOptions(def.Name, modelUdpValues);
+                    if (depOptions == null || depOptions.Count == 0) continue;
+
+                    string validValues = string.Join(",", depOptions);
+
+                    int transId = metamodelSession.BeginNamedTransaction($"UpdateListUDP_{def.Name}");
+                    try
                     {
-                        _verifiedUdps.Add(def.Name);
-
-                        // Check if dependency set has options for this UDP (with cascade filter)
-                        if (_dependencySetService != null && _dependencySetService.IsLoaded)
-                        {
-                            var depOptions = _dependencySetService.GetListUdpOptions(def.Name, modelUdpValues);
-                            if (depOptions != null && depOptions.Count > 0)
-                            {
-                                existingListUdpsToUpdate.Add((def, fullName));
-                                continue;
-                            }
-                        }
-
-                        Log($"UdpRuntime: {fullName} already exists - skipping");
+                        // Ensure the UDP is flagged as a List so the editor
+                        // renders the dropdown. The sync engine should have
+                        // already done this if the admin entry is List type,
+                        // but we re-assert here defensively in case the
+                        // sync was skipped (DB offline path).
+                        TrySetProperty(targetPt, "tag_Udp_Data_Type", 6);
+                        TrySetProperty(targetPt, "tag_Udp_Values_List", validValues);
+                        metamodelSession.CommitTransaction(transId);
+                        updated++;
+                        Log($"UdpRuntime: {fullName} list values updated from dependency set ({depOptions.Count} items): {validValues}");
                     }
-                    else
+                    catch (Exception ex)
                     {
-                        missingDefs.Add(def);
+                        try { metamodelSession.RollbackTransaction(transId); }
+                        catch (Exception rbEx) { Log($"UdpRuntime: dep-set rollback failed for {fullName}: {rbEx.Message}"); }
+                        Log($"UdpRuntime: dep-set update failed for {fullName}: {ex.Message}");
                     }
                 }
 
-                // Update existing List UDPs with dependency set values
-                if (existingListUdpsToUpdate.Count > 0)
-                {
-                    UpdateExistingListUdps(mmObjects, mmRoot, existingListUdpsToUpdate, metamodelSession, modelUdpValues);
-                }
-
-                // Sync UDP datatype for already-existing Property_Types so admin's
-                // MC_UDP_DEFINITION.UDP_TYPE changes propagate (an erwin UDP created
-                // once as Int stays Int forever otherwise, even after admin retypes
-                // it to Text). Runs even when missingDefs is empty - drift is the
-                // common case after an admin retypes an existing UDP.
-                SyncExistingUdpTypeDrift(mmObjects, mmRoot, metamodelSession, definitions);
-
-                if (missingDefs.Count == 0 && existingListUdpsToUpdate.Count == 0)
-                {
-                    Log("UdpRuntime: All UDPs already exist - nothing to create");
-                    return;
-                }
-                if (missingDefs.Count == 0)
-                {
-                    return;
-                }
-
-                // Create missing UDPs (each with its own owner class based on ObjectType)
-                int createdCount = 0;
-                foreach (var def in missingDefs)
-                {
-                    string defOwnerClass = GetScapiOwnerClass(def.ObjectType);
-                    if (defOwnerClass == null) continue;
-                    if (CreateUdpInMetamodel(mmObjects, def, defOwnerClass, metamodelSession, modelUdpValues))
-                        createdCount++;
-                }
-
-                Log($"UdpRuntime: Created {createdCount}/{missingDefs.Count} UDP(s) in erwin model");
+                if (updated > 0)
+                    Log($"UdpRuntime.UpdateDependencySetListValues: applied to {updated} UDP(s)");
             }
             catch (Exception ex)
             {
-                Log($"UdpRuntime.EnsureUdpsExistInModel error: {ex.Message}");
+                Log($"UdpRuntime.UpdateDependencySetListValues error: {ex.Message}");
             }
             finally
             {
                 if (metamodelSession != null)
                 {
-                    try { metamodelSession.Close(); } catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"Metamodel session close error: {ex.Message}"); }
+                    try { metamodelSession.Close(); }
+                    catch (Exception ex) { Log($"UdpRuntime: dep-set session close failed: {ex.Message}"); }
                 }
-            }
-        }
-
-        /// <summary>
-        /// Create a single UDP in the erwin metamodel via Property_Type.
-        /// Follows the same pattern as EnsureAllUdpsExist in ModelConfigForm.
-        /// </summary>
-        /// <summary>
-        /// Update existing List UDPs with values from dependency set external tables.
-        /// </summary>
-        private void UpdateExistingListUdps(dynamic mmObjects, dynamic mmRoot, List<(UdpDefinitionRuntime def, string fullName)> udpsToUpdate, dynamic metamodelSession, Dictionary<string, string> modelUdpValues)
-        {
-            try
-            {
-                dynamic propertyTypes = mmObjects.Collect(mmRoot, "Property_Type");
-                foreach (var (def, fullName) in udpsToUpdate)
-                {
-                    try
-                    {
-                        // Find the existing Property_Type by name
-                        dynamic targetPt = null;
-                        foreach (dynamic pt in propertyTypes)
-                        {
-                            if (pt == null) continue;
-                            try
-                            {
-                                string ptName = pt.Name ?? "";
-                                if (ptName.Equals(fullName, StringComparison.OrdinalIgnoreCase))
-                                {
-                                    targetPt = pt;
-                                    break;
-                                }
-                            }
-                            catch { }
-                        }
-
-                        if (targetPt == null) continue;
-
-                        var depOptions = _dependencySetService.GetListUdpOptions(def.Name, modelUdpValues);
-                        if (depOptions == null || depOptions.Count == 0) continue;
-
-                        string validValues = string.Join(",", depOptions);
-
-                        int transId = metamodelSession.BeginNamedTransaction($"UpdateListUDP_{def.Name}");
-                        try
-                        {
-                            // Ensure UDP type is List (dataTypeId=6) for dropdown display
-                            TrySetProperty(targetPt, "tag_Udp_Data_Type", 6);
-                            TrySetProperty(targetPt, "tag_Udp_Values_List", validValues);
-                            metamodelSession.CommitTransaction(transId);
-                            _verifiedUdps.Add(def.Name);
-                            Log($"UdpRuntime: {fullName} updated as List from dependency set ({depOptions.Count} items): {validValues}");
-                        }
-                        catch (Exception ex)
-                        {
-                            try { metamodelSession.RollbackTransaction(transId); } catch { }
-                            Log($"UdpRuntime: Failed to update {fullName}: {ex.Message}");
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Log($"UdpRuntime: UpdateExistingListUdps item error for {fullName}: {ex.Message}");
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Log($"UdpRuntime: UpdateExistingListUdps error: {ex.Message}");
-            }
-        }
-
-        private bool CreateUdpInMetamodel(dynamic mmObjects, UdpDefinitionRuntime def, string ownerClass, dynamic metamodelSession, Dictionary<string, string> modelUdpValues = null)
-        {
-            string fullName = $"{ownerClass}.Physical.{def.Name}";
-            int transId = metamodelSession.BeginNamedTransaction($"CreateUDP_{def.Name}");
-            try
-            {
-                dynamic udpType = mmObjects.Add("Property_Type");
-                udpType.Properties("Name").Value = fullName;
-
-                TrySetProperty(udpType, "tag_Udp_Owner_Type", ownerClass);
-                TrySetProperty(udpType, "tag_Is_Physical", true);
-                TrySetProperty(udpType, "tag_Is_Logical", false);
-
-                int dataTypeId = MapUdpTypeToErwinDataTypeId(def.UdpType);
-                TrySetProperty(udpType, "tag_Udp_Data_Type", dataTypeId);
-
-                // For List-type UDPs, set valid values as comma-separated string.
-                if (def.UdpType?.Equals("List", StringComparison.OrdinalIgnoreCase) == true)
-                {
-                    string validValues = null;
-
-                    if (def.ListOptions.Count > 0)
-                    {
-                        // Static list options from MC_UDP_LIST_OPTION
-                        validValues = string.Join(",", def.ListOptions.Select(o => o.Value));
-                    }
-
-                    // Override/supplement with dependency set external table data
-                    if (_dependencySetService != null && _dependencySetService.IsLoaded)
-                    {
-                        var depOptions = _dependencySetService.GetListUdpOptions(def.Name, modelUdpValues);
-                        if (depOptions != null && depOptions.Count > 0)
-                        {
-                            validValues = string.Join(",", depOptions);
-                            Log($"UdpRuntime: {fullName} List values from dependency set ({depOptions.Count} items)");
-                        }
-                    }
-
-                    if (!string.IsNullOrEmpty(validValues))
-                    {
-                        TrySetProperty(udpType, "tag_Udp_Values_List", validValues);
-                        Log($"UdpRuntime: {fullName} List values = '{validValues}'");
-                    }
-                    else
-                    {
-                        Log($"UdpRuntime: WARNING - {fullName} is List type but has no list options!");
-                    }
-                }
-
-                // Set default value if specified
-                if (!string.IsNullOrEmpty(def.DefaultValue))
-                {
-                    TrySetProperty(udpType, "tag_Udp_Default_Value", def.DefaultValue);
-                }
-
-                TrySetProperty(udpType, "tag_Order", "1");
-                TrySetProperty(udpType, "tag_Is_Locally_Defined", true);
-
-                metamodelSession.CommitTransaction(transId);
-                _verifiedUdps.Add(def.Name);
-                Log($"UdpRuntime: {fullName} UDP created (type={def.UdpType}, dataTypeId={dataTypeId})");
-                return true;
-            }
-            catch (Exception ex)
-            {
-                try { metamodelSession.RollbackTransaction(transId); } catch (Exception rbEx) { Log($"UdpRuntime: Rollback failed: {rbEx.Message}"); }
-                if (ex.Message.Contains("must be unique") || ex.Message.Contains("EBS-1057"))
-                {
-                    Log($"UdpRuntime: {fullName} already exists (unique constraint)");
-                    _verifiedUdps.Add(def.Name);
-                    return true; // Already exists — treat as success
-                }
-                Log($"UdpRuntime: Error creating {fullName}: {ex.Message}");
-                return false;
             }
         }
 
@@ -478,163 +341,6 @@ namespace EliteSoft.Erwin.AddIn.Services
             {
                 Log($"UdpRuntime: Could not set {propertyName}: {ex.Message}");
             }
-        }
-
-        /// <summary>
-        /// Sync the erwin metamodel's tag_Udp_Data_Type for every UDP that already
-        /// exists in the model so that admin-side UDP_TYPE changes propagate. Without
-        /// this pass, EnsureUdpsExistInModel's "already exists - skipping" branch
-        /// leaves an existing UDP at its original datatype forever (verified bug:
-        /// OWNER was created as Int once, admin later changed UDP_TYPE to Text, the
-        /// erwin Column Editor kept rejecting non-numeric input on OWNER).
-        ///
-        /// Idempotent: only writes when the metamodel value differs from the DB value.
-        /// Walks Property_Type once per call; on big-model machines this is ~150-700 ms
-        /// against ~1500 Property_Type entries. List values are NOT touched here -
-        /// UpdateExistingListUdps owns the list-options column.
-        /// </summary>
-        private void SyncExistingUdpTypeDrift(
-            dynamic mmObjects,
-            dynamic mmRoot,
-            dynamic metamodelSession,
-            List<UdpDefinitionRuntime> definitions)
-        {
-            Log($"UdpRuntime: SyncExistingUdpTypeDrift start (definitions={definitions?.Count ?? 0})");
-            if (definitions == null || definitions.Count == 0)
-            {
-                Log("UdpRuntime: SyncExistingUdpTypeDrift skipped (no definitions)");
-                return;
-            }
-
-            // Build a lookup of fullName -> expected datatype id from the DB side.
-            var expected = new Dictionary<string, (int dataTypeId, UdpDefinitionRuntime def)>(StringComparer.OrdinalIgnoreCase);
-            foreach (var def in definitions)
-            {
-                string ownerClass = GetScapiOwnerClass(def.ObjectType);
-                if (ownerClass == null)
-                {
-                    Log($"UdpRuntime: SyncExistingUdpTypeDrift: no owner class for '{def.ObjectType}' on UDP '{def.Name}'");
-                    continue;
-                }
-                string fullName = $"{ownerClass}.Physical.{def.Name}";
-                int expectedId = MapUdpTypeToErwinDataTypeId(def.UdpType);
-                expected[fullName] = (expectedId, def);
-                Log($"UdpRuntime: SyncExistingUdpTypeDrift expect {fullName} = {expectedId} ('{def.UdpType}')");
-            }
-
-            dynamic propertyTypes = null;
-            try { propertyTypes = mmObjects.Collect(mmRoot, "Property_Type"); }
-            catch (Exception ex)
-            {
-                Log($"UdpRuntime: SyncExistingUdpTypeDrift Property_Type collect failed: {ex.Message}");
-                return;
-            }
-            if (propertyTypes == null)
-            {
-                Log("UdpRuntime: SyncExistingUdpTypeDrift skipped (Property_Type collection null)");
-                return;
-            }
-
-            int drifted = 0;
-            int matched = 0;
-            int seen = 0;
-            try
-            {
-                foreach (dynamic pt in propertyTypes)
-                {
-                    seen++;
-                    if (pt == null) continue;
-                    string ptName;
-                    try { ptName = pt.Name ?? ""; }
-                    catch { continue; }
-                    if (string.IsNullOrEmpty(ptName)) continue;
-                    if (!expected.TryGetValue(ptName, out var match)) continue;
-                    matched++;
-
-                    int currentDataTypeId;
-                    try
-                    {
-                        var raw = pt.Properties("tag_Udp_Data_Type")?.Value;
-                        if (raw == null)
-                        {
-                            Log($"UdpRuntime: SyncExistingUdpTypeDrift {ptName} has null tag_Udp_Data_Type");
-                            continue;
-                        }
-                        currentDataTypeId = Convert.ToInt32(raw);
-                    }
-                    catch (Exception ex)
-                    {
-                        Log($"UdpRuntime: drift read failed for {ptName}: {ex.Message}");
-                        continue;
-                    }
-
-                    // For List-type UDPs we also keep the values string aligned
-                    // with MC_UDP_LIST_OPTION. Without this, an admin that
-                    // retypes a UDP into List (e.g. KVKK Int -> List) sees the
-                    // datatype flip but the Column Editor dropdown stays empty
-                    // because tag_Udp_Values_List was never populated. Skipped
-                    // when a dependency set owns this UDP's list values - that
-                    // path is handled in UpdateExistingListUdps with the
-                    // cascade-filtered options.
-                    bool isStaticList =
-                        match.dataTypeId == 6
-                        && match.def.ListOptions != null
-                        && match.def.ListOptions.Count > 0
-                        && (_dependencySetService == null
-                            || !_dependencySetService.IsLoaded
-                            || _dependencySetService.GetListUdpOptions(match.def.Name, null) == null
-                            || _dependencySetService.GetListUdpOptions(match.def.Name, null).Count == 0);
-
-                    string expectedListValues = isStaticList
-                        ? string.Join(",", match.def.ListOptions.Select(o => o.Value))
-                        : null;
-                    string currentListValues = null;
-                    if (isStaticList)
-                    {
-                        try { currentListValues = pt.Properties("tag_Udp_Values_List")?.Value?.ToString() ?? ""; }
-                        catch { currentListValues = ""; }
-                    }
-
-                    bool typeOk = currentDataTypeId == match.dataTypeId;
-                    bool listOk = !isStaticList || string.Equals(currentListValues ?? string.Empty, expectedListValues ?? string.Empty, StringComparison.Ordinal);
-
-                    if (typeOk && listOk)
-                    {
-                        Log($"UdpRuntime: SyncExistingUdpTypeDrift {ptName} already at {currentDataTypeId} ('{match.def.UdpType}') - ok");
-                        continue;
-                    }
-
-                    int transId = metamodelSession.BeginNamedTransaction($"SyncUdpType_{match.def.Name}");
-                    try
-                    {
-                        if (!typeOk)
-                            TrySetProperty(pt, "tag_Udp_Data_Type", match.dataTypeId);
-                        if (isStaticList && !listOk)
-                            TrySetProperty(pt, "tag_Udp_Values_List", expectedListValues);
-                        metamodelSession.CommitTransaction(transId);
-                        drifted++;
-                        if (!typeOk && isStaticList && !listOk)
-                            Log($"UdpRuntime: {ptName} drift fixed (type erwin={currentDataTypeId} -> DB={match.dataTypeId} '{match.def.UdpType}', list='{currentListValues}' -> '{expectedListValues}')");
-                        else if (!typeOk)
-                            Log($"UdpRuntime: {ptName} type drift fixed (erwin={currentDataTypeId} -> DB={match.dataTypeId} '{match.def.UdpType}')");
-                        else
-                            Log($"UdpRuntime: {ptName} list-values drift fixed ('{currentListValues}' -> '{expectedListValues}')");
-                    }
-                    catch (Exception ex)
-                    {
-                        try { metamodelSession.RollbackTransaction(transId); } catch { }
-                        Log($"UdpRuntime: drift sync failed for {ptName}: {ex.Message}");
-                    }
-                }
-            }
-            finally
-            {
-                // Property_Type collection - mirror the release pattern used in
-                // UpdateExistingListUdps (no explicit ReleaseCom there either; the
-                // metamodel session disposal in the caller handles it).
-            }
-
-            Log($"UdpRuntime: SyncExistingUdpTypeDrift done (seen={seen}, matched={matched}, drifted={drifted})");
         }
 
         #endregion

@@ -23,7 +23,6 @@ public class UdpSyncEngineDiffTests
         string udpType = "Text",
         string defaultValue = "",
         string description = "",
-        bool isDeleted = false,
         params string[] listOptions)
     {
         var snap = new UdpDefinitionSnapshot
@@ -34,7 +33,6 @@ public class UdpSyncEngineDiffTests
             UdpType = udpType,
             DefaultValue = defaultValue,
             Description = description,
-            IsDeleted = isDeleted,
         };
         for (int i = 0; i < listOptions.Length; i++)
         {
@@ -94,7 +92,7 @@ public class UdpSyncEngineDiffTests
 
         diff.Creates.Should().HaveCount(1);
         diff.Updates.Should().BeEmpty();
-        diff.Deletes.Should().BeEmpty();
+
 
         var entry = diff.Creates[0];
         entry.Action.Should().Be(UdpDiffAction.Create);
@@ -107,34 +105,40 @@ public class UdpSyncEngineDiffTests
     }
 
     [Fact]
-    public void IsDeleted_with_existing_match_emits_Delete()
+    public void Model_udp_missing_from_snapshot_is_not_deleted()
     {
-        var snapshot = new List<UdpDefinitionSnapshot>
-        {
-            AdminUdp(7, "OLD_FLAG", isDeleted: true),
-        };
+        // 2026-05-16: admin schema has no tombstone column, so a model UDP
+        // absent from the snapshot is indistinguishable from a user-authored
+        // UDP. The diff must NEVER emit a Delete for that case - silent
+        // deletion would risk destroying user data on every connect. Users
+        // remove UDPs themselves through erwin's UDP editor.
+        var snapshot = new List<UdpDefinitionSnapshot>();  // admin has nothing
         var model = AsMap(ModelUdp("Entity.Physical.OLD_FLAG", dataTypeId: 2));
 
         var diff = UdpSyncEngine.ComputeDiff(snapshot, model);
 
-        diff.Deletes.Should().HaveCount(1);
-        diff.Creates.Should().BeEmpty();
-        diff.Updates.Should().BeEmpty();
-        diff.Deletes[0].FullName.Should().Be("Entity.Physical.OLD_FLAG");
-        diff.Deletes[0].ExistingUdp.Should().NotBeNull();
+        diff.IsEmpty.Should().BeTrue();
+
     }
 
     [Fact]
-    public void IsDeleted_without_model_match_is_silently_skipped()
+    public void Diff_never_emits_deletes_even_with_orphans()
     {
+        // Admin defines OWNER. Model has OWNER (matches) plus USER_THING
+        // (manually created by user). Diff should pass OWNER through with
+        // no changes and ignore USER_THING entirely.
         var snapshot = new List<UdpDefinitionSnapshot>
         {
-            AdminUdp(7, "ALREADY_GONE", isDeleted: true),
+            AdminUdp(1, "OWNER", objectType: "Table", udpType: "Text"),
         };
+        var model = AsMap(
+            ModelUdp("Entity.Physical.OWNER", dataTypeId: 2),
+            ModelUdp("Entity.Physical.USER_THING", dataTypeId: 2));
 
-        var diff = UdpSyncEngine.ComputeDiff(snapshot, AsMap());
+        var diff = UdpSyncEngine.ComputeDiff(snapshot, model);
 
         diff.IsEmpty.Should().BeTrue();
+
     }
 
     [Fact]
@@ -156,9 +160,12 @@ public class UdpSyncEngineDiffTests
     }
 
     [Fact]
-    public void Type_change_emits_Update_with_recreates_true()
+    public void Type_change_emits_Update_in_place()
     {
-        // admin: List, model: Text -> not in-place compatible (Phase 1 default)
+        // In-place type change is the default; the existing drift sync had
+        // proven it works in production. The diff flags Type + ListValues
+        // changes so the dialog shows them; Apply writes the new datatype
+        // and list values on the existing Property_Type without recreate.
         var snapshot = new List<UdpDefinitionSnapshot>
         {
             AdminUdp(1, "OWNER", objectType: "Table", udpType: "List", listOptions: new[] { "A", "B" }),
@@ -174,8 +181,8 @@ public class UdpSyncEngineDiffTests
         var u = diff.Updates[0];
         u.Changes.Should().HaveFlag(UdpUpdateChanges.Type);
         u.Changes.Should().HaveFlag(UdpUpdateChanges.ListValues);
-        u.RecreatesValues.Should().BeTrue();
-        u.Details.Should().Contain("Text -> List").And.Contain("will recreate");
+        u.Details.Should().Contain("Text -> List");
+        u.Details.Should().NotContain("will recreate");
     }
 
     [Fact]
@@ -197,7 +204,6 @@ public class UdpSyncEngineDiffTests
         var u = diff.Updates[0];
         u.Changes.Should().HaveFlag(UdpUpdateChanges.ListValues);
         u.Changes.Should().NotHaveFlag(UdpUpdateChanges.Type);
-        u.RecreatesValues.Should().BeFalse();
         u.Details.Should().Contain("List options changed");
     }
 
@@ -237,7 +243,6 @@ public class UdpSyncEngineDiffTests
         diff.Updates.Should().HaveCount(1);
         var u = diff.Updates[0];
         u.Changes.Should().Be(UdpUpdateChanges.Default);
-        u.RecreatesValues.Should().BeFalse();
         u.Details.Should().Contain("Default").And.Contain("365").And.Contain("730");
     }
 
@@ -288,28 +293,85 @@ public class UdpSyncEngineDiffTests
     [Fact]
     public void Multiple_admin_udps_produce_aggregated_diff()
     {
+        // Admin has three UDPs (NEW_ONE, CHANGED, UNCHANGED). Model has
+        // CHANGED + UNCHANGED + a user-authored ORPHAN. Expectation:
+        //   - NEW_ONE -> Create (admin defines, model lacks)
+        //   - CHANGED -> Update (default value differs)
+        //   - UNCHANGED -> no diff (already aligned)
+        //   - ORPHAN -> untouched (user owns it, no delete)
         var snapshot = new List<UdpDefinitionSnapshot>
         {
             AdminUdp(1, "NEW_ONE", objectType: "Column", udpType: "Int"),
             AdminUdp(2, "CHANGED", objectType: "Table", udpType: "Text", defaultValue: "new"),
-            AdminUdp(3, "GONE", objectType: "Table", isDeleted: true),
             AdminUdp(4, "UNCHANGED", objectType: "Table", udpType: "Text", defaultValue: "same"),
         };
         var model = AsMap(
             ModelUdp("Entity.Physical.CHANGED", dataTypeId: 2, currentDefault: "old"),
-            ModelUdp("Entity.Physical.GONE", dataTypeId: 2),
+            ModelUdp("Entity.Physical.ORPHAN", dataTypeId: 2),
             ModelUdp("Entity.Physical.UNCHANGED", dataTypeId: 2, currentDefault: "same"));
 
         var diff = UdpSyncEngine.ComputeDiff(snapshot, model);
 
         diff.Creates.Should().HaveCount(1);
         diff.Updates.Should().HaveCount(1);
-        diff.Deletes.Should().HaveCount(1);
-        diff.TotalCount.Should().Be(3);
+
+        diff.TotalCount.Should().Be(2);
 
         diff.Creates[0].UdpName.Should().Be("NEW_ONE");
         diff.Updates[0].UdpName.Should().Be("CHANGED");
-        diff.Deletes[0].UdpName.Should().Be("GONE");
+    }
+
+    [Fact]
+    public void Boolean_admin_type_normalizes_to_List_with_True_False()
+    {
+        // Admin's Boolean type has no native erwin counterpart. The snapshot
+        // boundary rewrites it as List(True, False) so the rest of the
+        // pipeline only ever sees List. Regression guard for the 2026-05-16
+        // bug where Boolean UDPs (KVKK, PCIDSS) were being projected as
+        // erwin Text.
+        var snap = new UdpDefinitionSnapshot
+        {
+            Id = 42,
+            Name = "KVKK",
+            ObjectType = "Column",
+            UdpType = "Boolean",
+        };
+
+        UdpSyncEngine.NormalizeBooleanToList(snap);
+
+        snap.UdpType.Should().Be("List");
+        snap.ListOptions.Should().HaveCount(2);
+        snap.ListOptions[0].Value.Should().Be("True");
+        snap.ListOptions[1].Value.Should().Be("False");
+    }
+
+    [Fact]
+    public void Boolean_admin_type_diff_emits_Update_to_List_type()
+    {
+        // End-to-end: a Boolean admin row vs. an Integer-typed model UDP
+        // (the bug repro: KVKK was Integer in model). After normalization
+        // ComputeDiff should emit Update(Type=List, ListValues=True,False).
+        var snap = new UdpDefinitionSnapshot
+        {
+            Id = 42,
+            Name = "KVKK",
+            ObjectType = "Column",
+            UdpType = "Boolean",
+        };
+        UdpSyncEngine.NormalizeBooleanToList(snap);
+
+        var model = AsMap(ModelUdp(
+            "Attribute.Physical.KVKK",
+            dataTypeId: 1,        // Integer (the buggy starting state)
+            currentListValues: ""));
+
+        var diff = UdpSyncEngine.ComputeDiff(new[] { snap }, model);
+
+        diff.Updates.Should().HaveCount(1);
+        var u = diff.Updates[0];
+        u.Changes.Should().HaveFlag(UdpUpdateChanges.Type);
+        u.Changes.Should().HaveFlag(UdpUpdateChanges.ListValues);
+        u.Details.Should().Contain("Integer -> List");
     }
 
     [Theory]
@@ -349,12 +411,4 @@ public class UdpSyncEngineDiffTests
         UdpSyncEngine.MapUdpTypeToErwinDataTypeId(udpType).Should().Be(expected);
     }
 
-    [Fact]
-    public void ErwinSupportsInPlaceTypeChange_returns_true_only_for_identity()
-    {
-        UdpSyncEngine.ErwinSupportsInPlaceTypeChange(2, 2).Should().BeTrue();
-        UdpSyncEngine.ErwinSupportsInPlaceTypeChange(1, 2).Should().BeFalse();
-        UdpSyncEngine.ErwinSupportsInPlaceTypeChange(2, 6).Should().BeFalse();
-        UdpSyncEngine.ErwinSupportsInPlaceTypeChange(6, 2).Should().BeFalse();
-    }
 }
