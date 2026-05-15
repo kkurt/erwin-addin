@@ -1363,12 +1363,18 @@ namespace EliteSoft.Erwin.AddIn
                     _udpSyncDialogOpen = true;
                     try
                     {
-                        bool apply = UdpSyncDialog.ShowFor(diffLocal, this);
-                        if (!apply)
+                        bool apply = UdpSyncDialog.ShowFor(diffLocal, this, out var selectedDiff);
+                        if (!apply || selectedDiff == null || selectedDiff.IsEmpty)
                         {
                             Log($"UDP sync cancelled by user (creates={diffLocal.Creates.Count}, updates={diffLocal.Updates.Count})");
                             return;
                         }
+
+                        // The user may have unchecked some rows in the
+                        // dialog; only apply the subset they kept selected.
+                        int skipped = diffLocal.TotalCount - selectedDiff.TotalCount;
+                        if (skipped > 0)
+                            Log($"UDP sync: user opted out of {skipped} row(s) (applying {selectedDiff.TotalCount} of {diffLocal.TotalCount})");
 
                         // Apply blocks the UI thread for the duration of the
                         // metamodel transaction (SCAPI calls are STA-bound).
@@ -1381,7 +1387,7 @@ namespace EliteSoft.Erwin.AddIn
                         {
                             overlay = ShowBusyOverlay("Applying config UDP definitions to the model, please wait...");
                             Application.DoEvents();
-                            result = engineLocal.Apply(diffLocal);
+                            result = engineLocal.Apply(selectedDiff);
                         }
                         finally
                         {

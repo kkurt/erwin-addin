@@ -69,6 +69,17 @@ namespace EliteSoft.Erwin.AddIn.Forms
         private const int HTCAPTION = 0x2;
 
         private readonly UdpDiff _diff;
+        private ListView? _listView;
+        private Button? _btnApply;
+
+        /// <summary>
+        /// Diff filtered to the rows the user kept checked when they clicked
+        /// Apply. Set by <see cref="BtnApply_Click"/> just before
+        /// <see cref="DialogResult"/> is assigned to OK. Null until that
+        /// point. Caller (see <see cref="ShowFor"/>) reads this AFTER
+        /// ShowDialog returns to feed <c>UdpSyncEngine.Apply</c>.
+        /// </summary>
+        public UdpDiff? SelectedDiff { get; private set; }
 
         public UdpSyncDialog(UdpDiff diff)
         {
@@ -123,11 +134,24 @@ namespace EliteSoft.Erwin.AddIn.Forms
 
             var footerSep = new Panel { Dock = DockStyle.Bottom, Height = 1, BackColor = ClrBorder };
             var footer = BuildFooter(out Button apply, out Button cancel);
+            _btnApply = apply;
+
+            // Wire Apply to a custom click handler so we can build the
+            // filtered SelectedDiff before the dialog closes. The button's
+            // DialogResult would normally auto-close on click; we override
+            // by clearing DialogResult and assigning it ourselves after
+            // building the filtered diff.
+            apply.DialogResult = DialogResult.None;
+            apply.Click += BtnApply_Click;
 
             // ListView fills the centre. Constructed AFTER header / subtitle /
             // summary are docked so it claims the remaining vertical space.
             var listView = BuildListView();
+            _listView = listView;
             PopulateListView(listView);
+            // Track checked-row count so the Apply button can disable when
+            // the user has unchecked everything (nothing to apply).
+            listView.ItemChecked += (_, _) => UpdateApplyEnabled();
 
             // Docking order: Fill child first (claims the middle), then
             // bottom-docked footer + separator, then top-docked items in
@@ -315,32 +339,40 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 BackColor = Color.White,
                 Margin = new Padding(SidePadding, 0, SidePadding, 0),
                 Padding = new Padding(SidePadding, 0, SidePadding, 0),
-                OwnerDraw = true
+                OwnerDraw = true,
+                // Per-row opt-out. The user can uncheck rows they want to
+                // skip; the Apply button enables when at least one row is
+                // checked. Default state (set in PopulateListView) is all
+                // checked - the typical case is "yes, apply everything",
+                // so checking-by-default minimises clicks for the happy
+                // path while still letting power users opt out of specific
+                // diffs.
+                CheckBoxes = true
             };
 
+            // Column 0 is implicitly the "checkbox" column when CheckBoxes
+            // is true - the checkbox renders to the left of the first
+            // subitem text. We move the colored Action chip to column 1
+            // so it does not collide with the system-rendered checkbox.
+            lv.Columns.Add("Apply?", 60);
             lv.Columns.Add("Action", 90);
             lv.Columns.Add("UDP Name", 180);
-            lv.Columns.Add("Object Type", 120);
-            // Details column auto-sizes to remaining width via DialogWidth
-            // - other columns - vertical scrollbar reserve - paddings.
-            int detailsWidth = DialogWidth - 90 - 180 - 120 - SidePadding * 2 - 24;
+            lv.Columns.Add("Object Type", 110);
+            int detailsWidth = DialogWidth - 60 - 90 - 180 - 110 - SidePadding * 2 - 24;
             lv.Columns.Add("Details", Math.Max(120, detailsWidth));
 
-            // OwnerDraw lets us paint the Action column with the same colour
-            // palette as the summary counters. Without it the action label
-            // becomes a black-on-white block of text and the row's intent
-            // disappears at a glance on a dense diff. Other columns fall
-            // through to default rendering.
+            // OwnerDraw paints the Action column (column 1) with the same
+            // colour palette as the summary counters. Other columns fall
+            // through to default rendering. Column 0 (Apply?) is rendered
+            // by the system so the checkbox shows up cleanly.
             lv.DrawColumnHeader += (s, e) => e.DrawDefault = true;
             lv.DrawSubItem += (s, e) =>
             {
-                if (e.ColumnIndex != 0)
+                if (e.ColumnIndex != 1)
                 {
                     e.DrawDefault = true;
                     return;
                 }
-                // Column 0 = Action. Paint with the action colour as a small
-                // chip background for instant recognition.
                 var item = e.Item;
                 if (item == null)
                 {
@@ -361,7 +393,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 using (var bg = new SolidBrush(rowBg))
                     e.Graphics.FillRectangle(bg, e.Bounds);
 
-                // Coloured chip on the left, label text in white.
+                // Coloured chip with the action label centered in white.
                 var chipRect = new Rectangle(e.Bounds.X + 4, e.Bounds.Y + 3,
                                              e.Bounds.Width - 8, e.Bounds.Height - 6);
                 using (var chip = new SolidBrush(chipColor))
@@ -383,11 +415,16 @@ namespace EliteSoft.Erwin.AddIn.Forms
         {
             void Add(UdpDiffEntry entry)
             {
-                var li = new ListViewItem(entry.Action.ToString())
+                // Column 0 left empty - CheckBoxes=true puts the system
+                // checkbox here. Column 1+ carries the chip + name + type
+                // + details.
+                var li = new ListViewItem("")
                 {
                     Tag = entry,
-                    UseItemStyleForSubItems = false
+                    UseItemStyleForSubItems = false,
+                    Checked = true, // default: include all in Apply
                 };
+                li.SubItems.Add(entry.Action.ToString());
                 li.SubItems.Add(entry.UdpName);
                 li.SubItems.Add(entry.ObjectType);
                 li.SubItems.Add(entry.Details);
@@ -459,6 +496,47 @@ namespace EliteSoft.Erwin.AddIn.Forms
             apply = btnApply;
             cancel = btnCancel;
             return footer;
+        }
+
+        /// <summary>
+        /// Update the Apply button's enabled state based on how many rows
+        /// the user has currently checked. Zero checked rows = nothing to
+        /// apply = button disabled. Cancel is always available.
+        /// </summary>
+        private void UpdateApplyEnabled()
+        {
+            if (_btnApply == null || _listView == null) return;
+            int checkedCount = _listView.CheckedItems.Count;
+            _btnApply.Enabled = checkedCount > 0;
+        }
+
+        /// <summary>
+        /// Apply click handler: build a <see cref="UdpDiff"/> containing only
+        /// the rows the user kept checked, expose it via
+        /// <see cref="SelectedDiff"/>, and close with
+        /// <see cref="DialogResult.OK"/>. Disabled-button safety net guards
+        /// against the AcceptButton (Enter) path bypassing the enabled
+        /// state (e.g. focus-stealing race).
+        /// </summary>
+        private void BtnApply_Click(object? sender, EventArgs e)
+        {
+            if (_listView == null) return;
+            if (_listView.CheckedItems.Count == 0)
+            {
+                UpdateApplyEnabled();
+                return;
+            }
+
+            var filtered = new UdpDiff();
+            foreach (ListViewItem item in _listView.CheckedItems)
+            {
+                if (item.Tag is not UdpDiffEntry entry) continue;
+                if (entry.Action == UdpDiffAction.Create) filtered.Creates.Add(entry);
+                else if (entry.Action == UdpDiffAction.Update) filtered.Updates.Add(entry);
+            }
+            SelectedDiff = filtered;
+            DialogResult = DialogResult.OK;
+            Close();
         }
 
         #endregion
@@ -550,8 +628,17 @@ namespace EliteSoft.Erwin.AddIn.Forms
         /// Mirrors <see cref="AddinMessageDialog.Show"/>'s ergonomics so
         /// call sites have a single-line invocation.
         /// </summary>
-        public static bool ShowFor(UdpDiff diff, IWin32Window? owner = null)
+        /// <summary>
+        /// Show the dialog modally and return what the user chose. When they
+        /// click Apply, <paramref name="selectedDiff"/> carries the subset
+        /// of <paramref name="diff"/> they kept checked (which may be smaller
+        /// than the full diff if they unchecked rows). When they Cancel,
+        /// <paramref name="selectedDiff"/> is null.
+        /// </summary>
+        /// <returns>True if the user clicked Apply, false otherwise.</returns>
+        public static bool ShowFor(UdpDiff diff, IWin32Window? owner, out UdpDiff? selectedDiff)
         {
+            selectedDiff = null;
             if (diff == null) throw new ArgumentNullException(nameof(diff));
             if (diff.IsEmpty) return false;
 
@@ -569,7 +656,12 @@ namespace EliteSoft.Erwin.AddIn.Forms
             var result = effectiveOwner != null
                 ? dlg.ShowDialog(effectiveOwner)
                 : dlg.ShowDialog();
-            return result == DialogResult.OK;
+            if (result == DialogResult.OK)
+            {
+                selectedDiff = dlg.SelectedDiff;
+                return true;
+            }
+            return false;
         }
     }
 }
