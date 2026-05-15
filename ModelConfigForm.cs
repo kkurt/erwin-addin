@@ -1338,6 +1338,31 @@ namespace EliteSoft.Erwin.AddIn
                 return;
             }
 
+            // Silent-apply flag: when admin's "Apply UDP changes silently"
+            // checkbox is on for this config, skip the dialog and write the
+            // diff straight to the metamodel. Used by admin-managed shops
+            // where UDP definitions are centrally controlled and users
+            // should not see a sync prompt every model open. Read from
+            // CONFIG_PROPERTY via the existing PropertyApplicator helper.
+            bool silentApply = false;
+            try
+            {
+                silentApply = _propertyApplicatorService != null
+                              && _propertyApplicatorService.IsInitialized
+                              && _propertyApplicatorService.IsPropertyEnabled("ApplyUdpChangesSilently");
+            }
+            catch (Exception ex)
+            {
+                Log($"UDP sync: silent-apply flag read failed: {ex.Message}");
+            }
+
+            if (silentApply)
+            {
+                Log($"UDP sync: silent-apply mode (creates={diff.Creates.Count}, updates={diff.Updates.Count})");
+                ApplyUdpDiffSilently(syncEngine, diff);
+                return;
+            }
+
             if (_udpSyncDialogOpen)
             {
                 // Race guard: a previous BeginInvoke for an earlier connect
@@ -1437,6 +1462,54 @@ namespace EliteSoft.Erwin.AddIn
             {
                 Log($"UdpSync BeginInvoke failed: {ex.Message}");
                 AddConnectWarning($"UDP sync deferral failed: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Silent-apply branch of <see cref="RunUdpSyncIfNeeded"/>: when the
+        /// admin enabled "Apply UDP changes silently" for this config, write
+        /// the diff straight to the metamodel without showing the dialog.
+        /// Status bar reflects the outcome so the user still sees that
+        /// something happened. Runs synchronously inside InitializeModelServices
+        /// (no BeginInvoke deferral needed - silent apply has no modal
+        /// pump so it cannot deadlock Form.Load the way ShowDialog could).
+        /// </summary>
+        private void ApplyUdpDiffSilently(UdpSyncEngine engine, UdpDiff diff)
+        {
+            try
+            {
+                var result = engine.Apply(diff);
+                if (result.Success)
+                {
+                    int total = result.CreatedCount + result.UpdatedCount;
+                    Log($"UDP sync applied silently: created={result.CreatedCount}, updated={result.UpdatedCount}");
+                    UpdateStatus(
+                        $"UDP sync applied silently ({total} change{(total == 1 ? "" : "s")}).",
+                        Color.DarkGreen);
+                }
+                else
+                {
+                    Log($"UDP sync silent apply FAILED: {result.Error}");
+                    AddConnectWarning($"UDP sync apply failed: {result.Error}");
+                }
+
+                // Cascade refresh - same as dialog path. Independent of
+                // apply success/failure so dependency-set values reflect
+                // whatever made it into the metamodel.
+                try
+                {
+                    if (_udpRuntimeService != null && _udpRuntimeService.IsInitialized)
+                        _udpRuntimeService.UpdateDependencySetListValues();
+                }
+                catch (Exception ex)
+                {
+                    Log($"UDP sync silent-apply post-cascade refresh failed: {ex.Message}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"UDP sync silent apply error: {ex.Message}");
+                AddConnectWarning($"UDP sync silent apply error: {ex.Message}");
             }
         }
 
