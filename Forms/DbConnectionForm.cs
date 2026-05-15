@@ -478,19 +478,19 @@ namespace EliteSoft.Erwin.AddIn.Forms
             // Validate
             if (rbNative.Checked && string.IsNullOrWhiteSpace(txtServer.Text))
             {
-                MessageBox.Show("Server is required.", "Validation", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                AddinMessageDialog.Show("Server is required.", "Validation", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 DialogResult = DialogResult.None;
                 return;
             }
             if (rbOdbc.Checked && string.IsNullOrWhiteSpace(txtDsnName.Text))
             {
-                MessageBox.Show("DSN Name is required.", "Validation", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                AddinMessageDialog.Show("DSN Name is required.", "Validation", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 DialogResult = DialogResult.None;
                 return;
             }
             if (rbSqlAuth.Checked && string.IsNullOrWhiteSpace(txtUsername.Text))
             {
-                MessageBox.Show("Username is required for SQL Auth.", "Validation", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                AddinMessageDialog.Show("Username is required for SQL Auth.", "Validation", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 DialogResult = DialogResult.None;
                 return;
             }

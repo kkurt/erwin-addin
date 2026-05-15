@@ -6,6 +6,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Automation;
+using EliteSoft.Erwin.AddIn.Forms;
 
 namespace EliteSoft.Erwin.AddIn.Services
 {
@@ -730,7 +731,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 {
                     log?.Invoke("  [DB-7] [DEBUG-PAUSE] waiting for user to inspect RD - OK basinca Apply-to-Right tiklanacak");
                     try { overlayToggle?.Invoke(false); } catch { }
-                    System.Windows.Forms.MessageBox.Show(
+                    AddinMessageDialog.Show(
                         $"RD ekrani acik. Hangi modeller karsilastiriliyor + hangi ok tiklanacak (target: ({pt.X},{pt.Y})) inceleyin.\n\nOK basinca Apply-to-Right tiklanacak.",
                         "[DEBUG] From-DB Manuel Inceleme",
                         System.Windows.Forms.MessageBoxButtons.OK,

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Windows.Forms;
+using EliteSoft.Erwin.AddIn.Forms;
 
 namespace EliteSoft.Erwin.AddIn.Services
 {
@@ -145,6 +146,30 @@ namespace EliteSoft.Erwin.AddIn.Services
                 {
                     Log($"OnNewEntityDetected: UDP defaults error for '{physicalName}': {ex.Message}");
                 }
+
+                // Required-UDP enforcement (admin's IS_REQUIRED=true flag,
+                // 2026-05-15). ApplyDefaults above only seeds UDPs that have
+                // a DEFAULT_VALUE in MC_UDP_DEFINITION; required UDPs whose
+                // admin entry has no default (e.g. TABLE_TYPE marked as
+                // required with no fixed default - user must explicitly pick
+                // FACT / DIMENSION / etc) stay empty and silently violate
+                // the contract. The standalone UdpValidationEngine.ValidateAll
+                // already detects this case but was never invoked from the
+                // new-entity path; this block runs it and opens a modal that
+                // forces the user to pick before the pipeline returns.
+                //
+                // Cancel / [X] leaves the entity with empty values - the
+                // subsequent validation tick will surface the same error
+                // through the standard error-reporting path, so we do NOT
+                // delete the entity from here.
+                try
+                {
+                    PromptForMissingRequiredUdps(entity, physicalName);
+                }
+                catch (Exception ex)
+                {
+                    Log($"OnNewEntityDetected: required-UDP prompt error for '{physicalName}': {ex.Message}");
+                }
             }
 
             // Unconditional predefined columns (admin's 2026-05-14 extension).
@@ -163,6 +188,82 @@ namespace EliteSoft.Erwin.AddIn.Services
             catch (Exception ex)
             {
                 Log($"OnNewEntityDetected: AddUnconditionalPredefinedColumns error for '{physicalName}': {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Discover any Table-scope UDP definitions marked IS_REQUIRED whose
+        /// current value on <paramref name="entity"/> is still empty, then
+        /// open <see cref="Forms.RequiredUdpForm"/> so the user picks values.
+        /// On DialogResult.OK the picked values are written back through the
+        /// UDP runtime (same path ApplyDefaults uses), which fires the usual
+        /// dependency cascades + locked-UDP/term-type pipeline through the
+        /// next timer tick.
+        ///
+        /// Cancel + [X] returns without writing anything; the entity keeps
+        /// its empty values, and the subsequent
+        /// <see cref="UdpRuntimeService.ValidateBeforeSave"/> tick will
+        /// continue reporting the violation through the standard channel.
+        /// We do NOT delete the entity from here - rules apply to new
+        /// objects only and the user may have a reason to defer the pick.
+        /// </summary>
+        private void PromptForMissingRequiredUdps(dynamic entity, string physicalName)
+        {
+            // Read current Table UDP values once. ReadUdpValues swallows
+            // per-property COM errors so a misconfigured UDP (e.g. metamodel
+            // missing the Property_Type) does not block the prompt for
+            // unrelated required UDPs.
+            Dictionary<string, string> currentValues;
+            try { currentValues = _udpRuntimeService.ReadUdpValues((object)entity, "Table"); }
+            catch (Exception ex)
+            {
+                Log($"PromptForMissingRequiredUdps: ReadUdpValues failed on '{physicalName}': {ex.Message}");
+                currentValues = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            }
+
+            var missing = UdpDefinitionService.Instance
+                .GetByObjectType("Table")
+                .Where(d => d != null && d.IsRequired)
+                .Where(d =>
+                {
+                    if (!currentValues.TryGetValue(d.Name, out var v)) return true;
+                    return string.IsNullOrEmpty(v);
+                })
+                .ToList();
+
+            if (missing.Count == 0) return;
+
+            Log($"PromptForMissingRequiredUdps: '{physicalName}' missing {missing.Count} required UDP(s): {string.Join(", ", missing.Select(m => m.Name))}");
+
+            using (var form = new Forms.RequiredUdpForm(physicalName, missing))
+            {
+                var result = form.ShowDialog();
+                if (result != DialogResult.OK || form.SelectedValues.Count == 0)
+                {
+                    Log($"PromptForMissingRequiredUdps: user cancelled or supplied no values for '{physicalName}'");
+                    return;
+                }
+
+                try
+                {
+                    _udpRuntimeService.WriteUdpValues((object)entity, form.SelectedValues, "Table");
+                    Log($"PromptForMissingRequiredUdps: wrote {form.SelectedValues.Count} required UDP value(s) on '{physicalName}'");
+                }
+                catch (Exception ex)
+                {
+                    Log($"PromptForMissingRequiredUdps: WriteUdpValues failed on '{physicalName}': {ex.Message}");
+                    return;
+                }
+
+                // Run dependency cascades for each picked value so any
+                // conditional predefined column / dependent UDP that hangs
+                // off TABLE_TYPE etc. fires immediately, instead of waiting
+                // for the next user edit to trip CheckForUdpValueChanges.
+                foreach (var kvp in form.SelectedValues)
+                {
+                    try { _udpRuntimeService.HandleUdpValueChange(entity, kvp.Key, kvp.Value); }
+                    catch (Exception ex) { Log($"PromptForMissingRequiredUdps: dependency cascade failed for '{kvp.Key}': {ex.Message}"); }
+                }
             }
         }
 
@@ -962,7 +1063,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 string afterAll = NamingValidationEngine.ApplyNamingStandards(objectType, physicalName, scapiBoxed, autoOnly: false);
                 if (!string.Equals(afterAll, physicalName, StringComparison.Ordinal))
                 {
-                    var answer = System.Windows.Forms.MessageBox.Show(
+                    var answer = AddinMessageDialog.Show(
                         $"Naming standard suggests changes for '{physicalName}':\n\n" +
                         $"'{physicalName}' -> '{afterAll}'\n\n" +
                         $"Apply?",
@@ -1015,7 +1116,21 @@ namespace EliteSoft.Erwin.AddIn.Services
             {
                 foreach (var f in failures)
                 {
-                    Log($"Naming standard violation ({f.RuleName}): '{nameToValidate}' — {f.ErrorMessage}");
+                    // Diagnostic suffix: when the failing check is a Regexp
+                    // rule, also log the EXACT stored pattern (truncated for
+                    // log readability). Without this an admin reading the
+                    // log cannot tell whether the regex stored in DB is
+                    // what they typed in the admin UI - we hit exactly that
+                    // confusion on 2026-05-15 (admin typed `^.{0,3}$` but a
+                    // different value was rejecting every name).
+                    string diag = "";
+                    if (f.Rule != null && string.Equals(f.RuleName, "Regexp", StringComparison.Ordinal))
+                    {
+                        string p = f.Rule.RegexpPattern ?? "";
+                        if (p.Length > 80) p = p.Substring(0, 77) + "...";
+                        diag = $" [pattern(len={(f.Rule.RegexpPattern ?? "").Length})='{p}']";
+                    }
+                    Log($"Naming standard violation ({f.RuleName}): '{nameToValidate}' — {f.ErrorMessage}{diag}");
                 }
 
                 // Phase-2H (2026-05-13): if ANY failing rule is AUTO_APPLY=true,
@@ -1046,7 +1161,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     ? $"Naming standard violation(s) for '{nameToValidate}':\n\n{messages}\n\n" +
                       $"The name will be reset to 'PLEASE_CHANGE_IT'. Please choose a name that matches the standard."
                     : $"Naming standard violation(s) for '{nameToValidate}':\n\n{messages}";
-                System.Windows.Forms.MessageBox.Show(
+                AddinMessageDialog.Show(
                     popupBody,
                     "Naming Standard",
                     System.Windows.Forms.MessageBoxButtons.OK,
@@ -1159,7 +1274,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     "Table");
                                 Log($"UDP '{kvp.Key}' is locked on '{physicalName}' - reverted '{kvp.Value}' -> '{oldValue}'");
 
-                                System.Windows.Forms.MessageBox.Show(
+                                AddinMessageDialog.Show(
                                     $"'{kvp.Key}' UDP'si kilitli. Yeni deger ('{kvp.Value}') reddedildi; '{oldValue}' olarak korundu.",
                                     "UDP Kilitli",
                                     System.Windows.Forms.MessageBoxButtons.OK,

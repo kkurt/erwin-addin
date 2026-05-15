@@ -264,6 +264,15 @@ namespace EliteSoft.Erwin.AddIn.Services
                 {
                     if (!Regex.IsMatch(objectName, rule.RegexpPattern))
                     {
+                        // Diagnostic: surface the exact stored pattern + the
+                        // tested name so a future "regex looks right but
+                        // rejects every name" bug can be triaged from the
+                        // file log. (Without this line the user sees only
+                        // the human-readable ErrorMessage and the rule
+                        // pattern stays invisible at runtime.)
+                        System.Diagnostics.Debug.WriteLine(
+                            $"NamingValidation: regex fail rule#{rule.Id} pattern(len={rule.RegexpPattern.Length})='{rule.RegexpPattern}' name(len={objectName.Length})='{objectName}'");
+
                         results.Add(NamingValidationResult.Invalid("Regexp",
                             !string.IsNullOrEmpty(rule.ErrorMessage)
                                 ? rule.ErrorMessage

@@ -93,6 +93,16 @@ namespace EliteSoft.Erwin.AddIn.Services
         public int Count => _allRules.Count;
 
         /// <summary>
+        /// Read-only view of every active rule the service is holding. Used
+        /// by <c>ModelConfigForm.LoadNamingStandards</c> to emit a per-rule
+        /// diagnostic dump into the file log so a future "regex looks fine
+        /// in admin UI but rejects every name" bug can be triaged from the
+        /// log without running ad-hoc SQL. Returns an empty list when the
+        /// service has not loaded yet.
+        /// </summary>
+        public IReadOnlyList<NamingStandardRule> AllRules => _allRules;
+
+        /// <summary>
         /// Load all active naming standard rules from MC_NAMING_STANDARD.
         /// </summary>
         public bool LoadStandards()
@@ -148,7 +158,15 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     Suffix = reader["SUFFIX"] == DBNull.Value ? "" : reader["SUFFIX"]?.ToString()?.Trim() ?? "",
                                     LengthOperator = reader["LENGTH_OPERATOR"] == DBNull.Value ? "" : reader["LENGTH_OPERATOR"]?.ToString()?.Trim() ?? "",
                                     LengthValue = reader["LENGTH_VALUE"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["LENGTH_VALUE"]),
-                                    RegexpPattern = reader["REGEXP_PATTERN"] == DBNull.Value ? "" : reader["REGEXP_PATTERN"]?.ToString() ?? "",
+                                    // Defensive trim: 2026-05-15 we observed admin's UI
+                                    // saving '^.{0,3}$\n' (trailing newline) which made
+                                    // Regex.IsMatch reject every name because the literal
+                                    // \n at the end required a newline in the input.
+                                    // Trim removes any leading/trailing whitespace before
+                                    // the regex compiler sees the pattern. The admin UI
+                                    // should also trim before save, but defending here
+                                    // protects against any past + future authoring quirks.
+                                    RegexpPattern = reader["REGEXP_PATTERN"] == DBNull.Value ? "" : (reader["REGEXP_PATTERN"]?.ToString() ?? "").Trim(),
                                     ErrorMessage = reader["ERROR_MESSAGE"] == DBNull.Value ? "" : reader["ERROR_MESSAGE"]?.ToString() ?? "",
                                     AutoApply = reader["AUTO_APPLY"] != DBNull.Value && Convert.ToBoolean(reader["AUTO_APPLY"]),
                                     IsActive = Convert.ToBoolean(reader["IS_ACTIVE"]),

@@ -4,6 +4,7 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows.Forms;
+using EliteSoft.Erwin.AddIn.Forms;
 
 namespace EliteSoft.Erwin.AddIn.Services
 {
@@ -2649,7 +2650,7 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                 if (!suppressPopup)
                 {
-                    MessageBox.Show(
+                    AddinMessageDialog.Show(
                         $"Column '{curr.TableName}.{curr.PhysicalName}' is tagged '{canonical}' in the glossary.\n\n" +
                         $"{disallowed} cannot be changed and was reverted.\n\n" +
                         $"Restored: {corrected}",
@@ -2822,7 +2823,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 string afterAll = NamingValidationEngine.ApplyNamingStandards("Column", state.PhysicalName, attrBoxed, autoOnly: false);
                 if (!string.Equals(afterAll, state.PhysicalName, StringComparison.Ordinal))
                 {
-                    var answer = MessageBox.Show(
+                    var answer = AddinMessageDialog.Show(
                         $"Naming standard suggests changes for column '{state.TableName}.{state.PhysicalName}':\n\n" +
                         $"'{state.PhysicalName}' -> '{afterAll}'\n\n" +
                         $"Apply?",
@@ -2937,7 +2938,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                             if (NamingValidationEngine.HasAutoApplyChanges("Index", kgName, (object)kg))
                             {
                                 string newName = NamingValidationEngine.ApplyNamingStandards("Index", kgName, (object)kg);
-                                var answer = MessageBox.Show(
+                                var answer = AddinMessageDialog.Show(
                                     $"Naming standard requires changes for index '{tableName}.{kgName}':\n\n" +
                                     $"'{kgName}' → '{newName}'\n\nApply automatically?",
                                     "Naming Standard — Auto Apply",
@@ -3345,7 +3346,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     title = "Naming Standard Warning";
                 }
 
-                MessageBox.Show(
+                AddinMessageDialog.Show(
                     sb.ToString(),
                     title,
                     MessageBoxButtons.OK,

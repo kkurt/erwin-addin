@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using System.Windows.Forms;
+using EliteSoft.Erwin.AddIn.Forms;
 
 namespace EliteSoft.Erwin.AddIn
 {
@@ -62,7 +63,7 @@ namespace EliteSoft.Erwin.AddIn
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"Model açma hatası: {ex.Message}", "Hata",
+                AddinMessageDialog.Show($"Model açma hatası: {ex.Message}", "Hata",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return false;
             }
@@ -216,7 +217,7 @@ namespace EliteSoft.Erwin.AddIn
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"Script kaydetme hatası: {ex.Message}", "Hata",
+                AddinMessageDialog.Show($"Script kaydetme hatası: {ex.Message}", "Hata",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return null;
             }

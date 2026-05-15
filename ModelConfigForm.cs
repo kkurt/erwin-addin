@@ -5,6 +5,7 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using EliteSoft.Erwin.AddIn.Forms;
 using EliteSoft.Erwin.AddIn.Services;
 using EliteSoft.MetaAdmin.Services;
 
@@ -1379,7 +1380,18 @@ namespace EliteSoft.Erwin.AddIn
             const int repoY = 84;
             const int repoH = 158;
             var card = CreateSectionCard("Repository", cardX, repoY, cardW, repoH, clrCardBg, clrCardHeader);
-            AddCardRow(card, "Corporate:", "(not loaded)", fontBold, font, 0, out _, out _lblCorporateValue);
+            AddCardRow(card, "Config:", "(not loaded)", fontBold, font, 0, out _, out _lblCorporateValue);
+#if !PACKAGED
+            // Dev-only: re-run the full validation pipeline (CONFIG row from DB
+            // + glossary / UDP / naming-standards / predefined-columns reload)
+            // without restarting the addin. Hidden in packaged builds so end
+            // users don't trigger the 4-5s reinit cycle by accident.
+            int reloadBtnLeft = AddRepositoryReloadButton(card, cardW);
+            // Keep the AutoSize label from running under the dev button when a
+            // very long "Corp / Config (DBType)" string is rendered.
+            _lblCorporateValue.MaximumSize = new Size(reloadBtnLeft - 120 - 8, 0);
+            _lblCorporateValue.AutoEllipsis = true;
+#endif
             AddCardRow(card, "Database:",  "(not loaded)", fontBold, font, 1, out _, out _lblDbValue);
             AddCardRow(card, "Registry:",  "(not loaded)", fontBold, font, 2, out _, out _lblRegistryValue);
             // Warnings row surfaces any service-load failure (schema mismatch,
@@ -1744,6 +1756,88 @@ namespace EliteSoft.Erwin.AddIn
             host.Controls.Add(lblValue);
         }
 
+#if !PACKAGED
+        /// <summary>
+        /// Dev-only "Reload Config" button anchored to the right of the
+        /// Repository card's first row. Re-runs the full validation pipeline
+        /// (CONFIG row from DB + all config-scoped services) so a config edit
+        /// in the admin tool is picked up without restarting erwin.
+        /// </summary>
+        private int AddRepositoryReloadButton(Panel card, int cardW)
+        {
+            var host = card.Tag as Panel ?? card;
+            const int btnW = 110;
+            const int btnH = 22;
+            // Row 0's label sits at y=14; align the button's vertical center
+            // with the row by inset of 2px above (matches typical Button vs
+            // AutoSize Label baseline on Segoe UI 9pt).
+            int btnX = (cardW - 2) - btnW - 12;
+            int btnY = 12;
+
+            var btn = new Button
+            {
+                Text = "Reload Config",
+                Location = new Point(btnX, btnY),
+                Size = new Size(btnW, btnH),
+                FlatStyle = FlatStyle.System,
+                UseVisualStyleBackColor = true,
+                TabStop = false,
+            };
+            btn.Click += BtnReloadConfig_Click;
+            host.Controls.Add(btn);
+            return btnX;
+        }
+
+        private void BtnReloadConfig_Click(object sender, EventArgs e)
+        {
+            var btn = sender as Button;
+            // Re-entrancy guard: full reload is ~4-5s; disabling the button
+            // prevents the user from queuing a second pass that would interleave
+            // with the first DisposeServices/LoadGlossary cycle.
+            if (btn != null) btn.Enabled = false;
+            Form overlay = null;
+            try
+            {
+                Log("Reload Config: user triggered full validation re-init.");
+                overlay = ShowBusyOverlay("Reloading config from database, please wait...");
+                Application.DoEvents();
+
+                // Force the full pipeline (not the fast model-switch path).
+                _globalDataLoaded = false;
+                using (AddinLogger.BeginScope("InitializeValidationService(reload)"))
+                    InitializeValidationService();
+
+                if (Services.ConfigContextService.Instance.IsInitialized)
+                    _globalDataLoaded = true;
+
+                using (AddinLogger.BeginScope("UpdateGeneralTab(reload)"))
+                    UpdateGeneralTab();
+
+                Log("Reload Config: complete.");
+            }
+            catch (Exception ex)
+            {
+                // Surface the failure rather than swallowing - reload is a
+                // dev-only diagnostic, the stack trace is what we need.
+                Log($"Reload Config failed: {ex}");
+                AddinMessageDialog.Show(this,
+                    $"Reload Config failed:\r\n{ex.Message}",
+                    "Reload Config",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+            finally
+            {
+                if (overlay != null && !overlay.IsDisposed)
+                {
+                    overlay.Close();
+                    overlay.Dispose();
+                }
+                if (btn != null && !btn.IsDisposed) btn.Enabled = true;
+            }
+        }
+#endif
+
         /// <summary>
         /// Update General tab with corporate and connection info after initialization.
         /// </summary>
@@ -1762,8 +1856,11 @@ namespace EliteSoft.Erwin.AddIn
                     // would have left the label red, and skipping the reset
                     // was the user-reported 2026-05-14 bug ("bağlanınca da
                     // kırmızı kalıyor").
+                    // Label column already reads "Config:", so the value just
+                    // carries the config name (optionally prefixed by the
+                    // corporate group) without duplicating the "Config:" word.
                     string corpLabel = string.IsNullOrEmpty(ctx.CorporateName)
-                        ? $"Config: {ctx.ActiveConfigName}"
+                        ? ctx.ActiveConfigName
                         : $"{ctx.CorporateName} / {ctx.ActiveConfigName}";
                     string dbType = null;
                     try { dbType = DatabaseService.Instance.GetDbType(); } catch { }
@@ -2532,6 +2629,31 @@ namespace EliteSoft.Erwin.AddIn
                 if (service.IsLoaded)
                 {
                     Log($"NAMING_STANDARD loaded: {service.Count} active rules");
+
+                    // Per-rule diagnostic dump. Surfaces the EXACT stored
+                    // regex pattern, length operator/value, and error
+                    // message prefix so admin-side "the rule looks right
+                    // but the addin keeps rejecting names" bugs can be
+                    // triaged from the file log alone. Verified necessary
+                    // 2026-05-15: a regex that admins typed as `^.{0,3}$`
+                    // was rejecting every name, and without per-rule
+                    // logging we could not see what the addin had actually
+                    // loaded vs. what the admin UI displayed.
+                    foreach (var rule in service.AllRules)
+                    {
+                        string regex = rule.RegexpPattern ?? "";
+                        string lenOp = string.IsNullOrEmpty(rule.LengthOperator) ? "-" : rule.LengthOperator;
+                        string lenVal = rule.LengthValue?.ToString() ?? "-";
+                        string udpCond = string.IsNullOrEmpty(rule.DependsOnUdpName)
+                            ? "(none)"
+                            : $"{rule.DependsOnUdpName}={rule.DependsOnUdpValue ?? "(any)"}";
+                        string msg = rule.ErrorMessage ?? "";
+                        if (msg.Length > 80) msg = msg.Substring(0, 77) + "...";
+                        Log($"  rule#{rule.Id} {rule.ObjectType}.{rule.PropertyCode} " +
+                            $"prefix='{rule.Prefix}' suffix='{rule.Suffix}' " +
+                            $"len{lenOp}{lenVal} regex(len={regex.Length})='{regex}' " +
+                            $"auto={rule.AutoApply} cond={udpCond} msg='{msg}'");
+                    }
                 }
                 else
                 {
@@ -2614,13 +2736,13 @@ namespace EliteSoft.Erwin.AddIn
             {
                 if (cmbTables.SelectedItem == null)
                 {
-                    MessageBox.Show("Please select a table first.", "No Table Selected", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    AddinMessageDialog.Show("Please select a table first.", "No Table Selected", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return;
                 }
 
                 if (!chkArchiveTable.Checked && !chkIsolatedTable.Checked)
                 {
-                    MessageBox.Show("Please select at least one option (Archive or Isolated).", "No Option Selected", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    AddinMessageDialog.Show("Please select at least one option (Archive or Isolated).", "No Option Selected", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return;
                 }
 
@@ -2758,7 +2880,7 @@ namespace EliteSoft.Erwin.AddIn
                     if (tableName == newTableName)
                     {
                         Log($"Table '{newTableName}' already exists - skipping");
-                        MessageBox.Show($"Table '{newTableName}' already exists.", "Table Exists", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        AddinMessageDialog.Show($"Table '{newTableName}' already exists.", "Table Exists", MessageBoxButtons.OK, MessageBoxIcon.Information);
                         return false;
                     }
                 }
@@ -5221,7 +5343,7 @@ namespace EliteSoft.Erwin.AddIn
             UpdateConnectionStatus(StatusDisconnected, Color.Red);
             _isConnected = false;
             UpdateStatus("Connection failed.", Color.Red);
-            MessageBox.Show(this, message, title, MessageBoxButtons.OK, MessageBoxIcon.Error);
+            AddinMessageDialog.Show(this, message, title, MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
 
         #endregion

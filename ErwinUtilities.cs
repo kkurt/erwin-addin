@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using System.Windows.Forms;
+using EliteSoft.Erwin.AddIn.Forms;
 
 namespace EliteSoft.Erwin.AddIn
 {
@@ -30,7 +31,7 @@ namespace EliteSoft.Erwin.AddIn
         {
             if (string.IsNullOrWhiteSpace(value))
             {
-                MessageBox.Show($"{fieldName} alanı boş geçilemez!", "Doğrulama Hatası",
+                AddinMessageDialog.Show($"{fieldName} alanı boş geçilemez!", "Doğrulama Hatası",
                     MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return false;
             }
@@ -73,7 +74,7 @@ namespace EliteSoft.Erwin.AddIn
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"Dosya yazma hatası: {ex.Message}", "Hata",
+                AddinMessageDialog.Show($"Dosya yazma hatası: {ex.Message}", "Hata",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return false;
             }
@@ -118,7 +119,7 @@ namespace EliteSoft.Erwin.AddIn
 
             if (string.IsNullOrEmpty(targetBranch))
             {
-                MessageBox.Show("Hedef ortam bulunamadı, lütfen ortamlara göre şema isimlerini giriniz.",
+                AddinMessageDialog.Show("Hedef ortam bulunamadı, lütfen ortamlara göre şema isimlerini giriniz.",
                     "Uyarı", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
 
@@ -349,12 +350,12 @@ namespace EliteSoft.Erwin.AddIn
         {
             if (HasErrors)
             {
-                MessageBox.Show($"Model \"Error\"'ler bulunmaktadır. Düzeltip devam ediniz.\n\n{string.Join("\n", Errors)}",
+                AddinMessageDialog.Show($"Model \"Error\"'ler bulunmaktadır. Düzeltip devam ediniz.\n\n{string.Join("\n", Errors)}",
                     "Model Kontrol Sonucu", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             else if (HasWarnings)
             {
-                var answer = MessageBox.Show($"Model \"Warning\"'ler bulunmaktadır. Devam etmek ister misiniz?\n\n{string.Join("\n", Warnings)}",
+                var answer = AddinMessageDialog.Show($"Model \"Warning\"'ler bulunmaktadır. Devam etmek ister misiniz?\n\n{string.Join("\n", Warnings)}",
                     "Model Kontrol Sonucu", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
                 Success = (answer == DialogResult.Yes);
             }

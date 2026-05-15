@@ -22,6 +22,16 @@ namespace EliteSoft.Erwin.AddIn
         private static ModelConfigForm _activeForm = null;
         private static bool _exceptionHandlerInstalled = false;
 
+        /// <summary>
+        /// Public read-only accessor for the currently displayed addin form.
+        /// Used by <c>AddinMessageDialog</c> to position popups on the same
+        /// monitor as the addin (a popup that lands on a different display
+        /// from the host window is a UX bug - verified 2026-05-15). Returns
+        /// null when no form is active (between add-in unload/load cycles).
+        /// </summary>
+        public static System.Windows.Forms.Form ActiveForm =>
+            (_activeForm != null && !_activeForm.IsDisposed) ? _activeForm : null;
+
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         private static extern int MessageBoxW(IntPtr hWnd, string text, string caption, uint type);
 
