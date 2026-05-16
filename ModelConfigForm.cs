@@ -139,6 +139,16 @@ namespace EliteSoft.Erwin.AddIn
         // State tracking
         private Timer _glossaryRefreshTimer;
         private Timer _reconnectTimer;
+        // Re-entrancy guard for ReconnectTimer_Tick. The tick handler ends up
+        // calling ConnectToModel, whose splash Form.Show + COM Sessions.Open +
+        // explicit Application.DoEvents all pump the WinForms message loop;
+        // queued WM_TIMER messages from _reconnectTimer fire during that pump
+        // and re-enter the handler. Verified from the 2026-05-16 debug log:
+        // two ticks 144 ms apart both detected the same divergent locator,
+        // each running its own InitializeValidationService -> degraded path
+        // -> ShowConfigWarningDialog, producing two identical "no config"
+        // popups for a single model open.
+        private bool _inReconnectTick;
         private DateTime? _lastGlossaryRefreshTime;
         private volatile bool _isRefreshingGlossary;
 
@@ -748,6 +758,15 @@ namespace EliteSoft.Erwin.AddIn
             // was the fix for scenario 4 - the add-in used to keep validating
             // the original model's config indefinitely after a side-by-side
             // create, with no UI hint that anything was stale.
+            //
+            // Re-entrancy guard: ConnectToModel below pumps the message loop
+            // (splash Form.Show, _session.Open COM call, explicit
+            // Application.DoEvents) and the next queued WM_TIMER from this
+            // same timer fires inside that pump. Without the flag the second
+            // tick re-runs the whole detect-and-reconnect body for the same
+            // locator and produces a duplicate ShowConfigWarningDialog popup.
+            if (_inReconnectTick) return;
+            _inReconnectTick = true;
             try
             {
                 dynamic persistenceUnits = _scapi.PersistenceUnits;
@@ -981,6 +1000,10 @@ namespace EliteSoft.Erwin.AddIn
             catch (Exception ex)
             {
                 Log($"Reconnect poll error: {ex.Message}");
+            }
+            finally
+            {
+                _inReconnectTick = false;
             }
         }
 
@@ -2026,34 +2049,123 @@ namespace EliteSoft.Erwin.AddIn
 
 #if !PACKAGED
         /// <summary>
-        /// Dev-only "Reload Config" button anchored to the right of the
-        /// Repository card's first row. Re-runs the full validation pipeline
-        /// (CONFIG row from DB + all config-scoped services) so a config edit
-        /// in the admin tool is picked up without restarting erwin.
+        /// Dev-only "Reload Config" + "Probe Properties" buttons anchored
+        /// to the right of the Repository card's first row. Reload Config
+        /// re-runs the full validation pipeline (CONFIG row from DB + all
+        /// config-scoped services) so a config edit in the admin tool is
+        /// picked up without restarting erwin. Probe Properties dumps the
+        /// SCAPI Properties collection for one instance of each interesting
+        /// object class (Entity, Attribute, View, ...) so admins can find
+        /// the right PROPERTY_CODE for new naming-standard rules - see
+        /// <see cref="MetamodelPropertyProbeService"/>.
         /// </summary>
         private int AddRepositoryReloadButton(Panel card, int cardW)
         {
             var host = card.Tag as Panel ?? card;
             const int btnW = 110;
+            const int probeW = 130;
             const int btnH = 22;
+            const int gap = 6;
             // Row 0's label sits at y=14; align the button's vertical center
             // with the row by inset of 2px above (matches typical Button vs
             // AutoSize Label baseline on Segoe UI 9pt).
-            int btnX = (cardW - 2) - btnW - 12;
+            int reloadX = (cardW - 2) - btnW - 12;
+            int probeX = reloadX - probeW - gap;
             int btnY = 12;
 
-            var btn = new Button
+            var probeBtn = new Button
+            {
+                Text = "Probe Properties",
+                Location = new Point(probeX, btnY),
+                Size = new Size(probeW, btnH),
+                FlatStyle = FlatStyle.System,
+                UseVisualStyleBackColor = true,
+                TabStop = false,
+            };
+            probeBtn.Click += BtnProbeProperties_Click;
+            host.Controls.Add(probeBtn);
+
+            var reloadBtn = new Button
             {
                 Text = "Reload Config",
-                Location = new Point(btnX, btnY),
+                Location = new Point(reloadX, btnY),
                 Size = new Size(btnW, btnH),
                 FlatStyle = FlatStyle.System,
                 UseVisualStyleBackColor = true,
                 TabStop = false,
             };
-            btn.Click += BtnReloadConfig_Click;
-            host.Controls.Add(btn);
-            return btnX;
+            reloadBtn.Click += BtnReloadConfig_Click;
+            host.Controls.Add(reloadBtn);
+            // Return the LEFT-most button's X so the label MaximumSize math
+            // shrinks past both buttons.
+            return probeX;
+        }
+
+        private void BtnProbeProperties_Click(object sender, EventArgs e)
+        {
+            var btn = sender as Button;
+            if (btn != null) btn.Enabled = false;
+            Form overlay = null;
+            try
+            {
+                if (_session == null || _scapi == null || _currentModel == null)
+                {
+                    AddinMessageDialog.Show(this,
+                        "Probe Properties needs an active model session - connect to a model first.",
+                        "Probe Properties",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                    return;
+                }
+
+                Log("Probe Properties: starting metamodel property dump.");
+                overlay = ShowBusyOverlay("Probing SCAPI properties, please wait...");
+                Application.DoEvents();
+
+                var probe = new MetamodelPropertyProbeService(_session, _scapi, _currentModel);
+                probe.OnLog += Log;
+                string outPath = probe.RunProbe();
+
+                Log($"Probe Properties: dump written to {outPath}");
+
+                // Best-effort open the file in the default text editor so
+                // the user can scan it immediately without hunting in temp.
+                try
+                {
+                    System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(outPath)
+                    {
+                        UseShellExecute = true,
+                    });
+                }
+                catch (Exception openEx)
+                {
+                    Log($"Probe Properties: could not auto-open '{outPath}': {openEx.Message}");
+                }
+
+                AddinMessageDialog.Show(this,
+                    $"Property dump written to:\n{outPath}\n\nThe file should open in your default text editor.",
+                    "Probe Properties",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                Log($"Probe Properties failed: {ex}");
+                AddinMessageDialog.Show(this,
+                    $"Probe Properties failed:\r\n{ex.Message}",
+                    "Probe Properties",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+            finally
+            {
+                if (overlay != null && !overlay.IsDisposed)
+                {
+                    overlay.Close();
+                    overlay.Dispose();
+                }
+                if (btn != null && !btn.IsDisposed) btn.Enabled = true;
+            }
         }
 
         private void BtnReloadConfig_Click(object sender, EventArgs e)
