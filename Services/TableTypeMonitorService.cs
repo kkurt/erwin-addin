@@ -1115,9 +1115,10 @@ namespace EliteSoft.Erwin.AddIn.Services
             // Step 3b (2026-05-16): the admin can author rules on any
             // PROPERTY_DEF, not just Physical_Name. Iterate every property
             // code that has rules for this object type, read the live
-            // value, and accumulate failures. Without this, rules on
-            // Table.Owner / Column.Definition / etc. loaded fine but
-            // never fired against an actual entity.
+            // value via direct SCAPI access (admin's PROPERTY_CODE is now
+            // the exact erwin accessor name, verified empirically across
+            // SQL Server / Oracle / DB2 z/OS / PostgreSQL on 2026-05-16),
+            // and accumulate failures.
             if (scapiObject != null)
             {
                 foreach (var propertyCode in NamingStandardService.Instance.GetPropertyCodes(objectType))
@@ -1125,7 +1126,20 @@ namespace EliteSoft.Erwin.AddIn.Services
                     if (string.Equals(propertyCode, "Physical_Name", StringComparison.OrdinalIgnoreCase))
                         continue; // already covered by the Physical_Name run above
 
-                    string propValue = ReadScapiPropertyWithFallback(scapiObject, objectType, propertyCode);
+                    string propValue;
+                    try
+                    {
+                        propValue = scapiObject.Properties(propertyCode)?.Value?.ToString() ?? "";
+                    }
+                    catch (Exception ex)
+                    {
+                        // SCAPI rejected the property name. Admin DB is out
+                        // of sync with this DBMS's erwin metamodel - log so
+                        // the admin can run the Probe Properties dev tool
+                        // to find the right accessor for this DBMS.
+                        Log($"Naming standard: SCAPI rejected '{objectType}.{propertyCode}': {ex.Message}");
+                        continue;
+                    }
 
                     var extraResults = NamingValidationEngine.ValidateObjectName(
                         objectType, propValue, scapiBoxed, propertyCode);
@@ -1225,90 +1239,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                         Log($"PLEASE_CHANGE_IT rename failed for '{nameToValidate}': {ex.Message}");
                     }
                 }
-            }
-        }
-
-        /// <summary>
-        /// Read a SCAPI property by admin's <c>PROPERTY_CODE</c> with DBMS-
-        /// aware fallback. erwin's metamodel does not expose every admin-
-        /// authored property under the same name on every DBMS - the most
-        /// common case is <c>Table.Owner</c>, which the admin authors as
-        /// "Owner" but erwin actually surfaces under DBMS-specific names
-        /// ("Schema" / "SQL_Server_Schema" / "Oracle_Owner" / etc.).
-        /// Without this fallback chain a "Length &gt; 0" rule on
-        /// <c>Table.Owner</c> just logs "is not valid class id" and never
-        /// fires the popup (verified 2026-05-16 against the live MSSQL
-        /// model). Mirrors the chain used by
-        /// <c>ErwinAlterDdl.ActiveSessionMapProvider.ReadSchemaProperty</c>.
-        ///
-        /// Returns an empty string when no fallback resolves; this is the
-        /// correct value for the rest of the validation pipeline (a "Length
-        /// &gt; 0" rule still fires because 0 is not &gt; 0).
-        /// </summary>
-        private string ReadScapiPropertyWithFallback(dynamic scapiObject, string objectType, string propertyCode)
-        {
-            if (TryReadScapiProperty(scapiObject, propertyCode, out string value))
-                return value;
-
-            // Owner is the empirically broken case. Add other admin-coded
-            // properties here as we find them (none known on 2026-05-16).
-            bool isOwnerOnTableLike =
-                string.Equals(propertyCode, "Owner", StringComparison.OrdinalIgnoreCase)
-                && (string.Equals(objectType, "Table", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(objectType, "View", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(objectType, "Column", StringComparison.OrdinalIgnoreCase));
-
-            if (isOwnerOnTableLike)
-            {
-                string[] candidates =
-                {
-                    "Schema",
-                    "Physical_Schema",
-                    "Owner_Schema",
-                    "Owner_Name",
-                    "SQL_Server_Schema",
-                    "Oracle_Owner",
-                    "Table_Owner",
-                    "Schema_Name",
-                    "Owner_Schema_Name",
-                    "DB_Schema_Name",
-                };
-                foreach (var candidate in candidates)
-                {
-                    if (TryReadScapiProperty(scapiObject, candidate, out string fbValue))
-                    {
-                        Log($"Naming standard: '{objectType}.{propertyCode}' resolved via SCAPI fallback '{candidate}' (value='{fbValue}')");
-                        return fbValue;
-                    }
-                }
-            }
-
-            Log($"Naming standard: '{objectType}.{propertyCode}' not readable on this entity (no SCAPI fallback matched) - treating as empty");
-            return "";
-        }
-
-        /// <summary>
-        /// Single try/catch around <c>scapiObject.Properties(name).Value</c>.
-        /// Returns false when SCAPI rejects the property name; caller falls
-        /// through to the next fallback. Returns true with <paramref name="value"/>
-        /// set when the property exists - value may itself be an empty
-        /// string (legitimate "not yet filled" state which downstream
-        /// length / regex checks must still see). Uses an <c>out</c>
-        /// parameter rather than a value-tuple return because the dynamic
-        /// dispatch on <paramref name="scapiObject"/> breaks tuple
-        /// deconstruction at the call site.
-        /// </summary>
-        private static bool TryReadScapiProperty(dynamic scapiObject, string propertyName, out string value)
-        {
-            try
-            {
-                value = scapiObject.Properties(propertyName)?.Value?.ToString() ?? "";
-                return true;
-            }
-            catch
-            {
-                value = "";
-                return false;
             }
         }
 

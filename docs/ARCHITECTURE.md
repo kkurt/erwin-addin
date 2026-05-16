@@ -94,6 +94,65 @@ Unknown object types are skipped at diff time.
 
 ---
 
+## Naming Standards: SCAPI accessor mapping
+
+Naming-standard rules in `MC_NAMING_STANDARD` reference a `PROPERTY_DEF_ID`
+that points at `MC_PROPERTY_DEF.PROPERTY_CODE`. The addin reads the live
+value via `scapiObject.Properties(PROPERTY_CODE).Value`; the code must
+match an actual erwin SCAPI property accessor exactly or SCAPI throws
+"is not valid class id or class name for object or property".
+
+Verified empirically 2026-05-16 with [MetamodelPropertyProbeService](../Services/MetamodelPropertyProbeService.cs)
+across four DBMS families:
+
+| Concept | SCAPI accessor (PROPERTY_CODE) | Verified on |
+|---------|-------------------------------|-------------|
+| Table physical name | `Physical_Name` | SQL Server 2012, Oracle 19c, DB2 z/OS 12/13, PostgreSQL 16 |
+| Table logical name | `Name` | All 4 |
+| Table definition / comment | `Definition`, `Comment` | SQL Server (Oracle/DB2/PG only when populated) |
+| **Table owner / schema** | **`Name_Qualifier`** | **All 4** (returned 'MMS' / 'dbo' depending on model) |
+| Column physical name | `Physical_Name` | All 4 |
+| Column data type | `Physical_Data_Type` | All 4 |
+| Column nullability | `Null_Option_Type` | All 4 |
+| Index name | `Physical_Name` | All 4 |
+| Index type | `Key_Group_Type` (e.g. 'PK') | All 4 |
+| Index uniqueness | `Is_Unique` | All 4 |
+| Model name | `Name` | All 4 |
+| Model target DBMS | `Target_Server` (integer code) | All 4 |
+
+**Important non-result:** `Schema_Name` was rejected by SCAPI on every
+DBMS tested. erwin's metamodel association data
+(`Program Files\erwin\Data Modeler r10\EMXLPropertyAssociations.data`)
+lists `Entity__has__SchemaName` but the SCAPI accessor surface does not
+expose it. `Name_Qualifier` (from `AbstractEntity__has__NameQualifier`)
+is the live accessor.
+
+The previous `ReadScapiPropertyWithFallback` chain in
+`TableTypeMonitorService` was removed 2026-05-16 once the empirical
+mapping was confirmed - admin's `PROPERTY_CODE` is the authoritative
+SCAPI accessor.
+
+### Authoring a new naming-standard rule
+
+1. Insert (or use admin UI to add) a row in `MC_PROPERTY_DEF` whose
+   `PROPERTY_CODE` matches the SCAPI accessor for the property you
+   want to constrain. Use the table above for common ones; run the
+   dev-only Probe Properties button to discover new accessors on
+   exotic DBMS.
+2. Insert a rule in `MC_NAMING_STANDARD` pointing at the new
+   `PROPERTY_DEF_ID`.
+3. The addin picks it up on the next connect (or via Reload Config)
+   and fires the popup when the value violates the rule.
+
+### Adding a Platform Property (DBMS-specific)
+
+If a property is only meaningful on one DBMS (e.g. `Oracle_Entity_Partition_Type`),
+add the row with `DBMS_VERSION_ID` set to the specific version. The
+addin's naming-standard load query filters on the active model's
+DBMS_VERSION so other DBMS connections do not see the rule.
+
+---
+
 ## Deliberate trade-offs
 
 - **Renames are not detected.** The diff matches by canonical name. An

@@ -4,6 +4,55 @@ A running log of corrections and non-obvious findings that future sessions
 should not have to rediscover. Each entry is a short rule, the reason, and
 how to apply it.
 
+## 2026-05-16: Table owner SCAPI accessor is `Name_Qualifier`, NOT `Schema_Name`
+
+**Rule:** when reading a Table's schema/owner via SCAPI use
+`entity.Properties("Name_Qualifier").Value`. NEVER use `Schema_Name` -
+SCAPI throws "is not valid class id or class name for object or
+property" on every DBMS tested.
+
+**Why:** verified empirically with [MetamodelPropertyProbeService](../Services/MetamodelPropertyProbeService.cs)
+on 2026-05-16 against four DBMS families. Same model copied to all
+four target servers; on each, `Schema_Name` was rejected and
+`Name_Qualifier` returned the schema value:
+
+| DBMS | Target_Server code | `Name_Qualifier` value |
+|------|---------------------|--------------------------|
+| SQL Server 2012 | 172 | `'MMS'` |
+| Oracle 19c | 174 | `'dbo'` |
+| DB2 z/OS 12/13 | 170 | `'dbo'` |
+| PostgreSQL 16 | 216 | `'dbo'` |
+
+The misleading clue: `EMXLPropertyAssociations.data` (shipped under
+`Program Files\erwin\Data Modeler r10\`) lists
+`Entity__has__SchemaName` AND `Entity__has__SQLServerSchemaName` AND
+`AbstractEntity__has__NameQualifier`. Only the last one is exposed on
+the SCAPI accessor surface. The association table reflects metamodel
+relations; not all metamodel properties have a SCAPI accessor.
+
+The other misleading clue: meta-sync
+(`/c/Users/Kursat/Repos/meta-sync/MetaSync/Services/ErwinUserService.cs:73`)
+uses `Schema_Name` reads inside a `try {} catch {}` block. The catch
+silently swallows the SCAPI rejection, so meta-sync's "Schema_Name"
+calls actually return `null` on most DBMS - misread as "Schema_Name
+works" but it never did.
+
+**How to apply:** before adding a Platform Property row to
+`MC_PROPERTY_DEF`, run the dev-only "Probe Properties" button on a
+model bound to the target DBMS. The probe enumerates a curated
+candidate list and prints which accessor names SCAPI accepts. Confirmed
+universal accessors as of 2026-05-16:
+
+- Entity / Table: `Physical_Name`, `Name`, `Definition`, `Comment`, `Name_Qualifier`
+- Attribute / Column: `Physical_Name`, `Name`, `Physical_Data_Type`, `Null_Option_Type`, `Hide_In_Physical`, `Definition`, `Comment`
+- Key_Group / Index: `Physical_Name`, `Name`, `Key_Group_Type`, `Is_Unique`
+- Model root: `Name`, `Target_Server`, `Author`
+
+Empty Entity / View / Sequence / Subject_Area models cannot be probed -
+the test model needs at least one instance of each class for the probe
+to read its accessor surface. Drop a stub table + column + index +
+view before probing.
+
 ## 2026-05-16: SCAPI dynamic property reads are 0.85-3ms each - filter walks aggressively
 
 **Rule:** when walking a `mmObjects.Collect(parent, classKey)` result, only
