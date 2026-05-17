@@ -2952,29 +2952,38 @@ namespace EliteSoft.Erwin.AddIn
                 {
                     Log($"NAMING_STANDARD loaded: {service.Count} active rules");
 
-                    // Per-rule diagnostic dump. Surfaces the EXACT stored
-                    // regex pattern, length operator/value, and error
-                    // message prefix so admin-side "the rule looks right
-                    // but the addin keeps rejecting names" bugs can be
-                    // triaged from the file log alone. Verified necessary
-                    // 2026-05-15: a regex that admins typed as `^.{0,3}$`
-                    // was rejecting every name, and without per-rule
-                    // logging we could not see what the addin had actually
-                    // loaded vs. what the admin UI displayed.
+                    // Per-rule diagnostic dump. Each row is now atomic (post
+                    // 2026-05-16 migration); we print the RuleType plus only
+                    // the field(s) that kind uses. This makes admin-authoring
+                    // mistakes (e.g. a Regexp rule with an empty pattern, a
+                    // Length rule missing operator/value) trivially visible.
                     foreach (var rule in service.AllRules)
                     {
-                        string regex = rule.RegexpPattern ?? "";
-                        string lenOp = string.IsNullOrEmpty(rule.LengthOperator) ? "-" : rule.LengthOperator;
-                        string lenVal = rule.LengthValue?.ToString() ?? "-";
-                        string udpCond = string.IsNullOrEmpty(rule.DependsOnUdpName)
-                            ? "(none)"
-                            : $"{rule.DependsOnUdpName}={rule.DependsOnUdpValue ?? "(any)"}";
+                        // Polymorphic condition: at most one of (UDP, built-in
+                        // property) is set per the C3 admin contract. Diagnostic
+                        // surfaces whichever source the rule chose plus the CSV
+                        // values list so an admin reading the log can confirm
+                        // exactly what state the rule is gating on.
+                        string udpCond;
+                        if (!string.IsNullOrEmpty(rule.DependsOnUdpName))
+                            udpCond = $"udp[{rule.DependsOnUdpName}] in [{rule.DependsOnPropertyValues ?? "(any)"}]";
+                        else if (!string.IsNullOrEmpty(rule.DependsOnPropertyCode))
+                            udpCond = $"prop[{rule.DependsOnPropertyCode}] in [{rule.DependsOnPropertyValues ?? "(any)"}]";
+                        else
+                            udpCond = "(none)";
                         string msg = rule.ErrorMessage ?? "";
                         if (msg.Length > 80) msg = msg.Substring(0, 77) + "...";
-                        Log($"  rule#{rule.Id} {rule.ObjectType}.{rule.PropertyCode} " +
-                            $"prefix='{rule.Prefix}' suffix='{rule.Suffix}' " +
-                            $"len{lenOp}{lenVal} regex(len={regex.Length})='{regex}' " +
-                            $"auto={rule.AutoApply} cond={udpCond} msg='{msg}'");
+
+                        string typeParam = rule.RuleType switch
+                        {
+                            NamingRuleKind.Prefix => $"prefix='{rule.Prefix}' auto={rule.AutoApply}",
+                            NamingRuleKind.Suffix => $"suffix='{rule.Suffix}' auto={rule.AutoApply}",
+                            NamingRuleKind.Length => $"len {(string.IsNullOrEmpty(rule.LengthOperator) ? "?" : rule.LengthOperator)} {rule.LengthValue?.ToString() ?? "?"}",
+                            NamingRuleKind.Regexp => $"regex(len={(rule.RegexpPattern ?? "").Length})='{rule.RegexpPattern ?? ""}'",
+                            _ => "(unknown)",
+                        };
+                        Log($"  rule#{rule.Id} [{rule.RuleType}] {rule.ObjectType}.{rule.PropertyCode} " +
+                            $"req={rule.IsRequired} {typeParam} cond={udpCond} msg='{msg}'");
                     }
                 }
                 else

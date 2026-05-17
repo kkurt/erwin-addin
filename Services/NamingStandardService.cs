@@ -6,14 +6,55 @@ using System.Linq;
 namespace EliteSoft.Erwin.AddIn.Services
 {
     /// <summary>
+    /// Atomic rule kind. Each <see cref="NamingStandardRule"/> row carries
+    /// exactly one of these and exposes only the fields that kind needs.
+    /// Multiple rules on the same (ObjectType, PropertyCode) combine via
+    /// AND across separate rows; the engine dispatches by
+    /// <see cref="NamingStandardRule.RuleType"/> and ignores the inactive
+    /// fields.
+    /// <para>
+    /// "Required" is intentionally NOT a kind here - the spec models the
+    /// non-empty requirement as the orthogonal <see cref="NamingStandardRule.IsRequired"/>
+    /// flag that can layer on top of any of the four kinds. The DB CHECK
+    /// constraint (admin migration 2026-05-16/2026-05-17) enforces the
+    /// same closed set.
+    /// </para>
+    /// </summary>
+    public enum NamingRuleKind
+    {
+        /// <summary>Value must start with <see cref="NamingStandardRule.Prefix"/>; auto-apply optional.</summary>
+        Prefix,
+        /// <summary>Value must end with <see cref="NamingStandardRule.Suffix"/>; auto-apply optional.</summary>
+        Suffix,
+        /// <summary>Length comparison <c>LENGTH_OPERATOR LENGTH_VALUE</c>; validate only.</summary>
+        Length,
+        /// <summary>Value must match <see cref="NamingStandardRule.RegexpPattern"/>; validate only.</summary>
+        Regexp,
+    }
+
+    /// <summary>
     /// Represents a naming standard rule loaded from MC_NAMING_STANDARD.
-    /// Schema (post 2026-05-04 admin refactor):
-    ///   OBJECT_TYPE_ID  -> MC_OBJECT_TYPE.ID  (resolved into ObjectType string)
-    ///   PROPERTY_DEF_ID -> MC_PROPERTY_DEF.ID (resolved into PropertyCode string)
-    /// Rules are now keyed on (ObjectType, PropertyCode) so admins can author a
-    /// distinct rule per property of the same object (e.g. Table.Physical_Name
-    /// vs Table.Logical_Name). The addin currently only validates Physical_Name
-    /// equivalents for every object type.
+    /// <para>
+    /// Schema (post 2026-05-17 admin refactor): each row carries exactly
+    /// one rule kind via <c>RULE_TYPE NVARCHAR(20) NOT NULL</c> (CHECK in
+    /// {Prefix, Suffix, Length, Regexp}) and only the fields belonging to
+    /// that kind are non-NULL. The orthogonal <c>IS_REQUIRED bit NOT NULL</c>
+    /// flag layers a "value must be non-empty" gate on top of any kind -
+    /// "Required" is no longer a separate rule type. Multiple rules on
+    /// the same (ObjectType, PropertyCode) combine with AND semantics; the
+    /// engine dispatches by <see cref="RuleType"/>. <see cref="AutoApply"/>
+    /// is only meaningful for Prefix/Suffix; admin DB stores it as 0 on
+    /// other kinds and the addin masks it defensively at load time.
+    /// </para>
+    /// <para>
+    /// Condition (since 2026-05-17 C3) is polymorphic across two sources:
+    /// either a user-defined property (<see cref="DependsOnUdpId"/>) or an
+    /// erwin built-in property (<see cref="DependsOnPropertyDefId"/>). The
+    /// DB CHECK constraint <c>CK_MC_NAMING_COND_XOR</c> enforces that at
+    /// most one is set. The condition values live in
+    /// <see cref="DependsOnPropertyValues"/> as a CSV; the engine matches
+    /// case-insensitively (single-value CSV = back-compat path).
+    /// </para>
     /// </summary>
     public class NamingStandardRule
     {
@@ -21,6 +62,15 @@ namespace EliteSoft.Erwin.AddIn.Services
         public string ObjectType { get; set; }      // From MC_OBJECT_TYPE.NAME (e.g. "TABLE", "COLUMN")
         public string PropertyCode { get; set; }    // From MC_PROPERTY_DEF.PROPERTY_CODE (e.g. "Physical_Name")
         public int PropertyDefId { get; set; }
+        public NamingRuleKind RuleType { get; set; }
+        /// <summary>
+        /// IS_REQUIRED gate (orthogonal to <see cref="RuleType"/>). When true,
+        /// an empty/whitespace value emits a violation using this rule's
+        /// <see cref="ErrorMessage"/> and the pattern check is skipped. When
+        /// false, an empty value short-circuits the rule entirely (no
+        /// violation, no pattern check).
+        /// </summary>
+        public bool IsRequired { get; set; }
         public string Prefix { get; set; }
         public string Suffix { get; set; }
         public string LengthOperator { get; set; }
@@ -31,9 +81,33 @@ namespace EliteSoft.Erwin.AddIn.Services
         public bool IsActive { get; set; }
         public int SortOrder { get; set; }
         public int ConfigId { get; set; }
+
+        // --- Polymorphic condition (mutually exclusive sources) ---
+
+        /// <summary>FK to <c>MC_UDP_DEFINITION</c>. When set, the rule fires only
+        /// when the entity's UDP value is in <see cref="DependsOnPropertyValues"/>.</summary>
         public int? DependsOnUdpId { get; set; }
-        public string DependsOnUdpValue { get; set; }
-        public string DependsOnUdpName { get; set; }  // Resolved UDP name from JOIN
+
+        /// <summary>FK to <c>MC_PROPERTY_DEF</c>. When set, the rule fires only
+        /// when the entity's erwin built-in property value (read via SCAPI
+        /// using <see cref="DependsOnPropertyCode"/>) is in
+        /// <see cref="DependsOnPropertyValues"/>.</summary>
+        public int? DependsOnPropertyDefId { get; set; }
+
+        /// <summary>CSV of values the source property must match (case-insensitive).
+        /// Empty + a source set → "any non-empty value matches". Both FKs null
+        /// → rule is unconditional regardless of this field's contents.</summary>
+        public string DependsOnPropertyValues { get; set; }
+
+        /// <summary>Resolved UDP name when <see cref="DependsOnUdpId"/> is set
+        /// (JOIN result). The UDP value is read via the
+        /// <c>"&lt;OwnerClass&gt;.Physical.&lt;UdpName&gt;"</c> SCAPI accessor.</summary>
+        public string DependsOnUdpName { get; set; }
+
+        /// <summary>Resolved <c>PROPERTY_CODE</c> when
+        /// <see cref="DependsOnPropertyDefId"/> is set (JOIN result). Read as
+        /// a direct SCAPI accessor (e.g. <c>"Physical_Data_Type"</c>).</summary>
+        public string DependsOnPropertyCode { get; set; }
     }
 
     /// <summary>
@@ -148,12 +222,26 @@ namespace EliteSoft.Erwin.AddIn.Services
                         {
                             while (reader.Read())
                             {
+                                string ruleTypeRaw = reader["RULE_TYPE"]?.ToString()?.Trim() ?? "";
+                                if (!Enum.TryParse<NamingRuleKind>(ruleTypeRaw, ignoreCase: true, out var ruleKind))
+                                {
+                                    // Admin CHECK constraint guards this column, but defend
+                                    // against pre-migration rows surviving in dev/test DBs.
+                                    System.Diagnostics.Debug.WriteLine(
+                                        $"NamingStandardService: skipping rule ID={reader["ID"]} - unknown RULE_TYPE '{ruleTypeRaw}'");
+                                    continue;
+                                }
+
+                                bool autoApplyRaw = reader["AUTO_APPLY"] != DBNull.Value && Convert.ToBoolean(reader["AUTO_APPLY"]);
+
                                 var rule = new NamingStandardRule
                                 {
                                     Id = Convert.ToInt32(reader["ID"]),
                                     ObjectType = reader["OBJECT_TYPE"]?.ToString()?.Trim() ?? "",
                                     PropertyCode = reader["PROPERTY_CODE"]?.ToString()?.Trim() ?? "",
                                     PropertyDefId = Convert.ToInt32(reader["PROPERTY_DEF_ID"]),
+                                    RuleType = ruleKind,
+                                    IsRequired = reader["IS_REQUIRED"] != DBNull.Value && Convert.ToBoolean(reader["IS_REQUIRED"]),
                                     Prefix = reader["PREFIX"] == DBNull.Value ? "" : reader["PREFIX"]?.ToString()?.Trim() ?? "",
                                     Suffix = reader["SUFFIX"] == DBNull.Value ? "" : reader["SUFFIX"]?.ToString()?.Trim() ?? "",
                                     LengthOperator = reader["LENGTH_OPERATOR"] == DBNull.Value ? "" : reader["LENGTH_OPERATOR"]?.ToString()?.Trim() ?? "",
@@ -163,21 +251,34 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     // Regex.IsMatch reject every name because the literal
                                     // \n at the end required a newline in the input.
                                     // Trim removes any leading/trailing whitespace before
-                                    // the regex compiler sees the pattern. The admin UI
-                                    // should also trim before save, but defending here
-                                    // protects against any past + future authoring quirks.
+                                    // the regex compiler sees the pattern.
                                     RegexpPattern = reader["REGEXP_PATTERN"] == DBNull.Value ? "" : (reader["REGEXP_PATTERN"]?.ToString() ?? "").Trim(),
                                     ErrorMessage = reader["ERROR_MESSAGE"] == DBNull.Value ? "" : reader["ERROR_MESSAGE"]?.ToString() ?? "",
-                                    AutoApply = reader["AUTO_APPLY"] != DBNull.Value && Convert.ToBoolean(reader["AUTO_APPLY"]),
+                                    // AUTO_APPLY is only meaningful for Prefix/Suffix; admin
+                                    // stores 0 on other kinds, but defend against legacy or
+                                    // hand-edited rows by forcing it to false here too.
+                                    AutoApply = autoApplyRaw && (ruleKind == NamingRuleKind.Prefix || ruleKind == NamingRuleKind.Suffix),
                                     IsActive = Convert.ToBoolean(reader["IS_ACTIVE"]),
                                     SortOrder = reader["SORT_ORDER"] == DBNull.Value ? 0 : Convert.ToInt32(reader["SORT_ORDER"]),
                                     ConfigId = Convert.ToInt32(reader["CONFIG_ID"]),
                                     DependsOnUdpId = reader["DEPENDS_ON_UDP_ID"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["DEPENDS_ON_UDP_ID"]),
-                                    DependsOnUdpValue = reader["DEPENDS_ON_UDP_VALUE"] == DBNull.Value ? "" : reader["DEPENDS_ON_UDP_VALUE"]?.ToString()?.Trim() ?? "",
-                                    DependsOnUdpName = reader["UDP_NAME"] == DBNull.Value ? "" : reader["UDP_NAME"]?.ToString()?.Trim() ?? ""
+                                    DependsOnPropertyDefId = reader["DEPENDS_ON_PROPERTY_DEF_ID"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["DEPENDS_ON_PROPERTY_DEF_ID"]),
+                                    DependsOnPropertyValues = reader["DEPENDS_ON_PROPERTY_VALUES"] == DBNull.Value ? "" : reader["DEPENDS_ON_PROPERTY_VALUES"]?.ToString()?.Trim() ?? "",
+                                    DependsOnUdpName = reader["UDP_NAME"] == DBNull.Value ? "" : reader["UDP_NAME"]?.ToString()?.Trim() ?? "",
+                                    DependsOnPropertyCode = reader["COND_PROPERTY_CODE"] == DBNull.Value ? "" : reader["COND_PROPERTY_CODE"]?.ToString()?.Trim() ?? "",
                                 };
 
                                 if (!rule.IsActive) continue;
+
+                                // Defence-in-depth mirror of admin's CK_MC_NAMING_COND_XOR: a
+                                // hand-edited row that points at both sources would otherwise
+                                // produce confusing dual-read behaviour. Skip and log.
+                                if (rule.DependsOnUdpId.HasValue && rule.DependsOnPropertyDefId.HasValue)
+                                {
+                                    System.Diagnostics.Debug.WriteLine(
+                                        $"NamingStandardService: skipping rule ID={rule.Id} - both DEPENDS_ON_UDP_ID and DEPENDS_ON_PROPERTY_DEF_ID set");
+                                    continue;
+                                }
 
                                 _allRules.Add(rule);
 
@@ -207,28 +308,37 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
         }
 
-        // Schema (post 2026-05-04 admin refactor):
-        //   MC_NAMING_STANDARD.OBJECT_TYPE_ID  -> MC_OBJECT_TYPE.ID
-        //   MC_NAMING_STANDARD.PROPERTY_DEF_ID -> MC_PROPERTY_DEF.ID
+        // Schema (post 2026-05-17 admin refactor + C3 polymorphic condition):
+        //   MC_NAMING_STANDARD.OBJECT_TYPE_ID            -> MC_OBJECT_TYPE.ID
+        //   MC_NAMING_STANDARD.PROPERTY_DEF_ID           -> MC_PROPERTY_DEF.ID (the property the rule constrains)
+        //   MC_NAMING_STANDARD.RULE_TYPE                  -> one of Prefix/Suffix/Length/Regexp
+        //   MC_NAMING_STANDARD.IS_REQUIRED                -> orthogonal non-empty gate
+        //   MC_NAMING_STANDARD.DEPENDS_ON_UDP_ID          -> MC_UDP_DEFINITION.ID (XOR with PROPERTY_DEF_ID below)
+        //   MC_NAMING_STANDARD.DEPENDS_ON_PROPERTY_DEF_ID -> MC_PROPERTY_DEF.ID (erwin built-in property source)
+        //   MC_NAMING_STANDARD.DEPENDS_ON_PROPERTY_VALUES -> CSV of allowed source values (case-insensitive IN)
         // Filter: pd.DBMS_VERSION_ID IS NULL means "erwin built-in property" -
-        // those are the only properties the addin validates today (e.g.
-        // Physical_Name, Logical_Name). DBMS-version-specific PropertyDef rows
-        // (DDL-only DDLA fields, dialect quirks) are intentionally excluded
-        // because they don't correspond to anything the addin reads via SCAPI.
+        // those are the only RULE TARGETS the addin validates today (Physical_Name,
+        // Logical_Name, Name_Qualifier, ...). The CONDITION property (cond_pd JOIN)
+        // is unfiltered because the spec allows conditioning on DBMS-version-
+        // specific built-ins (e.g. Oracle-only Identity_Type).
         private static string GetQuery(string dbType)
         {
             switch (dbType?.ToUpper())
             {
                 case "POSTGRESQL":
                     return @"SELECT ns.""ID"", ot.""NAME"" AS ""OBJECT_TYPE"", pd.""PROPERTY_CODE"",
-                            ns.""PROPERTY_DEF_ID"", ns.""PREFIX"", ns.""SUFFIX"", ns.""LENGTH_OPERATOR"", ns.""LENGTH_VALUE"",
+                            ns.""PROPERTY_DEF_ID"", ns.""RULE_TYPE"", ns.""IS_REQUIRED"",
+                            ns.""PREFIX"", ns.""SUFFIX"", ns.""LENGTH_OPERATOR"", ns.""LENGTH_VALUE"",
                             ns.""REGEXP_PATTERN"", ns.""ERROR_MESSAGE"", ns.""AUTO_APPLY"", ns.""IS_ACTIVE"", ns.""SORT_ORDER"",
-                            ns.""CONFIG_ID"", ns.""DEPENDS_ON_UDP_ID"", ns.""DEPENDS_ON_UDP_VALUE"",
-                            udp.""NAME"" AS ""UDP_NAME""
+                            ns.""CONFIG_ID"", ns.""DEPENDS_ON_UDP_ID"", ns.""DEPENDS_ON_PROPERTY_DEF_ID"",
+                            ns.""DEPENDS_ON_PROPERTY_VALUES"",
+                            udp.""NAME"" AS ""UDP_NAME"",
+                            cond_pd.""PROPERTY_CODE"" AS ""COND_PROPERTY_CODE""
                             FROM ""MC_NAMING_STANDARD"" ns
                             JOIN ""MC_OBJECT_TYPE""  ot ON ot.""ID"" = ns.""OBJECT_TYPE_ID""
                             JOIN ""MC_PROPERTY_DEF"" pd ON pd.""ID"" = ns.""PROPERTY_DEF_ID""
                             LEFT JOIN ""MC_UDP_DEFINITION"" udp ON udp.""ID"" = ns.""DEPENDS_ON_UDP_ID""
+                            LEFT JOIN ""MC_PROPERTY_DEF"" cond_pd ON cond_pd.""ID"" = ns.""DEPENDS_ON_PROPERTY_DEF_ID""
                             WHERE ns.""IS_ACTIVE"" = true
                               AND ns.""CONFIG_ID"" = @cfgId
                               AND pd.""DBMS_VERSION_ID"" IS NULL
@@ -236,14 +346,18 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                 case "ORACLE":
                     return @"SELECT ns.ID, ot.NAME AS OBJECT_TYPE, pd.PROPERTY_CODE,
-                            ns.PROPERTY_DEF_ID, ns.PREFIX, ns.SUFFIX, ns.LENGTH_OPERATOR, ns.LENGTH_VALUE,
+                            ns.PROPERTY_DEF_ID, ns.RULE_TYPE, ns.IS_REQUIRED,
+                            ns.PREFIX, ns.SUFFIX, ns.LENGTH_OPERATOR, ns.LENGTH_VALUE,
                             ns.REGEXP_PATTERN, ns.ERROR_MESSAGE, ns.AUTO_APPLY, ns.IS_ACTIVE, ns.SORT_ORDER,
-                            ns.CONFIG_ID, ns.DEPENDS_ON_UDP_ID, ns.DEPENDS_ON_UDP_VALUE,
-                            udp.NAME AS UDP_NAME
+                            ns.CONFIG_ID, ns.DEPENDS_ON_UDP_ID, ns.DEPENDS_ON_PROPERTY_DEF_ID,
+                            ns.DEPENDS_ON_PROPERTY_VALUES,
+                            udp.NAME AS UDP_NAME,
+                            cond_pd.PROPERTY_CODE AS COND_PROPERTY_CODE
                             FROM MC_NAMING_STANDARD ns
                             JOIN MC_OBJECT_TYPE  ot ON ot.ID = ns.OBJECT_TYPE_ID
                             JOIN MC_PROPERTY_DEF pd ON pd.ID = ns.PROPERTY_DEF_ID
                             LEFT JOIN MC_UDP_DEFINITION udp ON udp.ID = ns.DEPENDS_ON_UDP_ID
+                            LEFT JOIN MC_PROPERTY_DEF cond_pd ON cond_pd.ID = ns.DEPENDS_ON_PROPERTY_DEF_ID
                             WHERE ns.IS_ACTIVE = 1
                               AND ns.CONFIG_ID = :cfgId
                               AND pd.DBMS_VERSION_ID IS NULL
@@ -252,14 +366,18 @@ namespace EliteSoft.Erwin.AddIn.Services
                 case "MSSQL":
                 default:
                     return @"SELECT ns.[ID], ot.[NAME] AS [OBJECT_TYPE], pd.[PROPERTY_CODE],
-                            ns.[PROPERTY_DEF_ID], ns.[PREFIX], ns.[SUFFIX], ns.[LENGTH_OPERATOR], ns.[LENGTH_VALUE],
+                            ns.[PROPERTY_DEF_ID], ns.[RULE_TYPE], ns.[IS_REQUIRED],
+                            ns.[PREFIX], ns.[SUFFIX], ns.[LENGTH_OPERATOR], ns.[LENGTH_VALUE],
                             ns.[REGEXP_PATTERN], ns.[ERROR_MESSAGE], ns.[AUTO_APPLY], ns.[IS_ACTIVE], ns.[SORT_ORDER],
-                            ns.[CONFIG_ID], ns.[DEPENDS_ON_UDP_ID], ns.[DEPENDS_ON_UDP_VALUE],
-                            udp.[NAME] AS [UDP_NAME]
+                            ns.[CONFIG_ID], ns.[DEPENDS_ON_UDP_ID], ns.[DEPENDS_ON_PROPERTY_DEF_ID],
+                            ns.[DEPENDS_ON_PROPERTY_VALUES],
+                            udp.[NAME] AS [UDP_NAME],
+                            cond_pd.[PROPERTY_CODE] AS [COND_PROPERTY_CODE]
                             FROM [dbo].[MC_NAMING_STANDARD] ns
                             JOIN [dbo].[MC_OBJECT_TYPE]  ot ON ot.[ID] = ns.[OBJECT_TYPE_ID]
                             JOIN [dbo].[MC_PROPERTY_DEF] pd ON pd.[ID] = ns.[PROPERTY_DEF_ID]
                             LEFT JOIN [dbo].[MC_UDP_DEFINITION] udp ON udp.[ID] = ns.[DEPENDS_ON_UDP_ID]
+                            LEFT JOIN [dbo].[MC_PROPERTY_DEF] cond_pd ON cond_pd.[ID] = ns.[DEPENDS_ON_PROPERTY_DEF_ID]
                             WHERE ns.[IS_ACTIVE] = 1
                               AND ns.[CONFIG_ID] = @cfgId
                               AND pd.[DBMS_VERSION_ID] IS NULL

@@ -459,15 +459,24 @@ namespace EliteSoft.Erwin.AddIn.Forms
             Size measured;
             using (var g = CreateGraphics())
             {
+                // TextFormatFlags.NoPadding strips the descender slack
+                // Windows normally reserves below the baseline (used by g, y,
+                // p, j). Without it a single line like "Owner girilmelidir!"
+                // gets its 'g' tail clipped at the bottom of the label.
+                // Use the default (no NoPadding) and add a couple of extra
+                // pixels as a safety margin against per-font metrics that
+                // still draw outside MeasureText's reported height on some
+                // DPI settings.
                 measured = TextRenderer.MeasureText(
                     g,
                     lblBody.Text,
                     lblBody.Font,
                     new Size(lblBody.Width, int.MaxValue),
-                    TextFormatFlags.WordBreak | TextFormatFlags.NoPadding);
+                    TextFormatFlags.WordBreak);
             }
 
-            int bodyContentHeight = Math.Max(IconSlot, measured.Height);
+            const int DescenderSafety = 4;
+            int bodyContentHeight = Math.Max(IconSlot, measured.Height + DescenderSafety);
             int bodyPanelHeight = bodyContentHeight + BodyVerticalPadding * 2;
 
             int chromeHeight = AccentStripHeight + HeaderHeight + 1 + 1 + FooterHeight;

@@ -120,12 +120,24 @@ across four DBMS families:
 | Model name | `Name` | All 4 |
 | Model target DBMS | `Target_Server` (integer code) | All 4 |
 
-**Important non-result:** `Schema_Name` was rejected by SCAPI on every
-DBMS tested. erwin's metamodel association data
-(`Program Files\erwin\Data Modeler r10\EMXLPropertyAssociations.data`)
-lists `Entity__has__SchemaName` but the SCAPI accessor surface does not
-expose it. `Name_Qualifier` (from `AbstractEntity__has__NameQualifier`)
-is the live accessor.
+**Important caveat: Owner is a referenced object, not a string.** In
+erwin's metamodel, "Owner" is a separate `Schema` object class.
+Entities reference it via the write-side accessor `Schema_Ref` (set
+`entity.Properties("Schema_Ref").Value = "DBO"`). Both `Name_Qualifier`
+and `Schema_Name` are read-only derived accessors that resolve only
+when `Schema_Ref` is set. On a brand-new entity that has not yet been
+assigned an owner, SCAPI rejects `Name_Qualifier` with "Entity class
+does not use a property of Name_Qualifier type or the property failed
+to satisfy a property collection filter conditions" - the property
+instance simply does not exist on the entity yet.
+
+This is exactly the state a `Length > 0` naming rule on `Name_Qualifier`
+is meant to catch ("Owner girilmelidir!"). Step 3b in
+`TableTypeMonitorService.ValidateNamingStandard` treats this specific
+SCAPI rejection as an empty value and runs the rule, so the popup fires
+on un-owned entities. (Source: meta-sync technical doc
+`docs/MetaSync-Technical-Internal-EN.md:280-289`, confirmed by live
+log on 2026-05-16.)
 
 The previous `ReadScapiPropertyWithFallback` chain in
 `TableTypeMonitorService` was removed 2026-05-16 once the empirical
@@ -139,10 +151,106 @@ SCAPI accessor.
    want to constrain. Use the table above for common ones; run the
    dev-only Probe Properties button to discover new accessors on
    exotic DBMS.
-2. Insert a rule in `MC_NAMING_STANDARD` pointing at the new
-   `PROPERTY_DEF_ID`.
+2. Insert one or more rows in `MC_NAMING_STANDARD` pointing at the new
+   `PROPERTY_DEF_ID`. **Each row is exactly one rule kind** (see
+   `RULE_TYPE` contract below); to express "must start with `DM_` AND
+   be at least 5 chars" use two rows, one Prefix + one Length.
 3. The addin picks it up on the next connect (or via Reload Config)
-   and fires the popup when the value violates the rule.
+   and fires the popup when the value violates any rule.
+
+### Atomic rule model (post 2026-05-17)
+
+Live `MC_NAMING_STANDARD` rows carry a single `RULE_TYPE NVARCHAR(20)`
+constrained to one of `Prefix | Suffix | Length | Regexp` and an
+orthogonal `IS_REQUIRED bit NOT NULL` flag that gates the empty-value
+case. The addin dispatches by `RULE_TYPE` and inspects only that
+kind's parameters; legacy AND-combine rows no longer exist (admin
+migrations 2026-05-16 / 2026-05-17 reshaped every live row).
+
+| `RULE_TYPE` | Populated fields | AUTO_APPLY honoured? | Pattern check (Step 3) |
+|-------------|------------------|----------------------|------------------------|
+| `Prefix`    | `PREFIX`                            | yes (silent prepend) | value missing prefix → violation |
+| `Suffix`    | `SUFFIX`                            | yes (silent append)  | value missing suffix → violation |
+| `Length`    | `LENGTH_OPERATOR` + `LENGTH_VALUE`  | no                   | comparison fails → violation (operator: `>=`, `<=`, `>`, `<`, `=`) |
+| `Regexp`    | `REGEXP_PATTERN`                    | no                   | value does not match → violation |
+
+Cross-cutting columns (`IS_REQUIRED`, `ERROR_MESSAGE`, `IS_ACTIVE`,
+`SORT_ORDER`, plus the polymorphic condition triple
+`DEPENDS_ON_UDP_ID` / `DEPENDS_ON_PROPERTY_DEF_ID` / `DEPENDS_ON_PROPERTY_VALUES`)
+work the same way on every rule kind.
+
+### Polymorphic condition (C3, 2026-05-17)
+
+The condition source is either a user-defined property OR an erwin
+built-in property - never both. DB `CK_MC_NAMING_COND_XOR` enforces the
+mutual exclusion; the loader skips and logs any row that violates it.
+
+| Source | FK column | Read path |
+|--------|-----------|-----------|
+| (none) | both NULL | rule is unconditional |
+| UDP    | `DEPENDS_ON_UDP_ID` → `MC_UDP_DEFINITION` | `<OwnerClass>.Physical.<UdpName>` SCAPI accessor |
+| Built-in property | `DEPENDS_ON_PROPERTY_DEF_ID` → `MC_PROPERTY_DEF` | direct `scapiObject.Properties(PROPERTY_CODE).Value` |
+
+`DEPENDS_ON_PROPERTY_VALUES` is a CSV of allowed source values, matched
+case-insensitively (single value = back-compat path). An empty CSV with
+a source set means "any non-empty value matches"; an empty source value
+fails even the permissive empty-CSV path so the rule does not fire on
+not-yet-populated state.
+
+**Example - DateTime column suffix rule:**
+
+| Column                       | Value |
+|------------------------------|-------|
+| `RULE_TYPE`                  | `Suffix` |
+| `SUFFIX`                     | `_DATE` |
+| `AUTO_APPLY`                 | `1` |
+| `IS_REQUIRED`                | `0` |
+| `DEPENDS_ON_PROPERTY_DEF_ID` | (FK to PropertyDef "Physical_Data_Type") |
+| `DEPENDS_ON_PROPERTY_VALUES` | `DateTime,Date,Timestamp,DATETIME2` |
+
+Reads: only when the column's `Physical_Data_Type` is in the CSV.
+Fires: if the name does not end with `_DATE`. AutoApply=1 so the
+suffix is silently appended.
+
+`ERROR_MESSAGE` is the single message field shared by the empty case
+and the pattern case; admins author one message that covers both
+(e.g. "Tablo adı boş bırakılamaz - DM_ ile başlamalı").
+
+### Evaluation order per rule
+
+1. **Step 1 - Empty / IS_REQUIRED gate.** If the value is null or
+   whitespace and `IS_REQUIRED=true`, emit one violation using the
+   rule's `ERROR_MESSAGE` and stop (no pattern check). If empty and
+   `IS_REQUIRED=false`, skip the rule entirely.
+2. **Step 2 - AutoApply.** For non-empty values, `ApplyNamingStandards`
+   silently prepends `PREFIX` (Prefix rules) or appends `SUFFIX`
+   (Suffix rules) when `AUTO_APPLY=true`. Length/Regexp do not
+   transform values (admin's `NormalizeByRuleType` forces
+   `AUTO_APPLY=false` on them; the addin also masks the flag at load
+   time as defence-in-depth).
+3. **Step 3 - Pattern check.** For non-empty values, dispatch on
+   `RULE_TYPE` and emit a violation when the kind-specific check
+   fails. Misconfigured rows (e.g. Length without `LENGTH_VALUE`,
+   Regexp with empty pattern, Prefix with empty `PREFIX`) are silently
+   skipped rather than firing a meaningless violation - the diagnostic
+   dump on connect exposes the row's empty parameter so the admin can
+   fix it.
+
+### Surfacing violations to the user
+
+The three violation classes have three distinct UX paths:
+
+| Violation source | UX |
+|------------------|-----|
+| **Required** (Step 1, `IS_REQUIRED=true` on empty value) | Modal `RequiredFieldDialog` with a TextBox - the user must type a value. Apply writes the value to SCAPI on `(Object, PropertyCode)` and removes the violation from the batch; Cancel leaves the violation behind so it surfaces as a warning later. Drives the "user is forced" semantics of the IS_REQUIRED flag. |
+| **Pattern** (Step 3, `IS_REQUIRED=false` or non-empty value) | Consolidated batch popup (existing `ShowConsolidatedPopup` / `AddinMessageDialog`). Aggregates multiple violations across the same gesture - never blocks save. |
+| **AutoApply silent fix** (Step 2 actually wrote a value) | Transient `ToastNotification` in the bottom-right of the addin's screen, 5s lifetime, dismissible via X. No interruption to the user's flow, but the change is visible so they don't wonder where the new prefix/suffix came from. |
+
+The data-type-change column-naming replay (C3 polymorphic condition)
+explicitly flushes `ShowConsolidatedPopup` after `ValidateColumnNamingStandard`
+returns, because pure type changes have no inline-edit close edge to
+ride - the user just Tab'd away from a combo and the warning needs to
+land on the same gesture.
 
 ### Adding a Platform Property (DBMS-specific)
 

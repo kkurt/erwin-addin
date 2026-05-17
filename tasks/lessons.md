@@ -4,12 +4,336 @@ A running log of corrections and non-obvious findings that future sessions
 should not have to rediscover. Each entry is a short rule, the reason, and
 how to apply it.
 
-## 2026-05-16: Table owner SCAPI accessor is `Name_Qualifier`, NOT `Schema_Name`
+## 2026-05-17 (revised): Rename detection is EVENT-DRIVEN, not polled
 
-**Rule:** when reading a Table's schema/owner via SCAPI use
-`entity.Properties("Name_Qualifier").Value`. NEVER use `Schema_Name` -
-SCAPI throws "is not valid class id or class name for object or
-property" on every DBMS tested.
+**Rule:** do NOT walk all entities every heartbeat tick to diff
+`Physical_Name` against a snapshot. Move rename detection to the
+specific user gestures that produce a rename:
+
+1. **Inline edit close** (`_wasInlineEditOpen && !inlineEditOpen`) -
+   user double-clicked an entity / attribute name and committed via
+   Enter/Tab/click-away. Catches diagram and Model Explorer renames,
+   INCLUDING renames of pre-existing real-named entities that the old
+   `_pendingNamedEntities` pending-set mechanism missed (it only
+   tracked placeholder-named newcomers).
+2. **Column Editor close transition** - catches Physical_Name typed in
+   the parent-table field on the way out.
+3. **Entity Editor close transition** - same for the Table Properties
+   dialog.
+
+All three trigger `ScanForRenamesEventDriven(trigger)` which walks the
+model ONCE per event (not per tick), diffs current Physical_Name
+against `_entityDisplayNameSnapshot`, and fires
+`RunScopedTableNamingCheck` on the new name for any diff.
+
+DiagramHeartbeatTick on stable ticks (`delta==0 && entityDelta==0 && !pending`)
+now returns immediately after the count read - no per-entity walk at
+all. Tick cost on a 286-entity model: ~5 ms instead of 1.5-2 s.
+
+**Why this is safe:** every realistic erwin rename gesture goes
+through one of the three boundaries above. The previous walk-every-
+tick approach exists in the codebase history because the editor
+close-transition diff was missing; the Phase-2G comment ("we now walk
+every tick regardless of count delta") was a workaround for that
+absence, not a fundamental requirement.
+
+**How to apply when adding a new "X changed" detection:**
+
+1. Identify the user gesture that produces X. Hook the gesture's
+   close/commit event.
+2. Capture the relevant state at gesture START, diff at gesture END.
+3. Only fall back to a periodic walk if the gesture cannot be hooked
+   (true event-less SCAPI mutations - rare, only system-driven model
+   imports).
+
+The 2026-05-05 "UDP backfill DISABLED" lesson, the earlier
+"walk-every-tick drift" lesson, and this one are all the same
+underlying anti-pattern: scaling work linearly with model size in a
+sub-1-second polling loop. erwin's STA thread cannot absorb that on
+real big models.
+
+## 2026-05-17 (superseded): NEVER walk every entity every heartbeat tick. Use edit-session diff instead.
+
+**Rule:** any "per-property drift detection across the model" feature must
+NOT be implemented as a `foreach (entity in all)` SCAPI walk inside
+`DiagramHeartbeatTick` (or any sub-1-second timer). It scales linearly
+with the number of entities AND the number of watched properties; on a
+realistic big model (286 entities × ~4 watched SCAPI reads per entity ×
+~3 ms per read) tick interval ballooned from 1 s to 3-5 s and the user
+reported "addin yavaşladı". This is the same failure mode the 2026-05-05
+"UDP backfill DISABLED on big-model evidence" lesson already caught:
+per-entity SCAPI reads on every tick freeze erwin's right-click menu
+and starve the STA thread.
+
+**Why:** SCAPI reads are dynamic COM property bag lookups - cheap once,
+but the cost compounds linearly. There is no caching layer between the
+addin and erwin's metamodel, so an N-entity model produces N reads per
+property per tick. The heartbeat runs every ~1 second, so the per-tick
+budget is in the order of tens of milliseconds, not seconds.
+
+**How to apply (and the actual fix we shipped for the C3 drift case):**
+
+1. **Edit-session diff pattern.** Capture the watched-property snapshot
+   when an edit dialog OPENS (`!_columnEditorWasOpen && editorIsOpen`
+   transition in `WindowMonitorTimer_Tick`), diff vs current when it
+   CLOSES (existing close-transition handler). Cost: O(rules × 1 entity)
+   per edit session - bounded by the rule set, independent of model size.
+   See `ReadEntityWatchedProperties` + `DiffWatchedPropertiesAndFire`
+   in `ValidationCoordinatorService.cs`.
+2. **Diagram-only / rename path** stays in the heartbeat because it is
+   already event-shaped (responds to entity-count delta and name diff)
+   and only does O(1) reads per entity (Physical_Name + Attribute count).
+3. **Snapshot mutating writes IMMEDIATELY refresh the snapshot's
+   WatchedProperties** in-place (already in the Required-popup write
+   path). Without that, a write→read race in the very next tick will
+   look like fresh drift and re-fire the popup the user just dismissed
+   (verified 2026-05-17 log line "Watched property changed ...
+   '' -> 'dbo' - re-running naming check" 1.2 s after a successful fill).
+4. **If you MUST scan periodically**: batch with a budget (the
+   pre-2026-05-05 UDP backfill did this with `UdpBackfillBatchSize`) or
+   throttle to every Nth tick AND profile against a 280+ entity model
+   before merging.
+
+The dead-end refactor (kept here as cautionary tale): an earlier
+attempt added `EnsureEntitySnapshotSeeded` + `CheckEntityPropertyDrift`
+to the per-entity walk inside `DiagramHeartbeatTick`. It "worked" on
+small models but the user's 286-entity test surfaced the same
+slowdown immediately. The fix was to delete that walk entirely and
+move drift detection to the edit-session boundary.
+
+## 2026-05-17 (C3 follow-up): Required forces, non-required warns, AutoApply toasts
+
+**Rule:** the three violation classes have three distinct UX paths:
+
+1. **Required violation** (Step 1 of `EvaluateRule`, fires when `IS_REQUIRED=true`
+   and value is empty): show a modal `RequiredFieldDialog` with a TextBox
+   so the user can fill the field inline. Apply writes the typed value back
+   via `scapiObject.Properties(propertyCode).Value = typed` inside its own
+   named transaction; Cancel leaves the violation in the batch where it
+   surfaces as a warning later. This is the "user is forced" path - the
+   warning is not enough, the user must engage.
+2. **Pattern violation** (Step 3, `IS_REQUIRED=false` or non-empty value):
+   stays in the consolidated batch popup (`_pendingResults` →
+   `ShowConsolidatedPopup`). Warning only, never blocks save.
+3. **AutoApply silent fix** (Step 2 wrote a prefix/suffix): emits a
+   transient `ToastNotification` in the bottom-right of the addin's
+   active screen. 5s lifetime, dismissible. No popup interruption but
+   the user sees what happened.
+
+**Why:** earlier model had Required violations going to the same
+warning popup as Length/Regexp issues - users dismissed them and the
+empty field stayed empty. The 2026-05-17 spec demanded "zorlanmalı" for
+Required while keeping non-required violations as just warnings. The
+toast handles the third case: AutoApply was silently fixing column
+names (e.g. `TEST` → `TEST_DATE`) and the user could not tell what
+happened.
+
+**How to apply (addin side):**
+
+1. After Step 3 produces `failures`, split off `f.RuleName == "Required"`
+   into its own pass and show `RequiredFieldDialog` per violation:
+   ```csharp
+   var rc = RequiredFieldDialog.Show(
+       title: "Required field",
+       message: rf.ErrorMessage,
+       fieldLabel: $"{objectType}.{rf.Rule.PropertyCode}",
+       out string typed);
+   if (rc == DialogResult.OK)
+   {
+       // Begin tx, write SCAPI, commit, remove violation.
+   }
+   ```
+2. Snapshot writeback: when the property is `Physical_Name` update both
+   `state.PhysicalName` and (for table path) the `_entitySnapshots[objectId]`
+   dictionary so the next monitor tick does not detect the write as a
+   rename loop.
+3. The column data-type-change branch (C3 replay) must call
+   `ShowConsolidatedPopup` explicitly after `ValidateColumnNamingStandard`
+   because pure type changes have no inline-edit close edge.
+4. `ToastNotification.Show(title, body)` from auto-apply paths only.
+   Thread-safe (marshals through `addinForm.BeginInvoke`); swallows UI
+   exceptions so the transactional path is not endangered by a UI
+   hiccup. Stack-rendered bottom-up in the addin's active screen,
+   `WS_EX_NOACTIVATE` so focus is never stolen.
+
+Live verified 2026-05-17 against the C3 DateTime suffix rule: the user
+changed `VARCHAR2(150)` -> `DATE` on a column, suffix `_DATE` was
+silently applied (AutoApply=true), toast surfaced the change.
+
+## 2026-05-17 (C3): Naming-rule condition is polymorphic across UDP + built-in property
+
+**Rule:** a naming-standard row can condition on EITHER an admin UDP
+(`DEPENDS_ON_UDP_ID` → `MC_UDP_DEFINITION`) OR an erwin built-in
+property (`DEPENDS_ON_PROPERTY_DEF_ID` → `MC_PROPERTY_DEF`) - the DB
+`CK_MC_NAMING_COND_XOR` constraint enforces "at most one source". The
+condition values live in `DEPENDS_ON_PROPERTY_VALUES` as a
+case-insensitive CSV (single value = back-compat path; empty CSV with
+a source set = "any non-empty value matches").
+
+**Why:** the old single-source UDP-only model forced admins to author
+manual UDP shims (`IsDateColumn=Y/N` etc.) just to express rules like
+"DateTime columns must end with `_DATE`". Conditioning directly on
+`Physical_Data_Type` removes that shim layer entirely.
+
+**How to apply (addin side):**
+
+1. `IsRuleApplicable` dispatches on which FK is set:
+   - `DependsOnUdpId` → read via `<OwnerClass>.Physical.<UdpName>` (existing UDP path)
+   - `DependsOnPropertyDefId` → read via direct `scapiObject.Properties(propertyCode).Value`
+     (built-in properties do NOT use the `Entity.Physical.X` wrapping)
+   - Neither → rule is unconditional
+2. The CSV IN-match is case-insensitive and trims each token; empty
+   tokens between commas are skipped (so `", ,Date"` matches `Date`
+   not `""`).
+3. SCAPI rejection on the built-in read (same "Entity class does not
+   use a property of X type" pattern as `Name_Qualifier` on a fresh
+   entity) returns "" - the IN-match short-circuits and the rule skips,
+   which is the right behaviour for "entity hasn't reached the gated
+   state yet".
+4. Defence-in-depth at the loader: any row with BOTH FKs populated is
+   skipped + logged. Admin's CHECK constraint prevents this server-side
+   but a hand-edited row would otherwise produce confusing dual reads.
+5. Diagnostic dump on connect now prints the condition shape as
+   `udp[X] in [csv]` / `prop[Y] in [csv]` / `(none)` so admin can read
+   off which source each rule is using.
+
+Live tests: 30+ unit tests cover Prefix/Suffix/Length/Regexp dispatch,
+IS_REQUIRED gate, and CSV IN-match (single, multi, case, empty tokens,
+empty-with-source, empty-with-empty-value). The polymorphic dispatch
+itself (UDP vs built-in) is tested at runtime since it requires a live
+SCAPI object.
+
+## 2026-05-17: IS_REQUIRED is a per-row flag, not a rule type
+
+**Rule:** the four `RULE_TYPE` values are now `Prefix | Suffix | Length | Regexp`.
+"Required" is **no longer a rule type** - the orthogonal
+`IS_REQUIRED bit NOT NULL` column gates whether an empty/whitespace
+value emits a violation. Engine dispatch: Step 1 = IS_REQUIRED gate,
+Step 3 = pattern check on non-empty values (Step 2 = AutoApply, lives
+in `ApplyNamingStandards`).
+
+**Why:** admin refactored the schema 2026-05-17. The previous "Required"
+kind couldn't combine with a pattern check on the same row, forcing
+admins to author "must not be empty AND must start with DM_" as TWO
+rows that fight over the same property. Splitting required-ness into
+an orthogonal flag lets one row carry "Prefix=DM_, IsRequired=true" and
+share its `ERROR_MESSAGE` between the empty-case and the pattern-case
+violations. DB CHECK constraint updated to drop "Required" from the
+allowed set.
+
+**How to apply:**
+
+1. Step 1 in `EvaluateRule`: if value is null/whitespace and
+   `IS_REQUIRED=true`, emit a violation tagged `RuleName="Required"`
+   using the rule's own `ERROR_MESSAGE` and return without running
+   the pattern check. Empty + IS_REQUIRED=false → skip the entire
+   rule (no violation, no pattern check).
+2. Step 3: dispatch on `rule.RuleType` switch over the four kinds.
+   Never re-introduce a `NamingRuleKind.Required` case - the enum
+   does not have it and the loader's `Enum.TryParse` would reject a
+   "Required" RULE_TYPE row anyway.
+3. Misconfigured rows (Length with NULL `LENGTH_VALUE`, Regexp with
+   empty pattern, Prefix with empty `PREFIX`) are silently skipped.
+   Admin's `NormalizeByRuleType` + `ValidateByRuleType` already
+   filters most at save time; the addin defends against hand-edited
+   rows.
+4. Only Prefix/Suffix rules participate in `ApplyNamingStandards`.
+   AUTO_APPLY on other kinds is forced to false at load time
+   (truncating to fit Length or transforming to satisfy Regexp would
+   silently corrupt user data; admin enforces this server-side too).
+5. The `PLEASE_CHANGE_IT` auto-rename path only triggers when an
+   AutoApply Prefix/Suffix rule on `Physical_Name` still fails after
+   Step 2 - the "I will fix this for you" promise was broken, so the
+   placeholder forces a manual fix.
+6. UDP conditioning (`DEPENDS_ON_UDP_ID` + `DEPENDS_ON_UDP_VALUE`)
+   applies uniformly to all rule kinds. Empty `DEPENDS_ON_UDP_VALUE`
+   means "any non-empty UDP value matches"; a non-empty value is
+   compared case-insensitively.
+
+Live verified 2026-05-17: MetaRepo has 2 atomic rows - a Prefix `LOG_`
+rule conditional on UDP `LOG=1008` and a Length `>0` rule on
+`Column.Definition`. Both have `IS_REQUIRED=0` post-migration, so the
+Length>0 rule is currently a no-op on empty values; admin needs to
+flip `IS_REQUIRED=1` to recover the old "Required" semantic.
+
+## 2026-05-16 (revised same day): Schema_Ref + Name_Qualifier + Schema is an OBJECT not a string
+
+**Rule:** in erwin, a table's owner is a separate `Schema` SCAPI object,
+not a string property on the Entity. The Entity references it via
+`Schema_Ref` (write-side: `entity.Properties("Schema_Ref").Value = "DBO"`),
+and reads it back via `Name_Qualifier` (derived from the referenced
+Schema's Name). Both accessors only work AFTER the entity has been
+bound to a schema. On a brand-new entity that has not yet been assigned,
+both `Name_Qualifier` and `Schema_Name` throw "Entity class does not use
+a property of <X> type or the property failed to satisfy a property
+collection filter conditions" - because the property instance does not
+exist on the entity yet (the schema reference has never been wired).
+
+**Why:** confirmed end-to-end on 2026-05-16. Probe on EXISTING entities
+showed `Name_Qualifier='dbo'` returning cleanly. Runtime on NEW entities
+('E/33', 'E/34'→'DDDDDD') triggered the rejection above. Meta-sync's
+internal documentation
+(`/c/Users/Kursat/Repos/meta-sync/docs/MetaSync-Technical-Internal-EN.md:280-289`)
+spells out the actual architecture:
+- "In erwin, Owner is a separate object type called `Schema`"
+- "Entities reference a Schema via the `Schema_Ref` property"
+- "Without creating a Schema object, the Owner dropdown appears empty"
+- "`Schema_Name` is a read-only property that returns the name of the
+  referenced Schema"
+
+So `Schema_Name` is also a real SCAPI accessor; it just only resolves
+when `Schema_Ref` has been set. Probe failed to print it because the
+probe only logs accessors that successfully return a value, and on a
+schema-less entity neither works.
+
+| DBMS | Target_Server | Confirmed `Name_Qualifier` on bound entity |
+|------|---------------|--------------------------------------------|
+| SQL Server 2012 | 172 | `'MMS'` |
+| Oracle 19c | 174 | `'dbo'` |
+| DB2 z/OS 12/13 | 170 | `'dbo'` |
+| PostgreSQL 16 | 216 | `'dbo'` |
+
+The misleading clue: `EMXLPropertyAssociations.data` lists
+`Entity__has__SchemaName` AND `Entity__has__SQLServerSchemaName` AND
+`AbstractEntity__has__NameQualifier`. Only the last gives a usable
+universal accessor; the schema-name accessors all flow through
+`Schema_Ref`.
+
+The other misleading clue: meta-sync
+(`/c/Users/Kursat/Repos/meta-sync/MetaSync/Services/ErwinUserService.cs:73`)
+uses `Schema_Name` reads inside a `try {} catch {}` block. The catch
+silently swallows the SCAPI rejection on un-bound entities - meta-sync
+gets away with it because it iterates entities that have already been
+imported from an ODBC DB (Schema_Ref preset). On a fresh diagram-drop
+entity those silent swallows would mean every read returns "".
+
+**How to apply:**
+
+1. **For naming-standard rules with `Length > 0`**: treat any SCAPI
+   rejection on the configured `PROPERTY_CODE` as an empty string, NOT
+   a skip. A brand-new entity with no Owner assigned will reject
+   `Name_Qualifier` exactly when the rule should fire. The fix in
+   `TableTypeMonitorService.ValidateNamingStandard` Step 3b is:
+   ```csharp
+   catch (Exception ex)
+   {
+       propValue = "";  // unset = empty for validation purposes
+       Log($"... SCAPI did not surface ... (treating as empty): {ex.Message}");
+   }
+   ```
+2. **For reading the actual schema name in other code paths**: try
+   `entity.Properties("Name_Qualifier").Value` first; if it rejects,
+   the entity has no Schema_Ref - the answer is genuinely empty.
+3. **For writing an Owner via SCAPI**: set
+   `entity.Properties("Schema_Ref").Value = "DBO"`. erwin will look up
+   or create the matching Schema object. Direct write to
+   `Name_Qualifier` does NOT work (it is derived).
+
+**Original (superseded) version of this rule** claimed
+`Name_Qualifier` was universally readable. That was only true for
+schema-bound entities; freshly-dropped entities show the
+"...property collection filter conditions" rejection. The rule above
+is the corrected version.
 
 **Why:** verified empirically with [MetamodelPropertyProbeService](../Services/MetamodelPropertyProbeService.cs)
 on 2026-05-16 against four DBMS families. Same model copied to all

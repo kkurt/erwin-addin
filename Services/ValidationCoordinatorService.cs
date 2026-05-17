@@ -36,6 +36,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         private bool _popupVisible;
         private volatile bool _isCheckingForChanges;
         private bool _columnEditorWasOpen;
+
         // Entity Editor (Table Properties dialog) lifecycle + live UDP
         // snapshot. Title shape is "SQL Server Table 'TableName' Editor" -
         // same #32770 dialog class as the Column Editor but without
@@ -167,6 +168,29 @@ namespace EliteSoft.Erwin.AddIn.Services
         //   user is still typing.
         private readonly Dictionary<string, string> _entityDisplayNameSnapshot =
             new Dictionary<string, string>(StringComparer.Ordinal);
+        /// <summary>
+        /// Table naming-standard checks that were deferred because an
+        /// edit dialog (Column Editor / Entity Editor) was open at the
+        /// time the rename / new-entity event fired. Flushed when the
+        /// next editor-close transition is observed so the Required popup
+        /// surfaces AFTER the user's gesture, not in the middle of it.
+        /// </summary>
+        private readonly HashSet<string> _pendingTableNamingChecks =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Edit-session baseline (2026-05-17) for naming-rule-watched
+        /// properties on the entity currently in focus. Captured when
+        /// the Column Editor or Entity Editor opens; diffed and cleared
+        /// when the same editor closes. Two separate buckets because
+        /// the user can have both editors open in sequence and each
+        /// "open" event must establish its own baseline.
+        /// </summary>
+        private Dictionary<string, string> _columnEditorEntityBaseline;
+        private string _columnEditorEntityName;
+        private Dictionary<string, string> _entityEditorBaseline;
+        private string _entityEditorName;
+
         private readonly HashSet<string> _pendingNamedEntities =
             new HashSet<string>(StringComparer.Ordinal);
 
@@ -912,6 +936,28 @@ namespace EliteSoft.Erwin.AddIn.Services
                     Log($"DiagramHeartbeat: delta detected attrs={delta:+#;-#;0} entities={entityDelta:+#;-#;0} (was {_lastTotalAttributeCount}/{_lastTotalEntityCount}, now {totalAttrs}/{totalEntities})");
                 }
 
+                // Stable-tick early-exit (2026-05-17, evolved): when both
+                // counts are unchanged AND nothing is pending, the walk
+                // below produces zero useful output - rename detection
+                // is now event-driven (ScanForRenamesEventDriven called
+                // from inline-edit / editor close transitions), and
+                // count-delta gates already handle new entities / new
+                // attributes. The walk is therefore safe to SKIP
+                // indefinitely on stable ticks; the previous "every 4th
+                // tick anyway" throttle was a holdover from when rename
+                // detection lived inside the walk.
+                //
+                // Pending sets force a walk because their drain depends on
+                // the per-entity rename-diff that runs further down.
+                if (!isFirstTick && delta == 0 && entityDelta == 0
+                    && _pendingNamedEntities.Count == 0
+                    && _pendingNamedAttrs.Count == 0)
+                {
+                    _lastTotalAttributeCount = totalAttrs;
+                    _lastTotalEntityCount = totalEntities;
+                    return;
+                }
+
                 var currentEntityIds = new HashSet<string>(StringComparer.Ordinal);
                 // (entity dispatch, displayName, entityId, kind, newAttrIds)
                 //   kind 'A' = attr count grew on a known entity (most common),
@@ -1091,6 +1137,19 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 }
                             }
                         }
+                        // Per-tick drift loop intentionally removed
+                        // 2026-05-17: walking every entity every second to
+                        // diff ~4 SCAPI-read watched properties scaled to
+                        // ~3-5 s per tick on a 286-entity model (verified
+                        // by user log: heartbeat interval dropped from 1 s
+                        // to 3-5 s). The drift check now runs as an
+                        // edit-session diff in WindowMonitorTimer_Tick:
+                        // snapshot watched properties when Column / Entity
+                        // editor OPENS, diff vs current when it CLOSES.
+                        // That captures the user's actual change gesture
+                        // exactly once and costs O(rules × 1 entity) per
+                        // edit session, not O(rules × N entities) per
+                        // heartbeat tick.
                     }
                     _entityDisplayNameSnapshot[entityId] = displayName;
                 }
@@ -1220,8 +1279,20 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // results on r10.10. Reentrancy guard inside
                 // RunScopedTableNamingCheck (_scopedCheckInProgress) protects
                 // against the modal popup pumping our own timer back into here.
+                // Editor-open gate (user feedback 2026-05-17): if any
+                // edit dialog is open the user is still mid-gesture on
+                // the very entity we'd validate. Defer the popups into
+                // _pendingTableNamingChecks; the editor-close transition
+                // handler in WindowMonitorTimer_Tick drains them.
+                bool editorOpen = IsColumnEditorOpen() || IsEntityEditorOpen(out _);
                 foreach (var entityName in entitiesToNamingCheck)
                 {
+                    if (editorOpen)
+                    {
+                        if (_pendingTableNamingChecks.Add(entityName))
+                            Log($"DiagramHeartbeat: deferring naming check on '{entityName}' (editor open)");
+                        continue;
+                    }
                     try { RunScopedTableNamingCheck(entityName); }
                     catch (Exception ex) { Log($"DiagramHeartbeat: naming check err for '{entityName}': {ex.Message}"); }
                 }
@@ -1230,6 +1301,204 @@ namespace EliteSoft.Erwin.AddIn.Services
             {
                 ReleaseCom(attrCollection);
                 ReleaseCom(entityCollection);
+            }
+        }
+
+        /// <summary>
+        /// Read the watched-property values for the entity matching
+        /// <paramref name="tableName"/> via SCAPI. Returns an empty
+        /// dict when the entity is not found or naming rules are not
+        /// loaded - callers compare-by-equality so an empty baseline
+        /// matches an empty current and produces no false fire.
+        /// Capped at one SCAPI read per active naming-rule property,
+        /// so the cost is bounded by the rule set (≤10 reads in
+        /// practice) regardless of model size.
+        /// </summary>
+        private Dictionary<string, string> ReadEntityWatchedProperties(string tableName)
+        {
+            var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (string.IsNullOrEmpty(tableName)) return result;
+            if (!NamingStandardService.Instance.IsLoaded) return result;
+
+            var codes = NamingStandardService.Instance.GetPropertyCodes("Table")
+                ?.Where(c => !string.IsNullOrEmpty(c)
+                          && !string.Equals(c, "Physical_Name", StringComparison.OrdinalIgnoreCase))
+                ?.ToList();
+            if (codes == null || codes.Count == 0) return result;
+
+            try
+            {
+                dynamic modelObjects = _session.ModelObjects;
+                dynamic root = modelObjects.Root;
+                if (root == null) return result;
+                dynamic allEntities = modelObjects.Collect(root, "Entity");
+                if (allEntities == null) return result;
+                foreach (dynamic entity in allEntities)
+                {
+                    if (entity == null) continue;
+                    string physName;
+                    try
+                    {
+                        string p = entity.Properties("Physical_Name").Value?.ToString() ?? "";
+                        physName = (!string.IsNullOrEmpty(p) && !p.StartsWith("%")) ? p : (entity.Name ?? "");
+                    }
+                    catch { continue; }
+                    if (!string.Equals(physName, tableName, StringComparison.OrdinalIgnoreCase)) continue;
+
+                    foreach (var code in codes)
+                    {
+                        try { result[code] = entity.Properties(code)?.Value?.ToString() ?? ""; }
+                        catch { result[code] = ""; }
+                    }
+                    break;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"ReadEntityWatchedProperties err for '{tableName}': {ex.Message}");
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// Compare the baseline captured at editor-open against the
+        /// current SCAPI state. Fires <see cref="RunScopedTableNamingCheck"/>
+        /// when any watched property changed - the validator will surface
+        /// any Required-violation popup that the diff exposed (e.g. the
+        /// user cleared Owner on an existing table).
+        /// </summary>
+        private void DiffWatchedPropertiesAndFire(string tableName, Dictionary<string, string> baseline)
+        {
+            if (string.IsNullOrEmpty(tableName) || baseline == null) return;
+            var current = ReadEntityWatchedProperties(tableName);
+            string changedCode = null;
+            string oldVal = null, newVal = null;
+            foreach (var kv in baseline)
+            {
+                string nowVal = current.TryGetValue(kv.Key, out var cv) ? (cv ?? "") : "";
+                if (!string.Equals(kv.Value ?? "", nowVal, StringComparison.Ordinal))
+                {
+                    changedCode = kv.Key;
+                    oldVal = kv.Value ?? "";
+                    newVal = nowVal;
+                    break;
+                }
+            }
+            if (changedCode == null) return;
+            Log($"Editor close: watched property drift on '{tableName}': {changedCode} '{oldVal}' -> '{newVal}' - running scoped naming check");
+            try { RunScopedTableNamingCheck(tableName); }
+            catch (Exception ex) { Log($"DiffWatchedPropertiesAndFire: scoped check err for '{tableName}': {ex.Message}"); }
+        }
+
+        /// <summary>
+        /// Event-driven Physical_Name rename scan (2026-05-17). Replaces
+        /// the per-tick per-entity Physical_Name read in
+        /// <see cref="DiagramHeartbeatTick"/> which dominated tick cost
+        /// (~1.5-2 s on 286-entity models). Walks the model ONCE at
+        /// specific user-gesture boundaries:
+        /// <list type="bullet">
+        /// <item><description>Inline edit close (diagram / Model Explorer
+        /// label edit finished) - catches "user double-clicked an
+        /// existing real-named entity and typed a new name". The previous
+        /// <see cref="_pendingNamedEntities"/> mechanism only covered
+        /// placeholder-named entities.</description></item>
+        /// <item><description>Column Editor close - catches renames typed
+        /// in the parent table's Physical_Name field on the way out.</description></item>
+        /// <item><description>Entity Editor close - same path for the
+        /// Table Properties dialog.</description></item>
+        /// </list>
+        /// Compares each entity's current Physical_Name against
+        /// <see cref="_entityDisplayNameSnapshot"/>; fires
+        /// <see cref="RunScopedTableNamingCheck"/> on the new name for any
+        /// diff and refreshes the snapshot so the next call sees a fresh
+        /// baseline.
+        /// </summary>
+        private void ScanForRenamesEventDriven(string trigger)
+        {
+            if (_sessionLost || _disposed || _validationSuspended) return;
+            if (!IsModelStillOpen()) return;
+
+            dynamic modelObjects = null;
+            dynamic root = null;
+            dynamic allEntities = null;
+            try
+            {
+                modelObjects = _session.ModelObjects;
+                root = modelObjects.Root;
+                if (root == null) return;
+                allEntities = modelObjects.Collect(root, "Entity");
+                if (allEntities == null) return;
+
+                var renames = new List<(string entityId, string oldName, string newName)>();
+                foreach (dynamic entity in allEntities)
+                {
+                    if (entity == null) continue;
+                    string entityId;
+                    try { entityId = entity.ObjectId?.ToString() ?? ""; }
+                    catch { continue; }
+                    if (string.IsNullOrEmpty(entityId)) continue;
+
+                    string displayName;
+                    try
+                    {
+                        string p = entity.Properties("Physical_Name").Value?.ToString() ?? "";
+                        displayName = (!string.IsNullOrEmpty(p) && !p.StartsWith("%")) ? p : (entity.Name ?? entityId);
+                    }
+                    catch { try { displayName = entity.Name ?? entityId; } catch { displayName = entityId; } }
+
+                    if (_entityDisplayNameSnapshot.TryGetValue(entityId, out var prev)
+                        && !string.Equals(prev, displayName, StringComparison.Ordinal))
+                    {
+                        renames.Add((entityId, prev, displayName));
+                    }
+                    _entityDisplayNameSnapshot[entityId] = displayName;
+                }
+
+                if (renames.Count == 0) return;
+                Log($"ScanForRenamesEventDriven [{trigger}]: {renames.Count} rename(s) detected");
+                foreach (var (id, oldName, newName) in renames)
+                {
+                    Log($"  rename detected '{oldName}' -> '{newName}' (id={id})");
+                    if (IsPlaceholderEntityName(newName))
+                    {
+                        // User cleared the name back to a placeholder during
+                        // the same gesture - defer until they pick a real name.
+                        _pendingNamedEntities.Add(id);
+                        continue;
+                    }
+                    try { RunScopedTableNamingCheck(newName); }
+                    catch (Exception ex) { Log($"ScanForRenamesEventDriven scoped check err for '{newName}': {ex.Message}"); }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"ScanForRenamesEventDriven [{trigger}] err: {ex.Message}");
+            }
+            finally
+            {
+                ReleaseCom(allEntities);
+                ReleaseCom(root);
+                ReleaseCom(modelObjects);
+            }
+        }
+
+        /// <summary>
+        /// Drain <see cref="_pendingTableNamingChecks"/> by firing the
+        /// scoped naming check for each entity. Called by the
+        /// WindowMonitorTimer when it observes a Column Editor or Entity
+        /// Editor close transition. Best-effort - per-entity errors are
+        /// logged but do not block draining the rest.
+        /// </summary>
+        private void FlushPendingTableNamingChecks()
+        {
+            if (_pendingTableNamingChecks.Count == 0) return;
+            var queued = _pendingTableNamingChecks.ToArray();
+            _pendingTableNamingChecks.Clear();
+            Log($"Editor close: flushing {queued.Length} deferred naming check(s): {string.Join(", ", queued)}");
+            foreach (var entityName in queued)
+            {
+                try { RunScopedTableNamingCheck(entityName); }
+                catch (Exception ex) { Log($"FlushPendingTableNamingChecks: err for '{entityName}': {ex.Message}"); }
             }
         }
 
@@ -1265,6 +1534,17 @@ namespace EliteSoft.Erwin.AddIn.Services
                 {
                     try { RunScopedTableNamingCheck(activeTable); }
                     catch (Exception ex) { Log($"RunScopedTableNamingCheck err: {ex.Message}"); }
+
+                    // Edit-session baseline (2026-05-17): capture the
+                    // watched-property values BEFORE the user starts
+                    // editing so the close-transition diff can detect
+                    // anything they clear / change.
+                    try
+                    {
+                        _columnEditorEntityBaseline = ReadEntityWatchedProperties(activeTable);
+                        _columnEditorEntityName = activeTable;
+                    }
+                    catch (Exception ex) { Log($"Column Editor open baseline err for '{activeTable}': {ex.Message}"); }
                 }
 
                 if (_columnEditorWasOpen && !editorIsOpen)
@@ -1285,6 +1565,32 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // Scoped delete: walk only the just-closed table's attrs, not all
                     // 280 * 30. Cuts the post-popup wait from ~5 s to ~30 ms.
                     DeletePleaseChangeItColumns(previousTable);
+
+                    // Editor-close flush (2026-05-17): drain naming-standard
+                    // checks that DiagramHeartbeat deferred while the editor
+                    // was open.
+                    try { FlushPendingTableNamingChecks(); }
+                    catch (Exception ex) { Log($"FlushPendingTableNamingChecks err: {ex.Message}"); }
+
+                    // Event-driven rename scan: Column Editor's parent-
+                    // table Physical_Name field can rename the entity too.
+                    try { ScanForRenamesEventDriven("column-editor-close"); }
+                    catch (Exception ex) { Log($"ScanForRenamesEventDriven (column) err: {ex.Message}"); }
+
+                    // Edit-session diff (2026-05-17): if the user changed
+                    // a watched property (e.g. cleared Owner) during the
+                    // edit session, fire the scoped naming check now so the
+                    // Required popup surfaces on close. This replaces the
+                    // expensive per-tick drift loop that scaled badly on
+                    // big models.
+                    if (_columnEditorEntityBaseline != null
+                        && !string.IsNullOrEmpty(_columnEditorEntityName))
+                    {
+                        try { DiffWatchedPropertiesAndFire(_columnEditorEntityName, _columnEditorEntityBaseline); }
+                        catch (Exception ex) { Log($"Column Editor close diff err: {ex.Message}"); }
+                    }
+                    _columnEditorEntityBaseline = null;
+                    _columnEditorEntityName = null;
                 }
 
                 _columnEditorWasOpen = editorIsOpen;
@@ -1300,6 +1606,18 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // commits.
                 bool entityEditorIsOpen = IsEntityEditorOpen(out string entityActiveTable);
                 _activeEntityEditorTable = entityEditorIsOpen ? entityActiveTable : null;
+
+                if (!_entityEditorWasOpen && entityEditorIsOpen && !string.IsNullOrEmpty(entityActiveTable))
+                {
+                    // Edit-session baseline (2026-05-17): mirror of the
+                    // Column Editor open branch above.
+                    try
+                    {
+                        _entityEditorBaseline = ReadEntityWatchedProperties(entityActiveTable);
+                        _entityEditorName = entityActiveTable;
+                    }
+                    catch (Exception ex) { Log($"Entity Editor open baseline err for '{entityActiveTable}': {ex.Message}"); }
+                }
 
                 if (entityEditorIsOpen && !string.IsNullOrEmpty(entityActiveTable)
                     && !_scopedCheckInProgress)
@@ -1334,6 +1652,33 @@ namespace EliteSoft.Erwin.AddIn.Services
                     _entityEditorUdpSnapshot = null;
                 }
 
+                // Editor-close flush (2026-05-17): same drain as the
+                // Column Editor branch above - the user closed the
+                // Table Properties dialog, so any naming check that
+                // DiagramHeartbeat deferred is now safe to surface.
+                if (_entityEditorWasOpen && !entityEditorIsOpen)
+                {
+                    try { FlushPendingTableNamingChecks(); }
+                    catch (Exception ex) { Log($"FlushPendingTableNamingChecks (entity) err: {ex.Message}"); }
+
+                    // Event-driven rename scan: the Entity Editor was the
+                    // ONE place where a Physical_Name edit produced a
+                    // rename invisible to the heartbeat's count-delta gate
+                    // (Gap B). Walk once on close to catch it.
+                    try { ScanForRenamesEventDriven("entity-editor-close"); }
+                    catch (Exception ex) { Log($"ScanForRenamesEventDriven (entity) err: {ex.Message}"); }
+
+                    // Edit-session diff for Table Properties dialog.
+                    if (_entityEditorBaseline != null
+                        && !string.IsNullOrEmpty(_entityEditorName))
+                    {
+                        try { DiffWatchedPropertiesAndFire(_entityEditorName, _entityEditorBaseline); }
+                        catch (Exception ex) { Log($"Entity Editor close diff err: {ex.Message}"); }
+                    }
+                    _entityEditorBaseline = null;
+                    _entityEditorName = null;
+                }
+
                 _entityEditorWasOpen = entityEditorIsOpen;
 
                 // --- Inline-edit (Model Explorer label edit + diagram column
@@ -1364,6 +1709,17 @@ namespace EliteSoft.Erwin.AddIn.Services
                 {
                     try { ValidateCommittedPendingAttrs(); }
                     catch (Exception ex) { Log($"ValidateCommittedPendingAttrs err: {ex.Message}"); }
+
+                    // Event-driven rename scan (Gap A): the inline edit
+                    // just committed. ValidateCommittedPendingAttrs only
+                    // covers attributes/entities that were ALREADY pending
+                    // (placeholder name). A user double-clicking an
+                    // existing real-named entity to rename it would not
+                    // be in any pending set, so without this scan the
+                    // rename was previously caught only by the now-removed
+                    // per-tick Physical_Name walk.
+                    try { ScanForRenamesEventDriven("inline-edit-close"); }
+                    catch (Exception ex) { Log($"ScanForRenamesEventDriven (inline) err: {ex.Message}"); }
                 }
                 _wasInlineEditOpen = inlineEditOpen;
             }
@@ -2545,6 +2901,51 @@ namespace EliteSoft.Erwin.AddIn.Services
                 {
                     Log($"Physical_Data_Type changed: {currentState.TableName}.{currentState.PhysicalName} '{previousState.PhysicalDataType}' -> '{currentState.PhysicalDataType}' (canonical='{currentState.TermTypeCanonical ?? "(none)"}')");
                     EnforceTermTypePolicy(attr, previousState, currentState);
+
+                    // C3 polymorphic-condition replay (2026-05-17): a naming rule can
+                    // condition on the live Physical_Data_Type value (e.g. "DateTime
+                    // columns must end with _DATE"). When the user only changes the
+                    // type - without renaming - the rule's source value just flipped,
+                    // so we re-run the column naming validator against the FINAL
+                    // post-policy type. ReadBuiltinPropertyValue reads SCAPI directly,
+                    // so even if EnforceTermTypePolicy reverted the type, the engine
+                    // sees the truth and gates correctly. No-op when no condition-
+                    // bearing rule applies, so cheap to call unconditionally.
+                    ValidateColumnNamingStandard(attr, currentState);
+
+                    // ValidateColumnNamingStandard parks Req=false violations in
+                    // _pendingResults. On rename-driven paths the consolidated
+                    // popup gets flushed by ValidateCommittedPendingAttrs when
+                    // the inline-edit closes, but a pure type-change has no
+                    // such edge event - the user changed a combo and Tab'd
+                    // away. Flush here so the warning surfaces immediately on
+                    // the same gesture that caused it. (Required violations
+                    // already drained themselves via the inline input dialog.)
+                    if (_pendingResults.Count > 0)
+                    {
+                        ShowConsolidatedPopup();
+                    }
+                }
+
+                // Watched-property drift detection (2026-05-17): mirror of
+                // the Table path in TableTypeMonitorService. Any naming-rule
+                // target on Column other than Physical_Name / Physical_Data_Type
+                // (those already have first-class diff branches above) is
+                // diffed here. Single change is enough to fire the validator;
+                // it re-snapshots downstream if it writes anything back.
+                if (!physicalNameChanged && !dataTypeChanged)
+                {
+                    bool drift = DetectWatchedColumnPropertyChange(attr, previousState, currentState,
+                        out string changedCode, out string oldVal, out string newVal);
+                    if (drift)
+                    {
+                        Log($"Watched column property changed on {currentState.TableName}.{currentState.PhysicalName}: {changedCode} '{oldVal}' -> '{newVal}' - re-running naming check");
+                        ValidateColumnNamingStandard(attr, currentState);
+                        if (_pendingResults.Count > 0)
+                        {
+                            ShowConsolidatedPopup();
+                        }
+                    }
                 }
             }
             finally
@@ -2807,6 +3208,9 @@ namespace EliteSoft.Erwin.AddIn.Services
                         attr.Properties("Physical_Name").Value = afterAuto;
                         _session.CommitTransaction(transId);
                         Log($"Column naming auto-applied (silent): '{state.TableName}.{state.PhysicalName}' -> '{afterAuto}'");
+                        EliteSoft.Erwin.AddIn.Forms.ToastNotification.Show(
+                            "Naming standard applied",
+                            $"Column '{state.TableName}.{state.PhysicalName}' -> '{afterAuto}'");
                         state.PhysicalName = afterAuto;
                     }
                     catch (Exception ex)
@@ -2853,7 +3257,89 @@ namespace EliteSoft.Erwin.AddIn.Services
 
             // Step 3: Validate remaining issues (warning popup for un-fixable rules)
             var results = NamingValidationEngine.ValidateObjectName("Column", state.PhysicalName, attrBoxed);
-            foreach (var r in results.Where(r => !r.IsValid))
+            var failures = results.Where(r => !r.IsValid).ToList();
+
+            // Required-input pass (2026-05-17 C3 follow-up): same contract as
+            // TableTypeMonitorService - Req=true violations get an inline
+            // input dialog, Apply writes back via SCAPI and removes the
+            // violation from the batch, Cancel leaves it for the consolidated
+            // warning popup downstream. Updates state.PhysicalName when the
+            // user just filled the column name so the snapshot baseline does
+            // not detect the write as a rename loop on the next tick.
+            if (attr != null && failures.Count > 0)
+            {
+                var requiredFailures = failures
+                    .Where(f => f.Rule != null
+                                && string.Equals(f.RuleName, "Required", StringComparison.Ordinal)
+                                && !string.IsNullOrEmpty(f.Rule.PropertyCode))
+                    .ToList();
+
+                foreach (var rf in requiredFailures)
+                {
+                    string fieldLabel = $"Column.{rf.Rule.PropertyCode}";
+                    var rc = EliteSoft.Erwin.AddIn.Forms.RequiredFieldDialog.Show(
+                        title: "Required field",
+                        message: rf.ErrorMessage,
+                        fieldLabel: fieldLabel,
+                        out string typed);
+
+                    if (rc != DialogResult.OK || string.IsNullOrEmpty(typed))
+                    {
+                        Log($"Required field dialog cancelled: {state.TableName}.{state.PhysicalName} field={fieldLabel}");
+                        continue;
+                    }
+
+                    int transId = _session.BeginNamedTransaction("RequiredColumnFieldFill");
+                    string writeAccessor = NamingValidationEngine.WriteAccessorFor(rf.Rule.PropertyCode);
+                    try
+                    {
+                        // Read-vs-write accessor split (Name_Qualifier -> Schema_Ref etc).
+                        attr.Properties(writeAccessor).Value = typed;
+                        _session.CommitTransaction(transId);
+                        Log($"Required field filled by user: {state.TableName}.{state.PhysicalName} {fieldLabel} = '{typed}'"
+                            + (writeAccessor != rf.Rule.PropertyCode ? $" (write accessor='{writeAccessor}')" : ""));
+                        failures.Remove(rf);
+
+                        if (string.Equals(rf.Rule.PropertyCode, "Physical_Name", StringComparison.OrdinalIgnoreCase))
+                            state.PhysicalName = typed;
+
+                        // Refresh the WatchedProperties snapshot so the
+                        // next-tick column drift diff doesn't fire on the
+                        // value we just wrote (mirrors the Table-path fix).
+                        try
+                        {
+                            string readBack;
+                            try { readBack = attr.Properties(rf.Rule.PropertyCode)?.Value?.ToString() ?? typed; }
+                            catch { readBack = typed; }
+                            state.WatchedProperties[rf.Rule.PropertyCode] = readBack;
+                        }
+                        catch (Exception snapEx)
+                        {
+                            Log($"Required column watched-snapshot refresh failed: {snapEx.Message}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        try { _session.RollbackTransaction(transId); } catch (Exception rbEx) { Log($"RequiredColumnFieldFill rollback error: {rbEx.Message}"); }
+                        Log($"Required column field write failed for {fieldLabel}: {ex.Message}");
+
+                        bool isSchemaRef = string.Equals(writeAccessor, "Schema_Ref", StringComparison.OrdinalIgnoreCase);
+                        string userMessage = isSchemaRef
+                            ? $"Cannot set '{typed}' as Owner. erwin's Schema_Ref expects an existing Schema object, " +
+                              $"so the value must match an Owner already defined in this model. " +
+                              $"Open Database Object Properties to create the Schema first.\n\n" +
+                              $"SCAPI error:\n{ex.Message}"
+                            : $"Failed to write '{typed}' to {fieldLabel}.\n\nSCAPI error:\n{ex.Message}";
+                        EliteSoft.Erwin.AddIn.Forms.AddinMessageDialog.Show(
+                            userMessage,
+                            "Required field write failed",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Error);
+                    }
+                }
+            }
+
+            foreach (var r in failures)
             {
                 Log($"Naming standard violation ({r.RuleName}): {state.TableName}.{state.PhysicalName} — {r.ErrorMessage}");
                 _pendingResults.Add(new CollectedValidationResult
@@ -3549,6 +4035,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                 PhysicalDataType = physicalDataType
             };
 
+            // Snapshot every property the active naming-rule set targets on
+            // Column, so the next tick can detect a user clearing / editing
+            // one of them without renaming the column. Physical_Name and
+            // Physical_Data_Type are already first-class snapshot fields,
+            // so skip them here to avoid double-tracking.
+            ReadWatchedColumnProperties(attr, snapshot);
+
             // Column UDP values are read lazily in ProcessAttributeChanges only when needed
             // (not in every snapshot — too expensive for 100+ attributes per tick).
             // TermTypeCanonical is also intentionally NOT resolved here; it's set when a
@@ -3556,6 +4049,91 @@ namespace EliteSoft.Erwin.AddIn.Services
             // refreshed when Physical_Name changes (column renamed to a different glossary term).
 
             return snapshot;
+        }
+
+        /// <summary>
+        /// Diff watched-property values between two column snapshots. Falls
+        /// back to re-reading the live SCAPI value when
+        /// <paramref name="currentState"/> happens to not carry a snapshot
+        /// for a code that <paramref name="previousState"/> does (e.g. a
+        /// new rule was added at runtime between snapshots). Returns true
+        /// on the first delta found, with the property code + values
+        /// reported via out parameters for the diagnostic log line.
+        /// </summary>
+        private bool DetectWatchedColumnPropertyChange(dynamic attr,
+            AttributeValidationSnapshot previousState, AttributeValidationSnapshot currentState,
+            out string changedCode, out string oldValue, out string newValue)
+        {
+            changedCode = "";
+            oldValue = "";
+            newValue = "";
+            if (previousState == null || currentState == null) return false;
+            try
+            {
+                foreach (var code in NamingStandardService.Instance.GetPropertyCodes("Column"))
+                {
+                    if (string.IsNullOrEmpty(code)) continue;
+                    if (string.Equals(code, "Physical_Name", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (string.Equals(code, "Physical_Data_Type", StringComparison.OrdinalIgnoreCase)) continue;
+
+                    string previous = previousState.WatchedProperties.TryGetValue(code, out var pv) ? (pv ?? "") : "";
+                    string current;
+                    if (!currentState.WatchedProperties.TryGetValue(code, out var cv))
+                    {
+                        try { current = attr?.Properties(code)?.Value?.ToString() ?? ""; }
+                        catch { current = ""; }
+                    }
+                    else
+                    {
+                        current = cv ?? "";
+                    }
+
+                    if (!string.Equals(previous, current, StringComparison.Ordinal))
+                    {
+                        changedCode = code;
+                        oldValue = previous;
+                        newValue = current;
+                        return true;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"DetectWatchedColumnPropertyChange error: {ex.Message}");
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Populate <see cref="AttributeValidationSnapshot.WatchedProperties"/>
+        /// from the live SCAPI state of <paramref name="attr"/>. Mirrors
+        /// <c>TableTypeMonitorService.RefreshWatchedProperties</c> for the
+        /// Column path. Read failures are stored as empty strings so the
+        /// next-tick diff treats them the same way Step 3b does in
+        /// <c>ValidateColumnNamingStandard</c>.
+        /// </summary>
+        private void ReadWatchedColumnProperties(dynamic attr, AttributeValidationSnapshot snapshot)
+        {
+            if (attr == null || snapshot == null) return;
+            try
+            {
+                snapshot.WatchedProperties.Clear();
+                foreach (var code in NamingStandardService.Instance.GetPropertyCodes("Column"))
+                {
+                    if (string.IsNullOrEmpty(code)) continue;
+                    if (string.Equals(code, "Physical_Name", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (string.Equals(code, "Physical_Data_Type", StringComparison.OrdinalIgnoreCase)) continue;
+
+                    string value;
+                    try { value = attr.Properties(code)?.Value?.ToString() ?? ""; }
+                    catch { value = ""; }
+                    snapshot.WatchedProperties[code] = value;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"ReadWatchedColumnProperties error: {ex.Message}");
+            }
         }
 
         private string GetTableName(dynamic entity)
@@ -3742,6 +4320,18 @@ namespace EliteSoft.Erwin.AddIn.Services
             /// disallowed portion when a term-type policy applies.
             /// </summary>
             public string PhysicalDataType { get; set; }
+
+            /// <summary>
+            /// Live SCAPI value cache for every PROPERTY_CODE that has at
+            /// least one active naming-standard rule on Column (other than
+            /// Physical_Name / Physical_Data_Type, both already first-class
+            /// snapshot fields). Diffed on each monitor tick - any change
+            /// re-fires <see cref="ValidateColumnNamingStandard"/> so e.g.
+            /// clearing a Required-flagged Comment / Definition / Schema_Ref
+            /// on an existing column triggers the Required popup just like
+            /// the new-attribute / rename paths.
+            /// </summary>
+            public Dictionary<string, string> WatchedProperties { get; set; } = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
             /// <summary>
             /// Canonical term-type concept (BUSINESS_TERM / AMORPH_DATA_TYPE /

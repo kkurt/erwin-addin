@@ -52,12 +52,11 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             var results = new List<NamingValidationResult>();
 
-            // Empty string is a legitimate value to validate (e.g. admin's
-            // "Length > 0" rule on Table.Owner should fire when the user
-            // leaves Owner blank on a new table). Pre-2026-05-16 the
-            // engine skipped empty here and the missing-required-field
-            // bug went undetected. Null still skips - that signals a
-            // programmer error (no value to compare against).
+            // Null is normalised to empty so the IS_REQUIRED gate in
+            // EvaluateRule can detect "no value" uniformly. Under the
+            // 2026-05-17 semantics an empty value only fires when the
+            // rule has IS_REQUIRED=true; otherwise the rule short-
+            // circuits and the pattern check is skipped.
             objectName ??= "";
             if (!NamingStandardService.Instance.IsLoaded) return results;
 
@@ -69,17 +68,42 @@ namespace EliteSoft.Erwin.AddIn.Services
                 if (!IsRuleApplicable(rule, objectType, scapiObject))
                     continue;
 
-                ValidateRule(rule, objectName, results);
+                EvaluateRule(rule, objectName, results);
             }
 
             return results;
         }
 
         /// <summary>
-        /// Apply naming standards (prefix/suffix) to an object name.
-        /// When autoOnly=true (default), only rules with AutoApply=true are applied — used by the
-        /// silent auto-apply path. When autoOnly=false, ALL applicable rules are applied — used by
-        /// the "ask user" path so we can compute what the name would look like with manual rules.
+        /// Evaluate a single rule against an object name and append violations.
+        /// Public so unit tests can exercise per-RuleType dispatch without
+        /// having to load <see cref="NamingStandardService"/> from a real
+        /// database. UDP conditioning is NOT applied here - caller is
+        /// responsible for filtering on <see cref="NamingStandardRule.DependsOnUdpId"/>
+        /// before invoking.
+        /// </summary>
+        public static List<NamingValidationResult> EvaluateRule(NamingStandardRule rule, string objectName)
+        {
+            var results = new List<NamingValidationResult>();
+            if (rule == null) return results;
+            objectName ??= "";
+            EvaluateRule(rule, objectName, results);
+            return results;
+        }
+
+        /// <summary>
+        /// Apply naming standards (prefix/suffix) to an object name. Only rules
+        /// with <see cref="NamingRuleKind.Prefix"/> or <see cref="NamingRuleKind.Suffix"/>
+        /// participate; Required/Length/Regexp rules are validate-only and never
+        /// transform a value (per atomic-rule contract 2026-05-16).
+        /// <para>
+        /// When autoOnly=true (default), only Prefix/Suffix rules whose
+        /// <see cref="NamingStandardRule.AutoApply"/> flag is set perform the
+        /// forward apply - used by the silent auto-apply path. When
+        /// autoOnly=false, ALL applicable Prefix/Suffix rules are applied,
+        /// regardless of AutoApply - used by the "ask user" path so we can
+        /// compute what the name would look like with manual rules.
+        /// </para>
         /// </summary>
         public static string ApplyNamingStandards(string objectType, string objectName, dynamic scapiObject = null, bool autoOnly = true, string propertyCode = DefaultPropertyCode)
         {
@@ -101,6 +125,12 @@ namespace EliteSoft.Erwin.AddIn.Services
 
             foreach (var rule in rules)
             {
+                // Only Prefix and Suffix kinds mutate the value; everything
+                // else is validate-only and the engine produces violations
+                // through ValidateObjectName, not transformations.
+                if (rule.RuleType != NamingRuleKind.Prefix && rule.RuleType != NamingRuleKind.Suffix)
+                    continue;
+
                 bool applicable = IsRuleApplicable(rule, objectType, scapiObject);
                 bool isConditional = rule.DependsOnUdpId.HasValue && !string.IsNullOrEmpty(rule.DependsOnUdpName);
 
@@ -112,14 +142,15 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // autoOnly=false and prompts on diff).
                     if (autoOnly && !rule.AutoApply) continue;
 
-                    if (!string.IsNullOrEmpty(rule.Prefix) &&
-                        !result.StartsWith(rule.Prefix, StringComparison.OrdinalIgnoreCase))
+                    if (rule.RuleType == NamingRuleKind.Prefix
+                        && !string.IsNullOrEmpty(rule.Prefix)
+                        && !result.StartsWith(rule.Prefix, StringComparison.OrdinalIgnoreCase))
                     {
                         result = rule.Prefix + result;
                     }
-
-                    if (!string.IsNullOrEmpty(rule.Suffix) &&
-                        !result.EndsWith(rule.Suffix, StringComparison.OrdinalIgnoreCase))
+                    else if (rule.RuleType == NamingRuleKind.Suffix
+                             && !string.IsNullOrEmpty(rule.Suffix)
+                             && !result.EndsWith(rule.Suffix, StringComparison.OrdinalIgnoreCase))
                     {
                         result = result + rule.Suffix;
                     }
@@ -132,14 +163,15 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // user confirmation regardless of AUTO_APPLY. Only
                     // conditional rules strip - a non-conditional baseline
                     // prefix is never auto-removed.
-                    if (!string.IsNullOrEmpty(rule.Prefix) &&
-                        result.StartsWith(rule.Prefix, StringComparison.OrdinalIgnoreCase))
+                    if (rule.RuleType == NamingRuleKind.Prefix
+                        && !string.IsNullOrEmpty(rule.Prefix)
+                        && result.StartsWith(rule.Prefix, StringComparison.OrdinalIgnoreCase))
                     {
                         result = result.Substring(rule.Prefix.Length);
                     }
-
-                    if (!string.IsNullOrEmpty(rule.Suffix) &&
-                        result.EndsWith(rule.Suffix, StringComparison.OrdinalIgnoreCase))
+                    else if (rule.RuleType == NamingRuleKind.Suffix
+                             && !string.IsNullOrEmpty(rule.Suffix)
+                             && result.EndsWith(rule.Suffix, StringComparison.OrdinalIgnoreCase))
                     {
                         result = result.Substring(0, result.Length - rule.Suffix.Length);
                     }
@@ -162,33 +194,110 @@ namespace EliteSoft.Erwin.AddIn.Services
             return !string.Equals(applied, objectName, StringComparison.Ordinal);
         }
 
+        /// <summary>
+        /// Map a read-side SCAPI accessor (admin's <c>PROPERTY_CODE</c>) to
+        /// the corresponding write-side accessor when the two differ.
+        /// <para>
+        /// Reason this exists: <c>Name_Qualifier</c> is a read-only derived
+        /// projection of an entity's <c>Schema_Ref</c> in erwin's metamodel
+        /// (verified 2026-05-16; meta-sync also documents this in
+        /// <c>docs/MetaSync-Technical-Internal-EN.md:280-289</c>). A naming
+        /// rule on Table.Owner reads <c>Name_Qualifier</c> just fine on
+        /// schema-bound entities, but a SCAPI write to
+        /// <c>Name_Qualifier</c> is silently dropped - the property bag
+        /// accepts the assignment, the transaction commits, but the model
+        /// state does not change. To actually set the owner the addin must
+        /// write to <c>Schema_Ref</c>; erwin then materialises (or reuses)
+        /// the matching Schema object and the derived <c>Name_Qualifier</c>
+        /// reflects the new value on the next read.
+        /// </para>
+        /// <para>
+        /// For every other accessor in the addin's current ruleset
+        /// (Physical_Name, Definition, Comment, Physical_Data_Type, ...)
+        /// the read and write codes are identical, so the default is
+        /// pass-through.
+        /// </para>
+        /// </summary>
+        public static string WriteAccessorFor(string readAccessor)
+        {
+            if (string.IsNullOrEmpty(readAccessor)) return readAccessor;
+            if (string.Equals(readAccessor, "Name_Qualifier", StringComparison.OrdinalIgnoreCase))
+                return "Schema_Ref";
+            return readAccessor;
+        }
+
         #region Private Helpers
 
         /// <summary>
-        /// Check if a rule should be applied based on its UDP condition.
+        /// Check whether a rule's polymorphic condition matches the live
+        /// state of the SCAPI object. The condition source is one of:
+        /// <list type="bullet">
+        /// <item><description>Neither <see cref="NamingStandardRule.DependsOnUdpId"/>
+        /// nor <see cref="NamingStandardRule.DependsOnPropertyDefId"/> set →
+        /// unconditional rule, always applicable.</description></item>
+        /// <item><description><see cref="NamingStandardRule.DependsOnUdpId"/> set →
+        /// read the UDP value through
+        /// <c>"&lt;OwnerClass&gt;.Physical.&lt;UdpName&gt;"</c>.</description></item>
+        /// <item><description><see cref="NamingStandardRule.DependsOnPropertyDefId"/>
+        /// set → read the erwin built-in property directly via its SCAPI
+        /// accessor name (<see cref="NamingStandardRule.DependsOnPropertyCode"/>).</description></item>
+        /// </list>
+        /// The CSV in <see cref="NamingStandardRule.DependsOnPropertyValues"/>
+        /// is matched case-insensitively (single-value CSV = back-compat
+        /// path; empty CSV with a source set = "any non-empty value matches").
         /// </summary>
         private static bool IsRuleApplicable(NamingStandardRule rule, string objectType, dynamic scapiObject)
         {
-            // No UDP condition → rule applies to all objects
-            if (!rule.DependsOnUdpId.HasValue || string.IsNullOrEmpty(rule.DependsOnUdpName))
+            bool hasUdpSource = rule.DependsOnUdpId.HasValue && !string.IsNullOrEmpty(rule.DependsOnUdpName);
+            bool hasPropSource = rule.DependsOnPropertyDefId.HasValue && !string.IsNullOrEmpty(rule.DependsOnPropertyCode);
+
+            // Unconditional rule.
+            if (!hasUdpSource && !hasPropSource)
                 return true;
 
-            // Has UDP condition but no SCAPI object to check → skip
+            // Has condition but no SCAPI object to evaluate against → skip
+            // (the caller is invoking us out of band, e.g. a static name
+            // check from a unit test or a Glossary-bound path that does
+            // not carry a live entity ref).
             if (scapiObject == null)
                 return false;
 
-            // Read the UDP value from the erwin object
-            string udpValue = ReadUdpValue(scapiObject, objectType, rule.DependsOnUdpName);
+            string sourceValue = hasUdpSource
+                ? ReadUdpValue(scapiObject, objectType, rule.DependsOnUdpName)
+                : ReadBuiltinPropertyValue(scapiObject, rule.DependsOnPropertyCode);
 
-            // Compare with condition value (case-insensitive)
-            if (string.IsNullOrEmpty(rule.DependsOnUdpValue))
-                return !string.IsNullOrEmpty(udpValue); // Any non-empty value matches
-
-            return string.Equals(udpValue, rule.DependsOnUdpValue, StringComparison.OrdinalIgnoreCase);
+            return MatchesCsv(sourceValue, rule.DependsOnPropertyValues);
         }
 
         /// <summary>
-        /// Read a UDP value from an erwin SCAPI object.
+        /// Case-insensitive IN-match against a CSV list of allowed values.
+        /// Empty/whitespace CSV with a non-empty source value passes
+        /// ("any non-empty value matches"). Both empty → no match.
+        /// Public for unit-test coverage of the C3 condition semantics.
+        /// </summary>
+        public static bool MatchesCsv(string sourceValue, string csv)
+        {
+            sourceValue = sourceValue ?? "";
+            csv = csv ?? "";
+
+            if (string.IsNullOrWhiteSpace(csv))
+                return !string.IsNullOrEmpty(sourceValue);
+
+            foreach (var raw in csv.Split(','))
+            {
+                var token = raw.Trim();
+                if (token.Length == 0) continue;
+                if (string.Equals(token, sourceValue, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Read a UDP value from an erwin SCAPI object. UDP path on r10 is
+        /// <c>&lt;OwnerClass&gt;.Physical.&lt;UdpName&gt;</c>; SCAPI throws on
+        /// unknown owner class so the switch hard-codes the small set the
+        /// addin actually validates today.
         /// </summary>
         private static string ReadUdpValue(dynamic scapiObject, string objectType, string udpName)
         {
@@ -213,82 +322,156 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// Validate a single rule against an object name and add results.
+        /// Read an erwin built-in property value via direct SCAPI access.
+        /// Built-in accessors do NOT use the <c>"&lt;Owner&gt;.Physical.X"</c>
+        /// path - they are plain <c>scapiObject.Properties("Physical_Data_Type").Value</c>
+        /// style calls. SCAPI rejection (e.g. property not surfaced on this
+        /// entity instance, the same pattern as Name_Qualifier on a brand-new
+        /// table) is treated as empty so the IN-match short-circuits and the
+        /// rule skips - the entity simply hasn't reached the state the
+        /// condition targets yet.
         /// </summary>
-        private static void ValidateRule(NamingStandardRule rule, string objectName, List<NamingValidationResult> results)
+        private static string ReadBuiltinPropertyValue(dynamic scapiObject, string propertyCode)
         {
-            // PREFIX check
-            if (!string.IsNullOrEmpty(rule.Prefix))
+            try
             {
-                if (!objectName.StartsWith(rule.Prefix, StringComparison.OrdinalIgnoreCase))
+                return scapiObject.Properties(propertyCode)?.Value?.ToString() ?? "";
+            }
+            catch
+            {
+                return "";
+            }
+        }
+
+        /// <summary>
+        /// Evaluate a single atomic rule (one <see cref="NamingRuleKind"/>)
+        /// against an object name. Spec (2026-05-17 admin update):
+        /// <list type="number">
+        /// <item><description>
+        /// <b>Empty / IS_REQUIRED gate.</b> If the value is null/whitespace
+        /// and <see cref="NamingStandardRule.IsRequired"/> is true, emit one
+        /// violation using the rule's <see cref="NamingStandardRule.ErrorMessage"/>
+        /// and stop. If it is empty and IS_REQUIRED is false, skip the rule
+        /// entirely - empty values do not get pattern-checked unless the
+        /// admin opted in via the flag.
+        /// </description></item>
+        /// <item><description>
+        /// <b>Pattern check.</b> For non-empty values, dispatch on
+        /// <see cref="NamingStandardRule.RuleType"/> and emit a violation
+        /// if the kind-specific check fails. Misconfigured rows (e.g. a
+        /// Length rule with NULL <c>LENGTH_VALUE</c>, a Regexp rule with
+        /// empty <c>REGEXP_PATTERN</c>) are silently skipped per the admin
+        /// contract; admin's <c>NormalizeByRuleType</c> + <c>ValidateByRuleType</c>
+        /// already filter most of these out at save time.
+        /// </description></item>
+        /// </list>
+        /// AutoApply is handled by <see cref="ApplyNamingStandards"/>, not
+        /// here - this method is the validate-only branch.
+        /// </summary>
+        private static void EvaluateRule(NamingStandardRule rule, string objectName, List<NamingValidationResult> results)
+        {
+            // Step 1: empty/IS_REQUIRED gate. ERROR_MESSAGE is the single
+            // message field shared by the empty case and the pattern case
+            // (spec 2026-05-17).
+            if (string.IsNullOrWhiteSpace(objectName))
+            {
+                if (rule.IsRequired)
                 {
-                    results.Add(NamingValidationResult.Invalid("Prefix",
+                    results.Add(NamingValidationResult.Invalid("Required",
                         !string.IsNullOrEmpty(rule.ErrorMessage)
                             ? rule.ErrorMessage
-                            : $"Name must start with '{rule.Prefix}'", rule));
+                            : "Value is required", rule));
                 }
+                // Empty + not required: skip pattern check entirely.
+                return;
             }
 
-            // SUFFIX check
-            if (!string.IsNullOrEmpty(rule.Suffix))
+            // Step 3: pattern check (Step 2 - AutoApply - lives in ApplyNamingStandards).
+            switch (rule.RuleType)
             {
-                if (!objectName.EndsWith(rule.Suffix, StringComparison.OrdinalIgnoreCase))
-                {
-                    results.Add(NamingValidationResult.Invalid("Suffix",
-                        !string.IsNullOrEmpty(rule.ErrorMessage)
-                            ? rule.ErrorMessage
-                            : $"Name must end with '{rule.Suffix}'", rule));
-                }
-            }
-
-            // LENGTH check
-            if (!string.IsNullOrEmpty(rule.LengthOperator) && rule.LengthValue.HasValue)
-            {
-                bool lengthOk = rule.LengthOperator switch
-                {
-                    ">=" => objectName.Length >= rule.LengthValue.Value,
-                    "<=" => objectName.Length <= rule.LengthValue.Value,
-                    ">" => objectName.Length > rule.LengthValue.Value,
-                    "<" => objectName.Length < rule.LengthValue.Value,
-                    "=" => objectName.Length == rule.LengthValue.Value,
-                    _ => true
-                };
-
-                if (!lengthOk)
-                {
-                    results.Add(NamingValidationResult.Invalid("Length",
-                        !string.IsNullOrEmpty(rule.ErrorMessage)
-                            ? rule.ErrorMessage
-                            : $"Name length must be {rule.LengthOperator} {rule.LengthValue}", rule));
-                }
-            }
-
-            // REGEXP check
-            if (!string.IsNullOrEmpty(rule.RegexpPattern))
-            {
-                try
-                {
-                    if (!Regex.IsMatch(objectName, rule.RegexpPattern))
+                case NamingRuleKind.Prefix:
+                    if (string.IsNullOrEmpty(rule.Prefix))
                     {
-                        // Diagnostic: surface the exact stored pattern + the
-                        // tested name so a future "regex looks right but
-                        // rejects every name" bug can be triaged from the
-                        // file log. (Without this line the user sees only
-                        // the human-readable ErrorMessage and the rule
-                        // pattern stays invisible at runtime.)
-                        System.Diagnostics.Debug.WriteLine(
-                            $"NamingValidation: regex fail rule#{rule.Id} pattern(len={rule.RegexpPattern.Length})='{rule.RegexpPattern}' name(len={objectName.Length})='{objectName}'");
-
-                        results.Add(NamingValidationResult.Invalid("Regexp",
+                        // Misconfigured: admin authored a Prefix rule with no
+                        // PREFIX value. Skip rather than emit a meaningless
+                        // "must start with ''" violation.
+                        break;
+                    }
+                    if (!objectName.StartsWith(rule.Prefix, StringComparison.OrdinalIgnoreCase))
+                    {
+                        results.Add(NamingValidationResult.Invalid("Prefix",
                             !string.IsNullOrEmpty(rule.ErrorMessage)
                                 ? rule.ErrorMessage
-                                : $"Name does not match pattern '{rule.RegexpPattern}'", rule));
+                                : $"Name must start with '{rule.Prefix}'", rule));
                     }
-                }
-                catch (Exception ex)
-                {
-                    System.Diagnostics.Debug.WriteLine($"NamingValidation: Invalid regex '{rule.RegexpPattern}': {ex.Message}");
-                }
+                    break;
+
+                case NamingRuleKind.Suffix:
+                    if (string.IsNullOrEmpty(rule.Suffix))
+                        break;
+                    if (!objectName.EndsWith(rule.Suffix, StringComparison.OrdinalIgnoreCase))
+                    {
+                        results.Add(NamingValidationResult.Invalid("Suffix",
+                            !string.IsNullOrEmpty(rule.ErrorMessage)
+                                ? rule.ErrorMessage
+                                : $"Name must end with '{rule.Suffix}'", rule));
+                    }
+                    break;
+
+                case NamingRuleKind.Length:
+                    if (string.IsNullOrEmpty(rule.LengthOperator) || !rule.LengthValue.HasValue)
+                        break;
+                    bool lengthOk = rule.LengthOperator switch
+                    {
+                        ">=" => objectName.Length >= rule.LengthValue.Value,
+                        "<=" => objectName.Length <= rule.LengthValue.Value,
+                        ">" => objectName.Length > rule.LengthValue.Value,
+                        "<" => objectName.Length < rule.LengthValue.Value,
+                        "=" => objectName.Length == rule.LengthValue.Value,
+                        _ => true,
+                    };
+                    if (!lengthOk)
+                    {
+                        results.Add(NamingValidationResult.Invalid("Length",
+                            !string.IsNullOrEmpty(rule.ErrorMessage)
+                                ? rule.ErrorMessage
+                                : $"Name length must be {rule.LengthOperator} {rule.LengthValue}", rule));
+                    }
+                    break;
+
+                case NamingRuleKind.Regexp:
+                    if (string.IsNullOrEmpty(rule.RegexpPattern))
+                        break;
+                    try
+                    {
+                        if (!Regex.IsMatch(objectName, rule.RegexpPattern))
+                        {
+                            // Diagnostic: surface the exact stored pattern +
+                            // the tested name so a future "regex looks right
+                            // but rejects every name" bug can be triaged from
+                            // the file log.
+                            System.Diagnostics.Debug.WriteLine(
+                                $"NamingValidation: regex fail rule#{rule.Id} pattern(len={rule.RegexpPattern.Length})='{rule.RegexpPattern}' name(len={objectName.Length})='{objectName}'");
+
+                            results.Add(NamingValidationResult.Invalid("Regexp",
+                                !string.IsNullOrEmpty(rule.ErrorMessage)
+                                    ? rule.ErrorMessage
+                                    : $"Name does not match pattern '{rule.RegexpPattern}'", rule));
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        System.Diagnostics.Debug.WriteLine(
+                            $"NamingValidation: Invalid regex rule#{rule.Id} '{rule.RegexpPattern}': {ex.Message}");
+                    }
+                    break;
+
+                default:
+                    // Unknown enum value - skip defensively. The loader's
+                    // Enum.TryParse already filters unparseable RULE_TYPE rows.
+                    System.Diagnostics.Debug.WriteLine(
+                        $"NamingValidation: rule#{rule.Id} has unhandled RuleType={rule.RuleType}, skipping");
+                    break;
             }
         }
 

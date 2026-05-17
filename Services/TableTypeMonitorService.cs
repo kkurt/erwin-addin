@@ -18,6 +18,15 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         // Snapshot of entity state: ObjectId -> EntitySnapshot
         private Dictionary<string, EntitySnapshot> _entitySnapshots;
+        /// <summary>
+        /// Per-View / per-Subject_Area watched-property bag. Keyed on the
+        /// SCAPI object's ObjectId (no V_/SA_ prefix - the two object
+        /// classes never collide because erwin guarantees globally unique
+        /// IDs across classes). Mirrors EntitySnapshot.WatchedProperties
+        /// for objects that don't get a full snapshot struct.
+        /// </summary>
+        private Dictionary<string, Dictionary<string, string>> _viewWatchedProperties;
+        private Dictionary<string, Dictionary<string, string>> _subjectAreaWatchedProperties;
 
         // Throttle counter for expensive operations (Key_Group/View/SA scans)
         private int _cycleCount;
@@ -62,6 +71,8 @@ namespace EliteSoft.Erwin.AddIn.Services
             _session = session;
             _entitySnapshots = new Dictionary<string, EntitySnapshot>();
             _keyGroupSnapshots = new Dictionary<string, string>();
+            _viewWatchedProperties = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+            _subjectAreaWatchedProperties = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
         }
 
         /// <summary>
@@ -350,6 +361,14 @@ namespace EliteSoft.Erwin.AddIn.Services
                             snapshot.UdpValues = _udpRuntimeService.ReadUdpValues((object)entity);
                         }
 
+                        // Snapshot every property the active naming-rule set
+                        // targets on Table, so the next tick can detect a
+                        // user clearing / editing one of them without
+                        // renaming the entity. Reads via SCAPI; failures are
+                        // treated as empty per the same contract Step 3b
+                        // uses in ValidateNamingStandard.
+                        RefreshWatchedProperties(entity, snapshot);
+
                         _entitySnapshots[objectId] = snapshot;
                     }
                 }
@@ -467,6 +486,32 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                         // Update snapshot with new name
                         _entitySnapshots[objectId].PhysicalName = physicalName;
+
+                        // Keep watched-property snapshot in sync after rename
+                        // so the next tick's diff doesn't false-fire on
+                        // properties the user didn't actually touch.
+                        RefreshWatchedProperties(entity, _entitySnapshots[objectId]);
+                    }
+                    else if (!isNew)
+                    {
+                        // Watched-property drift detection (2026-05-17): a
+                        // naming rule can target ANY property the admin
+                        // chose (e.g. TABLE.Name_Qualifier for the Owner
+                        // popup), not just Physical_Name. If the user
+                        // clears or edits one of those properties on an
+                        // existing entity, re-fire ValidateNamingStandard
+                        // so the Required popup pops just like the new-
+                        // entity / rename paths.
+                        if (DetectWatchedPropertyChange(entity, _entitySnapshots[objectId], out string changedProperty, out string oldVal, out string newVal))
+                        {
+                            Log($"Watched property changed on '{physicalName}': {changedProperty} '{oldVal}' -> '{newVal}' - re-running naming check");
+                            ValidateNamingStandard("Table", physicalName, entity);
+                            // Refresh the entire snapshot map post-validation
+                            // in case the validator wrote back any defaults
+                            // / auto-apply changes that should not re-fire
+                            // the diff on the next tick.
+                            RefreshWatchedProperties(entity, _entitySnapshots[objectId]);
+                        }
                     }
 
                     // Check for UDP value changes only on existing entities with known snapshots
@@ -546,6 +591,11 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                             // Validate Table naming standards for new entity (with auto-apply)
                             ValidateNamingStandard("Table", physicalName, entity);
+
+                            // Seed watched-property snapshot AFTER validation so
+                            // any value the user entered via the Required popup
+                            // is captured as the new baseline.
+                            RefreshWatchedProperties(entity, _entitySnapshots[objectId]);
                         }
                     }
                 }
@@ -698,11 +748,39 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 {
                                     // New view — just snapshot, validate on name change
                                     _keyGroupSnapshots["V_" + viewId] = viewName;
+                                    var bucket = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                                    ReadWatchedProperties(view, "View", bucket);
+                                    _viewWatchedProperties[viewId] = bucket;
                                 }
                                 else if (nameChanged)
                                 {
                                     ValidateNamingStandard("View", viewName, view);
                                     _keyGroupSnapshots["V_" + viewId] = viewName;
+                                    if (!_viewWatchedProperties.TryGetValue(viewId, out var refreshBucket))
+                                    {
+                                        refreshBucket = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                                        _viewWatchedProperties[viewId] = refreshBucket;
+                                    }
+                                    ReadWatchedProperties(view, "View", refreshBucket);
+                                }
+                                else
+                                {
+                                    // Drift detection (2026-05-17): a naming rule on
+                                    // View.<some property> fires the Required popup
+                                    // when the property is cleared on an existing view.
+                                    if (!_viewWatchedProperties.TryGetValue(viewId, out var prevBucket))
+                                    {
+                                        prevBucket = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                                        ReadWatchedProperties(view, "View", prevBucket);
+                                        _viewWatchedProperties[viewId] = prevBucket;
+                                    }
+                                    else if (DetectScapiPropertyChange(view, "View", prevBucket,
+                                        out string changedProp, out string oldVal, out string newVal))
+                                    {
+                                        Log($"Watched property changed on view '{viewName}': {changedProp} '{oldVal}' -> '{newVal}' - re-running naming check");
+                                        ValidateNamingStandard("View", viewName, view);
+                                        ReadWatchedProperties(view, "View", prevBucket);
+                                    }
                                 }
                             }
                             catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"View naming check error: {ex.Message}"); }
@@ -734,11 +812,38 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 {
                                     // New SA — just snapshot, validate on name change
                                     _keyGroupSnapshots[saKey] = saName;
+                                    var bucket = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                                    ReadWatchedProperties(sa, "Subject Area", bucket);
+                                    _subjectAreaWatchedProperties[saId] = bucket;
                                 }
                                 else if (nameChanged)
                                 {
                                     ValidateNamingStandard("Subject Area", saName, sa);
                                     _keyGroupSnapshots[saKey] = saName;
+                                    if (!_subjectAreaWatchedProperties.TryGetValue(saId, out var refreshBucket))
+                                    {
+                                        refreshBucket = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                                        _subjectAreaWatchedProperties[saId] = refreshBucket;
+                                    }
+                                    ReadWatchedProperties(sa, "Subject Area", refreshBucket);
+                                }
+                                else
+                                {
+                                    // Drift detection (2026-05-17): same logic as
+                                    // the View branch above.
+                                    if (!_subjectAreaWatchedProperties.TryGetValue(saId, out var prevBucket))
+                                    {
+                                        prevBucket = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                                        ReadWatchedProperties(sa, "Subject Area", prevBucket);
+                                        _subjectAreaWatchedProperties[saId] = prevBucket;
+                                    }
+                                    else if (DetectScapiPropertyChange(sa, "Subject Area", prevBucket,
+                                        out string changedProp, out string oldVal, out string newVal))
+                                    {
+                                        Log($"Watched property changed on subject area '{saName}': {changedProp} '{oldVal}' -> '{newVal}' - re-running naming check");
+                                        ValidateNamingStandard("Subject Area", saName, sa);
+                                        ReadWatchedProperties(sa, "Subject Area", prevBucket);
+                                    }
                                 }
                             }
                             catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"Subject_Area naming check error: {ex.Message}"); }
@@ -1041,6 +1146,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                         scapiObject.Properties("Physical_Name").Value = afterAuto;
                         _session.CommitTransaction(transId);
                         Log($"Naming standard auto-applied (silent): '{physicalName}' -> '{afterAuto}'");
+                        ToastNotification.Show("Naming standard applied",
+                            $"{objectType} '{physicalName}' -> '{afterAuto}'");
 
                         // Update snapshot
                         string objectId = scapiObject.ObjectId?.ToString() ?? "";
@@ -1133,17 +1240,146 @@ namespace EliteSoft.Erwin.AddIn.Services
                     }
                     catch (Exception ex)
                     {
-                        // SCAPI rejected the property name. Admin DB is out
-                        // of sync with this DBMS's erwin metamodel - log so
-                        // the admin can run the Probe Properties dev tool
-                        // to find the right accessor for this DBMS.
-                        Log($"Naming standard: SCAPI rejected '{objectType}.{propertyCode}': {ex.Message}");
-                        continue;
+                        // SCAPI says "Entity class does not use a property
+                        // of <X> type or the property failed to satisfy a
+                        // property collection filter conditions". On r10.10
+                        // this happens for a brand-new entity that has not
+                        // yet been assigned the property (e.g. a freshly
+                        // dropped table has no Name_Qualifier instance
+                        // until the user sets Owner in the Database Object
+                        // Properties dialog). This is the EXACT state a
+                        // "Length > 0" rule is meant to catch - treat the
+                        // unset property as an empty string and run the
+                        // validation so the popup fires. If admin's
+                        // PROPERTY_CODE is just wrong, the empty value
+                        // makes the rule fire constantly across every
+                        // entity, which is the loudest possible signal
+                        // for admin to notice and fix the code.
+                        propValue = "";
+                        Log($"Naming standard: SCAPI did not surface '{objectType}.{propertyCode}' on this entity (treating as empty): {ex.Message}");
                     }
 
                     var extraResults = NamingValidationEngine.ValidateObjectName(
                         objectType, propValue, scapiBoxed, propertyCode);
                     failures.AddRange(extraResults.Where(r => !r.IsValid));
+                }
+            }
+
+            // Required-input pass (2026-05-17 C3 follow-up): Req=true rules
+            // produce "Required" violations when the property is empty - per
+            // spec the user is FORCED to provide a value. We surface an
+            // input dialog right here, before the consolidated warning
+            // popup, so the user can fix the field inline. Apply writes the
+            // typed value back via SCAPI and removes the violation from the
+            // failure list; Cancel leaves the violation behind, where it
+            // surfaces in the warning popup like any other Req=false
+            // violation. Done in two phases (collect-then-prompt) so each
+            // dialog runs cleanly against the previous transaction's
+            // commit; running ToList() up-front also lets us mutate
+            // `failures` inside the loop without iterator invalidation.
+            if (scapiObject != null && failures.Count > 0)
+            {
+                var requiredFailures = failures
+                    .Where(f => f.Rule != null
+                                && string.Equals(f.RuleName, "Required", StringComparison.Ordinal)
+                                && !string.IsNullOrEmpty(f.Rule.PropertyCode))
+                    .ToList();
+
+                foreach (var rf in requiredFailures)
+                {
+                    string fieldLabel = $"{objectType}.{rf.Rule.PropertyCode}";
+                    var rc = RequiredFieldDialog.Show(
+                        title: "Required field",
+                        message: rf.ErrorMessage,
+                        fieldLabel: fieldLabel,
+                        out string typed);
+
+                    if (rc != System.Windows.Forms.DialogResult.OK || string.IsNullOrEmpty(typed))
+                    {
+                        Log($"Required field dialog cancelled: {fieldLabel}");
+                        continue;
+                    }
+
+                    int transId = _session.BeginNamedTransaction("RequiredFieldFill");
+                    string writeAccessor = NamingValidationEngine.WriteAccessorFor(rf.Rule.PropertyCode);
+                    try
+                    {
+                        // Read-vs-write accessor split: e.g. Name_Qualifier reads
+                        // are derived from Schema_Ref but writes have to target
+                        // Schema_Ref directly. See WriteAccessorFor for why.
+                        scapiObject.Properties(writeAccessor).Value = typed;
+                        _session.CommitTransaction(transId);
+                        Log($"Required field filled by user: {fieldLabel} = '{typed}'"
+                            + (writeAccessor != rf.Rule.PropertyCode ? $" (write accessor='{writeAccessor}')" : ""));
+                        failures.Remove(rf);
+
+                        // Refresh the WatchedProperties snapshot for this
+                        // entity so the next DiagramHeartbeat tick doesn't
+                        // see the value we just wrote as a phantom drift
+                        // (verified bug 2026-05-17: log line "Watched
+                        // property changed ... '' -> 'dbo' - re-running
+                        // naming check" fired 1.2 s after the user
+                        // successfully filled the popup). Read via the rule's
+                        // read accessor since Schema_Ref writes materialise
+                        // back through Name_Qualifier on the next read.
+                        try
+                        {
+                            string objId = scapiObject.ObjectId?.ToString() ?? "";
+                            if (!string.IsNullOrEmpty(objId)
+                                && _entitySnapshots.TryGetValue(objId, out var snap))
+                            {
+                                string readBack;
+                                try { readBack = scapiObject.Properties(rf.Rule.PropertyCode)?.Value?.ToString() ?? typed; }
+                                catch { readBack = typed; }
+                                snap.WatchedProperties[rf.Rule.PropertyCode] = readBack;
+                            }
+                        }
+                        catch (Exception snapEx)
+                        {
+                            Log($"Required field watched-snapshot refresh failed: {snapEx.Message}");
+                        }
+
+                        // Keep snapshot + local state in sync when the user
+                        // just edited Physical_Name so the next monitor tick
+                        // does not re-detect this as a rename.
+                        if (string.Equals(rf.Rule.PropertyCode, "Physical_Name", StringComparison.OrdinalIgnoreCase))
+                        {
+                            nameToValidate = typed;
+                            physicalName = typed;
+                            try
+                            {
+                                string objectId = scapiObject.ObjectId?.ToString() ?? "";
+                                if (_entitySnapshots.ContainsKey(objectId))
+                                    _entitySnapshots[objectId].PhysicalName = typed;
+                            }
+                            catch (Exception snapEx) { Log($"Required field snapshot update failed: {snapEx.Message}"); }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        try { _session.RollbackTransaction(transId); } catch (Exception rbEx) { Log($"RequiredFieldFill rollback error: {rbEx.Message}"); }
+                        Log($"Required field write failed for {fieldLabel}: {ex.Message}");
+
+                        // SCAPI rejected the value - surface it to the user so they
+                        // know why the field still appears empty. Most common case
+                        // (2026-05-17): Schema_Ref is an SCVT_OBJID column, so a
+                        // schema name that doesn't already exist as a Schema
+                        // object cannot be assigned. The error message from erwin
+                        // mentions the SCAPI type which is enough to give the
+                        // admin a starting point.
+                        bool isSchemaRef = string.Equals(writeAccessor, "Schema_Ref", StringComparison.OrdinalIgnoreCase);
+                        string userMessage = isSchemaRef
+                            ? $"Cannot set '{typed}' as Owner. erwin's Schema_Ref expects an existing Schema object, " +
+                              $"so the value must match an Owner already defined in this model. " +
+                              $"Open Database Object Properties to create the Schema first.\n\n" +
+                              $"SCAPI error:\n{ex.Message}"
+                            : $"Failed to write '{typed}' to {fieldLabel}.\n\nSCAPI error:\n{ex.Message}";
+                        AddinMessageDialog.Show(
+                            userMessage,
+                            "Required field write failed",
+                            System.Windows.Forms.MessageBoxButtons.OK,
+                            System.Windows.Forms.MessageBoxIcon.Error);
+                    }
                 }
             }
 
@@ -1181,14 +1417,21 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // Only renames when we have a scapiObject to write back to
                 // (the live-fire paths always pass one; static external callers
                 // that pass null fall through to the popup as before).
-                // Only Physical_Name failures can trigger the PLEASE_CHANGE_IT
-                // auto-rename: the placeholder makes sense as a name override
-                // but is meaningless for other properties (Owner, Definition,
-                // ...). Non-Physical_Name AUTO_APPLY failures surface in the
-                // popup only - the user must fix them manually.
+                // Only Physical_Name failures from a Prefix/Suffix rule can
+                // trigger the PLEASE_CHANGE_IT auto-rename: the placeholder
+                // makes sense as a name override but is meaningless for
+                // other properties (Owner, Definition, ...) and for
+                // validate-only rule kinds (Required/Length/Regexp) which
+                // never had an "I will fix this for you" promise to break.
+                // The atomic-rule loader already forces AutoApply=false on
+                // non-Prefix/Suffix kinds, so checking AutoApply alone would
+                // be sufficient - the explicit RuleType test below mirrors
+                // the spec for clarity and survives any future loader bug.
                 bool anyAutoApplyFailing = scapiObject != null
                     && failures.Any(f => f.Rule != null
                                          && f.Rule.AutoApply
+                                         && (f.Rule.RuleType == NamingRuleKind.Prefix
+                                             || f.Rule.RuleType == NamingRuleKind.Suffix)
                                          && string.Equals(f.Rule.PropertyCode, "Physical_Name", StringComparison.OrdinalIgnoreCase));
 
                 // Phase-2H popup-then-rename ordering (2026-05-13): show the
@@ -1702,6 +1945,174 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// Seed (but do not diff against) the entity's watched-property
+        /// snapshot. Called by <c>ValidationCoordinatorService.DiagramHeartbeatTick</c>
+        /// on EVERY entity it walks, regardless of editor-open state, so
+        /// the "before edit" state is captured before the user starts
+        /// modifying properties. Without this seed, the drift check
+        /// running for the first time after editor-close would baseline
+        /// against the POST-edit state and miss the change.
+        /// </summary>
+        public void EnsureEntitySnapshotSeeded(dynamic entity, string physicalName)
+        {
+            if (!_isMonitoring) return;
+            if (entity == null) return;
+            if (!NamingStandardService.Instance.IsLoaded) return;
+
+            string objectId;
+            try { objectId = entity.ObjectId?.ToString() ?? ""; }
+            catch { return; }
+            if (string.IsNullOrEmpty(objectId)) return;
+            if (_entitySnapshots.ContainsKey(objectId)) return;
+
+            var snapshot = new EntitySnapshot
+            {
+                ObjectId = objectId,
+                EntityName = "",
+                PhysicalName = physicalName ?? "",
+            };
+            RefreshWatchedProperties(entity, snapshot);
+            _entitySnapshots[objectId] = snapshot;
+        }
+
+        /// <summary>
+        /// Per-tick drift check entry point invoked by
+        /// <c>ValidationCoordinatorService.DiagramHeartbeatTick</c> ONLY
+        /// when no edit dialog is open (Table Editor / Column Editor
+        /// closed). Compares the entity's live SCAPI values against the
+        /// previously seeded snapshot; on the first change found we
+        /// re-fire <see cref="ValidateNamingStandard"/> and refresh the
+        /// snapshot to avoid re-firing on the same delta. If the entity
+        /// is not yet in the snapshot dictionary the call is a no-op -
+        /// the seeding pass <see cref="EnsureEntitySnapshotSeeded"/>
+        /// should have run first; not finding an entry here means an
+        /// unusual lifecycle (e.g. snapshot reset mid-tick) and skipping
+        /// is safer than baselining post-edit.
+        /// </summary>
+        public void CheckEntityPropertyDrift(dynamic entity, string physicalName)
+        {
+            if (!_isMonitoring) return;
+            if (entity == null) return;
+            if (!NamingStandardService.Instance.IsLoaded) return;
+
+            string objectId;
+            try { objectId = entity.ObjectId?.ToString() ?? ""; }
+            catch { return; }
+            if (string.IsNullOrEmpty(objectId)) return;
+
+            if (!_entitySnapshots.TryGetValue(objectId, out var snapshot))
+                return;
+
+            if (DetectWatchedPropertyChange(entity, snapshot,
+                out string changedProperty, out string oldVal, out string newVal))
+            {
+                Log($"Watched property changed on '{physicalName}': {changedProperty} '{oldVal}' -> '{newVal}' - re-running naming check");
+                ValidateNamingStandard("Table", physicalName, entity);
+                RefreshWatchedProperties(entity, snapshot);
+            }
+        }
+
+        /// <summary>
+        /// Read every property the loaded naming-standard set targets on
+        /// the given <paramref name="objectType"/> (excluding
+        /// <c>Physical_Name</c>, which has its own first-class snapshot
+        /// field on the wrapping struct) and write the live SCAPI value
+        /// into <paramref name="bucket"/>. Failures are stored as empty
+        /// strings - same contract Step 3b uses when evaluating the rule.
+        /// </summary>
+        private void ReadWatchedProperties(dynamic obj, string objectType, Dictionary<string, string> bucket)
+        {
+            if (obj == null || bucket == null) return;
+            try
+            {
+                bucket.Clear();
+                foreach (var code in NamingStandardService.Instance.GetPropertyCodes(objectType))
+                {
+                    if (string.IsNullOrEmpty(code)) continue;
+                    if (string.Equals(code, "Physical_Name", StringComparison.OrdinalIgnoreCase)) continue;
+
+                    string value;
+                    try { value = obj.Properties(code)?.Value?.ToString() ?? ""; }
+                    catch { value = ""; }
+                    bucket[code] = value;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"ReadWatchedProperties({objectType}) error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Convenience wrapper for the Table path: hands the
+        /// <see cref="EntitySnapshot"/> WatchedProperties dict to
+        /// <see cref="ReadWatchedProperties"/>.
+        /// </summary>
+        private void RefreshWatchedProperties(dynamic entity, EntitySnapshot snapshot)
+        {
+            if (snapshot == null) return;
+            ReadWatchedProperties(entity, "Table", snapshot.WatchedProperties);
+        }
+
+        /// <summary>
+        /// Diff the live SCAPI values for every watched property on
+        /// <paramref name="objectType"/> against the
+        /// <paramref name="previous"/> bucket. Returns true on the first
+        /// change found; the property code + old + new value are reported
+        /// via out parameters for the diagnostic log line.
+        /// </summary>
+        private bool DetectScapiPropertyChange(dynamic obj, string objectType,
+            Dictionary<string, string> previous,
+            out string changedProperty, out string oldValue, out string newValue)
+        {
+            changedProperty = "";
+            oldValue = "";
+            newValue = "";
+            if (obj == null || previous == null) return false;
+            try
+            {
+                foreach (var code in NamingStandardService.Instance.GetPropertyCodes(objectType))
+                {
+                    if (string.IsNullOrEmpty(code)) continue;
+                    if (string.Equals(code, "Physical_Name", StringComparison.OrdinalIgnoreCase)) continue;
+
+                    string current;
+                    try { current = obj.Properties(code)?.Value?.ToString() ?? ""; }
+                    catch { current = ""; }
+
+                    string prev = previous.TryGetValue(code, out var v) ? (v ?? "") : "";
+
+                    if (!string.Equals(current, prev, StringComparison.Ordinal))
+                    {
+                        changedProperty = code;
+                        oldValue = prev;
+                        newValue = current;
+                        return true;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"DetectScapiPropertyChange({objectType}) error: {ex.Message}");
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Convenience wrapper for the Table path: hands the
+        /// <see cref="EntitySnapshot"/> WatchedProperties dict to
+        /// <see cref="DetectScapiPropertyChange"/>.
+        /// </summary>
+        private bool DetectWatchedPropertyChange(dynamic entity, EntitySnapshot snapshot,
+            out string changedProperty, out string oldValue, out string newValue)
+        {
+            changedProperty = oldValue = newValue = "";
+            if (snapshot == null) return false;
+            return DetectScapiPropertyChange(entity, "Table", snapshot.WatchedProperties,
+                out changedProperty, out oldValue, out newValue);
+        }
+
+        /// <summary>
         /// Snapshot of entity state
         /// </summary>
         private class EntitySnapshot
@@ -1711,6 +2122,16 @@ namespace EliteSoft.Erwin.AddIn.Services
             public string PhysicalName { get; set; }
             /// <summary>UDP name -> value snapshot for dependency change detection</summary>
             public Dictionary<string, string> UdpValues { get; set; } = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            /// <summary>
+            /// Live SCAPI value cache for every PROPERTY_CODE that has at least
+            /// one active naming-standard rule on Table (other than
+            /// Physical_Name, which already has its own snapshot field).
+            /// Diffed on each monitor tick - any change re-fires
+            /// <see cref="ValidateNamingStandard"/> so e.g. clearing the
+            /// Owner column on an existing table triggers the Required popup
+            /// just like the original new-entity / rename paths do.
+            /// </summary>
+            public Dictionary<string, string> WatchedProperties { get; set; } = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         }
     }
 }
