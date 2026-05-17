@@ -34,11 +34,17 @@ Write-Host "Starting erwin..." -ForegroundColor Cyan
 Start-Process $erwinExe
 Write-Host "Waiting for erwin to open..."
 
-# Step 2: Wait for erwin window with a model (title contains "[")
+# Step 2: Wait for erwin window with a model. erwin renders two title shapes:
+# "erwin DM - [Model1 : ER_Diagram_164]" when the MDI child is maximized and
+# "erwin DM - Model1" when it is restored / floating. The old bracket-only
+# regex missed the restored case, so a model opened without the user clicking
+# Maximize would never trigger the launcher. The new pattern matches anything
+# after the " - " separator and correctly rejects the no-model startup titles
+# ("erwin DM" / "erwin Data Modeler") which have no separator at all.
 $erwinProc = $null
 $hWnd = [IntPtr]::Zero
 for ($i = 0; $i -lt 120; $i++) {  # 2 min timeout
-    $erwinProc = Get-Process -Name erwin -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $mySession -and $_.MainWindowTitle -match "erwin.*\[.+\]" } | Select-Object -First 1
+    $erwinProc = Get-Process -Name erwin -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $mySession -and $_.MainWindowTitle -match '^erwin\b.*\s-\s+\S' } | Select-Object -First 1
     if ($erwinProc) {
         $hWnd = $erwinProc.MainWindowHandle
         Write-Host "Model detected: '$($erwinProc.MainWindowTitle)'" -ForegroundColor Green

@@ -29,6 +29,13 @@ if ($Help) {
     Write-Host "registers COM host in HKCU, and configures erwin Add-In Manager."
     Write-Host "Fully User-scoped: no admin / UAC needed for the default flow."
     Write-Host ""
+    Write-Host "Each step is timestamp/hash gated so no-change runs finish in"
+    Write-Host "seconds: native bridge skipped when .cpp is unchanged, DdlHelper"
+    Write-Host "skipped when source is older than the published exe, install dir"
+    Write-Host "sync via robocopy /XO, COM register skipped when HKCU already"
+    Write-Host "points at the right comhost, watcher recycle skipped when the"
+    Write-Host "deployed autostart-watcher.ps1 hash matches scripts/."
+    Write-Host ""
     Write-Host "Usage:" -ForegroundColor Yellow
     Write-Host "  .\build-and-run.ps1                     Build + install + register"
     Write-Host "  .\build-and-run.ps1 -KillAllErwinProcs  Also kill other users' erwin"
@@ -111,6 +118,41 @@ function Unregister-ComUserScope {
     if (Test-Path -LiteralPath $progIdBase) { Remove-Item -LiteralPath $progIdBase -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
+# Returns $true when any source file is newer than $target (or $target is
+# missing). Used by the per-step gating logic so unchanged inputs skip the
+# rebuild instead of paying the full compile/publish cost on every run.
+function Test-AnyNewer {
+    param(
+        [string[]]$Sources,
+        [string]$Target
+    )
+    if (-not (Test-Path -LiteralPath $Target)) { return $true }
+    $targetTime = (Get-Item -LiteralPath $Target).LastWriteTimeUtc
+    foreach ($s in $Sources) {
+        if (-not (Test-Path -LiteralPath $s)) { continue }
+        $item = Get-Item -LiteralPath $s
+        if ($item.PSIsContainer) {
+            $files = Get-ChildItem -LiteralPath $s -Recurse -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -notmatch '\\(bin|obj)\\' }
+            foreach ($f in $files) {
+                if ($f.LastWriteTimeUtc -gt $targetTime) { return $true }
+            }
+        } else {
+            if ($item.LastWriteTimeUtc -gt $targetTime) { return $true }
+        }
+    }
+    return $false
+}
+
+# Stream-fast SHA1 of a small text file. Used to decide if the deployed copy
+# of autostart-watcher.ps1 differs from scripts/, since File.Copy resets the
+# mtime so timestamp compare alone is unreliable.
+function Get-FileHashSafe {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA1).Hash
+}
+
 # --- Step 1: Close processes that might hold our DLLs (CURRENT USER ONLY) ---
 # Use WMI GetOwner so we catch processes whose UserName PowerShell can't
 # inline-resolve (happens for cross-session or stale processes started on a
@@ -130,7 +172,8 @@ function Stop-UserProcesses {
     # ($p.ConvertToDateTime / $p.GetOwner) - which fails as soon as the
     # object is deserialized in PS7 - is replaced here.
     $procs = Get-CimInstance Win32_Process -Filter "Name='$name.exe'" -ErrorAction SilentlyContinue
-    if (-not $procs) { return }
+    if (-not $procs) { return 0 }
+    $killed = 0
     foreach ($p in $procs) {
         $ownerUser = $null
         try {
@@ -144,9 +187,11 @@ function Stop-UserProcesses {
         if ($All) {
             Write-Host "  Killing ${name}.exe PID=$($p.ProcessId) (user=$ownerLabel, FORCE all-users, started $started)" -ForegroundColor Red
             Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+            $killed++
         } elseif ($ownerUser -and $ownerUser -ieq $myUser) {
             Write-Host "  Killing ${name}.exe PID=$($p.ProcessId) (user=$ownerUser, started $started)" -ForegroundColor Yellow
             Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+            $killed++
         } else {
             # Default: never kill another user's (or owner-unknown) process.
             # Earlier versions guessed "treat as ours when owner can't be
@@ -157,6 +202,7 @@ function Stop-UserProcesses {
             Write-Host "  Skipping ${name}.exe PID=$($p.ProcessId) (user=$ownerLabel, not ours; pass -KillAllErwinProcs to override)" -ForegroundColor Gray
         }
     }
+    return $killed
 }
 
 if ($KillAllErwinProcs) {
@@ -164,10 +210,18 @@ if ($KillAllErwinProcs) {
 } else {
     Write-Host "`nClosing erwin / DdlHelper / ErwinInjector (user=$myUser)..." -ForegroundColor Yellow
 }
-Stop-UserProcesses "erwin"          -All:$KillAllErwinProcs
-Stop-UserProcesses "DdlHelper"      -All:$KillAllErwinProcs
-Stop-UserProcesses "ErwinInjector"  -All:$KillAllErwinProcs
-Start-Sleep -Seconds 2
+$killedTotal  = 0
+$killedTotal += Stop-UserProcesses "erwin"          -All:$KillAllErwinProcs
+$killedTotal += Stop-UserProcesses "DdlHelper"      -All:$KillAllErwinProcs
+$killedTotal += Stop-UserProcesses "ErwinInjector"  -All:$KillAllErwinProcs
+# Only wait when we actually terminated something - the OS needs a beat to
+# release file handles before the copy/COM register steps below. No kill -
+# no need to pay the 2s tax.
+if ($killedTotal -gt 0) {
+    Start-Sleep -Seconds 2
+} else {
+    Write-Host "  No processes were running - skipping 2s settle delay" -ForegroundColor DarkGray
+}
 
 # --- Step 2a: Build native bridge (cl.exe) ---
 # Must run BEFORE dotnet build so the csproj Copy task picks up the fresh DLL.
@@ -177,34 +231,42 @@ Start-Sleep -Seconds 2
 # build.ps1 itself uses $ErrorActionPreference=Stop + throw on failure, so
 # any compile error halts the sub-script before it returns.
 $bridgeScript = Join-Path $scriptDir "scripts\native-bridge\build.ps1"
-$bridgeDll    = Join-Path $scriptDir "scripts\native-bridge\ErwinNativeBridge.dll"
+$bridgeDir    = Join-Path $scriptDir "scripts\native-bridge"
+$bridgeDll    = Join-Path $bridgeDir "ErwinNativeBridge.dll"
 if (Test-Path $bridgeScript) {
-    Write-Host "`n[1a/5] Building native bridge (cl.exe)..." -ForegroundColor Yellow
-    $beforeMtime = if (Test-Path $bridgeDll) { (Get-Item $bridgeDll).LastWriteTime } else { [DateTime]::MinValue }
-    & $bridgeScript
-    if (-not (Test-Path $bridgeDll)) {
-        Write-Host "Native bridge build failed - DLL not produced!" -ForegroundColor Red
-        Write-Host "`nPress any key to exit..." -ForegroundColor Gray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown"); exit 1
-    }
-    $afterMtime = (Get-Item $bridgeDll).LastWriteTime
-    if ($afterMtime -le $beforeMtime) {
-        Write-Host "  Native bridge unchanged (still cached, OK)" -ForegroundColor Green
+    Write-Host "`n[1a/5] Native bridge (cl.exe)..." -ForegroundColor Yellow
+    # Recompile only when a .cpp/.h/.hpp file is newer than the DLL (or the
+    # DLL is missing). cl.exe + linker takes ~3-8s on this box - skipping
+    # it on no-source-change shaves the lion's share of the no-change cycle.
+    # -Include needs -Recurse OR a wildcard path; -LiteralPath + a flat
+    # -Include returns nothing in PS7. Enumerate the dir and filter on
+    # extension explicitly so the gate works regardless of CWD.
+    $bridgeSources = @(Get-ChildItem -LiteralPath $bridgeDir -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension -in '.cpp','.h','.hpp' } |
+        ForEach-Object { $_.FullName })
+    if (-not (Test-AnyNewer -Sources $bridgeSources -Target $bridgeDll)) {
+        Write-Host "  Skipped - sources unchanged since DLL was built" -ForegroundColor DarkGray
     } else {
-        Write-Host "  Native bridge built! (refreshed at $afterMtime)" -ForegroundColor Green
+        & $bridgeScript
+        if (-not (Test-Path $bridgeDll)) {
+            Write-Host "Native bridge build failed - DLL not produced!" -ForegroundColor Red
+            Write-Host "`nPress any key to exit..." -ForegroundColor Gray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown"); exit 1
+        }
+        Write-Host "  Native bridge rebuilt." -ForegroundColor Green
     }
 } else {
     Write-Host "`n[1a/5] (skipped) native bridge script not found at $bridgeScript" -ForegroundColor DarkGray
 }
 
 # --- Step 2b: Build managed code ---
-Write-Host "`n[1b/5] Building project..." -ForegroundColor Yellow
-dotnet clean erwin-addin.sln 2>&1 | Out-Null
-# Explicit restore between clean and build. `dotnet build` does implicit
-# restore but it sometimes misses cross-repo ProjectReferences (e.g.
-# ..\erwin-admin\MetaShared) after clean wipes their obj/ folders, producing
-# NETSDK1004 "Assets file ... not found". Verified 2026-05-13.
-dotnet restore erwin-addin.sln 2>&1 | Out-Null
-dotnet build erwin-addin.sln -c Release
+# Incremental dotnet build: no `dotnet clean`, no explicit `dotnet restore`.
+# The original script wiped obj/ then restored to dodge an NETSDK1004 caused
+# by clean itself - dropping the clean removes the trigger entirely. The
+# implicit restore inside `dotnet build` handles legitimate csproj/lock
+# changes on its own. A no-source-change rebuild now finishes in 1-2s
+# instead of the old 25-40s clean+restore+build cycle.
+Write-Host "`n[1b/5] Building project (incremental)..." -ForegroundColor Yellow
+dotnet build erwin-addin.sln -c Release -nologo -clp:Summary
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Build failed!" -ForegroundColor Red
@@ -212,13 +274,31 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host "  Build successful!" -ForegroundColor Green
 
-# Build DdlHelper tool
-Write-Host "  Building DdlHelper..." -ForegroundColor Gray
-$ddlHelperDir = Join-Path $scriptDir "tools\DdlHelper"
+# Build DdlHelper tool - only when the source dir is newer than the
+# published exe. `dotnet publish` with no source change still costs ~3-5s of
+# msbuild overhead (graph walk + Copy task), which we skip on no-change.
+$ddlHelperDir    = Join-Path $scriptDir "tools\DdlHelper"
+$ddlHelperOutDir = Join-Path $scriptDir "bin\Release\net10.0-windows\tools\DdlHelper"
+$ddlHelperExe    = Join-Path $ddlHelperOutDir "DdlHelper.exe"
 if (Test-Path $ddlHelperDir) {
-    dotnet publish "$ddlHelperDir\DdlHelper.csproj" -c Release -o (Join-Path $scriptDir "bin\Release\net10.0-windows\tools\DdlHelper") 2>&1 | Out-Null
-    if ($?) { Write-Host "  DdlHelper built!" -ForegroundColor Green }
-    else { Write-Host "  DdlHelper build failed (non-critical)" -ForegroundColor Yellow }
+    $ddlSources = @(
+        (Join-Path $ddlHelperDir "DdlHelper.csproj"),
+        (Join-Path $ddlHelperDir "Program.cs")
+    )
+    # Include any other .cs files that may be added later under DdlHelper/.
+    $extraCs = Get-ChildItem -LiteralPath $ddlHelperDir -File -Filter "*.cs" -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -ne (Join-Path $ddlHelperDir "Program.cs") } |
+        ForEach-Object { $_.FullName }
+    if ($extraCs) { $ddlSources += $extraCs }
+
+    if (Test-AnyNewer -Sources $ddlSources -Target $ddlHelperExe) {
+        Write-Host "  Publishing DdlHelper..." -ForegroundColor Gray
+        dotnet publish "$ddlHelperDir\DdlHelper.csproj" -c Release -o $ddlHelperOutDir --nologo -v q 2>&1 | Out-Null
+        if ($?) { Write-Host "  DdlHelper published" -ForegroundColor Green }
+        else    { Write-Host "  DdlHelper publish failed (non-critical)" -ForegroundColor Yellow }
+    } else {
+        Write-Host "  DdlHelper skipped - source unchanged since publish" -ForegroundColor DarkGray
+    }
 }
 
 $buildOutputDir = Join-Path $scriptDir "bin\Release\net10.0-windows"
@@ -227,62 +307,101 @@ if (-not (Test-Path (Join-Path $buildOutputDir "EliteSoft.Erwin.AddIn.dll"))) {
     Write-Host "`nPress any key to exit..." -ForegroundColor Gray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown"); exit 1
 }
 
-# --- Step 3: Unregister old version ---
-# Strip any HKCU CLSID/ProgID entries from a previous run so the fresh
-# Step 5 write below points at the just-copied comhost.dll. We do NOT touch
-# HKLM here - earlier builds may have used regsvr32 (HKLM Software\Classes)
-# but going forward all dev installs are HKCU-only. Leftover HKLM entries
-# don't hurt because erwin reads HKCR (HKCU wins on read), but they can be
-# cleaned manually with regsvr32 /u in an elevated shell if desired.
-Write-Host "`n[2/5] Unregistering old COM (HKCU)..." -ForegroundColor Yellow
-Unregister-ComUserScope
-Write-Host "  HKCU CLSID/ProgID entries cleared" -ForegroundColor Green
+# --- Step 3: Snapshot watcher hash BEFORE we sync the install dir, so the
+# tail-end recycle decision can compare "old deployed" vs "new on disk".
+$watcherSrcPath = Join-Path $scriptDir "scripts\autostart-watcher.ps1"
+$watcherDstPath = Join-Path $installDir "autostart-watcher.ps1"
+$watcherOldHash = Get-FileHashSafe -Path $watcherDstPath
+$watcherSrcHash = Get-FileHashSafe -Path $watcherSrcPath
 
-# --- Step 4: Copy files ---
-Write-Host "`n[3/5] Installing to $installDir..." -ForegroundColor Yellow
+# --- Step 4: Copy files via robocopy ---
+# robocopy /XO skips files whose destination copy is newer-or-equal-age, so
+# dotnet build's preserved mtimes on unchanged DLLs (third-party + projects
+# with no source changes) avoid being re-copied. /NJH /NJS /NDL /NFL /NP
+# silences the verbose default output; only the summary returns. Exit codes
+# 0-7 are success (0=nothing copied, 1=files copied, others=mismatch/extras).
+Write-Host "`n[3/5] Syncing $installDir..." -ForegroundColor Yellow
 if (-not (Test-Path $installDir)) {
     New-Item -ItemType Directory -Path $installDir -Force | Out-Null
-} else {
-    Remove-Item "$installDir\*.tlb" -Force -ErrorAction SilentlyContinue
-    Remove-Item "$installDir\*.config" -Force -ErrorAction SilentlyContinue
+}
+# Wipe transient TLB/config so re-registered COM picks up the fresh ones
+# even when robocopy /XO would have skipped them (rare edge - dotnet build
+# regenerates these but mtime sometimes does not advance past the deployed
+# copy when the typelib content is identical).
+Remove-Item "$installDir\*.tlb"    -Force -ErrorAction SilentlyContinue
+Remove-Item "$installDir\*.config" -Force -ErrorAction SilentlyContinue
+
+$robocopyArgs = @(
+    $buildOutputDir, $installDir,
+    "/E", "/XO",
+    "/NJH","/NJS","/NDL","/NFL","/NP","/R:2","/W:1"
+)
+$robocopyOutput = & robocopy.exe @robocopyArgs
+$rcExit = $LASTEXITCODE
+# robocopy exit codes 0-7 are non-fatal (0 = no files copied, 1 = files
+# copied OK, 2 = extra files in dest, 4 = mismatched files, 8+ = real
+# failure). Anything <= 7 is success.
+if ($rcExit -ge 8) {
+    Write-Host "  robocopy failed (exit=$rcExit):" -ForegroundColor Red
+    Write-Host $robocopyOutput -ForegroundColor Red
+    Write-Host "`nPress any key to exit..." -ForegroundColor Gray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown"); exit 1
 }
 
-Copy-Item -Path "$buildOutputDir\*" -Destination $installDir -Recurse -Force
-
-# autostart-watcher.ps1 lives under scripts/ (not bin/), so the bin->install
-# copy above misses it. Without this explicit refresh the install dir keeps
-# whatever watcher version was first deployed (often the very first one),
-# meaning auto-load improvements made in the repo never reach the running
-# Scheduled Task. We restart the task at the end of build-and-run, so
-# whatever sits at this path is what runs next - keep it in sync.
-$watcherSrc = Join-Path $scriptDir "scripts\autostart-watcher.ps1"
-$watcherDst = Join-Path $installDir "autostart-watcher.ps1"
-if (Test-Path -LiteralPath $watcherSrc) {
-    [System.IO.File]::Copy($watcherSrc, $watcherDst, $true)
-    Write-Host "  Refreshed autostart-watcher.ps1 from scripts/" -ForegroundColor Gray
+# autostart-watcher.ps1 lives under scripts/ (not bin/), so the robocopy
+# above misses it. Refresh only when the SHA1 differs from the snapshotted
+# pre-copy hash - File.Copy resets mtime, which made the previous always-
+# copy logic fool the recycle step into thinking the watcher changed on
+# every run.
+if (Test-Path -LiteralPath $watcherSrcPath) {
+    if ($watcherSrcHash -ne $watcherOldHash) {
+        [System.IO.File]::Copy($watcherSrcPath, $watcherDstPath, $true)
+        Write-Host "  Refreshed autostart-watcher.ps1 (hash changed)" -ForegroundColor Gray
+    }
 } else {
-    Write-Host "  WARNING: $watcherSrc missing - keeping installed watcher" -ForegroundColor Yellow
+    Write-Host "  WARNING: $watcherSrcPath missing - keeping installed watcher" -ForegroundColor Yellow
 }
 
-$copiedCount = (Get-ChildItem -LiteralPath $installDir -Recurse -File).Count
-Write-Host "  Copied $copiedCount files" -ForegroundColor Green
+# robocopy exit 0 == nothing copied (everything was up-to-date).
+if ($rcExit -eq 0) {
+    Write-Host "  Install dir already in sync (no files copied)" -ForegroundColor DarkGray
+} else {
+    Write-Host "  Sync complete (robocopy exit=$rcExit)" -ForegroundColor Green
+}
 # icacls grant skipped: $installDir lives under %LOCALAPPDATA% which the
 # current user owns and can read/execute by default. The grant only
 # mattered when the previous version dropped binaries into Program Files.
 
 # --- Step 5: Register COM (HKCU, no UAC) ---
-Write-Host "`n[4/5] Registering COM host (HKCU\Software\Classes)..." -ForegroundColor Yellow
+# Read the currently-registered comhost path; skip the unregister+register
+# pair when HKCU already points at our just-copied comhost. The pair is
+# idempotent (Register-ComUserScope writes with -Force), so skipping is
+# purely a speed win when nothing changed - no behavioral difference.
+Write-Host "`n[4/5] COM host registration (HKCU\Software\Classes)..." -ForegroundColor Yellow
 $comHost = Join-Path $installDir "EliteSoft.Erwin.AddIn.comhost.dll"
 if (-not (Test-Path -LiteralPath $comHost)) {
     Write-Host "  comhost.dll not found at $comHost" -ForegroundColor Red
     Write-Host "`nPress any key to exit..." -ForegroundColor Gray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown"); exit 1
 }
+$inprocKey   = "HKCU:\Software\Classes\CLSID\$clsid\InProcServer32"
+$currentPath = $null
 try {
-    Register-ComUserScope -comHostPath $comHost
-    Write-Host "  COM registered (HKCU; no UAC needed)" -ForegroundColor Green
-} catch {
-    Write-Host "  COM registration failed: $($_.Exception.Message)" -ForegroundColor Red
-    Write-Host "`nPress any key to exit..." -ForegroundColor Gray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown"); exit 1
+    $currentPath = (Get-ItemProperty -LiteralPath $inprocKey -Name "(default)" -ErrorAction Stop)."(default)"
+} catch { $currentPath = $null }
+
+if ($currentPath -and ($currentPath -ieq $comHost)) {
+    Write-Host "  HKCU already points at $comHost - skipped" -ForegroundColor DarkGray
+} else {
+    try {
+        # Unregister first to wipe any stale subkeys from older layouts that
+        # would otherwise survive the -Force overwrite (e.g. a leftover
+        # TypeLib subkey from a prior regsvr32 path).
+        Unregister-ComUserScope
+        Register-ComUserScope -comHostPath $comHost
+        Write-Host "  COM registered (HKCU; no UAC needed)" -ForegroundColor Green
+    } catch {
+        Write-Host "  COM registration failed: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "`nPress any key to exit..." -ForegroundColor Gray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown"); exit 1
+    }
 }
 
 # --- Step 5b: Write erwin Add-In Manager entry (HKCU) ---
@@ -292,16 +411,36 @@ try {
 # verified). Without this step the COM registration succeeds but erwin
 # can't discover the addin so it never loads. install-impl.ps1 writes the same
 # entry; we mirror it here so the dev loop is self-sufficient.
-Write-Host "`n[5b/5] Registering in erwin Add-In Manager (HKCU)..." -ForegroundColor Yellow
+Write-Host "`n[5b/5] erwin Add-In Manager entry (HKCU)..." -ForegroundColor Yellow
 $addInPath = "HKCU:\SOFTWARE\erwin\Data Modeler\10.10\Add-Ins\Elite Soft Erwin Addin"
-if (-not (Test-Path -LiteralPath $addInPath)) {
-    New-Item -Path $addInPath -Force | Out-Null
+# Skip the four Set-ItemProperty writes when the existing values already
+# match. Registry SetValue is microseconds-cheap so the win is small, but
+# the "Skipped" log line is the useful signal that the run is idempotent.
+$addInWanted = @{
+    "Menu Identifier" = 1
+    "ProgID"          = "EliteSoft.Erwin.AddIn"
+    "Invoke Method"   = "Execute"
+    "Invoke EXE"      = 0
 }
-Set-ItemProperty -LiteralPath $addInPath -Name "Menu Identifier" -Value 1                       -Type DWord
-Set-ItemProperty -LiteralPath $addInPath -Name "ProgID"          -Value "EliteSoft.Erwin.AddIn" -Type String
-Set-ItemProperty -LiteralPath $addInPath -Name "Invoke Method"   -Value "Execute"               -Type String
-Set-ItemProperty -LiteralPath $addInPath -Name "Invoke EXE"      -Value 0                       -Type DWord
-Write-Host "  HKCU Add-In entry written" -ForegroundColor Green
+$addInOk = Test-Path -LiteralPath $addInPath
+if ($addInOk) {
+    $cur = Get-ItemProperty -LiteralPath $addInPath -ErrorAction SilentlyContinue
+    foreach ($k in $addInWanted.Keys) {
+        if ($null -eq $cur -or $cur.$k -ne $addInWanted[$k]) { $addInOk = $false; break }
+    }
+}
+if ($addInOk) {
+    Write-Host "  HKCU Add-In entry already current - skipped" -ForegroundColor DarkGray
+} else {
+    if (-not (Test-Path -LiteralPath $addInPath)) {
+        New-Item -Path $addInPath -Force | Out-Null
+    }
+    Set-ItemProperty -LiteralPath $addInPath -Name "Menu Identifier" -Value 1                       -Type DWord
+    Set-ItemProperty -LiteralPath $addInPath -Name "ProgID"          -Value "EliteSoft.Erwin.AddIn" -Type String
+    Set-ItemProperty -LiteralPath $addInPath -Name "Invoke Method"   -Value "Execute"               -Type String
+    Set-ItemProperty -LiteralPath $addInPath -Name "Invoke EXE"      -Value 0                       -Type DWord
+    Write-Host "  HKCU Add-In entry written" -ForegroundColor Green
+}
 
 # --- Step 6: Auto-start watcher health check ---
 # Develop loop'unda watcher sessizce olebilir (process kill, OOM, vs). Build
@@ -357,43 +496,52 @@ if (-not $task) {
         Set-ScheduledTask -TaskName $watcherTaskName -Settings $newSettings | Out-Null
     }
 
-    # ALWAYS recycle the watcher process. PowerShell loads a script into
-    # memory once at process start, so a refreshed autostart-watcher.ps1
-    # on disk (Step 3 just copied the new version) won't take effect
-    # until the running watcher is killed and the task starts a fresh
-    # PS process. Without this recycle the dev loop keeps running the
-    # original watcher version that was deployed first - any subsequent
-    # change to scripts/autostart-watcher.ps1 silently has no effect.
+    # Recycle the watcher process only when the deployed script actually
+    # changed (hash compare snapshotted before the copy step above). The
+    # original logic always killed + restarted, which paid the 3-10s cold
+    # PowerShell startup tax on every run - even when nothing about the
+    # watcher had moved. PowerShell loads a script into memory once at
+    # process start; if the file on disk is byte-identical to what the
+    # running process loaded, the recycle is pure cost with zero benefit.
+    $watcherChanged = ($watcherSrcHash -ne $watcherOldHash)
     $existingWatchers = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -match 'autostart-watcher' })
-    if ($existingWatchers.Count -gt 0) {
-        foreach ($wp in $existingWatchers) {
-            Write-Host "  Killing stale watcher PID=$($wp.ProcessId) (will be replaced with refreshed script)" -ForegroundColor Gray
-            Stop-Process -Id $wp.ProcessId -Force -ErrorAction SilentlyContinue
+
+    if (-not $watcherChanged -and $existingWatchers.Count -gt 0) {
+        $first = $existingWatchers[0]
+        Write-Host "  Watcher already running (PID=$($first.ProcessId)) and script unchanged - recycle skipped" -ForegroundColor DarkGray
+        $watcherProc = $first
+    } else {
+        if ($existingWatchers.Count -gt 0) {
+            foreach ($wp in $existingWatchers) {
+                Write-Host "  Killing stale watcher PID=$($wp.ProcessId) (script changed or recycle requested)" -ForegroundColor Gray
+                Stop-Process -Id $wp.ProcessId -Force -ErrorAction SilentlyContinue
+            }
+            Start-Sleep -Seconds 1
         }
-        Start-Sleep -Seconds 1
+
+        Write-Host "  Triggering ScheduledTask '$watcherTaskName'..." -ForegroundColor Gray
+        Stop-ScheduledTask -TaskName $watcherTaskName -ErrorAction SilentlyContinue
+        Start-ScheduledTask  -TaskName $watcherTaskName
+        # Poll for the watcher to come up. Empirically takes 3-10 s on this
+        # box (cold PowerShell start + script preload). The previous fixed
+        # Start-Sleep -Seconds 2 tripped a false-failure path because the
+        # watcher just had not spawned yet (verified 2026-05-14: build-and-run
+        # reported "failed to start" 9 s before the watcher actually wrote
+        # its "Watcher started" line to the log). Cap at 20 s.
+        $watcherProc = $null
+        $maxWaitSec = 20
+        $waited = 0
+        while ($waited -lt $maxWaitSec -and -not $watcherProc) {
+            Start-Sleep -Seconds 1
+            $waited++
+            $watcherProc = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+                Where-Object { $_.CommandLine -match 'autostart-watcher' } | Select-Object -First 1
+        }
     }
 
-    Write-Host "  Triggering ScheduledTask '$watcherTaskName'..." -ForegroundColor Gray
-    Stop-ScheduledTask -TaskName $watcherTaskName -ErrorAction SilentlyContinue
-    Start-ScheduledTask  -TaskName $watcherTaskName
-    # Poll for the watcher to come up. Empirically takes 3-10 s on this
-    # box (cold PowerShell start + script preload). The previous fixed
-    # Start-Sleep -Seconds 2 tripped a false-failure path because the
-    # watcher just had not spawned yet (verified 2026-05-14: build-and-run
-    # reported "failed to start" 9 s before the watcher actually wrote
-    # its "Watcher started" line to the log). Cap at 20 s.
-    $watcherProc = $null
-    $maxWaitSec = 20
-    $waited = 0
-    while ($waited -lt $maxWaitSec -and -not $watcherProc) {
-        Start-Sleep -Seconds 1
-        $waited++
-        $watcherProc = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -match 'autostart-watcher' } | Select-Object -First 1
-    }
     if ($watcherProc) {
-        Write-Host "  Watcher running (PID=$($watcherProc.ProcessId), startup took ${waited}s)" -ForegroundColor Green
+        Write-Host "  Watcher running (PID=$($watcherProc.ProcessId))" -ForegroundColor Green
     } else {
         # autostart-watcher.ps1 routes its log to
         # %LOCALAPPDATA%\EliteSoft\ErwinAddIn-Logs\ regardless of install

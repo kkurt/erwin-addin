@@ -362,11 +362,17 @@ if (-not $dotnetOk) {
     exit 1
 }
 
-# Stop ALL watcher processes (prevents duplicates, unlocks COM host DLL)
+# Stop ALL watcher processes (prevents duplicates, unlocks COM host DLL).
+# Order matters: kill the PS process FIRST, then Stop-ScheduledTask AGAIN to
+# resync Task Scheduler state. After Win32_Process.Terminate() the SCM still
+# considers the task "Running" for up to 30 s (until its next poll); the
+# `Start-ScheduledTask` at the end of this script then silently no-ops
+# (MultipleInstancesPolicy=IgnoreNew) and the watcher never comes back. Root
+# cause traced 2026-05-15: 8+ install runs left the watcher dead because of
+# this race.
+$taskName = "EliteSoft Erwin AddIn AutoStart - $env:USERNAME"
+$legacyTaskName = "EliteSoft Erwin AddIn AutoStart"
 try {
-    # Try both per-user and legacy shared names; missing tasks fail silently.
-    Stop-ScheduledTask -TaskName "EliteSoft Erwin AddIn AutoStart - $env:USERNAME" -ErrorAction SilentlyContinue
-    Stop-ScheduledTask -TaskName "EliteSoft Erwin AddIn AutoStart" -ErrorAction SilentlyContinue
     # Kill ALL autostart-watcher PowerShell processes
     Get-WmiObject Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -match "autostart-watcher" } |
@@ -375,6 +381,11 @@ try {
             $_.Terminate() | Out-Null
         }
     Start-Sleep -Seconds 2
+    # Force SCM state Running -> Ready so the later Start-ScheduledTask is
+    # actually honoured. Missing tasks fail silently (legitimate on first
+    # install).
+    Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    Stop-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue
 } catch { }
 
 # Only OUR OWN erwin (same user + same session) can lock the install dir
@@ -782,8 +793,9 @@ if (Test-BootstrapConfigured $hklmBootstrap) {
 # Register kept failing with "already exists". Suffixing with $env:USERNAME
 # makes each user's autostart task independent.
 Write-Host "`n[Watcher] Configuring auto-start watcher..." -ForegroundColor Yellow
-$taskName = "EliteSoft Erwin AddIn AutoStart - $env:USERNAME"
-$legacyTaskName = "EliteSoft Erwin AddIn AutoStart"
+# $taskName / $legacyTaskName were declared earlier (Stop block) so that the
+# pre-Stop and post-Start phases agree on the exact same task name; do not
+# redeclare here.
 $watcherSource = Join-Path $sourceDir "autostart-watcher.ps1"
 $watcherTarget = Join-Path $installDir "autostart-watcher.ps1"
 
@@ -861,10 +873,42 @@ if (Test-Path -LiteralPath $watcherSource) {
         $registered = $null
     }
 
-    # Start watcher immediately (don't wait for next logon). Skip if
-    # registration failed - Start-ScheduledTask on a missing task throws.
+    # Start watcher immediately (don't wait for next logon) AND verify the
+    # PowerShell host actually came up. Previous version used
+    # `-ErrorAction SilentlyContinue` plus no verification, so any silent
+    # failure (Task Scheduler state still "Running" from a pre-kill race,
+    # AV quarantine, etc.) left the box with a registered task and no
+    # running watcher. Mirrors the working pattern in build-and-run.ps1.
     if ($registered) {
-        Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        try {
+            Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
+        }
+        catch {
+            Write-Host "  ERROR: Start-ScheduledTask '$taskName' failed:" -ForegroundColor Red
+            Write-Host "    $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "  Add-in will only auto-load after your next logon." -ForegroundColor Yellow
+        }
+
+        # Poll up to 20 s for the watcher PS process (cold PowerShell start
+        # can take 3-10 s; verified 2026-05-14 build-and-run telemetry).
+        $watcherProc = $null
+        $maxWaitSec = 20
+        $waited = 0
+        while ($waited -lt $maxWaitSec -and -not $watcherProc) {
+            Start-Sleep -Seconds 1
+            $waited++
+            $watcherProc = Get-WmiObject Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+                Where-Object { $_.CommandLine -match 'autostart-watcher' } | Select-Object -First 1
+        }
+        if ($watcherProc) {
+            Write-Host "  Watcher running (PID=$($watcherProc.ProcessId), startup took ${waited}s)" -ForegroundColor Green
+        } else {
+            $watcherLog = Join-Path $env:LOCALAPPDATA 'EliteSoft\ErwinAddIn-Logs\autostart.log'
+            Write-Host "  WARNING: Watcher did not start within ${maxWaitSec}s." -ForegroundColor Red
+            Write-Host "    Check $watcherLog for errors." -ForegroundColor Yellow
+            Write-Host "    Add-in will only auto-load after your next logon, or run:" -ForegroundColor Yellow
+            Write-Host "      Start-ScheduledTask -TaskName '$taskName'" -ForegroundColor Yellow
+        }
     }
 } else {
     Write-Host "  autostart-watcher.ps1 not found in package, skipping" -ForegroundColor Yellow

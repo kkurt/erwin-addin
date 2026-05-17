@@ -34,6 +34,23 @@ function Get-MyErwin {
     return Get-Process -Name "erwin" -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $mySessionId }
 }
 
+# Detects "a model is open in erwin" from the main window title. erwin's MFC
+# MDI host renders two distinct title shapes depending on the MDI child state,
+# and the addin's auto-load was only catching the first one (which is why a
+# fresh "New Model" or a model opened without maximizing the child paid no
+# attention to the watcher until the user clicked / maximized the child):
+#   maximized child : "erwin DM - [Model1 : ER_Diagram_164]"   <- has brackets
+#   restored child  : "erwin DM - Model1"                       <- no brackets
+#   no model        : "erwin Data Modeler" / "erwin DM"          <- no dash
+# We treat "anything after ' - ' that is non-empty" as a model-loaded signal;
+# the no-model titles have no " - " separator at all so they correctly fail.
+# Trailing "*" (dirty marker) and the optional bracket form are both covered.
+function Test-ErwinHasModel {
+    param([string]$Title)
+    if ([string]::IsNullOrWhiteSpace($Title)) { return $false }
+    return $Title -match '^erwin\b.*\s-\s+\S'
+}
+
 # erwin DM r10 Add-In discovery only reads from HKCU. Watcher runs at every
 # user's logon (Scheduled Task with INTERACTIVE-group trigger on Machine
 # installs, per-user trigger on User installs), so each user gets their
@@ -68,7 +85,7 @@ function Wait-ForModel {
             return $false
         }
 
-        $erwinProc = Get-MyErwin | Where-Object { $_.MainWindowTitle -match "erwin.*\[.+\]" } | Select-Object -First 1
+        $erwinProc = Get-MyErwin | Where-Object { Test-ErwinHasModel $_.MainWindowTitle } | Select-Object -First 1
         if ($erwinProc) {
             Write-Log "Model detected: '$($erwinProc.MainWindowTitle)'"
             return $true
@@ -160,7 +177,7 @@ while ($true) {
     }
 
     # --- Remember which erwin PID we're injecting into ---
-    $targetErwin = Get-MyErwin | Where-Object { $_.MainWindowTitle -match "erwin.*\[.+\]" } | Select-Object -First 1
+    $targetErwin = Get-MyErwin | Where-Object { Test-ErwinHasModel $_.MainWindowTitle } | Select-Object -First 1
     $targetPid = $targetErwin.Id
     Write-Log "Target erwin PID=$targetPid"
 
