@@ -1346,6 +1346,25 @@ namespace EliteSoft.Erwin.AddIn
 
                     diff = UdpSyncEngine.ComputeDiff(snapshot, walk.Map);
                     Log($"UDP sync diff: creates={diff.Creates.Count}, updates={diff.Updates.Count}");
+
+                    // Diagnostic for the recurring "List options changed" false-positive:
+                    // dump expected vs current verbatim, with length and per-codeunit hex,
+                    // so we can see exactly which character/order differs across runs.
+                    // Triggered only when ListValues flag is set, so it stays quiet on
+                    // healthy models.
+                    foreach (var upd in diff.Updates)
+                    {
+                        if (!upd.Changes.HasFlag(UdpUpdateChanges.ListValues)) continue;
+                        if (upd.AdminUdp == null || upd.ExistingUdp == null) continue;
+                        string diagExpected = string.Join(",", upd.AdminUdp.ListOptions.Select(o => o.Value));
+                        string diagCurrent = upd.ExistingUdp.CurrentListValues ?? "";
+                        Log($"UDP diff DIAG [{upd.FullName}] ListValues:");
+                        Log($"  admin   ({diagExpected.Length} chars): '{diagExpected}'");
+                        Log($"  model   ({diagCurrent.Length} chars): '{diagCurrent}'");
+                        Log($"  admin hex: {string.Join(" ", diagExpected.Select(c => ((int)c).ToString("X4")))}");
+                        Log($"  model hex: {string.Join(" ", diagCurrent.Select(c => ((int)c).ToString("X4")))}");
+                        Log($"  admin opts ({upd.AdminUdp.ListOptions.Count}): [{string.Join(" | ", upd.AdminUdp.ListOptions.Select(o => $"sort={o.SortOrder} val='{o.Value}'"))}]");
+                    }
                 }
             }
             catch (Exception ex)
@@ -2181,6 +2200,14 @@ namespace EliteSoft.Erwin.AddIn
                 Log("Reload Config: user triggered full validation re-init.");
                 overlay = ShowBusyOverlay("Reloading config from database, please wait...");
                 Application.DoEvents();
+
+                // Drop both bootstrap caches (DatabaseService + HklmFirstBootstrapReader)
+                // so the next GetConfig() re-reads HKLM/HKCU. Without this the button
+                // re-runs every DB query but keeps the connection string captured at
+                // process start - users editing registry via install.bat see no effect
+                // until they restart erwin.
+                Services.DatabaseService.Instance.ClearCache();
+                Log("Reload Config: bootstrap cache cleared - registry will be re-read.");
 
                 // Force the full pipeline (not the fast model-switch path).
                 _globalDataLoaded = false;
@@ -3452,7 +3479,6 @@ namespace EliteSoft.Erwin.AddIn
             btnAlterWizardProd.Enabled = false;
             lblDDLStatus.Text = "Generating DDL...";
             lblDDLStatus.ForeColor = Color.Gray;
-            rtbDDLOutput.Text = "";
             Application.DoEvents();
 
             bool martMode = rbFromMart.Checked;
@@ -3466,6 +3492,12 @@ namespace EliteSoft.Erwin.AddIn
 
             string script = null;
             string err = null;
+            // Track which pipeline produced the DDL so the approval-queue row
+            // captured by Forms.DdlApprovalDialog reflects the actual source
+            // (admin needs this to decide which environment / target server
+            // the DDL applies to). Set in each branch below; final success
+            // path passes it to ShowDDLResult.
+            string sourceMode = null;
             try
             {
                 if (dbMode)
@@ -3481,12 +3513,14 @@ namespace EliteSoft.Erwin.AddIn
                     var (dbScript, dbErr) = await RunFromDbDdlPipelineAsync(log);
                     script = dbScript;
                     err = dbErr;
+                    sourceMode = "FromDB";
                 }
                 else if (martMode)
                 {
                     int v = ParseRightVersion();
                     int activeV = ParseActivePuVersion();
                     bool sameVersion = (v > 0 && activeV > 0 && v == activeV);
+                    sourceMode = sameVersion ? "FromMart-Same" : "FromMart-Cross";
 
                     if (sameVersion)
                     {
@@ -3660,50 +3694,57 @@ namespace EliteSoft.Erwin.AddIn
 
             if (err != null)
             {
+                // The inline rtbDDLOutput viewer used to host long failure
+                // diagnostics; with the black box removed we surface them via
+                // a modal so the user actually sees the failure instead of a
+                // truncated status-label one-liner. Debug Log keeps the full
+                // stack for postmortem.
                 lblDDLStatus.Text = $"Error: {err}";
                 lblDDLStatus.ForeColor = Color.Red;
-                rtbDDLOutput.Text = $"-- FAILED: {err}\n";
+                ErwinAddIn.ShowTopMostMessage($"DDL generation failed:\n\n{err}", "Generate DDL", isError: true);
             }
             else if (script == null)
             {
+                string errTitle;
+                string errBody;
                 if (martMode)
                 {
-                    lblDDLStatus.Text = "Mart-Mart automation failed (see Debug Log).";
-                    lblDDLStatus.ForeColor = Color.Red;
-                    rtbDDLOutput.Text = "-- FAILED: programmatic CC + Apply-to-Right did not produce DDL.\n" +
-                                        "-- Check Debug Log for the step that failed (CC wizard open, \n" +
-                                        "-- Mart picker navigation, Apply-to-Right click, or native DDL capture).\n";
+                    errTitle = "Mart-Mart automation failed (see Debug Log).";
+                    errBody  = "Programmatic CC + Apply-to-Right did not produce DDL.\n\n" +
+                               "Check Debug Log for the step that failed (CC wizard open, " +
+                               "Mart picker navigation, Apply-to-Right click, or native DDL capture).";
                 }
                 else if (dbMode)
                 {
-                    lblDDLStatus.Text = "From-DB automation failed (see Debug Log).";
-                    lblDDLStatus.ForeColor = Color.Red;
-                    rtbDDLOutput.Text = "-- FAILED: From-DB CC + Apply-to-Right did not produce DDL.\n" +
-                                        "-- Check Debug Log for the step that failed (silent RE, MDI tab\n" +
-                                        "-- activation, Open-Models-in-Memory picker, Apply-to-Right, OnFE).\n";
+                    errTitle = "From-DB automation failed (see Debug Log).";
+                    errBody  = "From-DB CC + Apply-to-Right did not produce DDL.\n\n" +
+                               "Check Debug Log for the step that failed (silent RE, MDI tab " +
+                               "activation, Open-Models-in-Memory picker, Apply-to-Right, OnFE).";
                 }
                 else
                 {
-                    lblDDLStatus.Text = "erwin did not return a DDL buffer (see Debug Log).";
-                    lblDDLStatus.ForeColor = Color.Red;
-                    rtbDDLOutput.Text = "-- FAILED: native bridge returned null. Check Debug Log.\n";
+                    errTitle = "erwin did not return a DDL buffer (see Debug Log).";
+                    errBody  = "Native bridge returned null. Check Debug Log for the failing step.";
                 }
+                lblDDLStatus.Text = errTitle;
+                lblDDLStatus.ForeColor = Color.Red;
+                ErwinAddIn.ShowTopMostMessage(errBody, "Generate DDL", isError: true);
             }
             else if (script.Length == 0)
             {
-                lblDDLStatus.Text = "No differences detected.";
+                // No diff = informational, not an error. One-line status is
+                // sufficient; no need to pop a modal that the user has to
+                // dismiss every time they verify "nothing's changed".
+                string noDiffText = martMode ? "No differences between current model and Mart baseline."
+                                   : dbMode  ? "No differences between current model and DB schema."
+                                             : "No differences between model and last save.";
+                lblDDLStatus.Text = noDiffText;
                 lblDDLStatus.ForeColor = Color.OrangeRed;
-                if (martMode)
-                    rtbDDLOutput.Text = "-- No differences between current model and Mart baseline.\n";
-                else if (dbMode)
-                    rtbDDLOutput.Text = "-- No differences between current model and DB schema.\n";
-                else
-                    rtbDDLOutput.Text = "-- No differences between model and last save.\n";
             }
             else
             {
-                ShowDDLResult(script, "Alter DDL");
-                Log($"DDL produced ({script.Length} chars). Use Copy button to grab it.");
+                ShowDDLResult(script, "Alter DDL", sourceMode);
+                Log($"DDL produced ({script.Length} chars). Review popup opened; user can submit to approval queue or cancel.");
                 // The cross-version path now evicts the orphan right-version
                 // PU before reaching here (see CloseSelectedVersionPU call
                 // inside the cross-version branch). This DIAG dump is the
@@ -3770,7 +3811,19 @@ namespace EliteSoft.Erwin.AddIn
             catch { return false; }
         }
 
-        private void ShowDDLResult(string content, string label)
+        /// <summary>
+        /// Renders a produced DDL script in the approval-review popup. The
+        /// inline dark RichTextBox that previously hosted SQL on the DDL
+        /// Generation tab was removed 2026-05-16; successful DDL output now
+        /// routes exclusively to <see cref="Forms.DdlApprovalDialog"/> so it
+        /// can optionally be persisted to DDL_APPROVAL_QUEUE for the admin
+        /// module to triage. Failure / "no diff" paths surface via a modal
+        /// AddinMessageDialog (errors) or the status label (no-diff).
+        /// </summary>
+        /// <param name="sourceMode">Stored verbatim in DDL_APPROVAL_QUEUE.SOURCE_MODE
+        /// when the user clicks Sent to Approve. Use the call-site-specific
+        /// label (e.g. "FromMart-Same", "FromDB", "DDL-Diff-Version").</param>
+        private void ShowDDLResult(string content, string label, string sourceMode)
         {
             if (string.IsNullOrEmpty(content))
             {
@@ -3788,13 +3841,348 @@ namespace EliteSoft.Erwin.AddIn
             // Apply diagram selection filter if "Only Selected Objects" is checked
             displayContent = FilterByDiagramSelection(displayContent);
 
-            ApplySqlHighlighting(displayContent);
             int lineCount = displayContent.Split('\n').Length;
             if (!chkFilterObjects.Checked || lblDDLStatus.Text == "")
             {
-                lblDDLStatus.Text = $"{label}: {lineCount} lines.";
+                lblDDLStatus.Text = $"{label}: {lineCount} lines. Review popup opened.";
                 lblDDLStatus.ForeColor = Color.DarkGreen;
             }
+
+            ShowDdlForApproval(displayContent, sourceMode);
+        }
+
+        /// <summary>
+        /// Opens the DDL approval-review popup against the current model's
+        /// resolved ConfigContext. Caller is responsible for passing the
+        /// already-filtered / already-HTML-parsed display content; this method
+        /// only handles the dialog plumbing and metadata harvesting.
+        /// </summary>
+        private void ShowDdlForApproval(string ddl, string sourceMode)
+        {
+            if (string.IsNullOrWhiteSpace(ddl)) return;
+
+            var ctx = Services.ConfigContextService.Instance;
+            if (!ctx.IsInitialized || ctx.ActiveConfigId <= 0)
+            {
+                // Defensive: BtnAlterWizardProd_Click already guards against
+                // unresolved ConfigContext, but the other two call sites
+                // (PUWatcher version-diff, From-DB compare) could in theory
+                // arrive here in degraded mode if the user races a model
+                // switch. We surface a clear message instead of silently
+                // dropping the DDL (no_silent_fallback rule).
+                Log("ShowDdlForApproval: ConfigContext not initialized; cannot route to approval queue.");
+                ErwinAddIn.ShowTopMostMessage(
+                    "No configuration is defined for the model. Submission to the approval queue is unavailable.",
+                    "DDL Review",
+                    isError: true);
+                return;
+            }
+
+            string modelName    = _connectedModelName ?? string.Empty;
+            string modelLocator = _lastConnectedLocator ?? string.Empty;
+            // DBMS label comes from the active PU's PropertyBag, NOT from the
+            // CONFIG row. CONFIG.DBMS_VERSION_ID can drift from the model's
+            // actual target server (admin classified FIBA as Oracle 21c but
+            // the user's open model targets Oracle 19; matches erwin's own
+            // status-bar label). The live value is what the alter DDL will
+            // execute against, which is what the approval reviewer needs.
+            string dbmsType = ReadActivePuTargetServer();
+
+            using var dlg = new Forms.DdlApprovalDialog(
+                ddlText:           ddl,
+                configId:          ctx.ActiveConfigId,
+                modelName:         modelName,
+                modelLocator:      modelLocator,
+                sourceMode:        sourceMode ?? "Unknown",
+                dbmsType:          dbmsType,
+                log:               (Action<string>)Log,
+                martSaveCallback:  SaveCurrentModelWithDescription);
+            dlg.ShowDialog(this);
+        }
+
+        /// <summary>
+        /// Programmatic Mart save: pushes the supplied version description
+        /// into MCXGDMPersister_Mart::SetDescription via the native bridge
+        /// and then invokes pu.Save() so the description is stamped on the
+        /// new Mart version without erwin's own description dialog ever
+        /// surfacing. Returns true on commit success.
+        ///
+        /// IMPORTANT: the bridge's SetDescription cache is populated the
+        /// first time erwin itself calls SetDescription during the running
+        /// erwin session (i.e. the user does ONE manual Mart save). Before
+        /// that bootstrap, BridgeSetMartSaveDescription returns -2 and we
+        /// surface "manual save needed first" to the user. After bootstrap
+        /// the flow is fully programmatic and the description from the
+        /// popup is used verbatim.
+        /// </summary>
+        private System.Threading.Tasks.Task<bool> SaveCurrentModelWithDescription(string description)
+        {
+            return System.Threading.Tasks.Task.Run(() =>
+            {
+                if (_currentModel == null)
+                {
+                    Log("SaveCurrentModelWithDescription: no _currentModel; aborting.");
+                    return false;
+                }
+
+                // Resolve the persister and push description BEFORE Save so
+                // MCXModelIncrementalSaveCommand picks it up when pu.Save
+                // runs. Bridge looks the persister up by model name via the
+                // static MCXGDMPersister_Mart::FindPersister(CString) -
+                // hook-independent, works on the very first call.
+                string modelName = _connectedModelName ?? string.Empty;
+                int rc = Services.NativeBridgeService.SetMartSaveDescription(modelName, description, (Action<string>)Log);
+                Log($"SaveCurrentModelWithDescription: SetMartSaveDescription rc={rc} model='{modelName}'");
+                if (rc == -2)
+                {
+                    Log("SaveCurrentModelWithDescription: persister lookup failed - model name may not match the Mart locator key.");
+                }
+
+                try
+                {
+                    object saveRc = _currentModel.Save();
+                    bool ok = saveRc is bool b ? b : true;
+                    Log($"SaveCurrentModelWithDescription: pu.Save() returned {saveRc} (ok={ok})");
+                    return ok;
+                }
+                catch (Exception ex)
+                {
+                    Log($"SaveCurrentModelWithDescription: pu.Save threw {ex.GetType().Name}: {ex.Message}");
+                    return false;
+                }
+            });
+        }
+
+        /// <summary>
+        /// Reads the active model's target DBMS for the approval popup header
+        /// and DDL_APPROVAL_QUEUE.DBMS_TYPE column.
+        ///
+        /// IMPORTANT: erwin r10.10 stores the DBMS family in the PU's
+        /// PropertyBag <c>Target_Server</c> field as a "DBMS Brand ID"
+        /// (large 32-bit int, e.g. 1075858979 = Oracle, 1075859016 = SQL
+        /// Server). The published mapping lives in the SCAPI API Reference
+        /// Guide 15.0, "Property Bag Contents for Persistence Unit"
+        /// section, lines 8920+ in docs/erwin-api-ref-15.txt. We decode it
+        /// via <see cref="DbmsBrandNames"/> below.
+        ///
+        /// A previous attempt read <c>modelRoot.Properties("Target_Server").Value</c>
+        /// (the same call erwin-admin's ScapiService makes) but on r10.10
+        /// that returns 172 for every model regardless of DBMS - likely a
+        /// metamodel property descriptor id, not the property value. Mirroring
+        /// erwin-admin's small-int mapping (50..200) produced wrong labels
+        /// (Oracle 19c on a SQL Server model in the 2026-05-16 bug).
+        ///
+        /// The major version comes from PropertyBag's <c>Target_Server_Version</c>.
+        /// Composed label is "{Brand} {Version}" - e.g. "Oracle 19",
+        /// "SQL Server 2019". erwin's own status bar uses a friendlier
+        /// label sometimes ("SQL Server 2016/2017" for a release-pair); we
+        /// try to scrape that first via <see cref="ReadDbmsFromErwinStatusBar"/>
+        /// and fall back to the composed label when the scrape misses.
+        /// </summary>
+        private string ReadActivePuTargetServer()
+        {
+            // 1) Prefer erwin's own status bar text - it's the friendliest
+            //    label, matches what the user sees on screen, and stays
+            //    current with new DBMS releases without code changes.
+            string statusBar = ReadDbmsFromErwinStatusBar();
+            if (!string.IsNullOrWhiteSpace(statusBar)) return statusBar;
+
+            // 2) Fallback: read PropertyBag Target_Server brand ID + version
+            //    and compose a label from the documented brand-ID table.
+            if (_currentModel == null) return null;
+            try
+            {
+                long brandId = ReadPropertyBagLong(_currentModel, "Target_Server");
+                string version = ReadPropertyBagString(_currentModel, "Target_Server_Version");
+                Log($"ReadActivePuTargetServer: PropertyBag Target_Server={brandId}, Target_Server_Version='{version}'");
+
+                if (brandId == 0) return null;
+                string brand = DbmsBrandNames.TryGetValue(brandId, out string b) ? b : $"DBMS Brand {brandId}";
+                return ComposeDbmsLabel(brand, version);
+            }
+            catch (Exception ex) { Log($"ReadActivePuTargetServer: PropertyBag probe threw: {ex.GetType().Name}: {ex.Message}"); }
+            return null;
+        }
+
+        private static long ReadPropertyBagLong(dynamic pu, string key)
+        {
+            try
+            {
+                dynamic bag = pu.PropertyBag();
+                object raw = bag?.Value(key);
+                if (raw == null) return 0;
+                if (long.TryParse(raw.ToString(), out long n)) return n;
+            }
+            catch { }
+            return 0;
+        }
+
+        private static string ReadPropertyBagString(dynamic pu, string key)
+        {
+            try
+            {
+                dynamic bag = pu.PropertyBag();
+                object raw = bag?.Value(key);
+                return raw?.ToString();
+            }
+            catch { return null; }
+        }
+
+        /// <summary>
+        /// Composes the display label "brand version" with the Oracle suffix
+        /// convention applied (12+ -> "c", 10..11 -> "g", <=9 -> "i") so the
+        /// label matches what erwin's status bar shows (Oracle 19 -> Oracle
+        /// 19c, Oracle 11 -> Oracle 11g). For non-Oracle brands the version
+        /// is appended as-is because there is no comparable naming
+        /// convention (SQL Server / PostgreSQL / etc. ship as plain
+        /// numeric/year versions).
+        /// </summary>
+        private static string ComposeDbmsLabel(string brand, string version)
+        {
+            if (string.IsNullOrWhiteSpace(version)) return brand;
+            if (string.Equals(brand, "Oracle", StringComparison.OrdinalIgnoreCase)
+                && int.TryParse(version.Trim(), out int major))
+            {
+                string suffix = major switch
+                {
+                    <= 9  => "i",  // 8i, 9i
+                    <= 11 => "g",  // 10g, 11g
+                    _     => "c",  // 12c, 18c, 19c, 21c, 23c, ...
+                };
+                return $"Oracle {major}{suffix}";
+            }
+            return $"{brand} {version.Trim()}";
+        }
+
+        /// <summary>
+        /// erwin Property Bag "Target_Server" DBMS Brand ID -> name. Verbatim
+        /// from the SCAPI API Reference Guide 15.0, Property Bag Contents for
+        /// Persistence Unit and Persistence Unit Collection, page 324-326
+        /// (lines 8920..8985 in docs/erwin-api-ref-15.txt). These IDs are
+        /// stable across erwin releases - the version (Oracle 19 vs 21,
+        /// SQL Server 2016 vs 2019) is encoded separately in
+        /// Target_Server_Version, not in the brand ID.
+        /// </summary>
+        private static readonly System.Collections.Generic.Dictionary<long, string> DbmsBrandNames =
+            new System.Collections.Generic.Dictionary<long, string>
+            {
+                { 1075858977L, "IBM Db2 for i" },
+                { 1075858978L, "IBM Db2 for LUW" },
+                { 1075858979L, "Oracle" },
+                { 1075859006L, "IBM Informix" },
+                { 1075859009L, "ODBC/Generic" },
+                { 1075859010L, "Progress" },
+                { 1075859013L, "SAS" },
+                { 1075859016L, "SQL Server" },
+                { 1075859017L, "SAP ASE" },
+                { 1075859018L, "Teradata" },
+                { 1075859019L, "IBM Db2 for z/OS" },
+                { 1075859129L, "MySQL" },
+                { 1075859130L, "SAP IQ" },
+                { 1075859187L, "Apache Hive" },
+                { 1075859190L, "MariaDB" },
+                { 1075859193L, "Snowflake" },
+                { 1075859196L, "MongoDB" },
+                { 1075859199L, "Apache Cassandra" },
+                { 1075859202L, "Couchbase" },
+                { 1075859205L, "Apache Avro" },
+                { 1075859208L, "JSON" },
+                { 1075859211L, "Azure Synapse" },
+                { 1075859214L, "Neo4j" },
+                { 1075859217L, "ArangoDB" },
+                { 1075859220L, "Apache Parquet" },
+                { 1075859223L, "Amazon Keyspaces" },
+                { 1075859226L, "Google BigQuery" },
+                { 1075859229L, "Amazon DynamoDB" },
+                { 1075859232L, "Databricks" },
+                { 1075859235L, "PostgreSQL" },
+                { 1075885345L, "OpenAPI" },
+                { 1075918978L, "IBM Netezza" },
+                { 1075918979L, "Amazon Redshift" },
+                { 1075918980L, "AlloyDB for PostgreSQL" },
+            };
+
+        /// <summary>
+        /// Scrapes erwin's bottom status bar for the part that looks like a
+        /// DBMS label ("Oracle 19c", "SQL Server 2019", ...). erwin's status
+        /// bar is an XTP custom control that does NOT necessarily expose the
+        /// standard <c>msctls_statusbar32</c> class - SB_GETTEXT against
+        /// other classes silently returns empty, which is why the previous
+        /// class-specific scrape missed the label entirely. We brute-force
+        /// enumerate every child window, log each candidate, and return the
+        /// first window text that matches a known DBMS family name. This is
+        /// the same string the user sees on screen and the safest fallback
+        /// when the SCAPI Target_Server enum maps to an id we have not yet
+        /// catalogued.
+        /// </summary>
+        private string ReadDbmsFromErwinStatusBar()
+        {
+            try
+            {
+                IntPtr erwin = Services.Win32Helper.GetErwinMainWindow();
+                if (erwin == IntPtr.Zero) { Log("ReadDbmsFromErwinStatusBar: no erwin main window"); return null; }
+
+                int probed = 0;
+                int matched = 0;
+                string hit = null;
+                var children = Services.Win32Helper.EnumAllChildWindows(erwin);
+                foreach (var c in children)
+                {
+                    probed++;
+                    if (string.IsNullOrWhiteSpace(c.Text)) continue;
+                    if (!LooksLikeDbmsLabel(c.Text)) continue;
+                    matched++;
+                    if (hit == null)
+                    {
+                        hit = c.Text.Trim();
+                        Log($"ReadDbmsFromErwinStatusBar: matched hWnd={c.Handle} class='{c.ClassName}' text='{hit}'");
+                    }
+                    else
+                    {
+                        // Multiple matches: log them too so we can audit later
+                        // if the wrong one wins (e.g. a transient dialog).
+                        Log($"ReadDbmsFromErwinStatusBar: additional candidate hWnd={c.Handle} class='{c.ClassName}' text='{c.Text.Trim()}' (ignored, first match kept)");
+                    }
+                }
+
+                if (hit == null)
+                {
+                    // Best-effort attempt against the legacy standard class as
+                    // a last resort; harmless if the class is not present.
+                    var bars = Services.Win32Helper.FindChildWindowsByClass(erwin, "msctls_statusbar32");
+                    foreach (var bar in bars)
+                    {
+                        for (int i = 0; i < 16; i++)
+                        {
+                            string text = Services.Win32Helper.GetStatusBarText(bar, i);
+                            if (!LooksLikeDbmsLabel(text)) continue;
+                            hit = text.Trim();
+                            Log($"ReadDbmsFromErwinStatusBar: msctls fallback matched part[{i}]='{hit}'");
+                            break;
+                        }
+                        if (hit != null) break;
+                    }
+                    if (hit == null)
+                        Log($"ReadDbmsFromErwinStatusBar: no match (probed={probed} children, matched={matched})");
+                }
+                return hit;
+            }
+            catch (Exception ex) { Log($"ReadDbmsFromErwinStatusBar threw: {ex.GetType().Name}: {ex.Message}"); }
+            return null;
+        }
+
+        private static bool LooksLikeDbmsLabel(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return false;
+            string lower = s.ToLowerInvariant();
+            return lower.Contains("oracle")
+                || lower.Contains("sql server")
+                || lower.Contains("postgres")
+                || lower.Contains("mysql")
+                || lower.Contains("db2")
+                || lower.Contains("teradata")
+                || lower.Contains("snowflake")
+                || lower.Contains("azure");
         }
 
         private string ParseCompleteCompareHtml(string html)
@@ -3859,86 +4247,10 @@ namespace EliteSoft.Erwin.AddIn
             return sb.ToString();
         }
 
-        private void ApplySqlHighlighting(string sql) => ApplySqlHighlighting(rtbDDLOutput, sql);
-
-        // Generic helper: applies VS-Code-flavored SQL syntax highlighting to
-        // any RichTextBox. The DDL Generation tab and the Alter Compare tab
-        // both render alter scripts and reuse this so their dark-theme output
-        // stays visually identical (same keyword/type/comment/diff colors).
-        private void ApplySqlHighlighting(RichTextBox rtb, string sql)
-        {
-            rtb.SuspendLayout();
-            rtb.Clear();
-            // Pad with trailing blank lines so the last real line isn't
-            // clipped at the bottom of the RichTextBox viewport when the
-            // user scrolls all the way down (common RTB rendering issue).
-            rtb.Text = sql + "\n\n\n";
-
-            // Set default color
-            rtb.SelectAll();
-            rtb.SelectionColor = Color.FromArgb(220, 220, 220);
-
-            // IMPORTANT: Use RichTextBox's own text for regex matching
-            // RichTextBox converts \r\n to \n internally, so indices differ from original string
-            string rtbText = rtb.Text;
-
-            var clrKeyword = Color.FromArgb(86, 156, 214);     // VS Code blue
-            var clrType = Color.FromArgb(78, 201, 176);         // VS Code teal
-            var clrComment = Color.FromArgb(106, 153, 85);      // VS Code green
-            var clrString = Color.FromArgb(206, 145, 120);      // VS Code orange
-            var clrNumber = Color.FromArgb(181, 206, 168);      // VS Code light green
-            var clrGo = Color.FromArgb(197, 134, 192);          // VS Code purple
-            var clrDiffNew = Color.FromArgb(80, 220, 80);       // Bright green
-            var clrDiffDrop = Color.FromArgb(240, 80, 80);      // Bright red
-            var clrDiffChange = Color.FromArgb(255, 180, 50);   // Bright orange
-            var clrSection = Color.FromArgb(220, 220, 100);     // Yellow
-
-            // 1. Keywords (blue)
-            HighlightRegex(rtb, rtbText, @"\b(CREATE|ALTER|DROP|TABLE|ADD|COLUMN|CONSTRAINT|PRIMARY|KEY|FOREIGN|REFERENCES|NOT|NULL|DEFAULT|IDENTITY|CLUSTERED|NONCLUSTERED|INDEX|UNIQUE|ON|DELETE|UPDATE|CASCADE|SET|CHECK|WITH|ASC|DESC|BEGIN|END|DECLARE|IF|EXISTS|SELECT|FROM|WHERE|AND|OR|RETURN|GOTO|TRIGGER|FOR|INSERT|AS|RAISERROR|ROLLBACK|TRANSACTION|INTO|ACTION)\b", clrKeyword);
-
-            // 2. Data types (teal)
-            HighlightRegex(rtb, rtbText, @"\b(int|bigint|smallint|tinyint|bit|varchar|nvarchar|char|nchar|text|ntext|datetime|smalldatetime|date|time|timestamp|decimal|numeric|float|real|money|smallmoney|varbinary|binary|image|uniqueidentifier|VARCHAR2|NUMBER|CLOB|BLOB|COLLATE)\b", clrType);
-
-            // 3. Numbers (light green)
-            HighlightRegex(rtb, rtbText, @"(?<![a-zA-Z_])\d+(?![a-zA-Z_])", clrNumber);
-
-            // 4. GO (purple)
-            HighlightRegex(rtb, rtbText, @"(?m)^go$", clrGo);
-
-            // 5. String literals (orange)
-            HighlightRegex(rtb, rtbText, @"'[^']*'", clrString);
-
-            // 6. Comments (green) - overrides keywords inside comments
-            HighlightRegex(rtb, rtbText, @"--[^\n]*", clrComment);
-
-            // 7. Diff markers (override comment color)
-            HighlightRegex(rtb, rtbText, @"-- NEW:.*", clrDiffNew);
-            HighlightRegex(rtb, rtbText, @"-- DROPPED:.*", clrDiffDrop);
-            HighlightRegex(rtb, rtbText, @"-- CHANGED:.*", clrDiffChange);
-            HighlightRegex(rtb, rtbText, @"-- =+.*=+", clrSection);
-            HighlightRegex(rtb, rtbText, @"-- Summary:.*", clrSection);
-            HighlightRegex(rtb, rtbText, @"-- WARNING:.*", clrDiffDrop);
-
-            rtb.SelectionStart = 0;
-            rtb.SelectionLength = 0;
-            rtb.ResumeLayout();
-        }
-
-        private static void HighlightRegex(RichTextBox rtb, string rtbText, string pattern, Color color)
-        {
-            try
-            {
-                foreach (System.Text.RegularExpressions.Match m in
-                    System.Text.RegularExpressions.Regex.Matches(rtbText, pattern,
-                        System.Text.RegularExpressions.RegexOptions.IgnoreCase |
-                        System.Text.RegularExpressions.RegexOptions.Multiline))
-                {
-                    rtb.Select(m.Index, m.Length);
-                    rtb.SelectionColor = color;
-                }
-            }
-            catch { }
-        }
+        // ApplySqlHighlighting / HighlightRegex used to live here as private
+        // helpers and have been extracted to Forms.SqlHighlighter so the
+        // approval popup can reuse the same VS-Code-flavoured palette. The
+        // inline rtbDDLOutput viewer was removed at the same time.
 
         private void StartPUWatcher()
         {
@@ -3988,7 +4300,7 @@ namespace EliteSoft.Erwin.AddIn
                     {
                         string diff = DdlGenerationService.GenerateDiffWithDuplicate(
                             _scapi, _currentModel, feOpt, (Action<string>)Log);
-                        ShowDDLResult(diff, "DDL Diff");
+                        ShowDDLResult(diff, "DDL Diff", "DDL-Diff-Version");
                     }
                     catch (Exception ex)
                     {
@@ -4127,15 +4439,10 @@ namespace EliteSoft.Erwin.AddIn
             }
         }
 
-        private void BtnCopyDDL_Click(object sender, EventArgs e)
-        {
-            if (!string.IsNullOrEmpty(rtbDDLOutput.Text))
-            {
-                Clipboard.SetText(rtbDDLOutput.Text);
-                lblDDLStatus.Text = "DDL copied to clipboard!";
-                lblDDLStatus.ForeColor = Color.DarkGreen;
-            }
-        }
+        // BtnCopyDDL_Click was removed together with the inline rtbDDLOutput
+        // viewer (2026-05-16). Copy now lives inside Forms.DdlApprovalDialog
+        // alongside Cancel / Sent to Approve, operating on the popup's own
+        // RichTextBox so users can copy a selection or the full DDL there.
 
         // DB connection state (From DB mode)
         private string _dbConnectionString = "";
@@ -4660,7 +4967,6 @@ namespace EliteSoft.Erwin.AddIn
             }
 
             btnAlterWizardProd.Enabled = false;
-            rtbDDLOutput.Text = "";
             lblDDLStatus.Text = $"Reverse engineering {tableList.Count} table(s) from DB...";
             lblDDLStatus.ForeColor = Color.Gray;
             Application.DoEvents();
@@ -4729,7 +5035,7 @@ namespace EliteSoft.Erwin.AddIn
 
                 if (!string.IsNullOrEmpty(diff))
                 {
-                    ShowDDLResult(diff, $"DDL Diff vs {_dbLabel}");
+                    ShowDDLResult(diff, $"DDL Diff vs {_dbLabel}", "DDL-Diff-DB");
                     lblDDLStatus.Text = $"Diff computed vs {_dbLabel}.";
                     lblDDLStatus.ForeColor = Color.DarkGreen;
                 }

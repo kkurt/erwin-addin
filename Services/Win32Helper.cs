@@ -182,6 +182,27 @@ namespace EliteSoft.Erwin.AddIn.Services
         [DllImport("user32.dll")]
         private static extern bool IsWindowEnabled(IntPtr hWnd);
 
+        [DllImport("user32.dll")]
+        private static extern bool EnableWindow(IntPtr hWnd, bool bEnable);
+
+        /// <summary>
+        /// Re-enables a window that WinForms.Form.ShowDialog disabled when
+        /// it opened a modal child. WinForms walks every top-level window
+        /// owned by the process and EnableWindow(false) on each so the user
+        /// can only interact with the modal. erwin's main frame is one such
+        /// top-level (in-proc COM addin shares the process), so a modal
+        /// popup that wants the user to drive erwin's own UI (Mart Save
+        /// toolbar -> Description dialog) must explicitly re-enable it.
+        /// Returns the previous enabled state so the caller can restore.
+        /// </summary>
+        public static bool EnableWindowPublic(IntPtr hWnd, bool enable)
+        {
+            if (hWnd == IntPtr.Zero) return false;
+            bool wasEnabled = IsWindowEnabled(hWnd);
+            EnableWindow(hWnd, enable);
+            return wasEnabled;
+        }
+
         /// <summary>
         /// Returns true when erwin's main window is currently disabled by a
         /// modal child dialog (Mart Save, Mart Open, Print, Properties, ...).

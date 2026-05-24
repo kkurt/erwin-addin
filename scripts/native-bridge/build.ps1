@@ -43,9 +43,18 @@ Write-Host "Building ErwinNativeBridge.dll (x64)..." -ForegroundColor Cyan
 # /std:c++17
 # /O2        - optimize (spike runs fast, debug-info not critical)
 # /MD        - dynamic CRT (match erwin)
+# /D_AFXDLL  - link MFC dynamically. We need real ATL::CStringT<char,
+#              StrTraitMFC_DLL<char>> instances to pass into
+#              MCXGDMPersister_Mart::FindPersister / SetDescription -
+#              hand-constructed CStringData layouts crash inside mfc140
+#              because the string manager's thread-local state is required.
+#              Requires "C++ MFC for v143 build tools" to be installed via
+#              Visual Studio Installer; vcvars64 picks up MFC include + lib
+#              paths automatically once that workload is present.
 # /Fo/Fe     - output paths
 $clArgs = @(
     "/nologo", "/LD", "/EHsc", "/std:c++17", "/O2", "/MD", "/W3",
+    "/D_AFXDLL",
     "`"$src`"",
     "/Fo`"$outObj`"",
     "/Fe`"$outDll`"",

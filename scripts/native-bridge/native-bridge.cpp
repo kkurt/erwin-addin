@@ -32,6 +32,16 @@
 #include <vector>
 #include <string.h>
 
+// Pulled in by /D_AFXDLL on the cl.exe command line. MFC must come AFTER
+// the standard CRT headers above but BEFORE anything that uses CString.
+// We need the full MFC CString (ATL::CStringT<char, StrTraitMFC_DLL<char>>)
+// because that is the exact type erwin's EM_MCX.dll expects on the wire
+// for MCXGDMPersister_Mart::FindPersister and SetDescription (mangled name
+// "CStringT@DV?$StrTraitMFC_DLL@D..."). Constructing one by hand crashed
+// inside mfc140's allocator (no string manager thread state); using real
+// MFC sidesteps that entirely.
+#include <afx.h>
+
 // Captured on DLL_PROCESS_ATTACH (DllMain). Used by SetWindowsHookEx in
 // CCInsp_ForceDestroyWizard so a thread-targeted hook can be installed
 // pointing at this DLL.
@@ -377,6 +387,8 @@ extern "C" __declspec(dllexport) int __cdecl Probe_DumpAsContents(void* as);
 // install the AddItem detour without waiting for InstallObserverHook (which
 // managed code never invokes today).
 extern "C" __declspec(dllexport) int __cdecl InstallAddItemHook(void);
+extern "C" __declspec(dllexport) int __cdecl InstallSetDescriptionHook(void);
+extern "C" __declspec(dllexport) int __cdecl BridgeSetMartSaveDescription(const char* modelName, const char* description);
 
 // Phase-C step-3: forward decl so GetChangedEntityIds (defined a few hundred
 // lines below) can call CCInsp_GetTrasactionSummary which is defined even
@@ -722,6 +734,14 @@ extern "C" __declspec(dllexport) int __cdecl InstallHook(void) {
     // we just lose event-driven validation.
     int addItemRc = InstallAddItemHook();
     LogLine("[ADDITEM] InstallAddItemHook rc=%d", addItemRc);
+
+    // Install hook on MCXGDMPersister_Mart::SetDescription so the
+    // approval popup can later push a description into the Mart save
+    // pipeline without showing erwin's own description dialog. Hook also
+    // captures the active persister pointer the first time any manual
+    // save fires, which the bridge invoker needs as its `this` argument.
+    int setDescRc = InstallSetDescriptionHook();
+    LogLine("[SETDESC] InstallSetDescriptionHook rc=%d", setDescRc);
 
     // ----- v2 chained callbacks (kept as diagnostic) ----------------------
     HMODULE ecx = GetModuleHandleW(L"EM_ECX.dll");
@@ -5107,6 +5127,208 @@ extern "C" __declspec(dllexport) int __cdecl CCInsp_SnapshotState(void* outBuf) 
     out[2] = elc2As;
     out[3] = capMs;
     return 0;
+}
+
+// ===========================================================================
+// Mart Save Description hook + invoker (2026-05-19)
+//
+// Purpose:
+//   When the user clicks Mart Save in erwin, the description dialog
+//   (MCXIncrementalSave_VersionDescriptionDialog) Save button calls
+//   MCXGDMPersister_Mart::SetDescription(CString) on the persister bound
+//   to the active model. That sets the version-description text that
+//   MCXModelIncrementalSaveCommand::Write stamps on the Mart commit.
+//
+//   The addin's "Sent to Approve" flow needs to drive this WITHOUT showing
+//   the dialog and WITHOUT any UI automation (no SetWindowText / synthetic
+//   clicks). We:
+//
+//   1. Install an inline detour on SetDescription. Every time erwin's UI
+//      flow calls it, we cache the persister `this` pointer in
+//      g_capturedPersister and log the description text (research probe).
+//   2. Export BridgeSetMartSaveDescription(const char*) which builds an
+//      MFC-compatible CStringA (with nRefs=-1 "static literal" header so
+//      MFC's reference counting doesn't try to free our memory) and calls
+//      SetDescription against the cached persister.
+//
+// Bootstrap: the persister pointer is only known AFTER erwin itself has
+// called SetDescription at least once for the current model. The user is
+// expected to perform one manual Mart save (any time after opening the
+// model) so g_capturedPersister is populated; subsequent programmatic
+// calls via the bridge then work end-to-end.
+// ===========================================================================
+
+// Mangled name for the non-static member:
+//   void MCXGDMPersister_Mart::SetDescription(const CStringT<char, ...>&)
+static const char* kMcxSetDescriptionSym =
+    "?SetDescription@MCXGDMPersister_Mart@@QEAAXAEBV?$CStringT@DV?$StrTraitMFC_DLL@DV?$ChTraitsCRT@D@ATL@@@@@ATL@@@Z";
+
+// Mangled name for the STATIC class method:
+//   static MCXGDMPersister_MartI* MCXGDMPersister_Mart::FindPersister(const CString& name)
+static const char* kMcxFindPersisterByNameSym =
+    "?FindPersister@MCXGDMPersister_Mart@@SAPEAVMCXGDMPersister_MartI@@AEBV?$CStringT@DV?$StrTraitMFC_DLL@DV?$ChTraitsCRT@D@ATL@@@@@ATL@@@Z";
+
+typedef void(__fastcall* McxSetDescriptionFn)(void* thisPtr, const void* cstringRef);
+typedef void*(__fastcall* McxFindPersisterByNameFn)(const void* cstringRef);
+
+static McxSetDescriptionFn g_origMcxSetDesc = nullptr;
+static McxSetDescriptionFn g_mcxSetDesc = nullptr;  // resolved address (same as orig, kept for direct calls)
+static McxFindPersisterByNameFn g_mcxFindPersisterByName = nullptr;
+static volatile void* g_capturedPersister = nullptr;
+
+// CString construction now uses real MFC (via _AFXDLL + <afx.h>). The
+// earlier fake CStringData + no-op IAtlStringMgr approach crashed inside
+// mfc140 because the string manager's thread-local state was missing. With
+// proper MFC linkage the standard CString constructor allocates a valid
+// CStringData via mfc140's own CAfxStringMgr - layout, refcount, and
+// allocator all match what EM_MCX.dll expects on the wire.
+
+static void __fastcall McxSetDescriptionHook(void* thisPtr, const void* cstringRef) {
+    g_capturedPersister = thisPtr;
+    if (cstringRef) {
+        // The CString reference is a pointer to an 8-byte object whose
+        // first field is m_pszData (a char* into a CStringData-prefixed
+        // buffer). Read the chars for diagnostic logging only.
+        const CString* cs = static_cast<const CString*>(cstringRef);
+        const char* psz = (const char*)(LPCTSTR)*cs;
+        if (psz) {
+            char preview[100]; size_t n = strnlen(psz, sizeof(preview) - 4);
+            memcpy(preview, psz, n);
+            if (n >= sizeof(preview) - 4) { preview[n] = '.'; preview[n+1] = '.'; preview[n+2] = '.'; preview[n+3] = 0; }
+            else preview[n] = 0;
+            LogLine("[SETDESC-HOOK] persister=%p text=\"%s\"", thisPtr, preview);
+        } else {
+            LogLine("[SETDESC-HOOK] persister=%p text=(null)", thisPtr);
+        }
+    } else {
+        LogLine("[SETDESC-HOOK] persister=%p cstringRef=(null)", thisPtr);
+    }
+    if (g_origMcxSetDesc) g_origMcxSetDesc(thisPtr, cstringRef);
+}
+
+extern "C" __declspec(dllexport) int __cdecl InstallSetDescriptionHook(void) {
+    HMODULE mcx = GetModuleHandleW(L"EM_MCX.dll");
+    if (!mcx) mcx = LoadLibraryW(L"EM_MCX.dll");
+    if (!mcx) { LogLine("[SETDESC] EM_MCX.dll not loaded"); return -1; }
+    void* target = (void*)GetProcAddress(mcx, kMcxSetDescriptionSym);
+    if (!target) { LogLine("[SETDESC] SetDescription symbol not found"); return -2; }
+    LogLine("[SETDESC] target=%p", target);
+    g_mcxSetDesc = (McxSetDescriptionFn)target;
+    void* tramp = nullptr;
+    if (!InstallInlineHook(target, (void*)&McxSetDescriptionHook, &tramp)) {
+        LogLine("[SETDESC] InstallInlineHook failed");
+        return -3;
+    }
+    g_origMcxSetDesc = (McxSetDescriptionFn)tramp;
+    LogLine("[SETDESC] hook installed, trampoline=%p", tramp);
+    return 0;
+}
+
+// SEH-protected wrappers. We have to keep the __try/__except in a function
+// that does NOT contain any C++ objects with destructors (CString does);
+// otherwise cl.exe rejects with C2712 ("Cannot use __try in functions that
+// require object unwinding"). Outer callers construct the CString, hand a
+// raw pointer over, and these wrappers do the unsafe native call.
+static void* SafeInvokeFindPersister(McxFindPersisterByNameFn fn, const void* csRef, DWORD* outSeh) {
+    *outSeh = 0;
+    __try {
+        return fn(csRef);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *outSeh = GetExceptionCode();
+        return nullptr;
+    }
+}
+
+static int SafeInvokeSetDescription(McxSetDescriptionFn fn, void* persister, const void* csRef, DWORD* outSeh) {
+    *outSeh = 0;
+    __try {
+        fn(persister, csRef);
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *outSeh = GetExceptionCode();
+        return -3;
+    }
+}
+
+// Resolves and returns the MCXGDMPersister_MartI* for the given model name
+// by calling MCXGDMPersister_Mart::FindPersister(CString). Hook-independent,
+// works on the first call of an erwin session. Caller does not own the
+// returned pointer (it's a singleton inside EM_MCX's persister pack).
+static void* FindMartPersisterByName(const char* modelName) {
+    HMODULE mcx = GetModuleHandleW(L"EM_MCX.dll");
+    if (!mcx) mcx = LoadLibraryW(L"EM_MCX.dll");
+    if (!mcx) { LogLine("[FIND-PERSISTER] EM_MCX.dll not loaded"); return nullptr; }
+
+    if (!g_mcxFindPersisterByName) {
+        g_mcxFindPersisterByName = (McxFindPersisterByNameFn)GetProcAddress(mcx, kMcxFindPersisterByNameSym);
+        if (!g_mcxFindPersisterByName) {
+            LogLine("[FIND-PERSISTER] symbol not found in EM_MCX.dll");
+            return nullptr;
+        }
+        LogLine("[FIND-PERSISTER] resolver addr=%p", (void*)g_mcxFindPersisterByName);
+    }
+    if (!modelName) modelName = "";
+
+    // Real MFC CString - allocator + refcount + thread-local string manager
+    // all set up correctly by mfc140 under _AFXDLL. Constructed in this
+    // outer function so its destructor runs normally; the actual native
+    // call is forwarded to SafeInvokeFindPersister, which has no C++ object
+    // unwinding and therefore can host the __try/__except SEH guard.
+    CString name(modelName);
+    DWORD seh = 0;
+    void* persister = SafeInvokeFindPersister(g_mcxFindPersisterByName, &name, &seh);
+    if (seh != 0) {
+        LogLine("[FIND-PERSISTER] FindPersister raised SEH 0x%lX", seh);
+    }
+    LogLine("[FIND-PERSISTER] FindPersister('%s') = %p", modelName, persister);
+    return persister;
+}
+
+// C# entry point. Calls SetDescription on the persister for the named
+// model with the supplied text. Returns:
+//    0 = success
+//   -1 = SetDescription resolver missing
+//   -2 = persister lookup failed (model name unknown / wrong)
+//   -3 = exception during SetDescription
+extern "C" __declspec(dllexport) int __cdecl BridgeSetMartSaveDescription(const char* modelName, const char* description) {
+    HMODULE mcx = GetModuleHandleW(L"EM_MCX.dll");
+    if (!mcx) mcx = LoadLibraryW(L"EM_MCX.dll");
+    if (mcx && !g_mcxSetDesc) {
+        g_mcxSetDesc = (McxSetDescriptionFn)GetProcAddress(mcx, kMcxSetDescriptionSym);
+    }
+    if (!g_mcxSetDesc) {
+        LogLine("[BRIDGE-SETDESC] aborted: SetDescription symbol not resolved");
+        return -1;
+    }
+
+    // Prefer the persister captured by the hook (if it ever fired) - it's
+    // the exact same instance erwin uses internally. If the hook never
+    // captured (hook install failed or no manual save happened), fall
+    // back to FindPersister(modelName).
+    void* persister = (void*)g_capturedPersister;
+    if (!persister) {
+        persister = FindMartPersisterByName(modelName);
+    }
+    if (!persister) {
+        LogLine("[BRIDGE-SETDESC] aborted: persister not resolvable (modelName='%s')", modelName ? modelName : "(null)");
+        return -2;
+    }
+
+    // Real MFC CString - mfc140 handles all the allocator + lifecycle
+    // bookkeeping; MCX::SetDescription copies the chars into its own
+    // member CString and our local goes out of scope cleanly. SEH guard
+    // lives in SafeInvokeSetDescription which has no destructor-bearing
+    // locals (C2712 constraint).
+    CString desc(description ? description : "");
+    int len = desc.GetLength();
+    DWORD seh = 0;
+    int rc = SafeInvokeSetDescription(g_mcxSetDesc, persister, &desc, &seh);
+    if (rc == 0) {
+        LogLine("[BRIDGE-SETDESC] success: persister=%p len=%d", persister, len);
+    } else {
+        LogLine("[BRIDGE-SETDESC] SetDescription raised SEH 0x%lX", seh);
+    }
+    return rc;
 }
 
 // Definition of the forward-declared g_hBridgeModule. Captured on

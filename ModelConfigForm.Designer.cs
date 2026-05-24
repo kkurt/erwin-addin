@@ -473,9 +473,9 @@ namespace EliteSoft.Erwin.AddIn
             // that triggers a UIA TextChanged event that erwin's host listener
             // surfaces unsafely (same family as the Debug Log AppendText AV
             // documented in memory/reference_winforms_shown_after_dispose).
-            // SQL syntax highlighting via RichTextBox stays in place for
-            // rtbDDLOutput on the DDL Generation tab where there has been no
-            // observed AV.
+            // SQL syntax highlighting via RichTextBox stays in place for the
+            // DDL Generation popup (Forms.DdlApprovalDialog) where there has
+            // been no observed AV.
             this.txtAlterSql.Location = new System.Drawing.Point(20, 270);
             this.txtAlterSql.Name = "txtAlterSql";
             this.txtAlterSql.Size = new System.Drawing.Size(820, 145);
@@ -686,19 +686,12 @@ namespace EliteSoft.Erwin.AddIn
             this.btnBrowseFEOption.Click += new System.EventHandler(this.BtnBrowseFEOption_Click);
             this.grpDdlOptions.Controls.Add(this.btnBrowseFEOption);
 
-            // ----- Action row: Generate / Copy / Status -----
-            this.btnCopyDDL = new System.Windows.Forms.Button();
-            this.btnCopyDDL.Location = new System.Drawing.Point(195, 175);
-            this.btnCopyDDL.Size = new System.Drawing.Size(80, 26);
-            this.btnCopyDDL.Text = "Copy";
-            this.btnCopyDDL.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnCopyDDL.BackColor = System.Drawing.Color.White;
-            this.btnCopyDDL.FlatAppearance.BorderColor = clrBorder;
-            this.btnCopyDDL.Font = fontCaption;
-            this.btnCopyDDL.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnCopyDDL.Click += new System.EventHandler(this.BtnCopyDDL_Click);
-            this.tabDdlGeneration.Controls.Add(this.btnCopyDDL);
-
+            // ----- Action row: Generate DDL + status -----
+            // Copy button + inline rtbDDLOutput viewer removed 2026-05-16.
+            // Successful DDL now opens Forms.DdlApprovalDialog which carries
+            // its own Copy / Cancel / Sent to Approve buttons. Errors surface
+            // via AddinMessageDialog; the status label below stays as the
+            // one-line summary.
             this.btnAlterWizardProd = new System.Windows.Forms.Button();
             this.btnAlterWizardProd.Location = new System.Drawing.Point(12, 172);
             this.btnAlterWizardProd.Size = new System.Drawing.Size(175, 32);
@@ -712,25 +705,14 @@ namespace EliteSoft.Erwin.AddIn
             this.tabDdlGeneration.Controls.Add(this.btnAlterWizardProd);
 
             this.lblDDLStatus = new System.Windows.Forms.Label();
-            this.lblDDLStatus.Location = new System.Drawing.Point(290, 180);
-            this.lblDDLStatus.Size = new System.Drawing.Size(555, 20);
+            this.lblDDLStatus.Location = new System.Drawing.Point(200, 180);
+            this.lblDDLStatus.Size = new System.Drawing.Size(645, 20);
+            this.lblDDLStatus.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
+            this.lblDDLStatus.AutoEllipsis = true;
             this.lblDDLStatus.Text = "";
             this.lblDDLStatus.Font = fontCaption;
             this.lblDDLStatus.ForeColor = clrTextSecondary;
             this.tabDdlGeneration.Controls.Add(this.lblDDLStatus);
-
-            // ----- DDL output (anchor=All, fills remaining space) -----
-            this.rtbDDLOutput = new System.Windows.Forms.RichTextBox();
-            this.rtbDDLOutput.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right | System.Windows.Forms.AnchorStyles.Bottom;
-            this.rtbDDLOutput.Location = new System.Drawing.Point(12, 210);
-            this.rtbDDLOutput.Size = new System.Drawing.Size(832, 300);
-            this.rtbDDLOutput.ReadOnly = true;
-            this.rtbDDLOutput.WordWrap = false;
-            this.rtbDDLOutput.ScrollBars = System.Windows.Forms.RichTextBoxScrollBars.Both;
-            this.rtbDDLOutput.Font = new System.Drawing.Font("Consolas", 9.5f);
-            this.rtbDDLOutput.BackColor = System.Drawing.Color.FromArgb(30, 30, 30);
-            this.rtbDDLOutput.ForeColor = System.Drawing.Color.FromArgb(212, 212, 212);
-            this.tabDdlGeneration.Controls.Add(this.rtbDDLOutput);
 
             // ================================================================
             // STATUS BAR (Bottom)
@@ -824,7 +806,6 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.ComboBox cmbRightModel;
         private System.Windows.Forms.TextBox txtFEOptionXml;
         private System.Windows.Forms.Button btnBrowseFEOption;
-        private System.Windows.Forms.Button btnCopyDDL;
         private System.Windows.Forms.RadioButton rbFromMart;
         private System.Windows.Forms.RadioButton rbFromDB;
         private System.Windows.Forms.Button btnConfigureDB;
@@ -835,7 +816,6 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.GroupBox grpDdlOptions;
         private System.Windows.Forms.Label lblDDLStatus;
         private System.Windows.Forms.CheckBox chkFilterObjects;
-        private System.Windows.Forms.RichTextBox rtbDDLOutput;
 
         private System.Windows.Forms.GroupBox grpModel;
         private System.Windows.Forms.Label lblModelName;

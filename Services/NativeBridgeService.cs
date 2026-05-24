@@ -102,6 +102,17 @@ namespace EliteSoft.Erwin.AddIn.Services
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate int CCInspForceDestroyWizardFn(IntPtr hwnd);
 
+        // Mart save description plumbing (2026-05-19) - pushes a version
+        // description into MCXGDMPersister_Mart::SetDescription so the
+        // approval popup's commit can skip erwin's own description dialog.
+        // Bridge resolves the persister by model name via MCX's static
+        // FindPersister(CString) and then calls SetDescription on it. ANSI
+        // marshaling matches the CStringA signature MFC uses internally.
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+        private delegate int BridgeSetMartSaveDescriptionFn(
+            [MarshalAs(UnmanagedType.LPStr)] string modelName,
+            [MarshalAs(UnmanagedType.LPStr)] string description);
+
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate IntPtr CCInspGetLastOnFeMsFn();
 
@@ -1311,6 +1322,46 @@ namespace EliteSoft.Erwin.AddIn.Services
                     try { _freeDdlBuffer(ddlPtr); }
                     catch (Exception ex) { log?.Invoke($"NativeBridge: FreeDdlBuffer threw: {ex.Message}"); }
                 }
+            }
+        }
+
+        /// <summary>
+        /// Calls MCXGDMPersister_Mart::SetDescription on the persister the
+        /// bridge resolves for the given model name (via the static
+        /// FindPersister(CString) lookup in EM_MCX.dll). Lets the approval
+        /// popup stamp a version description onto the next Mart save
+        /// without showing erwin's own description dialog. No persister
+        /// cache bootstrap is needed - the lookup runs cold on the first
+        /// call.
+        /// </summary>
+        /// <returns>
+        ///  0 = success
+        /// -1 = SetDescription symbol not resolved
+        /// -2 = persister lookup failed (model name wrong / unknown)
+        /// -3 = the native call raised an SEH (most likely CString ABI drift)
+        ///  negative other = generic failure
+        /// </returns>
+        public static int SetMartSaveDescription(string modelName, string description, Action<string> log = null)
+        {
+            if (!Install(log)) return -10;
+            if (_bridgeModule == IntPtr.Zero) return -10;
+            IntPtr proc = GetProcAddress(_bridgeModule, "BridgeSetMartSaveDescription");
+            if (proc == IntPtr.Zero)
+            {
+                log?.Invoke("NativeBridge: BridgeSetMartSaveDescription export not found.");
+                return -11;
+            }
+            var fn = Marshal.GetDelegateForFunctionPointer<BridgeSetMartSaveDescriptionFn>(proc);
+            try
+            {
+                int rc = fn(modelName ?? "", description ?? "");
+                log?.Invoke($"NativeBridge: BridgeSetMartSaveDescription rc={rc} (model='{modelName}', description len={(description ?? "").Length}).");
+                return rc;
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"NativeBridge: BridgeSetMartSaveDescription threw {ex.GetType().Name}: {ex.Message}");
+                return -12;
             }
         }
     }
