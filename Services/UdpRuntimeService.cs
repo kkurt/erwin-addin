@@ -90,6 +90,134 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// Walk the metamodel for any admin-defined Locked Table UDP whose
+        /// <c>Property_Type</c> was deleted (e.g. via erwin's UDP Editor)
+        /// and re-create the missing definitions from the admin snapshot.
+        /// Returns the list of UDP names that had to be restored, so the
+        /// caller can surface a user-visible notification.
+        /// <para>
+        /// Why: Locked admin UDPs must persist - the user removing them
+        /// from the model leaves entities with the value cleared and no
+        /// way for our per-entity revert to write it back (SCAPI rejects
+        /// "is not valid class id" because the Property_Type class is
+        /// gone). Proactively re-creating the definition shrinks the
+        /// time window in which the deletion has any effect to the gap
+        /// between two periodic checks.
+        /// </para>
+        /// </summary>
+        public List<string> EnsureLockedTableDefinitionsExist()
+        {
+            var restored = new List<string>();
+            if (!_initialized) return restored;
+            if (!UdpDefinitionService.Instance.IsLoaded) return restored;
+
+            var admin = UdpDefinitionService.Instance.GetByObjectType("Table")
+                .Where(d => d != null && d.IsLocked && !string.IsNullOrEmpty(d.Name))
+                .ToList();
+            if (admin.Count == 0) return restored;
+
+            dynamic mmSession = null;
+            try
+            {
+                mmSession = _scapi.Sessions.Add();
+                mmSession.Open(_currentModel, 1); // SCD_SL_M1 = metamodel level
+
+                dynamic mmObjects = mmSession.ModelObjects;
+                dynamic mmRoot = mmObjects.Root;
+                if (mmRoot == null) return restored;
+
+                // Collect existing Property_Type names so we can diff against
+                // the admin Locked set without a per-name HasProperty call.
+                var existing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                try
+                {
+                    dynamic propertyTypes = mmObjects.Collect(mmRoot, "Property_Type");
+                    foreach (dynamic pt in propertyTypes)
+                    {
+                        if (pt == null) continue;
+                        try
+                        {
+                            string n = pt.Name ?? "";
+                            if (!string.IsNullOrEmpty(n)) existing.Add(n);
+                        }
+                        catch { }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log($"EnsureLockedTableDefinitionsExist: Property_Type enumerate failed: {ex.Message}");
+                    return restored;
+                }
+
+                var missing = admin
+                    .Where(d => !existing.Contains($"Entity.Physical.{d.Name}"))
+                    .ToList();
+                if (missing.Count == 0) return restored;
+
+                int transId = mmSession.BeginNamedTransaction("RestoreDeletedLockedUdpDefs");
+                try
+                {
+                    foreach (var def in missing)
+                    {
+                        try
+                        {
+                            dynamic pt = mmObjects.Add("Property_Type");
+                            string fullName = $"Entity.Physical.{def.Name}";
+                            pt.Properties("Name").Value = fullName;
+                            TrySetMetaProp(pt, "tag_Udp_Owner_Type", "Entity");
+                            TrySetMetaProp(pt, "tag_Is_Physical", true);
+                            TrySetMetaProp(pt, "tag_Is_Logical", false);
+                            TrySetMetaProp(pt, "tag_Udp_Data_Type", UdpSyncEngine.MapUdpTypeToErwinDataTypeId(def.UdpType));
+                            if (string.Equals(def.UdpType, "List", StringComparison.OrdinalIgnoreCase)
+                                && def.ListOptions != null && def.ListOptions.Count > 0)
+                            {
+                                string list = string.Join(",", def.ListOptions
+                                    .OrderBy(o => o.SortOrder)
+                                    .Select(o => o.Value));
+                                TrySetMetaProp(pt, "tag_Udp_Values_List", list);
+                            }
+                            TrySetMetaProp(pt, "tag_Udp_Default_Value", def.DefaultValue ?? "");
+                            TrySetMetaProp(pt, "Definition", def.Description ?? "");
+                            TrySetMetaProp(pt, "tag_Order", "1");
+                            TrySetMetaProp(pt, "tag_Is_Locally_Defined", true);
+                            restored.Add(def.Name);
+                            Log($"EnsureLockedTableDefinitionsExist: re-created '{fullName}' (admin Locked UDP was deleted)");
+                        }
+                        catch (Exception createEx)
+                        {
+                            Log($"EnsureLockedTableDefinitionsExist: re-create failed for '{def.Name}': {createEx.Message}");
+                        }
+                    }
+                    mmSession.CommitTransaction(transId);
+                }
+                catch (Exception txEx)
+                {
+                    try { mmSession.RollbackTransaction(transId); }
+                    catch (Exception rbEx) { Log($"EnsureLockedTableDefinitionsExist rollback err: {rbEx.Message}"); }
+                    Log($"EnsureLockedTableDefinitionsExist transaction error: {txEx.Message}");
+                    restored.Clear();
+                }
+            }
+            catch (Exception ex) { Log($"EnsureLockedTableDefinitionsExist err: {ex.Message}"); }
+            finally
+            {
+                if (mmSession != null)
+                {
+                    try { mmSession.Close(); }
+                    catch (Exception ex) { Log($"EnsureLockedTableDefinitionsExist: session close err: {ex.Message}"); }
+                }
+            }
+
+            return restored;
+        }
+
+        private void TrySetMetaProp(dynamic pt, string name, object value)
+        {
+            try { pt.Properties(name).Value = value; }
+            catch (Exception ex) { Log($"EnsureLockedTableDefinitionsExist: tag '{name}' set failed: {ex.Message}"); }
+        }
+
+        /// <summary>
         /// Initialize: load all UDP definitions from the admin DB and apply
         /// the per-connect dependency-set cascade refresh to existing
         /// Property_Type entries.
@@ -557,15 +685,9 @@ namespace EliteSoft.Erwin.AddIn.Services
             {
                 foreach (var kvp in values)
                 {
-                    try
-                    {
-                        string path = $"{prefix}.{kvp.Key}";
-                        entity.Properties(path).Value = kvp.Value;
-                    }
-                    catch (Exception ex)
-                    {
-                        Log($"UdpRuntime.WriteUdpValues: Failed to set '{kvp.Key}' = '{kvp.Value}': {ex.Message}");
-                    }
+                    string fullPath = $"{prefix}.{kvp.Key}";
+                    if (!TrySetUdpProperty(entity, fullPath, kvp.Value, out Exception setEx))
+                        Log($"UdpRuntime.WriteUdpValues: Failed to set '{kvp.Key}' = '{kvp.Value}': {setEx?.Message}");
                 }
 
                 _session.CommitTransaction(transId);
@@ -576,6 +698,95 @@ namespace EliteSoft.Erwin.AddIn.Services
                 catch (Exception rbEx) { Log($"UdpRuntime: Rollback failed: {rbEx.Message}"); }
                 Log($"UdpRuntime.WriteUdpValues transaction error: {ex.Message}");
             }
+        }
+
+        /// <summary>
+        /// Write a single UDP value, materialising the Property on the
+        /// entity first when SCAPI rejects the direct set. erwin's
+        /// <c>ISCModelPropertyCollection</c> stores UDP values sparsely:
+        /// the first call to <c>entity.Properties("Entity.Physical.X")</c>
+        /// on a brand-new entity (or any entity that never had X set
+        /// through the UDP grid) throws "is not valid class id or class
+        /// name" - the property class exists in the metamodel but no
+        /// instance is yet bound to this entity. Calling
+        /// <c>entity.Properties.Add("Entity.Physical.X")</c> creates the
+        /// binding (documented at API Reference 15.0 p.223,
+        /// <c>ISCModelPropertyCollection::Add</c>); the second
+        /// <c>Properties(...).Value = ...</c> then succeeds.
+        /// Returns true on success.
+        /// </summary>
+        private bool TrySetUdpProperty(dynamic entity, string fullPath, string value, out Exception failure)
+        {
+            failure = null;
+            try
+            {
+                entity.Properties(fullPath).Value = value;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                failure = ex;
+            }
+
+            // Direct set was rejected - try to materialise the property,
+            // then retry. Add is also idempotent in practice (erwin
+            // returns the existing property without throwing for an
+            // already-bound name on a Mart-loaded entity).
+            try
+            {
+                entity.Properties.Add(fullPath);
+                entity.Properties(fullPath).Value = value;
+                failure = null;
+                Log($"UdpRuntime.TrySetUdpProperty: materialised + set '{fullPath}' = '{value}' (initial direct set was rejected)");
+                return true;
+            }
+            catch (Exception addEx)
+            {
+                failure = addEx;
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Like <see cref="WriteUdpValues"/> but returns the keys that
+        /// could not be written so callers (the Locked enforcer) can
+        /// surface a real failure instead of logging a misleading
+        /// "reverted" line when SCAPI rejected the set.
+        /// </summary>
+        public List<string> WriteUdpValuesWithFailures(dynamic entity, Dictionary<string, string> values, string objectType = "Table")
+        {
+            var failed = new List<string>();
+            if (values == null || values.Count == 0) return failed;
+
+            string prefix = GetPropertyPathPrefix(objectType);
+            if (prefix == null)
+            {
+                foreach (var k in values.Keys) failed.Add(k);
+                return failed;
+            }
+
+            int transId = _session.BeginNamedTransaction("WriteUdpValues");
+            try
+            {
+                foreach (var kvp in values)
+                {
+                    string fullPath = $"{prefix}.{kvp.Key}";
+                    if (!TrySetUdpProperty(entity, fullPath, kvp.Value, out Exception setEx))
+                    {
+                        failed.Add(kvp.Key);
+                        Log($"UdpRuntime.WriteUdpValuesWithFailures: Failed to set '{kvp.Key}' = '{kvp.Value}': {setEx?.Message}");
+                    }
+                }
+                _session.CommitTransaction(transId);
+            }
+            catch (Exception ex)
+            {
+                try { _session.RollbackTransaction(transId); }
+                catch (Exception rbEx) { Log($"UdpRuntime: Rollback failed: {rbEx.Message}"); }
+                Log($"UdpRuntime.WriteUdpValuesWithFailures transaction error: {ex.Message}");
+                foreach (var k in values.Keys) if (!failed.Contains(k)) failed.Add(k);
+            }
+            return failed;
         }
 
         /// <summary>

@@ -27,14 +27,16 @@ namespace EliteSoft.Erwin.AddIn.Forms
     ///    Date = DateTimePicker, Int/Real = TextBox with numeric validation
     ///    deferred to UdpValidationEngine on save).
     ///  - Cancel / [X] returns DialogResult.Cancel and an empty value map.
-    ///    The caller treats that as "user chose not to fill them now"; the
-    ///    entity stays with empty values (no auto-delete), the standard UDP
-    ///    validation cycle will still surface the same problem on the next
-    ///    save / popup tick, so nothing is lost.
+    ///    Per the 2026-05-20 contract the caller deletes the new object on
+    ///    Cancel (since this form only ever runs in CREATE mode today). The
+    ///    button label is rewritten to "Discard New {Kind}" so the user
+    ///    sees what Cancel will do before clicking.
     /// </summary>
     public class RequiredUdpForm : Form
     {
         private readonly string _tableName;
+        private readonly string _objectKind;
+        private readonly RequiredOperationMode _mode;
         private readonly List<UdpDefinitionRuntime> _requiredUdps;
         private readonly Dictionary<string, Control> _inputs = new Dictionary<string, Control>(StringComparer.OrdinalIgnoreCase);
 
@@ -54,9 +56,12 @@ namespace EliteSoft.Erwin.AddIn.Forms
         private Button btnOk;
         private Button btnCancel;
 
-        public RequiredUdpForm(string tableName, List<UdpDefinitionRuntime> requiredUdps)
+        public RequiredUdpForm(string tableName, List<UdpDefinitionRuntime> requiredUdps,
+            RequiredOperationMode mode = RequiredOperationMode.Create, string objectKind = "Table")
         {
             _tableName = tableName ?? string.Empty;
+            _mode = mode;
+            _objectKind = string.IsNullOrEmpty(objectKind) ? "Object" : objectKind;
             // Defensive copy + sort by SortOrder so admin-controlled ordering
             // shows up in the dialog (UDPs are not re-sorted at load time).
             _requiredUdps = (requiredUdps ?? new List<UdpDefinitionRuntime>())
@@ -138,10 +143,19 @@ namespace EliteSoft.Erwin.AddIn.Forms
             btnOk.FlatAppearance.BorderSize = 0;
             btnOk.Click += BtnOk_Click;
 
+            // Cancel button label surfaces the destructive action so the
+            // user knows Cancel will discard the new object before they
+            // click (UPDATE mode currently unused but supported for
+            // symmetry with RequiredFieldDialog).
+            string cancelText = _mode == RequiredOperationMode.Create
+                ? $"Discard New {_objectKind}"
+                : "Revert Change";
+            int cancelWidth = _mode == RequiredOperationMode.Create ? 170 : 130;
+
             btnCancel = new Button
             {
-                Text = "Cancel",
-                Size = new Size(100, 32),
+                Text = cancelText,
+                Size = new Size(cancelWidth, 32),
                 FlatStyle = FlatStyle.Flat,
                 BackColor = Color.White,
                 ForeColor = ClrTextPrimary,
@@ -152,13 +166,16 @@ namespace EliteSoft.Erwin.AddIn.Forms
             btnCancel.FlatAppearance.BorderColor = ClrBorder;
             btnCancel.Click += (s, e) => { this.DialogResult = DialogResult.Cancel; this.Close(); };
 
-            btnOk.Location = new Point(pnlFooter.Width - 116, 9);
-            btnCancel.Location = new Point(btnOk.Left - 108, 9);
+            // Right-anchored, OK first then Cancel to its left. Layout
+            // is parameterised by the (possibly wider) Cancel button so
+            // the longer "Discard New Table" text doesn't get clipped.
+            btnOk.Location = new Point(pnlFooter.Width - btnOk.Width - 16, 9);
+            btnCancel.Location = new Point(btnOk.Left - btnCancel.Width - 8, 9);
             pnlFooter.Controls.AddRange(new Control[] { btnCancel, btnOk });
             pnlFooter.Resize += (s, e) =>
             {
-                btnOk.Location = new Point(pnlFooter.Width - 116, 9);
-                btnCancel.Location = new Point(btnOk.Left - 108, 9);
+                btnOk.Location = new Point(pnlFooter.Width - btnOk.Width - 16, 9);
+                btnCancel.Location = new Point(btnOk.Left - btnCancel.Width - 8, 9);
             };
 
             var footerSep = new Panel { Dock = DockStyle.Bottom, Height = 1, BackColor = ClrBorder };
