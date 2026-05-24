@@ -301,6 +301,44 @@ if (Test-Path $ddlHelperDir) {
     }
 }
 
+# Build ErwinInjector (single-file Win32 launcher) + TriggerDll (AOT). Both
+# end up in the install dir and are used by autostart-watcher.ps1 to load
+# the addin into a running erwin process - without these binaries the
+# watcher logs "Injector not found" and fails the dev loop's health check.
+# Kept on the same timestamp-gate as DdlHelper so no-source-change runs
+# skip the dotnet publish overhead.
+$injectorDir       = Join-Path $scriptDir "scripts\erwin-injector"
+$injectorPubDir    = Join-Path $injectorDir "bin\Release\net10.0\win-x64\publish"
+$injectorExe       = Join-Path $injectorPubDir "ErwinInjector.exe"
+$triggerDir        = Join-Path $injectorDir "TriggerDll"
+$triggerPubDir     = Join-Path $triggerDir "bin\Release\net10.0-windows\win-x64\publish"
+$triggerDll        = Join-Path $triggerPubDir "TriggerDll.dll"
+
+if (Test-Path $injectorDir) {
+    $injectorSources = @((Join-Path $injectorDir "ErwinInjector.csproj"), (Join-Path $injectorDir "Program.cs"))
+    if (Test-AnyNewer -Sources $injectorSources -Target $injectorExe) {
+        Write-Host "  Publishing ErwinInjector..." -ForegroundColor Gray
+        dotnet publish "$injectorDir\ErwinInjector.csproj" -c Release -r win-x64 --nologo -v q 2>&1 | Out-Null
+        if ($?) { Write-Host "  ErwinInjector published" -ForegroundColor Green }
+        else    { Write-Host "  ErwinInjector publish failed (non-critical)" -ForegroundColor Yellow }
+    } else {
+        Write-Host "  ErwinInjector skipped - source unchanged since publish" -ForegroundColor DarkGray
+    }
+}
+if (Test-Path $triggerDir) {
+    $triggerSources = @((Join-Path $triggerDir "TriggerDll.csproj"), (Join-Path $triggerDir "TriggerDll.cs"))
+    if (Test-AnyNewer -Sources $triggerSources -Target $triggerDll) {
+        Write-Host "  Publishing TriggerDll (AOT)..." -ForegroundColor Gray
+        # PublishAot takes 30-60s cold and pulls in the native toolchain, so
+        # the timestamp gate matters more here than for the managed bits.
+        dotnet publish "$triggerDir\TriggerDll.csproj" -c Release -r win-x64 --nologo -v q 2>&1 | Out-Null
+        if ($?) { Write-Host "  TriggerDll published" -ForegroundColor Green }
+        else    { Write-Host "  TriggerDll publish failed (non-critical)" -ForegroundColor Yellow }
+    } else {
+        Write-Host "  TriggerDll skipped - source unchanged since publish" -ForegroundColor DarkGray
+    }
+}
+
 $buildOutputDir = Join-Path $scriptDir "bin\Release\net10.0-windows"
 if (-not (Test-Path (Join-Path $buildOutputDir "EliteSoft.Erwin.AddIn.dll"))) {
     Write-Host "DLL not found in build output!" -ForegroundColor Red
@@ -359,6 +397,44 @@ if (Test-Path -LiteralPath $watcherSrcPath) {
     }
 } else {
     Write-Host "  WARNING: $watcherSrcPath missing - keeping installed watcher" -ForegroundColor Yellow
+}
+
+# ErwinInjector.exe + TriggerDll.dll also live outside bin/ - they are
+# published into the erwin-injector subtree. Robocopy can't see them so
+# we deploy them by hand. autostart-watcher.ps1 hardcodes these paths
+# (Test-Path on install dir) and refuses to start without both.
+foreach ($pair in @(
+    @{ Src = $injectorExe; Name = 'ErwinInjector.exe' },
+    @{ Src = $triggerDll;  Name = 'TriggerDll.dll' }
+)) {
+    if (Test-Path -LiteralPath $pair.Src) {
+        $dst = Join-Path $installDir $pair.Name
+        $srcHash = (Get-FileHash -LiteralPath $pair.Src -Algorithm SHA1).Hash
+        $dstHash = if (Test-Path -LiteralPath $dst) { (Get-FileHash -LiteralPath $dst -Algorithm SHA1).Hash } else { $null }
+        if ($srcHash -ne $dstHash) {
+            [System.IO.File]::Copy($pair.Src, $dst, $true)
+            Write-Host "  Refreshed $($pair.Name)" -ForegroundColor Gray
+        }
+    } else {
+        Write-Host "  WARNING: $($pair.Name) missing at $($pair.Src) - watcher will fail" -ForegroundColor Yellow
+    }
+}
+
+# license.lic check: addin's CheckLicenseStatus reads `<installDir>\license.lic`
+# at startup and refuses to load without it. The file is NOT in the repo (it's
+# RSA-signed against the specific machine's HWID) so robocopy can't bring it
+# in. If the install dir was ever wiped, the file vanishes and the user gets
+# a "License file not found" popup on next erwin launch. Surface the gap
+# loudly here AND print the exact KeyGen command so the fix is one paste away.
+$licDst = Join-Path $installDir "license.lic"
+if (-not (Test-Path -LiteralPath $licDst)) {
+    Write-Host "  WARNING: license.lic missing at $licDst - addin will fail license check." -ForegroundColor Yellow
+    Write-Host "  Generate one with:" -ForegroundColor Yellow
+    Write-Host "    cd C:\Users\Kursat\Repos\x-hw-licensing\KeyGen" -ForegroundColor Gray
+    Write-Host "    Copy-Item ..\rsa_private_key.xml ." -ForegroundColor Gray
+    Write-Host "    dotnet run -c Debug -- genlicense --hwid <YOUR_HWID> --licensee `"ErwinAddIn`" --features `"ErwinAddIn`" -o `"$licDst`"" -ForegroundColor Gray
+    Write-Host "    Remove-Item rsa_private_key.xml" -ForegroundColor Gray
+    Write-Host "  (HWID is shown in the 'Elite Soft - License Error' dialog if you launch the addin without one.)" -ForegroundColor Gray
 }
 
 # robocopy exit 0 == nothing copied (everything was up-to-date).

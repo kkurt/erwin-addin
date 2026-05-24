@@ -94,3 +94,6 @@ Söylediklerimi sorgula, ayrıca senin de çözüm için bulduğun  mantıkları
 Çalışan kodu, tam kanıtlanana kadar temizleme, ilgili yere implemente edince gerekirse sorarak temizle!
 
 Yazılımı oluşturuken profesyönel ve deneyimli bir yazılımcı olarak düşün. eklediğin kodların etkilerini göz ardı etme.
+
+
+Ekranları yaparken profesyönel bir UX gözü ile değerlendirerek iyi analiz ederek yap.

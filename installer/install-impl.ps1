@@ -812,40 +812,53 @@ if (-not (Test-Path $triggerDllPath)) {
 if (Test-Path -LiteralPath $watcherSource) {
     [System.IO.File]::Copy($watcherSource, $watcherTarget, $true)
 
-    # Remove old task if exists (current scope/name).
-    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    # Aggressively remove ANY existing task with this name in ANY task folder
+    # before re-registering. Required because:
+    #   1) Get/Unregister-ScheduledTask without -TaskPath searches the root
+    #      folder only; a task that ended up under a sub-folder (legacy
+    #      installer, group policy, manual import) hides from the cmdlet but
+    #      still blocks Register-ScheduledTask with ERROR_FILE_EXISTS
+    #      ("Cannot create a file when that file already exists").
+    #   2) A stale/corrupt task XML in C:\Windows\System32\Tasks\ can also
+    #      block registration while remaining invisible to the modern cmdlet;
+    #      legacy schtasks.exe usually succeeds where the cmdlet fails.
+    # We enumerate across all paths, try the cmdlet first, then fall back to
+    # schtasks.exe per task, and finish with a blind schtasks safety net.
+    $namesToClean = @($taskName)
+    if ($legacyTaskName -ne $taskName) { $namesToClean += $legacyTaskName }
 
-    # Best-effort cleanup of the legacy single-name task from older installs
-    # (pre per-user-suffix, or from the old -Scope Machine path). Cross-user
-    # removal may need elevation; if we can't, no harm - the new per-user
-    # task name avoids the conflict regardless.
-    if ($legacyTaskName -ne $taskName) {
+    foreach ($cleanupName in $namesToClean) {
+        $foundTasks = @()
         try {
-            Unregister-ScheduledTask -TaskName $legacyTaskName -Confirm:$false -ErrorAction Stop
-            Write-Host "  Removed legacy shared task '$legacyTaskName' (pre per-user-suffix install)" -ForegroundColor Gray
+            $foundTasks = @(Get-ScheduledTask -TaskName $cleanupName -TaskPath \* -ErrorAction SilentlyContinue)
         }
         catch {
-            # Legacy task absent or owned by another user - both fine.
+            # Get-ScheduledTask itself can throw on broken WMI state; ignore
+            # and let the schtasks fallback below handle it.
         }
-    }
 
-    # Create Scheduled Task - runs at logon, hidden.
-    # If a task with the same name already exists from a prior install (or
-    # from a different scope - Machine vs User), Register-ScheduledTask
-    # fails with "Cannot create a file when that file already exists" and
-    # leaves the stale task pointing at the old watcher script path. The
-    # previous Out-Null pipe swallowed the error and the script then
-    # printed a misleading "created" message. We now unregister first
-    # (best-effort) and check the register result so the user sees the
-    # truth.
-    try {
-        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction Stop
-        Write-Host "  Removed pre-existing Scheduled Task '$taskName' to avoid stale path" -ForegroundColor Gray
-    }
-    catch {
-        # No pre-existing task (or different folder/scope we can't access).
-        # Either way, proceed to register; the message below will surface
-        # any real failure.
+        foreach ($t in $foundTasks) {
+            $fullPath = "$($t.TaskPath)$($t.TaskName)"
+            try {
+                Unregister-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath -Confirm:$false -ErrorAction Stop
+                Write-Host "  Removed pre-existing task '$fullPath'" -ForegroundColor Gray
+            }
+            catch {
+                Write-Host "  Cmdlet unregister failed for '$fullPath' ($($_.Exception.Message)); trying schtasks" -ForegroundColor Yellow
+                # try/catch wrapper: schtasks.exe returns non-zero when the
+                # task does not exist; under $ErrorActionPreference='Stop'
+                # plus $PSNativeCommandUseErrorActionPreference (PS 7.3+)
+                # that bubbles up as a terminating error. We treat it as a
+                # best-effort cleanup, so swallow.
+                try { $null = & schtasks.exe /Delete /TN $fullPath /F 2>&1 } catch { }
+            }
+        }
+
+        # Blind schtasks pass: even if Get-ScheduledTask saw nothing, force
+        # a delete by name. Exit code is ignored on purpose - "task not
+        # found" (1) is the normal happy case here, and the cmdlet may
+        # have left a stale XML behind that schtasks can still clear.
+        try { $null = & schtasks.exe /Delete /TN $cleanupName /F 2>&1 } catch { }
     }
 
     $action = New-ScheduledTaskAction -Execute "powershell.exe" `
@@ -867,9 +880,10 @@ if (Test-Path -LiteralPath $watcherSource) {
         Write-Host "  ERROR: Could not register Scheduled Task '$taskName':" -ForegroundColor Red
         Write-Host "    $($_.Exception.Message)" -ForegroundColor Red
         Write-Host "  Without this task the add-in WILL NOT auto-load when erwin starts." -ForegroundColor Yellow
-        Write-Host "  Try this:" -ForegroundColor Yellow
-        Write-Host "    Open Task Scheduler, delete any task named '$taskName' under" -ForegroundColor Yellow
-        Write-Host "    '\\$taskName' or root, then re-run install.bat" -ForegroundColor Yellow
+        Write-Host "  Recovery (run in an elevated PowerShell, then re-run install.bat):" -ForegroundColor Yellow
+        Write-Host "    schtasks /Delete /TN `"$taskName`" /F" -ForegroundColor Yellow
+        Write-Host "  If that still fails, open Task Scheduler, locate '$taskName' in any" -ForegroundColor Yellow
+        Write-Host "  folder (root or sub-folder), delete it manually, then re-run install.bat." -ForegroundColor Yellow
         $registered = $null
     }
 
