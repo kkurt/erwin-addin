@@ -614,7 +614,14 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                 string adminDefault = adminUdp.DefaultValue ?? "";
                 string modelDefault = match.CurrentDefault ?? "";
-                if (!string.Equals(adminDefault, modelDefault, StringComparison.Ordinal))
+                // Same Turkish-I normalisation guard as the list-values
+                // branch below - erwin transforms 'İ' -> 'I' on store, so an
+                // Ordinal compare would loop the dialog forever on UDPs
+                // whose default contains a Turkish dotted I.
+                if (!string.Equals(
+                        NormalizeForErwinListCompare(adminDefault),
+                        NormalizeForErwinListCompare(modelDefault),
+                        StringComparison.Ordinal))
                 {
                     changes |= UdpUpdateChanges.Default;
                     detailParts.Add($"Default: '{Truncate(modelDefault, 24)}' -> '{Truncate(adminDefault, 24)}'");
@@ -624,16 +631,54 @@ namespace EliteSoft.Erwin.AddIn.Services
                 {
                     string expectedList = string.Join(",", adminUdp.ListOptions.Select(o => o.Value));
                     string modelList = match.CurrentListValues ?? "";
-                    if (!string.Equals(expectedList, modelList, StringComparison.Ordinal))
+
+                    // Erwin's tag_Udp_Values_List setter normalises Turkish
+                    // dotted-I characters (verified 2026-05-23 log diag on
+                    // CLASSIFICATION UDP: admin wrote 'Kurum İçi' (U+0130),
+                    // erwin stored 'Kurum Içi' (U+0049)). The byte-identical
+                    // Ordinal compare therefore always diffs - the dialog
+                    // re-appears on every model open even after a successful
+                    // Apply round-trip, because we cannot ever write a value
+                    // back that survives unchanged. Normalise both sides
+                    // through the same transformation erwin performs so the
+                    // diff converges. We still log the raw mismatch when
+                    // the normalised comparison is what matched, so an
+                    // admin staring at a diagnostic line can tell that
+                    // erwin corrupted the value rather than think the
+                    // Apply silently failed.
+                    bool listsDifferOrdinal = !string.Equals(expectedList, modelList, StringComparison.Ordinal);
+                    bool listsDifferAfterNormalize = !string.Equals(
+                        NormalizeForErwinListCompare(expectedList),
+                        NormalizeForErwinListCompare(modelList),
+                        StringComparison.Ordinal);
+
+                    if (listsDifferAfterNormalize)
                     {
                         changes |= UdpUpdateChanges.ListValues;
                         detailParts.Add("List options changed");
+                    }
+                    else if (listsDifferOrdinal)
+                    {
+                        // Same data, but erwin transformed the bytes on
+                        // store. Cannot emit a log line here - this method
+                        // is static; the suppression itself is the
+                        // breadcrumb (diff is empty -> dialog stays away).
+                        // If a session-level diagnostic is needed in the
+                        // future, refactor ComputeDiff to accept a log
+                        // delegate or pass the suppressed-mismatch count
+                        // back through UdpDiff.
+                        System.Diagnostics.Debug.WriteLine(
+                            $"UdpSync: '{adminUdp.Name}' list options match after Turkish-I normalisation " +
+                            $"(erwin stored '{modelList}' for admin's '{expectedList}'); suppressing false-positive diff.");
                     }
                 }
 
                 string adminDesc = adminUdp.Description ?? "";
                 string modelDesc = match.CurrentDescription ?? "";
-                if (!string.Equals(adminDesc, modelDesc, StringComparison.Ordinal))
+                if (!string.Equals(
+                        NormalizeForErwinListCompare(adminDesc),
+                        NormalizeForErwinListCompare(modelDesc),
+                        StringComparison.Ordinal))
                 {
                     changes |= UdpUpdateChanges.Description;
                     detailParts.Add("Description changed");
@@ -688,6 +733,37 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             if (string.IsNullOrEmpty(s)) return s ?? "";
             return s.Length <= maxLen ? s : s.Substring(0, maxLen - 1) + "...";
+        }
+
+        /// <summary>
+        /// Normalise a string the same way erwin's
+        /// <c>tag_Udp_Values_List</c> / <c>tag_Udp_Default_Value</c> /
+        /// <c>Definition</c> setters silently transform their input on
+        /// store. Lets <see cref="ComputeDiff"/> tell "admin's value
+        /// after a save+reopen round-trip" apart from a genuine drift.
+        /// <para>
+        /// Verified store-side transformations (2026-05-23 log diag on
+        /// CLASSIFICATION list options):
+        /// </para>
+        /// <list type="bullet">
+        /// <item><description>U+0130 'İ' (Turkish capital dotted I) -> U+0049 'I'
+        /// (ASCII capital I). Reason inferred: erwin's MFC layer uses a
+        /// Latin-only ToUpperInvariant pass that collapses the Turkish
+        /// dotted-I to plain I. The lowercase counterpart (U+0131 'ı')
+        /// gets the same treatment in reverse, mapping to U+0069 'i'.</description></item>
+        /// </list>
+        /// We only normalise the characters we have observed erwin
+        /// touch - adding more entries here belongs under "verify in log
+        /// first, then mirror".
+        /// </summary>
+        internal static string NormalizeForErwinListCompare(string? s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            // String.Replace(char, char) is O(n) on a fresh char array, so
+            // two passes is still ~n cost; cheap relative to the SCAPI
+            // reads that produced the string in the first place.
+            return s!.Replace('İ', 'I')   // İ -> I
+                     .Replace('ı', 'i');  // ı -> i
         }
 
         #endregion
@@ -895,7 +971,33 @@ namespace EliteSoft.Erwin.AddIn.Services
                 string validValues = adminUdp.ListOptions.Count > 0
                     ? string.Join(",", adminUdp.ListOptions.ConvertAll(o => o.Value))
                     : "";
+
+                // Apply-time diagnostic for the "round-trip mismatch" bug
+                // (admin's ASCII 'I' becomes Turkish 'İ' U+0130 after a
+                // save+reopen cycle, so the diff dialog reappears forever).
+                // We log the value just before the write, the literal we are
+                // about to send, and the value erwin returns from a re-read
+                // inside the same transaction. If write != readback, erwin's
+                // setter is silently transforming the bytes - then the fix
+                // belongs in how we serialize the list, not in callers.
+                string beforeWrite = "";
+                try { beforeWrite = pt.Properties("tag_Udp_Values_List")?.Value?.ToString() ?? ""; }
+                catch (Exception ex) { Log($"UdpSyncEngine.Apply DIAG: pre-write read failed: {ex.Message}"); }
+
                 TrySetProperty(pt, "tag_Udp_Values_List", validValues);
+
+                string afterWrite = "";
+                try { afterWrite = pt.Properties("tag_Udp_Values_List")?.Value?.ToString() ?? ""; }
+                catch (Exception ex) { Log($"UdpSyncEngine.Apply DIAG: post-write read failed: {ex.Message}"); }
+
+                Log($"UdpSyncEngine.Apply DIAG [{adminUdp.Name}] tag_Udp_Values_List:");
+                Log($"  before  ({beforeWrite.Length} chars): '{beforeWrite}'");
+                Log($"  wrote   ({validValues.Length} chars): '{validValues}'");
+                Log($"  readback({afterWrite.Length} chars): '{afterWrite}'");
+                Log($"  wrote    hex: {string.Join(" ", validValues.Select(c => ((int)c).ToString("X4")))}");
+                Log($"  readback hex: {string.Join(" ", afterWrite.Select(c => ((int)c).ToString("X4")))}");
+                if (!string.Equals(validValues, afterWrite, StringComparison.Ordinal))
+                    Log($"  *** MISMATCH: erwin setter transformed the value in-transaction ***");
             }
 
             // Default value: write empty string to clear when admin removed

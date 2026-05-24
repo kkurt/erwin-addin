@@ -265,6 +265,110 @@ public class UdpSyncEngineDiffTests
     }
 
     [Fact]
+    public void ListValues_only_Turkish_dotted_I_difference_suppresses_false_diff()
+    {
+        // erwin's tag_Udp_Values_List setter transforms U+0130 'İ' to U+0049 'I'
+        // on store. Without normalised compare the dialog re-fires on every model
+        // open because admin's 'İ' never byte-equals erwin's stored 'I'.
+        // Verified 2026-05-23 against the CLASSIFICATION UDP in the live log.
+        var snapshot = new List<UdpDefinitionSnapshot>
+        {
+            AdminUdp(1, "CLASSIFICATION", objectType: "Column", udpType: "List",
+                listOptions: new[] { "Kurum İçi", "Hizmete Özel", "Gizli" }),
+        };
+        var model = AsMap(ModelUdp(
+            "Attribute.Physical.CLASSIFICATION",
+            dataTypeId: 6,
+            // erwin stored value: capital dotted-I collapsed to plain I.
+            currentListValues: "Kurum Içi,Hizmete Özel,Gizli"));
+
+        var diff = UdpSyncEngine.ComputeDiff(snapshot, model);
+
+        diff.IsEmpty.Should().BeTrue("erwin's Turkish-I store transform is the only delta");
+    }
+
+    [Fact]
+    public void ListValues_lowercase_dotted_i_difference_also_suppresses()
+    {
+        // Symmetric to the uppercase test - U+0131 'ı' would collapse to
+        // U+0069 'i' if erwin's setter took the same path on the dotless
+        // form. Mirror the rule to avoid an admin chasing the same forever-
+        // loop down a different option value.
+        var snapshot = new List<UdpDefinitionSnapshot>
+        {
+            AdminUdp(1, "STATUS", objectType: "Table", udpType: "List",
+                listOptions: new[] { "kapalı", "açık" }),
+        };
+        var model = AsMap(ModelUdp(
+            "Entity.Physical.STATUS",
+            dataTypeId: 6,
+            currentListValues: "kapali,açik"));
+
+        var diff = UdpSyncEngine.ComputeDiff(snapshot, model);
+        diff.IsEmpty.Should().BeTrue();
+    }
+
+    [Fact]
+    public void ListValues_real_drift_still_fires_through_normalisation()
+    {
+        // Sanity: normalisation must not hide a genuine drift. Admin lists
+        // three options; model has an extra fourth ("TTT" - matches the
+        // user-reported 2026-05-23 TABLE_TYPE scenario where a manually
+        // added option needs to be cleaned up).
+        var snapshot = new List<UdpDefinitionSnapshot>
+        {
+            AdminUdp(1, "TABLE_TYPE", objectType: "Table", udpType: "List",
+                listOptions: new[] { "LOG", "PARAMETER", "TRANSACTION", "HISTORY" }),
+        };
+        var model = AsMap(ModelUdp(
+            "Entity.Physical.TABLE_TYPE",
+            dataTypeId: 6,
+            currentListValues: "LOG,PARAMETER,TRANSACTION,HISTORY,TTT"));
+
+        var diff = UdpSyncEngine.ComputeDiff(snapshot, model);
+
+        diff.Updates.Should().HaveCount(1);
+        diff.Updates[0].Changes.Should().HaveFlag(UdpUpdateChanges.ListValues);
+    }
+
+    [Fact]
+    public void Default_value_Turkish_I_difference_suppresses_false_diff()
+    {
+        // Same store-side normalisation applies to tag_Udp_Default_Value.
+        var snapshot = new List<UdpDefinitionSnapshot>
+        {
+            AdminUdp(1, "DEFAULT_OWNER", objectType: "Table", udpType: "Text",
+                defaultValue: "Kurum İçi"),
+        };
+        var model = AsMap(ModelUdp(
+            "Entity.Physical.DEFAULT_OWNER",
+            dataTypeId: 2,
+            currentDefault: "Kurum Içi"));
+
+        var diff = UdpSyncEngine.ComputeDiff(snapshot, model);
+        diff.IsEmpty.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Description_Turkish_I_difference_suppresses_false_diff()
+    {
+        // Definition / Description field also goes through the same
+        // setter quirk on r10.10.
+        var snapshot = new List<UdpDefinitionSnapshot>
+        {
+            AdminUdp(1, "INFO", objectType: "Table", udpType: "Text",
+                description: "İçeriği belirler"),
+        };
+        var model = AsMap(ModelUdp(
+            "Entity.Physical.INFO",
+            dataTypeId: 2,
+            currentDescription: "Içeriği belirler"));
+
+        var diff = UdpSyncEngine.ComputeDiff(snapshot, model);
+        diff.IsEmpty.Should().BeTrue();
+    }
+
+    [Fact]
     public void Model_orphan_not_in_admin_snapshot_is_left_alone()
     {
         // Admin has nothing; model has a user-created UDP. Diff must be empty.

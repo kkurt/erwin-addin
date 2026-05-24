@@ -4,6 +4,100 @@ A running log of corrections and non-obvious findings that future sessions
 should not have to rediscover. Each entry is a short rule, the reason, and
 how to apply it.
 
+## 2026-05-23 (b): Naming-rule popups MUST serialize with PromptForMissingRequiredUdps
+
+**Rule:** any code path that calls `RequiredFieldDialog.Show` /
+`RequiredUdpForm.ShowDialog` while another popup of the family is
+already up will stack two modals on the user. The Windows `ShowDialog`
+method pumps the message loop, so the addin's other timers
+(`WindowMonitorTimer_Tick` especially) keep firing during the modal
+and can drive a second popup-opening code path. Always acquire a
+single shared "naming activity in progress" gate before opening a
+popup, and have the parallel triggers no-op while it is held.
+
+**Why:** verified on 2026-05-23 against the FibaEmre_SQL config: a new
+table with admin's TableClass IS_REQUIRED=true UDP plus a Table.Definition
+required-length rule produced both `RequiredUdpForm` and
+`RequiredFieldDialog` visible at the same time. The flow:
+
+1. `DiagramHeartbeatTick` per-entity loop hits the new entity.
+2. `FireNewEntityPipeline` -> `OnNewEntityDetected` -> `PromptForMissingRequiredUdps`
+   opens `RequiredUdpForm.ShowDialog()` (modal #1).
+3. While modal #1's message pump is running, `WindowMonitorTimer_Tick`
+   fires and sees an inline-edit / editor close transition produced by
+   the same user gesture.
+4. The close transition calls `RunScopedTableNamingCheck` ->
+   `ValidateNamingStandard` -> `RequiredFieldDialog.Show()` opens
+   modal #2 ON TOP of modal #1.
+
+`MonitorTimer_Tick` was already protected by `_isCheckingForChanges`;
+`WindowMonitorTimer_Tick` was not, and `_scopedCheckInProgress` only
+guarded the inner `RunScopedTableNamingCheck` body - not the broader
+"a new-entity pipeline is showing its own popup right now" window.
+
+**How to apply:**
+
+1. Wrap `FireNewEntityPipeline` (the entry point that runs
+   `OnNewEntityDetected` synchronously) in a set/reset of
+   `_scopedCheckInProgress`. While held, the other popup-opening
+   paths (`RunScopedTableNamingCheck`, `DiffWatchedPropertiesAndFire`,
+   `ScanForRenamesEventDriven`) early-return.
+2. The heartbeat's `entitiesToNamingCheck` drain at the end of the
+   tick still fires the scoped naming check AFTER the new-entity
+   pipeline's modal closes, so deferred work is not lost.
+3. If you ever add a third popup type, route its open through the
+   same gate. Do not invent a parallel flag - one gate per concern
+   keeps the reasoning local.
+
+## 2026-05-23: erwin's UDP setter silently collapses Turkish dotted-I
+
+**Rule:** when comparing strings that have been round-tripped through
+erwin's `tag_Udp_Values_List` / `tag_Udp_Default_Value` /
+`Definition` setters (any UDP definition field, basically), pass both
+sides through `UdpSyncEngine.NormalizeForErwinListCompare` before
+calling `string.Equals`. Without it, a byte-Ordinal compare on a
+value containing U+0130 'İ' or U+0131 'ı' will diff forever no
+matter how many times the user clicks Apply.
+
+**Why:** erwin r10.10's setter for these fields applies a Latin-only
+ToUpperInvariant pass somewhere in its MFC layer. The store-side
+transformation observed in the live log on 2026-05-23 against the
+CLASSIFICATION UDP:
+
+| Admin wrote | erwin stored | Codepoint |
+|-------------|--------------|-----------|
+| `Kurum İçi` | `Kurum Içi` | U+0130 'İ' -> U+0049 'I' |
+
+Symmetric assumption for the lowercase form (U+0131 'ı' -> U+0069 'i'),
+covered in the normaliser but not yet log-verified in a real model -
+add a probe if a future bug surfaces on a different character.
+
+The compare bug produces the exact "Sync UDP definitions from config?"
+dialog re-appearing on every model open: the diff dialog shows
+"List options changed", the user clicks Apply, the metamodel
+transaction commits, the Mart save persists the bytes erwin chose to
+store (which differ from what we wrote), and the next FetchSnapshot
++ ComputeDiff re-detects the same mismatch immediately.
+
+**How to apply:**
+
+1. Use `NormalizeForErwinListCompare` in any compare against a value
+   that came back from a SCAPI read on a string-typed UDP definition
+   field. Keep the original (un-normalised) string for display and
+   for write-back; only the COMPARE goes through the normaliser.
+2. Do NOT normalise on write - the user's authoritative value still
+   contains the Turkish character; erwin will quietly strip it but
+   that is erwin's bug, not ours to hide on the admin side.
+3. When adding a new field-by-field UDP compare, look at what the
+   user-reported log says erwin stored for the diagnostic case; if
+   it differs from what we wrote by anything OTHER than the Turkish-I
+   pair, expand the normaliser there - do not assume the closed set.
+
+Tests: `UdpSyncEngineDiffTests` adds five guard cases - uppercase
+list, lowercase list, default value, description, and a genuine
+"TTT orphan" drift to prove the normaliser does not hide real
+differences.
+
 ## 2026-05-17 (revised): Rename detection is EVENT-DRIVEN, not polled
 
 **Rule:** do NOT walk all entities every heartbeat tick to diff

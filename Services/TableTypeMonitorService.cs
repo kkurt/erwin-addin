@@ -57,6 +57,18 @@ namespace EliteSoft.Erwin.AddIn.Services
         // (so the user can see WHY nothing fires when they change a UDP value)
         private readonly HashSet<string> _diagLoggedEmptyUdp = new HashSet<string>();
 
+        // Session-level Required-popup dismissal (added 2026-05-21). Key is
+        // "{objectId}|{propertyCode}". When the user clicks Cancel on a
+        // Required popup (Update mode) for a property whose baseline is also
+        // invalid, the revert is a no-op and the next tick's validation
+        // would re-fire the same popup. Adding the key here short-circuits
+        // every subsequent ValidateNamingStandard pass for that exact pair
+        // until session end. The set is intentionally NOT persisted - admin
+        // intent is that Required rules nag indefinitely, this is a per-
+        // session "I will deal with it later" courtesy that resets on next
+        // model open.
+        private readonly HashSet<string> _dismissedRequiredKeys = new HashSet<string>(StringComparer.Ordinal);
+
         // Property applicator for applying project standards to new tables
         private PropertyApplicatorService _propertyApplicator;
 
@@ -164,22 +176,27 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // admin entry has no default (e.g. TABLE_TYPE marked as
                 // required with no fixed default - user must explicitly pick
                 // FACT / DIMENSION / etc) stay empty and silently violate
-                // the contract. The standalone UdpValidationEngine.ValidateAll
-                // already detects this case but was never invoked from the
-                // new-entity path; this block runs it and opens a modal that
-                // forces the user to pick before the pipeline returns.
+                // the contract.
                 //
-                // Cancel / [X] leaves the entity with empty values - the
-                // subsequent validation tick will surface the same error
-                // through the standard error-reporting path, so we do NOT
-                // delete the entity from here.
+                // Per 2026-05-20 contract: on Cancel / [X], the new entity is
+                // deleted in the same transaction (so the user explicitly
+                // backed out of creation). We bail out of the rest of the
+                // pipeline (predefined columns etc.) because the target
+                // entity no longer exists.
+                bool cancelledAndDeleted = false;
                 try
                 {
-                    PromptForMissingRequiredUdps(entity, physicalName);
+                    cancelledAndDeleted = PromptForMissingRequiredUdps(entity, physicalName);
                 }
                 catch (Exception ex)
                 {
                     Log($"OnNewEntityDetected: required-UDP prompt error for '{physicalName}': {ex.Message}");
+                }
+
+                if (cancelledAndDeleted)
+                {
+                    Log($"OnNewEntityDetected: '{physicalName}' discarded by user via required-UDP Cancel - skipping remaining new-entity steps");
+                    return;
                 }
             }
 
@@ -210,15 +227,20 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// UDP runtime (same path ApplyDefaults uses), which fires the usual
         /// dependency cascades + locked-UDP/term-type pipeline through the
         /// next timer tick.
-        ///
-        /// Cancel + [X] returns without writing anything; the entity keeps
-        /// its empty values, and the subsequent
-        /// <see cref="UdpRuntimeService.ValidateBeforeSave"/> tick will
-        /// continue reporting the violation through the standard channel.
-        /// We do NOT delete the entity from here - rules apply to new
-        /// objects only and the user may have a reason to defer the pick.
+        /// <para>
+        /// Per the 2026-05-20 contract Cancel / [X] deletes the new entity
+        /// (Create-mode dialog). The transaction also clears our snapshot
+        /// bookkeeping so the next monitor tick treats the entity as gone
+        /// rather than firing a "disappeared" hayalet event. Returns true
+        /// when the entity was deleted so the caller can short-circuit the
+        /// remaining new-entity pipeline steps.
+        /// </para>
         /// </summary>
-        private void PromptForMissingRequiredUdps(dynamic entity, string physicalName)
+        /// <returns>True when the user cancelled and the entity was
+        /// deleted; false when no required UDPs were missing, when the
+        /// user supplied values via OK, or when the delete itself failed
+        /// (failure is logged and the entity is left as-is).</returns>
+        private bool PromptForMissingRequiredUdps(dynamic entity, string physicalName)
         {
             // Read current Table UDP values once. ReadUdpValues swallows
             // per-property COM errors so a misconfigured UDP (e.g. metamodel
@@ -242,17 +264,17 @@ namespace EliteSoft.Erwin.AddIn.Services
                 })
                 .ToList();
 
-            if (missing.Count == 0) return;
+            if (missing.Count == 0) return false;
 
             Log($"PromptForMissingRequiredUdps: '{physicalName}' missing {missing.Count} required UDP(s): {string.Join(", ", missing.Select(m => m.Name))}");
 
-            using (var form = new Forms.RequiredUdpForm(physicalName, missing))
+            using (var form = new Forms.RequiredUdpForm(physicalName, missing, Forms.RequiredOperationMode.Create, "Table"))
             {
                 var result = form.ShowDialog();
                 if (result != DialogResult.OK || form.SelectedValues.Count == 0)
                 {
-                    Log($"PromptForMissingRequiredUdps: user cancelled or supplied no values for '{physicalName}'");
-                    return;
+                    Log($"PromptForMissingRequiredUdps: user cancelled for '{physicalName}' - deleting new entity");
+                    return TryDeleteNewEntity(entity, physicalName);
                 }
 
                 try
@@ -263,7 +285,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 catch (Exception ex)
                 {
                     Log($"PromptForMissingRequiredUdps: WriteUdpValues failed on '{physicalName}': {ex.Message}");
-                    return;
+                    return false;
                 }
 
                 // Run dependency cascades for each picked value so any
@@ -275,6 +297,138 @@ namespace EliteSoft.Erwin.AddIn.Services
                     try { _udpRuntimeService.HandleUdpValueChange(entity, kvp.Key, kvp.Value); }
                     catch (Exception ex) { Log($"PromptForMissingRequiredUdps: dependency cascade failed for '{kvp.Key}': {ex.Message}"); }
                 }
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Remove a newly-created entity in response to the user discarding
+        /// its Required popup. Wraps the SCAPI <c>modelObjects.Remove</c>
+        /// call (same primitive proven by <see cref="ColumnValidationService"/>'s
+        /// PLEASE_CHANGE_IT cleanup) in a named transaction, then clears
+        /// our snapshot bookkeeping so the next monitor tick does not see
+        /// a phantom "entity disappeared" event for an object we
+        /// intentionally removed.
+        /// </summary>
+        /// <returns>True when the entity was successfully removed; false on
+        /// any failure (caller treats false as "leave the entity alone" so
+        /// the user can manually clean up).</returns>
+        private bool TryDeleteNewEntity(dynamic entity, string physicalName)
+        {
+            if (entity == null) return false;
+
+            string objectId = "";
+            try { objectId = entity.ObjectId?.ToString() ?? ""; }
+            catch (Exception ex) { Log($"TryDeleteNewEntity: ObjectId read failed for '{physicalName}': {ex.Message}"); }
+
+            int transId = 0;
+            bool transOpen = false;
+            try
+            {
+                dynamic modelObjects = _session.ModelObjects;
+                transId = _session.BeginNamedTransaction("DiscardNewEntity");
+                transOpen = true;
+
+                modelObjects.Remove(entity);
+
+                _session.CommitTransaction(transId);
+                transOpen = false;
+
+                if (!string.IsNullOrEmpty(objectId))
+                    _entitySnapshots.Remove(objectId);
+
+                Log($"TryDeleteNewEntity: removed '{physicalName}' (objectId={objectId})");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log($"TryDeleteNewEntity: remove failed for '{physicalName}': {ex.Message}");
+                if (transOpen)
+                {
+                    try { _session.RollbackTransaction(transId); }
+                    catch (Exception rbEx) { Log($"TryDeleteNewEntity: rollback failed: {rbEx.Message}"); }
+                }
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Revert a property on an existing entity to its pre-edit baseline
+        /// value, in response to the user cancelling the Required popup
+        /// (Update mode). Uses <see cref="NamingValidationEngine.WriteAccessorFor"/>
+        /// to map the rule's read accessor to the correct write accessor
+        /// (e.g. Name_Qualifier reads → Schema_Ref writes). Also resets
+        /// the snapshot's PhysicalName / WatchedProperties entry so the
+        /// next monitor tick does not see the revert itself as a drift.
+        /// </summary>
+        /// <returns>True when the revert succeeded; false on any failure
+        /// (caller treats false as "leave the entity in its current
+        /// invalid state and let the consolidated warning popup fire").</returns>
+        private bool TryRevertEntityProperty(dynamic entity, string objectId, string physicalName, string propertyCode, string oldValue)
+        {
+            if (entity == null || string.IsNullOrEmpty(propertyCode)) return false;
+
+            string writeAccessor = NamingValidationEngine.WriteAccessorFor(propertyCode);
+            string newValue = oldValue ?? "";
+            int transId = 0;
+            bool transOpen = false;
+            try
+            {
+                transId = _session.BeginNamedTransaction("RevertRequiredField");
+                transOpen = true;
+
+                entity.Properties(writeAccessor).Value = newValue;
+
+                _session.CommitTransaction(transId);
+                transOpen = false;
+
+                // Sync snapshot so the next tick's drift detection doesn't
+                // re-fire on the revert. PhysicalName is the rename-baseline
+                // mirror; the WatchedProperties entry covers all other
+                // rule-watched properties uniformly.
+                if (!string.IsNullOrEmpty(objectId) && _entitySnapshots.TryGetValue(objectId, out var snap))
+                {
+                    if (string.Equals(propertyCode, "Physical_Name", StringComparison.OrdinalIgnoreCase))
+                        snap.PhysicalName = newValue;
+                    snap.WatchedProperties[propertyCode] = newValue;
+                }
+
+                Log($"TryRevertEntityProperty: '{physicalName}' {propertyCode} reverted to '{newValue}'"
+                    + (writeAccessor != propertyCode ? $" (write accessor='{writeAccessor}')" : ""));
+                return true;
+            }
+            catch (Exception ex)
+            {
+                if (transOpen)
+                {
+                    try { _session.RollbackTransaction(transId); }
+                    catch (Exception rbEx) { Log($"TryRevertEntityProperty: rollback failed: {rbEx.Message}"); }
+                    transOpen = false;
+                }
+
+                // erwin SCVT_OBJID quirk (Schema_Ref / etc.): the property is
+                // an object-reference column, not a string column. Writing ""
+                // is rejected ("Failed to set ... from string ''"). When the
+                // baseline value we wanted to revert to was empty in the
+                // first place (the entity never had a Schema bound, the
+                // initial read failed with "does not use a property of ...
+                // type"), the "revert" is conceptually a no-op - there is
+                // nothing to restore. Treat that path as success so the
+                // caller records the session dismissal and the user is not
+                // told the cancel "failed" when the revert was a no-op by
+                // virtue of the baseline matching the current state.
+                bool emptyBaseline = string.IsNullOrEmpty(newValue);
+                bool looksLikeObjIdRejection = ex.Message != null
+                    && (ex.Message.IndexOf("SCVT_OBJID", StringComparison.OrdinalIgnoreCase) >= 0
+                        || ex.Message.IndexOf("from string ''", StringComparison.OrdinalIgnoreCase) >= 0);
+                if (emptyBaseline && looksLikeObjIdRejection)
+                {
+                    Log($"TryRevertEntityProperty: '{physicalName}' {propertyCode} no-op revert (empty baseline on SCVT_OBJID property)");
+                    return true;
+                }
+
+                Log($"TryRevertEntityProperty: revert failed for '{physicalName}'.{propertyCode}: {ex.Message}");
+                return false;
             }
         }
 
@@ -589,13 +743,17 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 }
                             }
 
-                            // Validate Table naming standards for new entity (with auto-apply)
-                            ValidateNamingStandard("Table", physicalName, entity);
+                            // Validate Table naming standards for new entity (with auto-apply).
+                            // isNew=true so the Required-popup Cancel branch deletes
+                            // the entity rather than reverting (no pre-edit state to
+                            // revert to on a freshly-created object).
+                            ValidateNamingStandard("Table", physicalName, entity, isNew: true);
 
-                            // Seed watched-property snapshot AFTER validation so
-                            // any value the user entered via the Required popup
-                            // is captured as the new baseline.
-                            RefreshWatchedProperties(entity, _entitySnapshots[objectId]);
+                            // RefreshWatchedProperties is only safe when the entity
+                            // still exists. ValidateNamingStandard's Cancel branch may
+                            // have deleted it; check the snapshot before touching it.
+                            if (_entitySnapshots.TryGetValue(objectId, out var refreshSnap))
+                                RefreshWatchedProperties(entity, refreshSnap);
                         }
                     }
                 }
@@ -1123,9 +1281,49 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// Column-Editor-open transition for the parent entity (Glossary-style
         /// scoped check on the table currently in focus).
         /// </summary>
-        internal void ValidateNamingStandard(string objectType, string physicalName, dynamic scapiObject = null)
+        internal void ValidateNamingStandard(string objectType, string physicalName, dynamic scapiObject = null, bool isNew = false, IDictionary<string, string> baselineOverride = null)
         {
             if (!NamingStandardService.Instance.IsLoaded) return;
+
+            // Capture baseline state at method entry. Step 1 auto-apply may
+            // mutate the snapshot mid-method, but a Required-popup Cancel
+            // (handled at the end) needs to revert all the way back to the
+            // user's pre-edit values - not to the auto-applied intermediate.
+            // For an isNew entity the baseline is effectively empty (the
+            // entity will be deleted instead of reverted), so this map is
+            // only consulted on the !isNew branch.
+            //
+            // baselineOverride takes precedence over _entitySnapshots so an
+            // editor-open caller (ValidationCoordinator.DiffWatchedPropertiesAndFire)
+            // can supply the live pre-edit values directly - critical for
+            // auto-generated / user-created entities that never made it into
+            // _entitySnapshots (the legacy periodic walk that filled that
+            // map was removed in Phase-2D, 2026-05-06).
+            string baselinePhysicalName = physicalName ?? "";
+            Dictionary<string, string> baselineWatched = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            string snapshotId = "";
+            if (scapiObject != null && !isNew)
+            {
+                try { snapshotId = scapiObject.ObjectId?.ToString() ?? ""; }
+                catch (Exception ex) { Log($"ValidateNamingStandard: ObjectId read failed for '{physicalName}': {ex.Message}"); }
+
+                if (baselineOverride != null && baselineOverride.Count > 0)
+                {
+                    foreach (var kvp in baselineOverride)
+                        baselineWatched[kvp.Key] = kvp.Value ?? "";
+                    if (baselineOverride.TryGetValue("Physical_Name", out var pn) && !string.IsNullOrEmpty(pn))
+                        baselinePhysicalName = pn;
+                }
+                else if (!string.IsNullOrEmpty(snapshotId) && _entitySnapshots.TryGetValue(snapshotId, out var baselineSnap))
+                {
+                    baselinePhysicalName = baselineSnap.PhysicalName ?? physicalName ?? "";
+                    if (baselineSnap.WatchedProperties != null)
+                    {
+                        foreach (var kvp in baselineSnap.WatchedProperties)
+                            baselineWatched[kvp.Key] = kvp.Value ?? "";
+                    }
+                }
+            }
 
             // scapiObject MUST be passed so UDP-conditional rules (DEPENDS_ON_UDP_ID) can read
             // the live UDP value off the entity. Without it, IsRuleApplicable returns false for
@@ -1265,18 +1463,19 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
             }
 
-            // Required-input pass (2026-05-17 C3 follow-up): Req=true rules
-            // produce "Required" violations when the property is empty - per
-            // spec the user is FORCED to provide a value. We surface an
-            // input dialog right here, before the consolidated warning
-            // popup, so the user can fix the field inline. Apply writes the
-            // typed value back via SCAPI and removes the violation from the
-            // failure list; Cancel leaves the violation behind, where it
-            // surfaces in the warning popup like any other Req=false
-            // violation. Done in two phases (collect-then-prompt) so each
-            // dialog runs cleanly against the previous transaction's
-            // commit; running ToList() up-front also lets us mutate
-            // `failures` inside the loop without iterator invalidation.
+            // Required-input pass (2026-05-17 C3 follow-up, updated 2026-05-20):
+            // Req=true rules produce "Required" violations when the property
+            // is empty - per spec the user is FORCED to provide a value.
+            // The dialog is opened in CREATE mode for new entities (Cancel
+            // deletes the entity) or UPDATE mode for existing edits (Cancel
+            // reverts the property to its pre-edit baseline). Both Cancel
+            // branches break the loop so any subsequent Required failures
+            // are suppressed - per the 2026-05-20 contract the user has
+            // explicitly abandoned the edit/creation, so chaining further
+            // popups on the same already-discarded object would be noise.
+            // Done in two phases (collect-then-prompt) so each dialog runs
+            // cleanly against the previous transaction's commit.
+            bool requiredCancelHandled = false;
             if (scapiObject != null && failures.Count > 0)
             {
                 var requiredFailures = failures
@@ -1285,18 +1484,69 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 && !string.IsNullOrEmpty(f.Rule.PropertyCode))
                     .ToList();
 
+                // Session-level dismissal pre-pass: drop any Required failure
+                // the user already cancelled on this exact (objectId, property)
+                // pair earlier in the session. Drops both the popup and the
+                // consolidated warning entry so a known-empty Definition or
+                // Owner on an existing entity does not nag every tick after
+                // the user explicitly said "later".
+                if (!string.IsNullOrEmpty(snapshotId))
+                {
+                    var dismissedNow = requiredFailures
+                        .Where(rf => _dismissedRequiredKeys.Contains($"{snapshotId}|{rf.Rule.PropertyCode}"))
+                        .ToList();
+                    foreach (var dismissed in dismissedNow)
+                    {
+                        Log($"Required field popup suppressed (session-dismissed): {objectType}.{dismissed.Rule.PropertyCode} on '{physicalName}'");
+                        requiredFailures.Remove(dismissed);
+                        failures.Remove(dismissed);
+                    }
+                }
+
                 foreach (var rf in requiredFailures)
                 {
                     string fieldLabel = $"{objectType}.{rf.Rule.PropertyCode}";
+                    var cancelMode = isNew ? Forms.RequiredOperationMode.Create : Forms.RequiredOperationMode.Update;
                     var rc = RequiredFieldDialog.Show(
                         title: "Required field",
                         message: rf.ErrorMessage,
                         fieldLabel: fieldLabel,
-                        out string typed);
+                        out string typed,
+                        owner: null,
+                        initialValue: "",
+                        mode: cancelMode,
+                        objectKind: objectType);
 
                     if (rc != System.Windows.Forms.DialogResult.OK || string.IsNullOrEmpty(typed))
                     {
-                        Log($"Required field dialog cancelled: {fieldLabel}");
+                        Log($"Required field dialog cancelled: {fieldLabel} (mode={cancelMode})");
+                        if (isNew)
+                        {
+                            requiredCancelHandled = TryDeleteNewEntity(scapiObject, physicalName);
+                        }
+                        else
+                        {
+                            string baseline = string.Equals(rf.Rule.PropertyCode, "Physical_Name", StringComparison.OrdinalIgnoreCase)
+                                ? baselinePhysicalName
+                                : (baselineWatched.TryGetValue(rf.Rule.PropertyCode, out var bv) ? bv : "");
+                            requiredCancelHandled = TryRevertEntityProperty(scapiObject, snapshotId, physicalName, rf.Rule.PropertyCode, baseline);
+
+                            // Cancel + Update means "leave it as is for now".
+                            // Even if the revert wrote nothing (baseline was
+                            // already empty / equal to current), record the
+                            // dismissal so the next tick does not re-prompt
+                            // the same Required popup for the same property.
+                            if (!string.IsNullOrEmpty(snapshotId))
+                            {
+                                _dismissedRequiredKeys.Add($"{snapshotId}|{rf.Rule.PropertyCode}");
+                                Log($"Required field dismissed for session: {snapshotId}|{rf.Rule.PropertyCode}");
+                            }
+                        }
+                        if (requiredCancelHandled) break;
+                        // Delete/revert failed - fall through to next iteration so
+                        // the remaining Required failures still get a chance. The
+                        // consolidated warning at the end will surface whichever
+                        // ones the user didn't address.
                         continue;
                     }
 
@@ -1312,6 +1562,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                         Log($"Required field filled by user: {fieldLabel} = '{typed}'"
                             + (writeAccessor != rf.Rule.PropertyCode ? $" (write accessor='{writeAccessor}')" : ""));
                         failures.Remove(rf);
+
+                        // Clear any stale session dismissal for this property
+                        // - the user just provided a valid value so the next
+                        // time it goes empty again the popup SHOULD reappear.
+                        if (!string.IsNullOrEmpty(snapshotId))
+                            _dismissedRequiredKeys.Remove($"{snapshotId}|{rf.Rule.PropertyCode}");
 
                         // Refresh the WatchedProperties snapshot for this
                         // entity so the next DiagramHeartbeat tick doesn't
@@ -1354,6 +1610,109 @@ namespace EliteSoft.Erwin.AddIn.Services
                             }
                             catch (Exception snapEx) { Log($"Required field snapshot update failed: {snapEx.Message}"); }
                         }
+
+                        // Pattern-rule re-prompt loop (2026-05-24): the
+                        // value the user just typed satisfied the Required
+                        // gate, but the SAME property might also have
+                        // Length / Regexp / Prefix-not-AutoApply rules
+                        // attached (admin layered "must be non-empty" on
+                        // top of "must be >= 10 chars"). The legacy flow
+                        // showed those as a consolidated WARNING popup
+                        // that the user dismissed with OK, leaving the
+                        // bad-but-non-empty value behind. Per user
+                        // feedback, the popup chain should keep pushing
+                        // until the value clears EVERY rule on the
+                        // property (or the user cancels). We re-read the
+                        // live value, re-validate against just this
+                        // PropertyCode's ruleset, and re-open the same
+                        // input dialog with the next violation's message
+                        // until the property is clean.
+                        string currentTyped = typed;
+                        while (true)
+                        {
+                            // Read what is actually on the entity now -
+                            // SCAPI may have transformed the value
+                            // (Schema_Ref objId, Turkish-I normalize, etc).
+                            string liveValue;
+                            try { liveValue = scapiObject.Properties(rf.Rule.PropertyCode)?.Value?.ToString() ?? ""; }
+                            catch { liveValue = currentTyped; }
+
+                            var freshResults = NamingValidationEngine.ValidateObjectName(
+                                objectType, liveValue, scapiBoxed, rf.Rule.PropertyCode);
+                            var freshFailure = freshResults?.FirstOrDefault(r => !r.IsValid);
+                            if (freshFailure == null)
+                            {
+                                // Property clears every rule now - drop
+                                // any non-Required failures for this
+                                // PropertyCode from the consolidated batch
+                                // so they are not shown twice.
+                                failures.RemoveAll(f => f.Rule != null
+                                    && string.Equals(f.Rule.PropertyCode, rf.Rule.PropertyCode, StringComparison.OrdinalIgnoreCase));
+                                break;
+                            }
+
+                            Log($"Required field re-prompt for {fieldLabel}: '{liveValue}' still violates rule#{freshFailure.Rule?.Id} ({freshFailure.RuleName})");
+                            var rc2 = RequiredFieldDialog.Show(
+                                title: "Required field",
+                                message: freshFailure.ErrorMessage,
+                                fieldLabel: fieldLabel,
+                                out string typed2,
+                                owner: null,
+                                initialValue: liveValue,
+                                mode: cancelMode,
+                                objectKind: objectType);
+
+                            if (rc2 != System.Windows.Forms.DialogResult.OK || string.IsNullOrEmpty(typed2))
+                            {
+                                Log($"Required field re-prompt cancelled for {fieldLabel} (mode={cancelMode})");
+                                if (isNew)
+                                {
+                                    requiredCancelHandled = TryDeleteNewEntity(scapiObject, physicalName);
+                                }
+                                else
+                                {
+                                    string baseline = string.Equals(rf.Rule.PropertyCode, "Physical_Name", StringComparison.OrdinalIgnoreCase)
+                                        ? baselinePhysicalName
+                                        : (baselineWatched.TryGetValue(rf.Rule.PropertyCode, out var bv) ? bv : "");
+                                    requiredCancelHandled = TryRevertEntityProperty(scapiObject, snapshotId, physicalName, rf.Rule.PropertyCode, baseline);
+                                    if (!string.IsNullOrEmpty(snapshotId))
+                                    {
+                                        _dismissedRequiredKeys.Add($"{snapshotId}|{rf.Rule.PropertyCode}");
+                                        Log($"Required field dismissed for session: {snapshotId}|{rf.Rule.PropertyCode}");
+                                    }
+                                }
+                                // Remove pending non-Required failures
+                                // for this property either way so the
+                                // consolidated popup does not re-surface
+                                // a violation the user already explicitly
+                                // declined.
+                                failures.RemoveAll(f => f.Rule != null
+                                    && string.Equals(f.Rule.PropertyCode, rf.Rule.PropertyCode, StringComparison.OrdinalIgnoreCase));
+                                break;
+                            }
+
+                            int loopTransId = _session.BeginNamedTransaction("RequiredFieldFillRepeat");
+                            try
+                            {
+                                scapiObject.Properties(writeAccessor).Value = typed2;
+                                _session.CommitTransaction(loopTransId);
+                                Log($"Required field re-filled by user: {fieldLabel} = '{typed2}'");
+                                currentTyped = typed2;
+                            }
+                            catch (Exception loopEx)
+                            {
+                                try { _session.RollbackTransaction(loopTransId); } catch { }
+                                Log($"Required field re-write failed for {fieldLabel}: {loopEx.Message}");
+                                AddinMessageDialog.Show(
+                                    $"Failed to write '{typed2}' to {fieldLabel}.\n\nSCAPI error:\n{loopEx.Message}",
+                                    "Required field write failed",
+                                    System.Windows.Forms.MessageBoxButtons.OK,
+                                    System.Windows.Forms.MessageBoxIcon.Error);
+                                break;
+                            }
+                        }
+
+                        if (requiredCancelHandled) break;
                     }
                     catch (Exception ex)
                     {
@@ -1381,6 +1740,18 @@ namespace EliteSoft.Erwin.AddIn.Services
                             System.Windows.Forms.MessageBoxIcon.Error);
                     }
                 }
+            }
+
+            // Required-Cancel short-circuit: the user explicitly discarded
+            // the new entity (Create) or reverted the edit (Update). Any
+            // remaining failures belong to an object that no longer exists
+            // or is back to a state we already accepted, so the consolidated
+            // warning popup and the PLEASE_CHANGE_IT rename below would
+            // both be confusing noise. Bail before reaching them.
+            if (requiredCancelHandled)
+            {
+                Log($"ValidateNamingStandard: Cancel-handled, suppressing remaining warnings for '{physicalName}'");
+                return;
             }
 
             if (failures.Count > 0)

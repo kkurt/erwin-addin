@@ -134,6 +134,22 @@ namespace EliteSoft.Erwin.AddIn.Services
                 bool applicable = IsRuleApplicable(rule, objectType, scapiObject);
                 bool isConditional = rule.DependsOnUdpId.HasValue && !string.IsNullOrEmpty(rule.DependsOnUdpName);
 
+                // Per-rule trace (2026-05-24): admins reported "Vp applied
+                // but _LOG not applied" on entities created from Home tab.
+                // Knowing whether IsRuleApplicable returned true / false on
+                // each rule (and what UDP value was observed) tells us if
+                // the conditional read missed the just-written UDP. Routed
+                // through Debug.WriteLine to keep the engine static and
+                // dependency-free; the addin's debug-log capture surfaces
+                // these lines in the live log.
+                if (isConditional)
+                {
+                    string condDiag = rule.DependsOnPropertyValues ?? "";
+                    AddinLogger.Log(
+                        $"NamingApply: rule#{rule.Id} [{rule.RuleType}] {rule.ObjectType}.{rule.PropertyCode} " +
+                        $"cond=udp[{rule.DependsOnUdpName}] in [{condDiag}] -> applicable={applicable}");
+                }
+
                 if (applicable)
                 {
                     // Forward apply: ADD prefix/suffix. Honour autoOnly so
@@ -146,12 +162,14 @@ namespace EliteSoft.Erwin.AddIn.Services
                         && !string.IsNullOrEmpty(rule.Prefix)
                         && !result.StartsWith(rule.Prefix, StringComparison.OrdinalIgnoreCase))
                     {
+                        AddinLogger.Log($"NamingApply: rule#{rule.Id} Prefix='{rule.Prefix}' applied to '{result}'");
                         result = rule.Prefix + result;
                     }
                     else if (rule.RuleType == NamingRuleKind.Suffix
                              && !string.IsNullOrEmpty(rule.Suffix)
                              && !result.EndsWith(rule.Suffix, StringComparison.OrdinalIgnoreCase))
                     {
+                        AddinLogger.Log($"NamingApply: rule#{rule.Id} Suffix='{rule.Suffix}' applied to '{result}'");
                         result = result + rule.Suffix;
                     }
                 }
@@ -301,22 +319,24 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// </summary>
         private static string ReadUdpValue(dynamic scapiObject, string objectType, string udpName)
         {
+            string ownerClass = objectType?.ToLower() switch
+            {
+                "table" => "Entity",
+                "column" => "Attribute",
+                "view" => "View",
+                "index" => "Key_Group",
+                _ => "Entity"
+            };
+            string path = $"{ownerClass}.Physical.{udpName}";
             try
             {
-                string ownerClass = objectType?.ToLower() switch
-                {
-                    "table" => "Entity",
-                    "column" => "Attribute",
-                    "view" => "View",
-                    "index" => "Key_Group",
-                    _ => "Entity"
-                };
-
-                string path = $"{ownerClass}.Physical.{udpName}";
-                return scapiObject.Properties(path)?.Value?.ToString() ?? "";
+                string value = scapiObject.Properties(path)?.Value?.ToString() ?? "";
+                AddinLogger.Log($"NamingApply.ReadUdpValue: '{path}' -> '{value}'");
+                return value;
             }
-            catch
+            catch (Exception ex)
             {
+                AddinLogger.Log($"NamingApply.ReadUdpValue: '{path}' threw {ex.GetType().Name}: {ex.Message}");
                 return "";
             }
         }

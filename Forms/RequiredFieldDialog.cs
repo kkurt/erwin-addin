@@ -7,11 +7,33 @@ using System.Windows.Forms;
 namespace EliteSoft.Erwin.AddIn.Forms
 {
     /// <summary>
+    /// Outcome contract for the Required popups (this dialog and
+    /// <see cref="RequiredUdpForm"/>). The Cancel branch is destructive
+    /// (delete the new object) or reversive (revert the changed
+    /// property), so the caller must tell the dialog which one applies
+    /// up front - the button label changes accordingly so the user
+    /// sees what will happen before they click.
+    /// </summary>
+    public enum RequiredOperationMode
+    {
+        /// <summary>Object was just created. Cancel deletes it.</summary>
+        Create,
+        /// <summary>Existing object was edited. Cancel reverts the edit.</summary>
+        Update,
+    }
+
+    /// <summary>
     /// Modal input dialog for naming-standard Required violations
     /// (<c>IS_REQUIRED=true</c>). The user is forced to type a value
-    /// for the property before continuing - Cancel is allowed but the
-    /// caller decides what fallback applies (e.g. PLEASE_CHANGE_IT for
-    /// Physical_Name).
+    /// for the property before continuing.
+    /// <para>
+    /// Cancel / [X] / Esc returns <see cref="DialogResult.Cancel"/>.
+    /// The caller (per the 2026-05-20 contract) interprets that as
+    /// "discard new object" or "revert the edit" depending on the
+    /// <see cref="RequiredOperationMode"/> it passed in. The button
+    /// label is rewritten to surface that destination so the user is
+    /// not surprised by the action.
+    /// </para>
     /// <para>
     /// Visual contract matches <see cref="AddinMessageDialog"/>:
     /// borderless chrome, primary-blue accent strip, drag-by-header,
@@ -56,7 +78,8 @@ namespace EliteSoft.Erwin.AddIn.Forms
         /// they cancelled or the dialog was closed without confirming.</summary>
         public string EnteredValue { get; private set; } = "";
 
-        private RequiredFieldDialog(string title, string message, string fieldLabel, string initialValue)
+        private RequiredFieldDialog(string title, string message, string fieldLabel, string initialValue,
+            RequiredOperationMode mode, string objectKind)
         {
             Text = title;
             FormBorderStyle = FormBorderStyle.None;
@@ -244,14 +267,23 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 BackColor = ClrSurface,
             };
 
+            // Cancel button label surfaces the destructive action so the
+            // user knows what Cancel will do before they click. CREATE
+            // discards the new object; UPDATE reverts the edit. The
+            // button has to be a bit wider to fit the longer text.
+            string cancelText = mode == RequiredOperationMode.Create
+                ? $"Discard New {(string.IsNullOrEmpty(objectKind) ? "Object" : objectKind)}"
+                : "Revert Change";
+            int cancelWidth = mode == RequiredOperationMode.Create ? 170 : 130;
+
             var btnCancel = new Button
             {
-                Text = "Cancel",
+                Text = cancelText,
                 FlatStyle = FlatStyle.Flat,
                 Font = new Font("Segoe UI", 9.5F),
                 ForeColor = ClrTextPrimary,
                 BackColor = Color.White,
-                Size = new Size(96, 32),
+                Size = new Size(cancelWidth, 32),
                 Margin = new Padding(8, 12, 0, 12),
                 TabIndex = 2,
             };
@@ -341,6 +373,13 @@ namespace EliteSoft.Erwin.AddIn.Forms
         /// <summary>
         /// Show the dialog and return the captured value. <paramref name="enteredValue"/>
         /// is non-empty only on <see cref="DialogResult.OK"/>.
+        /// <para>
+        /// <paramref name="mode"/> controls the Cancel button label so the
+        /// destructive consequence (delete vs revert) is visible up front.
+        /// <paramref name="objectKind"/> is the human-readable object type
+        /// (e.g. "Table", "Column") interpolated into the discard label;
+        /// pass empty / null for a generic "Object" fallback.
+        /// </para>
         /// </summary>
         public static DialogResult Show(
             string title,
@@ -348,9 +387,11 @@ namespace EliteSoft.Erwin.AddIn.Forms
             string fieldLabel,
             out string enteredValue,
             IWin32Window? owner = null,
-            string initialValue = "")
+            string initialValue = "",
+            RequiredOperationMode mode = RequiredOperationMode.Update,
+            string objectKind = "")
         {
-            using var dlg = new RequiredFieldDialog(title, message, fieldLabel, initialValue);
+            using var dlg = new RequiredFieldDialog(title, message, fieldLabel, initialValue, mode, objectKind);
             dlg.PositionOnActiveScreen(owner);
             var rc = dlg.ShowDialog(owner);
             enteredValue = rc == DialogResult.OK ? dlg.EnteredValue : "";

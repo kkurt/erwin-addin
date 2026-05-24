@@ -48,7 +48,8 @@ namespace EliteSoft.Erwin.AddIn.Services
         // editor close so the next open re-baselines.
         private bool _entityEditorWasOpen;
         private string _activeEntityEditorTable;
-        private Dictionary<string, string> _entityEditorUdpSnapshot;
+        // _entityEditorUdpSnapshot field removed 2026-05-22 along with the
+        // Table-UDP delta enforcement that was its only consumer.
         // Reentrancy guard. MessageBox.Show pumps the message loop while
         // modal, which fires this same WindowMonitorTimer again. Without
         // this flag the second tick re-enters RunScopedTableNamingCheck
@@ -94,6 +95,20 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         // Snapshot of all attributes
         private Dictionary<string, AttributeValidationSnapshot> _attributeSnapshots;
+
+        // _udpEditorWasOpen field removed 2026-05-22 along with the
+        // EnsureLockedTableDefinitionsExist call it gated.
+
+        // Session-level Required-popup dismissal for Column-level rules
+        // (mirrors TableTypeMonitorService._dismissedRequiredKeys). Key is
+        // "{attrObjectId}|{propertyCode}". Populated when the user cancels
+        // a Required popup in Update mode; consulted at the start of every
+        // Required loop to suppress the same popup on subsequent ticks.
+        // Cleared per-key when the user later supplies a valid value via
+        // the popup's OK path. Not persisted - admin intent for Required
+        // rules is "always nag", so the suppression is a per-session
+        // courtesy only.
+        private readonly HashSet<string> _dismissedRequiredColumnKeys = new HashSet<string>(StringComparer.Ordinal);
 
         // Phase-2E (2026-05-12): diagram-side heartbeat for add detection when no
         // editor dialog is open. Pure count snapshots, no per-property reads -
@@ -175,8 +190,25 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// next editor-close transition is observed so the Required popup
         /// surfaces AFTER the user's gesture, not in the middle of it.
         /// </summary>
-        private readonly HashSet<string> _pendingTableNamingChecks =
-            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        /// <summary>
+        /// Naming-check entries deferred because an edit dialog was open
+        /// when the heartbeat tried to fire them. The bool carries the
+        /// original isNew flag (2026-05-24) so a deferred new-entity
+        /// check still gets the "Discard New Table" Cancel button when
+        /// it eventually surfaces. Equality on the entity name alone
+        /// (via the comparer) keeps the set deduplicated across multiple
+        /// ticks that observed the same pending entity.
+        /// </summary>
+        private readonly HashSet<(string Name, bool IsNew)> _pendingTableNamingChecks =
+            new HashSet<(string, bool)>(new PendingNamingCheckComparer());
+
+        private sealed class PendingNamingCheckComparer : IEqualityComparer<(string Name, bool IsNew)>
+        {
+            public bool Equals((string Name, bool IsNew) x, (string Name, bool IsNew) y) =>
+                string.Equals(x.Name, y.Name, StringComparison.OrdinalIgnoreCase);
+            public int GetHashCode((string Name, bool IsNew) obj) =>
+                obj.Name == null ? 0 : StringComparer.OrdinalIgnoreCase.GetHashCode(obj.Name);
+        }
 
         /// <summary>
         /// Edit-session baseline (2026-05-17) for naming-rule-watched
@@ -797,7 +829,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                             }
                             catch { try { nameForMatch = entity.Name ?? ""; } catch { continue; } }
 
-                            if (!string.Equals(nameForMatch, _activeColumnEditorTable, StringComparison.OrdinalIgnoreCase))
+                            if (!EntityNameMatchesTitle(nameForMatch, _activeColumnEditorTable))
                                 continue;
 
                             // First-time touch for this table -> silent populate (no popups).
@@ -974,7 +1006,16 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // call RunScopedTableNamingCheck while still iterating the
                 // COM collection - it Collects("Entity") itself and the
                 // re-entry can wedge the COM enumerator.
-                var entitiesToNamingCheck = new List<string>();
+                //
+                // The IsNew flag (2026-05-24) tells the downstream
+                // ValidateNamingStandard whether this entity was just
+                // created in THIS tick so the Required-popup chain uses
+                // RequiredOperationMode.Create (Cancel button reads
+                // "Discard New Table") instead of Update ("Revert Change").
+                // Required-property prompts that fire from
+                // OnNewEntityDetected already get Create mode; threading
+                // the same flag here keeps the popup family consistent.
+                var entitiesToNamingCheck = new List<(string name, bool isNew)>();
 
                 foreach (dynamic entity in entityCollection)
                 {
@@ -1105,8 +1146,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                             }
                             else
                             {
-                                entitiesToNamingCheck.Add(displayName);
-                                Log($"[NAMING] newly seen entity '{displayName}' - queuing naming check");
+                                entitiesToNamingCheck.Add((displayName, isNew: true));
+                                Log($"[NAMING] newly seen entity '{displayName}' - queuing naming check (isNew)");
                                 FireNewEntityPipeline(entity, displayName);
                             }
                         }
@@ -1123,10 +1164,20 @@ namespace EliteSoft.Erwin.AddIn.Services
                             }
                             else
                             {
-                                entitiesToNamingCheck.Add(displayName);
-                                Log($"[NAMING] entity renamed '{prevDisplayName}' -> '{displayName}' - queuing naming check");
-
+                                // Resolve isNew BEFORE queuing: a pending
+                                // placeholder entity that just got a real
+                                // name is functionally a creation gesture
+                                // (we are about to run FireNewEntityPipeline
+                                // on it below), so the Cancel button must
+                                // say "Discard New Table". A genuine rename
+                                // of an already-real entity stays
+                                // isNew=false → "Revert Change".
                                 bool wasPending = _pendingNamedEntities.Remove(entityId);
+                                bool entityIsNew = wasPending;
+
+                                entitiesToNamingCheck.Add((displayName, entityIsNew));
+                                Log($"[NAMING] entity renamed '{prevDisplayName}' -> '{displayName}' - queuing naming check (isNew={entityIsNew})");
+
                                 if (wasPending)
                                 {
                                     Log($"[PENDING-ENTITY] entityId={entityId} dropped from pending after rename to '{displayName}'");
@@ -1285,15 +1336,18 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // _pendingTableNamingChecks; the editor-close transition
                 // handler in WindowMonitorTimer_Tick drains them.
                 bool editorOpen = IsColumnEditorOpen() || IsEntityEditorOpen(out _);
-                foreach (var entityName in entitiesToNamingCheck)
+                foreach (var (entityName, entityIsNew) in entitiesToNamingCheck)
                 {
                     if (editorOpen)
                     {
-                        if (_pendingTableNamingChecks.Add(entityName))
-                            Log($"DiagramHeartbeat: deferring naming check on '{entityName}' (editor open)");
+                        // Keep the isNew flag on the deferred entry so the
+                        // editor-close flush can still pick "Discard New
+                        // Table" over "Revert Change".
+                        if (_pendingTableNamingChecks.Add((entityName, entityIsNew)))
+                            Log($"DiagramHeartbeat: deferring naming check on '{entityName}' (editor open, isNew={entityIsNew})");
                         continue;
                     }
-                    try { RunScopedTableNamingCheck(entityName); }
+                    try { RunScopedTableNamingCheck(entityName, isNew: entityIsNew); }
                     catch (Exception ex) { Log($"DiagramHeartbeat: naming check err for '{entityName}': {ex.Message}"); }
                 }
             }
@@ -1314,6 +1368,28 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// so the cost is bounded by the rule set (≤10 reads in
         /// practice) regardless of model size.
         /// </summary>
+        /// <summary>
+        /// Compare an entity's stored Physical_Name against the name parsed
+        /// out of an editor window title. erwin transforms certain characters
+        /// (notably '/' in auto-generated placeholder names like 'E/33') to
+        /// '_' when it renders the title, so a literal string compare misses
+        /// the underlying entity. Normalises '/' -> '_' in physName before
+        /// the equality test; underscores in user-typed names compare
+        /// cleanly, only the slash-bearing autogenerated case benefits from
+        /// the fold (verified 2026-05-21 against log lines
+        ///   liveName='E/33'
+        ///   Entity Editor state -> OPEN activeTable='E_33'
+        /// where the strict compare returned zero matches and baseline
+        /// capture came back empty).
+        /// </summary>
+        private static bool EntityNameMatchesTitle(string physName, string titleName)
+        {
+            if (string.IsNullOrEmpty(physName) || string.IsNullOrEmpty(titleName)) return false;
+            if (string.Equals(physName, titleName, StringComparison.OrdinalIgnoreCase)) return true;
+            if (physName.IndexOf('/') < 0) return false;
+            return string.Equals(physName.Replace('/', '_'), titleName, StringComparison.OrdinalIgnoreCase);
+        }
+
         private Dictionary<string, string> ReadEntityWatchedProperties(string tableName)
         {
             var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -1343,7 +1419,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                         physName = (!string.IsNullOrEmpty(p) && !p.StartsWith("%")) ? p : (entity.Name ?? "");
                     }
                     catch { continue; }
-                    if (!string.Equals(physName, tableName, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!EntityNameMatchesTitle(physName, tableName)) continue;
 
                     foreach (var code in codes)
                     {
@@ -1386,7 +1462,15 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
             if (changedCode == null) return;
             Log($"Editor close: watched property drift on '{tableName}': {changedCode} '{oldVal}' -> '{newVal}' - running scoped naming check");
-            try { RunScopedTableNamingCheck(tableName); }
+            // Pass the editor-open baseline through so the downstream
+            // Required-popup Cancel branch can revert to the pre-edit value
+            // even when TableTypeMonitor._entitySnapshots has no entry for
+            // this entity (the legacy periodic-walk path that used to fill
+            // those snapshots was removed in Phase-2D; auto-generated /
+            // user-created entities never get a snapshot otherwise). The
+            // baseline dict we hold here IS the source of truth for what
+            // the user just changed away from.
+            try { RunScopedTableNamingCheck(tableName, baseline); }
             catch (Exception ex) { Log($"DiffWatchedPropertiesAndFire: scoped check err for '{tableName}': {ex.Message}"); }
         }
 
@@ -1494,10 +1578,10 @@ namespace EliteSoft.Erwin.AddIn.Services
             if (_pendingTableNamingChecks.Count == 0) return;
             var queued = _pendingTableNamingChecks.ToArray();
             _pendingTableNamingChecks.Clear();
-            Log($"Editor close: flushing {queued.Length} deferred naming check(s): {string.Join(", ", queued)}");
-            foreach (var entityName in queued)
+            Log($"Editor close: flushing {queued.Length} deferred naming check(s): {string.Join(", ", queued.Select(q => $"{q.Name}(isNew={q.IsNew})"))}");
+            foreach (var (entityName, isNew) in queued)
             {
-                try { RunScopedTableNamingCheck(entityName); }
+                try { RunScopedTableNamingCheck(entityName, isNew: isNew); }
                 catch (Exception ex) { Log($"FlushPendingTableNamingChecks: err for '{entityName}': {ex.Message}"); }
             }
         }
@@ -1508,6 +1592,19 @@ namespace EliteSoft.Erwin.AddIn.Services
 
             // Safety: check if model is still open BEFORE touching the session.
             if (!IsModelStillOpen()) { HandleSessionLost(); return; }
+
+            // Locked-UDP-definition watcher DISABLED 2026-05-22: every
+            // version of this watcher (periodic, event-driven on UDP
+            // Editor close) eventually produced an erwin crash. The
+            // root cause is the same as the Table-UDP value enforcement
+            // - erwin r10.10 SCAPI's Property collection refuses
+            // entity-level writes and reads on UDPs in sparse state,
+            // and our re-create / re-write attempts leave the metamodel
+            // in a state where erwin's own UI render crashes on next
+            // touch. Until we have a verified-safe SCAPI write path,
+            // Table-level Locked UDP protection is removed entirely.
+            // Column-level Locked enforcement and naming-standard
+            // enforcement are unaffected.
 
             try
             {
@@ -1607,57 +1704,73 @@ namespace EliteSoft.Erwin.AddIn.Services
                 bool entityEditorIsOpen = IsEntityEditorOpen(out string entityActiveTable);
                 _activeEntityEditorTable = entityEditorIsOpen ? entityActiveTable : null;
 
+                // State-transition diagnostic (2026-05-21): without this we
+                // cannot tell whether the dialog was missed by IsEntityEditorOpen
+                // (title format mismatch) or by something downstream. Logs only
+                // on the edge, not every tick.
+                if (_entityEditorWasOpen != entityEditorIsOpen)
+                {
+                    Log($"Entity Editor state -> {(entityEditorIsOpen ? "OPEN" : "CLOSED")} activeTable='{entityActiveTable ?? "(null)"}'");
+                }
+
                 if (!_entityEditorWasOpen && entityEditorIsOpen && !string.IsNullOrEmpty(entityActiveTable))
                 {
-                    // Edit-session baseline (2026-05-17): mirror of the
-                    // Column Editor open branch above.
+                    // Edit-session baseline (2026-05-17): captured ONCE
+                    // on open for the naming-watched property set
+                    // (Definition, Name_Qualifier, ...). Per the
+                    // 2026-05-22 ROLLBACK decision we no longer capture
+                    // the Table UDP snapshot here: reading
+                    // entity.Properties("Entity.Physical.<udp>") on an
+                    // entity whose UDP is in sparse / half-bound state
+                    // appears to leave erwin's internal property cache
+                    // in a state that crashes the UDP-tab grid renderer
+                    // on subsequent open. Three iterations of Locked
+                    // Table UDP enforcement (live-tick, close-edge,
+                    // event-driven UDP-Editor) all produced reliable
+                    // erwin crashes; we stop touching Table UDPs from
+                    // the watchdog until a safe write path is found.
+                    // Column-level Locked enforcement and naming-standard
+                    // enforcement are unaffected (different code paths,
+                    // proven safe in production).
                     try
                     {
                         _entityEditorBaseline = ReadEntityWatchedProperties(entityActiveTable);
                         _entityEditorName = entityActiveTable;
+                        Log($"Entity Editor open baseline for '{entityActiveTable}': {_entityEditorBaseline.Count} watched property/ies [{string.Join(", ", _entityEditorBaseline.Select(kv => $"{kv.Key}='{kv.Value}'"))}]");
                     }
                     catch (Exception ex) { Log($"Entity Editor open baseline err for '{entityActiveTable}': {ex.Message}"); }
-                }
-
-                if (entityEditorIsOpen && !string.IsNullOrEmpty(entityActiveTable)
-                    && !_scopedCheckInProgress)
-                {
-                    var currentUdps = ReadEntityRelevantUdpValues(entityActiveTable);
-                    if (_entityEditorUdpSnapshot == null)
-                    {
-                        // Just-opened baseline. Establish snapshot, don't
-                        // fire (open-time UDP value is the user's existing
-                        // state, not a change they performed in this
-                        // session of the editor).
-                        _entityEditorUdpSnapshot = currentUdps;
-                    }
-                    else if (HasUdpDelta(_entityEditorUdpSnapshot, currentUdps))
-                    {
-                        // CRITICAL: refresh the snapshot BEFORE invoking the
-                        // naming check. RunScopedTableNamingCheck calls into
-                        // MessageBox.Show which pumps the message loop while
-                        // modal - this same timer re-fires and would re-enter
-                        // here with the OLD snapshot, stacking another popup
-                        // ad infinitum. The reentrancy guard inside
-                        // RunScopedTableNamingCheck is a belt to this
-                        // suspenders.
-                        _entityEditorUdpSnapshot = currentUdps;
-                        Log($"Entity Editor: UDP change on '{entityActiveTable}' - running scoped naming check");
-                        try { RunScopedTableNamingCheck(entityActiveTable); }
-                        catch (Exception ex) { Log($"RunScopedTableNamingCheck (entity-live) err: {ex.Message}"); }
-                    }
-                }
-                else if (!entityEditorIsOpen && _entityEditorUdpSnapshot != null)
-                {
-                    _entityEditorUdpSnapshot = null;
                 }
 
                 // Editor-close flush (2026-05-17): same drain as the
                 // Column Editor branch above - the user closed the
                 // Table Properties dialog, so any naming check that
                 // DiagramHeartbeat deferred is now safe to surface.
+                //
+                // Re-entrancy is hostile here (2026-05-22): the close
+                // handler shows modal dialogs (LockedUdpDialog,
+                // AddinMessageDialog, RequiredFieldDialog), which pump
+                // the message loop. While the dialog is up, this same
+                // WindowMonitorTimer fires another tick. If we did not
+                // flip _entityEditorWasOpen and steal the captured
+                // snapshots up front, the re-entrant tick saw the same
+                // close-edge conditions, ran EnforceLockedTableUdps
+                // again with the still-set snapshot, and stacked
+                // dialogs ad infinitum (user-visible bug: "çoklu popup
+                // ve actionlogda sürekli WritingUdpValues"). Take the
+                // state first, clear it, only THEN do any work that
+                // can pump.
                 if (_entityEditorWasOpen && !entityEditorIsOpen)
                 {
+                    // 2026-05-22 re-entrancy fix: take state up front,
+                    // clear the instance fields, only THEN do any work
+                    // that can pump (LockedUdpDialog modal etc.). See
+                    // the comment block before this branch for why.
+                    _entityEditorWasOpen = false;
+                    var closedName = _entityEditorName;
+                    var closedBaseline = _entityEditorBaseline;
+                    _entityEditorBaseline = null;
+                    _entityEditorName = null;
+
                     try { FlushPendingTableNamingChecks(); }
                     catch (Exception ex) { Log($"FlushPendingTableNamingChecks (entity) err: {ex.Message}"); }
 
@@ -1668,18 +1781,26 @@ namespace EliteSoft.Erwin.AddIn.Services
                     try { ScanForRenamesEventDriven("entity-editor-close"); }
                     catch (Exception ex) { Log($"ScanForRenamesEventDriven (entity) err: {ex.Message}"); }
 
+                    // Table-UDP delta enforcement DISABLED 2026-05-22:
+                    // erwin crashed on UDP-tab click after our reads /
+                    // writes touched a Locked Table UDP that erwin's
+                    // sparse storage left half-bound. See open-edge
+                    // comment for the full diagnosis. Naming-property
+                    // diff below still fires (Definition / Name_Qualifier
+                    // are built-in props, not subject to the UDP quirk).
+
                     // Edit-session diff for Table Properties dialog.
-                    if (_entityEditorBaseline != null
-                        && !string.IsNullOrEmpty(_entityEditorName))
+                    if (closedBaseline != null && !string.IsNullOrEmpty(closedName))
                     {
-                        try { DiffWatchedPropertiesAndFire(_entityEditorName, _entityEditorBaseline); }
+                        try { DiffWatchedPropertiesAndFire(closedName, closedBaseline); }
                         catch (Exception ex) { Log($"Entity Editor close diff err: {ex.Message}"); }
                     }
-                    _entityEditorBaseline = null;
-                    _entityEditorName = null;
                 }
-
-                _entityEditorWasOpen = entityEditorIsOpen;
+                else
+                {
+                    // Normal (non-edge) state update.
+                    _entityEditorWasOpen = entityEditorIsOpen;
+                }
 
                 // --- Inline-edit (Model Explorer label edit + diagram column
                 // inline edit) close detection (Phase-2F, 2026-05-13).
@@ -1785,7 +1906,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // Queue table-name validations for after the walk - same reason
                 // as DiagramHeartbeatTick: RunScopedTableNamingCheck reopens
                 // its own Collect("Entity") enumerator.
-                var entitiesToNamingCheck = new List<string>();
+                // ValidateCommittedPendingAttrs path: every entity here is a
+                // pending placeholder whose inline-edit just closed - it is
+                // effectively a creation gesture, so isNew=true uniformly.
+                var entitiesToNamingCheck = new List<(string Name, bool IsNew)>();
 
                 foreach (dynamic entity in allEntities)
                 {
@@ -1809,8 +1933,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                     if (hasPendingEntity)
                     {
                         string liveEntityName = tableName;
-                        Log($"[PENDING-ENTITY] commit edge for entityId={entityId} liveName='{liveEntityName}' - queuing naming check");
-                        entitiesToNamingCheck.Add(liveEntityName);
+                        Log($"[PENDING-ENTITY] commit edge for entityId={entityId} liveName='{liveEntityName}' - queuing naming check (isNew=true)");
+                        entitiesToNamingCheck.Add((liveEntityName, IsNew: true));
                         _pendingNamedEntities.Remove(entityId);
 
                         // Fire the new-entity pipeline (model standards,
@@ -1941,9 +2065,9 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // keeps the two streams (glossary results from attrs, naming
                 // standard result from the entity) from racing the same modal
                 // pump and re-entering the timer through the message loop.
-                foreach (var entityName in entitiesToNamingCheck)
+                foreach (var (entityName, isNew) in entitiesToNamingCheck)
                 {
-                    try { RunScopedTableNamingCheck(entityName); }
+                    try { RunScopedTableNamingCheck(entityName, isNew: isNew); }
                     catch (Exception ex) { Log($"ValidateCommittedPendingAttrs: naming check err for '{entityName}': {ex.Message}"); }
                 }
             }
@@ -2005,6 +2129,34 @@ namespace EliteSoft.Erwin.AddIn.Services
 
             activeTable = foundTable;
             return foundTable != null;
+        }
+
+        /// <summary>
+        /// Detects erwin's UDP Editor dialog (Tools menu &gt; User Defined
+        /// Properties). Title shape verified 2026-05-22 against r10.10:
+        ///   "User Defined Properties : Physical"
+        ///   "User Defined Properties : Logical"
+        /// We match on the leading text since the suffix varies by the
+        /// Logical/Physical view selector. Window class is the standard
+        /// #32770 dialog so we filter by title only.
+        /// </summary>
+        private bool IsUdpEditorOpen()
+        {
+            bool found = false;
+            EnumWindows((hWnd, lParam) =>
+            {
+                if (!IsWindowVisible(hWnd)) return true;
+                var title = new StringBuilder(512);
+                GetWindowText(hWnd, title, 512);
+                string t = title.ToString();
+                if (t.StartsWith("User Defined Properties", StringComparison.OrdinalIgnoreCase))
+                {
+                    found = true;
+                    return false;
+                }
+                return true;
+            }, IntPtr.Zero);
+            return found;
         }
 
         /// <summary>
@@ -2096,7 +2248,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                             }
                             catch { try { entityName = entity.Name ?? ""; } catch { continue; } }
 
-                            if (!string.Equals(entityName, scopeTable, StringComparison.OrdinalIgnoreCase))
+                            if (!EntityNameMatchesTitle(entityName, scopeTable))
                                 continue;
                         }
 
@@ -2193,6 +2345,20 @@ namespace EliteSoft.Erwin.AddIn.Services
         private void FireNewEntityPipeline(dynamic entity, string physicalName)
         {
             if (_tableTypeMonitor == null) return;
+            // Modal-stacking guard (2026-05-23): OnNewEntityDetected synchronously
+            // opens RequiredUdpForm.ShowDialog when admin marked any UDP
+            // IS_REQUIRED=true on the entity's class (e.g. TableClass on FibaEmre).
+            // Its modal pump runs the WindowMonitorTimer which would otherwise
+            // see an inline-edit close or editor-open transition fired by the
+            // same user gesture and open RequiredFieldDialog for a naming-rule
+            // violation ON TOP of the first popup. Reusing the existing
+            // _scopedCheckInProgress flag tells RunScopedTableNamingCheck (the
+            // only entry to RequiredFieldDialog from the other code paths) to
+            // skip while the new-entity pipeline owns the modal. The deferred
+            // naming check still surfaces afterwards via the entitiesToNamingCheck
+            // drain at the end of DiagramHeartbeatTick.
+            bool acquired = !_scopedCheckInProgress;
+            if (acquired) _scopedCheckInProgress = true;
             try
             {
                 _tableTypeMonitor.OnNewEntityDetected(entity, physicalName);
@@ -2200,6 +2366,10 @@ namespace EliteSoft.Erwin.AddIn.Services
             catch (Exception ex)
             {
                 Log($"FireNewEntityPipeline error on '{physicalName}': {ex.Message}");
+            }
+            finally
+            {
+                if (acquired) _scopedCheckInProgress = false;
             }
         }
 
@@ -2223,7 +2393,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// (DEPENDS_ON_UDP_ID) read live UDP values off the entity and apply
         /// only when the condition matches.
         /// </summary>
-        private void RunScopedTableNamingCheck(string tableName)
+        private void RunScopedTableNamingCheck(string tableName, IDictionary<string, string> baselineOverride = null, bool isNew = false)
         {
             if (string.IsNullOrEmpty(tableName)) return;
             if (_validationSuspended) return;
@@ -2235,11 +2405,11 @@ namespace EliteSoft.Erwin.AddIn.Services
             // again - re-entry would stack popups indefinitely.
             if (_scopedCheckInProgress) return;
             _scopedCheckInProgress = true;
-            try { RunScopedTableNamingCheckCore(tableName); }
+            try { RunScopedTableNamingCheckCore(tableName, baselineOverride, isNew); }
             finally { _scopedCheckInProgress = false; }
         }
 
-        private void RunScopedTableNamingCheckCore(string tableName)
+        private void RunScopedTableNamingCheckCore(string tableName, IDictionary<string, string> baselineOverride = null, bool isNew = false)
         {
 
             dynamic modelObjects = null;
@@ -2270,11 +2440,11 @@ namespace EliteSoft.Erwin.AddIn.Services
                     }
                     catch { try { nameForMatch = entity.Name ?? ""; } catch { continue; } }
 
-                    if (!string.Equals(nameForMatch, tableName, StringComparison.OrdinalIgnoreCase))
+                    if (!EntityNameMatchesTitle(nameForMatch, tableName))
                         continue;
 
-                    Log($"Scoped naming check on '{nameForMatch}'");
-                    _tableTypeMonitor.ValidateNamingStandard("Table", nameForMatch, entity);
+                    Log($"Scoped naming check on '{nameForMatch}' (isNew={isNew})");
+                    _tableTypeMonitor.ValidateNamingStandard("Table", nameForMatch, entity, baselineOverride: baselineOverride, isNew: isNew);
                     return;
                 }
             }
@@ -2317,7 +2487,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     }
                     catch { continue; }
 
-                    if (!string.Equals(physName, tableName, StringComparison.OrdinalIgnoreCase))
+                    if (!EntityNameMatchesTitle(physName, tableName))
                         continue;
 
                     foreach (var udp in udpNames)
@@ -2334,6 +2504,187 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
             catch (Exception ex) { Log($"ReadEntityRelevantUdpValues err: {ex.Message}"); }
             return result;
+        }
+
+        /// <summary>
+        /// Read every Table UDP value the addin needs to track live for the
+        /// entity matching <paramref name="tableName"/>. Superset of
+        /// <see cref="ReadEntityRelevantUdpValues"/>: also includes UDPs
+        /// flagged IS_LOCKED or IS_REQUIRED so the live-editor delta loop
+        /// can enforce them even when no naming rule references them.
+        /// Returns an empty dict if no UDPs match - caller compares by
+        /// equality so an empty baseline matches an empty current and
+        /// produces no false fire.
+        /// </summary>
+        private Dictionary<string, string> ReadEntityTrackedUdpValues(string tableName)
+        {
+            var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (string.IsNullOrEmpty(tableName)) return result;
+
+            var udpNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var n in NamingStandardService.Instance.GetRelevantUdpNames())
+                if (!string.IsNullOrEmpty(n)) udpNames.Add(n);
+
+            if (UdpDefinitionService.Instance.IsLoaded)
+            {
+                foreach (var def in UdpDefinitionService.Instance.GetByObjectType("Table"))
+                {
+                    if (def == null || string.IsNullOrEmpty(def.Name)) continue;
+                    if (def.IsLocked || def.IsRequired) udpNames.Add(def.Name);
+                }
+            }
+            if (udpNames.Count == 0) return result;
+
+            try
+            {
+                dynamic modelObjects = _session?.ModelObjects;
+                dynamic root = modelObjects?.Root;
+                if (root == null) return result;
+                dynamic entities = modelObjects.Collect(root, "Entity");
+                if (entities == null) return result;
+
+                foreach (dynamic entity in entities)
+                {
+                    if (entity == null) continue;
+                    string physName;
+                    try
+                    {
+                        string p = entity.Properties("Physical_Name").Value?.ToString() ?? "";
+                        physName = (!string.IsNullOrEmpty(p) && !p.StartsWith("%")) ? p : (entity.Name ?? "");
+                    }
+                    catch { continue; }
+
+                    if (!EntityNameMatchesTitle(physName, tableName))
+                        continue;
+
+                    foreach (var udp in udpNames)
+                    {
+                        try
+                        {
+                            string val = entity.Properties($"Entity.Physical.{udp}").Value?.ToString() ?? "";
+                            result[udp] = val;
+                        }
+                        catch { result[udp] = ""; }
+                    }
+                    break;
+                }
+            }
+            catch (Exception ex) { Log($"ReadEntityTrackedUdpValues err: {ex.Message}"); }
+            return result;
+        }
+
+        /// <summary>
+        /// Apply Locked-UDP enforcement to a live Entity Editor delta. For
+        /// every UDP whose baseline value was non-empty and whose new value
+        /// differs, if the admin definition flags <c>IS_LOCKED=true</c>,
+        /// revert the change in-place via SCAPI. The initial empty -> value
+        /// seed is intentionally NOT blocked (mirrors the Column-level
+        /// behaviour in <see cref="EnforceLockedAttributeUdps"/>: wizards
+        /// and defaults can still populate the field on a new entity).
+        /// Reverts surface a single dialog so the user knows the change
+        /// was rejected; the snapshot caller re-reads UDP values after
+        /// this method so the next tick does not re-fire the same delta.
+        /// </summary>
+        private void EnforceLockedTableUdps(string tableName, Dictionary<string, string> baseline, Dictionary<string, string> current)
+        {
+            if (string.IsNullOrEmpty(tableName) || baseline == null || current == null) return;
+            if (!UdpDefinitionService.Instance.IsLoaded) return;
+            if (_tableTypeMonitor == null) return;
+
+            dynamic targetEntity = null;
+            try
+            {
+                dynamic modelObjects = _session?.ModelObjects;
+                dynamic root = modelObjects?.Root;
+                if (root == null) return;
+                dynamic entities = modelObjects.Collect(root, "Entity");
+                if (entities == null) return;
+
+                foreach (dynamic entity in entities)
+                {
+                    if (entity == null) continue;
+                    string physName;
+                    try
+                    {
+                        string p = entity.Properties("Physical_Name").Value?.ToString() ?? "";
+                        physName = (!string.IsNullOrEmpty(p) && !p.StartsWith("%")) ? p : (entity.Name ?? "");
+                    }
+                    catch { continue; }
+                    if (EntityNameMatchesTitle(physName, tableName))
+                    {
+                        targetEntity = entity;
+                        break;
+                    }
+                }
+            }
+            catch (Exception ex) { Log($"EnforceLockedTableUdps: entity lookup err: {ex.Message}"); return; }
+
+            if (targetEntity == null) return;
+
+            foreach (var kv in current)
+            {
+                string newVal = kv.Value ?? "";
+                baseline.TryGetValue(kv.Key, out var baseVal);
+                baseVal = baseVal ?? "";
+                if (string.Equals(baseVal, newVal, StringComparison.Ordinal)) continue;
+
+                var def = UdpDefinitionService.Instance.GetByName("Table", kv.Key);
+                if (def == null || !def.IsLocked) continue;
+                if (string.IsNullOrEmpty(baseVal)) continue; // initial seed allowed
+
+                try
+                {
+                    var failed = _udpRuntimeService?.WriteUdpValuesWithFailures(
+                        (object)targetEntity,
+                        new Dictionary<string, string> { [kv.Key] = baseVal },
+                        "Table") ?? new List<string> { kv.Key };
+
+                    if (failed.Contains(kv.Key))
+                    {
+                        // SCAPI rejected the revert (Properties Collection
+                        // Filter quirk on UDPs the entity never bound). Fail
+                        // loud so the user knows the lock did not stick and
+                        // can intervene manually via erwin's UDP grid - the
+                        // earlier "reverted" log line was a misreport that
+                        // hid the same bug for several sessions.
+                        Log($"EnforceLockedTableUdps: SCAPI rejected revert for '{kv.Key}' on '{tableName}' - lock NOT enforced");
+                        Forms.AddinMessageDialog.Show(
+                            $"'{kv.Key}' UDP'si kilitli ancak SCAPI yazimi reddetti, eski deger geri yazilamadi.\n\n" +
+                            $"Yeni deger ('{newVal}') modelde kalacak.\n\n" +
+                            $"Eski degeri ('{baseVal}') geri yazmak icin erwin'in UDP grid'inden manuel olarak girin.",
+                            "UDP Kilitli - Revert Basarisiz",
+                            System.Windows.Forms.MessageBoxButtons.OK,
+                            System.Windows.Forms.MessageBoxIcon.Warning);
+                        continue;
+                    }
+
+                    Log($"Locked Table UDP '{kv.Key}' on '{tableName}' reverted '{newVal}' -> '{baseVal}'");
+                    Forms.LockedUdpDialog.Show(kv.Key, newVal, baseVal);
+
+                    // Belt-and-suspenders re-revert after the modal closes:
+                    // erwin's UDP grid sometimes re-commits the user's edit
+                    // (the "empty" cell value) during the modal pump,
+                    // overwriting our first revert. Re-asserting the baseline
+                    // here makes the lock stick whatever erwin did under us.
+                    // Cheap: same write call, no-op on the model side when the
+                    // value already matches.
+                    try
+                    {
+                        _udpRuntimeService?.WriteUdpValuesWithFailures(
+                            (object)targetEntity,
+                            new Dictionary<string, string> { [kv.Key] = baseVal },
+                            "Table");
+                    }
+                    catch (Exception postEx)
+                    {
+                        Log($"EnforceLockedTableUdps: post-dialog re-revert failed for '{kv.Key}' on '{tableName}': {postEx.Message}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log($"EnforceLockedTableUdps: revert failed for '{kv.Key}' on '{tableName}': {ex.Message}");
+                }
+            }
         }
 
         /// <summary>
@@ -2387,7 +2738,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     }
                     catch { try { nameForMatch = entity.Name ?? ""; } catch { continue; } }
 
-                    if (!string.Equals(nameForMatch, tableName, StringComparison.OrdinalIgnoreCase))
+                    if (!EntityNameMatchesTitle(nameForMatch, tableName))
                         continue;
 
                     _pendingResults.Clear();
@@ -2835,8 +3186,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // Apply Column UDP defaults (with Glossary mapping if configured)
                 ApplyColumnUdpDefaults(attr, currentState.PhysicalName);
 
-                // Validate Column naming standards
-                ValidateColumnNamingStandard(attr, currentState);
+                // Validate Column naming standards. isNew=true so the
+                // Required-popup Cancel branch deletes the new column
+                // (no pre-edit value to revert to).
+                ValidateColumnNamingStandard(attr, currentState, isNew: true);
             }
             finally
             {
@@ -3178,8 +3531,16 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         /// <summary>
         /// Validate column name against naming standards and add failures to pending results.
+        /// <para>
+        /// <paramref name="isNew"/> controls the Required-popup Cancel branch
+        /// (added 2026-05-20): true means "this attribute was just created
+        /// in the active edit session" - Cancel discards the new column.
+        /// False means the user is editing an existing column - Cancel
+        /// reverts the changed property to its pre-edit value captured
+        /// from <c>_attributeSnapshots</c> at method entry.
+        /// </para>
         /// </summary>
-        private void ValidateColumnNamingStandard(dynamic attr, AttributeValidationSnapshot state)
+        private void ValidateColumnNamingStandard(dynamic attr, AttributeValidationSnapshot state, bool isNew = false)
         {
             if (_validationSuspended) return;
             if (!NamingStandardService.Instance.IsLoaded) return;
@@ -3195,6 +3556,32 @@ namespace EliteSoft.Erwin.AddIn.Services
             // Cast to object to keep the call compile-time resolved (dynamic dispatch breaks
             // the LINQ lambdas inside the engine — same trick as CheckEntityKeyGroups).
             object attrBoxed = attr;
+
+            // Capture baseline state at method entry for the Required-popup
+            // Cancel-Revert path. For !isNew callers, _attributeSnapshots
+            // still holds the pre-edit snapshot (it's updated AFTER this
+            // method returns by ProcessAttributeChanges). For isNew callers
+            // baselines are irrelevant - Cancel deletes the attribute.
+            string baselinePhysicalName = state.PhysicalName ?? "";
+            Dictionary<string, string> baselineWatched = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            string snapshotId = "";
+            if (!isNew && attr != null)
+            {
+                try
+                {
+                    snapshotId = attr.ObjectId?.ToString() ?? "";
+                    if (!string.IsNullOrEmpty(snapshotId) && _attributeSnapshots.TryGetValue(snapshotId, out var baselineSnap))
+                    {
+                        baselinePhysicalName = baselineSnap.PhysicalName ?? state.PhysicalName ?? "";
+                        if (baselineSnap.WatchedProperties != null)
+                        {
+                            foreach (var kvp in baselineSnap.WatchedProperties)
+                                baselineWatched[kvp.Key] = kvp.Value ?? "";
+                        }
+                    }
+                }
+                catch (Exception ex) { Log($"ValidateColumnNamingStandard: baseline capture failed for '{state.TableName}.{state.PhysicalName}': {ex.Message}"); }
+            }
 
             // Step 1: silently apply AUTO_APPLY=true rules
             if (attrBoxed != null)
@@ -3259,13 +3646,13 @@ namespace EliteSoft.Erwin.AddIn.Services
             var results = NamingValidationEngine.ValidateObjectName("Column", state.PhysicalName, attrBoxed);
             var failures = results.Where(r => !r.IsValid).ToList();
 
-            // Required-input pass (2026-05-17 C3 follow-up): same contract as
-            // TableTypeMonitorService - Req=true violations get an inline
-            // input dialog, Apply writes back via SCAPI and removes the
-            // violation from the batch, Cancel leaves it for the consolidated
-            // warning popup downstream. Updates state.PhysicalName when the
-            // user just filled the column name so the snapshot baseline does
-            // not detect the write as a rename loop on the next tick.
+            // Required-input pass (2026-05-17 C3 follow-up, updated 2026-05-20):
+            // Req=true violations get an inline input dialog. Cancel routes
+            // through the Create-delete / Update-revert contract; on Cancel
+            // the remaining Required popups are suppressed and the
+            // consolidated warning at the bottom is skipped (the user has
+            // explicitly abandoned this column-level edit).
+            bool requiredCancelHandled = false;
             if (attr != null && failures.Count > 0)
             {
                 var requiredFailures = failures
@@ -3274,18 +3661,79 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 && !string.IsNullOrEmpty(f.Rule.PropertyCode))
                     .ToList();
 
+                // Session-level dismissal pre-pass (added 2026-05-21):
+                // suppress popups the user already cancelled in this session
+                // for the same (attr, property) pair. Strips them from both
+                // requiredFailures (no popup) and failures (no consolidated
+                // warning entry). Empty snapshotId means we have no stable
+                // key to filter by - fall through to the normal popup path.
+                if (!string.IsNullOrEmpty(snapshotId))
+                {
+                    var dismissedNow = requiredFailures
+                        .Where(rf => _dismissedRequiredColumnKeys.Contains($"{snapshotId}|{rf.Rule.PropertyCode}"))
+                        .ToList();
+                    foreach (var dismissed in dismissedNow)
+                    {
+                        Log($"Required field popup suppressed (session-dismissed): Column.{dismissed.Rule.PropertyCode} on '{state.TableName}.{state.PhysicalName}'");
+                        requiredFailures.Remove(dismissed);
+                        failures.Remove(dismissed);
+                    }
+                }
+
                 foreach (var rf in requiredFailures)
                 {
                     string fieldLabel = $"Column.{rf.Rule.PropertyCode}";
+                    var cancelMode = isNew ? Forms.RequiredOperationMode.Create : Forms.RequiredOperationMode.Update;
                     var rc = EliteSoft.Erwin.AddIn.Forms.RequiredFieldDialog.Show(
                         title: "Required field",
                         message: rf.ErrorMessage,
                         fieldLabel: fieldLabel,
-                        out string typed);
+                        out string typed,
+                        owner: null,
+                        initialValue: "",
+                        mode: cancelMode,
+                        objectKind: "Column");
 
                     if (rc != DialogResult.OK || string.IsNullOrEmpty(typed))
                     {
-                        Log($"Required field dialog cancelled: {state.TableName}.{state.PhysicalName} field={fieldLabel}");
+                        Log($"Required field dialog cancelled: {state.TableName}.{state.PhysicalName} field={fieldLabel} (mode={cancelMode})");
+                        if (isNew)
+                        {
+                            requiredCancelHandled = TryDeleteNewAttribute(attr, state.TableName, state.PhysicalName);
+                        }
+                        else
+                        {
+                            string baseline = string.Equals(rf.Rule.PropertyCode, "Physical_Name", StringComparison.OrdinalIgnoreCase)
+                                ? baselinePhysicalName
+                                : (baselineWatched.TryGetValue(rf.Rule.PropertyCode, out var bv) ? bv : "");
+                            requiredCancelHandled = TryRevertAttributeProperty(attr, snapshotId, state.TableName, state.PhysicalName, rf.Rule.PropertyCode, baseline);
+                            // Keep the in-flight currentState aligned with the
+                            // revert so any code that runs after this method
+                            // (snapshot replace in ProcessAttributeChanges)
+                            // does not capture the rolled-back invalid value.
+                            if (requiredCancelHandled)
+                            {
+                                if (string.Equals(rf.Rule.PropertyCode, "Physical_Name", StringComparison.OrdinalIgnoreCase))
+                                    state.PhysicalName = baseline ?? "";
+                                state.WatchedProperties[rf.Rule.PropertyCode] = baseline ?? "";
+                            }
+
+                            // Record session dismissal even when the revert
+                            // wrote nothing (baseline equal to current). The
+                            // next tick's drift detector would otherwise
+                            // re-fire the same popup against the still-empty
+                            // value.
+                            if (!string.IsNullOrEmpty(snapshotId))
+                            {
+                                _dismissedRequiredColumnKeys.Add($"{snapshotId}|{rf.Rule.PropertyCode}");
+                                Log($"Required field dismissed for session: {snapshotId}|{rf.Rule.PropertyCode}");
+                            }
+                        }
+                        if (requiredCancelHandled) break;
+                        // Delete/revert failed - drop through so other Required
+                        // failures still get a chance and the consolidated
+                        // warning at the end surfaces whatever the user did
+                        // not resolve.
                         continue;
                     }
 
@@ -3299,6 +3747,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                         Log($"Required field filled by user: {state.TableName}.{state.PhysicalName} {fieldLabel} = '{typed}'"
                             + (writeAccessor != rf.Rule.PropertyCode ? $" (write accessor='{writeAccessor}')" : ""));
                         failures.Remove(rf);
+
+                        // Clear any stale session dismissal - if the user
+                        // later empties this property again the popup should
+                        // legitimately fire instead of being silenced by an
+                        // earlier Cancel record.
+                        if (!string.IsNullOrEmpty(snapshotId))
+                            _dismissedRequiredColumnKeys.Remove($"{snapshotId}|{rf.Rule.PropertyCode}");
 
                         if (string.Equals(rf.Rule.PropertyCode, "Physical_Name", StringComparison.OrdinalIgnoreCase))
                             state.PhysicalName = typed;
@@ -3317,6 +3772,85 @@ namespace EliteSoft.Erwin.AddIn.Services
                         {
                             Log($"Required column watched-snapshot refresh failed: {snapEx.Message}");
                         }
+
+                        // Pattern-rule re-prompt loop (2026-05-24): mirror
+                        // of the Table-path fix. If the same column-level
+                        // PropertyCode carries a non-Required rule (Length /
+                        // Regexp), the value the user just provided may
+                        // satisfy Required while still failing the pattern.
+                        // Keep re-opening the input dialog with the next
+                        // violation's message until the property clears all
+                        // rules or the user cancels.
+                        string currentTyped = typed;
+                        while (true)
+                        {
+                            string liveValue;
+                            try { liveValue = attr.Properties(rf.Rule.PropertyCode)?.Value?.ToString() ?? ""; }
+                            catch { liveValue = currentTyped; }
+
+                            var freshResults = NamingValidationEngine.ValidateObjectName(
+                                "Column", liveValue, attrBoxed, rf.Rule.PropertyCode);
+                            var freshFailure = freshResults?.FirstOrDefault(r => !r.IsValid);
+                            if (freshFailure == null)
+                            {
+                                failures.RemoveAll(f => f.Rule != null
+                                    && string.Equals(f.Rule.PropertyCode, rf.Rule.PropertyCode, StringComparison.OrdinalIgnoreCase));
+                                break;
+                            }
+
+                            Log($"Required field re-prompt for {fieldLabel}: '{liveValue}' still violates rule#{freshFailure.Rule?.Id} ({freshFailure.RuleName})");
+                            var rc2 = EliteSoft.Erwin.AddIn.Forms.RequiredFieldDialog.Show(
+                                title: "Required field",
+                                message: freshFailure.ErrorMessage,
+                                fieldLabel: fieldLabel,
+                                out string typed2,
+                                owner: null,
+                                initialValue: liveValue,
+                                mode: cancelMode,
+                                objectKind: "Column");
+
+                            if (rc2 != DialogResult.OK || string.IsNullOrEmpty(typed2))
+                            {
+                                Log($"Required field re-prompt cancelled for {fieldLabel} (mode={cancelMode})");
+                                if (isNew)
+                                {
+                                    requiredCancelHandled = TryDeleteNewAttribute(attr, state.TableName, state.PhysicalName);
+                                }
+                                else
+                                {
+                                    string baseline = baselineWatched.TryGetValue(rf.Rule.PropertyCode, out var bv) ? bv : "";
+                                    requiredCancelHandled = TryRevertAttributeProperty(attr, snapshotId, state.TableName, state.PhysicalName, rf.Rule.PropertyCode, baseline);
+                                    if (!string.IsNullOrEmpty(snapshotId))
+                                        _dismissedRequiredColumnKeys.Add($"{snapshotId}|{rf.Rule.PropertyCode}");
+                                }
+                                failures.RemoveAll(f => f.Rule != null
+                                    && string.Equals(f.Rule.PropertyCode, rf.Rule.PropertyCode, StringComparison.OrdinalIgnoreCase));
+                                break;
+                            }
+
+                            int loopTransId = _session.BeginNamedTransaction("RequiredColumnFieldFillRepeat");
+                            try
+                            {
+                                attr.Properties(writeAccessor).Value = typed2;
+                                _session.CommitTransaction(loopTransId);
+                                Log($"Required field re-filled by user: {state.TableName}.{state.PhysicalName} {fieldLabel} = '{typed2}'");
+                                currentTyped = typed2;
+                                state.WatchedProperties[rf.Rule.PropertyCode] = typed2;
+                            }
+                            catch (Exception loopEx)
+                            {
+                                try { _session.RollbackTransaction(loopTransId); } catch { }
+                                Log($"Required column re-write failed for {fieldLabel}: {loopEx.Message}");
+                                EliteSoft.Erwin.AddIn.Forms.AddinMessageDialog.Show(
+                                    $"Failed to write '{typed2}' to {fieldLabel}.\n\nSCAPI error:\n{loopEx.Message}",
+                                    "Required field write failed",
+                                    MessageBoxButtons.OK,
+                                    MessageBoxIcon.Error);
+                                break;
+                            }
+                        }
+
+                        if (requiredCancelHandled) break;
                     }
                     catch (Exception ex)
                     {
@@ -3339,6 +3873,17 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
             }
 
+            // Same short-circuit as the Table path: the user explicitly
+            // discarded/reverted this column, so the remaining failures
+            // belong to an object that is gone or already rolled back.
+            // Don't queue them into _pendingResults - the consolidated
+            // popup would be confusing noise.
+            if (requiredCancelHandled)
+            {
+                Log($"ValidateColumnNamingStandard: Cancel-handled, suppressing remaining warnings for '{state.TableName}.{state.PhysicalName}'");
+                return;
+            }
+
             foreach (var r in failures)
             {
                 Log($"Naming standard violation ({r.RuleName}): {state.TableName}.{state.PhysicalName} — {r.ErrorMessage}");
@@ -3349,6 +3894,116 @@ namespace EliteSoft.Erwin.AddIn.Services
                     ColumnName = state.PhysicalName,
                     Message = r.ErrorMessage
                 });
+            }
+        }
+
+        /// <summary>
+        /// Remove a newly-created attribute in response to the user
+        /// discarding its Required popup (Create mode). Uses the same
+        /// <c>modelObjects.Remove</c> primitive as
+        /// <see cref="ColumnValidationService"/>'s PLEASE_CHANGE_IT
+        /// cleanup, wrapped in a named transaction. Clears the snapshot
+        /// so the next monitor tick does not see a phantom drift.
+        /// </summary>
+        private bool TryDeleteNewAttribute(dynamic attr, string tableName, string columnName)
+        {
+            if (attr == null) return false;
+            string objectId = "";
+            try { objectId = attr.ObjectId?.ToString() ?? ""; }
+            catch (Exception ex) { Log($"TryDeleteNewAttribute: ObjectId read failed for '{tableName}.{columnName}': {ex.Message}"); }
+
+            int transId = 0;
+            bool transOpen = false;
+            try
+            {
+                dynamic modelObjects = _session.ModelObjects;
+                transId = _session.BeginNamedTransaction("DiscardNewAttribute");
+                transOpen = true;
+
+                modelObjects.Remove(attr);
+
+                _session.CommitTransaction(transId);
+                transOpen = false;
+
+                if (!string.IsNullOrEmpty(objectId))
+                    _attributeSnapshots.Remove(objectId);
+
+                Log($"TryDeleteNewAttribute: removed '{tableName}.{columnName}' (objectId={objectId})");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log($"TryDeleteNewAttribute: remove failed for '{tableName}.{columnName}': {ex.Message}");
+                if (transOpen)
+                {
+                    try { _session.RollbackTransaction(transId); }
+                    catch (Exception rbEx) { Log($"TryDeleteNewAttribute: rollback failed: {rbEx.Message}"); }
+                }
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Revert a property on an existing attribute to its pre-edit
+        /// baseline value, in response to the user cancelling the Required
+        /// popup (Update mode). Mirrors
+        /// <c>TableTypeMonitorService.TryRevertEntityProperty</c>.
+        /// </summary>
+        private bool TryRevertAttributeProperty(dynamic attr, string objectId, string tableName, string columnName, string propertyCode, string oldValue)
+        {
+            if (attr == null || string.IsNullOrEmpty(propertyCode)) return false;
+
+            string writeAccessor = NamingValidationEngine.WriteAccessorFor(propertyCode);
+            string newValue = oldValue ?? "";
+            int transId = 0;
+            bool transOpen = false;
+            try
+            {
+                transId = _session.BeginNamedTransaction("RevertRequiredColumnField");
+                transOpen = true;
+
+                attr.Properties(writeAccessor).Value = newValue;
+
+                _session.CommitTransaction(transId);
+                transOpen = false;
+
+                if (!string.IsNullOrEmpty(objectId) && _attributeSnapshots.TryGetValue(objectId, out var snap))
+                {
+                    if (string.Equals(propertyCode, "Physical_Name", StringComparison.OrdinalIgnoreCase))
+                        snap.PhysicalName = newValue;
+                    snap.WatchedProperties[propertyCode] = newValue;
+                }
+
+                Log($"TryRevertAttributeProperty: '{tableName}.{columnName}' {propertyCode} reverted to '{newValue}'"
+                    + (writeAccessor != propertyCode ? $" (write accessor='{writeAccessor}')" : ""));
+                return true;
+            }
+            catch (Exception ex)
+            {
+                if (transOpen)
+                {
+                    try { _session.RollbackTransaction(transId); }
+                    catch (Exception rbEx) { Log($"TryRevertAttributeProperty: rollback failed: {rbEx.Message}"); }
+                    transOpen = false;
+                }
+
+                // SCVT_OBJID quirk: see TableTypeMonitorService.TryRevertEntityProperty
+                // for the full diagnosis. Empty-baseline revert on a Schema_Ref-
+                // style object reference is a conceptual no-op and erwin
+                // physically rejects "" - treat as success so the caller
+                // records the session dismissal cleanly.
+                bool emptyBaseline = string.IsNullOrEmpty(newValue);
+                bool looksLikeObjIdRejection = ex.Message != null
+                    && (ex.Message.IndexOf("SCVT_OBJID", StringComparison.OrdinalIgnoreCase) >= 0
+                        || ex.Message.IndexOf("from string ''", StringComparison.OrdinalIgnoreCase) >= 0);
+                if (emptyBaseline && looksLikeObjIdRejection)
+                {
+                    Log($"TryRevertAttributeProperty: '{tableName}.{columnName}' {propertyCode} no-op revert (empty baseline on SCVT_OBJID property)");
+                    return true;
+                }
+
+                Log($"TryRevertAttributeProperty: revert failed for '{tableName}.{columnName}'.{propertyCode}: {ex.Message}");
+                return false;
             }
         }
 
