@@ -20,6 +20,25 @@ namespace EliteSoft.Erwin.AddIn.Services
     /// same closed set.
     /// </para>
     /// </summary>
+    /// <summary>
+    /// When a naming-standard rule should fire (2026-05-25 admin schema).
+    /// Stored in <c>MC_NAMING_STANDARD.APPLY_ON</c> as <c>nvarchar NOT NULL
+    /// DEFAULT 'Both'</c>. The engine filters rules by this flag against
+    /// the current evaluation context so admin can scope "rule applies
+    /// only when a column / entity is first created" vs "only when an
+    /// existing one is edited" - useful for grandfathering legacy data
+    /// that would otherwise fail a newly-tightened rule.
+    /// </summary>
+    public enum RuleApplyOn
+    {
+        /// <summary>Fire only on initial creation (new entity / new column).</summary>
+        Create,
+        /// <summary>Fire only when an existing object is being edited.</summary>
+        Update,
+        /// <summary>Fire in both contexts (default). Back-compat with pre-2026-05-25 rows.</summary>
+        Both,
+    }
+
     public enum NamingRuleKind
     {
         /// <summary>Value must start with <see cref="NamingStandardRule.Prefix"/>; auto-apply optional.</summary>
@@ -30,6 +49,18 @@ namespace EliteSoft.Erwin.AddIn.Services
         Length,
         /// <summary>Value must match <see cref="NamingStandardRule.RegexpPattern"/>; validate only.</summary>
         Regexp,
+        /// <summary>
+        /// First-class "value must not be empty / selection mandatory" rule.
+        /// Admin 2026-05-25: pre-existing Length&gt;0 rows were migrated to
+        /// this dedicated type so the engine can dispatch on RuleType alone
+        /// without parsing length-operator+value semantics. Carries no
+        /// extra fields - the orthogonal <see cref="NamingStandardRule.IsRequired"/>
+        /// flag is implied by this type (engine treats empty values as
+        /// violations regardless of how the flag is stored). Other length
+        /// rules (e.g. <c>length &lt;= 128</c>) keep using
+        /// <see cref="NamingRuleKind.Length"/> and run alongside.
+        /// </summary>
+        Required,
     }
 
     /// <summary>
@@ -81,6 +112,17 @@ namespace EliteSoft.Erwin.AddIn.Services
         public bool IsActive { get; set; }
         public int SortOrder { get; set; }
         public int ConfigId { get; set; }
+
+        /// <summary>
+        /// Context gate (2026-05-25 admin schema): "Create" fires only when
+        /// the rule's target object/column was just newly created in this
+        /// validation pass; "Update" fires only when an existing one is
+        /// being edited; "Both" (the default) fires either way. Lets admin
+        /// grandfather legacy data that pre-dates a newly-tightened rule
+        /// by setting <see cref="RuleApplyOn.Create"/> so old entities
+        /// keep validating clean while new ones must comply.
+        /// </summary>
+        public RuleApplyOn ApplyOn { get; set; } = RuleApplyOn.Both;
 
         // --- Polymorphic condition (mutually exclusive sources) ---
 
@@ -266,6 +308,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     DependsOnPropertyValues = reader["DEPENDS_ON_PROPERTY_VALUES"] == DBNull.Value ? "" : reader["DEPENDS_ON_PROPERTY_VALUES"]?.ToString()?.Trim() ?? "",
                                     DependsOnUdpName = reader["UDP_NAME"] == DBNull.Value ? "" : reader["UDP_NAME"]?.ToString()?.Trim() ?? "",
                                     DependsOnPropertyCode = reader["COND_PROPERTY_CODE"] == DBNull.Value ? "" : reader["COND_PROPERTY_CODE"]?.ToString()?.Trim() ?? "",
+                                    ApplyOn = ParseApplyOn(reader["APPLY_ON"]),
                                 };
 
                                 if (!rule.IsActive) continue;
@@ -321,6 +364,23 @@ namespace EliteSoft.Erwin.AddIn.Services
         // Logical_Name, Name_Qualifier, ...). The CONDITION property (cond_pd JOIN)
         // is unfiltered because the spec allows conditioning on DBMS-version-
         // specific built-ins (e.g. Oracle-only Identity_Type).
+        /// <summary>
+        /// Parse the APPLY_ON column with safe defaulting to
+        /// <see cref="RuleApplyOn.Both"/>. NULL / empty / unparseable
+        /// values fall back to Both so a hand-edited DB or a partially
+        /// migrated row never silently disables a rule. 2026-05-25.
+        /// </summary>
+        private static RuleApplyOn ParseApplyOn(object dbValue)
+        {
+            if (dbValue == null || dbValue == DBNull.Value) return RuleApplyOn.Both;
+            string raw = dbValue.ToString()?.Trim() ?? "";
+            if (raw.Length == 0) return RuleApplyOn.Both;
+            if (Enum.TryParse<RuleApplyOn>(raw, ignoreCase: true, out var parsed))
+                return parsed;
+            System.Diagnostics.Debug.WriteLine($"NamingStandardService: unknown APPLY_ON '{raw}', defaulting to Both");
+            return RuleApplyOn.Both;
+        }
+
         private static string GetQuery(string dbType)
         {
             switch (dbType?.ToUpper())
@@ -331,7 +391,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                             ns.""PREFIX"", ns.""SUFFIX"", ns.""LENGTH_OPERATOR"", ns.""LENGTH_VALUE"",
                             ns.""REGEXP_PATTERN"", ns.""ERROR_MESSAGE"", ns.""AUTO_APPLY"", ns.""IS_ACTIVE"", ns.""SORT_ORDER"",
                             ns.""CONFIG_ID"", ns.""DEPENDS_ON_UDP_ID"", ns.""DEPENDS_ON_PROPERTY_DEF_ID"",
-                            ns.""DEPENDS_ON_PROPERTY_VALUES"",
+                            ns.""DEPENDS_ON_PROPERTY_VALUES"", ns.""APPLY_ON"",
                             udp.""NAME"" AS ""UDP_NAME"",
                             cond_pd.""PROPERTY_CODE"" AS ""COND_PROPERTY_CODE""
                             FROM ""MC_NAMING_STANDARD"" ns
@@ -350,7 +410,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                             ns.PREFIX, ns.SUFFIX, ns.LENGTH_OPERATOR, ns.LENGTH_VALUE,
                             ns.REGEXP_PATTERN, ns.ERROR_MESSAGE, ns.AUTO_APPLY, ns.IS_ACTIVE, ns.SORT_ORDER,
                             ns.CONFIG_ID, ns.DEPENDS_ON_UDP_ID, ns.DEPENDS_ON_PROPERTY_DEF_ID,
-                            ns.DEPENDS_ON_PROPERTY_VALUES,
+                            ns.DEPENDS_ON_PROPERTY_VALUES, ns.APPLY_ON,
                             udp.NAME AS UDP_NAME,
                             cond_pd.PROPERTY_CODE AS COND_PROPERTY_CODE
                             FROM MC_NAMING_STANDARD ns
@@ -370,7 +430,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                             ns.[PREFIX], ns.[SUFFIX], ns.[LENGTH_OPERATOR], ns.[LENGTH_VALUE],
                             ns.[REGEXP_PATTERN], ns.[ERROR_MESSAGE], ns.[AUTO_APPLY], ns.[IS_ACTIVE], ns.[SORT_ORDER],
                             ns.[CONFIG_ID], ns.[DEPENDS_ON_UDP_ID], ns.[DEPENDS_ON_PROPERTY_DEF_ID],
-                            ns.[DEPENDS_ON_PROPERTY_VALUES],
+                            ns.[DEPENDS_ON_PROPERTY_VALUES], ns.[APPLY_ON],
                             udp.[NAME] AS [UDP_NAME],
                             cond_pd.[PROPERTY_CODE] AS [COND_PROPERTY_CODE]
                             FROM [dbo].[MC_NAMING_STANDARD] ns
@@ -434,11 +494,15 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             if (string.IsNullOrEmpty(objectType))
                 return Array.Empty<string>();
+            // A property counts as "required" if EITHER the legacy
+            // IS_REQUIRED flag is set on any active rule OR there is a
+            // dedicated RULE_TYPE='Required' row. Both shapes coexist
+            // post-2026-05-25 migration.
             return _allRules
                 .Where(r => r != null
-                            && r.IsRequired
                             && r.IsActive
                             && !string.IsNullOrEmpty(r.PropertyCode)
+                            && (r.IsRequired || r.RuleType == NamingRuleKind.Required)
                             && string.Equals(r.ObjectType, objectType, StringComparison.OrdinalIgnoreCase))
                 .Select(r => r.PropertyCode)
                 .Distinct(StringComparer.OrdinalIgnoreCase)

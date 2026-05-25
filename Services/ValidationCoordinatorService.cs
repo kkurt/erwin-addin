@@ -4907,7 +4907,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             // Step 1: silently apply AUTO_APPLY=true rules
             if (attrBoxed != null)
             {
-                string afterAuto = NamingValidationEngine.ApplyNamingStandards("Column", state.PhysicalName, attrBoxed, autoOnly: true);
+                string afterAuto = NamingValidationEngine.ApplyNamingStandards("Column", state.PhysicalName, attrBoxed, autoOnly: true, isNew: isNew);
                 if (!string.Equals(afterAuto, state.PhysicalName, StringComparison.Ordinal))
                 {
                     int transId = _session.BeginNamedTransaction("ApplyAutoColumnNaming");
@@ -4932,7 +4932,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             // Step 2: prompt for AUTO_APPLY=false rules that would change the name
             if (attrBoxed != null)
             {
-                string afterAll = NamingValidationEngine.ApplyNamingStandards("Column", state.PhysicalName, attrBoxed, autoOnly: false);
+                string afterAll = NamingValidationEngine.ApplyNamingStandards("Column", state.PhysicalName, attrBoxed, autoOnly: false, isNew: isNew);
                 if (!string.Equals(afterAll, state.PhysicalName, StringComparison.Ordinal))
                 {
                     var answer = AddinMessageDialog.Show(
@@ -4964,7 +4964,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
 
             // Step 3: Validate remaining issues (warning popup for un-fixable rules)
-            var results = NamingValidationEngine.ValidateObjectName("Column", state.PhysicalName, attrBoxed);
+            var results = NamingValidationEngine.ValidateObjectName("Column", state.PhysicalName, attrBoxed, isNew: isNew);
             var failures = results.Where(r => !r.IsValid).ToList();
 
             // Required-input pass (2026-05-17 C3 follow-up, updated 2026-05-20):
@@ -5127,7 +5127,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                             catch { liveValue = currentTyped; }
 
                             var freshResults = NamingValidationEngine.ValidateObjectName(
-                                "Column", liveValue, attrBoxed, rf.Rule.PropertyCode);
+                                "Column", liveValue, attrBoxed, rf.Rule.PropertyCode, isNew: isNew);
                             var freshFailure = freshResults?.FirstOrDefault(r => !r.IsValid);
                             if (freshFailure == null)
                             {

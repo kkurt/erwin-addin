@@ -13,10 +13,12 @@ param(
     [Alias('?')]
     [switch]$Help,
 
-    # Force-kills erwin.exe / DdlHelper.exe / ErwinInjector.exe owned by ANY
-    # user, not just $env:USERNAME. Needed when a stale process from another
-    # session is holding our install dir or the COM host. Off by default
-    # because killing another logged-in user's editor session is destructive.
+    # Force-kills erwin.exe / DdlHelper.exe owned by ANY user, not just
+    # $env:USERNAME. Needed when a stale process from another session is
+    # holding our install dir or the COM host. Off by default because
+    # killing another logged-in user's editor session is destructive.
+    # (ErwinInjector.exe was removed 2026-05-26 along with the
+    # injection-based auto-load path.)
     [switch]$KillAllErwinProcs
 )
 
@@ -83,7 +85,12 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $scriptDir
 
 $installDir = Join-Path $env:LOCALAPPDATA "EliteSoft\ErwinAddIn"
-$progId     = "EliteSoft.Erwin.AddIn"
+# ProgID + menu display name renamed 2026-05-25. Legacy names kept for
+# cleanup so a rebuild after the rename leaves a clean registry.
+$progId               = "EliteSoft.Meta.AddIn"
+$addInDisplayName     = "Elite Soft Meta Addin"
+$legacyProgId         = "EliteSoft.Erwin.AddIn"
+$legacyAddInDisplay   = "Elite Soft Erwin Addin"
 # CLSID must mirror the [Guid(...)] attribute on ErwinAddIn class in
 # ErwinAddIn.cs:17 (also referenced from install-impl.ps1).
 $clsid      = '{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}'
@@ -206,14 +213,13 @@ function Stop-UserProcesses {
 }
 
 if ($KillAllErwinProcs) {
-    Write-Host "`nClosing erwin / DdlHelper / ErwinInjector (ALL USERS, -KillAllErwinProcs)..." -ForegroundColor Red
+    Write-Host "`nClosing erwin / DdlHelper (ALL USERS, -KillAllErwinProcs)..." -ForegroundColor Red
 } else {
-    Write-Host "`nClosing erwin / DdlHelper / ErwinInjector (user=$myUser)..." -ForegroundColor Yellow
+    Write-Host "`nClosing erwin / DdlHelper (user=$myUser)..." -ForegroundColor Yellow
 }
 $killedTotal  = 0
 $killedTotal += Stop-UserProcesses "erwin"          -All:$KillAllErwinProcs
 $killedTotal += Stop-UserProcesses "DdlHelper"      -All:$KillAllErwinProcs
-$killedTotal += Stop-UserProcesses "ErwinInjector"  -All:$KillAllErwinProcs
 # Only wait when we actually terminated something - the OS needs a beat to
 # release file handles before the copy/COM register steps below. No kill -
 # no need to pay the 2s tax.
@@ -274,6 +280,27 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host "  Build successful!" -ForegroundColor Green
 
+# --- Step 2b': comhost.dll clsidmap embed (SDK CreateComHostTask workaround) ---
+# .NET 10.0.102 SDK silently fails to embed the .clsidmap resource into
+# comhost.dll even though the _CreateComHost MSBuild target reports
+# success. Without the embedded resource, CoCreateInstance fails with
+# TYPE_E_CANTLOADLIBRARY, erwin's Add-In Manager hides our menu entry on
+# validation, and the addin appears missing. The embed-comhost.ps1
+# wrapper calls our tools/comhost-embed helper (which uses
+# Microsoft.NET.HostModel.ComHost.ComHost.Create directly) to do what
+# the SDK should have done. Verified 2026-05-26: with this step,
+# CoCreateInstance succeeds and the addin shows up in Tools > Add-Ins.
+$embedScript = Join-Path $scriptDir 'scripts\embed-comhost.ps1'
+if (Test-Path $embedScript) {
+    Write-Host "`n[1b'/5] Embedding clsidmap into comhost.dll..." -ForegroundColor Yellow
+    pwsh -NoProfile -File $embedScript -Configuration Release
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  WARNING: comhost embed failed (exit=$LASTEXITCODE). Addin may not load." -ForegroundColor Yellow
+    } else {
+        Write-Host "  comhost.dll has correct clsidmap" -ForegroundColor Green
+    }
+}
+
 # Build DdlHelper tool - only when the source dir is newer than the
 # published exe. `dotnet publish` with no source change still costs ~3-5s of
 # msbuild overhead (graph walk + Copy task), which we skip on no-change.
@@ -301,43 +328,13 @@ if (Test-Path $ddlHelperDir) {
     }
 }
 
-# Build ErwinInjector (single-file Win32 launcher) + TriggerDll (AOT). Both
-# end up in the install dir and are used by autostart-watcher.ps1 to load
-# the addin into a running erwin process - without these binaries the
-# watcher logs "Injector not found" and fails the dev loop's health check.
-# Kept on the same timestamp-gate as DdlHelper so no-source-change runs
-# skip the dotnet publish overhead.
-$injectorDir       = Join-Path $scriptDir "scripts\erwin-injector"
-$injectorPubDir    = Join-Path $injectorDir "bin\Release\net10.0\win-x64\publish"
-$injectorExe       = Join-Path $injectorPubDir "ErwinInjector.exe"
-$triggerDir        = Join-Path $injectorDir "TriggerDll"
-$triggerPubDir     = Join-Path $triggerDir "bin\Release\net10.0-windows\win-x64\publish"
-$triggerDll        = Join-Path $triggerPubDir "TriggerDll.dll"
-
-if (Test-Path $injectorDir) {
-    $injectorSources = @((Join-Path $injectorDir "ErwinInjector.csproj"), (Join-Path $injectorDir "Program.cs"))
-    if (Test-AnyNewer -Sources $injectorSources -Target $injectorExe) {
-        Write-Host "  Publishing ErwinInjector..." -ForegroundColor Gray
-        dotnet publish "$injectorDir\ErwinInjector.csproj" -c Release -r win-x64 --nologo -v q 2>&1 | Out-Null
-        if ($?) { Write-Host "  ErwinInjector published" -ForegroundColor Green }
-        else    { Write-Host "  ErwinInjector publish failed (non-critical)" -ForegroundColor Yellow }
-    } else {
-        Write-Host "  ErwinInjector skipped - source unchanged since publish" -ForegroundColor DarkGray
-    }
-}
-if (Test-Path $triggerDir) {
-    $triggerSources = @((Join-Path $triggerDir "TriggerDll.csproj"), (Join-Path $triggerDir "TriggerDll.cs"))
-    if (Test-AnyNewer -Sources $triggerSources -Target $triggerDll) {
-        Write-Host "  Publishing TriggerDll (AOT)..." -ForegroundColor Gray
-        # PublishAot takes 30-60s cold and pulls in the native toolchain, so
-        # the timestamp gate matters more here than for the managed bits.
-        dotnet publish "$triggerDir\TriggerDll.csproj" -c Release -r win-x64 --nologo -v q 2>&1 | Out-Null
-        if ($?) { Write-Host "  TriggerDll published" -ForegroundColor Green }
-        else    { Write-Host "  TriggerDll publish failed (non-critical)" -ForegroundColor Yellow }
-    } else {
-        Write-Host "  TriggerDll skipped - source unchanged since publish" -ForegroundColor DarkGray
-    }
-}
+# ErwinInjector + TriggerDll publish - REMOVED 2026-05-26.
+# Both binaries are obsolete after the auto-load mechanism switched to
+# PostMessage WM_COMMAND (see Services/WmCommandLogger.cs +
+# scripts/autostart-watcher.ps1). The old injection path triggered SEP
+# SONAR.ProcHijack on unsigned builds and got the executable quarantined
+# in prod. Source folder scripts/erwin-injector/ is kept in the repo
+# for git history; no longer built, no longer shipped.
 
 $buildOutputDir = Join-Path $scriptDir "bin\Release\net10.0-windows"
 if (-not (Test-Path (Join-Path $buildOutputDir "EliteSoft.Erwin.AddIn.dll"))) {
@@ -399,26 +396,9 @@ if (Test-Path -LiteralPath $watcherSrcPath) {
     Write-Host "  WARNING: $watcherSrcPath missing - keeping installed watcher" -ForegroundColor Yellow
 }
 
-# ErwinInjector.exe + TriggerDll.dll also live outside bin/ - they are
-# published into the erwin-injector subtree. Robocopy can't see them so
-# we deploy them by hand. autostart-watcher.ps1 hardcodes these paths
-# (Test-Path on install dir) and refuses to start without both.
-foreach ($pair in @(
-    @{ Src = $injectorExe; Name = 'ErwinInjector.exe' },
-    @{ Src = $triggerDll;  Name = 'TriggerDll.dll' }
-)) {
-    if (Test-Path -LiteralPath $pair.Src) {
-        $dst = Join-Path $installDir $pair.Name
-        $srcHash = (Get-FileHash -LiteralPath $pair.Src -Algorithm SHA1).Hash
-        $dstHash = if (Test-Path -LiteralPath $dst) { (Get-FileHash -LiteralPath $dst -Algorithm SHA1).Hash } else { $null }
-        if ($srcHash -ne $dstHash) {
-            [System.IO.File]::Copy($pair.Src, $dst, $true)
-            Write-Host "  Refreshed $($pair.Name)" -ForegroundColor Gray
-        }
-    } else {
-        Write-Host "  WARNING: $($pair.Name) missing at $($pair.Src) - watcher will fail" -ForegroundColor Yellow
-    }
-}
+# ErwinInjector + TriggerDll deploy block removed 2026-05-26 along with
+# the injection-based auto-load path. PostMessage WM_COMMAND replaces
+# it (see scripts/autostart-watcher.ps1 + Services/WmCommandLogger.cs).
 
 # license.lic check: addin's CheckLicenseStatus reads `<installDir>\license.lic`
 # at startup and refuses to load without it. The file is NOT in the repo (it's
@@ -464,9 +444,26 @@ try {
     $currentPath = (Get-ItemProperty -LiteralPath $inprocKey -Name "(default)" -ErrorAction Stop)."(default)"
 } catch { $currentPath = $null }
 
-if ($currentPath -and ($currentPath -ieq $comHost)) {
-    Write-Host "  HKCU already points at $comHost - skipped" -ForegroundColor DarkGray
+# The original skip logic only checked the InProcServer32 path. After the
+# 2026-05-25 ProgID rename ("EliteSoft.Erwin.AddIn" -> "EliteSoft.Meta.AddIn")
+# the comhost path stayed the same but the new ProgID class hadn't been
+# written - erwin's Add-In Manager then surfaced
+# "Cannot find EliteSoft.Meta.AddIn Component" on activation. Also verify
+# the ProgID key + the CLSID's ProgId back-pointer to catch ProgID drift.
+$progIdRegistered  = Test-Path -LiteralPath "HKCU:\Software\Classes\$progId\CLSID"
+$clsidProgIdValue  = $null
+try {
+    $clsidProgIdValue = (Get-ItemProperty -LiteralPath "HKCU:\Software\Classes\CLSID\$clsid\ProgId" -Name "(default)" -ErrorAction Stop)."(default)"
+} catch { $clsidProgIdValue = $null }
+
+if ($currentPath -and ($currentPath -ieq $comHost) -and $progIdRegistered -and ($clsidProgIdValue -ieq $progId)) {
+    Write-Host "  HKCU already points at $comHost and ProgID '$progId' is current - skipped" -ForegroundColor DarkGray
 } else {
+    if (-not $progIdRegistered) {
+        Write-Host "  ProgID '$progId' not registered yet (rename or fresh install) - re-registering" -ForegroundColor Gray
+    } elseif ($clsidProgIdValue -and ($clsidProgIdValue -ine $progId)) {
+        Write-Host "  CLSID\ProgId is '$clsidProgIdValue', want '$progId' - re-registering" -ForegroundColor Gray
+    }
     try {
         # Unregister first to wipe any stale subkeys from older layouts that
         # would otherwise survive the -Force overwrite (e.g. a leftover
@@ -488,13 +485,35 @@ if ($currentPath -and ($currentPath -ieq $comHost)) {
 # can't discover the addin so it never loads. install-impl.ps1 writes the same
 # entry; we mirror it here so the dev loop is self-sufficient.
 Write-Host "`n[5b/5] erwin Add-In Manager entry (HKCU)..." -ForegroundColor Yellow
-$addInPath = "HKCU:\SOFTWARE\erwin\Data Modeler\10.10\Add-Ins\Elite Soft Erwin Addin"
+
+# Legacy cleanup: pre-2026-05-25 builds wrote "Elite Soft Erwin Addin" with
+# ProgID "EliteSoft.Erwin.AddIn". Sweep both the menu entry and the COM
+# ProgID class so a rebuild doesn't leave a duplicate menu item or a
+# stale ProgID -> CLSID lookup.
+$legacyAddInPath = "HKCU:\SOFTWARE\erwin\Data Modeler\10.10\Add-Ins\$legacyAddInDisplay"
+if (Test-Path -LiteralPath $legacyAddInPath) {
+    Remove-Item -LiteralPath $legacyAddInPath -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Host "  Removed legacy menu entry '$legacyAddInDisplay'" -ForegroundColor Gray
+}
+$legacyProgIdPath = "HKCU:\Software\Classes\$legacyProgId"
+if (Test-Path -LiteralPath $legacyProgIdPath) {
+    Remove-Item -LiteralPath $legacyProgIdPath -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Host "  Removed legacy ProgID '$legacyProgId'" -ForegroundColor Gray
+}
+# AddinCmdId clearing REMOVED 2026-05-26: empirically the cmd id is
+# stable across erwin restarts AND across menu-entry delete+recreate
+# cycles (still 1181 with one addin registered). Aggressive clearing on
+# every build-and-run was forcing the user to redo the 2-click discovery
+# after every dev iteration. WmCommandLogger.MarkExecuteEntry self-heals
+# if the id ever DOES drift, so leaving the cached value is safe.
+
+$addInPath = "HKCU:\SOFTWARE\erwin\Data Modeler\10.10\Add-Ins\$addInDisplayName"
 # Skip the four Set-ItemProperty writes when the existing values already
 # match. Registry SetValue is microseconds-cheap so the win is small, but
 # the "Skipped" log line is the useful signal that the run is idempotent.
 $addInWanted = @{
     "Menu Identifier" = 1
-    "ProgID"          = "EliteSoft.Erwin.AddIn"
+    "ProgID"          = $progId
     "Invoke Method"   = "Execute"
     "Invoke EXE"      = 0
 }
@@ -511,11 +530,11 @@ if ($addInOk) {
     if (-not (Test-Path -LiteralPath $addInPath)) {
         New-Item -Path $addInPath -Force | Out-Null
     }
-    Set-ItemProperty -LiteralPath $addInPath -Name "Menu Identifier" -Value 1                       -Type DWord
-    Set-ItemProperty -LiteralPath $addInPath -Name "ProgID"          -Value "EliteSoft.Erwin.AddIn" -Type String
-    Set-ItemProperty -LiteralPath $addInPath -Name "Invoke Method"   -Value "Execute"               -Type String
-    Set-ItemProperty -LiteralPath $addInPath -Name "Invoke EXE"      -Value 0                       -Type DWord
-    Write-Host "  HKCU Add-In entry written" -ForegroundColor Green
+    Set-ItemProperty -LiteralPath $addInPath -Name "Menu Identifier" -Value 1            -Type DWord
+    Set-ItemProperty -LiteralPath $addInPath -Name "ProgID"          -Value $progId      -Type String
+    Set-ItemProperty -LiteralPath $addInPath -Name "Invoke Method"   -Value "Execute"    -Type String
+    Set-ItemProperty -LiteralPath $addInPath -Name "Invoke EXE"      -Value 0            -Type DWord
+    Write-Host "  HKCU Add-In entry written ('$addInDisplayName' -> $progId)" -ForegroundColor Green
 }
 
 # --- Step 6: Auto-start watcher health check ---
@@ -598,7 +617,19 @@ if (-not $task) {
 
         Write-Host "  Triggering ScheduledTask '$watcherTaskName'..." -ForegroundColor Gray
         Stop-ScheduledTask -TaskName $watcherTaskName -ErrorAction SilentlyContinue
-        Start-ScheduledTask  -TaskName $watcherTaskName
+        # The task may be Disabled intentionally (e.g. while debugging the
+        # SEP-quarantine path or the WM_COMMAND discovery flow with no
+        # injection). Detect this BEFORE Start-ScheduledTask so we degrade
+        # to a clear skip instead of the cryptic "task is disabled" error.
+        $taskState = (Get-ScheduledTask -TaskName $watcherTaskName -ErrorAction SilentlyContinue).State
+        if ($taskState -eq 'Disabled') {
+            Write-Host "  Watcher task is Disabled - skipping start." -ForegroundColor Yellow
+            Write-Host "  Addin will NOT auto-load until the task is re-enabled:" -ForegroundColor Yellow
+            Write-Host "    Enable-ScheduledTask -TaskName '$watcherTaskName'" -ForegroundColor Yellow
+            $watcherProc = $null
+        } else {
+            Start-ScheduledTask  -TaskName $watcherTaskName
+        }
         # Poll for the watcher to come up. Empirically takes 3-10 s on this
         # box (cold PowerShell start + script preload). The previous fixed
         # Start-Sleep -Seconds 2 tripped a false-failure path because the

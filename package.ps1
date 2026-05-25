@@ -160,6 +160,22 @@ if (Test-Path $ddlHelperProject) {
 $fileCount = (Get-ChildItem -LiteralPath $publishDir -Recurse -File).Count
 Write-Host "  Published $fileCount files" -ForegroundColor Green
 
+# Workaround for .NET 10 SDK CreateComHostTask bug: re-embed clsidmap
+# into the published comhost.dll. See scripts/embed-comhost.ps1 +
+# tools/comhost-embed for the why/how. Without this the packaged build
+# ships a template comhost.dll with no CLSID map and the addin appears
+# missing from Tools > Add-Ins on every install. Verified 2026-05-26.
+$packagedComHost = Join-Path $publishDir 'EliteSoft.Erwin.AddIn.comhost.dll'
+if (Test-Path $packagedComHost) {
+    Write-Host "  Embedding clsidmap into packaged comhost.dll..." -ForegroundColor Gray
+    pwsh -NoProfile -File (Join-Path $scriptDir 'scripts\embed-comhost.ps1') -Configuration Release -ComHostPath @($packagedComHost)
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  WARNING: comhost embed failed (exit=$LASTEXITCODE). Addin WILL NOT load from this package." -ForegroundColor Red
+    } else {
+        Write-Host "  comhost.dll has correct clsidmap" -ForegroundColor Green
+    }
+}
+
 # STEP 2: Embed license (optional)
 if ($License) {
     Write-Host "`n[2] Generating license..." -ForegroundColor Yellow
@@ -200,48 +216,14 @@ $null = (Get-Host).UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
     Write-Host "  License embedded" -ForegroundColor Green
 }
 
-# STEP 3: Build and copy injection components
-Write-Host "`n[4] Building injection components..." -ForegroundColor Yellow
-
-$triggerDllProject = Join-Path $scriptDir "scripts\erwin-injector\TriggerDll\TriggerDll.csproj"
-$injectorProject = Join-Path $scriptDir "scripts\erwin-injector\ErwinInjector.csproj"
-
-# Add vswhere to PATH for NativeAOT linking
-$vsInstallerPath = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
-if (Test-Path $vsInstallerPath) {
-    $env:PATH = "$env:PATH;$vsInstallerPath"
-}
-
-# Publish TriggerDll (NativeAOT)
-Write-Host "  Publishing TriggerDll (NativeAOT)..." -ForegroundColor Gray
-dotnet publish $triggerDllProject -c Release 2>&1 | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "  TriggerDll publish failed!" -ForegroundColor Red
-    Write-Host "  Ensure Visual Studio C++ Build Tools are installed" -ForegroundColor Yellow
-    Write-Host "`nPress any key to exit..." -ForegroundColor Gray
-    $null = (Get-Host).UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
-    exit 1
-}
-$triggerDllSource = Join-Path $scriptDir "scripts\erwin-injector\TriggerDll\bin\Release\net10.0-windows\win-x64\publish\TriggerDll.dll"
-# .NET File.Copy used instead of Copy-Item because $publishDir may contain
-# square brackets (e.g. "MetaAddin [TTKOM-77]") which Copy-Item's path
-# resolver treats as wildcard patterns and rejects with "wildcard character
-# pattern is not valid". File.Copy works on raw filesystem strings.
-[System.IO.File]::Copy($triggerDllSource, (Join-Path $publishDir "TriggerDll.dll"), $true)
-Write-Host "  TriggerDll.dll published" -ForegroundColor Green
-
-# Publish ErwinInjector (framework-dependent single file)
-Write-Host "  Publishing ErwinInjector..." -ForegroundColor Gray
-dotnet publish $injectorProject -c Release 2>&1 | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "  ErwinInjector publish failed!" -ForegroundColor Red
-    Write-Host "`nPress any key to exit..." -ForegroundColor Gray
-    $null = (Get-Host).UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
-    exit 1
-}
-$injectorSource = Join-Path $scriptDir "scripts\erwin-injector\bin\Release\net10.0\win-x64\publish\ErwinInjector.exe"
-[System.IO.File]::Copy($injectorSource, (Join-Path $publishDir "ErwinInjector.exe"), $true)
-Write-Host "  ErwinInjector.exe published" -ForegroundColor Green
+# STEP 3 (legacy injection components - REMOVED 2026-05-26):
+# ErwinInjector.exe + TriggerDll.dll were superseded by the PostMessage
+# WM_COMMAND auto-load path (see scripts/autostart-watcher.ps1 +
+# Services/WmCommandLogger.cs). The injector triggered SEP
+# SONAR.ProcHijack on unsigned builds and got quarantined in prod. The
+# new path uses standard Win32 messages (zero injection, zero AV
+# heuristics). Source folder scripts/erwin-injector/ is kept in the repo
+# for git history; no longer built or shipped.
 
 # STEP 5: Copy install scripts + double-click wrappers + watcher.
 # The .bat files exist so the end user can extract the ZIP and double-click

@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <!-- Keep out of solution-wide enumeration so build-and-run.ps1 doesn't try
+         to publish this as part of the addin. -->
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <!-- Microsoft.NET.HostModel ships with the .NET SDK and is NOT on
+       NuGet, so reference it from the SDK install. $(MSBuildBinPath) is
+       the SDK root (e.g. C:\Program Files\dotnet\sdk\10.0.102\) regardless
+       of which SDK version is in use. -->
+  <ItemGroup>
+    <Reference Include="Microsoft.NET.HostModel">
+      <HintPath>$(MSBuildBinPath)\Microsoft.NET.HostModel.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+</Project>

@@ -15,7 +15,12 @@ namespace EliteSoft.Erwin.AddIn
     /// </summary>
     [ComVisible(true)]
     [Guid("A1B2C3D4-E5F6-7890-ABCD-EF1234567890")]
-    [ProgId("EliteSoft.Erwin.AddIn")]
+    // ProgID renamed from "EliteSoft.Erwin.AddIn" to "EliteSoft.Meta.AddIn"
+    // 2026-05-25. The C# namespace and assembly name remain
+    // EliteSoft.Erwin.AddIn (rename would touch every file with no
+    // user-visible benefit). Install scripts clean up the old ProgID
+    // and old menu key ("Elite Soft Erwin Addin") on install.
+    [ProgId("EliteSoft.Meta.AddIn")]
     [ClassInterface(ClassInterfaceType.AutoDual)]
     public class ErwinAddIn
     {
@@ -113,6 +118,27 @@ namespace EliteSoft.Erwin.AddIn
         {
             Services.AddinLogger.StartSession();
             using var _scope = Services.AddinLogger.BeginScope("ErwinAddIn.Execute");
+
+            // DIAGNOSTIC (auto-load discovery): subclass erwin's main window
+            // WindowProc and log every WM_COMMAND wParam so we can identify
+            // the dynamically-assigned cmd id erwin uses to dispatch our
+            // Tools&gt;Add-Ins entry. With that id, the watcher can
+            // PostMessage(erwinMain, WM_COMMAND, id, 0) from outside and
+            // auto-load the addin WITHOUT DLL injection (SEP-clean). The
+            // MarkExecuteEntry line gives us a timestamp anchor to
+            // correlate WM_COMMAND wParams with actual addin invocations.
+            // Idempotent / safe / always-on; log goes to
+            // %LOCALAPPDATA%\EliteSoft\ErwinAddIn\wmcmd.log.
+            try
+            {
+                var erwinMain = Services.Win32Helper.GetErwinMainWindow();
+                Services.WmCommandLogger.Install(erwinMain);
+                Services.WmCommandLogger.MarkExecuteEntry();
+            }
+            catch (Exception logEx)
+            {
+                Services.AddinLogger.Log($"WmCommandLogger install failed (non-fatal): {logEx.GetType().Name}: {logEx.Message}");
+            }
             // Splash shown BEFORE every heavy step so the user gets immediate
             // feedback. Without this the user saw a 1.5-7 sec dead-time between
             // erwin's model-load completing and the add-in's first paint

@@ -1,6 +1,8 @@
 #nullable enable
 using System;
+using System.Collections.Generic;
 using System.Drawing;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
@@ -72,14 +74,21 @@ namespace EliteSoft.Erwin.AddIn.Forms
         private const int WM_NCLBUTTONDOWN = 0xA1;
         private const int HTCAPTION = 0x2;
 
-        private readonly TextBox _txtValue;
+        // Either _txtValue OR _cmbValue is non-null - never both. When a
+        // <c>choices</c> list was passed we render a ComboBox locked to
+        // those entries (DropDownList style, no free typing) so the user
+        // cannot enter a value the model doesn't accept (2026-05-25 user
+        // request, primarily for Owner / Schema_Ref which erwin rejects
+        // unless the name matches an existing Schema object).
+        private readonly TextBox? _txtValue;
+        private readonly ComboBox? _cmbValue;
 
         /// <summary>The value the user typed when they clicked Apply. Empty when
         /// they cancelled or the dialog was closed without confirming.</summary>
         public string EnteredValue { get; private set; } = "";
 
         private RequiredFieldDialog(string title, string message, string fieldLabel, string initialValue,
-            RequiredOperationMode mode, string objectKind)
+            RequiredOperationMode mode, string objectKind, IReadOnlyList<string>? choices)
         {
             Text = title;
             FormBorderStyle = FormBorderStyle.None;
@@ -213,8 +222,11 @@ namespace EliteSoft.Erwin.AddIn.Forms
             };
             yCursor += lblField.PreferredHeight + LabelToFieldGap;
 
-            // TextBox with manual 1px border for visual consistency with
+            // Field control: ComboBox (locked DropDownList) when choices are
+            // supplied so the user is forced to pick a valid value, TextBox
+            // otherwise. Manual 1px border frame for visual consistency with
             // the borderless chrome.
+            bool useCombo = choices != null && choices.Count > 0;
             var fieldFrame = new Panel
             {
                 Location = new Point(BodyHorizontalPadding, yCursor),
@@ -222,30 +234,80 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 BackColor = ClrFieldBorder,
                 Padding = new Padding(1),
             };
-            _txtValue = new TextBox
+
+            if (useCombo)
             {
-                Dock = DockStyle.Fill,
-                Font = new Font("Segoe UI", 10F),
-                BorderStyle = BorderStyle.None,
-                BackColor = Color.White,
-                ForeColor = ClrTextPrimary,
-                Text = initialValue ?? "",
-            };
-            _txtValue.KeyDown += (_, e) =>
+                _cmbValue = new ComboBox
+                {
+                    Dock = DockStyle.Fill,
+                    Font = new Font("Segoe UI", 10F),
+                    BackColor = Color.White,
+                    ForeColor = ClrTextPrimary,
+                    DropDownStyle = ComboBoxStyle.DropDownList,
+                    FlatStyle = FlatStyle.Flat,
+                };
+                foreach (var c in choices!)
+                {
+                    if (!string.IsNullOrEmpty(c)) _cmbValue.Items.Add(c);
+                }
+                // Pre-select case-insensitive match to initialValue when
+                // possible so re-prompts after a failed write land back on
+                // what the user just picked. Otherwise default to first.
+                int matchIdx = -1;
+                if (!string.IsNullOrEmpty(initialValue))
+                {
+                    for (int i = 0; i < _cmbValue.Items.Count; i++)
+                    {
+                        if (string.Equals(_cmbValue.Items[i]?.ToString() ?? "", initialValue,
+                                StringComparison.OrdinalIgnoreCase))
+                        { matchIdx = i; break; }
+                    }
+                }
+                if (matchIdx >= 0) _cmbValue.SelectedIndex = matchIdx;
+                else if (_cmbValue.Items.Count > 0) _cmbValue.SelectedIndex = 0;
+                _cmbValue.KeyDown += (_, e) =>
+                {
+                    if (e.KeyCode == Keys.Enter)
+                    {
+                        e.SuppressKeyPress = true;
+                        AcceptIfValid();
+                    }
+                    else if (e.KeyCode == Keys.Escape)
+                    {
+                        e.SuppressKeyPress = true;
+                        DialogResult = DialogResult.Cancel;
+                        Close();
+                    }
+                };
+                fieldFrame.Controls.Add(_cmbValue);
+            }
+            else
             {
-                if (e.KeyCode == Keys.Enter)
+                _txtValue = new TextBox
                 {
-                    e.SuppressKeyPress = true;
-                    AcceptIfValid();
-                }
-                else if (e.KeyCode == Keys.Escape)
+                    Dock = DockStyle.Fill,
+                    Font = new Font("Segoe UI", 10F),
+                    BorderStyle = BorderStyle.None,
+                    BackColor = Color.White,
+                    ForeColor = ClrTextPrimary,
+                    Text = initialValue ?? "",
+                };
+                _txtValue.KeyDown += (_, e) =>
                 {
-                    e.SuppressKeyPress = true;
-                    DialogResult = DialogResult.Cancel;
-                    Close();
-                }
-            };
-            fieldFrame.Controls.Add(_txtValue);
+                    if (e.KeyCode == Keys.Enter)
+                    {
+                        e.SuppressKeyPress = true;
+                        AcceptIfValid();
+                    }
+                    else if (e.KeyCode == Keys.Escape)
+                    {
+                        e.SuppressKeyPress = true;
+                        DialogResult = DialogResult.Cancel;
+                        Close();
+                    }
+                };
+                fieldFrame.Controls.Add(_txtValue);
+            }
             yCursor += FieldHeight + 14;
 
             body.Controls.Add(lblMessage);
@@ -338,7 +400,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
 
             AcceptButton = btnApply;
             CancelButton = btnCancel;
-            ActiveControl = _txtValue;
+            ActiveControl = (Control?)_cmbValue ?? (Control?)_txtValue;
 
             // Final size: chrome + body content + footer.
             int chromeHeight = AccentStripHeight + HeaderHeight + 1 + 1 + FooterHeight;
@@ -349,8 +411,15 @@ namespace EliteSoft.Erwin.AddIn.Forms
             {
                 if (IsDisposed) return;
                 try { SetForegroundWindow(Handle); } catch { /* best effort */ }
-                _txtValue.Focus();
-                _txtValue.SelectAll();
+                if (_cmbValue != null)
+                {
+                    _cmbValue.Focus();
+                }
+                else if (_txtValue != null)
+                {
+                    _txtValue.Focus();
+                    _txtValue.SelectAll();
+                }
             };
         }
 
@@ -358,12 +427,27 @@ namespace EliteSoft.Erwin.AddIn.Forms
         {
             // Required-by-contract: empty submission is not allowed. The
             // caller can still detect a cancellation via DialogResult.
-            string typed = (_txtValue.Text ?? "").Trim();
-            if (typed.Length == 0)
+            string typed;
+            if (_cmbValue != null)
             {
-                _txtValue.Focus();
-                _txtValue.SelectAll();
-                return;
+                typed = (_cmbValue.SelectedItem?.ToString() ?? "").Trim();
+                if (typed.Length == 0)
+                {
+                    _cmbValue.Focus();
+                    if (_cmbValue.Items.Count > 0 && _cmbValue.SelectedIndex < 0)
+                        _cmbValue.SelectedIndex = 0;
+                    return;
+                }
+            }
+            else
+            {
+                typed = (_txtValue?.Text ?? "").Trim();
+                if (typed.Length == 0)
+                {
+                    _txtValue?.Focus();
+                    _txtValue?.SelectAll();
+                    return;
+                }
             }
             EnteredValue = typed;
             DialogResult = DialogResult.OK;
@@ -389,9 +473,10 @@ namespace EliteSoft.Erwin.AddIn.Forms
             IWin32Window? owner = null,
             string initialValue = "",
             RequiredOperationMode mode = RequiredOperationMode.Update,
-            string objectKind = "")
+            string objectKind = "",
+            IReadOnlyList<string>? choices = null)
         {
-            using var dlg = new RequiredFieldDialog(title, message, fieldLabel, initialValue, mode, objectKind);
+            using var dlg = new RequiredFieldDialog(title, message, fieldLabel, initialValue, mode, objectKind, choices);
             dlg.PositionOnActiveScreen(owner);
             var rc = dlg.ShowDialog(owner);
             enteredValue = rc == DialogResult.OK ? dlg.EnteredValue : "";

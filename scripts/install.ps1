@@ -15,8 +15,8 @@ param(
 $ErrorActionPreference = "Stop"
 
 # ── Config ──────────────────────────────────────────────────────
-$addInName      = "Elite Soft Erwin Addin"
-$progId         = "EliteSoft.Erwin.AddIn"
+$addInName      = "Elite Soft Meta Addin"
+$progId         = "EliteSoft.Meta.AddIn"
 $invokeMethod   = "Execute"
 $dllName        = "EliteSoft.Erwin.AddIn.dll"
 $installDir     = "C:\Program Files\EliteSoft\ErwinAddIn"

@@ -3007,10 +3007,11 @@ namespace EliteSoft.Erwin.AddIn
                             NamingRuleKind.Suffix => $"suffix='{rule.Suffix}' auto={rule.AutoApply}",
                             NamingRuleKind.Length => $"len {(string.IsNullOrEmpty(rule.LengthOperator) ? "?" : rule.LengthOperator)} {rule.LengthValue?.ToString() ?? "?"}",
                             NamingRuleKind.Regexp => $"regex(len={(rule.RegexpPattern ?? "").Length})='{rule.RegexpPattern ?? ""}'",
+                            NamingRuleKind.Required => "empty-check",
                             _ => "(unknown)",
                         };
                         Log($"  rule#{rule.Id} [{rule.RuleType}] {rule.ObjectType}.{rule.PropertyCode} " +
-                            $"req={rule.IsRequired} {typeParam} cond={udpCond} msg='{msg}'");
+                            $"req={rule.IsRequired} apply={rule.ApplyOn} {typeParam} cond={udpCond} msg='{msg}'");
                     }
                 }
                 else

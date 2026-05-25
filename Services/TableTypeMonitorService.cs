@@ -341,6 +341,60 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// a phantom "entity disappeared" event for an object we
         /// intentionally removed.
         /// </summary>
+        /// <summary>
+        /// Resolve the closed list of valid values for a Required-field
+        /// popup, when the property is one of erwin's reference-typed
+        /// columns (currently Owner / Name_Qualifier / Schema_Ref - all
+        /// of which are SCVT_OBJID columns that erwin refuses to accept
+        /// unless the value matches an existing Schema object's name).
+        /// Returns a sorted, distinct list of Schema names from the live
+        /// model. Returns <c>null</c> for properties that do not have a
+        /// fixed value set; the dialog then renders its default free-text
+        /// TextBox. 2026-05-25 user request.
+        /// </summary>
+        private System.Collections.Generic.IReadOnlyList<string> ResolveRequiredFieldChoices(string propertyCode)
+        {
+            if (string.IsNullOrEmpty(propertyCode)) return null;
+            // Owner-family aliases all resolve to the same Schema list.
+            bool isOwnerLike =
+                string.Equals(propertyCode, "Owner", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(propertyCode, "Name_Qualifier", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(propertyCode, "Schema_Ref", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(propertyCode, "Schema", StringComparison.OrdinalIgnoreCase);
+            if (!isOwnerLike) return null;
+
+            var names = new System.Collections.Generic.SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+            dynamic modelObjects = null;
+            dynamic root = null;
+            dynamic schemas = null;
+            try
+            {
+                modelObjects = _session?.ModelObjects;
+                root = modelObjects?.Root;
+                if (root == null) return null;
+                schemas = modelObjects.Collect(root, "Schema");
+                if (schemas == null) return null;
+                foreach (dynamic sch in schemas)
+                {
+                    if (sch == null) continue;
+                    string schName;
+                    try { schName = sch.Name?.ToString() ?? ""; }
+                    catch { continue; }
+                    if (!string.IsNullOrEmpty(schName)) names.Add(schName);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"ResolveRequiredFieldChoices err for '{propertyCode}': {ex.Message}");
+            }
+            // Returning an empty list would render an empty combo and trap
+            // the user. Fall back to null (free text) so they at least have
+            // a chance to type a name; the SCAPI write will still surface
+            // the existing "must be an existing Schema" error if they
+            // invent one.
+            return names.Count > 0 ? new System.Collections.Generic.List<string>(names) : null;
+        }
+
         /// <returns>True when the entity was successfully removed; false on
         /// any failure (caller treats false as "leave the entity alone" so
         /// the user can manually clean up).</returns>
@@ -1366,7 +1420,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             // Step 1: silently apply AUTO_APPLY=true rules
             if (scapiBoxed != null)
             {
-                string afterAuto = NamingValidationEngine.ApplyNamingStandards(objectType, physicalName, scapiBoxed, autoOnly: true);
+                string afterAuto = NamingValidationEngine.ApplyNamingStandards(objectType, physicalName, scapiBoxed, autoOnly: true, isNew: isNew);
                 if (!string.Equals(afterAuto, physicalName, StringComparison.Ordinal))
                 {
                     int transId = _session.BeginNamedTransaction("ApplyAutoNamingStandard");
@@ -1396,7 +1450,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             // Step 2: ask user about AUTO_APPLY=false rules that would still change the name
             if (scapiBoxed != null)
             {
-                string afterAll = NamingValidationEngine.ApplyNamingStandards(objectType, physicalName, scapiBoxed, autoOnly: false);
+                string afterAll = NamingValidationEngine.ApplyNamingStandards(objectType, physicalName, scapiBoxed, autoOnly: false, isNew: isNew);
                 if (!string.Equals(afterAll, physicalName, StringComparison.Ordinal))
                 {
                     var answer = AddinMessageDialog.Show(
@@ -1445,7 +1499,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 catch { }
             }
 
-            var results = NamingValidationEngine.ValidateObjectName(objectType, nameToValidate, scapiBoxed);
+            var results = NamingValidationEngine.ValidateObjectName(objectType, nameToValidate, scapiBoxed, isNew: isNew);
             var failures = results.Where(r => !r.IsValid).ToList();
 
             // Step 3b (2026-05-16): the admin can author rules on any
@@ -1488,8 +1542,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                         Log($"Naming standard: SCAPI did not surface '{objectType}.{propertyCode}' on this entity (treating as empty): {ex.Message}");
                     }
 
+                    // Diagnostic (2026-05-25): help triage "Required popup
+                    // didn't fire for property X on new entity Y" reports
+                    // by surfacing the live value the engine sees.
+                    Log($"NamingValidate: '{objectType}.{propertyCode}' on '{physicalName}' liveValue='{propValue}' isNew={isNew}");
                     var extraResults = NamingValidationEngine.ValidateObjectName(
-                        objectType, propValue, scapiBoxed, propertyCode);
+                        objectType, propValue, scapiBoxed, propertyCode, isNew: isNew);
                     failures.AddRange(extraResults.Where(r => !r.IsValid));
                 }
             }
@@ -1600,6 +1658,19 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // violates the rule. User must provide a valid value
                     // (or delete the entity from the diagram between
                     // popups). New entities still escape via Discard.
+                    // Property-aware choice list (2026-05-25 user request).
+                    // For list-typed required properties (currently Owner /
+                    // Name_Qualifier / Schema_Ref -> existing Schema objects),
+                    // resolve the set of valid values from the model so the
+                    // dialog renders a locked ComboBox instead of a free
+                    // text input. Without this, the user could type an
+                    // arbitrary string and erwin would later reject the
+                    // SCAPI write (SCVT_OBJID column expects an existing
+                    // Schema, not a name). Returns null for properties
+                    // without a fixed choice list - dialog falls back to
+                    // TextBox.
+                    var fieldChoices = ResolveRequiredFieldChoices(rf.Rule.PropertyCode);
+
                     string currentMessage = rf.ErrorMessage;
                     string currentSeed = seedValue;
                     System.Windows.Forms.DialogResult rc;
@@ -1614,7 +1685,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                             owner: null,
                             initialValue: currentSeed,
                             mode: cancelMode,
-                            objectKind: objectType);
+                            objectKind: objectType,
+                            choices: fieldChoices);
 
                         if (rc == System.Windows.Forms.DialogResult.OK && !string.IsNullOrEmpty(typed))
                             break; // user typed a value - fall through to write+re-prompt logic below
@@ -1758,7 +1830,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                             catch { liveValue = currentTyped; }
 
                             var freshResults = NamingValidationEngine.ValidateObjectName(
-                                objectType, liveValue, scapiBoxed, rf.Rule.PropertyCode);
+                                objectType, liveValue, scapiBoxed, rf.Rule.PropertyCode, isNew: isNew);
                             var freshFailure = freshResults?.FirstOrDefault(r => !r.IsValid);
                             if (freshFailure == null)
                             {
@@ -1780,7 +1852,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 owner: null,
                                 initialValue: liveValue,
                                 mode: cancelMode,
-                                objectKind: objectType);
+                                objectKind: objectType,
+                                choices: fieldChoices);
 
                             if (rc2 != System.Windows.Forms.DialogResult.OK || string.IsNullOrEmpty(typed2))
                             {
@@ -2136,8 +2209,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                 failures.RemoveAll(f => f.Rule != null
                     && string.Equals(f.Rule.PropertyCode, propertyCode, StringComparison.OrdinalIgnoreCase));
 
+                // Post-revert re-validation runs only for existing entities
+                // (the Cancel branch that calls this never fires for new
+                // ones - new entities are deleted on Cancel instead). So
+                // pass isNew=false unconditionally.
                 var freshResults = NamingValidationEngine.ValidateObjectName(
-                    objectType, postRevertValue, scapiBoxed, propertyCode);
+                    objectType, postRevertValue, scapiBoxed, propertyCode, isNew: false);
                 if (freshResults == null) return true;
 
                 var freshFailures = freshResults.Where(r => !r.IsValid).ToList();

@@ -95,5 +95,7 @@ Söylediklerimi sorgula, ayrıca senin de çözüm için bulduğun  mantıkları
 
 Yazılımı oluşturuken profesyönel ve deneyimli bir yazılımcı olarak düşün. eklediğin kodların etkilerini göz ardı etme.
 
-
 Ekranları yaparken profesyönel bir UX gözü ile değerlendirerek iyi analiz ederek yap.
+
+Yeni bir özellik/fonksiyonelaite eklerken mevcutta benzer işlem var mı bak, benzer yolları kullanmayı dene.
+Yeni ekleme yaparken SOLID proensiplerine dikkat et!

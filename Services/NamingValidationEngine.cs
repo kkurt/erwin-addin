@@ -48,7 +48,10 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <param name="objectName">Physical name of the object</param>
         /// <param name="scapiObject">erwin SCAPI object for reading UDP values (null = skip conditional rules)</param>
         /// <param name="propertyCode">Property whose value is being validated; defaults to "Physical_Name".</param>
-        public static List<NamingValidationResult> ValidateObjectName(string objectType, string objectName, dynamic scapiObject = null, string propertyCode = DefaultPropertyCode)
+        /// <param name="isNew">Set to <c>true</c> when the target object/column was just created
+        /// in this validation pass; false (default) for edits to existing ones. Filters rules
+        /// by their <see cref="NamingStandardRule.ApplyOn"/> gate.</param>
+        public static List<NamingValidationResult> ValidateObjectName(string objectType, string objectName, dynamic scapiObject = null, string propertyCode = DefaultPropertyCode, bool isNew = false)
         {
             var results = new List<NamingValidationResult>();
 
@@ -64,6 +67,11 @@ namespace EliteSoft.Erwin.AddIn.Services
 
             foreach (var rule in rules)
             {
+                // ApplyOn context gate (2026-05-25): admin can scope a rule
+                // to fire only on Create / only on Update / Both. Skip
+                // rules that do not match the current context.
+                if (!MatchesApplyOn(rule, isNew)) continue;
+
                 // UDP condition check: skip rule if condition doesn't match
                 if (!IsRuleApplicable(rule, objectType, scapiObject))
                     continue;
@@ -72,6 +80,24 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
 
             return results;
+        }
+
+        /// <summary>
+        /// Returns true when the rule's <see cref="NamingStandardRule.ApplyOn"/>
+        /// gate matches the current evaluation context. <c>Both</c> always
+        /// matches; <c>Create</c> matches only when <paramref name="isNew"/>
+        /// is true; <c>Update</c> matches only when it is false.
+        /// </summary>
+        internal static bool MatchesApplyOn(NamingStandardRule rule, bool isNew)
+        {
+            if (rule == null) return false;
+            switch (rule.ApplyOn)
+            {
+                case RuleApplyOn.Create: return isNew;
+                case RuleApplyOn.Update: return !isNew;
+                case RuleApplyOn.Both:
+                default: return true;
+            }
         }
 
         /// <summary>
@@ -105,7 +131,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// compute what the name would look like with manual rules.
         /// </para>
         /// </summary>
-        public static string ApplyNamingStandards(string objectType, string objectName, dynamic scapiObject = null, bool autoOnly = true, string propertyCode = DefaultPropertyCode)
+        public static string ApplyNamingStandards(string objectType, string objectName, dynamic scapiObject = null, bool autoOnly = true, string propertyCode = DefaultPropertyCode, bool isNew = false)
         {
             if (string.IsNullOrEmpty(objectName)) return objectName;
             if (!NamingStandardService.Instance.IsLoaded) return objectName;
@@ -123,7 +149,8 @@ namespace EliteSoft.Erwin.AddIn.Services
             var rules = NamingStandardService.Instance
                 .GetByObjectTypeAndProperty(objectType, propertyCode)
                 .Where(r => r != null
-                            && (r.RuleType == NamingRuleKind.Prefix || r.RuleType == NamingRuleKind.Suffix))
+                            && (r.RuleType == NamingRuleKind.Prefix || r.RuleType == NamingRuleKind.Suffix)
+                            && MatchesApplyOn(r, isNew))
                 .ToList();
 
             string result = objectName;
@@ -201,12 +228,12 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// Check if applying naming standards would change the given name.
         /// autoOnly=true → only AUTO_APPLY rules; autoOnly=false → all rules.
         /// </summary>
-        public static bool HasAutoApplyChanges(string objectType, string objectName, dynamic scapiObject = null, bool autoOnly = true, string propertyCode = DefaultPropertyCode)
+        public static bool HasAutoApplyChanges(string objectType, string objectName, dynamic scapiObject = null, bool autoOnly = true, string propertyCode = DefaultPropertyCode, bool isNew = false)
         {
             if (string.IsNullOrEmpty(objectName)) return false;
             if (!NamingStandardService.Instance.IsLoaded) return false;
 
-            string applied = ApplyNamingStandards(objectType, objectName, scapiObject, autoOnly, propertyCode);
+            string applied = ApplyNamingStandards(objectType, objectName, scapiObject, autoOnly, propertyCode, isNew);
             return !string.Equals(applied, objectName, StringComparison.Ordinal);
         }
 
@@ -395,10 +422,13 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             // Step 1: empty/IS_REQUIRED gate. ERROR_MESSAGE is the single
             // message field shared by the empty case and the pattern case
-            // (spec 2026-05-17).
+            // (spec 2026-05-17). Post-2026-05-25 a rule can ALSO carry
+            // RULE_TYPE='Required' as a first-class kind; that implies
+            // "must be non-empty" regardless of the IS_REQUIRED flag.
+            bool treatAsRequired = rule.IsRequired || rule.RuleType == NamingRuleKind.Required;
             if (string.IsNullOrWhiteSpace(objectName))
             {
-                if (rule.IsRequired)
+                if (treatAsRequired)
                 {
                     results.Add(NamingValidationResult.Invalid("Required",
                         !string.IsNullOrEmpty(rule.ErrorMessage)
@@ -460,6 +490,15 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 ? rule.ErrorMessage
                                 : $"Name length must be {rule.LengthOperator} {rule.LengthValue}", rule));
                     }
+                    break;
+
+                case NamingRuleKind.Required:
+                    // Pure Required rule. The non-empty check is done by
+                    // Step 1 above; once we reach here the value is
+                    // already non-empty, so this rule has nothing else
+                    // to enforce. Length / Regexp / Prefix / Suffix
+                    // siblings on the same property continue to run as
+                    // separate rules.
                     break;
 
                 case NamingRuleKind.Regexp:

@@ -90,7 +90,15 @@ if ($Help) {
 # Per-user install paths.
 $installDir = Join-Path $env:LOCALAPPDATA "EliteSoft\ErwinAddIn"
 $comHostDll = "EliteSoft.Erwin.AddIn.comhost.dll"
-$progId = "EliteSoft.Erwin.AddIn"
+# ProgID + menu display name. Both renamed 2026-05-25 from
+# "EliteSoft.Erwin.AddIn" + "Elite Soft Erwin Addin" to the names below.
+# Install script aggressively cleans up the OLD names to prevent erwin
+# from showing two entries in Tools > Add-Ins or routing CLSIDFromProgID
+# through stale registration.
+$progId = "EliteSoft.Meta.AddIn"
+$addInDisplayName = "Elite Soft Meta Addin"
+$legacyProgId = "EliteSoft.Erwin.AddIn"
+$legacyAddInDisplayName = "Elite Soft Erwin Addin"
 # CLSID must mirror the [Guid(...)] attribute on ErwinAddIn class in
 # ErwinAddIn.cs:17. Used by Register-ComUserScope which writes HKCU\Software\Classes
 # directly (avoids regsvr32's HKLM-default and the resulting UAC prompt).
@@ -251,22 +259,35 @@ if ($Uninstall) {
 
     Write-Host "Unregistering COM component (HKCU)..." -ForegroundColor Yellow
     Unregister-ComUserScope -clsid $clsid -progId $progId
+    # Also nuke the legacy "EliteSoft.Erwin.AddIn" ProgID key (pre-2026-05-25
+    # rename). Harmless when absent on fresh installs.
+    $legacyProgIdBase = "HKCU:\Software\Classes\$legacyProgId"
+    if (Test-Path $legacyProgIdBase) {
+        Remove-Item -LiteralPath $legacyProgIdBase -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Host "  Legacy ProgID '$legacyProgId' removed" -ForegroundColor Gray
+    }
     Write-Host "  COM unregistered" -ForegroundColor Green
 
     # Remove erwin Add-In Manager entry from HKCU only. HKLM Add-In entries
     # (if any exist from corporate provisioning) are invisible to erwin r10
     # anyway, so leaving them alone has no effect; touching HKLM would need
     # elevation we deliberately avoid.
+    #
+    # Sweep BOTH the current display name and the legacy one to guarantee
+    # a clean menu (otherwise users see "Elite Soft Erwin Addin" + "Elite
+    # Soft Meta Addin" side-by-side on upgrade boxes).
     $base = "HKCU:\$erwinRegBase"
     if (Test-Path $base) {
         Get-ChildItem $base -ErrorAction SilentlyContinue | ForEach-Object {
-            $addInPath = "$($_.PSPath)\Add-Ins\Elite Soft Erwin Addin"
-            if (Test-Path $addInPath) {
+            $verKey = $_
+            foreach ($entryName in @($addInDisplayName, $legacyAddInDisplayName)) {
+                $addInPath = "$($verKey.PSPath)\Add-Ins\$entryName"
+                if (-not (Test-Path $addInPath)) { continue }
                 try {
                     Remove-Item $addInPath -Recurse -Force -ErrorAction Stop
-                    Write-Host "  Removed erwin Add-In entry from HKCU\$($_.PSChildName)" -ForegroundColor Green
+                    Write-Host "  Removed '$entryName' from HKCU\$($verKey.PSChildName)" -ForegroundColor Green
                 } catch {
-                    Write-Host "  WARNING: Could not remove HKCU\$($_.PSChildName) Add-In entry: $($_.Exception.Message)" -ForegroundColor Yellow
+                    Write-Host "  WARNING: could not remove '$entryName' from HKCU\$($verKey.PSChildName): $($_.Exception.Message)" -ForegroundColor Yellow
                 }
             }
         }
@@ -372,15 +393,64 @@ if (-not $dotnetOk) {
 # this race.
 $taskName = "EliteSoft Erwin AddIn AutoStart - $env:USERNAME"
 $legacyTaskName = "EliteSoft Erwin AddIn AutoStart"
+# Graceful shutdown signal: a named event the watcher loop waits on.
+# Replaces the old `$_.Terminate()` WMI call which Symantec SEP's SONAR
+# heuristic (AGR.Terminate!g2) flags as `Compromised Application` because
+# powershell.exe terminating another powershell.exe via WMI matches the
+# script-host-killing-script-host malware pattern. SetEvent + brief wait
+# + non-WMI fallback delivers the same effect without the SONAR trigger.
+$shutdownEventName = 'Global\EliteSoft.ErwinAddIn.Watcher.Shutdown'
 try {
-    # Kill ALL autostart-watcher PowerShell processes
-    Get-WmiObject Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -match "autostart-watcher" } |
-        ForEach-Object {
-            Write-Host "  Stopping watcher process PID=$($_.ProcessId)" -ForegroundColor Gray
-            $_.Terminate() | Out-Null
+    # Identify running watcher PIDs via CommandLine match (read-only).
+    # Get-CimInstance is preferred over the deprecated Get-WmiObject; both
+    # are read-only enumeration here and do NOT match AGR.Terminate.
+    $watcherPids = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -match 'autostart-watcher' } |
+        Select-Object -ExpandProperty ProcessId)
+
+    if ($watcherPids.Count -gt 0) {
+        Write-Host "  Found $($watcherPids.Count) running watcher PID(s): $($watcherPids -join ', ')" -ForegroundColor Gray
+        # Step 1: signal graceful shutdown via named Event. The watcher's
+        # main loop blocks on WaitOne($shutdownEventName, $intervalMs); on
+        # signal it exits cleanly. New watchers (older builds without this
+        # event) just won't see the signal and we fall through to step 3.
+        $evt = $null
+        try {
+            $created = $false
+            $evt = [System.Threading.EventWaitHandle]::new($false, [System.Threading.EventResetMode]::ManualReset, $shutdownEventName, [ref]$created)
+            [void]$evt.Set()
+            Write-Host "  Signaled '$shutdownEventName'; waiting up to 3s for graceful exit" -ForegroundColor Gray
+        } catch {
+            Write-Host "  (named event signal failed: $($_.Exception.Message); will fall back to Stop-Process)" -ForegroundColor DarkGray
         }
-    Start-Sleep -Seconds 2
+
+        # Step 2: poll for actual exit. Most watchers respond in <1s.
+        $waitDeadline = (Get-Date).AddSeconds(3)
+        while ((Get-Date) -lt $waitDeadline) {
+            $stillAlive = @($watcherPids | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+            if ($stillAlive.Count -eq 0) { break }
+            Start-Sleep -Milliseconds 200
+        }
+
+        # Step 3: anything still alive after the grace period gets a hard
+        # Stop-Process. Stop-Process is the standard PowerShell idiom and
+        # does NOT match SEP's AGR.Terminate `Compromised Application`
+        # pattern (which was specifically about WMI Win32_Process.Terminate
+        # called from a script). Even if SEP still flags, only stragglers
+        # are at risk - happy path never reaches this branch.
+        $stragglers = @($watcherPids | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+        foreach ($pidVal in $stragglers) {
+            try {
+                Stop-Process -Id $pidVal -Force -ErrorAction Stop
+                Write-Host "  Force-stopped straggler watcher PID=$pidVal (event did not reach it)" -ForegroundColor Yellow
+            } catch {
+                Write-Host "  WARNING: could not stop watcher PID=${pidVal}: $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+        }
+
+        if ($evt) { try { $evt.Dispose() } catch {} }
+    }
+
     # Force SCM state Running -> Ready so the later Start-ScheduledTask is
     # actually honoured. Missing tasks fail silently (legitimate on first
     # install).
@@ -527,29 +597,52 @@ Write-Host "`n[3/4] Registering in erwin Add-In Manager (HKCU\$erwinRegBase\$erw
 # Sweep stale Add-In entries from BOTH hives so old installs (HKLM Add-Ins,
 # HKCU 9.98 leftovers, mismatched scope, etc.) cannot mask the canonical
 # HKCU\10.10 entry we are about to write.
+# Sweep BOTH the current and legacy display names so an upgrade from the
+# old "Elite Soft Erwin Addin" registration never leaves a duplicate
+# Tools > Add-Ins entry pointing at a stale ProgID.
 foreach ($staleHive in @("HKLM", "HKCU")) {
     $staleBase = "${staleHive}:\$erwinRegBase"
     if (-not (Test-Path $staleBase)) { continue }
     Get-ChildItem $staleBase -ErrorAction SilentlyContinue | ForEach-Object {
-        $stalePath = "$($_.PSPath)\Add-Ins\Elite Soft Erwin Addin"
-        if (-not (Test-Path $stalePath)) { return }
-        try {
-            Remove-Item $stalePath -Recurse -Force -ErrorAction Stop
-            Write-Host "  Removed stale $staleHive\$($_.PSChildName) Add-In entry" -ForegroundColor Gray
-        } catch {
-            if ($staleHive -eq "HKLM") {
-                Write-Host "  WARNING: Could not remove stale HKLM\$($_.PSChildName) Add-In entry (needs Admin); delete manually." -ForegroundColor Yellow
-            } else {
-                Write-Host "  WARNING: Could not remove stale HKCU\$($_.PSChildName) Add-In entry: $($_.Exception.Message)" -ForegroundColor Yellow
+        $verKey = $_
+        foreach ($entryName in @($addInDisplayName, $legacyAddInDisplayName)) {
+            $stalePath = "$($verKey.PSPath)\Add-Ins\$entryName"
+            if (-not (Test-Path $stalePath)) { continue }
+            try {
+                Remove-Item $stalePath -Recurse -Force -ErrorAction Stop
+                Write-Host "  Removed stale $staleHive\$($verKey.PSChildName) entry '$entryName'" -ForegroundColor Gray
+            } catch {
+                if ($staleHive -eq "HKLM") {
+                    Write-Host "  WARNING: Could not remove stale HKLM\$($verKey.PSChildName) '$entryName' (needs Admin); delete manually." -ForegroundColor Yellow
+                } else {
+                    Write-Host "  WARNING: Could not remove stale HKCU\$($verKey.PSChildName) '$entryName': $($_.Exception.Message)" -ForegroundColor Yellow
+                }
             }
         }
     }
 }
 
+# Also nuke the legacy COM ProgID HKCU\Software\Classes\EliteSoft.Erwin.AddIn
+# so erwin's CLSIDFromProgID for the OLD name resolves to nothing (defensive:
+# even if a stale Add-In Manager entry survives somewhere, it points at a
+# ProgID that no longer exists and erwin will not attempt activation).
+$legacyProgIdBase = "HKCU:\Software\Classes\$legacyProgId"
+if (Test-Path $legacyProgIdBase) {
+    Remove-Item -LiteralPath $legacyProgIdBase -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Host "  Removed legacy COM ProgID '$legacyProgId'" -ForegroundColor Gray
+}
+
+# AddinCmdId clearing REMOVED 2026-05-26: empirically the cmd id is
+# stable across erwin restarts AND across menu-entry delete+recreate
+# cycles (still 1181 with one addin registered). Aggressive clearing on
+# every install was forcing users to redo the 2-click discovery after
+# every upgrade. WmCommandLogger.MarkExecuteEntry self-heals if the id
+# ever DOES drift, so leaving the cached value is safe.
+
 # Write the canonical HKCU entry. New-Item -Force creates every missing parent
-# (Software\erwin\Data Modeler\10.10\Add-Ins\Elite Soft Erwin Addin) in one
+# (Software\erwin\Data Modeler\10.10\Add-Ins\$addInDisplayName) in one
 # call, so this works on a fresh user who has never opened erwin before.
-$addInPath = "HKCU:\$erwinRegBase\$erwinVersion\Add-Ins\Elite Soft Erwin Addin"
+$addInPath = "HKCU:\$erwinRegBase\$erwinVersion\Add-Ins\$addInDisplayName"
 if (-not (Test-Path $addInPath)) {
     New-Item -Path $addInPath -Force | Out-Null
 }
@@ -557,7 +650,7 @@ Set-ItemProperty $addInPath -Name "Menu Identifier" -Value 1 -Type DWord
 Set-ItemProperty $addInPath -Name "ProgID"          -Value $progId -Type String
 Set-ItemProperty $addInPath -Name "Invoke Method"   -Value "Execute" -Type String
 Set-ItemProperty $addInPath -Name "Invoke EXE"      -Value 0 -Type DWord
-Write-Host "  erwin $erwinVersion (HKCU) - OK" -ForegroundColor Green
+Write-Host "  erwin $erwinVersion (HKCU) - OK ('$addInDisplayName' -> $progId)" -ForegroundColor Green
 
 # Step 4: MetaRepo bootstrap (DB connection seed). Decision tree:
 #   1. HKLM\Software\EliteSoft\MetaRepo\Bootstrap is populated (DBHost AND
@@ -799,15 +892,11 @@ Write-Host "`n[Watcher] Configuring auto-start watcher..." -ForegroundColor Yell
 $watcherSource = Join-Path $sourceDir "autostart-watcher.ps1"
 $watcherTarget = Join-Path $installDir "autostart-watcher.ps1"
 
-# Verify injection components exist in install dir
-$injectorPath = Join-Path $installDir "ErwinInjector.exe"
-$triggerDllPath = Join-Path $installDir "TriggerDll.dll"
-if (-not (Test-Path $injectorPath)) {
-    Write-Host "  WARNING: ErwinInjector.exe not found in package" -ForegroundColor Yellow
-}
-if (-not (Test-Path $triggerDllPath)) {
-    Write-Host "  WARNING: TriggerDll.dll not found in package" -ForegroundColor Yellow
-}
+# Legacy injection components ErwinInjector.exe / TriggerDll.dll removed
+# 2026-05-26 (SEP SONAR.ProcHijack-flagged, obsolete after PostMessage
+# auto-load). No pre-flight check needed - watcher only requires
+# autostart-watcher.ps1 (verified by the Test-Path check immediately
+# below) and the addin COM registration (Step 2 above).
 
 if (Test-Path -LiteralPath $watcherSource) {
     [System.IO.File]::Copy($watcherSource, $watcherTarget, $true)

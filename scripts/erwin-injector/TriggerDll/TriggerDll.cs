@@ -195,7 +195,11 @@ public static class TriggerDll
         try
         {
             Guid clsid;
-            int hr = CLSIDFromProgID("EliteSoft.Erwin.AddIn", out clsid);
+            // ProgID renamed 2026-05-25 from "EliteSoft.Erwin.AddIn".
+            // TriggerDll is the SEP-flagged legacy injector path used only
+            // when InjectionEnabled=1 in HKCU\...\Watcher; the PostMessage
+            // auto-load path replaces this entirely.
+            int hr = CLSIDFromProgID("EliteSoft.Meta.AddIn", out clsid);
             if (hr != 0) { Log("ProgID not found"); return; }
 
             hr = CoCreateInstance(ref clsid, IntPtr.Zero, CLSCTX_ALL, ref IID_IDispatch, out pDispatch);

@@ -1,5 +1,5 @@
 try {
-    $obj = New-Object -ComObject "EliteSoft.Erwin.AddIn"
+    $obj = New-Object -ComObject "EliteSoft.Meta.AddIn"
     Write-Host "SUCCESS: COM object created"
 } catch {
     Write-Host "FAILED:"
