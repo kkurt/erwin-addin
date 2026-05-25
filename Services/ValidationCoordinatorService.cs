@@ -110,6 +110,37 @@ namespace EliteSoft.Erwin.AddIn.Services
         // courtesy only.
         private readonly HashSet<string> _dismissedRequiredColumnKeys = new HashSet<string>(StringComparer.Ordinal);
 
+        // Scoped entity cache (2026-05-24): when the locked-column rename
+        // watch runs, it has already walked the entity collection and
+        // bound `entity` for the matching table. Without this cache, the
+        // downstream EnforceLockedColumnRename -> ResolveEntityByName
+        // call would do a SECOND full walk for the SAME table on every
+        // locked rename. Set inside ScanForLockedColumnRenames before
+        // ProcessAttributeChanges; cleared in finally. Strictly a hot-
+        // path cache - never read outside the scoped call frame.
+        private string _scanContextTableName;
+        private dynamic _scanContextEntity;
+
+        // Locked-column dialog suspension flag (2026-05-25). True while a
+        // LockedColumnDialog is on screen. Heartbeat (MonitorTimer) and
+        // window-state (WindowMonitorTimer) ticks check this and early-
+        // return so their SCAPI walks do not run inside the dialog's
+        // nested message pump - those walks were blocking the dialog
+        // from processing OK clicks for several seconds. User complaint
+        // 2026-05-24 ("3-4 sn sonra tıklamam gerçekleşti"). Strictly
+        // per-process, not persisted.
+        private volatile bool _lockedDialogShowing;
+
+        // De-duplication for locked-column dialogs (2026-05-25). Multiple
+        // detection paths (close-edge re-evaluate, heartbeat attrsShrunk
+        // restore, scan rename) can race for the same column-action pair
+        // on the same tick / dialog cycle. Add the (entity|column|action)
+        // key when we enqueue a deferred dialog, remove it when the
+        // apply phase completes. While the key is pending, parallel
+        // detections short-circuit so the user does not see two dialogs
+        // for the same edit.
+        private readonly HashSet<string> _pendingLockedDialogKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
         // Phase-2E (2026-05-12): diagram-side heartbeat for add detection when no
         // editor dialog is open. Pure count snapshots, no per-property reads -
         // the eliminated Phase-2D full-walk was expensive because it read every
@@ -785,6 +816,11 @@ namespace EliteSoft.Erwin.AddIn.Services
         private void MonitorTimer_Tick(object sender, EventArgs e)
         {
             if (_sessionLost || !_isMonitoring || _disposed || _isProcessingChange || _validationSuspended || _isCheckingForChanges) return;
+            // 2026-05-25: while a locked-column dialog is up, skip the
+            // entire heartbeat. SCAPI walks during the dialog's nested
+            // message pump otherwise hog the UI thread and block OK
+            // click processing (user-reported 3-4 sec freeze).
+            if (_lockedDialogShowing) return;
 
             // Safety: check if model is still open BEFORE touching the session.
             // This avoids calling methods on a dead COM object (which causes native crash in erwin).
@@ -963,8 +999,12 @@ namespace EliteSoft.Erwin.AddIn.Services
             {
                 long delta = totalAttrs - _lastTotalAttributeCount;
                 long entityDelta = totalEntities - _lastTotalEntityCount;
-                if (!isFirstTick)
+                if (!isFirstTick && (delta != 0 || entityDelta != 0))
                 {
+                    // 2026-05-24: stopped logging zero-delta ticks. They fire
+                    // every second on every model and flooded the log file
+                    // (~90% of lines were stable-tick noise). Only log when
+                    // something actually changed.
                     Log($"DiagramHeartbeat: delta detected attrs={delta:+#;-#;0} entities={entityDelta:+#;-#;0} (was {_lastTotalAttributeCount}/{_lastTotalEntityCount}, now {totalAttrs}/{totalEntities})");
                 }
 
@@ -1052,22 +1092,29 @@ namespace EliteSoft.Erwin.AddIn.Services
                     catch (Exception ex) { Log($"DiagramHeartbeat: per-entity count err for '{displayName}': {ex.Message}"); }
 
                     bool attrsGrew = isKnownEntity && currentAttrCount > prevCount;
+                    bool attrsShrunk = isKnownEntity && currentAttrCount < prevCount;
                     bool isNewlySeenEntity = !isKnownEntity;
                     bool isPendingOwner = _pendingNamedAttrs.ContainsKey(entityId);
                     // Walk attribute ids whenever the entity hasn't been
-                    // snapshotted yet OR its count grew. Critically we run the
-                    // walk on the FIRST tick too (when no previous snapshot
-                    // exists for any entity), otherwise the next tick's diff
-                    // would see "no prior ids" and treat every existing attr
-                    // as new - producing a popup for every column in the table
-                    // (verified 2026-05-12: log "stripped 31 new attr(s)" then
-                    // "diff fired 31 result(s)" on a 31-attr table after a 1-
-                    // attr add). We do not validate on the first tick - just
-                    // snapshot - so the cost is one ObjectId read per attr per
-                    // entity, paid once at start.
-                    bool needsIdWalk = attrsGrew || isNewlySeenEntity;
+                    // snapshotted yet OR its count grew OR its count shrank.
+                    // Critically we run the walk on the FIRST tick too (when
+                    // no previous snapshot exists for any entity), otherwise
+                    // the next tick's diff would see "no prior ids" and treat
+                    // every existing attr as new - producing a popup for every
+                    // column in the table (verified 2026-05-12: log "stripped
+                    // 31 new attr(s)" then "diff fired 31 result(s)" on a 31-
+                    // attr table after a 1-attr add). We do not validate on
+                    // the first tick - just snapshot - so the cost is one
+                    // ObjectId read per attr per entity, paid once at start.
+                    //
+                    // attrsShrunk (2026-05-24, Phase 5) drives the locked-
+                    // column delete-restore path: we need the current attr-id
+                    // set so we can diff against the previous set and find
+                    // exactly which attribute ObjectIds disappeared.
+                    bool needsIdWalk = attrsGrew || isNewlySeenEntity || attrsShrunk;
 
                     HashSet<string> newAttrIds = null;
+                    HashSet<string> missingAttrIds = null;
                     if (needsIdWalk && entityAttrs != null)
                     {
                         currentAttrIds = new HashSet<string>(StringComparer.Ordinal);
@@ -1087,6 +1134,18 @@ namespace EliteSoft.Erwin.AddIn.Services
                         {
                             newAttrIds = new HashSet<string>(currentAttrIds, StringComparer.Ordinal);
                             newAttrIds.ExceptWith(prevIds);
+
+                            // Phase 5 (2026-05-24): when the count shrank we
+                            // also need to know which ObjectIds disappeared so
+                            // we can detect locked-column deletion. ExceptWith
+                            // is symmetric to the new-id calc above. Only
+                            // computed when attrsShrunk to avoid useless
+                            // allocations on grow-only ticks.
+                            if (attrsShrunk)
+                            {
+                                missingAttrIds = new HashSet<string>(prevIds, StringComparer.Ordinal);
+                                missingAttrIds.ExceptWith(currentAttrIds);
+                            }
                         }
                         else
                         {
@@ -1100,6 +1159,17 @@ namespace EliteSoft.Erwin.AddIn.Services
                         }
                     }
                     ReleaseCom(entityAttrs);
+
+                    // Locked-column delete restore (Phase 5, 2026-05-24).
+                    // Triggers ONLY when attrs shrank AND we have a missing-
+                    // id set. Pre-filtered against locked names so non-locked
+                    // deletions pay zero cost - admin's normal column-removal
+                    // workflow is not disturbed.
+                    if (!isFirstTick && attrsShrunk && missingAttrIds != null && missingAttrIds.Count > 0)
+                    {
+                        try { RestoreDeletedLockedColumns(entity, displayName, missingAttrIds); }
+                        catch (Exception restEx) { Log($"RestoreDeletedLockedColumns err on '{displayName}': {restEx.Message}"); }
+                    }
 
                     // Validation only fires AFTER the first tick (we want to
                     // baseline the pre-existing model silently on startup).
@@ -1443,9 +1513,177 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// any Required-violation popup that the diff exposed (e.g. the
         /// user cleared Owner on an existing table).
         /// </summary>
-        private void DiffWatchedPropertiesAndFire(string tableName, Dictionary<string, string> baseline)
+        /// <summary>
+        /// Look the entity up by physical name in the live model and let
+        /// <c>TableTypeMonitorService.ReevaluateConditionalPredefinedColumns</c>
+        /// re-apply any predefined-column rule whose UDP condition now
+        /// matches. Walking by name uses the same Collect("Entity") + match
+        /// path RunScopedTableNamingCheck does, so cost is identical.
+        /// Best-effort: per-entity errors are logged but do not propagate.
+        /// </summary>
+        private void RunScopedReevaluateConditionalPredefinedColumns(string tableName)
         {
-            if (string.IsNullOrEmpty(tableName) || baseline == null) return;
+            if (string.IsNullOrEmpty(tableName)) return;
+            if (_validationSuspended) return;
+            if (_sessionLost || _disposed) return;
+            if (_tableTypeMonitor == null) return;
+
+            dynamic modelObjects = null;
+            dynamic root = null;
+            dynamic allEntities = null;
+            try
+            {
+                modelObjects = _session.ModelObjects;
+                root = modelObjects?.Root;
+                if (root == null) return;
+                allEntities = modelObjects.Collect(root, "Entity");
+                if (allEntities == null) return;
+
+                foreach (dynamic entity in allEntities)
+                {
+                    if (entity == null) continue;
+                    string nameForMatch;
+                    try
+                    {
+                        string p = entity.Properties("Physical_Name").Value?.ToString() ?? "";
+                        nameForMatch = (!string.IsNullOrEmpty(p) && !p.StartsWith("%")) ? p : (entity.Name ?? "");
+                    }
+                    catch { try { nameForMatch = entity.Name ?? ""; } catch { continue; } }
+
+                    if (!EntityNameMatchesTitle(nameForMatch, tableName)) continue;
+
+                    // Locked-column delete-restore detection (close-edge,
+                    // 2026-05-25 - "show dialog BEFORE the column re-
+                    // appears"). Walk the entity's current attrs once,
+                    // build the set of locked rule names already present,
+                    // then ask the predefined-column service which locked
+                    // rules CURRENTLY APPLY but have no column in the
+                    // entity. Those are the deletes the user just made.
+                    // For each we enqueue a deferred (dialog + restore)
+                    // and SKIP the normal reevaluate call - the deferred
+                    // apply does the SCAPI add itself once the user
+                    // acknowledges.
+                    var currentLockedAttrNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    try
+                    {
+                        dynamic walkAttrs = modelObjects.Collect(entity, "Attribute");
+                        if (walkAttrs != null)
+                        {
+                            try
+                            {
+                                foreach (dynamic a in walkAttrs)
+                                {
+                                    if (a == null) continue;
+                                    try
+                                    {
+                                        string aName = a.Name ?? "";
+                                        if (!string.IsNullOrEmpty(aName))
+                                            currentLockedAttrNames.Add(aName);
+                                    }
+                                    catch { /* skip this attr */ }
+                                }
+                            }
+                            finally { ReleaseCom(walkAttrs); }
+                        }
+                    }
+                    catch (Exception walkEx) { Log($"RunScopedReevaluateConditionalPredefinedColumns walk err: {walkEx.Message}"); }
+
+                    // Which locked rules currently apply to this entity AND
+                    // are missing a corresponding column? FindApplicableLocked-
+                    // Rule already handles the conditional UDP check.
+                    var missingLockedRules = new List<PredefinedColumn>();
+                    foreach (var lockedRule in PredefinedColumnService.Instance.GetLocked())
+                    {
+                        if (string.IsNullOrEmpty(lockedRule.ColumnName)) continue;
+                        if (currentLockedAttrNames.Contains(lockedRule.ColumnName)) continue;
+                        var applicable = PredefinedColumnService.Instance.FindApplicableLockedRule(entity, lockedRule.ColumnName);
+                        if (applicable == null) continue;
+                        if (applicable.Id != lockedRule.Id) continue;
+                        missingLockedRules.Add(applicable);
+                    }
+
+                    bool entityHasPriorSnapshots = false;
+                    if (missingLockedRules.Count > 0)
+                    {
+                        foreach (var snapKv in _attributeSnapshots)
+                        {
+                            if (snapKv.Value != null
+                                && string.Equals(snapKv.Value.TableName, nameForMatch, StringComparison.Ordinal))
+                            { entityHasPriorSnapshots = true; break; }
+                        }
+                    }
+
+                    if (missingLockedRules.Count > 0 && entityHasPriorSnapshots)
+                    {
+                        // Defer dialog + restore for each missing locked
+                        // column. Skip the normal reevaluate so the column
+                        // does NOT reappear until the user has clicked OK.
+                        string capturedEntityName = nameForMatch;
+                        foreach (var ruleToRestore in missingLockedRules)
+                        {
+                            var capturedRule = ruleToRestore;
+                            string detail = $"Datatype: {capturedRule.DataType}\nNullable: {(capturedRule.Nullable ? "yes" : "no")}"
+                                + (string.IsNullOrEmpty(capturedRule.DefaultValue) ? "" : $"\nDefault: \"{capturedRule.DefaultValue}\"")
+                                + (capturedRule.IsPrimaryKey ? "\nPK: yes" : "");
+                            string dedupe = $"delete|{capturedEntityName}|{capturedRule.ColumnName}";
+                            Log($"Locked predefined-column delete intercepted (close-edge): '{capturedEntityName}.{capturedRule.ColumnName}' (locked rule#{capturedRule.Id}, deferring dialog+restore)");
+                            EnqueueLockedColumnDialogAndApply(
+                                capturedRule.ColumnName,
+                                capturedEntityName,
+                                Forms.LockedColumnAction.Delete,
+                                detail,
+                                dedupe,
+                                () =>
+                                {
+                                    try
+                                    {
+                                        dynamic restoreEntity = ResolveEntityByName(capturedEntityName);
+                                        if (restoreEntity == null)
+                                        {
+                                            Log($"Locked delete restore (close-edge): entity '{capturedEntityName}' not found at apply time");
+                                            return;
+                                        }
+                                        _tableTypeMonitor.RestoreSpecificPredefinedColumn(restoreEntity, capturedRule, capturedEntityName);
+                                        Log($"Locked delete restore applied (close-edge): rule#{capturedRule.Id} '{capturedRule.ColumnName}' on '{capturedEntityName}'");
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        Log($"Locked delete restore (close-edge) FAILED for '{capturedRule.ColumnName}' on '{capturedEntityName}': {ex.Message}");
+                                    }
+                                });
+                        }
+                        // Fall through but skip the normal reevaluate for
+                        // this entity - the deferred path owns the add.
+                        return;
+                    }
+
+                    // No missing locked columns (or brand-new entity which
+                    // is handled by the normal first-add path). Let the
+                    // standard reevaluate handle any non-locked conditional
+                    // rules.
+                    _tableTypeMonitor.ReevaluateConditionalPredefinedColumns(entity, nameForMatch);
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"RunScopedReevaluateConditionalPredefinedColumns err for '{tableName}': {ex.Message}");
+            }
+            finally
+            {
+                ReleaseCom(allEntities);
+            }
+        }
+
+        /// <summary>
+        /// Returns true when the scoped naming check was actually fired
+        /// (i.e. a watched property drift was detected). Callers use this
+        /// to skip a redundant follow-up RunScopedTableNamingCheck after
+        /// editor close.
+        /// </summary>
+        private bool DiffWatchedPropertiesAndFire(string tableName, Dictionary<string, string> baseline)
+        {
+            if (string.IsNullOrEmpty(tableName) || baseline == null) return false;
             var current = ReadEntityWatchedProperties(tableName);
             string changedCode = null;
             string oldVal = null, newVal = null;
@@ -1460,7 +1698,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     break;
                 }
             }
-            if (changedCode == null) return;
+            if (changedCode == null) return false;
             Log($"Editor close: watched property drift on '{tableName}': {changedCode} '{oldVal}' -> '{newVal}' - running scoped naming check");
             // Pass the editor-open baseline through so the downstream
             // Required-popup Cancel branch can revert to the pre-edit value
@@ -1472,6 +1710,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             // the user just changed away from.
             try { RunScopedTableNamingCheck(tableName, baseline); }
             catch (Exception ex) { Log($"DiffWatchedPropertiesAndFire: scoped check err for '{tableName}': {ex.Message}"); }
+            return true;
         }
 
         /// <summary>
@@ -1567,6 +1806,329 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// Event-driven locked-column rename watch (Gap C, 2026-05-24).
+        /// Designed for sub-second popup latency on big models. Walks
+        /// ONLY entities that currently hold a snapshot with a locked-
+        /// rule column name; everything else is filtered out before any
+        /// SCAPI read.
+        ///
+        /// <para>Algorithm:</para>
+        /// <list type="number">
+        /// <item>If no locked predefined-column rules are loaded, return.</item>
+        /// <item>Filter <see cref="_attributeSnapshots"/> to entries whose
+        ///       PhysicalName matches a locked rule's ColumnName, grouped
+        ///       by snapshot.TableName. Result: a small set of candidate
+        ///       table names (usually 1-3).</item>
+        /// <item>Walk entities, match by candidate table name (skip the
+        ///       rest), and for each candidate entity scan only its
+        ///       attributes whose ObjectId is in the filtered snapshot
+        ///       set. Read Physical_Name once per such attr; on drift
+        ///       fire <see cref="ProcessAttributeChanges"/> which runs
+        ///       the locked-column interceptor.</item>
+        /// </list>
+        ///
+        /// The previous unscoped variant walked 286 entities * ~30 attrs
+        /// = ~8400 SCAPI reads per inline-edit-close event and the
+        /// resulting popup latency was several seconds (user complaint
+        /// 2026-05-24). The scoped variant typically reads &lt; 50 props
+        /// and lands the popup in &lt; 200 ms.
+        /// </summary>
+        private void ScanForLockedColumnRenames(string trigger)
+        {
+            if (_sessionLost || _disposed || _validationSuspended) return;
+            if (!IsModelStillOpen()) return;
+            if (!PredefinedColumnService.Instance.IsLoaded) return;
+
+            // 1. Locked rule name set. Empty -> no work.
+            var lockedNames = new HashSet<string>(
+                PredefinedColumnService.Instance.GetLocked().Select(r => r.ColumnName ?? string.Empty),
+                StringComparer.OrdinalIgnoreCase);
+            lockedNames.Remove(string.Empty);
+            if (lockedNames.Count == 0) return;
+
+            // 2. Snapshot pre-filter. Map candidate attribute ObjectId ->
+            //    snapshot, and collect the distinct entity table names
+            //    that contain such an attribute. Skip empty PhysicalName
+            //    (placeholder) - the user cannot have renamed THAT into a
+            //    locked-rule violation on this gesture.
+            var candidateAttrs = new Dictionary<string, AttributeValidationSnapshot>(StringComparer.Ordinal);
+            var candidateTables = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kv in _attributeSnapshots)
+            {
+                var snap = kv.Value;
+                if (snap == null) continue;
+                string snapName = snap.PhysicalName ?? string.Empty;
+                if (snapName.Length == 0) continue;
+                if (!lockedNames.Contains(snapName)) continue;
+                candidateAttrs[kv.Key] = snap;
+                if (!string.IsNullOrEmpty(snap.TableName))
+                    candidateTables.Add(snap.TableName);
+            }
+            if (candidateAttrs.Count == 0) return;
+
+            dynamic modelObjects = null;
+            dynamic root = null;
+            dynamic allEntities = null;
+            int renamesProcessed = 0;
+            try
+            {
+                modelObjects = _session.ModelObjects;
+                root = modelObjects?.Root;
+                if (root == null) return;
+                allEntities = modelObjects.Collect(root, "Entity");
+                if (allEntities == null) return;
+
+                // Track remaining candidates so we can break the entity
+                // walk the moment every candidate has been visited - no
+                // point scanning all 286 entities when our target is one.
+                var remainingTables = new HashSet<string>(candidateTables, StringComparer.OrdinalIgnoreCase);
+
+                foreach (dynamic entity in allEntities)
+                {
+                    if (entity == null) continue;
+                    if (remainingTables.Count == 0) break;
+
+                    // Cheap match against candidate set BEFORE touching attrs.
+                    string tableName;
+                    try { tableName = GetTableName(entity); }
+                    catch { continue; }
+                    if (string.IsNullOrEmpty(tableName)) continue;
+
+                    // Candidate table set uses OrdinalIgnoreCase (HashSet ctor
+                    // above). EntityNameMatchesTitle is more permissive
+                    // (handles "/" -> "_" normalization for generated names)
+                    // so fall back to that if direct contains misses - small
+                    // perf cost only when candidate has the slash form.
+                    string matchedCandidate = null;
+                    if (remainingTables.Contains(tableName))
+                    {
+                        matchedCandidate = tableName;
+                    }
+                    else
+                    {
+                        foreach (var ct in remainingTables)
+                        {
+                            if (EntityNameMatchesTitle(ct, tableName) || EntityNameMatchesTitle(tableName, ct))
+                            {
+                                matchedCandidate = ct;
+                                break;
+                            }
+                        }
+                    }
+                    if (matchedCandidate == null) continue;
+                    remainingTables.Remove(matchedCandidate);
+
+                    dynamic entityAttrs = null;
+                    try { entityAttrs = modelObjects.Collect(entity, "Attribute"); }
+                    catch { continue; }
+                    if (entityAttrs == null) continue;
+
+                    HashSet<string> predefinedColumnNames = null;
+                    try
+                    {
+                        foreach (dynamic attr in entityAttrs)
+                        {
+                            if (attr == null) continue;
+
+                            string objectId;
+                            try { objectId = attr.ObjectId?.ToString() ?? ""; }
+                            catch { continue; }
+                            if (string.IsNullOrEmpty(objectId)) continue;
+                            if (!candidateAttrs.TryGetValue(objectId, out var existingSnap)) continue;
+
+                            string liveName;
+                            try { liveName = attr.Properties("Physical_Name").Value?.ToString() ?? ""; }
+                            catch { continue; }
+
+                            string liveResolved = (!string.IsNullOrEmpty(liveName) && !liveName.StartsWith("%"))
+                                ? liveName
+                                : (existingSnap.AttributeName ?? string.Empty);
+
+                            string snapPhys = existingSnap.PhysicalName ?? string.Empty;
+                            if (string.Equals(snapPhys, liveResolved, StringComparison.Ordinal)) continue;
+
+                            // Drift on a locked-named attr - fire processing.
+                            predefinedColumnNames ??= GetPredefinedColumnNames(entity);
+                            var currentState = CreateSnapshot(attr, tableName, modelObjects);
+                            currentState.TermTypeCanonical = existingSnap.TermTypeCanonical;
+                            foreach (var kvp in existingSnap.UdpValues)
+                                currentState.UdpValues[kvp.Key] = kvp.Value;
+                            if (string.IsNullOrEmpty(currentState.PhysicalDataType))
+                                currentState.PhysicalDataType = existingSnap.PhysicalDataType;
+
+                            Log($"ScanForLockedColumnRenames [{trigger}]: locked-name rename on '{tableName}': '{snapPhys}' -> '{liveResolved}' (id={objectId})");
+
+                            // Stash the entity we already have so the
+                            // downstream EnforceLockedColumnRename ->
+                            // ResolveEntityByName call sees a cache hit
+                            // instead of doing another full Collect walk.
+                            _scanContextTableName = tableName;
+                            _scanContextEntity = entity;
+                            try
+                            {
+                                ProcessAttributeChanges(attr, existingSnap, currentState, predefinedColumnNames);
+                                renamesProcessed++;
+                            }
+                            catch (Exception ex)
+                            {
+                                Log($"ScanForLockedColumnRenames: ProcessAttributeChanges err on '{tableName}.{snapPhys}': {ex.Message}");
+                            }
+                            finally
+                            {
+                                _scanContextTableName = null;
+                                _scanContextEntity = null;
+                            }
+
+                            if (_attributeSnapshots.TryGetValue(objectId, out var postSnap)
+                                && string.Equals(postSnap.PhysicalName ?? string.Empty, snapPhys, StringComparison.Ordinal))
+                            {
+                                // Interceptor reverted - keep the original snapshot.
+                            }
+                            else
+                            {
+                                _attributeSnapshots[objectId] = currentState;
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        ReleaseCom(entityAttrs);
+                    }
+                }
+
+                if (renamesProcessed > 0)
+                    Log($"ScanForLockedColumnRenames [{trigger}]: processed {renamesProcessed} locked-column rename(s)");
+            }
+            catch (Exception ex)
+            {
+                Log($"ScanForLockedColumnRenames [{trigger}] err: {ex.Message}");
+            }
+            finally
+            {
+                ReleaseCom(allEntities);
+                ReleaseCom(root);
+                ReleaseCom(modelObjects);
+            }
+        }
+
+        /// <summary>
+        /// Phase 5 (2026-05-24): locked-column delete restore. Called from
+        /// the DiagramHeartbeat per-entity walk when the attribute count
+        /// shrank AND we have a set of ObjectIds that disappeared since
+        /// the previous tick. For every missing id whose snapshot
+        /// PhysicalName matches an applicable locked predefined-column
+        /// rule, re-create the column via the existing predefined-column
+        /// add path. Shows <see cref="Forms.LockedColumnDialog"/> with
+        /// <see cref="Forms.LockedColumnAction.Delete"/> per restored
+        /// column.
+        ///
+        /// Pre-filter compliance: returns immediately when no locked
+        /// rules are loaded OR when none of the missing ids correspond
+        /// to a locked-named snapshot. The pre-filter is in-memory and
+        /// runs before any SCAPI write.
+        /// </summary>
+        private void RestoreDeletedLockedColumns(dynamic entity, string entityDisplayName, HashSet<string> missingAttrIds)
+        {
+            if (_tableTypeMonitor == null) return;
+            if (!PredefinedColumnService.Instance.IsLoaded) return;
+            if (missingAttrIds == null || missingAttrIds.Count == 0) return;
+
+            // Pre-filter: locked-rule name set. Empty -> no work.
+            var lockedNames = new HashSet<string>(
+                PredefinedColumnService.Instance.GetLocked().Select(r => r.ColumnName ?? string.Empty),
+                StringComparer.OrdinalIgnoreCase);
+            lockedNames.Remove(string.Empty);
+            if (lockedNames.Count == 0) return;
+
+            // Collect missing-id snapshots whose names match a locked rule.
+            // Dictionary keyed by ObjectId so we can purge stale snapshot
+            // entries AFTER restoration (otherwise the next tick's diff
+            // would see the new ObjectId from the re-created column as a
+            // brand-new attribute, but the OLD snapshot entry would still
+            // be around, polluting the rename watch's candidate set).
+            var candidates = new List<(string objectId, string columnName, AttributeValidationSnapshot snap)>();
+            foreach (var missingId in missingAttrIds)
+            {
+                if (!_attributeSnapshots.TryGetValue(missingId, out var snap)) continue;
+                if (snap == null) continue;
+                string snapName = snap.PhysicalName ?? string.Empty;
+                if (snapName.Length == 0) continue;
+                if (!lockedNames.Contains(snapName)) continue;
+                candidates.Add((missingId, snapName, snap));
+            }
+            if (candidates.Count == 0) return;
+
+            // Restore each locked column. The entity reference we already
+            // have from the heartbeat walk is exactly what
+            // RestoreSpecificPredefinedColumn needs.
+            int restored = 0;
+            foreach (var (objectId, columnName, snap) in candidates)
+            {
+                var rule = PredefinedColumnService.Instance.FindApplicableLockedRule(entity, columnName);
+                if (rule == null)
+                {
+                    // The rule's UDP condition no longer matches the entity's
+                    // current state - lock is RELEASED by design (conditional
+                    // semantics agreed 2026-05-24). Drop the stale snapshot so
+                    // we do not re-trigger restoration on next tick.
+                    _attributeSnapshots.Remove(objectId);
+                    Log($"Locked predefined-column '{columnName}' deleted from '{entityDisplayName}' - rule no longer applies, lock released");
+                    continue;
+                }
+
+                Log($"Locked predefined-column delete intercepted: '{entityDisplayName}.{columnName}' (locked rule#{rule.Id}, deferring dialog+restore)");
+
+                // The old snapshot id is stale (refers to the deleted
+                // SCAPI Attribute). Drop it NOW so the next heartbeat
+                // does not see this missing-id and re-fire restoration
+                // before the deferred apply lands.
+                _attributeSnapshots.Remove(objectId);
+
+                string detail = $"Datatype: {rule.DataType}\nNullable: {(rule.Nullable ? "yes" : "no")}"
+                    + (string.IsNullOrEmpty(rule.DefaultValue) ? "" : $"\nDefault: \"{rule.DefaultValue}\"")
+                    + (rule.IsPrimaryKey ? "\nPK: yes" : "");
+
+                var capturedRule = rule;
+                string capturedEntityName = entityDisplayName;
+                string capturedColumnName = columnName;
+                string dedupe = $"delete|{capturedEntityName}|{capturedColumnName}";
+
+                EnqueueLockedColumnDialogAndApply(
+                    capturedColumnName,
+                    capturedEntityName,
+                    Forms.LockedColumnAction.Delete,
+                    detail,
+                    dedupe,
+                    () =>
+                    {
+                        try
+                        {
+                            // Re-resolve the entity by name - the dynamic
+                            // reference we held earlier might be stale by
+                            // the time the BeginInvoke fires (especially
+                            // if heartbeat cycles touched COM state).
+                            dynamic restoreEntity = ResolveEntityByName(capturedEntityName);
+                            if (restoreEntity == null)
+                            {
+                                Log($"Locked delete restore: entity '{capturedEntityName}' not found at apply time");
+                                return;
+                            }
+                            _tableTypeMonitor.RestoreSpecificPredefinedColumn(restoreEntity, capturedRule, capturedEntityName);
+                            Log($"Locked delete restore applied: rule#{capturedRule.Id} '{capturedColumnName}' on '{capturedEntityName}'");
+                        }
+                        catch (Exception ex)
+                        {
+                            Log($"Locked delete restore FAILED for '{capturedColumnName}' on '{capturedEntityName}': {ex.Message}");
+                        }
+                    });
+                restored++;
+            }
+
+            if (restored > 0)
+                Log($"RestoreDeletedLockedColumns: queued {restored} locked column restore(s) on '{entityDisplayName}'");
+        }
+
+        /// <summary>
         /// Drain <see cref="_pendingTableNamingChecks"/> by firing the
         /// scoped naming check for each entity. Called by the
         /// WindowMonitorTimer when it observes a Column Editor or Entity
@@ -1589,6 +2151,11 @@ namespace EliteSoft.Erwin.AddIn.Services
         private void WindowMonitorTimer_Tick(object sender, EventArgs e)
         {
             if (_sessionLost || !_isMonitoring || _disposed || _validationSuspended) return;
+            // 2026-05-25: skip window-state polling while a locked-column
+            // dialog is up. Same reason as MonitorTimer_Tick - SCAPI
+            // reads inside the dialog's nested pump steal time slices
+            // from input processing.
+            if (_lockedDialogShowing) return;
 
             // Safety: check if model is still open BEFORE touching the session.
             if (!IsModelStillOpen()) { HandleSessionLost(); return; }
@@ -1674,17 +2241,58 @@ namespace EliteSoft.Erwin.AddIn.Services
                     try { ScanForRenamesEventDriven("column-editor-close"); }
                     catch (Exception ex) { Log($"ScanForRenamesEventDriven (column) err: {ex.Message}"); }
 
+                    // Predefined-column re-evaluation must run BEFORE the
+                    // naming check: ApplyNamingStandards may rename the
+                    // entity (e.g. _HISTORY -> _LOG when TableClass UDP
+                    // changes), and RunScopedReevaluateConditionalPredefinedColumns
+                    // matches entities by the captured name. Re-evaluating
+                    // first uses the still-valid pre-rename name; the
+                    // predefined-column add targets the entity object, not
+                    // its name, so a subsequent rename is harmless. Bug
+                    // fix 2026-05-24.
+                    if (!string.IsNullOrEmpty(_columnEditorEntityName))
+                    {
+                        try { RunScopedReevaluateConditionalPredefinedColumns(_columnEditorEntityName); }
+                        catch (Exception ex) { Log($"Column Editor close predefined-column re-eval err: {ex.Message}"); }
+                    }
+
+                    // Locked-column property drift scan (2026-05-25). The
+                    // heartbeat fingerprint short-circuits on anything
+                    // other than Physical_Name / Physical_Data_Type, so
+                    // Nullable / Default / PK changes never trip
+                    // ProcessAttributeChanges. We catch them here on the
+                    // close edge; pre-filtered by locked snapshot name so
+                    // entities without any locked column pay zero cost.
+                    if (!string.IsNullOrEmpty(_columnEditorEntityName))
+                    {
+                        try { ScanForLockedColumnPropertyDrift("column-editor-close", _columnEditorEntityName); }
+                        catch (Exception ex) { Log($"ScanForLockedColumnPropertyDrift (column-editor) err: {ex.Message}"); }
+                    }
+
                     // Edit-session diff (2026-05-17): if the user changed
                     // a watched property (e.g. cleared Owner) during the
                     // edit session, fire the scoped naming check now so the
                     // Required popup surfaces on close. This replaces the
                     // expensive per-tick drift loop that scaled badly on
                     // big models.
+                    bool columnWatchedDriftFired = false;
                     if (_columnEditorEntityBaseline != null
                         && !string.IsNullOrEmpty(_columnEditorEntityName))
                     {
-                        try { DiffWatchedPropertiesAndFire(_columnEditorEntityName, _columnEditorEntityBaseline); }
+                        try { columnWatchedDriftFired = DiffWatchedPropertiesAndFire(_columnEditorEntityName, _columnEditorEntityBaseline); }
                         catch (Exception ex) { Log($"Column Editor close diff err: {ex.Message}"); }
+                    }
+
+                    // UDP-conditional naming re-evaluation, Column Editor
+                    // variant (2026-05-24). Mirrors the Entity Editor branch
+                    // so a parent-table UDP change made via this editor's
+                    // own UDP grid (e.g. TableClass on the parent of the
+                    // columns being edited) still triggers the engine's
+                    // forward-apply + reverse-strip pair.
+                    if (!columnWatchedDriftFired && !string.IsNullOrEmpty(_columnEditorEntityName))
+                    {
+                        try { RunScopedTableNamingCheck(_columnEditorEntityName); }
+                        catch (Exception ex) { Log($"Column Editor close UDP-conditional check err: {ex.Message}"); }
                     }
                     _columnEditorEntityBaseline = null;
                     _columnEditorEntityName = null;
@@ -1789,11 +2397,57 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // diff below still fires (Definition / Name_Qualifier
                     // are built-in props, not subject to the UDP quirk).
 
+                    // Predefined-column re-evaluation (2026-05-24): UDP grid
+                    // edits inside the Table Properties dialog can newly
+                    // satisfy a conditional predefined-column rule (e.g.
+                    // TableClass changed to Log -> Log-conditional column
+                    // must land on the entity). The legacy
+                    // CheckForUdpValueChanges path used to do this; it is
+                    // dead code, so we hook the editor-close edge instead.
+                    // Idempotent through ApplyPredefinedColumnsToEntity's
+                    // in-entity name check.
+                    //
+                    // MUST run BEFORE DiffWatchedPropertiesAndFire and
+                    // RunScopedTableNamingCheck: ApplyNamingStandards may
+                    // rename the entity (e.g. _HISTORY -> _LOG when
+                    // TableClass changes), and our lookup matches by the
+                    // captured closedName. Re-evaluating first sees the
+                    // pre-rename name and finds the entity; the predefined-
+                    // column add targets the entity reference, not its name.
+                    if (!string.IsNullOrEmpty(closedName))
+                    {
+                        try { RunScopedReevaluateConditionalPredefinedColumns(closedName); }
+                        catch (Exception ex) { Log($"Entity Editor close predefined-column re-eval err: {ex.Message}"); }
+                    }
+
+                    // Locked-column property drift scan (2026-05-25). Mirror
+                    // of the Column Editor branch. Entity Editor's UDP grid
+                    // can also affect rule applicability (TableClass switch
+                    // flips which locked columns apply), so we scan here too.
+                    if (!string.IsNullOrEmpty(closedName))
+                    {
+                        try { ScanForLockedColumnPropertyDrift("entity-editor-close", closedName); }
+                        catch (Exception ex) { Log($"ScanForLockedColumnPropertyDrift (entity-editor) err: {ex.Message}"); }
+                    }
+
                     // Edit-session diff for Table Properties dialog.
+                    bool watchedDriftFired = false;
                     if (closedBaseline != null && !string.IsNullOrEmpty(closedName))
                     {
-                        try { DiffWatchedPropertiesAndFire(closedName, closedBaseline); }
+                        try { watchedDriftFired = DiffWatchedPropertiesAndFire(closedName, closedBaseline); }
                         catch (Exception ex) { Log($"Entity Editor close diff err: {ex.Message}"); }
+                    }
+
+                    // UDP-conditional naming re-evaluation (2026-05-24): the
+                    // engine's ApplyNamingStandards forward-apply + reverse-
+                    // strip pair handles "TableClass switched from Log to
+                    // History" - rule#20 (cond=Log) becomes inapplicable and
+                    // its '_LOG' suffix is stripped, rule#21 (cond=History)
+                    // becomes applicable and adds '_HISTORY'.
+                    if (!watchedDriftFired && !string.IsNullOrEmpty(closedName))
+                    {
+                        try { RunScopedTableNamingCheck(closedName); }
+                        catch (Exception ex) { Log($"Entity Editor close UDP-conditional check err: {ex.Message}"); }
                     }
                 }
                 else
@@ -1841,6 +2495,19 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // per-tick Physical_Name walk.
                     try { ScanForRenamesEventDriven("inline-edit-close"); }
                     catch (Exception ex) { Log($"ScanForRenamesEventDriven (inline) err: {ex.Message}"); }
+
+                    // Locked-column rename watch (2026-05-24, Gap C): the
+                    // heartbeat's count-delta check never sees an existing-
+                    // column rename because attr count is unchanged - the
+                    // per-entity walk is only triggered when attrsGrew.
+                    // Diagram inline-edit of an existing column commits in
+                    // this same close edge, so we walk locked-column
+                    // candidates vs live names here. Scope is intentionally
+                    // narrow (only entities that hold a locked-rule-named
+                    // snapshot) to keep the popup delay sub-second; on big
+                    // models the broad walk took several seconds.
+                    try { ScanForLockedColumnRenames("inline-edit-close"); }
+                    catch (Exception ex) { Log($"ScanForLockedColumnRenames (inline) err: {ex.Message}"); }
                 }
                 _wasInlineEditOpen = inlineEditOpen;
             }
@@ -2370,6 +3037,30 @@ namespace EliteSoft.Erwin.AddIn.Services
             finally
             {
                 if (acquired) _scopedCheckInProgress = false;
+
+                // Rapid-create flush (2026-05-24): when the user creates
+                // multiple new tables in quick succession, each one's
+                // PromptForMissingRequiredUdps opens a modal whose pump
+                // re-runs the WindowMonitorTimer; that timer triggers a
+                // nested ValidateCommittedPendingAttrs which queues its own
+                // entitiesToNamingCheck and tries to drain them via
+                // RunScopedTableNamingCheck - but the outer FireNewEntityPipeline
+                // here still holds _scopedCheckInProgress, so every nested
+                // drain falls through to the defer-to-pending branch added
+                // in RunScopedTableNamingCheck. Without an explicit flush
+                // here those deferred checks only surface when the user
+                // closes the editor, which is too late if they expect the
+                // Description popup chain to fire before walking away. The
+                // outermost FireNewEntityPipeline finally is the right point
+                // to drain - the gate is now released, so each pending
+                // entry's scoped naming check can run cleanly (each opens
+                // its own RequiredFieldDialog, sequenced through the same
+                // gate which it now claims).
+                if (acquired)
+                {
+                    try { FlushPendingTableNamingChecks(); }
+                    catch (Exception ex) { Log($"FireNewEntityPipeline: FlushPendingTableNamingChecks err: {ex.Message}"); }
+                }
             }
         }
 
@@ -2401,9 +3092,25 @@ namespace EliteSoft.Erwin.AddIn.Services
             if (_tableTypeMonitor == null) return;
             if (!NamingStandardService.Instance.IsLoaded) return;
             // Reentrancy guard. The downstream ValidateNamingStandard opens
-            // MessageBox.Show whose modal pump fires our WindowMonitorTimer
-            // again - re-entry would stack popups indefinitely.
-            if (_scopedCheckInProgress) return;
+            // a modal dialog whose pump fires our WindowMonitorTimer again -
+            // re-entry would stack popups indefinitely. When the gate is
+            // held by an OUTER FireNewEntityPipeline (e.g. rapid table
+            // create where each PromptForMissingRequiredUdps modal pumps a
+            // nested ValidateCommittedPendingAttrs), we DEFER the entity
+            // into the pending queue instead of dropping it. The outermost
+            // FireNewEntityPipeline.finally and the editor-close transitions
+            // both flush the queue, so the deferred entries surface as soon
+            // as the gate releases. baselineOverride is intentionally lost
+            // on the deferred path - the Edit-session diff that owns it
+            // (DiffWatchedPropertiesAndFire) only ever runs from
+            // WindowMonitorTimer's already-non-reentrant editor-close
+            // branch, so a defer collision there is impossible in practice.
+            if (_scopedCheckInProgress)
+            {
+                if (_pendingTableNamingChecks.Add((tableName, isNew)))
+                    Log($"RunScopedTableNamingCheck: deferring '{tableName}' (isNew={isNew}) - check already in progress");
+                return;
+            }
             _scopedCheckInProgress = true;
             try { RunScopedTableNamingCheckCore(tableName, baselineOverride, isNew); }
             finally { _scopedCheckInProgress = false; }
@@ -3161,6 +3868,597 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
         }
 
+        /// <summary>
+        /// Common helper for the locked-column enforcement family
+        /// (2026-05-25). Sequence: <c>BeginInvoke -> set guard ->
+        /// ShowDialog (sync, modal) -> on OK run <paramref name="applyAction"/>
+        /// -> clear guard</c>. The user explicitly asked for this order
+        /// ("Değişikliği uygulamadan önce popup'ı göstersin, sonra
+        /// uygulasın"); previously we applied SCAPI writes immediately
+        /// and only logged / surfaced the dialog afterward, which gave a
+        /// 'something changed silently' feel. Now the dialog appears
+        /// FIRST and the SCAPI write (revert / restore) lands only after
+        /// the user acknowledges.
+        ///
+        /// <paramref name="dedupeKey"/> protects against duplicate
+        /// dialogs when multiple detection paths race for the same
+        /// edit; pass null to disable de-dup.
+        /// </summary>
+        private void EnqueueLockedColumnDialogAndApply(
+            string columnName,
+            string entityName,
+            Forms.LockedColumnAction action,
+            string detail,
+            string dedupeKey,
+            Action applyAction)
+        {
+            if (!string.IsNullOrEmpty(dedupeKey))
+            {
+                lock (_pendingLockedDialogKeys)
+                {
+                    if (!_pendingLockedDialogKeys.Add(dedupeKey))
+                    {
+                        Log($"Locked column dialog suppressed (duplicate): {dedupeKey}");
+                        return;
+                    }
+                }
+            }
+
+            void Run()
+            {
+                _lockedDialogShowing = true;
+                try
+                {
+                    Forms.LockedColumnDialog.Show(columnName, entityName, action, detail);
+                    if (applyAction != null)
+                    {
+                        try { applyAction(); }
+                        catch (Exception applyEx)
+                        {
+                            Log($"Locked column apply error for '{entityName}.{columnName}' ({action}): {applyEx.Message}");
+                        }
+                    }
+                }
+                finally
+                {
+                    _lockedDialogShowing = false;
+                    if (!string.IsNullOrEmpty(dedupeKey))
+                    {
+                        lock (_pendingLockedDialogKeys) { _pendingLockedDialogKeys.Remove(dedupeKey); }
+                    }
+                }
+            }
+
+            Form host = null;
+            try
+            {
+                if (Application.OpenForms.Count > 0)
+                    host = Application.OpenForms[0];
+            }
+            catch { /* fall through to inline */ }
+
+            if (host != null && host.IsHandleCreated && !host.IsDisposed)
+            {
+                try
+                {
+                    host.BeginInvoke(new Action(Run));
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    Log($"EnqueueLockedColumnDialogAndApply BeginInvoke fallback: {ex.Message}");
+                }
+            }
+            Run();
+        }
+
+        /// <summary>
+        /// Phase 3 of locked predefined-column enforcement (2026-05-24):
+        /// rename revert. Called from <see cref="ProcessAttributeChanges"/>
+        /// when the user renamed a column. If the PREVIOUS column name
+        /// matches an applicable locked predefined-column rule, we
+        /// defer the dialog and the actual SCAPI revert via
+        /// <see cref="EnqueueLockedColumnDialogAndApply"/> so the user
+        /// sees the popup BEFORE the name flips back. Returns true when
+        /// we intercepted (caller should stop processing this attribute
+        /// change for THIS tick).
+        /// </summary>
+        private bool EnforceLockedColumnRename(dynamic attr, AttributeValidationSnapshot previousState, AttributeValidationSnapshot currentState)
+        {
+            try
+            {
+                if (!PredefinedColumnService.Instance.IsLoaded) return false;
+                if (string.IsNullOrEmpty(previousState?.PhysicalName)) return false;
+
+                dynamic entity = ResolveEntityByName(previousState.TableName);
+                var rule = PredefinedColumnService.Instance.FindApplicableLockedRule(entity, previousState.PhysicalName);
+                if (rule == null) return false;
+
+                Log($"Locked predefined-column rename intercepted: '{previousState.TableName}.{previousState.PhysicalName}' -> '{currentState.PhysicalName}' (locked rule#{rule.Id}, deferring dialog+revert)");
+
+                // Mutate the snapshots NOW (before the dialog defers) so the
+                // heartbeat's fingerprint diff sees the snapshot already
+                // tracking the rule-authored name. Without this the next
+                // tick (before the deferred revert lands) would see
+                // snapshot=COL1 vs live=COL1_NEW and re-fire ProcessAttribute-
+                // Changes -> EnforceLockedColumnRename -> queue another
+                // dialog. We rely on the dedupe key on the deferred call
+                // for safety, but bringing snapshots forward avoids the
+                // extra work entirely.
+                currentState.PhysicalName = previousState.PhysicalName;
+                string objId = previousState.ObjectId;
+                if (!string.IsNullOrEmpty(objId) && _attributeSnapshots.TryGetValue(objId, out var snap))
+                {
+                    snap.PhysicalName = previousState.PhysicalName;
+                }
+
+                // Capture the local fields needed inside the deferred apply.
+                string attemptedName = currentState.PhysicalName ?? string.Empty;
+                string keptName = previousState.PhysicalName ?? string.Empty;
+                string tableName = previousState.TableName ?? string.Empty;
+                int ruleId = rule.Id;
+                dynamic capturedAttr = attr;
+                string detail = $"Attempted rename: \"{attemptedName}\"\nRestored name: \"{keptName}\"";
+                string dedupe = $"rename|{objId}|{keptName}";
+
+                EnqueueLockedColumnDialogAndApply(
+                    keptName,
+                    tableName,
+                    Forms.LockedColumnAction.Rename,
+                    detail,
+                    dedupe,
+                    () =>
+                    {
+                        int transId = _session.BeginNamedTransaction("RevertLockedColumnRename");
+                        try
+                        {
+                            capturedAttr.Properties("Physical_Name").Value = keptName;
+                            _session.CommitTransaction(transId);
+                            Log($"Locked rename revert applied: rule#{ruleId} '{attemptedName}' -> '{keptName}' on '{tableName}'");
+                        }
+                        catch (Exception ex)
+                        {
+                            try { _session.RollbackTransaction(transId); } catch (Exception rbEx) { Log($"RevertLockedColumnRename rollback error: {rbEx.Message}"); }
+                            Log($"Locked rename revert FAILED for '{keptName}' on '{tableName}': {ex.Message}");
+                        }
+                    });
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log($"EnforceLockedColumnRename error on '{previousState?.TableName}.{previousState?.PhysicalName}': {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Phase 4 of locked predefined-column enforcement (2026-05-24,
+        /// extended 2026-05-25). Thin wrapper kept for backward source-
+        /// compat with the <see cref="ProcessAttributeChanges"/> call
+        /// site; delegates to the shared helper that ALSO powers the
+        /// editor-close-edge scan (<see cref="ScanForLockedColumnPropertyDrift"/>).
+        /// Returns true iff drift was detected (caller short-circuits).
+        /// </summary>
+        private bool EnforceLockedColumnPropertyChange(dynamic attr, AttributeValidationSnapshot previousState, AttributeValidationSnapshot currentState)
+        {
+            string objId = currentState?.ObjectId ?? string.Empty;
+            string columnName = currentState?.PhysicalName ?? string.Empty;
+            string tableName = currentState?.TableName ?? string.Empty;
+            return CheckAndEnqueueLockedPropertyDrift(attr, null, columnName, tableName, objId, currentState);
+        }
+
+        /// <summary>
+        /// Shared locked-column property drift detector and enqueuer
+        /// (2026-05-25). Reads every locked-rule-relevant property
+        /// (Physical_Data_Type, Null_Option_Type, Physical_Default_Value,
+        /// PK membership) on the given attribute, diffs against the
+        /// applicable locked rule, and if anything drifted defers a
+        /// dialog + revert through <see cref="EnqueueLockedColumnDialogAndApply"/>.
+        /// Returns true when drift was found (and a deferred apply was
+        /// enqueued). <paramref name="resolvedEntity"/> may be passed by
+        /// callers that already have a live entity reference to avoid a
+        /// second Collect walk; pass null and we resolve by table name.
+        /// </summary>
+        private bool CheckAndEnqueueLockedPropertyDrift(dynamic attr, dynamic resolvedEntity, string columnName, string tableName, string objId, AttributeValidationSnapshot currentStateOpt)
+        {
+            try
+            {
+                if (!PredefinedColumnService.Instance.IsLoaded) return false;
+                if (string.IsNullOrEmpty(columnName)) return false;
+
+                dynamic entity = resolvedEntity ?? ResolveEntityByName(tableName);
+                var rule = PredefinedColumnService.Instance.FindApplicableLockedRule(entity, columnName);
+                if (rule == null) return false;
+
+                // Drifted built-in properties. We read live SCAPI values so
+                // the diff is accurate regardless of snapshot freshness.
+                var driftedProps = new List<(string label, string accessor, string ruleValue, string liveValue)>();
+
+                // Physical_Data_Type
+                string liveDataType = "";
+                try { liveDataType = attr.Properties("Physical_Data_Type").Value?.ToString() ?? ""; }
+                catch { /* leave empty */ }
+                string ruleDataType = rule.DataType ?? "";
+                if (!string.IsNullOrEmpty(ruleDataType)
+                    && !string.Equals(liveDataType, ruleDataType, StringComparison.Ordinal))
+                {
+                    driftedProps.Add(("Datatype", "Physical_Data_Type", ruleDataType, liveDataType));
+                }
+
+                // Nullability detection (2026-05-25). erwin r10.10 exposes
+                // TWO related accessors:
+                //   * Null_Option_Type - integer enum (0/1, semantic varies)
+                //   * Null_Option      - string ("NULL" / "NOT NULL", clear semantic)
+                // We compare on the string form which is unambiguous, and
+                // fall back to the integer form only when the string read
+                // fails. The integer write (Null_Option_Type = 0 or 1) in
+                // ApplyPredefinedColumnsToEntity still works because erwin
+                // accepts BOTH accessor names; we just don't trust the
+                // integer interpretation any more for diff purposes.
+                string liveNullStr = "";
+                try { liveNullStr = (attr.Properties("Null_Option").Value?.ToString() ?? "").Trim().ToUpperInvariant(); }
+                catch (Exception nullStrEx)
+                {
+                    Log($"CheckAndEnqueueLockedPropertyDrift: Null_Option (string) read err on '{tableName}.{columnName}': {nullStrEx.Message}");
+                }
+                string liveNullInt = "";
+                try { liveNullInt = attr.Properties("Null_Option_Type").Value?.ToString() ?? ""; }
+                catch (Exception nullIntEx)
+                {
+                    Log($"CheckAndEnqueueLockedPropertyDrift: Null_Option_Type (int) read err on '{tableName}.{columnName}': {nullIntEx.Message}");
+                }
+                // Canonicalise live to "NULL" or "NOT NULL" preferring the
+                // string accessor; if that came back empty we infer from
+                // the integer using the most-common erwin mapping (0=NULL,
+                // 1=NOT NULL) and label uncertainty in the log.
+                string liveNullCanon;
+                if (liveNullStr == "NULL" || liveNullStr == "NOT NULL")
+                    liveNullCanon = liveNullStr;
+                else if (liveNullInt == "1")
+                    liveNullCanon = "NOT NULL";
+                else if (liveNullInt == "0")
+                    liveNullCanon = "NULL";
+                else
+                    liveNullCanon = ""; // unknown
+                string ruleNullCanon = rule.Nullable ? "NULL" : "NOT NULL";
+                Log($"CheckAndEnqueueLockedPropertyDrift: '{tableName}.{columnName}' Nullability live(str='{liveNullStr}', int='{liveNullInt}') canon='{liveNullCanon}' rule.Nullable={rule.Nullable} expected='{ruleNullCanon}'");
+                if (!string.IsNullOrEmpty(liveNullCanon)
+                    && !string.Equals(liveNullCanon, ruleNullCanon, StringComparison.Ordinal))
+                {
+                    // We write through Null_Option_Type (integer) because
+                    // that is the accessor the existing ApplyPredefined
+                    // add-path uses and we know it sticks. Value: 0 for
+                    // nullable, 1 for not-null - matches the add-path
+                    // convention.
+                    string writeValue = rule.Nullable ? "0" : "1";
+                    driftedProps.Add(("Nullability", "Null_Option_Type", writeValue, liveNullCanon));
+                }
+
+                // Default value SCAPI accessor varies by erwin build
+                // ("Physical_Default_Value" is invalid on r10.10). Probe
+                // and cache via ErwinUtilities. When no accessor is
+                // available the comparison is skipped entirely (we
+                // cannot read OR write, so flagging drift is pointless).
+                string defAccessor = ErwinUtilities.ResolveAttributeDefaultAccessor(attr);
+                if (!string.IsNullOrEmpty(defAccessor))
+                {
+                    string liveDefault = "";
+                    try { liveDefault = attr.Properties(defAccessor).Value?.ToString() ?? ""; }
+                    catch { /* leave empty */ }
+                    string ruleDefault = rule.DefaultValue ?? "";
+                    if (!string.Equals(liveDefault, ruleDefault, StringComparison.Ordinal))
+                    {
+                        driftedProps.Add(("Default value", defAccessor, ruleDefault, liveDefault));
+                    }
+                }
+
+                // PK membership drift. Tracked separately because it is
+                // not a simple property write - apply phase goes through
+                // Key_Group / Key_Group_Member SCAPI. Live = is column
+                // currently a PK member? Rule = should it be?
+                bool livePk = false;
+                if (!string.IsNullOrEmpty(objId) && entity != null && _tableTypeMonitor != null)
+                {
+                    try { livePk = _tableTypeMonitor.IsAttributeInPrimaryKey(entity, objId); }
+                    catch (Exception pkEx) { Log($"CheckAndEnqueueLockedPropertyDrift PK read err for '{tableName}.{columnName}': {pkEx.Message}"); }
+                }
+                bool pkDrift = livePk != rule.IsPrimaryKey;
+                if (pkDrift)
+                {
+                    driftedProps.Add((
+                        "Primary Key",
+                        "PK", // accessor sentinel - apply phase uses it as a marker, not a SCAPI property name
+                        rule.IsPrimaryKey ? "yes" : "no",
+                        livePk ? "yes" : "no"));
+                }
+
+                if (driftedProps.Count == 0) return false;
+
+                Log($"Locked predefined-column property drift on '{tableName}.{columnName}': {driftedProps.Count} prop(s) - deferring dialog+revert");
+
+                // Patch snapshot now so the heartbeat does not re-fire on
+                // the same drift before the apply lands.
+                if (currentStateOpt != null && !string.IsNullOrEmpty(ruleDataType))
+                    currentStateOpt.PhysicalDataType = ruleDataType;
+                if (!string.IsNullOrEmpty(objId) && _attributeSnapshots.TryGetValue(objId, out var snap))
+                {
+                    if (!string.IsNullOrEmpty(ruleDataType)) snap.PhysicalDataType = ruleDataType;
+                }
+
+                string detail = string.Join("\n", driftedProps.Select(d =>
+                    $"{d.label}: \"{d.liveValue}\" -> \"{d.ruleValue}\""));
+                int ruleIdLocal = rule.Id;
+                dynamic capturedAttr = attr;
+                bool capturedRulePk = rule.IsPrimaryKey;
+                string capturedColumnName = columnName;
+                string capturedTableName = tableName;
+                string capturedObjId = objId;
+                var capturedProps = driftedProps.ToList();
+                string dedupe = $"prop|{objId}|{columnName}|{string.Join(",", capturedProps.Select(p => p.accessor))}";
+
+                EnqueueLockedColumnDialogAndApply(
+                    capturedColumnName,
+                    capturedTableName,
+                    Forms.LockedColumnAction.PropertyChange,
+                    detail,
+                    dedupe,
+                    () =>
+                    {
+                        // Built-in property reverts in one transaction.
+                        var simpleReverts = capturedProps.Where(p => !string.Equals(p.accessor, "PK", StringComparison.Ordinal)).ToList();
+                        if (simpleReverts.Count > 0)
+                        {
+                            int transId = _session.BeginNamedTransaction("RevertLockedColumnProperty");
+                            try
+                            {
+                                foreach (var (label, accessor, ruleValue, liveValue) in simpleReverts)
+                                {
+                                    try
+                                    {
+                                        capturedAttr.Properties(accessor).Value = ruleValue;
+                                        Log($"Locked property revert applied: rule#{ruleIdLocal} {label} ({accessor}) '{liveValue}' -> '{ruleValue}' on '{capturedTableName}.{capturedColumnName}'");
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        Log($"  {label} ({accessor}): revert FAILED - {ex.Message}");
+                                    }
+                                }
+                                _session.CommitTransaction(transId);
+                            }
+                            catch (Exception ex)
+                            {
+                                try { _session.RollbackTransaction(transId); } catch (Exception rbEx) { Log($"RevertLockedColumnProperty rollback error: {rbEx.Message}"); }
+                                Log($"Locked property revert FAILED: {ex.Message}");
+                            }
+                        }
+
+                        // PK revert via Key_Group plumbing (separate
+                        // transaction boundaries inside the helpers).
+                        bool pkRevertNeeded = capturedProps.Any(p => string.Equals(p.accessor, "PK", StringComparison.Ordinal));
+                        if (pkRevertNeeded && _tableTypeMonitor != null)
+                        {
+                            try
+                            {
+                                dynamic applyEntity = ResolveEntityByName(capturedTableName);
+                                if (applyEntity == null)
+                                {
+                                    Log($"Locked PK revert: entity '{capturedTableName}' not found at apply time");
+                                }
+                                else if (capturedRulePk)
+                                {
+                                    _tableTypeMonitor.EnsureAttributeInPrimaryKey(applyEntity, capturedAttr, capturedColumnName);
+                                    Log($"Locked PK revert applied: rule#{ruleIdLocal} '{capturedColumnName}' restored to PK on '{capturedTableName}'");
+                                }
+                                else
+                                {
+                                    _tableTypeMonitor.RemoveAttributeFromPrimaryKey(applyEntity, capturedObjId, capturedColumnName);
+                                    Log($"Locked PK revert applied: rule#{ruleIdLocal} '{capturedColumnName}' removed from PK on '{capturedTableName}'");
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                Log($"Locked PK revert FAILED for '{capturedTableName}.{capturedColumnName}': {ex.Message}");
+                            }
+                        }
+                    });
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log($"CheckAndEnqueueLockedPropertyDrift error on '{tableName}.{columnName}': {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Editor-close-edge scan for locked-column property drift
+        /// (2026-05-25). The heartbeat's Phase-2A fingerprint short-
+        /// circuit checks only Physical_Name + Physical_Data_Type, so a
+        /// user editing ONLY Nullable, Default, or PK never reaches
+        /// <see cref="ProcessAttributeChanges"/>. This scan fires once
+        /// per Column / Entity Editor close edge to catch those changes.
+        ///
+        /// Pre-filter compliance (per [[no-full-walks-in-change-detection]]):
+        /// returns immediately when no locked rules are loaded; walks
+        /// ONLY attributes whose <see cref="_attributeSnapshots"/> entry
+        /// already carries a locked-rule name; does NOT enumerate all
+        /// entities or all attributes.
+        /// </summary>
+        private void ScanForLockedColumnPropertyDrift(string trigger, string scopedEntityName)
+        {
+            if (_sessionLost || _disposed || _validationSuspended) return;
+            if (!PredefinedColumnService.Instance.IsLoaded) return;
+
+            // 1. Locked rule name set. Empty -> no work.
+            var lockedNames = new HashSet<string>(
+                PredefinedColumnService.Instance.GetLocked().Select(r => r.ColumnName ?? string.Empty),
+                StringComparer.OrdinalIgnoreCase);
+            lockedNames.Remove(string.Empty);
+            if (lockedNames.Count == 0) return;
+
+            // 2. Snapshot pre-filter to candidate attribute ObjectIds.
+            //    If scopedEntityName is provided (we know which table the
+            //    user just closed), further restrict to that table.
+            var candidateAttrs = new Dictionary<string, AttributeValidationSnapshot>(StringComparer.Ordinal);
+            var candidateTables = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kv in _attributeSnapshots)
+            {
+                var snap = kv.Value;
+                if (snap == null) continue;
+                string snapName = snap.PhysicalName ?? string.Empty;
+                if (snapName.Length == 0) continue;
+                if (!lockedNames.Contains(snapName)) continue;
+                if (!string.IsNullOrEmpty(scopedEntityName)
+                    && !string.Equals(snap.TableName, scopedEntityName, StringComparison.Ordinal)
+                    && !EntityNameMatchesTitle(snap.TableName ?? "", scopedEntityName)
+                    && !EntityNameMatchesTitle(scopedEntityName, snap.TableName ?? "")) continue;
+                candidateAttrs[kv.Key] = snap;
+                if (!string.IsNullOrEmpty(snap.TableName))
+                    candidateTables.Add(snap.TableName);
+            }
+            if (candidateAttrs.Count == 0) return;
+
+            dynamic modelObjects = null;
+            dynamic root = null;
+            dynamic allEntities = null;
+            int driftsQueued = 0;
+            try
+            {
+                modelObjects = _session.ModelObjects;
+                root = modelObjects?.Root;
+                if (root == null) return;
+                allEntities = modelObjects.Collect(root, "Entity");
+                if (allEntities == null) return;
+
+                var remainingTables = new HashSet<string>(candidateTables, StringComparer.OrdinalIgnoreCase);
+                foreach (dynamic entity in allEntities)
+                {
+                    if (entity == null) continue;
+                    if (remainingTables.Count == 0) break;
+
+                    string entityName;
+                    try { entityName = GetTableName(entity); }
+                    catch { continue; }
+                    if (string.IsNullOrEmpty(entityName)) continue;
+
+                    string matchedCandidate = null;
+                    if (remainingTables.Contains(entityName))
+                        matchedCandidate = entityName;
+                    else
+                    {
+                        foreach (var ct in remainingTables)
+                        {
+                            if (EntityNameMatchesTitle(ct, entityName) || EntityNameMatchesTitle(entityName, ct))
+                            {
+                                matchedCandidate = ct;
+                                break;
+                            }
+                        }
+                    }
+                    if (matchedCandidate == null) continue;
+                    remainingTables.Remove(matchedCandidate);
+
+                    dynamic entityAttrs = null;
+                    try { entityAttrs = modelObjects.Collect(entity, "Attribute"); }
+                    catch { continue; }
+                    if (entityAttrs == null) continue;
+
+                    try
+                    {
+                        foreach (dynamic attr in entityAttrs)
+                        {
+                            if (attr == null) continue;
+                            string aId;
+                            try { aId = attr.ObjectId?.ToString() ?? ""; }
+                            catch { continue; }
+                            if (string.IsNullOrEmpty(aId)) continue;
+                            if (!candidateAttrs.TryGetValue(aId, out var attrSnap)) continue;
+
+                            if (CheckAndEnqueueLockedPropertyDrift(attr, entity, attrSnap.PhysicalName, entityName, aId, attrSnap))
+                                driftsQueued++;
+                        }
+                    }
+                    finally { ReleaseCom(entityAttrs); }
+                }
+
+                if (driftsQueued > 0)
+                    Log($"ScanForLockedColumnPropertyDrift [{trigger}]: queued {driftsQueued} property revert(s)");
+            }
+            catch (Exception ex)
+            {
+                Log($"ScanForLockedColumnPropertyDrift [{trigger}] err: {ex.Message}");
+            }
+            finally
+            {
+                ReleaseCom(allEntities);
+                ReleaseCom(root);
+                ReleaseCom(modelObjects);
+            }
+        }
+
+        /// <summary>
+        /// Resolve a live SCAPI Entity by physical name. Best-effort:
+        /// returns null on miss or error so callers that need the entity
+        /// ONLY for conditional-rule UDP reads degrade to "unconditional-
+        /// only" matching rather than crashing.
+        ///
+        /// Checks <see cref="_scanContextEntity"/> first - if a caller
+        /// up the stack already resolved the entity for THIS exact
+        /// table name we skip the full Collect walk entirely. This is
+        /// the hot path on locked-column rename: ScanForLockedColumnRenames
+        /// already iterated entities and bound the matching one, so the
+        /// downstream EnforceLockedColumnRename should not pay the walk
+        /// cost a second time.
+        /// </summary>
+        private dynamic ResolveEntityByName(string tableName)
+        {
+            if (string.IsNullOrEmpty(tableName) || _session == null) return null;
+
+            // Fast path: scoped cache hit. Compare with EntityNameMatchesTitle
+            // semantics so generated names ("E/33" vs "E_33") match.
+            if (_scanContextEntity != null && !string.IsNullOrEmpty(_scanContextTableName)
+                && (string.Equals(_scanContextTableName, tableName, StringComparison.OrdinalIgnoreCase)
+                    || EntityNameMatchesTitle(_scanContextTableName, tableName)
+                    || EntityNameMatchesTitle(tableName, _scanContextTableName)))
+            {
+                return _scanContextEntity;
+            }
+
+            dynamic modelObjects = null;
+            dynamic root = null;
+            dynamic allEntities = null;
+            try
+            {
+                modelObjects = _session.ModelObjects;
+                root = modelObjects?.Root;
+                if (root == null) return null;
+                allEntities = modelObjects.Collect(root, "Entity");
+                if (allEntities == null) return null;
+
+                foreach (dynamic entity in allEntities)
+                {
+                    if (entity == null) continue;
+                    string physName;
+                    try
+                    {
+                        string p = entity.Properties("Physical_Name").Value?.ToString() ?? "";
+                        physName = (!string.IsNullOrEmpty(p) && !p.StartsWith("%")) ? p : (entity.Name ?? "");
+                    }
+                    catch { try { physName = entity.Name ?? ""; } catch { continue; } }
+
+                    if (EntityNameMatchesTitle(physName, tableName)) return entity;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"ResolveEntityByName err for '{tableName}': {ex.Message}");
+            }
+            // NOTE: cannot Release here - caller may still need the entity.
+            // Caller (locked-column check) is short-lived and entity goes
+            // out of scope at end of method, .NET COM RCW cleanup handles it.
+            return null;
+        }
+
         private void ProcessNewAttribute(dynamic attr, AttributeValidationSnapshot currentState, HashSet<string> predefinedColumnNames)
         {
             // Suspended ise hicbir validation yapma. Timer-tick disindan
@@ -3214,6 +4512,29 @@ namespace EliteSoft.Erwin.AddIn.Services
 
             // No changes relevant to validation
             if (!physicalNameChanged && !domainChanged && !dataTypeChanged) return;
+
+            // Locked predefined-column enforcement (2026-05-24).
+            //
+            // Two intercepts, both gated by name-match against the locked
+            // rule set so non-locked columns pay zero cost:
+            //   * Rename: previousState.PhysicalName matches a locked
+            //     rule -> revert Physical_Name back to it.
+            //   * Property change (datatype/nullable/default): the column
+            //     name (current = previous when no rename) matches a
+            //     locked rule -> revert any drifted property to the
+            //     rule's authored value.
+            // Either intercept returning true short-circuits the rest of
+            // ProcessAttributeChanges - the locked column's downstream
+            // state is now authored, no glossary / naming / UDP cascade
+            // is needed against the typed-but-rejected value.
+            if (physicalNameChanged && EnforceLockedColumnRename(attr, previousState, currentState))
+            {
+                return;
+            }
+            if (!physicalNameChanged && EnforceLockedColumnPropertyChange(attr, previousState, currentState))
+            {
+                return;
+            }
 
             _isProcessingChange = true;
             try
@@ -3655,10 +4976,20 @@ namespace EliteSoft.Erwin.AddIn.Services
             bool requiredCancelHandled = false;
             if (attr != null && failures.Count > 0)
             {
+                // Same Required-property-promotion rule as the Table path
+                // (2026-05-24): any non-Required failure (Length / Regexp /
+                // non-AutoApply Prefix-Suffix) on a column property that
+                // also carries IS_REQUIRED=true goes through the modal
+                // input popup with the re-prompt loop instead of the
+                // consolidated warning.
+                var requiredProps = NamingStandardService.Instance.GetRequiredPropertyCodes("Column");
                 var requiredFailures = failures
                     .Where(f => f.Rule != null
-                                && string.Equals(f.RuleName, "Required", StringComparison.Ordinal)
-                                && !string.IsNullOrEmpty(f.Rule.PropertyCode))
+                                && !string.IsNullOrEmpty(f.Rule.PropertyCode)
+                                && (string.Equals(f.RuleName, "Required", StringComparison.Ordinal)
+                                    || (requiredProps != null && requiredProps.Contains(f.Rule.PropertyCode))))
+                    .GroupBy(f => f.Rule.PropertyCode, StringComparer.OrdinalIgnoreCase)
+                    .Select(g => g.FirstOrDefault(x => string.Equals(x.RuleName, "Required", StringComparison.Ordinal)) ?? g.First())
                     .ToList();
 
                 // Session-level dismissal pre-pass (added 2026-05-21):
@@ -3684,13 +5015,20 @@ namespace EliteSoft.Erwin.AddIn.Services
                 {
                     string fieldLabel = $"Column.{rf.Rule.PropertyCode}";
                     var cancelMode = isNew ? Forms.RequiredOperationMode.Create : Forms.RequiredOperationMode.Update;
+
+                    // Pre-fill the dialog with the column's current value
+                    // (same rationale as the Table path).
+                    string seedValue = "";
+                    try { seedValue = attr?.Properties(rf.Rule.PropertyCode)?.Value?.ToString() ?? ""; }
+                    catch { seedValue = ""; }
+
                     var rc = EliteSoft.Erwin.AddIn.Forms.RequiredFieldDialog.Show(
                         title: "Required field",
                         message: rf.ErrorMessage,
                         fieldLabel: fieldLabel,
                         out string typed,
                         owner: null,
-                        initialValue: "",
+                        initialValue: seedValue,
                         mode: cancelMode,
                         objectKind: "Column");
 

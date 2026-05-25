@@ -4,6 +4,7 @@ using System.IO;
 using System.Text;
 using System.Windows.Forms;
 using EliteSoft.Erwin.AddIn.Forms;
+using EliteSoft.Erwin.AddIn.Services;
 
 namespace EliteSoft.Erwin.AddIn
 {
@@ -12,6 +13,68 @@ namespace EliteSoft.Erwin.AddIn
     /// </summary>
     public static class ErwinUtilities
     {
+        /// <summary>
+        /// Cached SCAPI accessor name for the "default value" property on
+        /// Attribute (Column) objects. erwin r10.10 does NOT recognize
+        /// "Physical_Default_Value" - that throws "is not valid class id
+        /// or class name for object or property". The actual accessor
+        /// varies between releases / installs; we probe on first use,
+        /// cache the winning name, and reuse it for the rest of the
+        /// session. <c>null</c> sentinel = unknown; <c>""</c> sentinel =
+        /// probe ran, nothing worked (rare - means defaults are not
+        /// settable from SCAPI on this build, callers gracefully skip).
+        /// 2026-05-25.
+        /// </summary>
+        private static string _attributeDefaultAccessor;
+        private static readonly object _attributeDefaultAccessorLock = new object();
+
+        private static readonly string[] AttributeDefaultAccessorCandidates =
+        {
+            "Default_Value",
+            "DefaultValue",
+            "Default_Value_Override",
+            "Initial_Value",
+            "Physical_Default_Value", // historical guess, kept last for completeness
+        };
+
+        /// <summary>
+        /// Resolve and cache the working SCAPI accessor for an Attribute's
+        /// default value. Probes the candidate list against the given
+        /// attribute; the first name whose <c>Properties(name).Value</c>
+        /// read does NOT throw "not valid class id" wins. Returns the
+        /// accessor name on success, empty string when no candidate
+        /// worked. Idempotent - subsequent calls return the cached value
+        /// without re-probing.
+        /// </summary>
+        public static string ResolveAttributeDefaultAccessor(dynamic attr)
+        {
+            if (_attributeDefaultAccessor != null) return _attributeDefaultAccessor;
+            if (attr == null) return null; // wait for a live attr before committing
+
+            lock (_attributeDefaultAccessorLock)
+            {
+                if (_attributeDefaultAccessor != null) return _attributeDefaultAccessor;
+
+                foreach (var candidate in AttributeDefaultAccessorCandidates)
+                {
+                    try
+                    {
+                        var _ = attr.Properties(candidate).Value; // read attempt
+                        _attributeDefaultAccessor = candidate;
+                        try { AddinLogger.Log($"ResolveAttributeDefaultAccessor: using '{candidate}'"); } catch { }
+                        return candidate;
+                    }
+                    catch
+                    {
+                        // Try next candidate.
+                    }
+                }
+                _attributeDefaultAccessor = string.Empty;
+                try { AddinLogger.Log("ResolveAttributeDefaultAccessor: no candidate worked - default value accessor unavailable on this build"); } catch { }
+                return string.Empty;
+            }
+        }
+
         #region Environment Constants
 
         public static readonly string[] Environments = new[]

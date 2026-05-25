@@ -57,17 +57,22 @@ namespace EliteSoft.Erwin.AddIn.Services
         // (so the user can see WHY nothing fires when they change a UDP value)
         private readonly HashSet<string> _diagLoggedEmptyUdp = new HashSet<string>();
 
-        // Session-level Required-popup dismissal (added 2026-05-21). Key is
-        // "{objectId}|{propertyCode}". When the user clicks Cancel on a
-        // Required popup (Update mode) for a property whose baseline is also
-        // invalid, the revert is a no-op and the next tick's validation
-        // would re-fire the same popup. Adding the key here short-circuits
-        // every subsequent ValidateNamingStandard pass for that exact pair
-        // until session end. The set is intentionally NOT persisted - admin
-        // intent is that Required rules nag indefinitely, this is a per-
-        // session "I will deal with it later" courtesy that resets on next
-        // model open.
-        private readonly HashSet<string> _dismissedRequiredKeys = new HashSet<string>(StringComparer.Ordinal);
+        // Session-level Required-popup dismissal (added 2026-05-21,
+        // extended 2026-05-24). Key is "{objectId}|{propertyCode}", value
+        // is the property value at dismiss-time. When the user clicks
+        // Cancel on a Required popup (Update mode) for a property whose
+        // baseline is also invalid, the revert is a no-op and the next
+        // tick's validation would re-fire the same popup. Storing the
+        // dismissed-value lets us short-circuit only while the value is
+        // unchanged; once the user types a different value (valid OR
+        // invalid) the dismiss naturally expires and the popup can re-
+        // surface. Without the value check the flag stuck forever: type a
+        // long valid Description, then later truncate to 'kkk' and no
+        // warning fired (bug 2026-05-24). Intentionally NOT persisted -
+        // admin intent is that Required rules nag indefinitely, this is
+        // a per-session "I will deal with it later" courtesy that resets
+        // on next model open.
+        private readonly Dictionary<string, string> _dismissedRequiredKeys = new Dictionary<string, string>(StringComparer.Ordinal);
 
         // Property applicator for applying project standards to new tables
         private PropertyApplicatorService _propertyApplicator;
@@ -289,13 +294,39 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
 
                 // Run dependency cascades for each picked value so any
-                // conditional predefined column / dependent UDP that hangs
-                // off TABLE_TYPE etc. fires immediately, instead of waiting
-                // for the next user edit to trip CheckForUdpValueChanges.
+                // dependent UDP (e.g. TABLE_TYPE -> derived flag) is
+                // refreshed immediately instead of waiting for the next
+                // tick.
                 foreach (var kvp in form.SelectedValues)
                 {
                     try { _udpRuntimeService.HandleUdpValueChange(entity, kvp.Key, kvp.Value); }
                     catch (Exception ex) { Log($"PromptForMissingRequiredUdps: dependency cascade failed for '{kvp.Key}': {ex.Message}"); }
+                }
+
+                // Conditional predefined columns (2026-05-24 fix): admin can
+                // attach predefined columns to a UDP value (e.g. "every Log
+                // table gets a LogTime column"). The legacy cascade lived
+                // inside the dead CheckForUdpValueChanges path; with the
+                // Required-UDP popup now being the canonical "user picked
+                // the conditional UDP" event we trigger AddPredefinedColumnsForUdp
+                // directly here so the column lands on the same gesture
+                // that filled the UDP. Per-value try/catch keeps a broken
+                // predefined-column rule from poisoning the cascade for
+                // other UDPs picked in the same form.
+                foreach (var kvp in form.SelectedValues)
+                {
+                    try
+                    {
+                        var conditional = PredefinedColumnService.Instance.GetByUdpCondition(kvp.Key, kvp.Value);
+                        if (conditional != null && conditional.Any())
+                        {
+                            AddPredefinedColumnsForUdp(entity, kvp.Key, kvp.Value, physicalName);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"PromptForMissingRequiredUdps: predefined-column cascade failed for '{kvp.Key}'='{kvp.Value}' on '{physicalName}': {ex.Message}");
+                    }
                 }
                 return false;
             }
@@ -1478,26 +1509,66 @@ namespace EliteSoft.Erwin.AddIn.Services
             bool requiredCancelHandled = false;
             if (scapiObject != null && failures.Count > 0)
             {
+                // Pattern violations (Length / Regexp / non-AutoApply Prefix /
+                // non-AutoApply Suffix) on a property that ALSO carries an
+                // IS_REQUIRED=true rule must be enforced through the modal
+                // input popup, not the OK-and-forget warning. Admin signalled
+                // "user must fill this field" by setting Required; "ddd"
+                // satisfying Required but failing Length>10 has to keep
+                // prompting until the value clears all rules. We keep one
+                // entry per PropertyCode so a property with multiple failures
+                // gets a single chain of popups (Required first if present,
+                // then the re-prompt loop drains the rest).
+                var requiredProps = NamingStandardService.Instance.GetRequiredPropertyCodes(objectType);
                 var requiredFailures = failures
                     .Where(f => f.Rule != null
-                                && string.Equals(f.RuleName, "Required", StringComparison.Ordinal)
-                                && !string.IsNullOrEmpty(f.Rule.PropertyCode))
+                                && !string.IsNullOrEmpty(f.Rule.PropertyCode)
+                                && (string.Equals(f.RuleName, "Required", StringComparison.Ordinal)
+                                    || (requiredProps != null && requiredProps.Contains(f.Rule.PropertyCode))))
+                    .GroupBy(f => f.Rule.PropertyCode, StringComparer.OrdinalIgnoreCase)
+                    // Prefer a Required entry as the seed; otherwise take the first
+                    // failure (typically Length / Regexp) - the re-prompt loop will
+                    // surface the remaining ones with the right error message anyway.
+                    .Select(g => g.FirstOrDefault(x => string.Equals(x.RuleName, "Required", StringComparison.Ordinal)) ?? g.First())
                     .ToList();
 
                 // Session-level dismissal pre-pass: drop any Required failure
                 // the user already cancelled on this exact (objectId, property)
-                // pair earlier in the session. Drops both the popup and the
-                // consolidated warning entry so a known-empty Definition or
-                // Owner on an existing entity does not nag every tick after
-                // the user explicitly said "later".
+                // pair earlier in the session AND whose current value still
+                // matches the value at dismiss-time. If the value has changed
+                // since dismiss, the user has clearly engaged with the field
+                // again - we clear the flag and let the popup re-surface.
+                // Drops both the popup and the consolidated warning entry so
+                // a known-empty Definition or Owner on an existing entity
+                // does not nag every tick after the user explicitly said
+                // "later" - but the moment they touch it again, the rule
+                // applies again.
                 if (!string.IsNullOrEmpty(snapshotId))
                 {
-                    var dismissedNow = requiredFailures
-                        .Where(rf => _dismissedRequiredKeys.Contains($"{snapshotId}|{rf.Rule.PropertyCode}"))
-                        .ToList();
-                    foreach (var dismissed in dismissedNow)
+                    var toRemove = new List<NamingValidationResult>();
+                    foreach (var rf in requiredFailures)
                     {
-                        Log($"Required field popup suppressed (session-dismissed): {objectType}.{dismissed.Rule.PropertyCode} on '{physicalName}'");
+                        string key = $"{snapshotId}|{rf.Rule.PropertyCode}";
+                        if (!_dismissedRequiredKeys.TryGetValue(key, out var dismissedValue))
+                            continue;
+
+                        string liveValue = "";
+                        try { liveValue = scapiObject?.Properties(rf.Rule.PropertyCode)?.Value?.ToString() ?? ""; }
+                        catch { liveValue = ""; }
+
+                        if (string.Equals(liveValue, dismissedValue, StringComparison.Ordinal))
+                        {
+                            Log($"Required field popup suppressed (session-dismissed): {objectType}.{rf.Rule.PropertyCode} on '{physicalName}'");
+                            toRemove.Add(rf);
+                        }
+                        else
+                        {
+                            _dismissedRequiredKeys.Remove(key);
+                            Log($"Required field dismiss cleared (value changed '{dismissedValue}' -> '{liveValue}'): {objectType}.{rf.Rule.PropertyCode} on '{physicalName}'");
+                        }
+                    }
+                    foreach (var dismissed in toRemove)
+                    {
                         requiredFailures.Remove(dismissed);
                         failures.Remove(dismissed);
                     }
@@ -1507,41 +1578,90 @@ namespace EliteSoft.Erwin.AddIn.Services
                 {
                     string fieldLabel = $"{objectType}.{rf.Rule.PropertyCode}";
                     var cancelMode = isNew ? Forms.RequiredOperationMode.Create : Forms.RequiredOperationMode.Update;
-                    var rc = RequiredFieldDialog.Show(
-                        title: "Required field",
-                        message: rf.ErrorMessage,
-                        fieldLabel: fieldLabel,
-                        out string typed,
-                        owner: null,
-                        initialValue: "",
-                        mode: cancelMode,
-                        objectKind: objectType);
 
-                    if (rc != System.Windows.Forms.DialogResult.OK || string.IsNullOrEmpty(typed))
+                    // Pre-fill the dialog with the property's current value -
+                    // a pure Required violation reads "" (the empty state), but a
+                    // Length / Regexp violation on a property that already has
+                    // a partial value (e.g. Description="ddd" violating
+                    // Length>10) lets the user extend instead of retyping
+                    // from scratch.
+                    string seedValue = "";
+                    try { seedValue = scapiObject?.Properties(rf.Rule.PropertyCode)?.Value?.ToString() ?? ""; }
+                    catch { seedValue = ""; }
+
+                    // Cancel-with-invalid-revert re-prompt loop (2026-05-24
+                    // user rule: "10 dan küçük girmeye izin vermemeli, boş
+                    // bırakmaya da"). On existing entities the user could
+                    // previously escape every Required popup by clicking
+                    // Revert when the baseline was itself invalid - one
+                    // dismiss persisted forever, every subsequent tick
+                    // suppressed the popup. We now re-show the popup
+                    // IMMEDIATELY while the post-revert value still
+                    // violates the rule. User must provide a valid value
+                    // (or delete the entity from the diagram between
+                    // popups). New entities still escape via Discard.
+                    string currentMessage = rf.ErrorMessage;
+                    string currentSeed = seedValue;
+                    System.Windows.Forms.DialogResult rc;
+                    string typed;
+                    while (true)
                     {
+                        rc = RequiredFieldDialog.Show(
+                            title: "Required field",
+                            message: currentMessage,
+                            fieldLabel: fieldLabel,
+                            out typed,
+                            owner: null,
+                            initialValue: currentSeed,
+                            mode: cancelMode,
+                            objectKind: objectType);
+
+                        if (rc == System.Windows.Forms.DialogResult.OK && !string.IsNullOrEmpty(typed))
+                            break; // user typed a value - fall through to write+re-prompt logic below
+
                         Log($"Required field dialog cancelled: {fieldLabel} (mode={cancelMode})");
                         if (isNew)
                         {
                             requiredCancelHandled = TryDeleteNewEntity(scapiObject, physicalName);
+                            break; // new entity is either gone or revert failed; either way exit this rf
                         }
-                        else
-                        {
-                            string baseline = string.Equals(rf.Rule.PropertyCode, "Physical_Name", StringComparison.OrdinalIgnoreCase)
-                                ? baselinePhysicalName
-                                : (baselineWatched.TryGetValue(rf.Rule.PropertyCode, out var bv) ? bv : "");
-                            requiredCancelHandled = TryRevertEntityProperty(scapiObject, snapshotId, physicalName, rf.Rule.PropertyCode, baseline);
 
-                            // Cancel + Update means "leave it as is for now".
-                            // Even if the revert wrote nothing (baseline was
-                            // already empty / equal to current), record the
-                            // dismissal so the next tick does not re-prompt
-                            // the same Required popup for the same property.
+                        string baseline = string.Equals(rf.Rule.PropertyCode, "Physical_Name", StringComparison.OrdinalIgnoreCase)
+                            ? baselinePhysicalName
+                            : (baselineWatched.TryGetValue(rf.Rule.PropertyCode, out var bv) ? bv : "");
+                        requiredCancelHandled = TryRevertEntityProperty(scapiObject, snapshotId, physicalName, rf.Rule.PropertyCode, baseline);
+
+                        string postRevertValue = "";
+                        try { postRevertValue = scapiObject?.Properties(rf.Rule.PropertyCode)?.Value?.ToString() ?? ""; }
+                        catch { postRevertValue = ""; }
+                        bool revertedIsValid = RevalidatePropertyAfterRevert(scapiBoxed, objectType, rf.Rule.PropertyCode, postRevertValue, failures);
+
+                        if (revertedIsValid)
+                        {
+                            // Reverted value passes every rule - this is the
+                            // intended dismiss path: store the value and exit.
                             if (!string.IsNullOrEmpty(snapshotId))
                             {
-                                _dismissedRequiredKeys.Add($"{snapshotId}|{rf.Rule.PropertyCode}");
-                                Log($"Required field dismissed for session: {snapshotId}|{rf.Rule.PropertyCode}");
+                                _dismissedRequiredKeys[$"{snapshotId}|{rf.Rule.PropertyCode}"] = postRevertValue;
+                                Log($"Required field dismissed for session: {snapshotId}|{rf.Rule.PropertyCode} value='{postRevertValue}'");
                             }
+                            break;
                         }
+
+                        // Reverted value still violates - pull the freshest
+                        // failure message (Required vs Length etc.) and loop
+                        // back to the popup. NO dismiss flag is stored, so
+                        // even if revert wrote nothing the user is forced to
+                        // address the violation right now.
+                        var freshFailure = failures.FirstOrDefault(f => f.Rule != null
+                            && string.Equals(f.Rule.PropertyCode, rf.Rule.PropertyCode, StringComparison.OrdinalIgnoreCase));
+                        currentMessage = freshFailure?.ErrorMessage ?? currentMessage;
+                        currentSeed = postRevertValue;
+                        Log($"Required field re-prompt after Cancel (post-revert still invalid): {fieldLabel}");
+                    }
+
+                    if (rc != System.Windows.Forms.DialogResult.OK || string.IsNullOrEmpty(typed))
+                    {
                         if (requiredCancelHandled) break;
                         // Delete/revert failed - fall through to next iteration so
                         // the remaining Required failures still get a chance. The
@@ -1675,10 +1795,14 @@ namespace EliteSoft.Erwin.AddIn.Services
                                         ? baselinePhysicalName
                                         : (baselineWatched.TryGetValue(rf.Rule.PropertyCode, out var bv) ? bv : "");
                                     requiredCancelHandled = TryRevertEntityProperty(scapiObject, snapshotId, physicalName, rf.Rule.PropertyCode, baseline);
-                                    if (!string.IsNullOrEmpty(snapshotId))
+                                    string postRevertValue2 = "";
+                                    try { postRevertValue2 = scapiObject?.Properties(rf.Rule.PropertyCode)?.Value?.ToString() ?? ""; }
+                                    catch { postRevertValue2 = ""; }
+                                    bool revertedIsValid2 = RevalidatePropertyAfterRevert(scapiBoxed, objectType, rf.Rule.PropertyCode, postRevertValue2, failures);
+                                    if (!string.IsNullOrEmpty(snapshotId) && revertedIsValid2)
                                     {
-                                        _dismissedRequiredKeys.Add($"{snapshotId}|{rf.Rule.PropertyCode}");
-                                        Log($"Required field dismissed for session: {snapshotId}|{rf.Rule.PropertyCode}");
+                                        _dismissedRequiredKeys[$"{snapshotId}|{rf.Rule.PropertyCode}"] = postRevertValue2;
+                                        Log($"Required field dismissed for session: {snapshotId}|{rf.Rule.PropertyCode} value='{postRevertValue2}'");
                                     }
                                 }
                                 // Remove pending non-Required failures
@@ -1986,9 +2110,314 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// Re-validate rules for a single property after the user clicked
+        /// Cancel on a Required popup and we reverted the value. Replaces
+        /// any existing failure entries for this property in the
+        /// consolidated <paramref name="failures"/> list with the result
+        /// of validating the post-revert value, so the end-of-method
+        /// warning surface reflects current model state (not the pre-
+        /// cancel value). Returns <c>true</c> when the reverted value
+        /// satisfies every rule (caller may safely set the dismiss flag),
+        /// <c>false</c> when violations remain (caller MUST NOT set the
+        /// dismiss flag - leaving it unset lets the next validation pass
+        /// re-fire the popup so the user is forced to address it).
+        /// 2026-05-24 user requests: "her ihtimale karşı yine kurallar
+        /// revert edilen üzerinde çalıştırılmalı" + "Revert sonrası hala
+        /// invalid ise Popup'ı TEKRAR göster".
+        /// </summary>
+        private bool RevalidatePropertyAfterRevert(object scapiBoxed, string objectType, string propertyCode, string postRevertValue, List<NamingValidationResult> failures)
+        {
+            if (failures == null || string.IsNullOrEmpty(propertyCode)) return true;
+            try
+            {
+                // Drop every existing failure entry for this property -
+                // they were computed against the pre-revert value and are
+                // now stale.
+                failures.RemoveAll(f => f.Rule != null
+                    && string.Equals(f.Rule.PropertyCode, propertyCode, StringComparison.OrdinalIgnoreCase));
+
+                var freshResults = NamingValidationEngine.ValidateObjectName(
+                    objectType, postRevertValue, scapiBoxed, propertyCode);
+                if (freshResults == null) return true;
+
+                var freshFailures = freshResults.Where(r => !r.IsValid).ToList();
+                if (freshFailures.Count == 0)
+                {
+                    Log($"Post-revert re-validation: {objectType}.{propertyCode}='{postRevertValue}' satisfies all rules");
+                    return true;
+                }
+
+                failures.AddRange(freshFailures);
+                foreach (var f in freshFailures)
+                {
+                    Log($"Post-revert re-validation: {objectType}.{propertyCode}='{postRevertValue}' still violates rule#{f.Rule?.Id} ({f.RuleName}) - dismiss NOT set, popup will re-fire");
+                }
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Log($"RevalidatePropertyAfterRevert err for {objectType}.{propertyCode}: {ex.Message}");
+                return true; // safer default: prevent loop on internal errors
+            }
+        }
+
+        /// <summary>
         /// Add predefined columns to the entity based on a UDP condition match.
         /// Called when a UDP value change matches predefined column rules.
         /// </summary>
+        /// <summary>
+        /// Re-evaluate every conditional predefined-column rule against
+        /// the entity's CURRENT UDP values. For each rule whose
+        /// <c>DEPENDS_ON_UDP_VALUE</c> matches the entity's current UDP
+        /// value, apply its predefined columns (idempotent: already-
+        /// present columns are skipped by
+        /// <see cref="ApplyPredefinedColumnsToEntity"/>). Used by the
+        /// Entity / Column Editor close paths to pick up UDP changes the
+        /// user made via the grid - the live per-tick UDP watcher was
+        /// disabled 2026-05-22 due to erwin crashes, so the close-edge
+        /// pass is the only place we can re-evaluate without paying the
+        /// per-tick read cost. Columns added by a rule whose UDP no
+        /// longer matches are intentionally NOT removed - admin's intent
+        /// was "add these when UDP=X", and dropping them later would
+        /// risk losing user-typed column metadata.
+        /// </summary>
+        public void ReevaluateConditionalPredefinedColumns(dynamic entity, string physicalName)
+        {
+            if (entity == null || string.IsNullOrEmpty(physicalName)) return;
+            try
+            {
+                if (!PredefinedColumnService.Instance.IsLoaded)
+                {
+                    PredefinedColumnService.Instance.LoadPredefinedColumns();
+                }
+
+                // Distinct list of UDP names referenced by any conditional
+                // rule. Reading per-UDP once keeps the SCAPI cost bounded
+                // to O(rules) regardless of how many predefined columns
+                // each rule produces.
+                var conditionalRules = PredefinedColumnService.Instance.GetAll()
+                    .Where(c => c != null && !string.IsNullOrEmpty(c.DependsOnUdpName) && !string.IsNullOrEmpty(c.DependsOnUdpValue))
+                    .ToList();
+                Log($"ReevaluateConditionalPredefinedColumns: '{physicalName}' - {conditionalRules.Count} conditional rule(s) loaded (total loaded={PredefinedColumnService.Instance.GetAll().Count()})");
+                if (conditionalRules.Count == 0) return;
+
+                var udpNames = conditionalRules.Select(c => c.DependsOnUdpName)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                var liveUdp = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var udpName in udpNames)
+                {
+                    string path = $"Entity.Physical.{udpName}";
+                    try
+                    {
+                        liveUdp[udpName] = entity.Properties(path)?.Value?.ToString() ?? "";
+                        Log($"ReevaluateConditionalPredefinedColumns: read '{path}' on '{physicalName}' = '{liveUdp[udpName]}'");
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"ReevaluateConditionalPredefinedColumns: read '{path}' on '{physicalName}' failed: {ex.Message}");
+                        liveUdp[udpName] = "";
+                    }
+                }
+
+                // Distinct (udpName, udpValue) pairs that match the live
+                // state. AddPredefinedColumnsForUdp re-queries by the same
+                // key so calling it once per pair is sufficient.
+                var firedPairs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var rule in conditionalRules)
+                {
+                    if (!liveUdp.TryGetValue(rule.DependsOnUdpName, out var liveVal))
+                    {
+                        Log($"ReevaluateConditionalPredefinedColumns: rule '{rule.DependsOnUdpName}'='{rule.DependsOnUdpValue}' SKIP - liveUdp has no entry for '{rule.DependsOnUdpName}'");
+                        continue;
+                    }
+                    if (string.IsNullOrEmpty(liveVal))
+                    {
+                        Log($"ReevaluateConditionalPredefinedColumns: rule '{rule.DependsOnUdpName}'='{rule.DependsOnUdpValue}' SKIP - live value empty");
+                        continue;
+                    }
+                    if (!rule.DependsOnUdpValue.Equals(liveVal, StringComparison.OrdinalIgnoreCase))
+                    {
+                        Log($"ReevaluateConditionalPredefinedColumns: rule '{rule.DependsOnUdpName}'='{rule.DependsOnUdpValue}' SKIP - live value='{liveVal}' (mismatch)");
+                        continue;
+                    }
+                    Log($"ReevaluateConditionalPredefinedColumns: rule '{rule.DependsOnUdpName}'='{rule.DependsOnUdpValue}' MATCH live='{liveVal}' on '{physicalName}'");
+
+                    string key = rule.DependsOnUdpName + "\0" + rule.DependsOnUdpValue;
+                    if (!firedPairs.Add(key)) continue;
+
+                    try
+                    {
+                        AddPredefinedColumnsForUdp(entity, rule.DependsOnUdpName, rule.DependsOnUdpValue, physicalName);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"ReevaluateConditionalPredefinedColumns: AddPredefinedColumnsForUdp err for '{rule.DependsOnUdpName}'='{rule.DependsOnUdpValue}' on '{physicalName}': {ex.Message}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"ReevaluateConditionalPredefinedColumns error for '{physicalName}': {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Read-only check: is the attribute (identified by ObjectId) a
+        /// current PK member of the given entity? Walks the entity's
+        /// Key_Group collection, finds the one with Key_Group_Type="PK",
+        /// then walks its Key_Group_Member rows looking for a matching
+        /// Attribute_Ref. Used by locked-predefined-column enforcement
+        /// (2026-05-25) to detect PK drift on locked columns.
+        /// </summary>
+        public bool IsAttributeInPrimaryKey(dynamic entity, string attrObjectId)
+        {
+            if (entity == null || string.IsNullOrEmpty(attrObjectId)) return false;
+            try
+            {
+                dynamic modelObjects = _session.ModelObjects;
+                dynamic groups = modelObjects.Collect(entity, "Key_Group");
+                if (groups == null) return false;
+                foreach (dynamic kg in groups)
+                {
+                    string kgType = null;
+                    try { kgType = kg.Properties("Key_Group_Type").Value?.ToString(); }
+                    catch { continue; }
+                    if (!string.Equals(kgType, "PK", StringComparison.OrdinalIgnoreCase)) continue;
+
+                    dynamic members = modelObjects.Collect(kg, "Key_Group_Member");
+                    if (members == null) return false;
+                    foreach (dynamic m in members)
+                    {
+                        string memberAttrRef = null;
+                        try { memberAttrRef = m.Properties("Attribute_Ref").Value?.ToString(); }
+                        catch { continue; }
+                        if (string.Equals(memberAttrRef, attrObjectId, StringComparison.OrdinalIgnoreCase))
+                            return true;
+                    }
+                    return false; // there is exactly one PK Key_Group per entity
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"IsAttributeInPrimaryKey err: {ex.Message}");
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Public entry to add an attribute to the entity's PK Key_Group.
+        /// Idempotent (no-op when already a member). Wraps the existing
+        /// private helper so the locked-column enforcement code (in
+        /// <c>ValidationCoordinatorService</c>) can promote a column to
+        /// PK without duplicating the Key_Group / Key_Group_Member
+        /// transaction logic. 2026-05-25.
+        /// </summary>
+        public void EnsureAttributeInPrimaryKey(dynamic entity, dynamic attr, string columnName)
+        {
+            if (entity == null || attr == null) return;
+            try { MakeAttributePrimaryKey(entity, attr, columnName ?? string.Empty, "LOCKED-ENFORCE"); }
+            catch (Exception ex) { Log($"EnsureAttributeInPrimaryKey err for '{columnName}': {ex.Message}"); }
+        }
+
+        /// <summary>
+        /// Remove an attribute from the entity's PK Key_Group. No-op
+        /// when the attribute is not a current PK member. Used by
+        /// locked-predefined-column PK enforcement when admin authored
+        /// the rule with IS_PRIMARY_KEY=false but the user added the
+        /// column to the PK manually. 2026-05-25.
+        /// </summary>
+        public void RemoveAttributeFromPrimaryKey(dynamic entity, string attrObjectId, string columnName)
+        {
+            if (entity == null || string.IsNullOrEmpty(attrObjectId)) return;
+            try
+            {
+                dynamic modelObjects = _session.ModelObjects;
+                dynamic groups = modelObjects.Collect(entity, "Key_Group");
+                if (groups == null) return;
+                dynamic pkGroup = null;
+                foreach (dynamic kg in groups)
+                {
+                    string kgType = null;
+                    try { kgType = kg.Properties("Key_Group_Type").Value?.ToString(); }
+                    catch { continue; }
+                    if (string.Equals(kgType, "PK", StringComparison.OrdinalIgnoreCase))
+                    {
+                        pkGroup = kg;
+                        break;
+                    }
+                }
+                if (pkGroup == null) return;
+
+                dynamic members = modelObjects.Collect(pkGroup, "Key_Group_Member");
+                if (members == null) return;
+
+                dynamic targetMember = null;
+                foreach (dynamic m in members)
+                {
+                    string memberAttrRef = null;
+                    try { memberAttrRef = m.Properties("Attribute_Ref").Value?.ToString(); }
+                    catch { continue; }
+                    if (string.Equals(memberAttrRef, attrObjectId, StringComparison.OrdinalIgnoreCase))
+                    {
+                        targetMember = m;
+                        break;
+                    }
+                }
+                if (targetMember == null) return;
+
+                int txId = _session.BeginNamedTransaction("RemoveLockedPkMember");
+                try
+                {
+                    // SCAPI removal uses the parent's Remove(child) on the
+                    // member collection. The Add path used Collect(pkGroup).
+                    // Add("Key_Group_Member") so the inverse is symmetric.
+                    modelObjects.Collect(pkGroup).Remove(targetMember);
+                    _session.CommitTransaction(txId);
+                    Log($"Removed '{columnName}' from PK Key_Group (locked rule says IS_PRIMARY_KEY=false)");
+                }
+                catch (Exception ex)
+                {
+                    try { _session.RollbackTransaction(txId); } catch (Exception rbEx) { Log($"RemoveAttributeFromPrimaryKey rollback err: {rbEx.Message}"); }
+                    Log($"RemoveAttributeFromPrimaryKey FAILED for '{columnName}': {ex.Message}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"RemoveAttributeFromPrimaryKey err for '{columnName}': {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Re-create a specific predefined column on the given entity.
+        /// Used by the locked-column delete-restore path
+        /// (<c>ValidationCoordinatorService.RestoreDeletedLockedColumns</c>):
+        /// the user just deleted a column whose name matched a locked
+        /// predefined-column rule, so we re-apply just that rule. Goes
+        /// through the same <see cref="ApplyPredefinedColumnsToEntity"/>
+        /// path the normal add flow uses, so the column comes back with
+        /// the exact properties admin authored (datatype, nullable, PK,
+        /// default, in-PK membership). Idempotent: if a column with the
+        /// same name still exists (e.g. the heartbeat fired during a
+        /// rapid recreate gesture) the inner name-check skips it.
+        /// </summary>
+        public void RestoreSpecificPredefinedColumn(dynamic entity, PredefinedColumn rule, string physicalName)
+        {
+            if (entity == null || rule == null) return;
+            try
+            {
+                string contextLabel = rule.IsUnconditional
+                    ? "LOCKED-RESTORE unconditional"
+                    : $"LOCKED-RESTORE UDP '{rule.DependsOnUdpName}'='{rule.DependsOnUdpValue}'";
+                ApplyPredefinedColumnsToEntity(entity, new[] { rule }, physicalName, contextLabel);
+            }
+            catch (Exception ex)
+            {
+                Log($"RestoreSpecificPredefinedColumn err for '{rule.ColumnName}' on '{physicalName}': {ex.Message}");
+            }
+        }
+
         private void AddPredefinedColumnsForUdp(dynamic entity, string udpName, string udpValue, string physicalName)
         {
             try
@@ -2117,8 +2546,18 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                         if (!string.IsNullOrEmpty(col.DefaultValue))
                         {
-                            try { newAttribute.Properties("Physical_Default_Value").Value = col.DefaultValue; }
-                            catch (Exception ex) { Log($"ApplyPredefined({contextLabel}): set default '{col.ColumnName}': {ex.Message}"); }
+                            // Default-value SCAPI accessor varies between
+                            // erwin builds. Probe once, cache, reuse.
+                            string defAccessor = ErwinUtilities.ResolveAttributeDefaultAccessor(newAttribute);
+                            if (string.IsNullOrEmpty(defAccessor))
+                            {
+                                Log($"ApplyPredefined({contextLabel}): default skipped for '{col.ColumnName}' - no default-value accessor available");
+                            }
+                            else
+                            {
+                                try { newAttribute.Properties(defAccessor).Value = col.DefaultValue; }
+                                catch (Exception ex) { Log($"ApplyPredefined({contextLabel}): set default ({defAccessor}) '{col.ColumnName}': {ex.Message}"); }
+                            }
                         }
 
                         _session.CommitTransaction(transId);

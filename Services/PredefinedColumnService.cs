@@ -30,6 +30,19 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// it trusts whatever shape the admin row carries.
         /// </summary>
         public bool IsPrimaryKey { get; set; }
+        /// <summary>
+        /// Admin "this column is locked" flag (2026-05-24 schema extension,
+        /// IS_LOCKED bit NOT NULL DEFAULT 0). When true and the rule
+        /// currently applies to an entity (unconditional, or the gating
+        /// UDP value matches), the user is prevented from renaming,
+        /// re-typing, or deleting the resulting column - any such gesture
+        /// is reverted by ValidationCoordinatorService and a
+        /// LockedColumnDialog surfaces. Conditional locks are released
+        /// the moment the UDP value no longer matches, by design (admin
+        /// asked for "while condition holds" semantics, not "once locked
+        /// always locked"). 2026-05-24 user rule.
+        /// </summary>
+        public bool IsLocked { get; set; }
         public string DefaultValue { get; set; }
         // Nullable to match admin's schema (admin authored 2026-05-14:
         // "rule-independent predefined columns"). HasValue==false means
@@ -163,6 +176,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 bool isPrimaryKey = reader["IS_PRIMARY_KEY"] != DBNull.Value &&
                                                     Convert.ToBoolean(reader["IS_PRIMARY_KEY"]);
 
+                                // IS_LOCKED is admin's 2026-05-24 schema extension
+                                // (bit NOT NULL DEFAULT 0). Nullable-safe read
+                                // for forward-compat with admin DBs that may
+                                // not yet have the column.
+                                bool isLocked = reader["IS_LOCKED"] != DBNull.Value &&
+                                                Convert.ToBoolean(reader["IS_LOCKED"]);
+
                                 _columns.Add(new PredefinedColumn
                                 {
                                     Id = Convert.ToInt32(reader["ID"]),
@@ -171,6 +191,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     DataType = reader["DATA_TYPE"]?.ToString()?.Trim() ?? "",
                                     Nullable = reader["NULLABLE"] != DBNull.Value && Convert.ToBoolean(reader["NULLABLE"]),
                                     IsPrimaryKey = isPrimaryKey,
+                                    IsLocked = isLocked,
                                     DefaultValue = reader["DEFAULT_VALUE"] == DBNull.Value ? "" : reader["DEFAULT_VALUE"]?.ToString() ?? "",
                                     DependsOnUdpId = dependsOnUdpId,
                                     DependsOnUdpValue = reader["DEPENDS_ON_UDP_VALUE"] == DBNull.Value ? "" : reader["DEPENDS_ON_UDP_VALUE"]?.ToString()?.Trim() ?? "",
@@ -183,7 +204,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
 
                 _isLoaded = true;
-                System.Diagnostics.Debug.WriteLine($"PredefinedColumnService: Loaded {_columns.Count} entries");
+                int lockedCount = _columns.Count(c => c.IsLocked);
+                System.Diagnostics.Debug.WriteLine($"PredefinedColumnService: Loaded {_columns.Count} entries ({lockedCount} locked)");
                 return true;
             }
             catch (Exception ex)
@@ -201,7 +223,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             {
                 case "POSTGRESQL":
                     return @"SELECT pc.""ID"", pc.""CONFIG_ID"", pc.""COLUMN_NAME"", pc.""DATA_TYPE"", pc.""NULLABLE"",
-                            pc.""IS_PRIMARY_KEY"",
+                            pc.""IS_PRIMARY_KEY"", pc.""IS_LOCKED"",
                             pc.""DEFAULT_VALUE"", pc.""DEPENDS_ON_UDP_ID"", pc.""DEPENDS_ON_UDP_VALUE"",
                             pc.""SORT_ORDER"",
                             udp.""NAME"" AS ""UDP_NAME""
@@ -212,7 +234,7 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                 case "ORACLE":
                     return @"SELECT pc.ID, pc.CONFIG_ID, pc.COLUMN_NAME, pc.DATA_TYPE, pc.NULLABLE,
-                            pc.IS_PRIMARY_KEY,
+                            pc.IS_PRIMARY_KEY, pc.IS_LOCKED,
                             pc.DEFAULT_VALUE, pc.DEPENDS_ON_UDP_ID, pc.DEPENDS_ON_UDP_VALUE,
                             pc.SORT_ORDER,
                             udp.NAME AS UDP_NAME
@@ -224,7 +246,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 case "MSSQL":
                 default:
                     return @"SELECT pc.[ID], pc.[CONFIG_ID], pc.[COLUMN_NAME], pc.[DATA_TYPE], pc.[NULLABLE],
-                            pc.[IS_PRIMARY_KEY],
+                            pc.[IS_PRIMARY_KEY], pc.[IS_LOCKED],
                             pc.[DEFAULT_VALUE], pc.[DEPENDS_ON_UDP_ID], pc.[DEPENDS_ON_UDP_VALUE],
                             pc.[SORT_ORDER],
                             udp.[NAME] AS [UDP_NAME]
@@ -281,6 +303,67 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// Get all loaded predefined columns.
         /// </summary>
         public IEnumerable<PredefinedColumn> GetAll() => _columns;
+
+        /// <summary>
+        /// Get every locked predefined column row. Used by the locked-column
+        /// enforcement (rename / re-type / delete revert). Includes BOTH
+        /// unconditional locked rows AND conditional locked rows - the
+        /// caller decides whether a conditional row currently applies to
+        /// a given entity via <see cref="FindApplicableLockedRule"/>.
+        /// 2026-05-24.
+        /// </summary>
+        public IEnumerable<PredefinedColumn> GetLocked()
+        {
+            if (!_isLoaded) return Enumerable.Empty<PredefinedColumn>();
+            return _columns.Where(c => c.IsLocked).OrderBy(c => c.SortOrder);
+        }
+
+        /// <summary>
+        /// Look up the locked rule (if any) that currently APPLIES to the
+        /// given column name on the given entity. Conditional locked rules
+        /// only protect the column while their gating UDP value matches the
+        /// entity's current UDP state - the "while condition holds" semantic
+        /// the user confirmed 2026-05-24. Returns null when no locked rule
+        /// matches; caller treats that as "the column is free to edit".
+        /// </summary>
+        /// <param name="entity">Live SCAPI Entity reference for reading UDP state.</param>
+        /// <param name="columnName">Physical column name to check.</param>
+        public PredefinedColumn FindApplicableLockedRule(dynamic entity, string columnName)
+        {
+            if (!_isLoaded || string.IsNullOrEmpty(columnName)) return null;
+
+            foreach (var rule in _columns)
+            {
+                if (!rule.IsLocked) continue;
+                if (!string.Equals(rule.ColumnName, columnName, StringComparison.OrdinalIgnoreCase)) continue;
+
+                // Unconditional locked rule always applies.
+                if (rule.IsUnconditional) return rule;
+
+                // Conditional rule: read the gating UDP on this entity and
+                // compare. Wrap in try/catch because reading a UDP that the
+                // entity has never been assigned can throw on r10.10 (sparse
+                // storage) - treat as "not applicable" which is the safe
+                // default (column not locked, user can edit). Without this
+                // guard a single broken UDP would surface as a SCAPI exception
+                // every tick the user clicked the column.
+                if (entity == null) continue;
+                try
+                {
+                    string path = $"Entity.Physical.{rule.DependsOnUdpName}";
+                    string liveValue = entity.Properties(path)?.Value?.ToString() ?? "";
+                    if (string.Equals(liveValue, rule.DependsOnUdpValue, StringComparison.OrdinalIgnoreCase))
+                        return rule;
+                }
+                catch
+                {
+                    // SCAPI returned "Entity class does not use a property of
+                    // ... type" - the entity has not been assigned this UDP,
+                    // so the gating condition cannot be met. Skip this rule.
+                }
+            }
+            return null;
+        }
 
         public void Reload(string platformDbType = null)
         {

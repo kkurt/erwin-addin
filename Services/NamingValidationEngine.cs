@@ -119,80 +119,78 @@ namespace EliteSoft.Erwin.AddIn.Services
             // silently as bookkeeping. Re-asking the user every time the
             // conditioning UDP changes was rejected as a UX regression
             // 2026-05-07.
-            IEnumerable<NamingStandardRule> rules = NamingStandardService.Instance.GetByObjectTypeAndProperty(objectType, propertyCode);
+            // Materialise once so we can iterate twice (strip-then-apply).
+            var rules = NamingStandardService.Instance
+                .GetByObjectTypeAndProperty(objectType, propertyCode)
+                .Where(r => r != null
+                            && (r.RuleType == NamingRuleKind.Prefix || r.RuleType == NamingRuleKind.Suffix))
+                .ToList();
 
             string result = objectName;
 
+            // Two-pass design (2026-05-24): a single pass that interleaved
+            // reverse-strip with forward-apply ordered the operations by
+            // SORT_ORDER, so a now-applicable rule (TableClass switched to
+            // Log -> rule#20 adds '_LOG') ran BEFORE a now-stale rule
+            // (rule#21 _HISTORY strip), leaving the entity with both
+            // suffixes ("VpE_281_HISTORY_LOG" - verified 2026-05-24). Pass
+            // 1 strips every stale conditional decoration first, pass 2
+            // adds the currently-applicable ones to the clean baseline.
+            // Per-pass evaluations of IsRuleApplicable are independent (same
+            // SCAPI state for both), so the two-pass scan does not flip a
+            // decision mid-iteration.
+
+            // Pass 1: reverse-strip for non-applicable conditional rules.
             foreach (var rule in rules)
             {
-                // Only Prefix and Suffix kinds mutate the value; everything
-                // else is validate-only and the engine produces violations
-                // through ValidateObjectName, not transformations.
-                if (rule.RuleType != NamingRuleKind.Prefix && rule.RuleType != NamingRuleKind.Suffix)
-                    continue;
+                bool isConditional = rule.DependsOnUdpId.HasValue && !string.IsNullOrEmpty(rule.DependsOnUdpName);
+                if (!isConditional) continue;
 
                 bool applicable = IsRuleApplicable(rule, objectType, scapiObject);
-                bool isConditional = rule.DependsOnUdpId.HasValue && !string.IsNullOrEmpty(rule.DependsOnUdpName);
+                AddinLogger.Log(
+                    $"NamingApply: rule#{rule.Id} [{rule.RuleType}] {rule.ObjectType}.{rule.PropertyCode} " +
+                    $"cond=udp[{rule.DependsOnUdpName}] in [{rule.DependsOnPropertyValues ?? ""}] -> applicable={applicable}");
 
-                // Per-rule trace (2026-05-24): admins reported "Vp applied
-                // but _LOG not applied" on entities created from Home tab.
-                // Knowing whether IsRuleApplicable returned true / false on
-                // each rule (and what UDP value was observed) tells us if
-                // the conditional read missed the just-written UDP. Routed
-                // through Debug.WriteLine to keep the engine static and
-                // dependency-free; the addin's debug-log capture surfaces
-                // these lines in the live log.
-                if (isConditional)
+                if (applicable) continue; // forward-apply pass handles it below
+
+                if (rule.RuleType == NamingRuleKind.Prefix
+                    && !string.IsNullOrEmpty(rule.Prefix)
+                    && result.StartsWith(rule.Prefix, StringComparison.OrdinalIgnoreCase))
                 {
-                    string condDiag = rule.DependsOnPropertyValues ?? "";
-                    AddinLogger.Log(
-                        $"NamingApply: rule#{rule.Id} [{rule.RuleType}] {rule.ObjectType}.{rule.PropertyCode} " +
-                        $"cond=udp[{rule.DependsOnUdpName}] in [{condDiag}] -> applicable={applicable}");
+                    AddinLogger.Log($"NamingApply: rule#{rule.Id} stale Prefix='{rule.Prefix}' stripped from '{result}'");
+                    result = result.Substring(rule.Prefix.Length);
                 }
-
-                if (applicable)
+                else if (rule.RuleType == NamingRuleKind.Suffix
+                         && !string.IsNullOrEmpty(rule.Suffix)
+                         && result.EndsWith(rule.Suffix, StringComparison.OrdinalIgnoreCase))
                 {
-                    // Forward apply: ADD prefix/suffix. Honour autoOnly so
-                    // AUTO_APPLY=false rules are deferred to the ask-user
-                    // path (the caller invokes us a second time with
-                    // autoOnly=false and prompts on diff).
-                    if (autoOnly && !rule.AutoApply) continue;
-
-                    if (rule.RuleType == NamingRuleKind.Prefix
-                        && !string.IsNullOrEmpty(rule.Prefix)
-                        && !result.StartsWith(rule.Prefix, StringComparison.OrdinalIgnoreCase))
-                    {
-                        AddinLogger.Log($"NamingApply: rule#{rule.Id} Prefix='{rule.Prefix}' applied to '{result}'");
-                        result = rule.Prefix + result;
-                    }
-                    else if (rule.RuleType == NamingRuleKind.Suffix
-                             && !string.IsNullOrEmpty(rule.Suffix)
-                             && !result.EndsWith(rule.Suffix, StringComparison.OrdinalIgnoreCase))
-                    {
-                        AddinLogger.Log($"NamingApply: rule#{rule.Id} Suffix='{rule.Suffix}' applied to '{result}'");
-                        result = result + rule.Suffix;
-                    }
+                    AddinLogger.Log($"NamingApply: rule#{rule.Id} stale Suffix='{rule.Suffix}' stripped from '{result}'");
+                    result = result.Substring(0, result.Length - rule.Suffix.Length);
                 }
-                else if (isConditional)
+            }
+
+            // Pass 2: forward-apply for applicable rules (conditional and
+            // unconditional). Honour autoOnly here so AUTO_APPLY=false rules
+            // are deferred to the ask-user path.
+            foreach (var rule in rules)
+            {
+                bool applicable = IsRuleApplicable(rule, objectType, scapiObject);
+                if (!applicable) continue;
+                if (autoOnly && !rule.AutoApply) continue;
+
+                if (rule.RuleType == NamingRuleKind.Prefix
+                    && !string.IsNullOrEmpty(rule.Prefix)
+                    && !result.StartsWith(rule.Prefix, StringComparison.OrdinalIgnoreCase))
                 {
-                    // Reverse strip: ALWAYS silent. The conditioning UDP no
-                    // longer matches, so any prefix/suffix the rule had
-                    // previously added is stale; removing it does not need
-                    // user confirmation regardless of AUTO_APPLY. Only
-                    // conditional rules strip - a non-conditional baseline
-                    // prefix is never auto-removed.
-                    if (rule.RuleType == NamingRuleKind.Prefix
-                        && !string.IsNullOrEmpty(rule.Prefix)
-                        && result.StartsWith(rule.Prefix, StringComparison.OrdinalIgnoreCase))
-                    {
-                        result = result.Substring(rule.Prefix.Length);
-                    }
-                    else if (rule.RuleType == NamingRuleKind.Suffix
-                             && !string.IsNullOrEmpty(rule.Suffix)
-                             && result.EndsWith(rule.Suffix, StringComparison.OrdinalIgnoreCase))
-                    {
-                        result = result.Substring(0, result.Length - rule.Suffix.Length);
-                    }
+                    AddinLogger.Log($"NamingApply: rule#{rule.Id} Prefix='{rule.Prefix}' applied to '{result}'");
+                    result = rule.Prefix + result;
+                }
+                else if (rule.RuleType == NamingRuleKind.Suffix
+                         && !string.IsNullOrEmpty(rule.Suffix)
+                         && !result.EndsWith(rule.Suffix, StringComparison.OrdinalIgnoreCase))
+                {
+                    AddinLogger.Log($"NamingApply: rule#{rule.Id} Suffix='{rule.Suffix}' applied to '{result}'");
+                    result = result + rule.Suffix;
                 }
             }
 
@@ -331,11 +329,16 @@ namespace EliteSoft.Erwin.AddIn.Services
             try
             {
                 string value = scapiObject.Properties(path)?.Value?.ToString() ?? "";
-                AddinLogger.Log($"NamingApply.ReadUdpValue: '{path}' -> '{value}'");
+                // 2026-05-24: per-read success log dropped. Rule applicability
+                // outcome ("rule#N applicable=True/False") is already logged
+                // at the calling site and is the useful signal; logging every
+                // single read here added ~1200 lines per validation pass.
                 return value;
             }
             catch (Exception ex)
             {
+                // Keep the error path - sparse-storage / typo / missing UDP
+                // diagnostics are valuable.
                 AddinLogger.Log($"NamingApply.ReadUdpValue: '{path}' threw {ex.GetType().Name}: {ex.Message}");
                 return "";
             }

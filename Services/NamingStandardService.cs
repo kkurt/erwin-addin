@@ -419,6 +419,33 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// Distinct PROPERTY_CODE values that carry at least one rule with
+        /// <c>IS_REQUIRED=true</c> for the given object type. The caller
+        /// uses this to decide whether a non-Required violation (Length /
+        /// Regexp) should still be enforced through the modal input popup
+        /// instead of the consolidated warning - when admin opted into
+        /// the required-fill UX for a property, every rule on that
+        /// property inherits the "user must fix" treatment so a short
+        /// non-empty value cannot slip through with just an OK click.
+        /// Returns empty when nothing is loaded or no required rules
+        /// target the type. Case-insensitive on both keys.
+        /// </summary>
+        public IReadOnlyCollection<string> GetRequiredPropertyCodes(string objectType)
+        {
+            if (string.IsNullOrEmpty(objectType))
+                return Array.Empty<string>();
+            return _allRules
+                .Where(r => r != null
+                            && r.IsRequired
+                            && r.IsActive
+                            && !string.IsNullOrEmpty(r.PropertyCode)
+                            && string.Equals(r.ObjectType, objectType, StringComparison.OrdinalIgnoreCase))
+                .Select(r => r.PropertyCode)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        /// <summary>
         /// Distinct UDP names referenced by any active rule's
         /// <c>DEPENDS_ON_UDP_NAME</c> condition. Used by the live Entity
         /// Editor watcher to know which UDPs to snapshot/diff each tick;
