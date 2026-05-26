@@ -155,10 +155,22 @@ public static class WatcherWmPoster {
     public delegate bool EnumProc(IntPtr h, IntPtr l);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowExW(IntPtr parent, IntPtr child, string cls, string wnd);
     [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr p, EnumProc cb, IntPtr l);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr lParam);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder cls, int cap);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr h, StringBuilder sb, int max);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int nCmdShow);
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr hAfter, int x, int y, int w, int h_, uint flags);
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
     public const uint WM_MDIGETACTIVE = 0x0229;
     public const uint WM_MDIACTIVATE  = 0x0222;
     public const uint WM_MDIMAXIMIZE  = 0x0225;
+    public const uint WM_CLOSE        = 0x0010;
+    public const int  SW_HIDE         = 0;
+    public const uint SWP_NOSIZE      = 0x0001;
+    public const uint SWP_NOZORDER    = 0x0004;
+    public const uint SWP_NOACTIVATE  = 0x0010;
+    public const uint SWP_HIDEWINDOW  = 0x0080;
 
     // Public so PS callers can use it for diagnostics.
     public static IntPtr FindMdiClient(IntPtr mainFrame) {
@@ -185,6 +197,95 @@ public static class WatcherWmPoster {
         IntPtr activeChild;
         SendMessageTimeoutW(client, WM_MDIGETACTIVE, IntPtr.Zero, IntPtr.Zero, SMTO_ABORTIFHUNG, 500, out activeChild);
         return activeChild;
+    }
+
+    // Find a top-level modal dialog (class #32770) owned by the given
+    // process whose title contains the given substring. Returns IntPtr.Zero
+    // when no match. Title match is OrdinalIgnoreCase. The class #32770
+    // is the standard Win32 dialog class - erwin's MFC dialogs (including
+    // Add-In Manager) all use it.
+    public static IntPtr FindDialogByProcess(uint pid, string titleSubstr) {
+        IntPtr found = IntPtr.Zero;
+        EnumWindows((h, _) => {
+            uint wndPid; GetWindowThreadProcessId(h, out wndPid);
+            if (wndPid != pid) return true;
+            var cls = new StringBuilder(64);
+            GetClassNameW(h, cls, cls.Capacity);
+            if (cls.ToString() != "#32770") return true;
+            if (string.IsNullOrEmpty(titleSubstr)) { found = h; return false; }
+            var t = new StringBuilder(256);
+            GetWindowTextW(h, t, t.Capacity);
+            if (t.ToString().IndexOf(titleSubstr, StringComparison.OrdinalIgnoreCase) >= 0) {
+                found = h; return false;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+
+    // Force erwin's lazy addin activation: post WM_COMMAND 1179 (the
+    // Manage-Add-Ins menu command), wait for the resulting #32770 dialog
+    // to appear, immediately hide it off-screen + ShowWindow(SW_HIDE),
+    // let erwin finish wiring the per-addin cmd id bindings (the work
+    // that the dialog's enumeration triggers), then post WM_CLOSE to
+    // dismiss it. After this returns, posting WM_COMMAND for the addin's
+    // cmd id (1181 in our HKCU.AddinCmdId) dispatches into Execute()
+    // reliably even on cold-launch erwin sessions where lazy activation
+    // hadn't run yet.
+    //
+    // Returns: 0 = dialog never appeared (post may have been dropped),
+    // 1 = dialog found, hidden, and close posted (activation expected).
+    // Total cost ~300-800 ms depending on how fast erwin opens the dialog.
+    public static int TriggerLazyActivation(IntPtr mainFrame, uint erwinPid) {
+        // 1179 = Manage Add-Ins dialog (from erwin string table +
+        // EM_CMP.dll dispatch). Verified 2026-05-26 from the user's
+        // wmcmd.log: opening Tools > Add-Ins... was what flipped cmd
+        // 1181 into a bound state on subsequent PostMessages.
+        PostMessageW(mainFrame, 0x0111, (IntPtr)1179, IntPtr.Zero);
+
+        // Poll up to 2 s for the dialog to appear. 50 ms granularity so
+        // we catch it before its initial WM_PAINT (typical Win32 dialog
+        // creation -> first paint window is 80-150 ms).
+        IntPtr dlg = IntPtr.Zero;
+        for (int i = 0; i < 40 && dlg == IntPtr.Zero; i++) {
+            System.Threading.Thread.Sleep(50);
+            // Title substring filter is intentionally loose ("Add-In")
+            // so localized strings ("Add-in Yoneticisi" / "Eklenti...")
+            // still match. If user has multiple #32770 dialogs open
+            // unrelated to addins, the substring should still pick the
+            // right one.
+            dlg = FindDialogByProcess(erwinPid, "Add-In");
+            if (dlg == IntPtr.Zero) {
+                // Some localizations may not contain "Add-In" - fall
+                // back to ANY #32770 owned by erwin. We just posted the
+                // command 50 ms ago so a fresh dialog is almost
+                // certainly ours.
+                dlg = FindDialogByProcess(erwinPid, null);
+            }
+        }
+        if (dlg == IntPtr.Zero) return 0;
+
+        // Hide ASAP: combine ShowWindow(SW_HIDE) + SetWindowPos with
+        // SWP_HIDEWINDOW for redundancy. If the dialog already painted,
+        // user sees a brief flash; if we caught it before paint, zero
+        // flash. Either way the activation work happens inside erwin's
+        // dialog setup BEFORE we get here, so by the time we hide it
+        // the addin cmd id binding is already done.
+        ShowWindow(dlg, SW_HIDE);
+        SetWindowPos(dlg, IntPtr.Zero, -32000, -32000, 0, 0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_HIDEWINDOW);
+
+        // Give erwin a moment to finish per-addin CoCreateInstance +
+        // cmd id binding. 200 ms is generous; the work is mostly already
+        // done when the dialog's WM_INITDIALOG returned.
+        System.Threading.Thread.Sleep(200);
+
+        // Close cleanly. WM_CLOSE on a #32770 invokes the default
+        // close handler which is equivalent to Cancel. PostMessage so
+        // we don't block. The activation has already happened; cleanup
+        // can run async.
+        PostMessageW(dlg, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+        return 1;
     }
 
     // Activate + maximize the active MDI child to flip erwin's
@@ -451,6 +552,24 @@ while ($true) {
                 # the new active-child state before our first WM_COMMAND
                 # lands - empirically 100 ms is enough on r10.10.
                 if ($mdiResult -eq 2) { Start-Sleep -Milliseconds 100 }
+
+                # Force erwin's lazy addin activation. Without this, on
+                # certain erwin cold-launch sessions cmd id 1181 is in
+                # the menu list but NOT bound to a real handler yet; all
+                # subsequent PostMessages get dropped. Empirically the
+                # ONLY way to flip erwin out of the lazy state is for
+                # something to enumerate Tools > Add-Ins (either via the
+                # menu or the manager dialog). PostMessage WM_COMMAND
+                # 1179 (Manage Add-Ins dialog) triggers that enumeration;
+                # we hide+close the dialog before the user sees it. Cost
+                # ~250-800 ms on first launch, near-zero on cached
+                # sessions (we still attempt but it's cheap).
+                $actResult = [WatcherWmPoster]::TriggerLazyActivation($mainHwnd, [uint32]$targetPid)
+                switch ($actResult) {
+                    0 { Write-Log "Lazy activation: dialog never appeared (WM_COMMAND 1179 may have been dropped)" }
+                    1 { Write-Log "Lazy activation: Add-Ins dialog opened, hidden, closed - cmd id binding should be live now" }
+                }
+                Start-Sleep -Milliseconds 100
 
                 $maxAttempts    = 30
                 $attemptWaitMs  = 2000

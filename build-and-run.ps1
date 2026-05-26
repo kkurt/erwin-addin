@@ -725,7 +725,32 @@ if (-not $task) {
     $existingWatchers = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -match 'autostart-watcher' })
 
-    if (-not $watcherChanged -and $existingWatchers.Count -gt 0) {
+    # Duplicate watcher cleanup. If more than one autostart-watcher.ps1
+    # process is alive (happens when the Task Scheduler races with a
+    # logon-trigger spawn, or when build-and-run kills the OLD process
+    # right as a NEW one is starting), keep exactly one and stop the
+    # rest. Without this the watcher fires PostMessage WM_COMMAND twice
+    # per model load and the addin opens TWO ModelConfigForm windows
+    # (verified 2026-05-26 23:18: user reported '2 addin acildi' with
+    # two watchers concurrently in the autostart.log).
+    if ($existingWatchers.Count -gt 1) {
+        $keep = $existingWatchers | Sort-Object CreationDate | Select-Object -First 1
+        $dupes = $existingWatchers | Where-Object { $_.ProcessId -ne $keep.ProcessId }
+        Write-Host "  Found $($existingWatchers.Count) watcher processes - keeping oldest PID=$($keep.ProcessId), stopping $($dupes.Count) duplicate(s)" -ForegroundColor Yellow
+        foreach ($d in $dupes) {
+            try {
+                Stop-Process -Id $d.ProcessId -Force -ErrorAction Stop
+                Write-Host "    Stopped duplicate PID=$($d.ProcessId)" -ForegroundColor Gray
+            } catch {
+                Write-Host "    WARN: could not stop duplicate PID=$($d.ProcessId): $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+        }
+        Start-Sleep -Milliseconds 500
+        $existingWatchers = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -match 'autostart-watcher' })
+    }
+
+    if (-not $watcherChanged -and $existingWatchers.Count -eq 1) {
         $first = $existingWatchers[0]
         Write-Host "  Watcher already running (PID=$($first.ProcessId)) and script unchanged - recycle skipped" -ForegroundColor DarkGray
         $watcherProc = $first

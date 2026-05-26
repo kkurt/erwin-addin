@@ -112,9 +112,51 @@ namespace EliteSoft.Erwin.AddIn
         }
 
         /// <summary>
+        /// Atomic re-entry guard for <see cref="Execute"/>. erwin's COM
+        /// dispatch is on the UI thread, but the body pumps the message
+        /// queue at multiple points (early splash dialog, MessageBoxW
+        /// during license fail, SCAPI Activator.CreateInstance, and
+        /// ModelConfigForm constructor). If a second WM_COMMAND for the
+        /// same cmd id is queued during one of those pumps the message
+        /// pump dispatches it inline, re-entering Execute before the
+        /// _activeForm field is set at line 238. The form-active guard
+        /// at line 208 then misses (still null), the body runs again,
+        /// and we end up with TWO ModelConfigForm windows open at once
+        /// (verified 2026-05-26 23:18 with duplicate watchers in flight).
+        /// Setting this flag atomically at body entry, clearing in the
+        /// finally block, makes nested invocations no-op out immediately
+        /// regardless of how many PostMessage WM_COMMAND 1181s end up in
+        /// the queue. 0 = idle, 1 = currently executing.
+        /// </summary>
+        private static int _executeRunning;
+
+        /// <summary>
         /// Called by erwin - parameterless version
         /// </summary>
         public void Execute()
+        {
+            // Top-of-body re-entry guard. See _executeRunning XML doc for
+            // the duplicate-form scenario this prevents. Runs BEFORE
+            // logger start so we don't even pollute the log with the
+            // re-entered call's session marker.
+            if (System.Threading.Interlocked.Exchange(ref _executeRunning, 1) != 0)
+            {
+                try { Services.AddinLogger.Log("Execute re-entered while previous invocation is still running - returning no-op."); }
+                catch { /* never throw out of the guard */ }
+                return;
+            }
+
+            try
+            {
+                ExecuteBody();
+            }
+            finally
+            {
+                System.Threading.Interlocked.Exchange(ref _executeRunning, 0);
+            }
+        }
+
+        private void ExecuteBody()
         {
             Services.AddinLogger.StartSession();
             using var _scope = Services.AddinLogger.BeginScope("ErwinAddIn.Execute");
