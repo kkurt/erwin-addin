@@ -500,12 +500,19 @@ if (Test-Path -LiteralPath $legacyProgIdPath) {
     Remove-Item -LiteralPath $legacyProgIdPath -Recurse -Force -ErrorAction SilentlyContinue
     Write-Host "  Removed legacy ProgID '$legacyProgId'" -ForegroundColor Gray
 }
-# AddinCmdId clearing REMOVED 2026-05-26: empirically the cmd id is
-# stable across erwin restarts AND across menu-entry delete+recreate
-# cycles (still 1181 with one addin registered). Aggressive clearing on
-# every build-and-run was forcing the user to redo the 2-click discovery
-# after every dev iteration. WmCommandLogger.MarkExecuteEntry self-heals
-# if the id ever DOES drift, so leaving the cached value is safe.
+# AddinCmdId pre-seed (2026-05-26): on r10.10 with one addin registered,
+# erwin deterministically assigns WM_COMMAND id 1181. Pre-seed so new dev
+# accounts get auto-load with zero manual clicks. Skip if already set
+# (don't clobber a captured-correct id from prior runs).
+$watcherRegPath = 'HKCU:\Software\EliteSoft\ErwinAddIn\Watcher'
+if (-not (Test-Path $watcherRegPath)) {
+    New-Item -Path $watcherRegPath -Force | Out-Null
+}
+$existingCmdId = (Get-ItemProperty -Path $watcherRegPath -Name 'AddinCmdId' -ErrorAction SilentlyContinue).AddinCmdId
+if ($null -eq $existingCmdId) {
+    Set-ItemProperty -Path $watcherRegPath -Name 'AddinCmdId' -Value 1181 -Type DWord
+    Write-Host "  Pre-seeded AddinCmdId=1181 (WmCommandLogger self-heals if different)" -ForegroundColor Gray
+}
 
 $addInPath = "HKCU:\SOFTWARE\erwin\Data Modeler\10.10\Add-Ins\$addInDisplayName"
 # Skip the four Set-ItemProperty writes when the existing values already

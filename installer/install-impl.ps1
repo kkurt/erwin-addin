@@ -632,12 +632,28 @@ if (Test-Path $legacyProgIdBase) {
     Write-Host "  Removed legacy COM ProgID '$legacyProgId'" -ForegroundColor Gray
 }
 
-# AddinCmdId clearing REMOVED 2026-05-26: empirically the cmd id is
-# stable across erwin restarts AND across menu-entry delete+recreate
-# cycles (still 1181 with one addin registered). Aggressive clearing on
-# every install was forcing users to redo the 2-click discovery after
-# every upgrade. WmCommandLogger.MarkExecuteEntry self-heals if the id
-# ever DOES drift, so leaving the cached value is safe.
+# AddinCmdId pre-seed (2026-05-26): on r10.10 with one addin registered,
+# erwin deterministically assigns WM_COMMAND id 1181 to our Tools>Add-Ins
+# entry. Pre-seeding lets the watcher PostMessage immediately on the
+# first session - new users get auto-load with ZERO manual clicks. If
+# the user has additional add-ins registered (corporate Spy, custom etc),
+# the id may differ; in that case the first PostMessage silently no-ops,
+# the user does one manual menu click, and WmCommandLogger.MarkExecuteEntry
+# overwrites the registry with the captured-correct id.
+#
+# Only seed if no value exists (don't clobber a previously-captured id
+# from a prior install that might have a different addin-set in play).
+$watcherRegPath = 'HKCU:\Software\EliteSoft\ErwinAddIn\Watcher'
+if (-not (Test-Path $watcherRegPath)) {
+    New-Item -Path $watcherRegPath -Force | Out-Null
+}
+$existingCmdId = (Get-ItemProperty -Path $watcherRegPath -Name 'AddinCmdId' -ErrorAction SilentlyContinue).AddinCmdId
+if ($null -eq $existingCmdId) {
+    Set-ItemProperty -Path $watcherRegPath -Name 'AddinCmdId' -Value 1181 -Type DWord
+    Write-Host "  Pre-seeded AddinCmdId=1181 (empirically stable on r10.10; WmCommandLogger self-heals if different)" -ForegroundColor Gray
+} else {
+    Write-Host "  AddinCmdId=$existingCmdId already set (preserved)" -ForegroundColor Gray
+}
 
 # Write the canonical HKCU entry. New-Item -Force creates every missing parent
 # (Software\erwin\Data Modeler\10.10\Add-Ins\$addInDisplayName) in one
