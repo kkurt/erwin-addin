@@ -1602,24 +1602,54 @@ namespace EliteSoft.Erwin.AddIn.Services
                         missingLockedRules.Add(applicable);
                     }
 
-                    bool entityHasPriorSnapshots = false;
-                    if (missingLockedRules.Count > 0)
+                    // Per-rule snapshot lookup. A locked column is treated as
+                    // "user-deleted -> defer dialog" only when a snapshot for
+                    // that SPECIFIC column name still exists on this entity
+                    // (user deleted, heartbeat hasn't dropped the snapshot
+                    // yet). If no snapshot for that column name exists, the
+                    // column never lived on the entity in this session -
+                    // typical when the user just flipped a UDP value that
+                    // newly activates a conditional rule (TableClass=Parametre
+                    // -> Log activates the COL1 rule; COL1 never existed
+                    // before so this is a first-time add, NOT a restore).
+                    // Verified 2026-05-26 21:13 from erwin-addin-debug.log:
+                    // user added VpTEST3, set TableClass=Parametre, added
+                    // musteri_no, then flipped TableClass to Log. The OLD
+                    // coarse "any snapshot for the entity" check fired
+                    // because musteri_no's snapshot existed; the close-edge
+                    // restore loop then popped a 'Column Restored - deletion
+                    // was undone' dialog even though the user had never
+                    // touched COL1. The dropped rules below fall through to
+                    // the normal reevaluate path which silently adds them.
+                    string capturedEntityNameOuter = nameForMatch;
+                    var deferableRules = new List<PredefinedColumn>();
+                    foreach (var rule in missingLockedRules)
                     {
+                        bool snapshotExistsForColumn = false;
                         foreach (var snapKv in _attributeSnapshots)
                         {
-                            if (snapKv.Value != null
-                                && string.Equals(snapKv.Value.TableName, nameForMatch, StringComparison.Ordinal))
-                            { entityHasPriorSnapshots = true; break; }
+                            var snap = snapKv.Value;
+                            if (snap == null) continue;
+                            if (!string.Equals(snap.TableName, capturedEntityNameOuter, StringComparison.Ordinal)) continue;
+                            if (string.Equals(snap.PhysicalName, rule.ColumnName, StringComparison.OrdinalIgnoreCase))
+                            {
+                                snapshotExistsForColumn = true;
+                                break;
+                            }
                         }
+                        if (snapshotExistsForColumn)
+                            deferableRules.Add(rule);
+                        else
+                            Log($"Locked predefined-column missing on '{capturedEntityNameOuter}.{rule.ColumnName}' but no prior snapshot - treating as first-time add (no restore dialog).");
                     }
 
-                    if (missingLockedRules.Count > 0 && entityHasPriorSnapshots)
+                    if (deferableRules.Count > 0)
                     {
                         // Defer dialog + restore for each missing locked
                         // column. Skip the normal reevaluate so the column
                         // does NOT reappear until the user has clicked OK.
                         string capturedEntityName = nameForMatch;
-                        foreach (var ruleToRestore in missingLockedRules)
+                        foreach (var ruleToRestore in deferableRules)
                         {
                             var capturedRule = ruleToRestore;
                             string detail = $"Datatype: {capturedRule.DataType}\nNullable: {(capturedRule.Nullable ? "yes" : "no")}"
