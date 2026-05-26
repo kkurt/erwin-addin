@@ -1055,25 +1055,46 @@ namespace EliteSoft.Erwin.AddIn.Services
                 return null;
             }
 
-            // Step 1: ensure a FEWPageOptions is captured (wizard open).
-            if (GetCapturedFEWPageOptionsPtr() == IntPtr.Zero)
+            // Always re-open our hidden wizard, even if g_capturedFEWPO is
+            // non-zero. erwin's own Mart > Review (Compare-with-Last-Saved)
+            // internally constructs a FEWPageOptions which fires our
+            // FEW-CTOR hook and populates g_capturedFEWPO. When that
+            // Review wizard closes the FEWPageOptions object is destroyed
+            // but the pointer in g_capturedFEWPO is NOT cleared (the hook
+            // has no destructor counterpart). The next Generate DDL call
+            // then sees a non-zero FEWPO, skips the hidden-wizard open,
+            // and IPS-CALL fails with 'wizard=0' (the actual hwnd was the
+            // Review wizard which is now destroyed). Verified
+            // 2026-05-26 21:55 against erwin-native-bridge.log:
+            //   FEW-CTOR captured @ 0x...BE9700 (from Review)
+            //   ShowERwinCCWiz EXIT rv=2          (Review closed)
+            //   IPS-CALL ... wizard=0x0 - cannot proceed.
+            //
+            // Cost: ~700 ms wizard reopen on every call. Cheap vs. the
+            // alternative of plumbing a hook-destructor through the
+            // native side.
+            if (_openHiddenWizard == null)
             {
-                if (_openHiddenWizard == null)
-                {
-                    log?.Invoke("NativeBridge: no wizard open and OpenAlterScriptWizardHidden export missing.");
-                    return null;
-                }
-                log?.Invoke("NativeBridge: no wizard open - triggering Ctrl+Alt+T silently...");
-                _hiddenWizardHwnd = _openHiddenWizard();
-                if (_hiddenWizardHwnd == IntPtr.Zero)
-                {
-                    log?.Invoke("NativeBridge: failed to auto-open wizard.");
-                    return null;
-                }
-                log?.Invoke($"NativeBridge: hidden wizard opened at hwnd=0x{_hiddenWizardHwnd.ToInt64():X}");
-                // The FEW-CTOR hook fires synchronously during wizard creation,
-                // so g_capturedFEWPO should already be set by the time we get here.
+                log?.Invoke("NativeBridge: OpenAlterScriptWizardHidden export missing.");
+                return null;
             }
+            // Close any prior wizard we're still tracking so the new
+            // ctor fires our FEW-CTOR hook with a guaranteed-fresh pointer.
+            if (_hiddenWizardHwnd != IntPtr.Zero && _closeHiddenWizard != null)
+            {
+                try { _closeHiddenWizard(_hiddenWizardHwnd); } catch { }
+                _hiddenWizardHwnd = IntPtr.Zero;
+            }
+            log?.Invoke("NativeBridge: opening hidden wizard (force-fresh, ignoring any stale FEWPO)...");
+            _hiddenWizardHwnd = _openHiddenWizard();
+            if (_hiddenWizardHwnd == IntPtr.Zero)
+            {
+                log?.Invoke("NativeBridge: failed to auto-open wizard.");
+                return null;
+            }
+            log?.Invoke($"NativeBridge: hidden wizard opened at hwnd=0x{_hiddenWizardHwnd.ToInt64():X}");
+            // The FEW-CTOR hook fires synchronously during wizard creation,
+            // so g_capturedFEWPO is now set to the live wizard's options.
 
             // Step 2: call Invoke → GA detour captures DDL.
             string ddl = CallInvokePreviewDirect(log);
