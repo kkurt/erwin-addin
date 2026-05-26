@@ -399,7 +399,7 @@ $legacyTaskName = "EliteSoft Erwin AddIn AutoStart"
 # powershell.exe terminating another powershell.exe via WMI matches the
 # script-host-killing-script-host malware pattern. SetEvent + brief wait
 # + non-WMI fallback delivers the same effect without the SONAR trigger.
-$shutdownEventName = 'Global\EliteSoft.ErwinAddIn.Watcher.Shutdown'
+$shutdownEventName = 'EliteSoft.ErwinAddIn.Watcher.Shutdown'
 try {
     # Identify running watcher PIDs via CommandLine match (read-only).
     # Get-CimInstance is preferred over the deprecated Get-WmiObject; both

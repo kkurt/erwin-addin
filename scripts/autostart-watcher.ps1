@@ -131,7 +131,7 @@ Write-Log "Watcher started (PID=$PID, Session=$mySessionId)"
 # tears down COM/files. Replaces the old WMI Win32_Process.Terminate() call
 # which triggered SEP's AGR.Terminate!g2 heuristic (`script kills another
 # script host` malware pattern). Sleeps in the main loop poll this handle.
-$shutdownEventName = 'Global\EliteSoft.ErwinAddIn.Watcher.Shutdown'
+$shutdownEventName = 'EliteSoft.ErwinAddIn.Watcher.Shutdown'
 $shutdownEvent = $null
 try {
     $created = $false
