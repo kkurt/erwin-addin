@@ -436,6 +436,15 @@ namespace EliteSoft.Erwin.AddIn
                         string loc = Services.PuLocatorReader.Read(
                             puColl.Item(i),
                             allowWindowTitleFallback: false) ?? string.Empty;
+                        // Skip ephemeral Compare-with-Last-Saved PUs (Review
+                        // button creates them with ';Duplicate=YES' suffix).
+                        // They should never enter the known set; the
+                        // ReconnectTimer_Tick guard also short-circuits on
+                        // this suffix, so adding them here would be a no-op
+                        // at best and confuse the count-drop detection at
+                        // worst.
+                        if (loc.IndexOf(";Duplicate=YES", StringComparison.OrdinalIgnoreCase) >= 0)
+                            continue;
                         _knownLocators.Add(loc);
                     }
                 }
@@ -443,8 +452,10 @@ namespace EliteSoft.Erwin.AddIn
                 {
                     Log($"ConnectToModel: failed to seed known-locators set: {kex.Message}");
                     // Defensive: ensure at least the active locator is recorded
-                    // so the tick has SOMETHING to compare against.
-                    _knownLocators.Add(puLocator);
+                    // so the tick has SOMETHING to compare against. Skip
+                    // ;Duplicate=YES here too on the same rationale.
+                    if (puLocator.IndexOf(";Duplicate=YES", StringComparison.OrdinalIgnoreCase) < 0)
+                        _knownLocators.Add(puLocator);
                 }
 
                 // Record the open PU count so the tick can detect a PU being
@@ -830,6 +841,26 @@ namespace EliteSoft.Erwin.AddIn
                     string loc = Services.PuLocatorReader.Read(
                         persistenceUnits.Item(i),
                         allowWindowTitleFallback: false) ?? string.Empty;
+
+                    // Skip ephemeral Compare-with-Last-Saved PUs that erwin's
+                    // Review button creates ('locator;Duplicate=YES'). These
+                    // are short-lived clean-mart copies used by erwin's
+                    // internal CC pipeline; they should NOT be treated as
+                    // genuine new models. Without this guard our reconnect
+                    // timer fired ConnectToModel(<dup index>), our session.Open
+                    // on the Duplicate caused erwin's MDI to swap views to the
+                    // clean side, the user's dirty changes vanished from the
+                    // diagram, and erwin's Compare showed no diff because the
+                    // active view WAS the Duplicate (verified 2026-05-26 from
+                    // erwin-addin-debug.log at 20:33:38: Locator='...;Duplicate=YES'
+                    // followed by ConnectToModel(1) -> dirty changes disappeared).
+                    // Original PU's session+dirty stays preserved (see memory
+                    // reference_review_button_duplicate_yes); we simply leave
+                    // it alone.
+                    if (loc.IndexOf(";Duplicate=YES", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        continue;
+                    }
                     if (!_knownLocators.Contains(loc))
                     {
                         newIndex = i;
