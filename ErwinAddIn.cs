@@ -279,6 +279,17 @@ namespace EliteSoft.Erwin.AddIn
         }
 
         /// <summary>
+        /// Latched once the failure popup has been shown in this AppDomain.
+        /// Even after the watcher's retry-storm fix, a user-driven re-click
+        /// + a failing-license combo could still cause a second Execute()
+        /// invocation; this guard suppresses the duplicate popup in that
+        /// edge case. Gated at popup-show time (not at check-start) so a
+        /// mid-session license fix + re-click still re-validates and can
+        /// succeed. Cleared on AppDomain teardown (next erwin launch).
+        /// </summary>
+        private static bool _licenseFailurePopupShown;
+
+        /// <summary>
         /// Validates hardware license. Returns true if valid, false otherwise.
         /// Wraps the UI-free check + shows the MessageBox on failure. Used by the
         /// startup path; the failure message is displayed on the calling thread,
@@ -328,6 +339,16 @@ namespace EliteSoft.Erwin.AddIn
                 failureMessage = retryMessage;
             }
 
+            // De-dupe the popup but always run the underlying check. A
+            // mid-session license fix + manual re-click should be able to
+            // re-validate; latching CheckLicenseStatus itself would block
+            // that recovery path.
+            if (_licenseFailurePopupShown)
+            {
+                Services.AddinLogger.Log("CheckLicense: re-failed but popup already shown this session - suppressing duplicate dialog");
+                return false;
+            }
+            _licenseFailurePopupShown = true;
             ShowTopMostMessage(failureMessage, "Elite Soft - License Error", isError: false);
             return false;
         }

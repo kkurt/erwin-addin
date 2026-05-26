@@ -102,7 +102,17 @@ function Register-HKCUAddIn {
 }
 
 function Wait-ForModel {
-    # Wait until erwin window title contains a model name (e.g. "erwin DM - [ModelName : ...]")
+    # Detect "erwin has a model loaded" by checking the title shape AND,
+    # crucially, walking the MFC MDIClient hierarchy. Title-only detection
+    # had a false-negative: when a Mart model is opened with the MDI child
+    # in RESTORED (not maximized) state, the main frame title shows
+    # "erwin DM - Mart://Mart/.../MetaRepo : v17" - identical to the
+    # Mart-connected-no-model-yet state, so Test-ErwinHasModel returns
+    # false even though the diagram IS open. The MDI client's active
+    # child (WM_MDIGETACTIVE) is the source of truth: when a model is
+    # loaded erwin always has an active MDI child, regardless of its
+    # maximize state. Title check stays as a fast path for the common
+    # maximized case.
     $elapsed = 0
     while ($elapsed -lt $modelTimeoutSec) {
         if (-not (Get-MyErwin)) {
@@ -110,9 +120,9 @@ function Wait-ForModel {
             return $false
         }
 
-        $erwinProc = Get-MyErwin | Where-Object { Test-ErwinHasModel $_.MainWindowTitle } | Select-Object -First 1
+        $erwinProc = Get-MyErwin | Where-Object { Test-ErwinHasModelComplete $_ } | Select-Object -First 1
         if ($erwinProc) {
-            Write-Log "Model detected: '$($erwinProc.MainWindowTitle)'"
+            Write-Log "Model detected: '$($erwinProc.MainWindowTitle)' (hwnd=0x$('{0:X}' -f $erwinProc.MainWindowHandle.ToInt64()))"
             return $true
         }
 
@@ -122,6 +132,104 @@ function Wait-ForModel {
 
     Write-Log "Timeout waiting for model ($modelTimeoutSec sec)"
     return $false
+}
+
+# WatcherWmPoster - Win32 PostMessage + MDI helpers used by the main loop.
+# Hoisted to script-init time (was inline inside the WM_COMMAND post block)
+# so Wait-ForModel can also call GetActiveMdiChild for the MDI-existence
+# detection that bypasses the title-shape false-negative for restored
+# MDI children. The MDI activation pattern mirrors the production code in
+# Services/MartMartAutomation.cs:2421-2467 (erwin uses standard MFC
+# MDIClient class, FindWindowExW with that class name finds it reliably).
+try {
+    Add-Type -Language CSharp -TypeDefinition @'
+using System; using System.Runtime.InteropServices; using System.Text;
+public static class WatcherWmPoster {
+    [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);
+    [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr SendMessageTimeoutW(
+        IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam, uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
+    public const uint SMTO_NORMAL          = 0x0;
+    public const uint SMTO_ABORTIFHUNG     = 0x2;
+    public const uint SMTO_NOTIMEOUTIFNOTHUNG = 0x8;
+
+    public delegate bool EnumProc(IntPtr h, IntPtr l);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowExW(IntPtr parent, IntPtr child, string cls, string wnd);
+    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr p, EnumProc cb, IntPtr l);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder cls, int cap);
+    public const uint WM_MDIGETACTIVE = 0x0229;
+    public const uint WM_MDIACTIVATE  = 0x0222;
+    public const uint WM_MDIMAXIMIZE  = 0x0225;
+
+    // Public so PS callers can use it for diagnostics.
+    public static IntPtr FindMdiClient(IntPtr mainFrame) {
+        if (mainFrame == IntPtr.Zero) return IntPtr.Zero;
+        IntPtr direct = FindWindowExW(mainFrame, IntPtr.Zero, "MDIClient", null);
+        if (direct != IntPtr.Zero) return direct;
+        IntPtr found = IntPtr.Zero;
+        EnumChildWindows(mainFrame, (h, _) => {
+            var cls = new StringBuilder(64);
+            GetClassNameW(h, cls, cls.Capacity);
+            if (cls.ToString() == "MDIClient") { found = h; return false; }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+
+    // Returns active MDI child handle (zero if no MDIClient or no active
+    // child). Used as the ground-truth signal for "is a model loaded";
+    // erwin always activates a child window when a model is open,
+    // regardless of maximize state.
+    public static IntPtr GetActiveMdiChild(IntPtr mainFrame) {
+        IntPtr client = FindMdiClient(mainFrame);
+        if (client == IntPtr.Zero) return IntPtr.Zero;
+        IntPtr activeChild;
+        SendMessageTimeoutW(client, WM_MDIGETACTIVE, IntPtr.Zero, IntPtr.Zero, SMTO_ABORTIFHUNG, 500, out activeChild);
+        return activeChild;
+    }
+
+    // Activate + maximize the active MDI child to flip erwin's
+    // UPDATE_COMMAND_UI cycle into "addin command enabled" state for
+    // restored-MDI-child cases. Returns 0 = no MDIClient, 1 = no active
+    // child, 2 = activated+maximized. Encoded as int because Add-Type
+    // compiled C# handles primitives better than out params from PS.
+    public static int ActivateAndMaximizeMdiChild(IntPtr mainFrame) {
+        IntPtr client = FindMdiClient(mainFrame);
+        if (client == IntPtr.Zero) return 0;
+        IntPtr activeChild;
+        SendMessageTimeoutW(client, WM_MDIGETACTIVE, IntPtr.Zero, IntPtr.Zero, SMTO_ABORTIFHUNG, 1000, out activeChild);
+        if (activeChild == IntPtr.Zero) return 1;
+        IntPtr discard;
+        SendMessageTimeoutW(client, WM_MDIACTIVATE, activeChild, IntPtr.Zero, SMTO_ABORTIFHUNG, 1000, out discard);
+        SendMessageTimeoutW(client, WM_MDIMAXIMIZE, activeChild, IntPtr.Zero, SMTO_ABORTIFHUNG, 1000, out discard);
+        return 2;
+    }
+}
+'@ -ErrorAction Stop
+} catch {
+    Write-Log "Add-Type WatcherWmPoster failed at init: $($_.Exception.Message)"
+}
+
+# Combined "is a model loaded" detector. Order:
+#   1. Fast title check (Test-ErwinHasModel) - covers the common
+#      maximized-MDI-child case via bracket regex; cheap, no Win32 calls.
+#   2. MDI hierarchy fallback - the only signal that survives the
+#      restored-MDI-child + Mart-only-shaped main title combination
+#      (verified 2026-05-26 on Kursat's user: model loaded fully, title
+#      stayed "erwin DM - Mart://Mart/Kursat/MetaRepo : v17" with no
+#      diagram suffix, Test-ErwinHasModel kept returning false, watcher
+#      hung in Wait-ForModel for 12+ minutes).
+function Test-ErwinHasModelComplete {
+    param($Proc)
+    if (-not $Proc) { return $false }
+    if (Test-ErwinHasModel $Proc.MainWindowTitle) { return $true }
+    $hwnd = $Proc.MainWindowHandle
+    if ($hwnd -eq [IntPtr]::Zero) { return $false }
+    try {
+        return ([WatcherWmPoster]::GetActiveMdiChild($hwnd) -ne [IntPtr]::Zero)
+    } catch {
+        Write-Log "MDI detection threw (falling back to title-only): $($_.Exception.Message)"
+        return $false
+    }
 }
 
 Write-Log "Watcher started (PID=$PID, Session=$mySessionId)"
@@ -230,7 +338,7 @@ while ($true) {
     }
 
     # --- Remember which erwin PID we're injecting into ---
-    $targetErwin = Get-MyErwin | Where-Object { Test-ErwinHasModel $_.MainWindowTitle } | Select-Object -First 1
+    $targetErwin = Get-MyErwin | Where-Object { Test-ErwinHasModelComplete $_ } | Select-Object -First 1
     $targetPid = $targetErwin.Id
     Write-Log "Target erwin PID=$targetPid"
 
@@ -271,27 +379,17 @@ while ($true) {
         # CoCreateInstance(EliteSoft.Erwin.AddIn) -> Invoke("Execute") -> addin
         # form appears. No injector binary involved.
         try {
-            Add-Type -Language CSharp -TypeDefinition @'
-using System; using System.Runtime.InteropServices;
-public static class WatcherWmPoster {
-    [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);
-    [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr SendMessageTimeoutW(
-        IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam, uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
-    public const uint SMTO_NORMAL          = 0x0;
-    public const uint SMTO_ABORTIFHUNG     = 0x2;
-    public const uint SMTO_NOTIMEOUTIFNOTHUNG = 0x8;
-}
-'@ -ErrorAction SilentlyContinue
+            # WatcherWmPoster type loaded once at script init (hoisted out
+            # of the loop). See the Add-Type block immediately after the
+            # Wait-ForModel function definition.
 
-            # Brief pre-flight before the first attempt. Empirically the
-            # command map is ready ~1.5 s after the bracketed model
-            # title appears for SMALL Mart models. For larger models
-            # (verified: SQL_BUYUKMODEL took >8 s) erwin's UI thread is
-            # busy parsing geometry and the message pump backlog
-            # silently drops queued WM_COMMANDs. 2 s gets us the small
-            # case quickly; the retry loop below covers the long tail
-            # with 15 attempts (covers up to ~25 s of model-load time).
-            Start-Sleep -Seconds 2
+            # Pre-flight Start-Sleep removed (was 2 s): with the new
+            # single-post + tight-poll retry logic below, posting
+            # immediately is safe even when the command map isn't yet
+            # ready. If the first post is dropped (command UPDATE_UI
+            # disabled), the 20 s poll window expires and the retry
+            # post catches it. Happy-path savings: 2 s shaved off the
+            # perceived "addin loads late after model" latency.
             $mainHwnd = $targetErwin.MainWindowHandle
             if ($mainHwnd -eq [IntPtr]::Zero) {
                 Write-Log "MainWindowHandle is zero - giving erwin 1s to settle"
@@ -309,16 +407,54 @@ public static class WatcherWmPoster {
                 $logSizeBefore = 0
                 if (Test-Path $wmcmdLog) { $logSizeBefore = (Get-Item $wmcmdLog).Length }
 
-                # Retry loop. erwin's WindowProc + command map +
-                # CoCreateInstance + Execute + WmCommandLogger.Persist
-                # typically completes in well under 1 s when the command
-                # map IS ready. If erwin's UI thread is busy parsing the
-                # model (big Mart models can keep it busy for 15-25 s),
-                # queued WM_COMMANDs are dropped silently. 15 attempts
-                # x 1.5 s = ~22 s of patience covers the worst observed
-                # model load (SQL_BUYUKMODEL on the dev box).
-                $maxAttempts  = 15
-                $perAttemptMs = 1500
+                # Aggressive but de-duplicated retry. erwin's MFC command
+                # map can drop WM_COMMAND when UPDATE_COMMAND_UI marks the
+                # entry disabled - happens transiently while a big Mart
+                # model parses geometry (UI thread busy >5 s), and
+                # persistently while the MDI child is in "restored" (not
+                # maximized) state. In both cases the title looks bracketed
+                # so Test-ErwinHasModel returns true, but the dispatch
+                # silently fails until command state flips to enabled
+                # (model parse finishes / user maximizes the MDI child).
+                #
+                # Strategy: post every 2 s and tight-poll wmcmd.log inside
+                # each window. The first post that lands while command is
+                # enabled triggers Execute() within ~1.6 s (CoreCLR cold
+                # start) and we see growth on the next poll tick. Cap at
+                # 30 attempts = 60 s of patience (covers SQL_BUYUKMODEL
+                # cold-load + user-maximize delay). Beyond that the late-
+                # retry loop below keeps trying with longer cadence.
+                #
+                # Safe to retry aggressively because the addin's
+                # ErwinAddIn.Execute() has both an active-form guard
+                # (returns BringToFront for already-open form) and a
+                # license-popup latch (only first failed CheckLicense pops
+                # a dialog), so worst-case duplicate dispatches degrade to
+                # cheap no-ops, not user-visible duplicates.
+                # MDI activation pre-step: programatically make sure erwin's
+                # MDI child is active+maximized BEFORE the first WM_COMMAND
+                # post. Without this, models opened with a restored MDI
+                # child stay command-disabled (UPDATE_COMMAND_UI cycle
+                # rejects the addin entry), all posts get silently dropped,
+                # and the user has to manually maximize before the addin
+                # appears. Run once on attempt #1 only - subsequent retries
+                # honour any manual restore the user did. Bridge logic
+                # mirrored from Services/MartMartAutomation.cs:2421-2467
+                # (already proven on erwin r10.10).
+                $mdiResult = [WatcherWmPoster]::ActivateAndMaximizeMdiChild($mainHwnd)
+                switch ($mdiResult) {
+                    0 { Write-Log "MDI pre-step: MDIClient class not found - skipping" }
+                    1 { Write-Log "MDI pre-step: MDIClient found but no active child yet" }
+                    2 { Write-Log "MDI pre-step: WM_MDIACTIVATE + WM_MDIMAXIMIZE sent to active child" }
+                }
+                # Brief settle so erwin's UPDATE_COMMAND_UI cycle picks up
+                # the new active-child state before our first WM_COMMAND
+                # lands - empirically 100 ms is enough on r10.10.
+                if ($mdiResult -eq 2) { Start-Sleep -Milliseconds 100 }
+
+                $maxAttempts    = 30
+                $attemptWaitMs  = 2000
+                $pollIntervalMs = 200
                 for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
                     Write-Log "PostMessage attempt ${attempt}: WM_COMMAND id=$savedCmdId to erwin PID=$targetPid hwnd=0x$('{0:X}' -f $mainHwnd.ToInt64())"
                     $ok = [WatcherWmPoster]::PostMessageW($mainHwnd, 0x0111, [IntPtr]$savedCmdId, [IntPtr]::Zero)
@@ -327,22 +463,25 @@ public static class WatcherWmPoster {
                         Write-Log "  PostMessage Win32 err=$err"
                     }
 
-                    Start-Sleep -Milliseconds $perAttemptMs
-
-                    $logSizeNow = 0
-                    if (Test-Path $wmcmdLog) { $logSizeNow = (Get-Item $wmcmdLog).Length }
-                    if ($logSizeNow -gt $logSizeBefore) {
-                        Write-Log "  Detected wmcmd.log growth ($logSizeBefore -> $logSizeNow) on attempt $attempt - addin loaded"
-                        $loaded = $true
-                        break
+                    $waited = 0
+                    $detected = $false
+                    while ($waited -lt $attemptWaitMs) {
+                        Start-Sleep -Milliseconds $pollIntervalMs
+                        $waited += $pollIntervalMs
+                        $logSizeNow = 0
+                        if (Test-Path $wmcmdLog) { $logSizeNow = (Get-Item $wmcmdLog).Length }
+                        if ($logSizeNow -gt $logSizeBefore) {
+                            Write-Log "  wmcmd.log grew $logSizeBefore -> $logSizeNow after ${waited} ms on attempt $attempt - addin loaded"
+                            $loaded = $true
+                            $detected = $true
+                            break
+                        }
                     }
-                    Write-Log "  No wmcmd.log change yet (size still $logSizeNow). Retrying in 2 s..."
-                    # No extra inter-attempt backoff - the per-attempt wait
-                    # IS the backoff (erwin had 1 s to process, didn't, retry now).
+                    if ($detected) { break }
                 }
 
                 if (-not $loaded) {
-                    Write-Log "PostMessage path exhausted $maxAttempts attempts ($($maxAttempts * $perAttemptMs / 1000) s) without observable addin load - falling through to monitoring + late-retry loop"
+                    Write-Log "PostMessage path exhausted $maxAttempts attempts ($($maxAttempts * $attemptWaitMs / 1000) s) - falling through to monitoring + late-retry loop"
                 }
             }
         } catch {
@@ -403,12 +542,13 @@ public static class WatcherWmPoster {
             continue
         }
 
-        # Re-check title: was it a transient Mart-only state? If now real
-        # (brackets present OR not a Mart:// URL), retry PostMessage.
+        # Re-check via the same combined detector Wait-ForModel uses
+        # (title fast path + MDI hierarchy fallback) so the restored-MDI-
+        # child case doesn't fall through to "still no model".
         $erwinNow = Get-Process -Id $targetPid -ErrorAction SilentlyContinue
         if (-not $erwinNow) { continue }
+        if (-not (Test-ErwinHasModelComplete $erwinNow)) { continue }
         $newTitle = $erwinNow.MainWindowTitle
-        if (-not (Test-ErwinHasModel $newTitle)) { continue }
 
         Write-Log "Title now '$newTitle' looks real - retrying PostMessage WM_COMMAND id=$savedCmdId"
         $mainHwnd = $erwinNow.MainWindowHandle

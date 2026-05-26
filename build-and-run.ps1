@@ -400,21 +400,102 @@ if (Test-Path -LiteralPath $watcherSrcPath) {
 # the injection-based auto-load path. PostMessage WM_COMMAND replaces
 # it (see scripts/autostart-watcher.ps1 + Services/WmCommandLogger.cs).
 
-# license.lic check: addin's CheckLicenseStatus reads `<installDir>\license.lic`
+# license.lic auto-gen: addin's CheckLicenseStatus reads `<installDir>\license.lic`
 # at startup and refuses to load without it. The file is NOT in the repo (it's
 # RSA-signed against the specific machine's HWID) so robocopy can't bring it
-# in. If the install dir was ever wiped, the file vanishes and the user gets
-# a "License file not found" popup on next erwin launch. Surface the gap
-# loudly here AND print the exact KeyGen command so the fix is one paste away.
+# in. If the install dir was ever wiped (-> "License file not found" popup),
+# we generate one here:
+#   1. Compute this machine's HWID via the same WMI components the addin's
+#      C# HwidGenerator uses (see x-hw-licensing/HwidCollector/Get-xId.ps1
+#      for the canonical reference - identical hash output).
+#   2. Copy x-hw-licensing\rsa_private_key.xml next to KeyGen, invoke
+#      `dotnet run genlicense`, delete the key.
+# Any failure (KeyGen not found, private key missing, dotnet run nonzero
+# exit, sibling x-hw-licensing repo absent) falls back to the original
+# manual-instructions warning so the dev still has a path forward.
 $licDst = Join-Path $installDir "license.lic"
 if (-not (Test-Path -LiteralPath $licDst)) {
-    Write-Host "  WARNING: license.lic missing at $licDst - addin will fail license check." -ForegroundColor Yellow
-    Write-Host "  Generate one with:" -ForegroundColor Yellow
-    Write-Host "    cd C:\Users\Kursat\Repos\x-hw-licensing\KeyGen" -ForegroundColor Gray
-    Write-Host "    Copy-Item ..\rsa_private_key.xml ." -ForegroundColor Gray
-    Write-Host "    dotnet run -c Debug -- genlicense --hwid <YOUR_HWID> --licensee `"ErwinAddIn`" --features `"ErwinAddIn`" -o `"$licDst`"" -ForegroundColor Gray
-    Write-Host "    Remove-Item rsa_private_key.xml" -ForegroundColor Gray
-    Write-Host "  (HWID is shown in the 'Elite Soft - License Error' dialog if you launch the addin without one.)" -ForegroundColor Gray
+    function Get-CurrentHwid {
+        # Matches HwidGenerator.cs exactly: 6 components, SHA256 of sorted
+        # pipe-joined values. Components hash-empty/UNKNOWN_* fall back to a
+        # sentinel so license generation is at least attempted; the resulting
+        # HWID won't validate if any component is unknown, surfacing via the
+        # license dialog.
+        function Get-WmiOrUnknown([scriptblock]$block, [string]$fallback) {
+            try { $v = & $block; if (-not [string]::IsNullOrWhiteSpace($v)) { return $v.Trim() } } catch { }
+            return $fallback
+        }
+        $components = @(
+            (Get-WmiOrUnknown { (Get-CimInstance Win32_Processor | Select-Object -First 1).ProcessorId } "UNKNOWN_CPU"),
+            (Get-WmiOrUnknown { (Get-CimInstance Win32_BaseBoard | Select-Object -First 1).SerialNumber } "UNKNOWN_MB"),
+            (Get-WmiOrUnknown { (Get-CimInstance Win32_ComputerSystemProduct | Select-Object -First 1).UUID } "UNKNOWN_BIOS"),
+            (Get-WmiOrUnknown {
+                $a = Get-CimInstance Win32_NetworkAdapter -Filter "PhysicalAdapter=TRUE AND MACAddress IS NOT NULL" |
+                    Where-Object { ![string]::IsNullOrWhiteSpace($_.MACAddress) } |
+                    ForEach-Object { [pscustomobject]@{ Name = $_.Name; Mac = ($_.MACAddress -replace '[:\-]','') } } |
+                    Where-Object { $_.Mac -ne "000000000000" } |
+                    Sort-Object Name
+                if ($a) { if ($a -is [array]) { $a[0].Mac } else { $a.Mac } }
+            } "UNKNOWN_MAC"),
+            (Get-WmiOrUnknown { (Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'" | Select-Object -First 1).VolumeSerialNumber } "UNKNOWN_VOL"),
+            (Get-WmiOrUnknown { (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').ProductId } "UNKNOWN_PID")
+        )
+        $joined = (($components | Sort-Object) -join "|")
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $hash = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($joined))
+            return ([BitConverter]::ToString($hash) -replace '-','')
+        } finally { $sha.Dispose() }
+    }
+
+    $licensingRoot = Resolve-Path -LiteralPath (Join-Path $scriptDir "..\x-hw-licensing") -ErrorAction SilentlyContinue
+    $keyGenProj = if ($licensingRoot) { Join-Path $licensingRoot.Path "KeyGen\KeyGen.csproj" } else { $null }
+    $privKeySrc = if ($licensingRoot) { Join-Path $licensingRoot.Path "rsa_private_key.xml" } else { $null }
+    $canAutoGen = $keyGenProj -and (Test-Path -LiteralPath $keyGenProj) -and
+                  $privKeySrc -and (Test-Path -LiteralPath $privKeySrc)
+
+    if ($canAutoGen) {
+        Write-Host "  license.lic missing - auto-generating for this machine..." -ForegroundColor Yellow
+        try {
+            $hwid = Get-CurrentHwid
+            Write-Host "    HWID: $($hwid.Substring(0,16))..." -ForegroundColor Gray
+            $keyGenDir = Split-Path $keyGenProj -Parent
+            $privKeyDst = Join-Path $keyGenDir "rsa_private_key.xml"
+            Copy-Item -LiteralPath $privKeySrc -Destination $privKeyDst -Force
+            try {
+                Push-Location -LiteralPath $keyGenDir
+                try {
+                    & dotnet run --project $keyGenProj -c Debug -- genlicense `
+                        --hwid $hwid `
+                        --licensee "ErwinAddIn" `
+                        --features "ErwinAddIn" `
+                        -o $licDst 2>&1 | Out-Null
+                    $exit = $LASTEXITCODE
+                } finally { Pop-Location }
+            } finally {
+                Remove-Item -LiteralPath $privKeyDst -Force -ErrorAction SilentlyContinue
+            }
+            if ($exit -eq 0 -and (Test-Path -LiteralPath $licDst)) {
+                Write-Host "    license.lic generated -> $licDst" -ForegroundColor Green
+            } else {
+                Write-Host "    KeyGen failed (exit=$exit); falling back to manual instructions." -ForegroundColor Red
+                $canAutoGen = $false
+            }
+        } catch {
+            Write-Host "    Auto-gen threw: $($_.Exception.Message); falling back to manual instructions." -ForegroundColor Red
+            $canAutoGen = $false
+        }
+    }
+
+    if (-not $canAutoGen -and -not (Test-Path -LiteralPath $licDst)) {
+        Write-Host "  WARNING: license.lic missing at $licDst - addin will fail license check." -ForegroundColor Yellow
+        Write-Host "  Manual generation:" -ForegroundColor Yellow
+        Write-Host "    cd C:\Users\Kursat\Repos\x-hw-licensing\KeyGen" -ForegroundColor Gray
+        Write-Host "    Copy-Item ..\rsa_private_key.xml ." -ForegroundColor Gray
+        Write-Host "    dotnet run -c Debug -- genlicense --hwid <YOUR_HWID> --licensee `"ErwinAddIn`" --features `"ErwinAddIn`" -o `"$licDst`"" -ForegroundColor Gray
+        Write-Host "    Remove-Item rsa_private_key.xml" -ForegroundColor Gray
+        Write-Host "  (HWID is shown in the 'Elite Soft - License Error' dialog if you launch the addin without one.)" -ForegroundColor Gray
+    }
 }
 
 # robocopy exit 0 == nothing copied (everything was up-to-date).
