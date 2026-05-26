@@ -39,6 +39,15 @@
     Justification='Plaintext required for DPAPI ProtectedData.Protect; the value is encrypted before any persistence and the seed file is deleted on success.')]
 param(
     [switch]$Uninstall,
+    # Uninstall-only. When set, the uninstall path also removes
+    # HKCU\Software\EliteSoft\MetaRepo\Bootstrap (DB connection: host, port,
+    # database, DPAPI-encrypted user/password) and Extension (UI prefs). When
+    # absent, uninstall preserves these entries by default and asks
+    # interactively; this matches the user expectation that a normal
+    # uninstall / reinstall cycle should NOT silently wipe the DB
+    # credentials they entered on first install. Set this only for a true
+    # "wipe everything" uninstall (e.g. machine handoff, support case).
+    [switch]$RemoveConnectionInfo,
     # MetaRepo bootstrap seed. Param names (-DBHost, -DBPort, -DBName, -DBUserName,
     # -DBPassword, -DBType) match the registry value names under
     # SOFTWARE\EliteSoft\MetaRepo\Bootstrap. PowerShell parameter binding is
@@ -70,9 +79,10 @@ if ($Help) {
     Write-Host "  Double-click uninstall.bat " -NoNewline; Write-Host "Uninstall (removes the per-user install)" -ForegroundColor Gray
     Write-Host ""
     Write-Host "Usage (CLI):" -ForegroundColor Yellow
-    Write-Host "  .\install-impl.ps1            " -NoNewline; Write-Host "Same as install.bat (no admin needed)" -ForegroundColor Gray
-    Write-Host "  .\install-impl.ps1 -Uninstall " -NoNewline; Write-Host "Same as uninstall.bat" -ForegroundColor Gray
-    Write-Host "  .\install-impl.ps1 -?         " -NoNewline; Write-Host "Show this help" -ForegroundColor Gray
+    Write-Host "  .\install-impl.ps1                              " -NoNewline; Write-Host "Same as install.bat (no admin needed)" -ForegroundColor Gray
+    Write-Host "  .\install-impl.ps1 -Uninstall                   " -NoNewline; Write-Host "Same as uninstall.bat (preserves DB connection info; asks)" -ForegroundColor Gray
+    Write-Host "  .\install-impl.ps1 -Uninstall -RemoveConnectionInfo " -NoNewline; Write-Host "Uninstall + wipe HKCU MetaRepo (no prompt)" -ForegroundColor Gray
+    Write-Host "  .\install-impl.ps1 -?                           " -NoNewline; Write-Host "Show this help" -ForegroundColor Gray
     Write-Host ""
     Write-Host "Notes:" -ForegroundColor Yellow
     Write-Host "  - Install is always per-user. Binaries to LOCALAPPDATA, COM to HKCU\Software\Classes," -ForegroundColor Gray
@@ -229,6 +239,65 @@ function Unregister-ComUserScope([string]$clsid, [string]$progId) {
         Remove-Item -Path $progIdBase -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
+
+# Stop any running autostart-watcher.ps1 processes via named-event signal then
+# Stop-Process fallback. Replaces the deprecated WMI Win32_Process.Terminate
+# pattern (SEP's AGR.Terminate!g2 heuristic flags powershell.exe killing
+# another powershell.exe via WMI). Used by BOTH install (before re-deploying
+# files) and uninstall (before removing $installDir which holds the watcher
+# script). Without this on uninstall, the orphan watcher kept running after
+# scheduled task was removed, and the next install had to clean it up
+# itself - cosmetic but confusing, and could rarely lock files in the
+# install dir.
+#
+# The named event signal currently does not reach the watcher because its
+# main loop polls with Start-Sleep instead of WaitOne; the 3 s grace is a
+# best-effort window before Stop-Process. Keeping the Set call regardless so
+# if/when the watcher loop is rewritten to honour the event, no script-side
+# change is needed.
+function Stop-WatcherProcesses {
+    $shutdownEventName = 'EliteSoft.ErwinAddIn.Watcher.Shutdown'
+    try {
+        $watcherPids = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -match 'autostart-watcher' } |
+            Select-Object -ExpandProperty ProcessId)
+
+        if ($watcherPids.Count -eq 0) { return }
+
+        Write-Host "  Found $($watcherPids.Count) running watcher PID(s): $($watcherPids -join ', ')" -ForegroundColor Gray
+
+        $evt = $null
+        try {
+            $created = $false
+            $evt = [System.Threading.EventWaitHandle]::new($false, [System.Threading.EventResetMode]::ManualReset, $shutdownEventName, [ref]$created)
+            [void]$evt.Set()
+            Write-Host "  Signaled '$shutdownEventName'; waiting up to 3s for graceful exit" -ForegroundColor Gray
+        } catch {
+            Write-Host "  (named event signal failed: $($_.Exception.Message); will fall back to Stop-Process)" -ForegroundColor DarkGray
+        }
+
+        $waitDeadline = (Get-Date).AddSeconds(3)
+        while ((Get-Date) -lt $waitDeadline) {
+            $stillAlive = @($watcherPids | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+            if ($stillAlive.Count -eq 0) { break }
+            Start-Sleep -Milliseconds 200
+        }
+
+        $stragglers = @($watcherPids | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+        foreach ($pidVal in $stragglers) {
+            try {
+                Stop-Process -Id $pidVal -Force -ErrorAction Stop
+                Write-Host "  Force-stopped straggler watcher PID=$pidVal (event did not reach it)" -ForegroundColor Yellow
+            } catch {
+                Write-Host "  WARNING: could not stop watcher PID=${pidVal}: $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+        }
+
+        if ($evt) { try { $evt.Dispose() } catch {} }
+    } catch {
+        Write-Host "  (watcher stop pass threw: $($_.Exception.Message))" -ForegroundColor DarkGray
+    }
+}
 # Add-In is hardcoded to a single erwin DM target. Reading versions from
 # HKLM was unreliable: stale 9.98 keys leaked from old installs and a fresh
 # user (no first-erwin-run yet) had no HKCU subkeys, so install silently
@@ -256,6 +325,14 @@ if ($Uninstall) {
     if (-not (Test-Path -LiteralPath $installDir)) {
         Write-Host "  No per-user install found at $installDir" -ForegroundColor Yellow
     }
+
+    # Stop running watcher BEFORE removing files / scheduled task so the
+    # orphan watcher process can't (a) lock autostart-watcher.ps1 against
+    # Remove-Item, (b) keep PostMessage-ing into erwin after the addin is
+    # gone, or (c) get picked up by the next install's pre-flight as a
+    # stale process. Matches the install path's stop order.
+    Write-Host "Stopping autostart watcher..." -ForegroundColor Yellow
+    Stop-WatcherProcesses
 
     Write-Host "Unregistering COM component (HKCU)..." -ForegroundColor Yellow
     Unregister-ComUserScope -clsid $clsid -progId $progId
@@ -301,13 +378,58 @@ if ($Uninstall) {
     Unregister-ScheduledTask -TaskName $sharedTaskName -Confirm:$false -ErrorAction SilentlyContinue
     Write-Host "  Removed Scheduled Task(s) for autostart" -ForegroundColor Green
 
-    # Remove HKCU MetaRepo entries only. HKLM bootstrap (if present) belongs
-    # to corporate IT - this uninstaller does not own that hive.
-    foreach ($subKey in @("Bootstrap", "Extension")) {
-        $path = "HKCU:\Software\EliteSoft\MetaRepo\$subKey"
-        if (Test-Path $path) {
-            Remove-Item $path -Recurse -Force
-            Write-Host "  Removed HKCU\Software\EliteSoft\MetaRepo\$subKey" -ForegroundColor Green
+    # HKCU MetaRepo entries: Bootstrap holds the user's DB connection (DBHost,
+    # DBPort, DBName, DPAPI-encrypted DBUserName/DBPassword); Extension holds
+    # UI prefs. Default is PRESERVE - a normal uninstall/reinstall cycle (e.g.
+    # upgrade) should not silently wipe credentials the user entered manually.
+    # The user gets an explicit prompt with N as default, or can pass
+    # -RemoveConnectionInfo to skip the prompt and wipe outright (support
+    # tooling / machine handoff). HKLM bootstrap (if present) is corporate
+    # IT territory and is never touched here.
+    $metaRepoBase = "HKCU:\Software\EliteSoft\MetaRepo"
+    $bootstrapPath = "$metaRepoBase\Bootstrap"
+    $extensionPath = "$metaRepoBase\Extension"
+    $hasBootstrap = Test-Path $bootstrapPath
+    $hasExtension = Test-Path $extensionPath
+
+    if ($hasBootstrap -or $hasExtension) {
+        $removeConn = $RemoveConnectionInfo.IsPresent
+        if (-not $removeConn) {
+            Write-Host ""
+            Write-Host "  MetaRepo HKCU registry entries detected:" -ForegroundColor Yellow
+            if ($hasBootstrap) {
+                try {
+                    $bs = Get-ItemProperty -LiteralPath $bootstrapPath -ErrorAction Stop
+                    $bsType = if ($bs.PSObject.Properties['DBType']) { $bs.DBType } else { '(missing)' }
+                    $bsHost = if ($bs.PSObject.Properties['DBHost']) { $bs.DBHost } else { '(missing)' }
+                    $bsPort = if ($bs.PSObject.Properties['DBPort']) { $bs.DBPort } else { '(missing)' }
+                    $bsName = if ($bs.PSObject.Properties['DBName']) { $bs.DBName } else { '(missing)' }
+                    Write-Host "    Bootstrap (DB connection): DBType=$bsType DBHost=$bsHost DBPort=$bsPort DBName=$bsName" -ForegroundColor Gray
+                } catch {
+                    Write-Host "    Bootstrap (DB connection): (could not read - $($_.Exception.Message))" -ForegroundColor DarkGray
+                }
+            }
+            if ($hasExtension) {
+                Write-Host "    Extension (UI prefs / per-user state)" -ForegroundColor Gray
+            }
+            Write-Host ""
+            Write-Host "  Removing these clears your DB connection. The next install will ask for DBHost/DBName/UserName/Password again." -ForegroundColor Yellow
+            $resp = Read-Host "  Also remove MetaRepo HKCU entries? [y/N]"
+            $removeConn = ($resp -match '^[yY]')
+        }
+
+        if ($removeConn) {
+            foreach ($p in @($bootstrapPath, $extensionPath)) {
+                if (-not (Test-Path $p)) { continue }
+                try {
+                    Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction Stop
+                    Write-Host "  Removed $p" -ForegroundColor Green
+                } catch {
+                    Write-Host "  WARNING: Could not remove ${p}: $($_.Exception.Message)" -ForegroundColor Yellow
+                }
+            }
+        } else {
+            Write-Host "  MetaRepo HKCU entries PRESERVED (DB connection + UI prefs kept for next install)." -ForegroundColor Green
         }
     }
 
@@ -393,64 +515,11 @@ if (-not $dotnetOk) {
 # this race.
 $taskName = "EliteSoft Erwin AddIn AutoStart - $env:USERNAME"
 $legacyTaskName = "EliteSoft Erwin AddIn AutoStart"
-# Graceful shutdown signal: a named event the watcher loop waits on.
-# Replaces the old `$_.Terminate()` WMI call which Symantec SEP's SONAR
-# heuristic (AGR.Terminate!g2) flags as `Compromised Application` because
-# powershell.exe terminating another powershell.exe via WMI matches the
-# script-host-killing-script-host malware pattern. SetEvent + brief wait
-# + non-WMI fallback delivers the same effect without the SONAR trigger.
-$shutdownEventName = 'EliteSoft.ErwinAddIn.Watcher.Shutdown'
+# Stop running watcher PS instances (SEP-clean: named-event signal + graceful
+# wait + Stop-Process fallback; never WMI Terminate). See Stop-WatcherProcesses
+# function comment for the SEP rationale.
+Stop-WatcherProcesses
 try {
-    # Identify running watcher PIDs via CommandLine match (read-only).
-    # Get-CimInstance is preferred over the deprecated Get-WmiObject; both
-    # are read-only enumeration here and do NOT match AGR.Terminate.
-    $watcherPids = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -match 'autostart-watcher' } |
-        Select-Object -ExpandProperty ProcessId)
-
-    if ($watcherPids.Count -gt 0) {
-        Write-Host "  Found $($watcherPids.Count) running watcher PID(s): $($watcherPids -join ', ')" -ForegroundColor Gray
-        # Step 1: signal graceful shutdown via named Event. The watcher's
-        # main loop blocks on WaitOne($shutdownEventName, $intervalMs); on
-        # signal it exits cleanly. New watchers (older builds without this
-        # event) just won't see the signal and we fall through to step 3.
-        $evt = $null
-        try {
-            $created = $false
-            $evt = [System.Threading.EventWaitHandle]::new($false, [System.Threading.EventResetMode]::ManualReset, $shutdownEventName, [ref]$created)
-            [void]$evt.Set()
-            Write-Host "  Signaled '$shutdownEventName'; waiting up to 3s for graceful exit" -ForegroundColor Gray
-        } catch {
-            Write-Host "  (named event signal failed: $($_.Exception.Message); will fall back to Stop-Process)" -ForegroundColor DarkGray
-        }
-
-        # Step 2: poll for actual exit. Most watchers respond in <1s.
-        $waitDeadline = (Get-Date).AddSeconds(3)
-        while ((Get-Date) -lt $waitDeadline) {
-            $stillAlive = @($watcherPids | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
-            if ($stillAlive.Count -eq 0) { break }
-            Start-Sleep -Milliseconds 200
-        }
-
-        # Step 3: anything still alive after the grace period gets a hard
-        # Stop-Process. Stop-Process is the standard PowerShell idiom and
-        # does NOT match SEP's AGR.Terminate `Compromised Application`
-        # pattern (which was specifically about WMI Win32_Process.Terminate
-        # called from a script). Even if SEP still flags, only stragglers
-        # are at risk - happy path never reaches this branch.
-        $stragglers = @($watcherPids | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
-        foreach ($pidVal in $stragglers) {
-            try {
-                Stop-Process -Id $pidVal -Force -ErrorAction Stop
-                Write-Host "  Force-stopped straggler watcher PID=$pidVal (event did not reach it)" -ForegroundColor Yellow
-            } catch {
-                Write-Host "  WARNING: could not stop watcher PID=${pidVal}: $($_.Exception.Message)" -ForegroundColor Yellow
-            }
-        }
-
-        if ($evt) { try { $evt.Dispose() } catch {} }
-    }
-
     # Force SCM state Running -> Ready so the later Start-ScheduledTask is
     # actually honoured. Missing tasks fail silently (legitimate on first
     # install).
