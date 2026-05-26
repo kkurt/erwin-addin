@@ -625,6 +625,41 @@ if ($addInOk) {
     Write-Host "  HKCU Add-In entry written ('$addInDisplayName' -> $progId)" -ForegroundColor Green
 }
 
+# --- Step 5c: COM pre-warm ---
+# Without this, the FIRST erwin launch after rebuild often hides the addin
+# from Tools > Add-Ins: erwin's Add-In Manager enumerates registered entries
+# and runs an internal validation that includes CoCreateInstance. Windows'
+# first cold COM activation (load comhost.dll -> bootstrap CoreCLR -> load
+# main DLL -> instantiate type) can race with SEP / Defender first-scan of
+# the freshly-rebuilt comhost + assembly OR with disk-page-cache cold reads,
+# and erwin treats the failure as "invalid addin, hide entry". The validation
+# result is cached for the lifetime of the erwin session, so once it fails
+# the addin stays missing from the menu until the user closes and re-opens
+# erwin - usually 2 - 4 cycles before it sticks.
+#
+# Doing CoCreateInstance ourselves NOW (against $progId, with all registry
+# chains just freshly written) primes the page cache + COM activation paths
+# so erwin's first launch finds everything pre-validated and lists the
+# addin. We hold the COM object for ~500 ms to ensure the activation
+# completes, then release. install-impl.ps1 had this step since 2026-05-26
+# (memory reference_first_launch_dialog_closed); build-and-run was missing
+# it - that is the recurring "addin disappeared after rebuild" we kept
+# chasing all session.
+Write-Host "`n[5c/5] COM pre-warm..." -ForegroundColor Yellow
+try {
+    $tmpObj = New-Object -ComObject $progId -ErrorAction Stop
+    Start-Sleep -Milliseconds 500
+    [System.Runtime.InteropServices.Marshal]::ReleaseComObject($tmpObj) | Out-Null
+    Remove-Variable tmpObj -ErrorAction SilentlyContinue
+    [System.GC]::Collect()
+    [System.GC]::WaitForPendingFinalizers()
+    Write-Host "  COM pre-warm OK - addin will appear in erwin Tools > Add-Ins on next launch" -ForegroundColor Green
+} catch {
+    Write-Host "  COM pre-warm FAILED: $($_.Exception.Message)" -ForegroundColor Yellow
+    Write-Host "  HRESULT: 0x$('{0:X8}' -f $_.Exception.HResult)" -ForegroundColor Yellow
+    Write-Host "  Addin may still appear if you restart erwin manually after this run." -ForegroundColor Yellow
+}
+
 # --- Step 6: Auto-start watcher health check ---
 # Develop loop'unda watcher sessizce olebilir (process kill, OOM, vs). Build
 # bittiginde task var ama watcher process yok ise tetikle - addin auto-load
