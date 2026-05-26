@@ -668,6 +668,38 @@ Set-ItemProperty $addInPath -Name "Invoke Method"   -Value "Execute" -Type Strin
 Set-ItemProperty $addInPath -Name "Invoke EXE"      -Value 0 -Type DWord
 Write-Host "  erwin $erwinVersion (HKCU) - OK ('$addInDisplayName' -> $progId)" -ForegroundColor Green
 
+# Step 3b: COM pre-warm. Without this, the FIRST erwin launch after install
+# often hides our menu entry: erwin's Add-In Manager enumerates registered
+# add-ins, runs an internal validation that includes a CoCreateInstance probe,
+# and Windows' first cold COM activation (load comhost.dll -> bootstrap
+# CoreCLR -> load main DLL -> instantiate type) can race or fail in a way
+# that erwin treats as "invalid, hide entry". A subsequent erwin restart
+# usually works because Windows has warmed the activation cache.
+#
+# Doing CoCreateInstance ourselves NOW (against $progId, with all registry
+# chains just freshly written) primes the cache so erwin's first launch
+# finds everything pre-validated and lists the addin. We hold the COM
+# object for ~0.5 s to ensure the activation completes, then release.
+#
+# Verified 2026-05-26: the "addin missing on first launch, present on
+# restart" symptom hit a fresh-install user; this pre-warm makes the
+# first launch behave like a restart.
+Write-Host "  Pre-warming COM activation..." -ForegroundColor Gray
+try {
+    $tmpObj = New-Object -ComObject $progId -ErrorAction Stop
+    Start-Sleep -Milliseconds 500
+    [System.Runtime.InteropServices.Marshal]::ReleaseComObject($tmpObj) | Out-Null
+    Remove-Variable tmpObj -ErrorAction SilentlyContinue
+    [System.GC]::Collect()
+    [System.GC]::WaitForPendingFinalizers()
+    Write-Host "  COM pre-warm OK - addin will appear in erwin Tools > Add-Ins on next launch" -ForegroundColor Green
+} catch {
+    Write-Host "  COM pre-warm FAILED: $($_.Exception.Message)" -ForegroundColor Yellow
+    Write-Host "  Hresult: 0x$('{0:X8}' -f $_.Exception.HResult)" -ForegroundColor Yellow
+    Write-Host "  Possible causes: .NET 10 Desktop Runtime missing, comhost.dll not properly built, or main DLL inaccessible" -ForegroundColor Yellow
+    Write-Host "  Addin may still appear if you restart erwin manually after install." -ForegroundColor Yellow
+}
+
 # Step 4: MetaRepo bootstrap (DB connection seed). Decision tree:
 #   1. HKLM\Software\EliteSoft\MetaRepo\Bootstrap is populated (DBHost AND
 #      DBName non-empty) -> SKIP entirely. The add-in will read from HKLM at
