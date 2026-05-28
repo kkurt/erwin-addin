@@ -34,9 +34,10 @@ if ($Help) {
     Write-Host "Each step is timestamp/hash gated so no-change runs finish in"
     Write-Host "seconds: native bridge skipped when .cpp is unchanged, DdlHelper"
     Write-Host "skipped when source is older than the published exe, install dir"
-    Write-Host "sync via robocopy /XO, COM register skipped when HKCU already"
-    Write-Host "points at the right comhost, watcher recycle skipped when the"
-    Write-Host "deployed autostart-watcher.ps1 hash matches scripts/."
+    Write-Host "sync via share-aware FileStream copy (skips dst-newer-or-equal),"
+    Write-Host "COM register skipped when HKCU already points at the right"
+    Write-Host "comhost, watcher recycle skipped when the deployed"
+    Write-Host "autostart-watcher.ps1 hash matches scripts/."
     Write-Host ""
     Write-Host "Usage:" -ForegroundColor Yellow
     Write-Host "  .\build-and-run.ps1                     Build + install + register"
@@ -349,40 +350,126 @@ $watcherDstPath = Join-Path $installDir "autostart-watcher.ps1"
 $watcherOldHash = Get-FileHashSafe -Path $watcherDstPath
 $watcherSrcHash = Get-FileHashSafe -Path $watcherSrcPath
 
-# --- Step 4: Copy files via robocopy ---
-# robocopy /XO skips files whose destination copy is newer-or-equal-age, so
-# dotnet build's preserved mtimes on unchanged DLLs (third-party + projects
-# with no source changes) avoid being re-copied. /NJH /NJS /NDL /NFL /NP
-# silences the verbose default output; only the summary returns. Exit codes
-# 0-7 are success (0=nothing copied, 1=files copied, others=mismatch/extras).
+# --- Step 4: Copy files via shared-mode .NET FileStream ---
+# /XO equivalence (skip when destination mtime >= source mtime) is preserved
+# inside Sync-DirectoryShared below; see the function header for why we no
+# longer call robocopy.
 Write-Host "`n[3/5] Syncing $installDir..." -ForegroundColor Yellow
 if (-not (Test-Path $installDir)) {
     New-Item -ItemType Directory -Path $installDir -Force | Out-Null
 }
 # Wipe transient TLB/config so re-registered COM picks up the fresh ones
-# even when robocopy /XO would have skipped them (rare edge - dotnet build
+# even when the /XO check would have skipped them (rare edge - dotnet build
 # regenerates these but mtime sometimes does not advance past the deployed
 # copy when the typelib content is identical).
 Remove-Item "$installDir\*.tlb"    -Force -ErrorAction SilentlyContinue
 Remove-Item "$installDir\*.config" -Force -ErrorAction SilentlyContinue
 
-$robocopyArgs = @(
-    $buildOutputDir, $installDir,
-    "/E", "/XO",
-    "/NJH","/NJS","/NDL","/NFL","/NP","/R:2","/W:1"
-)
-$robocopyOutput = & robocopy.exe @robocopyArgs
-$rcExit = $LASTEXITCODE
-# robocopy exit codes 0-7 are non-fatal (0 = no files copied, 1 = files
-# copied OK, 2 = extra files in dest, 4 = mismatched files, 8+ = real
-# failure). Anything <= 7 is success.
-if ($rcExit -ge 8) {
-    Write-Host "  robocopy failed (exit=$rcExit):" -ForegroundColor Red
-    Write-Host $robocopyOutput -ForegroundColor Red
+# robocopy was the previous sync tool here but it failed reproducibly with
+# ERROR 32 against the freshly built EliteSoft.Erwin.AddIn.dll. Root cause
+# (verified 2026-05-27): robocopy opens the source with a stricter
+# dwShareMode mask than the concurrent reader (Roslyn LSP /
+# Microsoft.CodeAnalysis.LanguageServer / Defender real-time scan), which
+# all open the just-written assembly with FileShare.ReadWrite|Delete.
+#
+# Killing the locker is a losing battle - VS Code's C# extension respawns
+# Microsoft.CodeAnalysis.LanguageServer immediately and re-locks before
+# robocopy retries. A .NET FileStream open with the matching share mask
+# coexists with the locker cleanly, so we drop robocopy in favour of an
+# in-process recursive copy that uses FileShare.ReadWrite|Delete on the
+# source side. /XO equivalence is preserved by skipping files whose
+# destination mtime is >= source mtime.
+function Copy-FileShared {
+    param(
+        [Parameter(Mandatory)] [string]$Source,
+        [Parameter(Mandatory)] [string]$Destination
+    )
+    $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+    $srcStream = [System.IO.File]::Open(
+        $Source,
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read,
+        $share)
+    try {
+        $dstStream = [System.IO.File]::Open(
+            $Destination,
+            [System.IO.FileMode]::Create,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None)
+        try {
+            $srcStream.CopyTo($dstStream)
+        } finally {
+            $dstStream.Dispose()
+        }
+    } finally {
+        $srcStream.Dispose()
+    }
+    $srcInfo = [System.IO.FileInfo]::new($Source)
+    [System.IO.File]::SetLastWriteTimeUtc($Destination, $srcInfo.LastWriteTimeUtc)
+    [System.IO.File]::SetCreationTimeUtc($Destination, $srcInfo.CreationTimeUtc)
+}
+
+function Sync-DirectoryShared {
+    param(
+        [Parameter(Mandatory)] [string]$Source,
+        [Parameter(Mandatory)] [string]$Destination
+    )
+    if (-not (Test-Path -LiteralPath $Destination)) {
+        New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+    }
+    $srcRoot = (Resolve-Path -LiteralPath $Source).Path.TrimEnd('\','/')
+    $copied = 0
+    $skipped = 0
+    $failed = 0
+    Get-ChildItem -LiteralPath $srcRoot -Recurse -File | ForEach-Object {
+        $rel = $_.FullName.Substring($srcRoot.Length).TrimStart('\','/')
+        $dstPath = Join-Path $Destination $rel
+        $dstDir = Split-Path -Parent $dstPath
+        if (-not (Test-Path -LiteralPath $dstDir)) {
+            New-Item -ItemType Directory -Path $dstDir -Force | Out-Null
+        }
+        # robocopy /XO: skip when destination exists and is same age or
+        # newer than source. Compare in UTC to avoid DST off-by-one bugs.
+        if (Test-Path -LiteralPath $dstPath) {
+            $dstInfo = [System.IO.FileInfo]::new($dstPath)
+            if ($dstInfo.LastWriteTimeUtc -ge $_.LastWriteTimeUtc) {
+                $skipped++
+                return
+            }
+        }
+        # Two-pass retry: the .NET share-aware open succeeds against
+        # well-behaved concurrent readers immediately; the retry only
+        # exists for the rare Defender scan race that happens to use a
+        # stricter share mask. 250ms is well under the LSP's re-lock
+        # cycle, so we don't queue forever.
+        $attempt = 0
+        $maxAttempts = 4
+        while ($true) {
+            $attempt++
+            try {
+                Copy-FileShared -Source $_.FullName -Destination $dstPath
+                $copied++
+                break
+            } catch [System.IO.IOException] {
+                if ($attempt -ge $maxAttempts) {
+                    Write-Host "    FAIL $rel after $maxAttempts attempts: $($_.Exception.Message)" -ForegroundColor Red
+                    $failed++
+                    break
+                }
+                Start-Sleep -Milliseconds (200 * $attempt)
+            }
+        }
+    }
+    return [pscustomobject]@{ Copied = $copied; Skipped = $skipped; Failed = $failed }
+}
+
+$syncResult = Sync-DirectoryShared -Source $buildOutputDir -Destination $installDir
+if ($syncResult.Failed -gt 0) {
+    Write-Host "  Sync FAILED: $($syncResult.Failed) file(s) could not be copied" -ForegroundColor Red
     Write-Host "`nPress any key to exit..." -ForegroundColor Gray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown"); exit 1
 }
 
-# autostart-watcher.ps1 lives under scripts/ (not bin/), so the robocopy
+# autostart-watcher.ps1 lives under scripts/ (not bin/), so Sync-DirectoryShared
 # above misses it. Refresh only when the SHA1 differs from the snapshotted
 # pre-copy hash - File.Copy resets mtime, which made the previous always-
 # copy logic fool the recycle step into thinking the watcher changed on
@@ -498,11 +585,10 @@ if (-not (Test-Path -LiteralPath $licDst)) {
     }
 }
 
-# robocopy exit 0 == nothing copied (everything was up-to-date).
-if ($rcExit -eq 0) {
-    Write-Host "  Install dir already in sync (no files copied)" -ForegroundColor DarkGray
+if ($syncResult.Copied -eq 0) {
+    Write-Host "  Install dir already in sync (skipped=$($syncResult.Skipped))" -ForegroundColor DarkGray
 } else {
-    Write-Host "  Sync complete (robocopy exit=$rcExit)" -ForegroundColor Green
+    Write-Host "  Sync complete (copied=$($syncResult.Copied), skipped=$($syncResult.Skipped))" -ForegroundColor Green
 }
 # icacls grant skipped: $installDir lives under %LOCALAPPDATA% which the
 # current user owns and can read/execute by default. The grant only
@@ -646,17 +732,34 @@ if ($addInOk) {
 # it - that is the recurring "addin disappeared after rebuild" we kept
 # chasing all session.
 Write-Host "`n[5c/5] COM pre-warm..." -ForegroundColor Yellow
+# CRITICAL: warm-up MUST run in a child pwsh.exe, not in this script's
+# process. New-Object -ComObject loads comhost.dll -> CoreCLR -> the addin
+# assembly. CLR's default AssemblyLoadContext does NOT unload, so the
+# managed DLL stays mapped into the *current* process address space until
+# that process dies. If we did this inline, this shell would hold an open
+# handle on $installDir\EliteSoft.Erwin.AddIn.dll, and the NEXT
+# build-and-run run's Sync-DirectoryShared step would fail with
+# UnauthorizedAccess (Test-FileLocked saw it as PID==self and would
+# politely skip, leaving robocopy/install dir wedged). A spawned pwsh
+# exits cleanly when warm-up finishes, releasing every handle it held.
+$childCmd = @"
 try {
-    $tmpObj = New-Object -ComObject $progId -ErrorAction Stop
+    `$o = New-Object -ComObject '$progId' -ErrorAction Stop
     Start-Sleep -Milliseconds 500
-    [System.Runtime.InteropServices.Marshal]::ReleaseComObject($tmpObj) | Out-Null
-    Remove-Variable tmpObj -ErrorAction SilentlyContinue
-    [System.GC]::Collect()
-    [System.GC]::WaitForPendingFinalizers()
-    Write-Host "  COM pre-warm OK - addin will appear in erwin Tools > Add-Ins on next launch" -ForegroundColor Green
+    [System.Runtime.InteropServices.Marshal]::ReleaseComObject(`$o) | Out-Null
+    Write-Output 'WARMUP_OK'
+    exit 0
 } catch {
-    Write-Host "  COM pre-warm FAILED: $($_.Exception.Message)" -ForegroundColor Yellow
-    Write-Host "  HRESULT: 0x$('{0:X8}' -f $_.Exception.HResult)" -ForegroundColor Yellow
+    Write-Output ('WARMUP_FAIL: ' + `$_.Exception.Message + ' HRESULT=0x' + ('{0:X8}' -f `$_.Exception.HResult))
+    exit 1
+}
+"@
+$warmupOutput = & pwsh.exe -NoProfile -NonInteractive -Command $childCmd 2>&1
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "  COM pre-warm OK - addin will appear in erwin Tools > Add-Ins on next launch" -ForegroundColor Green
+} else {
+    Write-Host "  COM pre-warm FAILED:" -ForegroundColor Yellow
+    Write-Host "    $warmupOutput" -ForegroundColor Yellow
     Write-Host "  Addin may still appear if you restart erwin manually after this run." -ForegroundColor Yellow
 }
 

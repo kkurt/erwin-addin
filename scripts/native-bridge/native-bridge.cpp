@@ -1831,58 +1831,124 @@ static bool DismissOkOnlyPopup() {
     return false;
 }
 
-// Dismisses erwin's "Use current diagram selections? You have N entity
+// When non-zero, DismissDiagramSelectionPopup answers the "Use current
+// diagram selections?" prompt with YES (scope the alter script to the
+// entities the user has selected on the active diagram) instead of the
+// default NO (all changed objects). Set from managed code via the
+// SetUseDiagramSelection export, wired to the "Only Selected Objects"
+// checkbox on the DDL Generation tab. Default 0 = answer No (legacy
+// behavior; the whole diff). This replaces the old post-hoc regex DDL
+// filter - erwin's own Object Filter page does the scoping natively.
+static volatile LONG g_useDiagramSelection = 0;
+
+extern "C" __declspec(dllexport) void __cdecl SetUseDiagramSelection(int enabled) {
+    InterlockedExchange(&g_useDiagramSelection, enabled ? 1 : 0);
+    LogLine("[OBJ-FILTER] diagram-selection answer = %s",
+        enabled ? "YES (only selected objects)" : "NO (all changed objects)");
+}
+
+// Finds a Yes/No child button on an erwin popup. wantYes=true returns the
+// Yes button, false returns the No button. Handles plain, ampersand-prefixed
+// and Turkish-localized ("Evet"/"Hayır") captions, plus a first-letter scan
+// fallback for unicode ampersand variants. Returns nullptr if not found.
+static HWND FindYesNoButton(HWND popup, bool wantYes) {
+    if (wantYes) {
+        HWND b = FindWindowExW(popup, nullptr, L"Button", L"&Yes");
+        if (!b) b = FindWindowExW(popup, nullptr, L"Button", L"Yes");
+        if (!b) b = FindWindowExW(popup, nullptr, L"Button", L"&Evet");
+        if (!b) b = FindWindowExW(popup, nullptr, L"Button", L"Evet");
+        if (b) return b;
+        HWND child = nullptr;
+        while ((child = FindWindowExW(popup, child, L"Button", nullptr)) != nullptr) {
+            wchar_t t[64] = {0};
+            GetWindowTextW(child, t, 63);
+            if (t[0] == L'Y' || t[0] == L'y' ||
+                (t[0] == L'&' && (t[1] == L'Y' || t[1] == L'y')) ||
+                wcsstr(t, L"Evet")) return child;
+        }
+        return nullptr;
+    }
+    HWND b = FindWindowExW(popup, nullptr, L"Button", L"&No");
+    if (!b) b = FindWindowExW(popup, nullptr, L"Button", L"No");
+    if (!b) b = FindWindowExW(popup, nullptr, L"Button", L"&Hayır");
+    if (!b) b = FindWindowExW(popup, nullptr, L"Button", L"Hayır");
+    if (b) return b;
+    HWND child = nullptr;
+    while ((child = FindWindowExW(popup, child, L"Button", nullptr)) != nullptr) {
+        wchar_t t[64] = {0};
+        GetWindowTextW(child, t, 63);
+        if (t[0] == L'N' || t[0] == L'n' ||
+            (t[0] == L'&' && (t[1] == L'N' || t[1] == L'n')) ||
+            wcsstr(t, L"Hayır") || wcsstr(t, L"Hayir")) return child;
+    }
+    return nullptr;
+}
+
+// Answers erwin's "Use current diagram selections? You have N entity
 // selected" popup that the Object Filter wizard page raises when the user
-// has table(s) selected on the active diagram. Manual flow: click No to
-// keep the wizard's "all changed objects" filter; clicking Yes scopes the
-// alter script to only the selected entities, which produces a stripped
-// DDL most callers don't want. Returns true if a popup was found and
-// dismissed.
+// has table(s) selected on the active diagram. The answer is driven by
+// g_useDiagramSelection (managed-controlled): YES scopes the alter script
+// to the selected entities (erwin filters natively); NO keeps the wizard's
+// "all changed objects" filter. Returns true if a popup was found and
+// answered.
 //
 // Used by both the OnFE-WORKER-NEXT Mart-Mart pipeline and the IPS-CALL
 // same-version Next-loop. Originally a lambda inside OnFeWorkerProc; lifted
 // to top-level so the IPS-CALL Next-loop can reuse it without duplicating
 // the title-match + button-find logic.
 static bool DismissDiagramSelectionPopup() {
+    bool wantYes = (InterlockedCompareExchange(&g_useDiagramSelection, 0, 0) != 0);
     auto dialogs = EnumerateVisibleDialogs();
     for (HWND popup : dialogs) {
         wchar_t title[256] = {0};
         GetWindowTextW(popup, title, 255);
         if (wcsstr(title, L"erwin Data Modeler") == nullptr) continue;
-        // Search for a 'No' button child to confirm it's a Yes/No popup.
-        HWND noBtn = FindWindowExW(popup, nullptr, L"Button", L"&No");
-        if (!noBtn) noBtn = FindWindowExW(popup, nullptr, L"Button", L"No");
-        if (!noBtn) noBtn = FindWindowExW(popup, nullptr, L"Button", L"&Hayır");
-        if (!noBtn) noBtn = FindWindowExW(popup, nullptr, L"Button", L"Hayır");
-        if (!noBtn) {
-            // Some erwin popups use unicode ampersand-prefixed text; try
-            // enumerating Button children to find one whose text starts with N.
-            HWND child = nullptr;
-            while ((child = FindWindowExW(popup, child, L"Button", nullptr)) != nullptr) {
-                wchar_t btxt[64] = {0};
-                GetWindowTextW(child, btxt, 63);
-                if (btxt[0] == L'N' || btxt[0] == L'n' ||
-                    (btxt[0] == L'&' && (btxt[1] == L'N' || btxt[1] == L'n')) ||
-                    wcsstr(btxt, L"Hayır") || wcsstr(btxt, L"Hayir"))
-                { noBtn = child; break; }
-            }
-        }
-        if (!noBtn) continue;
-        LogLine("[POPUP-DISMISS] 'erwin Data Modeler' popup hwnd=%p title='%ls' (clicking No)", popup, title);
-        PostMessage(popup, WM_COMMAND, MAKEWPARAM(IDNO, BN_CLICKED), (LPARAM)noBtn);
+        // Confirm it's a Yes/No popup by requiring BOTH buttons present, so
+        // we don't mis-fire on an OK-only informational popup.
+        HWND yesBtn = FindYesNoButton(popup, true);
+        HWND noBtn  = FindYesNoButton(popup, false);
+        if (!yesBtn || !noBtn) continue;
+        HWND target = wantYes ? yesBtn : noBtn;
+        int cmdId = wantYes ? IDYES : IDNO;
+        LogLine("[POPUP-DISMISS] 'erwin Data Modeler' popup hwnd=%p title='%ls' (clicking %s)",
+            popup, title, wantYes ? "Yes" : "No");
+        PostMessage(popup, WM_COMMAND, MAKEWPARAM(cmdId, BN_CLICKED), (LPARAM)target);
         // Also send BM_CLICK directly to the button as a backup - some custom
-        // dialogs don't honor IDNO unless the message targets the button hwnd
-        // specifically.
-        PostMessage(noBtn, BM_CLICK, 0, 0);
+        // dialogs don't honor IDYES/IDNO unless the message targets the button
+        // hwnd specifically.
+        PostMessage(target, BM_CLICK, 0, 0);
         return true;
     }
     return false;
 }
 
+// Debug-mode flag: when non-zero, HideWizardAggressive becomes a no-op so
+// the user can actually see the CC wizard / RD dialog / Alter Script Wizard
+// state as the pipeline drives them. Toggled from managed code via the
+// SetDebugKeepWindowsVisible export; the C# DebugMode service flips it from
+// the dev-only "Generate DDL (debug)" button on each click. Default 0 =
+// production silent path.
+static volatile LONG g_dbgKeepWindowsVisible = 0;
+
+extern "C" __declspec(dllexport) void __cdecl SetDebugKeepWindowsVisible(int enabled) {
+    InterlockedExchange(&g_dbgKeepWindowsVisible, enabled ? 1 : 0);
+    LogLine("[DBG-VISIBLE] HideWizardAggressive %s (managed toggled)",
+        enabled ? "DISABLED (windows stay visible)" : "ENABLED (production silent)");
+}
+
+extern "C" __declspec(dllexport) int __cdecl GetDebugKeepWindowsVisible(void) {
+    return (int)InterlockedCompareExchange(&g_dbgKeepWindowsVisible, 0, 0);
+}
+
 // Hide a wizard window aggressively: make it transparent (alpha=0) AND move
 // off-screen. Using WS_EX_LAYERED with alpha=0 ensures it's not drawn at all
-// even momentarily, so no flash is perceptible.
+// even momentarily, so no flash is perceptible. Skipped entirely when
+// g_dbgKeepWindowsVisible is set so a human can observe the pipeline.
 static void HideWizardAggressive(HWND hwnd) {
+    if (InterlockedCompareExchange(&g_dbgKeepWindowsVisible, 0, 0) != 0) {
+        LogLine("[DBG-VISIBLE] HideWizardAggressive skipped for hwnd=0x%p (debug mode on)", hwnd);
+        return;
+    }
     LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
     SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED | WS_EX_TOOLWINDOW);
     SetLayeredWindowAttributes(hwnd, 0, 0 /* fully transparent */, LWA_ALPHA);

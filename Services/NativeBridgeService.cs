@@ -45,6 +45,20 @@ namespace EliteSoft.Erwin.AddIn.Services
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate void FreeDdlBufferFn(IntPtr buf);
 
+        // Debug-mode visibility toggle (2026-05-27). Setting non-zero makes
+        // HideWizardAggressive a no-op so the CC wizard, RD dialog, hidden
+        // Alter Script Wizard, etc. stay visible while the pipeline drives
+        // them. Mirrors DebugMode.KeepDialogsVisible.
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate void SetDebugKeepWindowsVisibleFn(int enabled);
+
+        // Controls how the bridge answers erwin's "Use current diagram
+        // selections?" Object Filter popup: 1 = Yes (only selected objects),
+        // 0 = No (all changed objects). Wired to the "Only Selected Objects"
+        // checkbox on the DDL Generation tab.
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate void SetUseDiagramSelectionFn(int enabled);
+
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate int InstallObserverHookFn();
 
@@ -211,6 +225,8 @@ namespace EliteSoft.Erwin.AddIn.Services
         private static OpenAlterScriptWizardHiddenFn _openHiddenWizard;
         private static CloseHiddenWizardFn _closeHiddenWizard;
         private static GetCapturedFEWPageOptionsFn _getCapturedFEWPO;
+        private static SetDebugKeepWindowsVisibleFn _setDebugKeepWindowsVisible;
+        private static SetUseDiagramSelectionFn _setUseDiagramSelection;
         private static IntPtr _hiddenWizardHwnd = IntPtr.Zero;
 
         // D1-spike: CC state inspection delegates
@@ -346,6 +362,30 @@ namespace EliteSoft.Erwin.AddIn.Services
                     IntPtr getCapProc = GetProcAddress(_bridgeModule, "GetCapturedFEWPageOptions");
                     if (getCapProc != IntPtr.Zero)
                         _getCapturedFEWPO = Marshal.GetDelegateForFunctionPointer<GetCapturedFEWPageOptionsFn>(getCapProc);
+
+                    // Debug-mode visibility toggle. Older native bridge builds
+                    // do not export this; absence is treated as "stuck on
+                    // hidden" - the managed-side Pause()s still fire, just
+                    // the wizard windows remain hidden until the bridge is
+                    // rebuilt.
+                    IntPtr setDbgProc = GetProcAddress(_bridgeModule, "SetDebugKeepWindowsVisible");
+                    if (setDbgProc != IntPtr.Zero)
+                    {
+                        _setDebugKeepWindowsVisible = Marshal.GetDelegateForFunctionPointer<SetDebugKeepWindowsVisibleFn>(setDbgProc);
+                        // Push current DebugMode state into the bridge now
+                        // that the export is wired up. SyncDebugVisibility
+                        // is also called from BtnAlterWizardProd_Click so
+                        // env-var changes between addin launch and the user
+                        // hitting Generate DDL still take effect.
+                        try { _setDebugKeepWindowsVisible(DebugMode.KeepDialogsVisible ? 1 : 0); } catch { }
+                    }
+
+                    // Object Filter answer toggle ("Only Selected Objects").
+                    // Older bridge builds without this export fall back to the
+                    // baked-in "No" (all changed objects) answer.
+                    IntPtr setObjFilterProc = GetProcAddress(_bridgeModule, "SetUseDiagramSelection");
+                    if (setObjFilterProc != IntPtr.Zero)
+                        _setUseDiagramSelection = Marshal.GetDelegateForFunctionPointer<SetUseDiagramSelectionFn>(setObjFilterProc);
 
                     // D1-spike: CC state inspection
                     IntPtr ccAs  = GetProcAddress(_bridgeModule, "CCInsp_GetFEDataActionSummary");
@@ -1096,8 +1136,17 @@ namespace EliteSoft.Erwin.AddIn.Services
             // The FEW-CTOR hook fires synchronously during wizard creation,
             // so g_capturedFEWPO is now set to the live wizard's options.
 
+            // Debug pause: in debug mode the wizard is now visible on-screen
+            // before we drive it. Give the dev a chance to actually see the
+            // wizard before the GA detour fires.
+            DebugMode.Pause("hidden alter wizard opened - inspect it", log);
+
             // Step 2: call Invoke → GA detour captures DDL.
             string ddl = CallInvokePreviewDirect(log);
+
+            // Debug pause: DDL has been captured but the wizard is still open.
+            // Hold it open so the dev can read the Preview page in debug runs.
+            DebugMode.Pause("DDL captured - wizard still open for review", log);
 
             // Step 3: always close the hidden wizard. It's a MODAL CPropertySheet,
             // and leaving it alive locks the erwin main window (title shows
@@ -1115,6 +1164,63 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         /// <summary>Closes the hidden wizard (if one was auto-opened). Normally
         /// not needed during a session — the wizard is cheap to keep alive.</summary>
+        /// <summary>
+        /// Push the current <see cref="DebugMode.KeepDialogsVisible"/> value
+        /// into the native bridge so HideWizardAggressive becomes a no-op
+        /// during the next pipeline run. Safe when the bridge is older and
+        /// does not export SetDebugKeepWindowsVisible (silent skip). Called
+        /// from <see cref="ModelConfigForm.BtnAlterWizardProd_Click"/> right
+        /// before the pipeline branches, so the dev "Generate DDL (debug)"
+        /// button's per-click DebugMode flip takes effect immediately.
+        /// </summary>
+        public static void SyncDebugVisibility(Action<string> log = null)
+        {
+            if (_setDebugKeepWindowsVisible == null)
+            {
+                log?.Invoke("NativeBridge: SetDebugKeepWindowsVisible export missing (older bridge); HideWizardAggressive still hides windows. Rebuild native-bridge to enable.");
+                return;
+            }
+            try
+            {
+                _setDebugKeepWindowsVisible(DebugMode.KeepDialogsVisible ? 1 : 0);
+                log?.Invoke($"NativeBridge: HideWizardAggressive = {(DebugMode.KeepDialogsVisible ? "DISABLED (windows visible)" : "ENABLED (production silent)")}");
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"NativeBridge: SyncDebugVisibility threw: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Tell the bridge how to answer erwin's "Use current diagram
+        /// selections?" Object Filter popup on the next pipeline run:
+        /// <paramref name="onlySelected"/> true -> Yes (scope the alter script
+        /// to the entities selected on the active diagram); false -> No (all
+        /// changed objects, the legacy default). Wired to the "Only Selected
+        /// Objects" checkbox; called from
+        /// <see cref="ModelConfigForm.BtnAlterWizardProd_Click"/> right before
+        /// the pipeline branches. Replaces the old post-hoc regex DDL filter -
+        /// erwin's own Object Filter page does the scoping natively. Silent
+        /// no-op on older bridge builds without the export.
+        /// </summary>
+        public static void SetUseDiagramSelection(bool onlySelected, Action<string> log = null)
+        {
+            if (_setUseDiagramSelection == null)
+            {
+                log?.Invoke("NativeBridge: SetUseDiagramSelection export missing (older bridge); Object Filter will answer No (all objects). Rebuild native-bridge to enable.");
+                return;
+            }
+            try
+            {
+                _setUseDiagramSelection(onlySelected ? 1 : 0);
+                log?.Invoke($"NativeBridge: Object Filter answer = {(onlySelected ? "YES (only selected objects)" : "NO (all changed objects)")}");
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"NativeBridge: SetUseDiagramSelection threw: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
         public static void CloseHiddenWizardIfAny()
         {
             if (_hiddenWizardHwnd != IntPtr.Zero && _closeHiddenWizard != null)

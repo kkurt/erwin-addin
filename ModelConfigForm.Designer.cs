@@ -658,33 +658,13 @@ namespace EliteSoft.Erwin.AddIn
             this.chkFilterObjects.Font = fontCaption;
             this.grpDdlOptions.Controls.Add(this.chkFilterObjects);
 
-            var lblFEOption = new System.Windows.Forms.Label();
-            lblFEOption.Location = new System.Drawing.Point(220, 26);
-            lblFEOption.Size = new System.Drawing.Size(85, 20);
-            lblFEOption.Text = "FE Option XML:";
-            lblFEOption.Font = fontCaption;
-            lblFEOption.ForeColor = clrTextSecondary;
-            this.grpDdlOptions.Controls.Add(lblFEOption);
-
-            this.txtFEOptionXml = new System.Windows.Forms.TextBox();
-            this.txtFEOptionXml.Location = new System.Drawing.Point(305, 23);
-            this.txtFEOptionXml.Size = new System.Drawing.Size(450, 22);
-            this.txtFEOptionXml.Font = fontCaption;
-            this.txtFEOptionXml.Text = "";
-            this.txtFEOptionXml.ForeColor = clrTextSecondary;
-            this.grpDdlOptions.Controls.Add(this.txtFEOptionXml);
-
-            this.btnBrowseFEOption = new System.Windows.Forms.Button();
-            this.btnBrowseFEOption.Location = new System.Drawing.Point(758, 22);
-            this.btnBrowseFEOption.Size = new System.Drawing.Size(60, 24);
-            this.btnBrowseFEOption.Text = "Browse";
-            this.btnBrowseFEOption.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnBrowseFEOption.BackColor = System.Drawing.Color.White;
-            this.btnBrowseFEOption.FlatAppearance.BorderColor = clrBorder;
-            this.btnBrowseFEOption.Font = fontCaption;
-            this.btnBrowseFEOption.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnBrowseFEOption.Click += new System.EventHandler(this.BtnBrowseFEOption_Click);
-            this.grpDdlOptions.Controls.Add(this.btnBrowseFEOption);
+            // Removed 2026-05-27: 'FE Option XML' label/textbox/Browse button.
+            // The textbox value was never read by the production Generate DDL
+            // pipelines (RunFromDbDdlPipelineAsync / NativeBridgeService.
+            // GenerateAlterDdl / MartMartAutomation cross-version path all
+            // ignored it). FE option auto-apply now resolves the active
+            // config's XML_OPTION TYPE='DDL' row at Generate DDL click time
+            // (see BtnAlterWizardProd_Click). No manual override surface.
 
             // ----- Action row: Generate DDL + status -----
             // Copy button + inline rtbDDLOutput viewer removed 2026-05-16.
@@ -704,9 +684,35 @@ namespace EliteSoft.Erwin.AddIn
             this.btnAlterWizardProd.Click += new System.EventHandler(this.BtnAlterWizardProd_Click);
             this.tabDdlGeneration.Controls.Add(this.btnAlterWizardProd);
 
+#if !PACKAGED
+            // Dev-only sibling button: same pipeline as Generate DDL, but
+            // runs with DebugMode.Enabled=true so child wizards / dialogs
+            // stay visible and the pipeline pauses 5 s at every phase
+            // transition. Hidden in packaged builds via #if !PACKAGED so
+            // shipping users never see it.
+            this.btnAlterWizardProdDebug = new System.Windows.Forms.Button();
+            this.btnAlterWizardProdDebug.Location = new System.Drawing.Point(193, 172);
+            this.btnAlterWizardProdDebug.Size = new System.Drawing.Size(175, 32);
+            this.btnAlterWizardProdDebug.Text = "Generate DDL (debug)";
+            this.btnAlterWizardProdDebug.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnAlterWizardProdDebug.BackColor = System.Drawing.Color.FromArgb(204, 102, 0); // amber - "dev only" tint
+            this.btnAlterWizardProdDebug.ForeColor = System.Drawing.Color.White;
+            this.btnAlterWizardProdDebug.Font = new System.Drawing.Font("Segoe UI", 9.5f, System.Drawing.FontStyle.Bold);
+            this.btnAlterWizardProdDebug.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnAlterWizardProdDebug.Click += new System.EventHandler(this.BtnAlterWizardProdDebug_Click);
+            this.tabDdlGeneration.Controls.Add(this.btnAlterWizardProdDebug);
+#endif
+
             this.lblDDLStatus = new System.Windows.Forms.Label();
+#if !PACKAGED
+            // Debug button sits to the right of the production button; status
+            // label starts after it (12 + 175 + 6 gap + 175 + 12 gap = 380).
+            this.lblDDLStatus.Location = new System.Drawing.Point(380, 180);
+            this.lblDDLStatus.Size = new System.Drawing.Size(465, 20);
+#else
             this.lblDDLStatus.Location = new System.Drawing.Point(200, 180);
             this.lblDDLStatus.Size = new System.Drawing.Size(645, 20);
+#endif
             this.lblDDLStatus.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
             this.lblDDLStatus.AutoEllipsis = true;
             this.lblDDLStatus.Text = "";
@@ -802,10 +808,13 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.Label lblOpenedModel;
         private System.Windows.Forms.Button btnMartReview;
         private System.Windows.Forms.Button btnAlterWizardProd;
+#if !PACKAGED
+        private System.Windows.Forms.Button btnAlterWizardProdDebug;
+#endif
         private System.Windows.Forms.ComboBox cmbLeftModel;
         private System.Windows.Forms.ComboBox cmbRightModel;
-        private System.Windows.Forms.TextBox txtFEOptionXml;
-        private System.Windows.Forms.Button btnBrowseFEOption;
+        // txtFEOptionXml + btnBrowseFEOption removed 2026-05-27 (dead UI; see
+        // matching note in the designer constructor block).
         private System.Windows.Forms.RadioButton rbFromMart;
         private System.Windows.Forms.RadioButton rbFromDB;
         private System.Windows.Forms.Button btnConfigureDB;

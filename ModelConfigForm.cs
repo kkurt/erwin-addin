@@ -3463,8 +3463,27 @@ namespace EliteSoft.Erwin.AddIn
             }
         }
 
+#if !PACKAGED
+        private void BtnAlterWizardProdDebug_Click(object sender, EventArgs e)
+        {
+            // Forward to the production handler; the sender check at the top
+            // of BtnAlterWizardProd_Click flips DebugMode.Enabled for this run
+            // only, so each click is self-contained.
+            BtnAlterWizardProd_Click(sender, e);
+        }
+#endif
+
         private async void BtnAlterWizardProd_Click(object sender, EventArgs e)
         {
+#if !PACKAGED
+            // Two buttons share this handler in dev builds: production
+            // (silent / fast) and debug (visible windows / 5 s pauses).
+            // Mode is decided per click so back-to-back clicks of either
+            // button don't inherit the other's state. NativeBridge picks
+            // up the flag flip via SyncDebugVisibility, called at the next
+            // line below where it already lives in the production path.
+            Services.DebugMode.Enabled = (sender == btnAlterWizardProdDebug);
+#endif
             if (!_isConnected || _currentModel == null)
             {
                 ErwinAddIn.ShowTopMostMessage("No model connected.", "Generate DDL");
@@ -3530,6 +3549,40 @@ namespace EliteSoft.Erwin.AddIn
             // the DDL applies to). Set in each branch below; final success
             // path passes it to ShowDDLResult.
             string sourceMode = null;
+
+            // Auto-apply XML_OPTION TYPE='DDL' to erwin's FE options state
+            // before invoking the Alter Script Wizard pipeline. The wizard
+            // (driven by NativeBridgeService.GenerateAlterDdl / GenerateMart-
+            // MartDdlViaOnFE) reads from the same per-model FE options that
+            // FEModel_DDL writes when given an XML path - calling FEModel_DDL
+            // with a throwaway DDL target file is the cheapest way to make the
+            // wizard pick up the admin-authored options without native bridge
+            // changes. Best-effort: failure here is logged but never blocks
+            // the user (pipeline still runs with erwin defaults). All three
+            // branches (From-DB / Mart-Same / Mart-Cross) benefit from a
+            // single warm-up because the wizard's FE options state is shared.
+            // Sync debug-mode visibility into the native bridge before
+            // anything else. When DebugMode.KeepDialogsVisible is on the
+            // bridge's HideWizardAggressive becomes a no-op for this run
+            // so the user can watch the CC wizard / RD dialog / hidden
+            // Alter Script Wizard transitions. Pushed here (not at addin
+            // init) so the dev "Generate DDL (debug)" button's per-click
+            // flag flip takes effect on the very next pipeline dispatch.
+            Services.NativeBridgeService.SyncDebugVisibility(log);
+
+            // "Only Selected Objects": tell the bridge to answer YES to erwin's
+            // "Use current diagram selections?" Object Filter popup so the alter
+            // script is scoped natively to the entities selected on the active
+            // diagram. Unchecked (or disabled on the From-DB path) answers NO
+            // (all changed objects). The checkbox is only enabled on the
+            // From-Mart path (see OnRightSourceChanged), which is the only one
+            // whose wizard raises this popup.
+            Services.NativeBridgeService.SetUseDiagramSelection(
+                chkFilterObjects.Enabled && chkFilterObjects.Checked, log);
+
+            WarmupDdlFEOptions(log);
+            Services.DebugMode.Pause("FE option XML warmed up - about to dispatch DDL pipeline", log);
+
             try
             {
                 if (dbMode)
@@ -3542,7 +3595,9 @@ namespace EliteSoft.Erwin.AddIn
                     //      against the RE'd PU as right
                     //   4. OnFE+GA captures alter DDL (left dirty vs right RE'd)
                     //   5. clean up: CloseSession + PUs.Remove(rePU,false)
+                    Services.DebugMode.Pause("From-DB route selected - starting silent RE + CC pipeline", log);
                     var (dbScript, dbErr) = await RunFromDbDdlPipelineAsync(log);
+                    Services.DebugMode.Pause("From-DB pipeline returned - about to render DDL", log);
                     script = dbScript;
                     err = dbErr;
                     sourceMode = "FromDB";
@@ -3569,10 +3624,12 @@ namespace EliteSoft.Erwin.AddIn
                         // ShowBusyOverlay helper - we just hadn't wired it
                         // into the fast path. Restored 2026-05-08.
                         var fastOverlay = ShowBusyOverlay("Generating DDL, please wait...");
+                        Services.DebugMode.Pause("Mart fast path - about to open hidden Alter Script Wizard", log);
                         try
                         {
                             script = await System.Threading.Tasks.Task.Run(() =>
                                 Services.NativeBridgeService.GenerateAlterDdl(log));
+                            Services.DebugMode.Pause("Mart fast path returned - wizard captured DDL (or null)", log);
                         }
                         finally
                         {
@@ -3641,7 +3698,9 @@ namespace EliteSoft.Erwin.AddIn
                         };
                         try
                         {
+                            Services.DebugMode.Pause("Mart cross-version - about to drive CC wizard + Apply-to-Right", log);
                             sess = await Services.MartMartAutomation.DriveCCAndApplyAsync(v, catalog, log, toggle);
+                            Services.DebugMode.Pause($"CC + Apply-to-Right returned (Applied={sess?.Applied}) - about to capture DDL via OnFE", log);
                             if (sess == null || !sess.Applied)
                             {
                                 err = "Programmatic CC + Apply-to-Right failed. See Debug Log.";
@@ -3650,6 +3709,7 @@ namespace EliteSoft.Erwin.AddIn
                             {
                                 script = await System.Threading.Tasks.Task.Run(() =>
                                     Services.NativeBridgeService.GenerateMartMartDdlViaOnFE(log));
+                                Services.DebugMode.Pause($"GenerateMartMartDdlViaOnFE returned ({script?.Length ?? 0} chars)", log);
                             }
                         }
                         finally
@@ -3870,15 +3930,14 @@ namespace EliteSoft.Erwin.AddIn
             if (content.TrimStart().StartsWith("<html", StringComparison.OrdinalIgnoreCase))
                 displayContent = ParseCompleteCompareHtml(content);
 
-            // Apply diagram selection filter if "Only Selected Objects" is checked
-            displayContent = FilterByDiagramSelection(displayContent);
-
+            // "Only Selected Objects" scoping is now done natively by erwin's
+            // Alter Script Wizard Object Filter page (the bridge answers its
+            // "Use current diagram selections?" popup with Yes via
+            // SetUseDiagramSelection). The DDL arriving here is therefore
+            // already scoped - no post-hoc regex DDL text filtering.
             int lineCount = displayContent.Split('\n').Length;
-            if (!chkFilterObjects.Checked || lblDDLStatus.Text == "")
-            {
-                lblDDLStatus.Text = $"{label}: {lineCount} lines. Review popup opened.";
-                lblDDLStatus.ForeColor = Color.DarkGreen;
-            }
+            lblDDLStatus.Text = $"{label}: {lineCount} lines. Review popup opened.";
+            lblDDLStatus.ForeColor = Color.DarkGreen;
 
             ShowDdlForApproval(displayContent, sourceMode);
         }
@@ -4316,7 +4375,13 @@ namespace EliteSoft.Erwin.AddIn
                     StopPUWatcher();
 
                     int ver = _pendingDDLVersion;
-                    string feOpt = _pendingDDLFeOption;
+                    // FE option XML: resolve TYPE='DDL' from XML_OPTION on
+                    // demand (XmlOptionLoaderService handles MetaRepo lookup
+                    // + temp-file write + fallback). Returns null when no row
+                    // is configured for the active config; GenerateDiffWith-
+                    // Duplicate then treats it as "no XML" and erwin falls
+                    // back to its own defaults.
+                    string feOpt = ResolveDdlFEOptionXml(Log) ?? "";
                     _pendingDDLVersion = 0;
 
                     // Set selected version and generate DDL
@@ -4357,117 +4422,152 @@ namespace EliteSoft.Erwin.AddIn
             }
         }
 
+        // FilterByDiagramSelection (post-hoc regex DDL text filter) removed
+        // 2026-05-28. "Only Selected Objects" is now honoured natively by
+        // erwin's Alter Script Wizard Object Filter page: the bridge answers
+        // its "Use current diagram selections?" popup with Yes (see
+        // NativeBridgeService.SetUseDiagramSelection + native-bridge
+        // DismissDiagramSelectionPopup). The old text filter only understood
+        // the CompleteCompare "-- NEW:"/"-- ===="" marker format and silently
+        // stripped the raw alter DDL produced by the OnFE fast path, which is
+        // why selecting the option yielded an empty script. Win32Helper.
+        // GetDiagramSelectedEntities is retained as a general utility.
+
+        // BtnBrowseFEOption_Click removed 2026-05-27 together with txtFEOptionXml
+        // (dead UI - value was never consumed by production Generate DDL paths).
+        // Auto-apply uses XML_OPTION TYPE='DDL' resolved from the MetaRepo via
+        // XmlOptionLoaderService.
+
         /// <summary>
-        /// Reads diagram selection from erwin's Overview pane and filters DDL diff content
-        /// to only include statements related to the selected entities.
-        /// Returns the original content if checkbox is unchecked or no entity is selected.
+        /// Resolve the FE Option XML for DDL generation: pulls the
+        /// CONFIG-scoped row from MetaRepo's XML_OPTION (TYPE='DDL') and
+        /// materializes it to a temp file. Returns the temp file path (caller
+        /// is responsible for deleting it), or null when no XML is configured
+        /// for the active config or any step fails.
+        ///
+        /// Connection source: <see cref="Services.DatabaseService.Instance.CreateConnection"/>
+        /// which honours the addin's Bootstrap configuration (HKCU / HKLM
+        /// fallback) - same MetaRepo connection GlossaryService uses for
+        /// CONNECTION_DEF lookups. Falls back silently when MetaRepo is not
+        /// configured or ConfigContext hasn't resolved yet, since the
+        /// production pipelines treat null/empty XML as "no option XML".
         /// </summary>
-        private string FilterByDiagramSelection(string content)
+        private string ResolveDdlFEOptionXml(Action<string> log)
         {
-            if (!chkFilterObjects.Checked || string.IsNullOrEmpty(content))
-                return content;
-
-            // Read current diagram selection
-            var hWnd = Services.Win32Helper.GetErwinMainWindow();
-            if (hWnd == IntPtr.Zero) return content;
-
-            string modelName = "";
             try
             {
-                dynamic pu = _scapi.PersistenceUnits.Item(0);
-                modelName = pu.Name?.ToString() ?? "";
+                if (!Services.ConfigContextService.Instance.IsInitialized)
+                {
+                    log?.Invoke("DDL FE Option: ConfigContext not initialized - skipping XML_OPTION lookup");
+                    return null;
+                }
+                int activeConfigId = Services.ConfigContextService.Instance.ActiveConfigId;
+                if (!Services.DatabaseService.Instance.IsConfigured)
+                {
+                    log?.Invoke("DDL FE Option: MetaRepo (Bootstrap) not configured - skipping XML_OPTION lookup");
+                    return null;
+                }
+                string xml;
+                using (var conn = Services.DatabaseService.Instance.CreateConnection())
+                {
+                    conn.Open();
+                    xml = Services.XmlOptionLoaderService.ResolveXml(conn, activeConfigId, "DDL", log);
+                }
+                if (string.IsNullOrEmpty(xml))
+                {
+                    log?.Invoke($"DDL FE Option: no XML_OPTION TYPE='DDL' row for CONFIG_ID={activeConfigId} (erwin will use its own defaults)");
+                    return null;
+                }
+                // STABLE per-config path, NOT a GUID temp file. erwin's
+                // FEModel_DDL stores this PATH (not the content) into the
+                // model's FE-options state during WarmupDdlFEOptions, and the
+                // Alter Script Wizard re-reads it later when the native-bridge
+                // pipeline opens it. A GUID temp file that we deleted right
+                // after warmup left the wizard with a dangling reference ->
+                // erwin "xml was not found" -> wizard failed to open. That
+                // only surfaced 2026-05-28 with a smaller option set: the
+                // large XML's post-warmup delete lost the race against
+                // erwin's still-open read handle (so the file survived), the
+                // small XML's delete won the race (file gone, wizard broke).
+                // A fixed path we overwrite each run and never delete removes
+                // the race entirely and keeps exactly one file per config.
+                string path = System.IO.Path.Combine(
+                    System.IO.Path.GetTempPath(),
+                    $"erwin_addin_ddl_fe_opt_cfg{activeConfigId}.xml");
+                System.IO.File.WriteAllText(path, xml);
+                log?.Invoke($"DDL FE Option: resolved from MetaRepo CONFIG_ID={activeConfigId} ({xml.Length} chars) -> {path}");
+                return path;
             }
-            catch { }
-            if (string.IsNullOrEmpty(modelName))
-                modelName = _connectedModelName ?? "";
-
-            if (string.IsNullOrEmpty(modelName)) return content;
-
-            var selectedEntities = Services.Win32Helper.GetDiagramSelectedEntities(hWnd, modelName);
-            if (selectedEntities.Count == 0)
+            catch (Exception ex)
             {
-                Log("DDL: 'Only Selected Objects' checked but no entity selected in diagram.");
-                lblDDLStatus.Text = "No entity selected in diagram. Showing all.";
-                lblDDLStatus.ForeColor = Color.OrangeRed;
-                return content;
+                log?.Invoke($"DDL FE Option: lookup threw (continuing without XML): {ex.GetType().Name}: {ex.Message}");
+                return null;
             }
-
-            Log($"DDL: Filtering by diagram selection: {string.Join(", ", selectedEntities)}");
-
-            var selected = new HashSet<string>(selectedEntities, StringComparer.OrdinalIgnoreCase);
-            var sb = new System.Text.StringBuilder();
-            bool inSelectedBlock = false;
-            bool inHeader = true;
-
-            foreach (var line in content.Split('\n'))
-            {
-                string trimmed = line.Trim();
-
-                // Keep header lines
-                if (inHeader && trimmed.StartsWith("--") && !trimmed.StartsWith("-- NEW:") &&
-                    !trimmed.StartsWith("-- DROPPED:") && !trimmed.StartsWith("-- CHANGED:") &&
-                    !trimmed.StartsWith("-- ===="))
-                {
-                    sb.AppendLine(line.TrimEnd());
-                    continue;
-                }
-
-                if (trimmed.StartsWith("-- ===="))
-                {
-                    inHeader = false;
-                    sb.AppendLine(line.TrimEnd());
-                    continue;
-                }
-
-                // Check diff marker lines
-                if (trimmed.StartsWith("-- NEW:") || trimmed.StartsWith("-- DROPPED:") || trimmed.StartsWith("-- CHANGED:"))
-                {
-                    int colonIdx = trimmed.IndexOf(':', 3);
-                    string key = colonIdx > 0 ? trimmed.Substring(colonIdx + 1).Trim() : "";
-
-                    string objName = "";
-                    if (key.Contains(":"))
-                    {
-                        string afterColon = key.Split(':')[1];
-                        objName = afterColon.Contains(".") ? afterColon.Split('.')[0] : afterColon;
-                    }
-
-                    inSelectedBlock = selected.Contains(objName);
-
-                    // Check trigger naming: tD_TableName, tU_TableName, tI_TableName
-                    if (!inSelectedBlock && !string.IsNullOrEmpty(objName))
-                    {
-                        string triggerTable = objName;
-                        if (triggerTable.StartsWith("tD_") || triggerTable.StartsWith("tU_") || triggerTable.StartsWith("tI_"))
-                            triggerTable = triggerTable.Substring(3);
-                        inSelectedBlock = selected.Contains(triggerTable);
-                    }
-                }
-
-                if (inSelectedBlock)
-                    sb.AppendLine(line.TrimEnd());
-
-                if (trimmed.Equals("go", StringComparison.OrdinalIgnoreCase) && inSelectedBlock)
-                    inSelectedBlock = true; // keep going until next marker
-            }
-
-            string filtered = sb.ToString();
-            lblDDLStatus.Text = $"Filtered: {string.Join(", ", selectedEntities)}";
-            lblDDLStatus.ForeColor = Color.DarkGreen;
-            return filtered;
         }
 
-        private void BtnBrowseFEOption_Click(object sender, EventArgs e)
+        /// <summary>
+        /// Apply the admin-authored XML_OPTION TYPE='DDL' to erwin's per-model
+        /// FE options state. We invoke <c>currentPU.FEModel_DDL(throwaway, xmlPath)</c>
+        /// with a throwaway destination DDL file; the SCAPI method's side
+        /// effect is to populate the model's internal FE options structure
+        /// from the XML, which the Alter Script Wizard then reads when our
+        /// native-bridge pipeline opens it. This is the cheapest way to
+        /// "set wizard options programmatically" - the alternative would be
+        /// to manipulate FEWPageOptions through the native bridge or simulate
+        /// UIA clicks on the wizard's "Load Option Set..." button, both of
+        /// which need significantly more code.
+        ///
+        /// Best-effort: any failure is logged and swallowed. The wizard then
+        /// proceeds with whatever FE options the user last configured manually
+        /// (or erwin's defaults on a fresh model). Only the throwaway DDL file
+        /// is removed in the finally block; the option XML lives at a stable
+        /// per-config path (see <see cref="ResolveDdlFEOptionXml"/>) that the
+        /// wizard re-reads on open, so deleting it here would dangle erwin's
+        /// retained reference.
+        /// </summary>
+        private void WarmupDdlFEOptions(Action<string> log)
         {
-            using (var dlg = new OpenFileDialog())
+            if (_currentModel == null) return;
+
+            string xmlPath = ResolveDdlFEOptionXml(log);
+            if (string.IsNullOrEmpty(xmlPath)) return;
+
+            string throwawayDdl = null;
+            try
             {
-                dlg.Title = "Select FE Option Set XML";
-                dlg.Filter = "XML files (*.xml)|*.xml|All files (*.*)|*.*";
-                if (dlg.ShowDialog() == DialogResult.OK)
+                throwawayDdl = System.IO.Path.Combine(
+                    System.IO.Path.GetTempPath(),
+                    $"erwin_addin_fewarmup_{Guid.NewGuid():N}.sql");
+                bool ok = false;
+                try
                 {
-                    txtFEOptionXml.Text = dlg.FileName;
-                    txtFEOptionXml.ForeColor = System.Drawing.SystemColors.WindowText;
+                    ok = _currentModel.FEModel_DDL(throwawayDdl, xmlPath);
                 }
+                catch (Exception ex)
+                {
+                    log?.Invoke($"DDL FE Option warm-up: FEModel_DDL threw (continuing): {ex.GetType().Name}: {ex.Message}");
+                    return;
+                }
+                if (ok)
+                {
+                    log?.Invoke("DDL FE Option warm-up: applied to model FE options (wizard will pick up on next open).");
+                }
+                else
+                {
+                    log?.Invoke("DDL FE Option warm-up: FEModel_DDL returned false - options may not have applied.");
+                }
+            }
+            finally
+            {
+                if (!string.IsNullOrEmpty(throwawayDdl))
+                {
+                    try { if (System.IO.File.Exists(throwawayDdl)) System.IO.File.Delete(throwawayDdl); } catch { /* throwaway DDL cleanup best-effort */ }
+                }
+                // Intentionally do NOT delete xmlPath: erwin's FEModel_DDL
+                // retained it as the model's FE-options source and the Alter
+                // Script Wizard re-reads it when the pipeline opens. It is a
+                // stable per-config path we overwrite each run, so there's
+                // nothing to leak and deleting it dangles the wizard's ref.
             }
         }
 
@@ -4605,12 +4705,18 @@ namespace EliteSoft.Erwin.AddIn
             try { _validationService?.StopMonitoring(); } catch (Exception ex) { log($"[From-DB] ColumnValidation StopMonitoring err: {ex.Message}"); }
             log("[From-DB] all monitoring services suspended for pipeline duration");
 
-            // GECICI DEBUG: kullanici manuel RD inceleme istedi (2026-04-27).
-            // Splash overlay devre disi - RD ekrani gorunur olsun.
-            // Apply-to-Right click oncesi MessageBox ile pause.
-            const bool DEBUG_FROMDB_VISIBLE = false;
-            Form overlay = DEBUG_FROMDB_VISIBLE ? null : ShowBusyOverlay("Generating From-DB DDL, please wait...");
-            Action<bool> overlayToggle = DEBUG_FROMDB_VISIBLE ? (Action<bool>)null : (visible =>
+            // Overlay + transparency toggle. Skipped when the dev "Generate
+            // DDL (debug)" button (#if !PACKAGED) was used to launch this
+            // run, which flipped DebugMode.Enabled=true at the top of the
+            // click handler. The old hardcoded DEBUG_FROMDB_VISIBLE flag is
+            // now driven by the runtime DebugMode service so the dev can
+            // toggle between fast/silent and slow/visible without recompile.
+            // When DebugMode.KeepDialogsVisible is true: no busy overlay, no
+            // transparency tricks, and the pipeline injects Pause()s between
+            // phases so the user can actually read the screens.
+            bool dbgVisible = Services.DebugMode.KeepDialogsVisible;
+            Form overlay = dbgVisible ? null : ShowBusyOverlay("Generating From-DB DDL, please wait...");
+            Action<bool> overlayToggle = dbgVisible ? (Action<bool>)null : (visible =>
             {
                 try
                 {
@@ -4763,7 +4869,7 @@ namespace EliteSoft.Erwin.AddIn
                 if (string.IsNullOrEmpty(rePuName))
                     return (null, "RE'd PU name is empty - cannot select it in CC picker.");
                 log($"[From-DB] DriveCCDbAndApply(reModelName='{rePuName}')");
-                sess = await Services.MartMartAutomation.DriveCCDbAndApplyAsync(rePuName, log, overlayToggle, dbgPauseBeforeApply: DEBUG_FROMDB_VISIBLE);
+                sess = await Services.MartMartAutomation.DriveCCDbAndApplyAsync(rePuName, log, overlayToggle, dbgPauseBeforeApply: Services.DebugMode.KeepDialogsVisible);
                 if (sess == null || !sess.Applied)
                     return (null, "Programmatic CC + Apply-to-Right failed - see Debug Log.");
 
@@ -5166,6 +5272,15 @@ namespace EliteSoft.Erwin.AddIn
             btnSelectDbTables.Visible = fromDB;
             lblSelectedTableCount.Visible = fromDB;
 
+            // "Only Selected Objects" is honoured natively by the Alter Script
+            // Wizard's Object Filter page (the "Use current diagram selections?"
+            // popup), which only exists on the From-Mart compare path. From-DB
+            // runs a different pipeline with no such page, so disable + clear
+            // the option there rather than leave a checkbox that silently does
+            // nothing.
+            chkFilterObjects.Enabled = fromMart;
+            if (!fromMart) chkFilterObjects.Checked = false;
+
             UpdateSelectedTableCountLabel();
 
             if (fromDB)
@@ -5392,7 +5507,9 @@ namespace EliteSoft.Erwin.AddIn
         private int _martVersion = 0;
         private string _martLocator = "";
         private int _pendingDDLVersion = 0;
-        private string _pendingDDLFeOption = "";
+        // _pendingDDLFeOption field removed 2026-05-27 (was always ""; never set).
+        // PuWatcherTimer_Tick now resolves DDL FE option XML from XML_OPTION
+        // TYPE='DDL' on demand instead of relying on a stale instance field.
         private Timer _puWatcherTimer;
         private int _puWatcherInitialCount;
 
@@ -5735,6 +5852,13 @@ namespace EliteSoft.Erwin.AddIn
         /// </summary>
         private Form ShowBusyOverlay(string message)
         {
+            // Debug mode: skip the overlay entirely so the user can see
+            // erwin's dialogs / wizard state while the pipeline runs. All
+            // callers null-check the returned Form already; ToggleBusyOverlay
+            // also no-ops on null. The pipeline becomes visible+slow when
+            // the dev "Generate DDL (debug)" button (#if !PACKAGED) is used.
+            if (Services.DebugMode.Enabled) return null;
+
             var accent = Color.FromArgb(46, 125, 50);       // Elite Soft green
             var dark   = Color.FromArgb(40, 42, 54);
             var subtle = Color.FromArgb(100, 110, 130);

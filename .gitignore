@@ -22,3 +22,6 @@ scripts/native-bridge/*.exp
 scripts/native-bridge/*.lib
 scripts/native-bridge/*.obj
 *.pdb
+
+# Roslyn/IDE language-server cache
+*.lscache

@@ -4946,9 +4946,17 @@ namespace EliteSoft.Erwin.AddIn.Services
                         attr.Properties("Physical_Name").Value = afterAuto;
                         _session.CommitTransaction(transId);
                         Log($"Column naming auto-applied (silent): '{state.TableName}.{state.PhysicalName}' -> '{afterAuto}'");
-                        EliteSoft.Erwin.AddIn.Forms.ToastNotification.Show(
+                        // Modal popup (was a transient ToastNotification until
+                        // 2026-05-27): user explicitly asked for an OK-to-
+                        // dismiss confirmation so silent rename auto-apply
+                        // cannot be missed. Owner is null so the dialog
+                        // anchors to ErwinAddIn.ActiveForm's screen per
+                        // AddinMessageDialog's own multi-monitor logic.
+                        AddinMessageDialog.Show(
+                            $"Column '{state.TableName}.{state.PhysicalName}' -> '{afterAuto}'",
                             "Naming standard applied",
-                            $"Column '{state.TableName}.{state.PhysicalName}' -> '{afterAuto}'");
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Information);
                         state.PhysicalName = afterAuto;
                     }
                     catch (Exception ex)

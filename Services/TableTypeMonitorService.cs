@@ -1429,8 +1429,17 @@ namespace EliteSoft.Erwin.AddIn.Services
                         scapiObject.Properties("Physical_Name").Value = afterAuto;
                         _session.CommitTransaction(transId);
                         Log($"Naming standard auto-applied (silent): '{physicalName}' -> '{afterAuto}'");
-                        ToastNotification.Show("Naming standard applied",
-                            $"{objectType} '{physicalName}' -> '{afterAuto}'");
+                        // Modal popup (was a transient ToastNotification until
+                        // 2026-05-27): user explicitly asked for an OK-to-
+                        // dismiss confirmation so silent rename auto-apply
+                        // cannot be missed. Owner is null so the dialog
+                        // anchors to ErwinAddIn.ActiveForm's screen per
+                        // AddinMessageDialog's own multi-monitor logic.
+                        AddinMessageDialog.Show(
+                            $"{objectType} '{physicalName}' -> '{afterAuto}'",
+                            "Naming standard applied",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Information);
 
                         // Update snapshot
                         string objectId = scapiObject.ObjectId?.ToString() ?? "";
