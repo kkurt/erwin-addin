@@ -530,10 +530,9 @@ namespace EliteSoft.Erwin.AddIn
             this.grpDdlSource.ForeColor = clrTextSecondary;
             this.tabDdlGeneration.Controls.Add(this.grpDdlSource);
 
-            // Single read-only label replaces the previous "Active Model:" caption
-            // + combo. The active model is implicit (only one PU is in focus) so
-            // a dropdown is misleading. The label always shows the opened model
-            // with version + a hint that unsaved (dirty) changes are included.
+            // lblOpenedModel is kept as a hidden field: legacy code still
+            // assigns its .Text (harmless when not shown). The visible Source
+            // control is now cmbLeftModel (2026-05-28 multi-version compare).
             this.lblOpenedModel = new System.Windows.Forms.Label();
             this.lblOpenedModel.Location = new System.Drawing.Point(12, 22);
             this.lblOpenedModel.Size = new System.Drawing.Size(360, 22);
@@ -541,16 +540,20 @@ namespace EliteSoft.Erwin.AddIn
             this.lblOpenedModel.Font = fontBodyBold;
             this.lblOpenedModel.ForeColor = clrTextPrimary;
             this.lblOpenedModel.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
+            this.lblOpenedModel.Visible = false;
             this.grpDdlSource.Controls.Add(this.lblOpenedModel);
 
-            // cmbLeftModel kept as a hidden field so legacy code that reads
-            // SelectedItem still works; user can no longer change it.
+            // Source (Left) model selector. First item = active model with its
+            // unsaved changes ("Model_1 v2 (with last changes)"); the rest are
+            // the saved Mart versions descending. Selecting a version reshapes
+            // the Target (Right) combo via OnLeftModelChanged (cascade).
             this.cmbLeftModel = new System.Windows.Forms.ComboBox();
-            this.cmbLeftModel.Location = new System.Drawing.Point(95, 19);
-            this.cmbLeftModel.Size = new System.Drawing.Size(270, 24);
+            this.cmbLeftModel.Location = new System.Drawing.Point(12, 21);
+            this.cmbLeftModel.Size = new System.Drawing.Size(360, 24);
             this.cmbLeftModel.DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList;
             this.cmbLeftModel.Font = fontCaption;
-            this.cmbLeftModel.Visible = false;
+            this.cmbLeftModel.Visible = true;
+            this.cmbLeftModel.SelectedIndexChanged += (s, ev) => OnLeftModelChanged();
             this.grpDdlSource.Controls.Add(this.cmbLeftModel);
 
             // Restored 2026-05-07 per user request. Triggers erwin's native
@@ -595,8 +598,9 @@ namespace EliteSoft.Erwin.AddIn
             this.cmbRightModel.Size = new System.Drawing.Size(322, 24);
             this.cmbRightModel.DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList;
             this.cmbRightModel.Font = fontCaption;
-            // Locked until the multi-version compare flow is wired up; will be re-enabled later.
-            this.cmbRightModel.Enabled = false;
+            // Enabled 2026-05-28: multi-version compare. Contents cascade from
+            // the Source (Left) selection - see OnLeftModelChanged.
+            this.cmbRightModel.Enabled = true;
             this.grpDdlTarget.Controls.Add(this.cmbRightModel);
 
             this.rbFromDB = new System.Windows.Forms.RadioButton();

@@ -3606,7 +3606,14 @@ namespace EliteSoft.Erwin.AddIn
                 {
                     int v = ParseRightVersion();
                     int activeV = ParseActivePuVersion();
-                    bool sameVersion = (v > 0 && activeV > 0 && v == activeV);
+                    bool leftIsActive = LeftIsActiveModel();
+                    // Same-version fast path requires the LEFT to be the active
+                    // (dirty) model AND the RIGHT to be its own version: that is
+                    // the proven "dirty vs last saved" OnFE route. Any other
+                    // combination is a multi-version / Mart-vs-Mart compare that
+                    // routes through the Review / Complete Compare wizards
+                    // (Faz 2 / Faz 3).
+                    bool sameVersion = leftIsActive && v > 0 && activeV > 0 && v == activeV;
                     sourceMode = sameVersion ? "FromMart-Same" : "FromMart-Cross";
 
                     if (sameVersion)
@@ -3644,8 +3651,17 @@ namespace EliteSoft.Erwin.AddIn
                             catch (Exception ex) { log($"[ROUTE] fast-path overlay close err: {ex.Message}"); }
                         }
                     }
-                    else
+                    else if (leftIsActive && LegacyCrossVersionEnabled)
                     {
+                    // LEGACY cross-version path (active dirty vs older Mart
+                    // version) via bridge CC + Apply-to-Right + OnFE. Gated OFF
+                    // by default (LegacyCrossVersionEnabled=false) on 2026-05-28:
+                    // it leaves an orphan right-version PU and can lock erwin
+                    // (see reference_cross_version_orphan_unsolved). Faz 2
+                    // replaces it with the Review-wizard-driven flow whose own
+                    // lifecycle releases the loaded version cleanly. Kept here
+                    // (not deleted) so the service methods stay referenced and
+                    // we can compare behaviour while wiring the Review path.
                     // Production Mart-Mart zero-click flow:
                     //   1. Drive CC wizard + Apply-to-Right programmatically
                     //      (hidden dialogs), honoring cmbRightModel selection.
@@ -3768,7 +3784,24 @@ namespace EliteSoft.Erwin.AddIn
                             log("[XV] pipeline complete - monitoring resume scheduled to background");
                         }
                     }
-                    } // close: else (different versions) of sameVersion check
+                    } // close: else if (leftIsActive && LegacyCrossVersionEnabled)
+                    else if (leftIsActive)
+                    {
+                        // Active model vs an OLDER Mart version. Faz 2 will run
+                        // this through erwin's Review wizard (which captures the
+                        // active dirty buffer and releases the loaded version on
+                        // close). Not yet wired - surface a clear message rather
+                        // than silently doing nothing or running the gated legacy
+                        // path (feedback_no_silent_fallback).
+                        err = "Aktif model ile eski bir versiyon karsilastirmasi 'Review' wizard ile yapilacak (Faz 2 - cok yakinda). " +
+                              "Su an yalniz son (current) versiyonla karsilastirma aktif.";
+                    }
+                    else
+                    {
+                        // LEFT is a saved version -> Mart-vs-Mart. Faz 3 will run
+                        // this through Actions > Complete Compare.
+                        err = "Iki Mart versiyonunun karsilastirmasi (Mart-vs-Mart) 'Complete Compare' ile yapilacak (Faz 3 - cok yakinda).";
+                    }
                 }
                 else
                 {
@@ -5507,6 +5540,17 @@ namespace EliteSoft.Erwin.AddIn
         private int _martVersion = 0;
         private string _martLocator = "";
         private int _pendingDDLVersion = 0;
+
+        // Gates the legacy bridge CC + Apply-to-Right cross-version path
+        // (active dirty vs older Mart version). OFF since 2026-05-28: that path
+        // orphans the loaded version PU and can lock erwin. Faz 2 replaces it
+        // with the Review-wizard-driven flow. static readonly (not const) so
+        // the gated block stays reachable to the compiler - keeps the helper
+        // methods (CloseSelectedVersionPU, ParseActivePuCatalog, ...) referenced
+        // and avoids unused-member errors under TreatWarningsAsErrors. Flip to
+        // true only to A/B the old path against the new Review path.
+        private static readonly bool LegacyCrossVersionEnabled = false;
+
         // _pendingDDLFeOption field removed 2026-05-27 (was always ""; never set).
         // PuWatcherTimer_Tick now resolves DDL FE option XML from XML_OPTION
         // TYPE='DDL' on demand instead of relying on a stale instance field.
@@ -5559,42 +5603,106 @@ namespace EliteSoft.Erwin.AddIn
                 string modelName = _connectedModelName ?? "Model";
                 Log($"DDL: Model='{modelName}', Version={version}, Locator='{locator}'");
 
-                // Left model: Active Model
-                string leftLabel = version > 1 ? $"Active Model (v{version})" : "Active Model";
-                cmbLeftModel.Items.Add(leftLabel);
-                cmbLeftModel.SelectedIndex = 0;
-                string vTag = version > 1 ? $"v{version} " : "";
-                lblOpenedModel.Text = $"Opened Model: {modelName} {vTag}(with last changes)";
+                // LEFT: active-dirty model first (index 0, default), then the
+                // saved Mart versions descending. The active item carries the
+                // unsaved buffer ("with last changes"); the saved items let the
+                // user pick a stored version as the source for a Mart-vs-Mart
+                // compare (Faz 3). Selecting any LEFT item reshapes RIGHT via
+                // OnLeftModelChanged.
+                string vTag = version >= 1 ? $"v{version} " : "";
+                string activeLabel = $"{modelName} {vTag}(with last changes)";
+                cmbLeftModel.Items.Add(activeLabel);
+                lblOpenedModel.Text = $"Opened Model: {activeLabel}"; // legacy field, hidden
 
-                // Right model: list versions from Mart (only for Mart models)
                 var versions = DdlGenerationService.GetMartVersions(modelName, (object)_currentModel, (Action<string>)Log);
-
                 if (versions.Count > 0)
                 {
-                    // Newest-first ordering: highest version on top so first item is the most recent.
                     for (int i = versions.Count - 1; i >= 0; i--)
                     {
                         var v = versions[i];
-                        string label = $"v{v.Version}" + (!string.IsNullOrEmpty(v.Name) ? $" ({v.Name})" : "");
-                        cmbRightModel.Items.Add(label);
+                        cmbLeftModel.Items.Add($"v{v.Version}" + (!string.IsNullOrEmpty(v.Name) ? $" ({v.Name})" : ""));
                     }
+                }
 
-                    cmbRightModel.SelectedIndex = 0;
-                }
-                else
-                {
-                    cmbRightModel.Items.Add("Mart Baseline (connect-time)");
-                    cmbRightModel.SelectedIndex = 0;
-                }
+                // Selecting index 0 fires OnLeftModelChanged, which builds the
+                // RIGHT combo cascade (versions <= active, default = latest).
+                cmbLeftModel.SelectedIndex = 0;
+                RebuildRightCombo();
             }
             catch (Exception ex)
             {
                 Log($"PopulateVersionCombos error: {ex.Message}");
-                cmbLeftModel.Items.Add("Active Model");
+                cmbLeftModel.Items.Add("Active Model (with last changes)");
                 cmbLeftModel.SelectedIndex = 0;
                 lblOpenedModel.Text = "Opened Model: (active, with last changes)";
                 cmbRightModel.Items.Add("(Mart Baseline)");
                 cmbRightModel.SelectedIndex = 0;
+            }
+        }
+
+        /// <summary>
+        /// True when the Source (Left) combo has the active "with last changes"
+        /// model selected (index 0). Saved-version selections (index &gt; 0)
+        /// indicate a Mart-vs-Mart compare where neither side is the live model.
+        /// </summary>
+        private bool LeftIsActiveModel() => cmbLeftModel.SelectedIndex <= 0;
+
+        /// <summary>
+        /// Parses the Source (Left) version number from the selected combo text
+        /// (e.g. "Model_1 v2 (with last changes)" or "v1 (Version 1)" -&gt; 2/1).
+        /// Returns -1 when not parseable.
+        /// </summary>
+        private int ParseLeftVersion()
+        {
+            try
+            {
+                string sel = cmbLeftModel.SelectedItem?.ToString() ?? "";
+                var m = System.Text.RegularExpressions.Regex.Match(sel, @"v(\d+)");
+                if (m.Success && int.TryParse(m.Groups[1].Value, out int v)) return v;
+            }
+            catch { /* fall through to -1 */ }
+            return -1;
+        }
+
+        /// <summary>Fires when the Source (Left) selection changes - rebuilds RIGHT.</summary>
+        private void OnLeftModelChanged()
+        {
+            try { RebuildRightCombo(); }
+            catch (Exception ex) { Log($"OnLeftModelChanged error: {ex.Message}"); }
+        }
+
+        /// <summary>
+        /// Rebuilds the Target (Right) combo based on the Source (Left)
+        /// selection. When LEFT is the active-dirty model (version N), RIGHT
+        /// lists vN..v1 (default vN -&gt; "dirty vs last saved", today's
+        /// behavior). When LEFT is a saved version vM, RIGHT lists v(M-1)..v1
+        /// (strictly below, default highest). v1-on-the-left has no lower
+        /// version, so RIGHT is disabled with a placeholder.
+        /// </summary>
+        private void RebuildRightCombo()
+        {
+            if (cmbLeftModel.SelectedIndex < 0) return;
+            cmbRightModel.Items.Clear();
+
+            bool leftIsActive = cmbLeftModel.SelectedIndex == 0;
+            int activeV = _martVersion > 0 ? _martVersion : 1;
+            int leftV = leftIsActive ? activeV : ParseLeftVersion();
+            if (leftV <= 0) leftV = activeV;
+
+            int top = leftIsActive ? leftV : leftV - 1;
+            for (int v = top; v >= 1; v--)
+                cmbRightModel.Items.Add($"v{v} (Version {v})");
+
+            if (cmbRightModel.Items.Count > 0)
+            {
+                cmbRightModel.SelectedIndex = 0; // highest available version
+                cmbRightModel.Enabled = true;
+            }
+            else
+            {
+                cmbRightModel.Items.Add("(no lower version)");
+                cmbRightModel.SelectedIndex = 0;
+                cmbRightModel.Enabled = false;
             }
         }
 
