@@ -854,6 +854,64 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
         }
 
+        // DIAGNOSTIC (2026-05-29): dump every UIA descendant of the FE Alter
+        // Script wizard WITH its screen BoundingRectangle + clickable point, so
+        // we can see whether the left-nav page items ("Overview" / "Option
+        // Selection" / ... / "Preview") are exposed as targetable elements, and
+        // if not, learn the "Navigational Pane" container rect to compute the
+        // "Preview" item's pixel position for a mouse-sim jump. Read-only.
+        private static void DumpWizardNavProbe(IntPtr wizardHwnd, Action<string> log)
+        {
+            try
+            {
+                var root = AutomationElement.FromHandle(wizardHwnd);
+                if (root == null)
+                {
+                    log?.Invoke("  [NAVPROBE] FromHandle null");
+                    return;
+                }
+                AutomationElementCollection all;
+                try { all = root.FindAll(TreeScope.Descendants, Condition.TrueCondition); }
+                catch (Exception ex) { log?.Invoke($"  [NAVPROBE] FindAll threw: {ex.Message}"); return; }
+
+                log?.Invoke($"  [NAVPROBE] === wizard descendants ({all.Count}) ===");
+                int i = 0;
+                foreach (AutomationElement el in all)
+                {
+                    if (i++ > 200) { log?.Invoke("  [NAVPROBE] cap 200 reached"); break; }
+                    string ctype = "?", name = "", aid = "", cls = "";
+                    bool enabled = false, offscreen = false;
+                    string rectStr = "?", clickStr = "no-click";
+                    try
+                    {
+                        var c = el.Current;
+                        ctype = c.ControlType?.ProgrammaticName?.Replace("ControlType.", "") ?? "?";
+                        name = c.Name ?? "";
+                        aid = c.AutomationId ?? "";
+                        cls = c.ClassName ?? "";
+                        enabled = c.IsEnabled;
+                        offscreen = c.IsOffscreen;
+                        var r = c.BoundingRectangle;
+                        rectStr = $"({(int)r.Left},{(int)r.Top} {(int)r.Width}x{(int)r.Height})";
+                    }
+                    catch { }
+                    try
+                    {
+                        if (el.TryGetClickablePoint(out System.Windows.Point p))
+                            clickStr = $"clk=({(int)p.X},{(int)p.Y})";
+                    }
+                    catch { }
+                    if (name.Length > 60) name = name.Substring(0, 57) + "...";
+                    log?.Invoke($"  [NAVPROBE] [{ctype}] name='{name}' aid='{aid}' cls='{cls}' rect={rectStr} {clickStr} en={enabled} off={offscreen}");
+                }
+                log?.Invoke("  [NAVPROBE] === end ===");
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"  [NAVPROBE] threw: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
         // Returns true when any UIA Text descendant under the given window
         // contains the given substring (case-insensitive). Used to identify
         // confirmation popups by their static-text content rather than just
@@ -1114,22 +1172,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                     return session;
                 }
 
-                // GECICI DEBUG: kullanici manuel inceleme istedi (2026-04-27).
-                // Apply-to-Right click'ten ONCE pause - kullanici RD'yi
-                // gorebilir, hangi modeller, hangi ok'lar; OK basinca click
-                // yapilir. dbgPauseBeforeApply false ise (mart-mart default)
-                // bu kod no-op.
-                if (dbgPauseBeforeApply)
-                {
-                    log?.Invoke("  [DB-7] [DEBUG-PAUSE] waiting for user to inspect RD - OK basinca Apply-to-Right tiklanacak");
-                    try { overlayToggle?.Invoke(false); } catch { }
-                    AddinMessageDialog.Show(
-                        $"RD ekrani acik. Hangi modeller karsilastiriliyor + hangi ok tiklanacak (target: ({pt.X},{pt.Y})) inceleyin.\n\nOK basinca Apply-to-Right tiklanacak.",
-                        "[DEBUG] From-DB Manuel Inceleme",
-                        System.Windows.Forms.MessageBoxButtons.OK,
-                        System.Windows.Forms.MessageBoxIcon.Information);
-                    log?.Invoke("  [DB-7] [DEBUG-PAUSE] user OK - proceeding with click");
-                }
+                // NOTE: a temporary "manual inspection" AddinMessageDialog used
+                // to pause here when dbgPauseBeforeApply was set. Removed
+                // 2026-05-29: DriveCCDbAndApply runs on a background Task.Run
+                // thread, so a modal WinForms dialog shown from here is not
+                // pumped and its OK cannot be clicked -> erwin appears locked.
+                // Debug pacing already comes from DebugMode.Pause + visible
+                // dialogs; this blocking prompt added nothing but the deadlock.
                 int txAfter = txBefore;
                 try
                 {
@@ -1162,6 +1211,15 @@ namespace EliteSoft.Erwin.AddIn.Services
                     session.Applied = (txAfter - txBefore) > 0;
                     if (!session.Applied)
                         log?.Invoke("  [DB-7] [WARN] mouse click did not trigger EDR tx after 2 attempts.");
+                    else
+                        // Apply-to-Right cascaded the dirty Mart (LEFT) onto the
+                        // RE'd DB (RIGHT), so the RIGHT Alter Script (cmd 1057)
+                        // becomes enabled while the LEFT one (1056) goes DISABLED.
+                        // Clicking 1056 was the bug ("FE Wizard did not appear",
+                        // verified 2026-05-29 - same as the Review path). Wait for
+                        // 1057 to be enabled here (also dumps the RD toolbar
+                        // button states) so the caller's 1057 click lands.
+                        WaitForRdAlterScriptEnabled(resolveDlg, CMD_RD_RIGHT_ALTER_SCRIPT, log);
                 }
                 finally
                 {
@@ -2662,19 +2720,21 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// Manuel akış mimicry: FE Alter Script wizard'ı açıldıktan sonra
-        /// sol nav listesinde "Preview" item'ına UIA Invoke / SelectionItem
-        /// Select. Bu erwin'in iç GA çağrısını tetikler -> bridge'in GA
-        /// hook'u DDL'i capture buffer'a yazar (ConsumeLastCapturedDdl
-        /// ile alınır). Manuel test 11:19:07 doğrulaması: GA EXIT rv=0,
-        /// 23 lines / 5582 chars alter DDL.
+        /// Manuel akış mimicry: FE Alter Script wizard açıldıktan sonra 1x Next
+        /// (Overview -> Option Selection) atar, sonra sol nav'daki "Preview"
+        /// label'ına HESAPLANMIS pikselde mouse-sim tıklar. Nav item'lari UIA'da
+        /// yok (sadece "Navigational Pane" Static container var), o yuzden tek
+        /// yol pixel-click. Preview sayfasi render olunca erwin GA cagrisini
+        /// tetikler -> bridge GA hook DDL'i capture buffer'a yazar. Production'da
+        /// <paramref name="overlayToggle"/> ile addin formu click-through yapilir
+        /// (mouse wizard'a gecsin). Next-loop'a gore ~5x hizli (600ms vs ~2.5s).
         /// </summary>
-        public static async Task<bool> ClickWizardPreviewTabAsync(IntPtr wizardHwnd, Action<string> log)
+        public static async Task<bool> ClickWizardPreviewTabAsync(IntPtr wizardHwnd, Action<string> log, Action<bool> overlayToggle = null)
         {
-            return await Task.Run(() => ClickWizardPreviewTab(wizardHwnd, log));
+            return await Task.Run(() => ClickWizardPreviewTab(wizardHwnd, log, overlayToggle));
         }
 
-        private static bool ClickWizardPreviewTab(IntPtr wizardHwnd, Action<string> log)
+        private static bool ClickWizardPreviewTab(IntPtr wizardHwnd, Action<string> log, Action<bool> overlayToggle = null)
         {
             if (wizardHwnd == IntPtr.Zero || !IsWindow(wizardHwnd))
             {
@@ -2682,61 +2742,113 @@ namespace EliteSoft.Erwin.AddIn.Services
                 return false;
             }
 
-            // Next-loop strategy (UIA-free): post CMD_FE_WIZARD_NEXT (1766)
-            // repeatedly until the bridge's GA hook captures DDL. Each Next
-            // walks one page: Overview -> Option Selection -> Summary ->
-            // Owner Override -> Object Filter -> Preview. The Preview page
-            // triggers FE Wizard's internal generate flow which calls
-            // ELA -> FEProcessor::GenerateAlterScript -> bridge GA hook
-            // captures the DDL into the bridge's buffer (consumed by
-            // caller via ConsumeLastCapturedDdl). Memory:
-            // reference_alter_script_wizard_automation - same pattern is
-            // used by DriveFEAlterScriptWizard (line 546+). UIA path
-            // failed because XTP wizard property sheet does not expose
-            // navigation items in the UIA tree consistently.
-            log?.Invoke("  [WPT] Next-loop strategy: posting CMD_FE_WIZARD_NEXT until DDL captured");
+            // JUMP-to-Preview strategy (2026-05-29). The user's manual flow is:
+            // one Next (Overview -> Option Selection), then a single MOUSE click
+            // on the left-nav "Preview" item, which renders the Preview page and
+            // auto-generates the DDL (ELA -> FEProcessor::GenerateAlterScript ->
+            // bridge GA hook -> DDL buffer) - far faster than walking every page.
+            //
+            // The nav items are NOT in the UIA tree (verified by NAVPROBE dump
+            // 2026-05-29: the only nav element is a single Static container
+            // name='Navigational Pane' aid='1063'; the 6 page labels are
+            // custom-drawn inside it). So there is no element to UIA-Select; the
+            // only way is a mouse-sim at the "Preview" label's PIXEL position,
+            // computed from the live container rect. The wizard stays VISIBLE
+            // (hiding it hung erwin on teardown - see
+            // reference_layered_wizard_compositor_leak), so mouse-sim works.
+            log?.Invoke("  [WPT] Jump strategy: 1x Next then mouse-click the 'Preview' nav item");
 
-            for (int page = 1; page <= 8; page++)
+            // Step 1: Overview -> Option Selection (matches the user's flow; some
+            // wizards only enable later nav items once a prior page is visited).
+            PostMessage(wizardHwnd, WM_COMMAND, MakeWParam(CMD_FE_WIZARD_NEXT, 0), IntPtr.Zero);
+            Thread.Sleep(600);
+
+            // Step 2: read the live "Navigational Pane" rect (handles wherever
+            // the wizard opened) and compute the "Preview" label position.
+            System.Windows.Rect pane = default;
+            bool gotPane = false;
+            try
             {
-                // Wait for current page to render and any sub-dialogs to
-                // settle (e.g. SQL Server Connection picker, Use current
-                // diagram selections? Yes/No popup).
-                Thread.Sleep(700);
+                var root = AutomationElement.FromHandle(wizardHwnd);
+                var navEl = root?.FindFirst(TreeScope.Descendants,
+                    new PropertyCondition(AutomationElement.AutomationIdProperty, "1063"));
+                if (navEl != null) { pane = navEl.Current.BoundingRectangle; gotPane = true; }
+            }
+            catch (Exception ex) { log?.Invoke($"  [WPT] nav-pane read err: {ex.Message}"); }
 
-                // Caller (RunFromDbDdlPipelineAsync) polls bridge buffer
-                // continuously after this method returns; we don't consume
-                // here so the caller sees the DDL on its own poll.
-                // Just check if bridge already captured (fast path - some
-                // wizards generate DDL during initial CTOR).
-                string preview = NativeBridgeService.ConsumeLastCapturedDdl();
-                if (!string.IsNullOrEmpty(preview))
+            if (!gotPane || pane.Width < 10 || pane.Height < 10)
+            {
+                log?.Invoke("  [WPT] Navigational Pane rect not found - cannot target Preview");
+                return false;
+            }
+
+            // The 6 page labels (Overview .. Preview) occupy the TOP of the pane,
+            // evenly spaced; Preview is the LAST (index 5). CALIBRATION 2026-05-29
+            // on pane (Y 321..714, h393): a click at paneTop+0.31*h (Y=442) landed
+            // on "Object Filter" (index 4, one ABOVE Preview), so Preview sits one
+            // item lower. Item pitch is ~22-28px, so Preview center is ~Y 466-470;
+            // paneTop+0.375*h (Y=468) targets its middle. Anchoring to a fraction
+            // of the (fixed-size) pane keeps this DPI-stable. X is ~55px in from
+            // the pane's left edge (over the left-aligned label - X was correct,
+            // the 442 click registered as a nav row, just the wrong one).
+            int clickX = (int)pane.Left + 55;
+            int clickY = (int)pane.Top + (int)(pane.Height * 0.375);
+            log?.Invoke($"  [WPT] pane=({(int)pane.Left},{(int)pane.Top} {(int)pane.Width}x{(int)pane.Height}) -> Preview click=({clickX},{clickY})");
+
+            // Production: make the addin form click-through (WS_EX_TRANSPARENT)
+            // + hide the "please wait" popup so the mouse-sim reaches the wizard
+            // below. Null in debug (no overlay). Restored in finally - leaving
+            // the form click-through would silently break user interaction.
+            // Mirrors the proven Apply-to-Right pattern (DriveCCDbAndApply).
+            try { overlayToggle?.Invoke(false); } catch { }
+            try
+            {
+                // Bring the (visible) wizard foreground so XTP accepts the
+                // synthetic click (same requirement as the Apply-to-Right RD
+                // click), then verify the click point actually belongs to the
+                // wizard (guards against something still covering it).
+                ForceForeground(wizardHwnd);
+                Thread.Sleep(120);
+                IntPtr atPoint = WindowFromPoint(new POINT { X = clickX, Y = clickY });
+                IntPtr atRoot = GetAncestor(atPoint, GA_ROOT);
+                log?.Invoke($"  [WPT] WindowFromPoint=0x{atPoint.ToInt64():X} root=0x{atRoot.ToInt64():X} (wizard=0x{wizardHwnd.ToInt64():X})");
+                if (atRoot != wizardHwnd && atPoint != wizardHwnd)
+                    log?.Invoke("  [WPT] WARN click point is not on the wizard - something is covering it");
+
+                // Step 3: click the Preview label (cursor hidden during the
+                // jump; SendMouseClickAt saves/restores the cursor position).
+                try
                 {
-                    log?.Invoke($"  [WPT] DDL captured at page {page} ({preview.Length} chars) - re-stashing for caller");
-                    // Re-stash via a marker - but bridge has no Set. Just
-                    // signal success; caller will see empty buffer but we
-                    // succeeded. To not lose DDL we stash it on the static
-                    // field below for caller to retrieve.
-                    LastCapturedWizardDdl = preview;
-                    return true;
+                    ShowCursor(false);
+                    SendMouseClickAt(clickX, clickY, log);
+                }
+                finally
+                {
+                    ShowCursor(true);
                 }
 
-                log?.Invoke($"  [WPT] page {page}: posting CMD_FE_WIZARD_NEXT (1766)");
-                PostMessage(wizardHwnd, WM_COMMAND, MakeWParam(CMD_FE_WIZARD_NEXT, 0), IntPtr.Zero);
-            }
+                // Step 4: poll for the auto-generated DDL (the GA hook fires when
+                // the Preview page renders). No Next-loop fallback by design - if
+                // the jump does not produce DDL we surface the failure honestly.
+                for (int i = 0; i < 20; i++)
+                {
+                    Thread.Sleep(200);
+                    string ddl = NativeBridgeService.ConsumeLastCapturedDdl();
+                    if (!string.IsNullOrEmpty(ddl))
+                    {
+                        log?.Invoke($"  [WPT] DDL captured after Preview jump ({ddl.Length} chars) at {(i + 1) * 200}ms");
+                        LastCapturedWizardDdl = ddl;
+                        return true;
+                    }
+                }
 
-            // After Next-loop, give it one more second for the final page's
-            // generate to complete and bridge GA hook to fire.
-            Thread.Sleep(1500);
-            string finalDdl = NativeBridgeService.ConsumeLastCapturedDdl();
-            if (!string.IsNullOrEmpty(finalDdl))
+                log?.Invoke("  [WPT] Preview jump did not produce DDL within 4s");
+                return false;
+            }
+            finally
             {
-                log?.Invoke($"  [WPT] DDL captured at end ({finalDdl.Length} chars)");
-                LastCapturedWizardDdl = finalDdl;
-                return true;
+                try { overlayToggle?.Invoke(true); } catch { }
             }
-
-            log?.Invoke("  [WPT] Next-loop exhausted without DDL capture");
-            return false;
         }
 
         /// <summary>
@@ -2762,7 +2874,12 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             await Task.Run(() =>
             {
-                IntPtr popup = WaitForDialog("erwin Data Modeler", 500);
+                // 200ms is enough: when this popup appears (Generate / Next on
+                // a page with diagram selections) it shows within ~100ms; the
+                // jump path (1x Next + nav click on Preview) almost never raises
+                // it, so we should not waste 500ms waiting on the critical path
+                // before the DDL approval dialog renders.
+                IntPtr popup = WaitForDialog("erwin Data Modeler", 200);
                 if (popup == IntPtr.Zero) return;
                 string title = GetTitle(popup);
                 log?.Invoke($"  [POP] erwin popup detected hwnd=0x{popup.ToInt64():X} title='{title}' - dismissing with No");
@@ -2792,7 +2909,21 @@ namespace EliteSoft.Erwin.AddIn.Services
             const int IDCANCEL = 2;
             try { PostMessage(wizardHwnd, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero); }
             catch (Exception ex) { log?.Invoke($"  [WC] PostMessage err: {ex.Message}"); }
-            await Task.Delay(1500);
+
+            // Poll until the wizard window is gone, up to 1500ms (was a fixed
+            // 1500ms sleep). Typical IDCANCEL closes the wizard in 200-500ms;
+            // returning the moment it is gone shaves ~1s off the critical path
+            // before the DDL approval dialog renders. If it is still alive at
+            // the cap, fall through to the ForceDestroy branch below.
+            for (int waited = 0; waited < 1500; waited += 100)
+            {
+                if (!IsWindow(wizardHwnd))
+                {
+                    log?.Invoke($"  [WC] wizard gone after {waited}ms");
+                    break;
+                }
+                await Task.Delay(100);
+            }
 
             if (IsWindow(wizardHwnd))
             {
@@ -2911,8 +3042,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                 var root = AutomationElement.FromHandle(dlg);
                 if (root == null) { log?.Invoke("  [SM-CLOSE] UIA root null"); return; }
 
-                // (1) Single-row guard: count data rows by their 'Mart://' path
-                // cell, and locate the 'Model_1*' name cell for the row Y.
+                // (1) Single-row guard: count dirty model rows by their
+                // "Model_X*" name cell (the '*' marker is on the model-name cell
+                // only; one per row). This works for BOTH the Mart "Save Models"
+                // (Review teardown) and the file-based "Save Models" that closing
+                // the From-DB RE'd in-memory model raises - the path column
+                // differs ("Mart://" vs "C:\...") but the dirty name cell is the
+                // same. Exactly-one-row keeps the active dirty v2 (Review) safe.
                 var customs = root.FindAll(TreeScope.Descendants,
                     new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Custom));
                 int rowCount = 0;
@@ -2920,16 +3056,15 @@ namespace EliteSoft.Erwin.AddIn.Services
                 foreach (AutomationElement c in customs)
                 {
                     string n = ""; try { n = c.Current.Name ?? ""; } catch { }
-                    if (n.StartsWith("Mart:", StringComparison.OrdinalIgnoreCase)) rowCount++;
-                    if (modelCell == null && n.Contains("*")) modelCell = c;
+                    if (n.Contains("*")) { rowCount++; if (modelCell == null) modelCell = c; }
                 }
-                log?.Invoke($"  [SM-CLOSE] data rows (Mart:// cells) = {rowCount}");
+                log?.Invoke($"  [SM-CLOSE] dirty model rows ('*' name cells) = {rowCount}");
                 if (rowCount != 1)
                 {
                     log?.Invoke($"  [SM-CLOSE] >>> ABORT: expected exactly 1 row, found {rowCount}. Leaving dialog for manual (v2 protection). <<<");
                     return;
                 }
-                if (modelCell == null) { log?.Invoke("  [SM-CLOSE] could not locate model-name cell (Model_1*); ABORT (leaving for manual)"); return; }
+                if (modelCell == null) { log?.Invoke("  [SM-CLOSE] could not locate model-name cell (Model_X*); ABORT (leaving for manual)"); return; }
 
                 // (2) Geometry: first checkbox-column header X, data row Y.
                 System.Windows.Rect rowRect = default;
@@ -3049,7 +3184,14 @@ namespace EliteSoft.Erwin.AddIn.Services
                 Thread.Sleep(500);
 
                 // (4) Drive the follow-up "Mart Offline" dialog to Save-to=Close.
-                IntPtr martOffline = WaitForDialog("Mart Offline", 3000);
+                // 500ms is enough: when it appears it shows within ~300ms; the
+                // From-DB RE'd model is file-based and NEVER raises it (verified
+                // across multiple runs - "no Mart Offline dialog (suppressed)").
+                // The DDL approval dialog opens during this teardown and is
+                // briefly buried behind erwin's Save Models flash; trimming this
+                // dead-wait from 1500ms to 500ms shrinks that "behind" window
+                // by ~1s and lets the reclaim bring it back to the front sooner.
+                IntPtr martOffline = WaitForDialog("Mart Offline", 500);
                 if (martOffline == IntPtr.Zero)
                 {
                     log?.Invoke("  [SM-CLOSE] no Mart Offline dialog (suppressed or v1 closed directly) - done.");
@@ -3075,7 +3217,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 log?.Invoke($"  [DB-CLEAN] closing RD via IDCANCEL 0x{s.ResolveDifferences.ToInt64():X}");
                 try { PostMessage(s.ResolveDifferences, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero); }
                 catch (Exception ex) { log?.Invoke($"  [DB-CLEAN] RD IDCANCEL err: {ex.Message}"); }
-                await Task.Delay(1500);
+                await Task.Delay(800);
 
                 if (IsWindow(s.ResolveDifferences))
                 {
@@ -3094,7 +3236,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 log?.Invoke($"  [DB-CLEAN] closing CC wizard via IDCANCEL 0x{s.CCWizard.ToInt64():X}");
                 try { PostMessage(s.CCWizard, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero); }
                 catch (Exception ex) { log?.Invoke($"  [DB-CLEAN] CC IDCANCEL err: {ex.Message}"); }
-                await Task.Delay(1500);
+                await Task.Delay(800);
 
                 // Some erwin builds spawn a "Close Model?" confirmation
                 // popup after CC IDCANCEL. The Mart-Mart CloseSession has
@@ -3209,6 +3351,65 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             if (mdiClient == IntPtr.Zero) return IntPtr.Zero;
             return SendMessage(mdiClient, WM_MDIGETACTIVE, IntPtr.Zero, IntPtr.Zero);
+        }
+
+        /// <summary>
+        /// Closes the From-DB silent-RE'd model's MDI tab, which otherwise
+        /// lingers open after the pipeline (the active Mart model has a
+        /// "Mart://" title; the RE'd in-memory model does NOT - that is how we
+        /// tell them apart). WM_CLOSE the non-Mart child + click "No" on the
+        /// resulting "Save changes to &lt;model&gt;?" prompt (the RE'd model is a
+        /// throwaway - never save it). This is the UI close, NOT the SCAPI
+        /// PUs.Remove (which invalidates the active Mart PU root and triggers a
+        /// Session-lost cascade - see reference_cross_version_orphan_unsolved).
+        /// Run via Task.Run (it blocks on Thread.Sleep + the dismiss watcher).
+        /// </summary>
+        public static void CloseReModelMdiChild(string reModelName, Action<string> log)
+        {
+            IntPtr main = FindErwinMain();
+            if (main == IntPtr.Zero) { log?.Invoke("  [DB-CLOSE] erwin main not found"); return; }
+            IntPtr mdiClient = FindMdiClientOf(main);
+            if (mdiClient == IntPtr.Zero) { log?.Invoke("  [DB-CLOSE] MDIClient not found"); return; }
+
+            IntPtr reChild = IntPtr.Zero, firstNonMart = IntPtr.Zero;
+            IntPtr child = GetWindow(mdiClient, GW_CHILD);
+            while (child != IntPtr.Zero)
+            {
+                string t = GetTitle(child);
+                if (!string.IsNullOrEmpty(t) && t.IndexOf("Mart://", StringComparison.OrdinalIgnoreCase) < 0)
+                {
+                    if (firstNonMart == IntPtr.Zero) firstNonMart = child;
+                    if (!string.IsNullOrEmpty(reModelName) && t.IndexOf(reModelName, StringComparison.OrdinalIgnoreCase) >= 0)
+                    { reChild = child; break; }
+                }
+                child = GetWindow(child, GW_HWNDNEXT);
+            }
+            if (reChild == IntPtr.Zero) reChild = firstNonMart;
+            if (reChild == IntPtr.Zero) { log?.Invoke("  [DB-CLOSE] no non-Mart RE'd model MDI child found - nothing to close"); return; }
+
+            log?.Invoke($"  [DB-CLOSE] WM_CLOSE RE'd model child 0x{reChild.ToInt64():X} title='{GetTitle(reChild)}'");
+            PostMessage(reChild, WM_CLOSE_MSG, IntPtr.Zero, IntPtr.Zero);
+            Thread.Sleep(800);
+
+            // Closing a dirty in-memory model raises a "Save Models" grid
+            // (Model_X* / <new file> / C:\...\My Models) - NOT a simple Yes/No
+            // popup. Reuse the same uncheck-the-save-box + OK handler the Review
+            // teardown uses (it now matches the dirty name cell, Mart or file).
+            IntPtr sm = WaitForDialog("Save Models", 3000);
+            if (sm == IntPtr.Zero) sm = WaitForDialog("Save Model", 1000);
+            if (sm != IntPtr.Zero)
+            {
+                log?.Invoke($"  [DB-CLOSE] 'Save Models' dialog up 0x{sm.ToInt64():X} - closing without saving (uncheck + OK)");
+                CloseSaveModelsWithoutSaving(sm, log);
+                Thread.Sleep(500);
+            }
+            else
+            {
+                log?.Invoke("  [DB-CLOSE] no Save Models dialog - RE'd model closed silently (or a different prompt is up).");
+            }
+            log?.Invoke(IsWindow(reChild)
+                ? "  [DB-CLOSE] RE'd model child still alive after close attempt - may need manual handling"
+                : "  [DB-CLOSE] RE'd model child closed (discarded, not saved).");
         }
 
         /// <summary>Activate a SPECIFIC MDI child (used to flip Left back to the

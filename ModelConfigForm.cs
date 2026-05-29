@@ -3611,6 +3611,23 @@ namespace EliteSoft.Erwin.AddIn
                 return;
             }
 
+            // Re-entry guard (2026-05-29, Option A): the From-DB / Review
+            // pipelines now run their erwin teardown on a background task and
+            // return early so the DDL renders ~11s sooner. _martMartPipelineActive
+            // stays TRUE until that teardown finishes; block a second Generate
+            // until then so two pipelines never overlap (the first one's wizard /
+            // RD / CC / Save-Models dialogs are still being dismissed).
+            if (_martMartPipelineActive)
+            {
+                ErwinAddIn.ShowTopMostMessage(
+                    "Önceki DDL üretimi hâlâ tamamlanıyor (arka planda erwin temizliği sürüyor).\n\n" +
+                    "Lütfen birkaç saniye bekleyip tekrar deneyin.",
+                    "Generate DDL",
+                    isError: false);
+                Log("[ROUTE] Aborted: previous pipeline still finalizing in background (_martMartPipelineActive=true).");
+                return;
+            }
+
             // Concurrent-modal guard. Verified crash trigger 2026-05-07: user
             // had Mart Save dialog open, switched to addin, clicked Generate
             // DDL; NativeBridge sent Ctrl+Alt+T which misrouted to the modal,
@@ -3990,17 +4007,11 @@ namespace EliteSoft.Erwin.AddIn
                                             }
                                             else
                                             {
-                                                // Hide the FE wizard AND the RD before driving the
-                                                // Next-loop: it is WM_COMMAND-based and the GA hook
-                                                // captures DDL regardless of visibility, so in
-                                                // production (non-debug) we keep both off-screen.
-                                                if (!keepVisible)
-                                                {
-                                                    try { Services.MartMartAutomation.HideWindow(capturedWizard); }
-                                                    catch (Exception hex) { log($"[REVIEW] wizard hide err: {hex.Message}"); }
-                                                    try { Services.MartMartAutomation.HideWindow(rsess.ResolveDifferences); }
-                                                    catch (Exception hex) { log($"[REVIEW] RD hide err: {hex.Message}"); }
-                                                }
+                                                // NOTE: hiding the FE wizard + RD during the Next-loop
+                                                // (WS_EX_LAYERED) was tried 2026-05-29 and REVERTED - it
+                                                // appeared to hang erwin on teardown (cf.
+                                                // reference_layered_wizard_compositor_leak). Both stay
+                                                // visible during the capture.
                                                 bool previewOk = await Services.MartMartAutomation
                                                     .ClickWizardPreviewTabAsync(capturedWizard, (Action<string>)log);
                                                 if (!previewOk)
@@ -5042,7 +5053,15 @@ namespace EliteSoft.Erwin.AddIn
             _validationCoordinatorService?.SuspendValidation();
             try { _tableTypeMonitorService?.StopMonitoring(); } catch (Exception ex) { log($"[From-DB] StopMonitoring err: {ex.Message}"); }
             try { _validationService?.StopMonitoring(); } catch (Exception ex) { log($"[From-DB] ColumnValidation StopMonitoring err: {ex.Message}"); }
-            log("[From-DB] all monitoring services suspended for pipeline duration");
+            // Also stop the reconnect timer + raise the pipeline guard (same as
+            // the Review/CC path). Without this, the silent RE'd in-memory model
+            // is picked up by ReconnectTimer_Tick mid-pipeline, which re-inits
+            // the addin against a model that has NO config row and pops the
+            // "Add-in loaded with controls disabled" warning over the RE
+            // (observed 2026-05-29). The guard makes the tick a no-op.
+            _martMartPipelineActive = true;
+            StopReconnectTimer();
+            log("[From-DB] all monitoring services suspended + reconnect timer stopped for pipeline duration");
 
             // Overlay + transparency toggle. Skipped when the dev "Generate
             // DDL (debug)" button (#if !PACKAGED) was used to launch this
@@ -5253,21 +5272,31 @@ namespace EliteSoft.Erwin.AddIn
                 IntPtr capturedWizard = IntPtr.Zero;
                 try
                 {
-                    log("[From-DB] Posting WM_COMMAND 1056 to RD - erwin's handler will invoke OnFE with correct state.");
+                    // cmd 1057 = RIGHT Alter Script (the RE'd DB is the RIGHT side;
+                    // Apply-to-Right cascaded Mart->DB so 1057 is enabled). 1056
+                    // is the LEFT button and is DISABLED here - clicking it never
+                    // opened the FE Wizard (verified 2026-05-29, same as Review).
+                    log("[From-DB] Posting WM_COMMAND 1057 (RIGHT Alter Script) to RD - invokes OnFE for the RE'd DB side.");
                     Services.NativeBridgeService.ClearCapturedDdl();
                     Services.MartMartAutomation.ClearLastCapturedWizardDdl();
 
                     capturedWizard = await Services.MartMartAutomation
-                        .ClickRightAlterScriptInRdAsync(sess.ResolveDifferences, log);
+                        .ClickRightAlterScriptInRdAsync(sess.ResolveDifferences, 1057, log);
                     if (capturedWizard == IntPtr.Zero)
                     {
-                        err = "Right Alter Script button click failed - FE Wizard did not appear.";
+                        err = "Right Alter Script (cmd 1057) click failed - FE Wizard did not appear.";
                     }
                     else
                     {
-                        log("[From-DB] FE Wizard opened - driving Next-loop to Preview");
+                        // NOTE: a "hide the FE wizard during the Next-loop"
+                        // optimization was tried 2026-05-29 and REVERTED - hiding
+                        // the wizard via WS_EX_LAYERED appeared to hang erwin on
+                        // teardown (the user could not see the wizard and the run
+                        // froze; cf. reference_layered_wizard_compositor_leak).
+                        // The wizard stays visible during the Next-loop.
+                        log("[From-DB] FE Wizard opened - jumping to Preview for DDL capture");
                         bool previewOk = await Services.MartMartAutomation
-                            .ClickWizardPreviewTabAsync(capturedWizard, log);
+                            .ClickWizardPreviewTabAsync(capturedWizard, log, overlayToggle);
                         if (!previewOk)
                         {
                             err = "Wizard Next-loop / Preview tab failed.";
@@ -5338,13 +5367,22 @@ namespace EliteSoft.Erwin.AddIn
             {
                 // Step 7: cleanup. Order matters: close CC/RD first so the CC
                 // engine's transient ms references are released before we
-                // remove the underlying PU. PUs.Remove on a SCAPI-Create()'d
-                // locator='' PU is safe (reference_rescript_pu_removable).
+                // remove the underlying PU.
+                //
+                // Note (2026-05-29): a "background the teardown so the DDL
+                // approval modal opens ~11s sooner" optimization (Option A) was
+                // implemented, then reverted at the user's request: the modal
+                // opened EARLY, then erwin's Save Models mouse-sim stole the
+                // foreground, then the modal returned to front. That appear ->
+                // behind -> reappear sequence read as "the dialog is showing
+                // twice" and a user could mistakenly think the run was finished
+                // on the first appearance. Holding the modal until teardown
+                // fully completes is the cleaner UX (one clean appearance).
+                // The 3 dead-wait trims (UseCurrentDiagram 500->200, FE wizard
+                // IDCANCEL fixed-1500 -> poll, Mart Offline 1500->500) STAY -
+                // they shave ~2.3s without flicker.
                 if (sess != null)
                 {
-                    // CC + RD cleanup. Validation servisleri pipeline
-                    // boyunca suspended oldugu icin rename loop riski yok;
-                    // IDCANCEL + fallback ForceDestroy guvenli sayilir.
                     try
                     {
                         await Services.MartMartAutomation
@@ -5355,36 +5393,37 @@ namespace EliteSoft.Erwin.AddIn
                         log($"[From-DB] CloseDbCCSessionClean failed: {closeEx.GetType().Name}: {closeEx.Message}");
                     }
                 }
+
+                // Close the busy overlay BEFORE closing the RE'd model: in
+                // production the overlay is a TopMost form that can cover the
+                // "Save Models" dialog, so the uncheck mouse-click would land
+                // on the overlay and silently no-op.
+                try { overlay?.Close(); } catch { }
+
+                // Discard the throwaway RE'd model (WM_CLOSE + "Save Models"
+                // uncheck+OK). Done AFTER the CC/RD teardown so the wizard no
+                // longer references it.
+                try
+                {
+                    await System.Threading.Tasks.Task.Run(() =>
+                        Services.MartMartAutomation.CloseReModelMdiChild(rePuName, log));
+                }
+                catch (Exception ex) { log($"[From-DB] CloseReModelMdiChild err: {ex.Message}"); }
+
                 if (rePU != null)
                 {
-                    // PU.Remove on a CC-touched silent RE'd PU not only throws
-                    // RPC_E_SERVERFAULT (CC engine holds back-references after
-                    // wizard frame is gone) but - critically - the CALL ITSELF
-                    // invalidates the active mart PU's root object. 09:12 log
-                    // shows: PU remove failed -> ValidationCoordinatorService
-                    // "root model object {GUID} is not available" -> Session
-                    // lost -> add-in reconnect cascade -> next user click
-                    // crash. Same root cause as
-                    // reference_cross_version_orphan_unsolved.md (Mart-Mart
-                    // cross-version "erwin locks within ~3min").
-                    //
-                    // Skipping the Remove call entirely keeps the active mart
-                    // PU usable. The RE'd PU stays in session as an orphan
-                    // (Model_N accumulates across runs) - acceptable trade-off
-                    // until the CC-engine back-reference is properly cleared
-                    // by a future bridge change.
+                    // PU.Remove on a CC-touched silent RE'd PU invalidates the
+                    // active mart PU's root object -> Session lost cascade ->
+                    // next user click crash. Skipped entirely; the RE'd PU
+                    // stays as a session orphan.
                     log("[From-DB] SKIPPING PU.Remove on RE'd PU - call would invalidate active mart PU root and trigger Session lost cascade.");
                     log("[From-DB] WARNING: RE'd PU stays in SCAPI session as an orphan.");
                     log("[From-DB] If CC's 'Open Models in Memory' picker shows duplicates next run, restart erwin to reset session.");
                 }
-                try { overlay?.Close(); } catch { }
 
                 // Monitoring resume FIRE-AND-FORGET background. StartMonitoring
-                // ic islerinde TakeSnapshot tetikliyor (model walk: 24 entity
-                // + 182 attribute = 7sn UI freeze, 13:55:43->13:55:50
-                // verified). UI thread'i bloklamayalim - DDL TextBox'a HEMEN
-                // yansisin, monitoring arka planda hazir hale gelsin.
-                // Validation guard'lari volatile flag uzerinden thread-safe.
+                // triggers a model walk (multi-second UI freeze if run on the
+                // UI thread). Off-thread so the addin stays responsive.
                 _ = System.Threading.Tasks.Task.Run(() =>
                 {
                     try { _validationCoordinatorService?.ResumeValidation(); }
@@ -5395,7 +5434,11 @@ namespace EliteSoft.Erwin.AddIn
                     catch (Exception ex) { try { log($"[From-DB] bg ColumnValidation StartMonitoring err: {ex.Message}"); } catch { } }
                     try { log("[From-DB] monitoring resumed (background)"); } catch { }
                 });
-                log("[From-DB] pipeline complete - monitoring resume scheduled to background");
+                // Clear the pipeline guard + restart the reconnect timer LAST
+                // so no tick touches SCAPI while cleanup is still settling.
+                _martMartPipelineActive = false;
+                try { StartReconnectTimer(); } catch (Exception ex) { log($"[From-DB] StartReconnectTimer err: {ex.Message}"); }
+                log("[From-DB] pipeline complete - monitoring + reconnect resume scheduled to background");
             }
 
             return (script, err);

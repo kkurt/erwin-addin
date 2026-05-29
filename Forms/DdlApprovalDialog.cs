@@ -62,6 +62,27 @@ namespace EliteSoft.Erwin.AddIn.Forms
             Forms.SqlHighlighter.Apply(_rtb, _ddlText);
         }
 
+        /// <summary>
+        /// Pop this review window to the FRONT when it opens. The From-DB /
+        /// Review teardown now runs on a background task (perceived-speed
+        /// optimization) and can briefly steal foreground while it dismisses
+        /// erwin's own dialogs (the "Save Models" mouse-sim), which otherwise
+        /// leaves this dialog buried behind erwin. The owner (ModelConfigForm)
+        /// also re-asserts the front once teardown fully completes.
+        /// </summary>
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            try
+            {
+                TopMost = true;
+                BringToFront();
+                Activate();
+                TopMost = false;
+            }
+            catch (Exception ex) { _log($"DdlApprovalDialog OnShown bring-to-front err: {ex.Message}"); }
+        }
+
         private void BuildUi()
         {
             Text             = "DDL Review";
