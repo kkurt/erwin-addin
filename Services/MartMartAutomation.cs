@@ -447,8 +447,20 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <see cref="CloseSession"/> for the Close Model + Mart Offline
         /// teardown that releases the loaded version.
         /// </summary>
-        public static CCSession DriveReviewToResolveDifferences(
-            int rightVersion, string catalogPath, bool keepVisible, Action<string> log)
+        /// <summary>
+        /// Drives erwin to a "Resolve Differences" comparing the CURRENT model
+        /// (LEFT) against an older Mart version (RIGHT), then returns the
+        /// CCSession (RD + wizard + opened version child). Two entry modes:
+        /// useCompleteCompare=false -> "Review" toolbar (LEFT = the active model
+        /// WITH its unsaved/dirty buffer; Faz 2); useCompleteCompare=true ->
+        /// Actions "Complete Compare" via WM_COMMAND 1082 (LEFT = the current
+        /// model's LAST-SAVED baseline; Faz 3). Everything else (open the RIGHT
+        /// version as an MDI child, re-activate the current child so it is the
+        /// compare LEFT, navigate to the Right Model page, select the version
+        /// from the in-memory list, Compare) is identical for both.
+        /// </summary>
+        public static CCSession DriveCompareToResolveDifferences(
+            int rightVersion, string catalogPath, bool keepVisible, bool useCompleteCompare, Action<string> log)
         {
             var session = new CCSession();
             try
@@ -498,18 +510,31 @@ namespace EliteSoft.Erwin.AddIn.Services
                 if (dirtyChild != IntPtr.Zero) ActivateMdiChildHandle(mdiClient, dirtyChild, log);
                 DebugMode.Pause("re-activated dirty model as compare LEFT", log);
 
-                // ---- STEP 3: launch Review and reach the Right Model page.
+                // ---- STEP 3: launch the compare wizard and reach the Right
+                // Model page. Review (Faz 2) uses the toolbar button; Complete
+                // Compare (Faz 3) uses WM_COMMAND 1082 on the main frame. Both
+                // open a wizard whose Right Model page we navigate to below.
                 var dialogsBeforeReview = EnumerateVisibleDialogs();
-                log?.Invoke("  [REVIEW-3] launching Mart > Review (LEFT = active dirty model)");
-                if (!Win32Helper.InvokeToolbarButton(erwinMain, "Review", log))
+                if (useCompleteCompare)
                 {
-                    log?.Invoke("  [REVIEW] 'Review' toolbar button not found.");
-                    return session;
+                    log?.Invoke("  [REVIEW-3] launching Complete Compare (WM_COMMAND 1082; LEFT = current model last-saved baseline)");
+                    PostMessage(erwinMain, WM_COMMAND, MakeWParam(CMD_COMPLETE_COMPARE, 0), IntPtr.Zero);
                 }
-                IntPtr ccWizard = WaitForNewDialog(dialogsBeforeReview, "Review wizard", 6000, log);
+                else
+                {
+                    log?.Invoke("  [REVIEW-3] launching Mart > Review (LEFT = active dirty model)");
+                    if (!Win32Helper.InvokeToolbarButton(erwinMain, "Review", log))
+                    {
+                        log?.Invoke("  [REVIEW] 'Review' toolbar button not found.");
+                        return session;
+                    }
+                }
+                IntPtr ccWizard = WaitForNewDialog(dialogsBeforeReview, useCompleteCompare ? "Complete Compare wizard" : "Review wizard", 6000, log);
                 if (ccWizard == IntPtr.Zero)
                 {
-                    log?.Invoke("  [REVIEW] wizard did not open - active model may have NO changes (Review needs dirty edits).");
+                    log?.Invoke(useCompleteCompare
+                        ? "  [REVIEW] Complete Compare wizard did not open (WM_COMMAND 1082)."
+                        : "  [REVIEW] wizard did not open - active model may have NO changes (Review needs dirty edits).");
                     return session;
                 }
                 if (!keepVisible) HideWindow(ccWizard);

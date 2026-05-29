@@ -3905,18 +3905,23 @@ namespace EliteSoft.Erwin.AddIn
                         }
                     }
                     } // close: else if (leftIsActive && LegacyCrossVersionEnabled)
-                    else if (leftIsActive)
+                    else
                     {
-                        // Active dirty model vs an OLDER Mart version via erwin's
-                        // Review wizard (only Review puts the unsaved buffer on
-                        // the left). Faz 2.1 scope: reach Resolve Differences
-                        // (left=active dirty, right=selected version), then tear
-                        // down cleanly. Apply-to-Right arrow + WM_COMMAND 1057 +
-                        // DDL capture land in Faz 2.2/2.3.
+                        // Current model vs an OLDER Mart version, captured as alter
+                        // DDL. Two modes share the SAME pipeline (open right
+                        // version, reach Resolve Differences, Apply-to-Right + cmd
+                        // 1057 + capture, clean teardown), differing only in the
+                        // entry wizard:
+                        //   - LEFT = "(with last changes)" [leftIsActive]  -> Review
+                        //     wizard (Faz 2): the unsaved buffer is the compare LEFT.
+                        //   - LEFT = "(last saved)" [!leftIsActive]        -> Complete
+                        //     Compare (Faz 3, WM_COMMAND 1082): the current model's
+                        //     last-saved baseline is the compare LEFT.
+                        bool useCompleteCompare = !leftIsActive;
                         string catalog = ParseActivePuCatalog();
                         if (v <= 0 || string.IsNullOrEmpty(catalog))
                         {
-                            err = "Could not derive right-version or Mart catalog path for the Review compare.";
+                            err = "Could not derive right-version or Mart catalog path for the version compare.";
                         }
                         else
                         {
@@ -3943,11 +3948,11 @@ namespace EliteSoft.Erwin.AddIn
                                 // Task.Run worker thread, so they pace the wizard
                                 // without blocking the UI.
                                 rsess = await System.Threading.Tasks.Task.Run(() =>
-                                    Services.MartMartAutomation.DriveReviewToResolveDifferences(v, catalog, keepVisible, (Action<string>)log));
+                                    Services.MartMartAutomation.DriveCompareToResolveDifferences(v, catalog, keepVisible, useCompleteCompare, (Action<string>)log));
 
                                 if (rsess == null || rsess.ResolveDifferences == IntPtr.Zero)
                                 {
-                                    err = "Review wizard did not reach Resolve Differences (see Debug Log). " +
+                                    err = "Compare wizard did not reach Resolve Differences (see Debug Log). " +
                                           "If the active model has no unsaved changes, Review cannot open.";
                                 }
                                 else
@@ -4025,8 +4030,9 @@ namespace EliteSoft.Erwin.AddIn
                                                     }
                                                     if (!string.IsNullOrEmpty(script))
                                                     {
-                                                        sourceMode = "Review-Active-vs-Version";
-                                                        lblDDLStatus.Text = $"Review: alter DDL captured (active vs v{v}, {script.Length} chars).";
+                                                        sourceMode = useCompleteCompare ? "Mart-vs-Mart" : "Review-Active-vs-Version";
+                                                        string leftLabel = useCompleteCompare ? "last saved" : "active";
+                                                        lblDDLStatus.Text = $"Alter DDL captured ({leftLabel} vs v{v}, {script.Length} chars).";
                                                         lblDDLStatus.ForeColor = Color.DarkGreen;
                                                     }
                                                 }
@@ -4093,12 +4099,6 @@ namespace EliteSoft.Erwin.AddIn
                                 log("[REVIEW] pipeline complete - graceful teardown attempted (observe-mode); monitoring + reconnect resumed");
                             }
                         }
-                    }
-                    else
-                    {
-                        // LEFT is a saved version -> Mart-vs-Mart. Faz 3 will run
-                        // this through Actions > Complete Compare.
-                        err = "Iki Mart versiyonunun karsilastirmasi (Mart-vs-Mart) 'Complete Compare' ile yapilacak (Faz 3 - cok yakinda).";
                     }
                 }
                 else
@@ -5909,26 +5909,21 @@ namespace EliteSoft.Erwin.AddIn
                 string modelName = _connectedModelName ?? "Model";
                 Log($"DDL: Model='{modelName}', Version={version}, Locator='{locator}'");
 
-                // LEFT: active-dirty model first (index 0, default), then the
-                // saved Mart versions descending. The active item carries the
-                // unsaved buffer ("with last changes"); the saved items let the
-                // user pick a stored version as the source for a Mart-vs-Mart
-                // compare (Faz 3). Selecting any LEFT item reshapes RIGHT via
-                // OnLeftModelChanged.
+                // LEFT is ALWAYS the open model "(with last changes)". A
+                // separate "(last saved)" entry was tried (Faz 3 Complete
+                // Compare) but proven REDUNDANT 2026-05-29: erwin's Complete
+                // Compare uses the model's OPEN state (dirty if dirty, else the
+                // last-saved state) on the LEFT - identical to what the Review
+                // pipeline already captures. So to compare last-saved vs an
+                // older version the user simply opens the model with no unsaved
+                // changes and runs the normal flow. The compare target (an
+                // older version) is chosen on the RIGHT. (See
+                // project_complete_compare_redundant memory; the Faz 3
+                // useCompleteCompare code path is kept dormant, not deleted.)
                 string vTag = version >= 1 ? $"v{version} " : "";
                 string activeLabel = $"{modelName} {vTag}(with last changes)";
                 cmbLeftModel.Items.Add(activeLabel);
                 lblOpenedModel.Text = $"Opened Model: {activeLabel}"; // legacy field, hidden
-
-                var versions = DdlGenerationService.GetMartVersions(modelName, (object)_currentModel, (Action<string>)Log);
-                if (versions.Count > 0)
-                {
-                    for (int i = versions.Count - 1; i >= 0; i--)
-                    {
-                        var v = versions[i];
-                        cmbLeftModel.Items.Add($"v{v.Version}" + (!string.IsNullOrEmpty(v.Name) ? $" ({v.Name})" : ""));
-                    }
-                }
 
                 // Selecting index 0 fires OnLeftModelChanged, which builds the
                 // RIGHT combo cascade (versions <= active, default = latest).
