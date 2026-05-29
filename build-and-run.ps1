@@ -71,7 +71,7 @@ trap {
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if ($KillAllErwinProcs -and -not $isAdmin) {
     Write-Host "WARNING: -KillAllErwinProcs needs admin to terminate other users' processes." -ForegroundColor Yellow
-    Write-Host "         Continuing without it; only your own erwin/DdlHelper/Injector will be stopped." -ForegroundColor Yellow
+    Write-Host "         Continuing without it; only your own erwin/DdlHelper will be stopped." -ForegroundColor Yellow
     $KillAllErwinProcs = $false
 }
 
