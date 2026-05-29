@@ -41,6 +41,7 @@
 // inside mfc140's allocator (no string manager thread state); using real
 // MFC sidesteps that entirely.
 #include <afx.h>
+#include <commctrl.h>   // TBBUTTON / TB_GETBUTTON for the recon toolbar dump
 
 // Captured on DLL_PROCESS_ATTACH (DllMain). Used by SetWindowsHookEx in
 // CCInsp_ForceDestroyWizard so a thread-targeted hook can be installed
@@ -1938,6 +1939,161 @@ extern "C" __declspec(dllexport) void __cdecl SetDebugKeepWindowsVisible(int ena
 
 extern "C" __declspec(dllexport) int __cdecl GetDebugKeepWindowsVisible(void) {
     return (int)InterlockedCompareExchange(&g_dbgKeepWindowsVisible, 0, 0);
+}
+
+// ===================================================================
+// RECON: foreground window-tree dumper (Faz 2a, dev only)
+// ===================================================================
+// Logs the full child-control hierarchy of the current foreground window so
+// we can learn the real control IDs / window classes / toolbar command IDs of
+// erwin's Review / Complete Compare / Resolve Differences dialogs WITHOUT
+// guessing. Triggered from managed code via a dev-only global hotkey while the
+// user manually walks the wizard (the addin form isn't foreground during that
+// flow, so we dump whatever IS). The bridge runs in-process inside erwin, so
+// TB_GETBUTTON against a standard ToolbarWindow32 returns real data; XTP
+// toolbars override the protocol and report 0 buttons (we log that fact so we
+// know to subclass instead).
+static void ReconDumpWnd(HWND h, int depth) {
+    if (!h || !IsWindow(h)) return;
+    wchar_t cls[160] = {0}; GetClassNameW(h, cls, 159);
+    wchar_t txt[256] = {0}; GetWindowTextW(h, txt, 255);
+    int id = GetDlgCtrlID(h);
+    RECT r = {0}; GetWindowRect(h, &r);
+    int vis = IsWindowVisible(h) ? 1 : 0;
+    int en  = IsWindowEnabled(h) ? 1 : 0;
+    char indent[80]; int n = depth * 2; if (n > 78) n = 78;
+    memset(indent, ' ', n); indent[n] = 0;
+    LogLine("[RECON]%s hwnd=0x%p id=%d vis=%d en=%d cls='%ls' txt='%ls' rect=(%d,%d %dx%d)",
+        indent, h, id, vis, en, cls, txt, r.left, r.top, r.right - r.left, r.bottom - r.top);
+
+    if (wcsstr(cls, L"ToolbarWindow32") || wcsstr(cls, L"Toolbar")) {
+        int count = (int)SendMessageW(h, TB_BUTTONCOUNT, 0, 0);
+        LogLine("[RECON]%s   [toolbar buttoncount=%d]", indent, count);
+        for (int i = 0; i < count && i < 64; i++) {
+            TBBUTTON tb; ZeroMemory(&tb, sizeof(tb));
+            if (SendMessageW(h, TB_GETBUTTON, (WPARAM)i, (LPARAM)&tb)) {
+                LogLine("[RECON]%s     btn[%d] cmd=%d (0x%X) state=0x%X style=0x%X bitmap=%d",
+                    indent, i, tb.idCommand, tb.idCommand, tb.fsState, tb.fsStyle, tb.iBitmap);
+            }
+        }
+    }
+
+    HWND child = GetWindow(h, GW_CHILD);
+    while (child) {
+        ReconDumpWnd(child, depth + 1);
+        child = GetWindow(child, GW_HWNDNEXT);
+    }
+}
+
+extern "C" __declspec(dllexport) void __cdecl DumpForegroundWindowTree(void) {
+    HWND fg = GetForegroundWindow();
+    if (!fg) { LogLine("[RECON] no foreground window"); return; }
+    wchar_t cls[160] = {0}; GetClassNameW(fg, cls, 159);
+    wchar_t txt[256] = {0}; GetWindowTextW(fg, txt, 255);
+    LogLine("[RECON] ========== foreground dump begin fg=0x%p cls='%ls' txt='%ls' ==========", fg, cls, txt);
+    ReconDumpWnd(fg, 0);
+    LogLine("[RECON] ========== foreground dump end ==========");
+}
+
+// RECON command/notify capture: subclasses the foreground window's WindowProc
+// and logs every WM_COMMAND (toolbar/button/menu cmd id) and WM_NOTIFY (e.g.
+// the Resolve Differences Object-View arrow hit regions, which fire NM_*
+// notifications rather than commands). Toggled from managed code via a dev
+// hotkey: first press starts capture on the current foreground window, second
+// press restores the original WndProc. This is how we learn which cmd the
+// "Right Alter Script/Schema Generation" toolbar button sends and what the
+// Model-row right-arrow does, without guessing. Same subclass pattern as
+// WmCommandLogger (proven safe in-process).
+static HWND    g_reconCmdHwnd = NULL;
+static WNDPROC g_reconCmdOrig = NULL;
+
+static LRESULT CALLBACK ReconCmdProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
+    if (msg == WM_COMMAND) {
+        int cmd = LOWORD(w); int notify = HIWORD(w);
+        LogLine("[RECON-CMD] WM_COMMAND cmd=%d (0x%X) notify=%d lParam=0x%p", cmd, cmd, notify, (void*)l);
+    } else if (msg == WM_NOTIFY) {
+        NMHDR* nh = (NMHDR*)l;
+        if (nh) LogLine("[RECON-CMD] WM_NOTIFY code=%d (0x%X) idFrom=%u hwndFrom=0x%p",
+                        (int)nh->code, (unsigned)nh->code, (unsigned)nh->idFrom, (void*)nh->hwndFrom);
+    }
+    return CallWindowProc(g_reconCmdOrig, h, msg, w, l);
+}
+
+// Returns: 1 = capture started, 0 = capture stopped, -1 = error.
+extern "C" __declspec(dllexport) int __cdecl ToggleReconCommandCapture(void) {
+    if (g_reconCmdHwnd && g_reconCmdOrig) {
+        if (IsWindow(g_reconCmdHwnd))
+            SetWindowLongPtrW(g_reconCmdHwnd, GWLP_WNDPROC, (LONG_PTR)g_reconCmdOrig);
+        LogLine("[RECON-CMD] capture STOPPED on hwnd=0x%p", g_reconCmdHwnd);
+        g_reconCmdHwnd = NULL; g_reconCmdOrig = NULL;
+        return 0;
+    }
+    HWND fg = GetForegroundWindow();
+    if (!fg) { LogLine("[RECON-CMD] no foreground window"); return -1; }
+    g_reconCmdOrig = (WNDPROC)SetWindowLongPtrW(fg, GWLP_WNDPROC, (LONG_PTR)ReconCmdProc);
+    if (!g_reconCmdOrig) { LogLine("[RECON-CMD] subclass FAILED err=%lu", GetLastError()); return -1; }
+    g_reconCmdHwnd = fg;
+    wchar_t txt[256] = {0}; GetWindowTextW(fg, txt, 255);
+    LogLine("[RECON-CMD] capture STARTED on hwnd=0x%p txt='%ls' - click the controls now, toggle again to stop", fg, txt);
+    return 1;
+}
+
+// ===================================================================
+// SPIKE (Faz 2 UI-Open path probes, dev only)
+// ===================================================================
+// Probes for the "open a prior Mart version as its own MDI child via erwin's
+// privileged UI, select it from id=1083, close it normally" architecture.
+// Resolve U1 (does a 2nd version coexist as a separate MDI child) and U2
+// (does a graceful WM_CLOSE on that child release its PU without killing the
+// active model's session). The bridge runs in-process so these reach erwin's
+// own MDIClient. main hwnd is passed from managed (Win32Helper.GetErwinMainWindow).
+static BOOL CALLBACK FindMdiClientProc(HWND h, LPARAM lp) {
+    wchar_t cls[64] = {0}; GetClassNameW(h, cls, 63);
+    if (wcscmp(cls, L"MDIClient") == 0) { *(HWND*)lp = h; return FALSE; }
+    return TRUE;
+}
+static HWND FindMdiClient(HWND main) {
+    HWND mc = NULL;
+    if (main && IsWindow(main)) EnumChildWindows(main, FindMdiClientProc, (LPARAM)&mc);
+    return mc;
+}
+
+// Logs every MDI child window (the open model frames) under erwin's MDIClient,
+// marking the active one. Used to confirm two versions of the same model
+// coexist as separate children (U1) and to capture the version child's title.
+extern "C" __declspec(dllexport) void __cdecl DumpMdiChildren(void* mainHwnd) {
+    HWND main = (HWND)mainHwnd;
+    HWND mdi = FindMdiClient(main);
+    if (!mdi) { LogLine("[SPIKE-MDI] no MDIClient under main=0x%p", main); return; }
+    HWND active = (HWND)SendMessageW(mdi, 0x0229 /*WM_MDIGETACTIVE*/, 0, 0);
+    LogLine("[SPIKE-MDI] ===== MDI children begin (MDIClient=0x%p active=0x%p) =====", mdi, active);
+    int n = 0;
+    HWND child = GetWindow(mdi, GW_CHILD);
+    while (child) {
+        wchar_t t[256] = {0}; GetWindowTextW(child, t, 255);
+        wchar_t c[64] = {0}; GetClassNameW(child, c, 63);
+        LogLine("[SPIKE-MDI]   child[%d] hwnd=0x%p %s cls='%ls' title='%ls'",
+            n++, child, (child == active ? "<ACTIVE>" : ""), c, t);
+        child = GetWindow(child, GW_HWNDNEXT);
+    }
+    LogLine("[SPIKE-MDI] ===== MDI children end (%d total) =====", n);
+}
+
+// Posts WM_CLOSE to the ACTIVE MDI child (NOT WM_MDIDESTROY) so erwin's normal
+// model-close handler runs - the graceful path that pops the "Close Model" /
+// "Mart Offline" dialogs and releases the PU the way a manual user close does,
+// WITHOUT the PUs.Remove active-root invalidation. The user activates the
+// version child first, then triggers this. Returns 0 on post, -1 on no active.
+extern "C" __declspec(dllexport) int __cdecl GracefulCloseActiveMdiChild(void* mainHwnd) {
+    HWND main = (HWND)mainHwnd;
+    HWND mdi = FindMdiClient(main);
+    if (!mdi) { LogLine("[SPIKE-MDI] GracefulClose: no MDIClient under main=0x%p", main); return -1; }
+    HWND active = (HWND)SendMessageW(mdi, 0x0229 /*WM_MDIGETACTIVE*/, 0, 0);
+    if (!active || !IsWindow(active)) { LogLine("[SPIKE-MDI] GracefulClose: no active MDI child"); return -1; }
+    wchar_t t[256] = {0}; GetWindowTextW(active, t, 255);
+    LogLine("[SPIKE-MDI] GracefulClose: posting WM_CLOSE to active child 0x%p title='%ls'", active, t);
+    PostMessageW(active, 0x0010 /*WM_CLOSE*/, 0, 0);
+    return 0;
 }
 
 // Hide a wizard window aggressively: make it transparent (alpha=0) AND move

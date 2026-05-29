@@ -149,6 +149,15 @@ namespace EliteSoft.Erwin.AddIn
         // -> ShowConfigWarningDialog, producing two identical "no config"
         // popups for a single model open.
         private bool _inReconnectTick;
+
+        // Set true while a Review / Complete Compare pipeline is loading a Mart
+        // version into the session. Loading a version makes erwin open a new PU
+        // which the reconnect timer would otherwise treat as a model switch and
+        // re-init the addin (config reload + "Sync UDP definitions" popup) mid-
+        // pipeline - disrupting the automation and risking a form rebuild while
+        // BtnAlterWizardProd_Click is still running. ReconnectTimer_Tick early-
+        // returns while this is set; the pipeline also stops the timer outright.
+        private volatile bool _martMartPipelineActive;
         private DateTime? _lastGlossaryRefreshTime;
         private volatile bool _isRefreshingGlossary;
 
@@ -777,6 +786,18 @@ namespace EliteSoft.Erwin.AddIn
             // tick re-runs the whole detect-and-reconnect body for the same
             // locator and produces a duplicate ShowConfigWarningDialog popup.
             if (_inReconnectTick) return;
+            // Suppress all reconnect/re-init while a version-compare pipeline is
+            // loading a Mart version (the loaded PU is transient and must not
+            // trigger an addin re-init mid-pipeline).
+            if (_martMartPipelineActive) return;
+            // Defensive backstop: NEVER touch SCAPI while erwin's main window is
+            // disabled by a modal dialog (Close Model / Mart Offline / Save
+            // Models). A WinForms timer tick is on the STA/UI thread; calling
+            // _scapi.PersistenceUnits into a modal-blocked process deadlocks
+            // (erwin "Not Responding" - verified 2026-05-29). This guards the
+            // residual race where a queued WM_TIMER fires after the pipeline
+            // flag clears but a modal still lingers.
+            try { if (Services.Win32Helper.IsErwinMainWindowBlockedByModal()) return; } catch { }
             _inReconnectTick = true;
             try
             {
@@ -3471,6 +3492,87 @@ namespace EliteSoft.Erwin.AddIn
             // only, so each click is self-contained.
             BtnAlterWizardProd_Click(sender, e);
         }
+
+        // ---- RECON (Faz 2a, dev only): global hotkey Ctrl+Alt+D dumps the
+        // current foreground window's control tree to the native-bridge log.
+        // Global (system-wide) so it captures whatever erwin dialog is up while
+        // the user manually walks Review / Complete Compare - the addin form is
+        // not foreground during that flow.
+        [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+        private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
+
+        [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+        private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+
+        private const int ReconHotkeyId = 0x5245;     // 'RE'  -> Ctrl+Alt+D dump tree
+        private const int ReconCmdHotkeyId = 0x5243;   // 'RC'  -> Ctrl+Alt+C toggle cmd capture
+        private const int SpikeMdiHotkeyId = 0x534D;   // 'SM'  -> Ctrl+Alt+M dump MDI children
+        private const int SpikePuHotkeyId = 0x5350;    // 'SP'  -> Ctrl+Alt+P dump session PUs
+        private const int SpikeCloseHotkeyId = 0x5358; // 'SX'  -> Ctrl+Alt+X graceful-close active MDI child
+        private const uint MOD_ALT = 0x0001, MOD_CONTROL = 0x0002, MOD_NOREPEAT = 0x4000;
+        private const uint VK_D = 0x44;
+        private const uint VK_C = 0x43;
+        private const uint VK_M = 0x4D;
+        private const uint VK_P = 0x50;
+        private const uint VK_X = 0x58;
+        private const int WM_HOTKEY = 0x0312;
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            try
+            {
+                if (RegisterHotKey(this.Handle, ReconHotkeyId, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_D))
+                    Log("[RECON] hotkey Ctrl+Alt+D registered - press over any dialog to dump its control tree.");
+                else
+                    Log($"[RECON] RegisterHotKey(D) failed (err={System.Runtime.InteropServices.Marshal.GetLastWin32Error()}) - Ctrl+Alt+D may be taken.");
+
+                if (RegisterHotKey(this.Handle, ReconCmdHotkeyId, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_C))
+                    Log("[RECON] hotkey Ctrl+Alt+C registered - press to START cmd/notify capture on the foreground window, press again to STOP.");
+                else
+                    Log($"[RECON] RegisterHotKey(C) failed (err={System.Runtime.InteropServices.Marshal.GetLastWin32Error()}) - Ctrl+Alt+C may be taken.");
+
+                RegisterHotKey(this.Handle, SpikeMdiHotkeyId, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_M);
+                RegisterHotKey(this.Handle, SpikePuHotkeyId, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_P);
+                RegisterHotKey(this.Handle, SpikeCloseHotkeyId, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_X);
+                Log("[SPIKE] hotkeys registered - Ctrl+Alt+M=dump MDI children, Ctrl+Alt+P=dump session PUs, Ctrl+Alt+X=graceful-close ACTIVE MDI child.");
+            }
+            catch (Exception ex) { Log($"[RECON] RegisterHotKey threw: {ex.Message}"); }
+        }
+
+        protected override void OnHandleDestroyed(EventArgs e)
+        {
+            try { UnregisterHotKey(this.Handle, ReconHotkeyId); } catch { /* best-effort */ }
+            try { UnregisterHotKey(this.Handle, ReconCmdHotkeyId); } catch { /* best-effort */ }
+            try { UnregisterHotKey(this.Handle, SpikeMdiHotkeyId); } catch { /* best-effort */ }
+            try { UnregisterHotKey(this.Handle, SpikePuHotkeyId); } catch { /* best-effort */ }
+            try { UnregisterHotKey(this.Handle, SpikeCloseHotkeyId); } catch { /* best-effort */ }
+            base.OnHandleDestroyed(e);
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WM_HOTKEY)
+            {
+                int hk = m.WParam.ToInt32();
+                if (hk == ReconHotkeyId) { Services.NativeBridgeService.DumpForegroundWindowTree(Log); return; }
+                if (hk == ReconCmdHotkeyId) { Services.NativeBridgeService.ToggleReconCommandCapture(Log); return; }
+                if (hk == SpikeMdiHotkeyId)
+                {
+                    var h = Services.Win32Helper.GetErwinMainWindow();
+                    Services.NativeBridgeService.DumpMdiChildren(h, Log);
+                    return;
+                }
+                if (hk == SpikePuHotkeyId) { try { LogSessionPUs("SPIKE", Log); } catch (Exception ex) { Log($"[SPIKE] LogSessionPUs err: {ex.Message}"); } return; }
+                if (hk == SpikeCloseHotkeyId)
+                {
+                    var h = Services.Win32Helper.GetErwinMainWindow();
+                    Services.NativeBridgeService.GracefulCloseActiveMdiChild(h, Log);
+                    return;
+                }
+            }
+            base.WndProc(ref m);
+        }
 #endif
 
         private async void BtnAlterWizardProd_Click(object sender, EventArgs e)
@@ -3550,6 +3652,14 @@ namespace EliteSoft.Erwin.AddIn
             // path passes it to ShowDDLResult.
             string sourceMode = null;
 
+            // Faz 2.1 (active-vs-older-version via Review) reaches "Resolve
+            // Differences" but does NOT capture DDL yet (Apply-to-Right + 1057
+            // land in Faz 2.2/2.3). Reaching RD is a SUCCESS, not a failure, so
+            // the post-routing must not render the generic "did not produce
+            // DDL" error for this path. This flag distinguishes "intentionally
+            // no DDL yet" from "pipeline failed to produce DDL".
+            bool reviewReachedRd = false;
+
             // Auto-apply XML_OPTION TYPE='DDL' to erwin's FE options state
             // before invoking the Alter Script Wizard pipeline. The wizard
             // (driven by NativeBridgeService.GenerateAlterDdl / GenerateMart-
@@ -3580,8 +3690,17 @@ namespace EliteSoft.Erwin.AddIn
             Services.NativeBridgeService.SetUseDiagramSelection(
                 chkFilterObjects.Enabled && chkFilterObjects.Checked, log);
 
+            // FE option warm-up: write the admin XML_OPTION TYPE='DDL' into the
+            // active model's FE-options state (FEModel_DDL retains the option
+            // path; the Alter Script Wizard re-reads it on open). ALL three
+            // pipelines open a wizard that compares against _currentModel
+            // (same-version OnFE, From-DB via WM_COMMAND 1056, and the Review
+            // active-vs-older path's eventual 1057 wizard), so warm up once
+            // here for every path. Best-effort - failure is logged, not fatal.
+            // No debug Pause here: the warm-up is a background COM call, not a
+            // visible window transition, and stacking it with the pipeline's
+            // first pause made the initial wait feel like a hang.
             WarmupDdlFEOptions(log);
-            Services.DebugMode.Pause("FE option XML warmed up - about to dispatch DDL pipeline", log);
 
             try
             {
@@ -3624,6 +3743,7 @@ namespace EliteSoft.Erwin.AddIn
                         // the proven flash-free path used by Debug Log's
                         // "Normal Alter DDL (dirty vs save)" button.
                         log($"[ROUTE] Same version v{v} on both sides - OnFE fast path (dirty vs last saved, no flashes)");
+                        // (FE options already warmed once before the routing.)
                         // Splash: the Next-loop + GA detour takes ~1-3 s on
                         // Mart-bound models; without the overlay the user
                         // sees a frozen ribbon and may double-click. Cross-
@@ -3787,14 +3907,192 @@ namespace EliteSoft.Erwin.AddIn
                     } // close: else if (leftIsActive && LegacyCrossVersionEnabled)
                     else if (leftIsActive)
                     {
-                        // Active model vs an OLDER Mart version. Faz 2 will run
-                        // this through erwin's Review wizard (which captures the
-                        // active dirty buffer and releases the loaded version on
-                        // close). Not yet wired - surface a clear message rather
-                        // than silently doing nothing or running the gated legacy
-                        // path (feedback_no_silent_fallback).
-                        err = "Aktif model ile eski bir versiyon karsilastirmasi 'Review' wizard ile yapilacak (Faz 2 - cok yakinda). " +
-                              "Su an yalniz son (current) versiyonla karsilastirma aktif.";
+                        // Active dirty model vs an OLDER Mart version via erwin's
+                        // Review wizard (only Review puts the unsaved buffer on
+                        // the left). Faz 2.1 scope: reach Resolve Differences
+                        // (left=active dirty, right=selected version), then tear
+                        // down cleanly. Apply-to-Right arrow + WM_COMMAND 1057 +
+                        // DDL capture land in Faz 2.2/2.3.
+                        string catalog = ParseActivePuCatalog();
+                        if (v <= 0 || string.IsNullOrEmpty(catalog))
+                        {
+                            err = "Could not derive right-version or Mart catalog path for the Review compare.";
+                        }
+                        else
+                        {
+                            bool keepVisible = Services.DebugMode.KeepDialogsVisible;
+                            Services.NativeBridgeService.SyncDebugVisibility(log);
+
+                            // Suppress addin re-init while Review loads the version
+                            // (the loaded PU must not trigger a reconnect/UDP popup).
+                            _martMartPipelineActive = true;
+                            StopReconnectTimer();
+                            _validationCoordinatorService?.SuspendValidation();
+                            try { _tableTypeMonitorService?.StopMonitoring(); } catch (Exception ex) { log($"[REVIEW] StopMonitoring err: {ex.Message}"); }
+                            try { _validationService?.StopMonitoring(); } catch (Exception ex) { log($"[REVIEW] ColumnValidation StopMonitoring err: {ex.Message}"); }
+                            log("[REVIEW] monitoring suspended + reconnect timer stopped for pipeline");
+
+                            var overlay = ShowBusyOverlay("Comparing versions, please wait...");
+                            Services.MartMartAutomation.CCSession rsess = null;
+                            try
+                            {
+                                // No DebugMode.Pause on the UI thread here: Thread.Sleep
+                                // would freeze the addin form's message pump. The
+                                // per-step observation pauses live INSIDE
+                                // DriveReviewToResolveDifferences, which runs on this
+                                // Task.Run worker thread, so they pace the wizard
+                                // without blocking the UI.
+                                rsess = await System.Threading.Tasks.Task.Run(() =>
+                                    Services.MartMartAutomation.DriveReviewToResolveDifferences(v, catalog, keepVisible, (Action<string>)log));
+
+                                if (rsess == null || rsess.ResolveDifferences == IntPtr.Zero)
+                                {
+                                    err = "Review wizard did not reach Resolve Differences (see Debug Log). " +
+                                          "If the active model has no unsaved changes, Review cannot open.";
+                                }
+                                else
+                                {
+                                    log($"[REVIEW] reached Resolve Differences (RD=0x{rsess.ResolveDifferences.ToInt64():X}) - Apply-to-Right + alter DDL capture");
+                                    reviewReachedRd = true;
+
+                                    // Faz 2.2/2.3: Apply-to-Right (cascade active
+                                    // v2 -> v1) then capture the alter DDL via the
+                                    // proven RD-generic chain (1056 -> FE Wizard ->
+                                    // Next-loop -> Preview -> GA hook). Runs while
+                                    // RD is still OPEN; the outer finally tears the
+                                    // session down afterwards.
+                                    IntPtr capturedWizard = IntPtr.Zero;
+                                    try
+                                    {
+                                        bool applied = await System.Threading.Tasks.Task.Run(() =>
+                                            Services.MartMartAutomation.ApplyToRightArrowOnReviewRd(rsess.ResolveDifferences, (Action<string>)log));
+                                        if (!applied)
+                                        {
+                                            err = "Review Apply-to-Right did not register (no EDR tx) - see Debug Log.";
+                                        }
+                                        else
+                                        {
+                                            Services.NativeBridgeService.ClearCapturedDdl();
+                                            Services.MartMartAutomation.ClearLastCapturedWizardDdl();
+                                            // cmd 1057 = RIGHT Alter Script (enabled after
+                                            // Apply-to-Right). 1056 is the LEFT button and is
+                                            // DISABLED here - clicking it never opened the wizard.
+                                            capturedWizard = await Services.MartMartAutomation
+                                                .ClickRightAlterScriptInRdAsync(rsess.ResolveDifferences, 1057, (Action<string>)log);
+                                            if (capturedWizard == IntPtr.Zero)
+                                            {
+                                                err = "Right Alter Script (cmd 1057) click failed - FE Wizard did not appear.";
+                                            }
+                                            else
+                                            {
+                                                // Hide the FE wizard AND the RD before driving the
+                                                // Next-loop: it is WM_COMMAND-based and the GA hook
+                                                // captures DDL regardless of visibility, so in
+                                                // production (non-debug) we keep both off-screen.
+                                                if (!keepVisible)
+                                                {
+                                                    try { Services.MartMartAutomation.HideWindow(capturedWizard); }
+                                                    catch (Exception hex) { log($"[REVIEW] wizard hide err: {hex.Message}"); }
+                                                    try { Services.MartMartAutomation.HideWindow(rsess.ResolveDifferences); }
+                                                    catch (Exception hex) { log($"[REVIEW] RD hide err: {hex.Message}"); }
+                                                }
+                                                bool previewOk = await Services.MartMartAutomation
+                                                    .ClickWizardPreviewTabAsync(capturedWizard, (Action<string>)log);
+                                                if (!previewOk)
+                                                {
+                                                    err = "Wizard Next-loop / Preview tab failed.";
+                                                }
+                                                else
+                                                {
+                                                    string stashed = Services.MartMartAutomation.LastCapturedWizardDdl;
+                                                    if (!string.IsNullOrEmpty(stashed))
+                                                    {
+                                                        script = stashed;
+                                                        log($"[REVIEW] DDL stashed by Next-loop ({stashed.Length} chars)");
+                                                        Services.MartMartAutomation.ClearLastCapturedWizardDdl();
+                                                    }
+                                                    else
+                                                    {
+                                                        log("[REVIEW] no stashed DDL - polling capture buffer");
+                                                        for (int i = 0; i < 30; i++)
+                                                        {
+                                                            await System.Threading.Tasks.Task.Delay(200);
+                                                            string ddl = await System.Threading.Tasks.Task.Run(() =>
+                                                                Services.NativeBridgeService.ConsumeLastCapturedDdl());
+                                                            if (!string.IsNullOrEmpty(ddl)) { script = ddl; log($"[REVIEW] DDL captured ({ddl.Length} chars) after {(i + 1) * 200}ms"); break; }
+                                                        }
+                                                        if (script == null) err = "DDL not captured within 6s after Next-loop.";
+                                                    }
+                                                    if (!string.IsNullOrEmpty(script))
+                                                    {
+                                                        sourceMode = "Review-Active-vs-Version";
+                                                        lblDDLStatus.Text = $"Review: alter DDL captured (active vs v{v}, {script.Length} chars).";
+                                                        lblDDLStatus.ForeColor = Color.DarkGreen;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    finally
+                                    {
+                                        if (capturedWizard != IntPtr.Zero)
+                                        {
+                                            try { await Services.MartMartAutomation.DismissUseCurrentDiagramPopupAsync((Action<string>)log); }
+                                            catch (Exception pex) { log($"[REVIEW] popup dismiss err: {pex.Message}"); }
+                                            try { await Services.MartMartAutomation.CloseFEWizardCleanAsync(capturedWizard, (Action<string>)log); }
+                                            catch (Exception dex) { log($"[REVIEW] wizard close err: {dex.Message}"); }
+                                        }
+                                    }
+                                }
+                            }
+                            finally
+                            {
+                                // GRACEFUL teardown (2026-05-29): IDCANCEL the RD +
+                                // CC wizards (releases the ;Duplicate=YES copy), then
+                                // WM_CLOSE the loaded v1 child and close its "Save
+                                // Models" prompt WITHOUT saving (uncheck the single
+                                // save row + OK), then drive "Mart Offline" to
+                                // Save-to=Close. A single-row guard inside
+                                // CloseReviewSession means the active dirty v2 (never
+                                // listed in that dialog) is never touched. Runs on a
+                                // bg thread so erwin's STA UI can surface its dialogs;
+                                // the modal guard in ReconnectTimer_Tick + the
+                                // pipeline flag staying TRUE keep erwin responsive.
+                                // Close the busy overlay BEFORE the teardown: if it
+                                // (a TopMost addin form) covers the Save Models dialog,
+                                // the teardown's checkbox mouse-click lands on the
+                                // overlay instead of the checkbox and silently no-ops
+                                // (suspected splash-cover, 2026-05-29). Teardown
+                                // dialogs flash briefly but that is acceptable.
+                                try { overlay?.Close(); } catch { }
+
+                                if (rsess != null)
+                                {
+                                    try
+                                    {
+                                        LogSessionPUs("REVIEW-PRE-CLOSE", log);
+                                        await System.Threading.Tasks.Task.Run(() =>
+                                            Services.MartMartAutomation.CloseReviewSession(rsess, (Action<string>)log));
+                                        LogSessionPUs("REVIEW-POST-CLOSE", log);
+                                    }
+                                    catch (Exception ex) { log($"[REVIEW] teardown err: {ex.Message}"); }
+                                }
+
+                                // Resume monitoring fire-and-forget. Clear the
+                                // pipeline guard + restart the reconnect timer LAST
+                                // so no tick can touch SCAPI while a teardown dialog
+                                // is still up (the modal guard backstops this too).
+                                _ = System.Threading.Tasks.Task.Run(() =>
+                                {
+                                    try { _validationCoordinatorService?.ResumeValidation(); } catch (Exception ex) { try { log($"[REVIEW] bg ResumeValidation err: {ex.Message}"); } catch { } }
+                                    try { _tableTypeMonitorService?.StartMonitoring(); } catch (Exception ex) { try { log($"[REVIEW] bg StartMonitoring err: {ex.Message}"); } catch { } }
+                                    try { _validationService?.StartMonitoring(); } catch (Exception ex) { try { log($"[REVIEW] bg ColumnValidation StartMonitoring err: {ex.Message}"); } catch { } }
+                                });
+                                _martMartPipelineActive = false;
+                                try { StartReconnectTimer(); } catch (Exception ex) { log($"[REVIEW] StartReconnectTimer err: {ex.Message}"); }
+                                log("[REVIEW] pipeline complete - graceful teardown attempted (observe-mode); monitoring + reconnect resumed");
+                            }
+                        }
                     }
                     else
                     {
@@ -3827,6 +4125,14 @@ namespace EliteSoft.Erwin.AddIn
                 lblDDLStatus.Text = $"Error: {err}";
                 lblDDLStatus.ForeColor = Color.Red;
                 ErwinAddIn.ShowTopMostMessage($"DDL generation failed:\n\n{err}", "Generate DDL", isError: true);
+            }
+            else if (reviewReachedRd && string.IsNullOrEmpty(script))
+            {
+                // Review path reached Resolve Differences but produced no DDL
+                // AND set no error (defensive). Status label already shows the
+                // checkpoint; do NOT fall through to the generic "did not
+                // produce DDL" error. When capture succeeds, script is set and
+                // this guard is skipped so the DDL renders normally below.
             }
             else if (script == null)
             {

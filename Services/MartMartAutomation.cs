@@ -39,6 +39,15 @@ namespace EliteSoft.Erwin.AddIn.Services
         private static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
         [DllImport("user32.dll")]
         private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+        [DllImport("kernel32.dll")]
+        private static extern uint GetCurrentThreadId();
+        [DllImport("user32.dll")]
+        private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+        [DllImport("user32.dll")]
+        private static extern IntPtr SetActiveWindow(IntPtr hWnd);
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetAncestor(IntPtr hWnd, uint gaFlags);
+        private const uint GA_ROOT = 2;
         [DllImport("user32.dll")]
         private static extern bool IsWindowVisible(IntPtr hWnd);
         [DllImport("user32.dll")]
@@ -142,6 +151,13 @@ namespace EliteSoft.Erwin.AddIn.Services
         private static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, bool bRepaint);
         [DllImport("user32.dll")]
         private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+        private const uint GW_CHILD = 5;
+        private const uint GW_HWNDNEXT = 2;
+        private const uint WM_MDIGETACTIVE = 0x0229;
+        private const uint WM_MDIACTIVATE_MSG = 0x0222;
+        private const uint WM_CLOSE_MSG = 0x0010;
         [DllImport("user32.dll")]
         private static extern bool ClientToScreen(IntPtr hWnd, ref POINT lpPoint);
         [DllImport("user32.dll")]
@@ -259,6 +275,38 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
         }
 
+        /// <summary>
+        /// Force a window foreground + active from a BACKGROUND thread. Plain
+        /// SetForegroundWindow fails from a non-foreground thread (Win32
+        /// foreground-lock), which left the Save Models XTP dialog INACTIVE so
+        /// its checkbox mouse-click silently no-op'd in production (verified
+        /// 2026-05-29: prod left the save box checked -> v1 not closed). We
+        /// AttachThreadInput to the window's UI thread to lift the lock, then
+        /// detach in finally. Same-process (addin is COM-hosted in erwin.exe)
+        /// so the attach is between two threads of one process.
+        /// </summary>
+        private static void ForceForeground(IntPtr hWnd)
+        {
+            if (hWnd == IntPtr.Zero) return;
+            uint myTid = GetCurrentThreadId();
+            uint targetTid = GetWindowThreadProcessId(hWnd, out _);
+            bool attached = false;
+            try
+            {
+                if (targetTid != 0 && targetTid != myTid)
+                    attached = AttachThreadInput(myTid, targetTid, true);
+                try { UnhideWindow(hWnd); } catch { }
+                BringWindowToTop(hWnd);
+                SetForegroundWindow(hWnd);
+                SetActiveWindow(hWnd);
+            }
+            catch { }
+            finally
+            {
+                if (attached) { try { AttachThreadInput(myTid, targetTid, false); } catch { } }
+            }
+        }
+
         // Messages + command IDs (from old WizardAutomationService reverse-engineering)
         private const uint WM_COMMAND = 0x0111;
         private const int CMD_COMPLETE_COMPARE = 1082;   // main frame menu: open CC wizard
@@ -268,7 +316,8 @@ namespace EliteSoft.Erwin.AddIn.Services
         private const int CC_CLOSE  = 12327;             // CC wizard Close
         private const int CMD_FROM_MART_RADIO = 1081;    // Right Model page: From Mart radio
         private const int CMD_LOAD_BUTTON     = 1082;    // Right Model page: Load button
-        private const int CMD_RD_ALTER_SCRIPT = 1056;    // Resolve Differences toolbar: Alter Script
+        private const int CMD_RD_ALTER_SCRIPT = 1056;    // Resolve Differences toolbar: LEFT Alter Script (From-DB direction)
+        private const int CMD_RD_RIGHT_ALTER_SCRIPT = 1057; // RD toolbar: RIGHT Alter Script (enabled after Apply-to-Right; Review direction). 1056 is LEFT and DISABLED post-apply - verified by RD toolbar dump 2026-05-29
         private const int IDCANCEL = 2;
         private const int IDOK     = 1;
         private const int IDYES    = 6;
@@ -287,6 +336,10 @@ namespace EliteSoft.Erwin.AddIn.Services
             public IntPtr CCWizard;
             public IntPtr ResolveDifferences;
             public bool Applied;
+            // UI-Open path (Faz 2): the prior-version model opened as its own
+            // MDI child to serve as the compare RIGHT side. Closed via
+            // CloseMartMdiChild in cleanup (graceful WM_CLOSE - no PUs.Remove).
+            public IntPtr VersionChild;
         }
 
         /// <summary>
@@ -368,6 +421,320 @@ namespace EliteSoft.Erwin.AddIn.Services
                 log?.Invoke($"  diag flow threw: {ex.GetType().Name}: {ex.Message}");
                 return session.CCWizard != IntPtr.Zero ? session : null;
             }
+        }
+
+        /// <summary>
+        /// Phase 2 (active-vs-older version): drive erwin's Mart &gt; REVIEW
+        /// wizard to Resolve Differences. Review is used instead of Complete
+        /// Compare because ONLY Review puts the active model WITH its unsaved
+        /// (dirty) changes on the left; Complete Compare uses the last-saved
+        /// state. Right side = the chosen older Mart version, selected via the
+        /// same <see cref="SelectMartVersionInPicker"/> the CC flow uses.
+        ///
+        /// Mirrors <see cref="DriveCCToResolveDifferencesVisible"/> exactly
+        /// except the LAUNCH step: instead of WM_COMMAND CMD_COMPLETE_COMPARE
+        /// it clicks the ribbon "Review" button (the only entry that captures
+        /// the dirty buffer). The post-launch wizard pages, command ids
+        /// (Back/Next/Compare = 12323/12324/12325, Mart radio 1081, Load 1082)
+        /// and the Mart picker are identical (verified via 2026-05-28 recon).
+        ///
+        /// Requires the active model to have changes - if it is clean, Review
+        /// does not open and this returns null (caller should fall back to
+        /// Complete Compare per the agreed routing).
+        ///
+        /// Returns a <see cref="CCSession"/> with the Resolve Differences
+        /// handle on success, or null. Caller MUST pass the result to
+        /// <see cref="CloseSession"/> for the Close Model + Mart Offline
+        /// teardown that releases the loaded version.
+        /// </summary>
+        public static CCSession DriveReviewToResolveDifferences(
+            int rightVersion, string catalogPath, bool keepVisible, Action<string> log)
+        {
+            var session = new CCSession();
+            try
+            {
+                IntPtr erwinMain = FindErwinMain();
+                if (erwinMain == IntPtr.Zero) { log?.Invoke("  [REVIEW] erwin main window not found."); return null; }
+
+                IntPtr mdiClient = FindMdiClientOf(erwinMain);
+                if (mdiClient == IntPtr.Zero) { log?.Invoke("  [REVIEW] MDIClient not found."); return null; }
+
+                // Capture the active dirty model (the compare LEFT) so we can
+                // flip back to it after opening the version child.
+                IntPtr dirtyChild = GetActiveMdiChild(mdiClient);
+                log?.Invoke($"  [REVIEW] active dirty child = 0x{dirtyChild.ToInt64():X} title='{GetTitle(dirtyChild)}'");
+                var beforeChildren = new System.Collections.Generic.HashSet<IntPtr>(EnumMartMdiChildHandles(mdiClient));
+
+                // ---- STEP 1: open the older version as ITS OWN MDI child via
+                // erwin's privileged main "Open" (not SCAPI, not the wizard
+                // Load - this is what the user does manually; multiple versions
+                // coexist). Reuses the catalog Open picker automation as-is.
+                DebugMode.Pause($"about to open v{rightVersion} as its own MDI child (Mart > Open)", log);
+                var dlgsBeforeOpen = EnumerateVisibleDialogs();
+                log?.Invoke("  [REVIEW-1] Mart > Open (open older version as MDI child)");
+                if (!Win32Helper.InvokeToolbarButton(erwinMain, "Open", log))
+                {
+                    log?.Invoke("  [REVIEW] 'Open' toolbar button not found.");
+                    return null;
+                }
+                IntPtr picker = WaitForNewDialog(dlgsBeforeOpen, "Open picker", 6000, log);
+                if (picker == IntPtr.Zero) { log?.Invoke("  [REVIEW] Open picker did not appear."); return null; }
+                if (!keepVisible) HideWindow(picker);
+                if (!SelectMartVersionInPicker(picker, rightVersion, catalogPath, log))
+                {
+                    log?.Invoke($"  [REVIEW] picker select failed for v{rightVersion}.");
+                    PostMessage(picker, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero);
+                    return session;
+                }
+                IntPtr versionChild = WaitForNewMartMdiChild(mdiClient, beforeChildren, 8000, log);
+                if (versionChild == IntPtr.Zero) { log?.Invoke("  [REVIEW] version MDI child did not appear after Open."); return session; }
+                session.VersionChild = versionChild;
+                log?.Invoke($"  [REVIEW-2] v{rightVersion} opened as MDI child 0x{versionChild.ToInt64():X}");
+                LogChildDirty("after Open (read-only attempted if DebugMode)", session.VersionChild, log);
+                DebugMode.Pause($"v{rightVersion} opened as MDI child", log);
+
+                // ---- STEP 2: flip the active child back to the dirty model so
+                // Review/CC defaults LEFT = active dirty.
+                if (dirtyChild != IntPtr.Zero) ActivateMdiChildHandle(mdiClient, dirtyChild, log);
+                DebugMode.Pause("re-activated dirty model as compare LEFT", log);
+
+                // ---- STEP 3: launch Review and reach the Right Model page.
+                var dialogsBeforeReview = EnumerateVisibleDialogs();
+                log?.Invoke("  [REVIEW-3] launching Mart > Review (LEFT = active dirty model)");
+                if (!Win32Helper.InvokeToolbarButton(erwinMain, "Review", log))
+                {
+                    log?.Invoke("  [REVIEW] 'Review' toolbar button not found.");
+                    return session;
+                }
+                IntPtr ccWizard = WaitForNewDialog(dialogsBeforeReview, "Review wizard", 6000, log);
+                if (ccWizard == IntPtr.Zero)
+                {
+                    log?.Invoke("  [REVIEW] wizard did not open - active model may have NO changes (Review needs dirty edits).");
+                    return session;
+                }
+                if (!keepVisible) HideWindow(ccWizard);
+                session.CCWizard = ccWizard;
+                DebugMode.Pause("Review wizard opened", log);
+
+                for (int i = 0; i < 12; i++)
+                {
+                    string t = GetTitle(ccWizard);
+                    if (t.StartsWith("Wizard Overview", StringComparison.OrdinalIgnoreCase)
+                        || t.StartsWith("Overview", StringComparison.OrdinalIgnoreCase)) break;
+                    PostMessage(ccWizard, WM_COMMAND, MakeWParam(CC_BACK, 0), IntPtr.Zero);
+                    Thread.Sleep(100);
+                }
+                log?.Invoke("  [REVIEW-4] Overview + Next x2 -> Right Model");
+                PostMessage(ccWizard, WM_COMMAND, MakeWParam(CC_NEXT, 0), IntPtr.Zero); Thread.Sleep(200);
+                PostMessage(ccWizard, WM_COMMAND, MakeWParam(CC_NEXT, 0), IntPtr.Zero); Thread.Sleep(400);
+                DebugMode.Pause("reached Right Model page", log);
+
+                // ---- STEP 4: select the opened version from "Open Models in
+                // Memory" (id=1083) - NO catalog Load, since it's already an
+                // in-session MDI child (same shape as the From-DB pipeline).
+                if (!SelectInMemoryModelOnRightPage(ccWizard, rightVersion, log))
+                {
+                    log?.Invoke($"  [REVIEW] could not select v{rightVersion} from in-memory list.");
+                    return session;
+                }
+                LogChildDirty("after in-memory select", session.VersionChild, log);
+                DebugMode.Pause($"selected v{rightVersion} from in-memory list (no Load)", log);
+
+                // ---- STEP 5: Compare -> Resolve Differences.
+                LogChildDirty("before CC_COMPARE", session.VersionChild, log);
+                log?.Invoke("  [REVIEW-5] Compare");
+                PostMessage(ccWizard, WM_COMMAND, MakeWParam(CC_COMPARE, 0), IntPtr.Zero);
+                Thread.Sleep(800);
+
+                IntPtr popup = WaitForDialog("erwin Data Modeler", 1500);
+                if (popup != IntPtr.Zero && popup != ccWizard)
+                {
+                    try
+                    {
+                        var pop = AutomationElement.FromHandle(popup);
+                        if (pop != null) ClickButtonByName(pop, new[] { "No", "Hayır", "Cancel", "İptal" });
+                    }
+                    catch { }
+                    log?.Invoke("  [REVIEW] unexpected popup after Compare - dismissed; aborting.");
+                    return session;
+                }
+
+                IntPtr rd = WaitForDialog("Resolve Differences", 10000);
+                if (rd == IntPtr.Zero) { log?.Invoke("  [REVIEW] Resolve Differences did not open."); return session; }
+                log?.Invoke($"  [REVIEW] Resolve Differences = 0x{rd.ToInt64():X}");
+                session.ResolveDifferences = rd;
+                LogChildDirty("after Resolve Differences", session.VersionChild, log);
+                DebugMode.Pause("Resolve Differences opened (active dirty vs selected version)", log);
+                return session;
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"  [REVIEW] threw: {ex.GetType().Name}: {ex.Message}");
+                return (session.CCWizard != IntPtr.Zero || session.VersionChild != IntPtr.Zero) ? session : null;
+            }
+        }
+
+        /// <summary>
+        /// Review-path Apply-to-Right: synthesize a real mouse click on the
+        /// Apply-to-Right arrow (listview id=200, row 0, subitem 6) of the
+        /// Resolve Differences dialog to cascade the active dirty v2 (LEFT)
+        /// changes onto the older version v1 (RIGHT). Returns true if the click
+        /// fired an EDR transaction (the apply registered) - the precondition
+        /// for ClickRightAlterScriptInRdAsync to read valid CC state.
+        ///
+        /// DELIBERATE COPY of the proven From-DB Apply-to-Right block
+        /// (DriveCCDbAndApply ~lines 820-934), kept separate for now so the
+        /// working From-DB pipeline is not destabilised; to be unified into one
+        /// shared helper once the Review DDL pipeline is proven end-to-end
+        /// (committed follow-up, see project memory). XTP filters synthetic
+        /// WM_LBUTTON*, so a raw mouse_event (SetCursorPos + down/up via
+        /// SendMouseClickAt) is the only path; a 2-attempt retry covers a
+        /// first-click miss before the listview hot-track zone settles.
+        /// </summary>
+        public static bool ApplyToRightArrowOnReviewRd(IntPtr rd, Action<string> log)
+        {
+            if (rd == IntPtr.Zero || !IsWindow(rd)) { log?.Invoke("  [REVIEW-APPLY] RD invalid"); return false; }
+            try
+            {
+                // Poll the RD listview (id=200) until it has >=1 item AND the
+                // row-0 arrow subitem rect is non-zero. Clicking too early fires
+                // a bogus EDR tx that makes OnFE emit "No schema to generate".
+                IntPtr lv = IntPtr.Zero;
+                int polled = 0; const int pollStep = 50; const int pollMaxMs = 1500;
+                while (polled < pollMaxMs)
+                {
+                    lv = FindListViewById(rd, 200, log: null);
+                    if (lv != IntPtr.Zero)
+                    {
+                        int cnt = SendMessage(lv, LVM_GETITEMCOUNT, IntPtr.Zero, IntPtr.Zero).ToInt32();
+                        if (cnt > 0)
+                        {
+                            RECT testRc = new RECT { left = LVIR_BOUNDS, top = 6, right = 0, bottom = 0 };
+                            SendMessage(lv, LVM_GETSUBITEMRECT, new IntPtr(0), ref testRc);
+                            if (testRc.right > testRc.left && testRc.bottom > testRc.top)
+                            {
+                                log?.Invoke($"  [REVIEW-APPLY] listview ready after {polled}ms (items={cnt}, arrow rect ok)");
+                                break;
+                            }
+                        }
+                    }
+                    Thread.Sleep(pollStep);
+                    polled += pollStep;
+                }
+                if (lv == IntPtr.Zero) { log?.Invoke($"  [REVIEW-APPLY] listview id=200 not found within {pollMaxMs}ms"); return false; }
+
+                // Make the RD visible + on top BEFORE measuring/clicking. In
+                // production (non-debug) the wizard/dialogs are hidden, so the
+                // mouse click would otherwise land on an off-screen / layered
+                // window and miss. Mirrors ClickRightAlterScriptInRd's unhide.
+                try { BringWindowToTop(rd); SetForegroundWindow(rd); UnhideWindow(rd); } catch { }
+                Thread.Sleep(60);
+
+                int total = SendMessage(lv, LVM_GETITEMCOUNT, IntPtr.Zero, IntPtr.Zero).ToInt32();
+                log?.Invoke($"  [REVIEW-APPLY] LV items={total}; clicking row 0 Apply-to-Right arrow (subitem 6)");
+
+                RECT rc = new RECT { left = LVIR_BOUNDS, top = 6, right = 0, bottom = 0 };
+                SendMessage(lv, LVM_GETSUBITEMRECT, new IntPtr(0), ref rc);
+                POINT pt = new POINT { X = (rc.left + rc.right) / 2, Y = (rc.top + rc.bottom) / 2 };
+                if (!ClientToScreen(lv, ref pt)) { log?.Invoke("  [REVIEW-APPLY] ClientToScreen failed"); return false; }
+                log?.Invoke($"  [REVIEW-APPLY] click target (screen) = ({pt.X},{pt.Y})");
+
+                int txBefore = NativeBridgeService.GetEdrTxCount();
+                if (!GetCursorPos(out POINT saved)) { log?.Invoke("  [REVIEW-APPLY] GetCursorPos failed"); return false; }
+
+                int txAfter = txBefore;
+                for (int attempt = 1; attempt <= 2; attempt++)
+                {
+                    SetForegroundWindow(rd);
+                    try
+                    {
+                        ShowCursor(false);
+                        SendMouseClickAt(pt.X, pt.Y, log);
+                        Thread.Sleep(20);
+                    }
+                    finally
+                    {
+                        SetCursorPos(saved.X, saved.Y);
+                        ShowCursor(true);
+                    }
+                    log?.Invoke($"  [REVIEW-APPLY] attempt {attempt}: click fired, waiting for EDR tx settle");
+                    txAfter = WaitForEdrTxSettle(txBefore, timeoutMs: 2500, stableMs: 350, log);
+                    if (txAfter > txBefore) { log?.Invoke($"  [REVIEW-APPLY] attempt {attempt}: tx delta = {txAfter - txBefore}"); break; }
+                    log?.Invoke($"  [REVIEW-APPLY] attempt {attempt}: no tx - retrying...");
+                    Thread.Sleep(100);
+                }
+                bool applied = txAfter > txBefore;
+                if (!applied) { log?.Invoke("  [REVIEW-APPLY] [WARN] click did not trigger EDR tx after 2 attempts."); return false; }
+
+                // Re-hide the RD in production (reduce flash). The toolbar still
+                // answers TB_* messages while hidden, and ClickRightAlterScriptInRd
+                // re-unhides it for the 1057 click.
+                if (!DebugMode.KeepDialogsVisible) { try { HideWindow(rd); } catch { } }
+
+                // After Apply-to-Right, the RIGHT Alter Script button
+                // (cmd 1057) becomes enabled (the LEFT one, 1056, stays
+                // DISABLED - that was the bug: we were clicking 1056). Wait for
+                // 1057 to be enabled before the caller invokes
+                // ClickRightAlterScriptInRdAsync(rd, CMD_RD_RIGHT_ALTER_SCRIPT).
+                WaitForRdAlterScriptEnabled(rd, CMD_RD_RIGHT_ALTER_SCRIPT, log);
+                return true;
+            }
+            catch (Exception ex) { log?.Invoke($"  [REVIEW-APPLY] threw: {ex.GetType().Name}: {ex.Message}"); return false; }
+        }
+
+        /// <summary>
+        /// Polls the RD's toolbar(s) until the "Right Alter Script" button
+        /// (cmd 1056 = <see cref="CMD_RD_ALTER_SCRIPT"/>) reports TBSTATE_ENABLED
+        /// (0x04), up to ~3s. erwin leaves it disabled for ~100-200ms after an
+        /// Apply-to-Right, so clicking it immediately is a visible no-op that
+        /// never opens the FE Alter Script wizard. On the first poll it also
+        /// DUMPS every toolbar button (cmd + state) so the log reveals the full
+        /// button set + which are enabled - confirming 1056 is the right button
+        /// and whether it was disabled. Returns true once 1056 is enabled,
+        /// false on timeout (caller proceeds anyway). Diagnostic-only enumerate;
+        /// posts nothing.
+        /// </summary>
+        private static bool WaitForRdAlterScriptEnabled(IntPtr rd, int cmdId, Action<string> log)
+        {
+            const byte TBSTATE_ENABLED = 0x04;
+            const byte TBSTATE_HIDDEN = 0x08;
+            const byte TBSTYLE_SEP = 0x01;
+            bool dumped = false;
+            for (int attempt = 0; attempt < 12; attempt++)   // ~12 x 250ms = 3s
+            {
+                bool found = false, enabled = false;
+                EnumChildWindows(rd, (tb, _) =>
+                {
+                    var cls = new StringBuilder(64);
+                    GetClassName(tb, cls, cls.Capacity);
+                    if (cls.ToString() != "ToolbarWindow32") return true;
+                    int count = SendMessage(tb, TB_BUTTONCOUNT, IntPtr.Zero, IntPtr.Zero).ToInt32();
+                    for (int i = 0; i < count; i++)
+                    {
+                        var tbb = new TBBUTTON();
+                        SendMessageTbButton(tb, TB_GETBUTTON, new IntPtr(i), ref tbb);
+                        bool isEnabled = (tbb.fsState & TBSTATE_ENABLED) != 0;
+                        if (!dumped)
+                        {
+                            bool isSep = (tbb.fsStyle & TBSTYLE_SEP) != 0;
+                            bool isHidden = (tbb.fsState & TBSTATE_HIDDEN) != 0;
+                            log?.Invoke($"  [RAS-WAIT] tb=0x{tb.ToInt64():X} btn[{i}] cmdId={tbb.idCommand} state=0x{tbb.fsState:X2} style=0x{tbb.fsStyle:X2}{(isSep ? " SEP" : "")}{(isHidden ? " HIDDEN" : "")}{(isEnabled ? " ENABLED" : " disabled")}");
+                        }
+                        if (tbb.idCommand == cmdId) { found = true; if (isEnabled) enabled = true; }
+                    }
+                    return true;
+                }, IntPtr.Zero);
+                dumped = true;
+                if (found && enabled)
+                {
+                    log?.Invoke($"  [RAS-WAIT] cmd {cmdId} ENABLED after {attempt * 250}ms");
+                    Thread.Sleep(200);   // small extra settle once enabled
+                    return true;
+                }
+                Thread.Sleep(250);
+            }
+            log?.Invoke($"  [RAS-WAIT] cmd {cmdId} not enabled within 3s; proceeding anyway (see button dump above)");
+            return false;
         }
 
         /// <summary>
@@ -1286,19 +1653,31 @@ namespace EliteSoft.Erwin.AddIn.Services
                 log?.Invoke($"    TB_BUTTONCOUNT = {count}");
                 if (count <= 0) return false;
 
-                // Walk all buttons, log their command IDs, pick visual
-                // index 2 (3rd from left) as the "Close" action.
+                // Walk all buttons and pick the 3rd VISIBLE one (the user's
+                // "üstten 3. ikon" = Set All to Close). The toolbar's leading
+                // buttons can be HIDDEN (TBSTATE_HIDDEN=0x08) and there are
+                // separators (TBSTYLE_SEP=0x01) - both must be skipped, else
+                // the raw index 2 lands on a hidden button whose WM_COMMAND is
+                // a no-op (verified 2026-05-29: btn[0..2] were hidden, so the
+                // Save-to stayed "Offline" and OK spawned a Save As dialog).
+                const byte TBSTATE_HIDDEN = 0x08;
+                const byte TBSTYLE_SEP    = 0x01;
                 int chosenCmd = 0;
+                int visibleIdx = 0;
                 for (int i = 0; i < count; i++)
                 {
                     var tbb = new TBBUTTON();
                     SendMessageTbButton(toolbarHwnd, TB_GETBUTTON, new IntPtr(i), ref tbb);
-                    log?.Invoke($"    btn[{i}] cmdId={tbb.idCommand} state=0x{tbb.fsState:X2} style=0x{tbb.fsStyle:X2}");
-                    if (i == 2) chosenCmd = tbb.idCommand;
+                    bool isSep = (tbb.fsStyle & TBSTYLE_SEP) != 0;
+                    bool isHidden = (tbb.fsState & TBSTATE_HIDDEN) != 0;
+                    log?.Invoke($"    btn[{i}] cmdId={tbb.idCommand} state=0x{tbb.fsState:X2} style=0x{tbb.fsStyle:X2}{(isSep ? " SEP" : "")}{(isHidden ? " HIDDEN" : "")}");
+                    if (isSep || isHidden) continue;
+                    if (visibleIdx == 2) chosenCmd = tbb.idCommand;   // 3rd visible
+                    visibleIdx++;
                 }
                 if (chosenCmd == 0)
                 {
-                    log?.Invoke("    no btn[2] command id captured");
+                    log?.Invoke($"    no 3rd-visible toolbar button captured ({visibleIdx} visible button(s))");
                     return false;
                 }
 
@@ -1860,36 +2239,74 @@ namespace EliteSoft.Erwin.AddIn.Services
                     }
                 }
 
-                // Step 1: ensure a model is selected in the DataGrid (SysListView32 id=30270).
-                // After catalog navigation the grid should be populated.
+                // Step 1: select the model row whose name matches the active
+                // model's catalog name (last segment of catalogPath, e.g.
+                // "MetaRepo") - NOT the first row. Selecting firstRow loaded the
+                // WRONG model (e.g. "CrashTest", alphabetically first in the
+                // Kursat catalog) which crashed erwin (verified 2026-05-29).
+                // There is deliberately NO fallback to firstRow: loading a
+                // different model is far worse than failing cleanly.
+                string wantModel = "";
+                try
+                {
+                    var segs2 = (catalogPath ?? "").Split(new[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries);
+                    if (segs2.Length > 0) wantModel = segs2[segs2.Length - 1];
+                }
+                catch { /* wantModel stays empty -> handled below */ }
+
                 var grid = root.FindFirst(TreeScope.Descendants,
                     new PropertyCondition(AutomationElement.AutomationIdProperty, "30270"));
-                if (grid != null)
+                if (grid == null)
                 {
-                    var firstRow = grid.FindFirst(TreeScope.Children,
+                    log?.Invoke("    [WARN] model grid (id=30270) not found");
+                    PostMessage(martDlg, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero);
+                    return false;
+                }
+
+                // Poll: the grid populates asynchronously after catalog
+                // navigation / From-Mart selection. Reading it once can race and
+                // find an empty/partial list -> "model not found" -> spurious
+                // abort. Retry up to ~3 s until the named model row appears.
+                // Exact (trimmed, case-insensitive) match preferred; a substring
+                // match is a guarded fallback. NEVER firstRow.
+                AutomationElement modelRow = null;
+                for (int attempt = 0; attempt < 12 && modelRow == null; attempt++)
+                {
+                    var rows = grid.FindAll(TreeScope.Descendants,
                         new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.DataItem));
-                    if (firstRow == null)
-                        firstRow = grid.FindFirst(TreeScope.Descendants,
-                            new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.DataItem));
-                    if (firstRow != null)
+                    AutomationElement containsRow = null;
+                    int ri = 0;
+                    foreach (AutomationElement r in rows)
                     {
-                        string rowName = "";
-                        try { rowName = firstRow.Current.Name ?? ""; } catch { }
-                        log?.Invoke($"    model list row[0] = '{rowName}'");
-                        try
-                        {
-                            if (firstRow.TryGetCurrentPattern(SelectionItemPattern.Pattern, out object sip))
-                                ((SelectionItemPattern)sip).Select();
-                            else
-                                firstRow.SetFocus();
-                            Thread.Sleep(200);
-                        }
-                        catch (Exception ex) { log?.Invoke($"    row select err: {ex.Message}"); }
+                        string rn = ""; try { rn = (r.Current.Name ?? "").Trim(); } catch { }
+                        if (attempt == 0) log?.Invoke($"    model list row[{ri++}] = '{rn}'");
+                        if (string.IsNullOrEmpty(wantModel) || string.IsNullOrEmpty(rn)) continue;
+                        if (string.Equals(rn, wantModel, StringComparison.OrdinalIgnoreCase)) { modelRow = r; break; }
+                        if (containsRow == null && rn.IndexOf(wantModel, StringComparison.OrdinalIgnoreCase) >= 0) containsRow = r;
                     }
+                    if (modelRow == null) modelRow = containsRow;
+                    if (modelRow == null) Thread.Sleep(250);
+                }
+                if (modelRow == null)
+                {
+                    log?.Invoke($"    [WARN] model '{wantModel}' not found in picker grid after poll - aborting (refusing to load a different model)");
+                    PostMessage(martDlg, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero);
+                    return false;
+                }
+                try
+                {
+                    if (modelRow.TryGetCurrentPattern(SelectionItemPattern.Pattern, out object sip))
+                        ((SelectionItemPattern)sip).Select();
                     else
-                    {
-                        log?.Invoke("    model list has no DataItem rows");
-                    }
+                        modelRow.SetFocus();
+                    log?.Invoke($"    selected model row '{wantModel}'");
+                    Thread.Sleep(250);
+                }
+                catch (Exception ex)
+                {
+                    log?.Invoke($"    model row select err: {ex.Message}");
+                    PostMessage(martDlg, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero);
+                    return false;
                 }
 
                 // Step 2: locate the Open Version ComboBox (AutomationId=2111), expand it,
@@ -1966,6 +2383,14 @@ namespace EliteSoft.Erwin.AddIn.Services
                 catch { }
                 Thread.Sleep(150);
 
+                // NOTE: we open the version WITHOUT a lock type ("Unlocked",
+                // the picker default). The 2026-05-29 spike proved a read-only
+                // lock (Shared Lock) does NOT stop erwin's CC engine from
+                // dirtying the right model during compare, AND it adds a second
+                // "lock" checkbox column to the Save Models close dialog. Since
+                // we close the version without saving anyway, Unlocked is
+                // simplest (single save checkbox to clear).
+
                 // Step 3: click Open (AutomationId=2059) or fall back to WM_COMMAND IDOK.
                 var openBtn = root.FindFirst(TreeScope.Descendants,
                     new PropertyCondition(AutomationElement.AutomationIdProperty, "2059"));
@@ -2040,10 +2465,23 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// </summary>
         public static async Task<IntPtr> ClickRightAlterScriptInRdAsync(IntPtr rdHwnd, Action<string> log)
         {
-            return await Task.Run(() => ClickRightAlterScriptInRd(rdHwnd, log));
+            return await Task.Run(() => ClickRightAlterScriptInRd(rdHwnd, CMD_RD_ALTER_SCRIPT, log));
         }
 
-        private static IntPtr ClickRightAlterScriptInRd(IntPtr rdHwnd, Action<string> log)
+        /// <summary>
+        /// cmdId overload. From-DB uses <see cref="CMD_RD_ALTER_SCRIPT"/> (1056 -
+        /// the enabled generate for its compare direction). The Review path
+        /// passes 1057 (<see cref="CMD_RD_RIGHT_ALTER_SCRIPT"/>): on the Review
+        /// RD, 1056 is the LEFT Alter Script (DISABLED after Apply-to-Right) and
+        /// 1057 is the RIGHT one (ENABLED) - verified by the RD toolbar dump
+        /// 2026-05-29 (btn[2]=1056 disabled, btn[3]=1057 enabled).
+        /// </summary>
+        public static async Task<IntPtr> ClickRightAlterScriptInRdAsync(IntPtr rdHwnd, int cmdId, Action<string> log)
+        {
+            return await Task.Run(() => ClickRightAlterScriptInRd(rdHwnd, cmdId, log));
+        }
+
+        private static IntPtr ClickRightAlterScriptInRd(IntPtr rdHwnd, int cmdId, Action<string> log)
         {
             if (rdHwnd == IntPtr.Zero || !IsWindow(rdHwnd))
             {
@@ -2063,15 +2501,15 @@ namespace EliteSoft.Erwin.AddIn.Services
             // SendMouseClickAt (the same proven helper used for the
             // Apply-to-Right click). Fully dynamic - no hardcoded coords.
             (IntPtr toolbar, int buttonIdx) = FindToolbarButtonByCommand(
-                rdHwnd, CMD_RD_ALTER_SCRIPT, log);
+                rdHwnd, cmdId, log);
 
             var dialogsBefore = EnumerateVisibleDialogs();
             try { SetForegroundWindow(rdHwnd); UnhideWindow(rdHwnd); } catch { }
 
             if (toolbar == IntPtr.Zero || buttonIdx < 0)
             {
-                log?.Invoke($"  [RAS] toolbar with cmd {CMD_RD_ALTER_SCRIPT} NOT found - falling back to WM_COMMAND PostMessage (will produce stripped DDL)");
-                PostMessage(rdHwnd, WM_COMMAND, MakeWParam(CMD_RD_ALTER_SCRIPT, 0), IntPtr.Zero);
+                log?.Invoke($"  [RAS] toolbar with cmd {cmdId} NOT found - falling back to WM_COMMAND PostMessage (will produce stripped DDL)");
+                PostMessage(rdHwnd, WM_COMMAND, MakeWParam(cmdId, 0), IntPtr.Zero);
             }
             else
             {
@@ -2080,7 +2518,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 if (rcRes == IntPtr.Zero || (btnRect.right == 0 && btnRect.bottom == 0))
                 {
                     log?.Invoke($"  [RAS] TB_GETITEMRECT returned empty for toolbar=0x{toolbar.ToInt64():X} idx={buttonIdx} - fallback to WM_COMMAND");
-                    PostMessage(rdHwnd, WM_COMMAND, MakeWParam(CMD_RD_ALTER_SCRIPT, 0), IntPtr.Zero);
+                    PostMessage(rdHwnd, WM_COMMAND, MakeWParam(cmdId, 0), IntPtr.Zero);
                 }
                 else
                 {
@@ -2092,7 +2530,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     if (!ClientToScreen(toolbar, ref center))
                     {
                         log?.Invoke("  [RAS] ClientToScreen failed - fallback to WM_COMMAND");
-                        PostMessage(rdHwnd, WM_COMMAND, MakeWParam(CMD_RD_ALTER_SCRIPT, 0), IntPtr.Zero);
+                        PostMessage(rdHwnd, WM_COMMAND, MakeWParam(cmdId, 0), IntPtr.Zero);
                     }
                     else
                     {
@@ -2355,6 +2793,249 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// ile MFC OnCancel handler path'inden git, son care ForceDestroy.
         /// Mart-Mart'a dokunulmadi (CloseSession ayni kalir).
         /// </summary>
+        /// <summary>
+        /// Review-path teardown (2026-05-29, synchronous - call via Task.Run so
+        /// erwin's STA UI thread stays free to surface its dialogs). Gracefully
+        /// IDCANCELs the RD then the CC wizard (releases the ;Duplicate=YES left
+        /// copy), then WM_CLOSEs the loaded version child (v1). erwin's Complete
+        /// Compare dirties v1 during the diff, so WM_CLOSE raises a "Save Models"
+        /// prompt; we close it WITHOUT saving (uncheck the single save row + OK)
+        /// then drive the follow-up "Mart Offline" dialog to Save-to=Close. A hard
+        /// single-row guard (the dialog only ever lists the one model being closed
+        /// = v1; the active dirty v2 is never in it) means v2 can never be touched.
+        /// If the guard trips we leave the dialog for the user. The reconnect
+        /// timer's modal-guard + the pipeline flag staying true keep erwin
+        /// responsive while the dialogs are up.
+        /// </summary>
+        public static void CloseReviewSession(CCSession s, Action<string> log)
+        {
+            if (s == null) return;
+            const int IDCANCEL = 2;
+            try
+            {
+                if (s.ResolveDifferences != IntPtr.Zero && IsWindow(s.ResolveDifferences))
+                {
+                    log?.Invoke($"  [REVIEW-CLEAN] IDCANCEL RD 0x{s.ResolveDifferences.ToInt64():X}");
+                    PostMessage(s.ResolveDifferences, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero);
+                    Thread.Sleep(800);
+                }
+                if (s.CCWizard != IntPtr.Zero && IsWindow(s.CCWizard))
+                {
+                    log?.Invoke($"  [REVIEW-CLEAN] IDCANCEL CC wizard 0x{s.CCWizard.ToInt64():X} (lets erwin release the ;Duplicate=YES left copy)");
+                    PostMessage(s.CCWizard, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero);
+                    Thread.Sleep(800);
+                }
+
+                // WM_CLOSE the loaded version child (v1) by HANDLE. erwin's CC
+                // engine dirties v1 during the compare (verified by the
+                // [REVIEW-DIRTY] checkpoints), so this raises a "Save Models"
+                // prompt that CloseSaveModelsWithoutSaving handles below.
+                if (s.VersionChild != IntPtr.Zero && IsWindow(s.VersionChild))
+                {
+                    string vt = GetTitle(s.VersionChild);
+                    bool wasDirty = vt.Contains("*");
+                    log?.Invoke($"  [REVIEW-CLEAN] WM_CLOSE version child 0x{s.VersionChild.ToInt64():X} (dirty={(wasDirty ? "YES" : "no")}) ('{vt}')");
+                    PostMessage(s.VersionChild, WM_CLOSE_MSG, IntPtr.Zero, IntPtr.Zero);
+                    Thread.Sleep(600);
+                    if (!IsWindow(s.VersionChild))
+                        log?.Invoke("  [REVIEW-CLEAN] version child closed cleanly (no prompt) - session back to the active model only.");
+                    else
+                        log?.Invoke("  [REVIEW-CLEAN] version child still alive after WM_CLOSE - handling the Save Models prompt without saving.");
+                }
+                else
+                {
+                    log?.Invoke("  [REVIEW-CLEAN] version child gone/invalid - nothing to close.");
+                }
+
+                // Close the "Save Models" prompt WITHOUT saving (uncheck the
+                // single save row + OK), then drive the follow-up "Mart Offline"
+                // dialog to Save-to=Close. CloseSaveModelsWithoutSaving enforces
+                // the single-row guard internally.
+                IntPtr dlg = WaitForDialog("Save Models", 3000);
+                if (dlg == IntPtr.Zero) { dlg = WaitForDialog("Close Model", 1500); }
+                if (dlg == IntPtr.Zero)
+                {
+                    log?.Invoke("  [REVIEW-CLEAN] no Save Models / Close Model dialog - v1 closed silently; teardown clean.");
+                    return;
+                }
+                CloseSaveModelsWithoutSaving(dlg, log);
+            }
+            catch (Exception ex) { log?.Invoke($"  [REVIEW-CLEAN] threw: {ex.GetType().Name}: {ex.Message}"); }
+        }
+
+        /// <summary>
+        /// Closes the "Save Models" prompt WITHOUT saving the loaded version
+        /// (v1), then drives the follow-up "Mart Offline" dialog to
+        /// Save-to=Close. Steps (the user's verified manual flow): (1) hard
+        /// single-row guard - abort (leave for manual) unless the dialog lists
+        /// EXACTLY one data row, so the active dirty v2 (never in this dialog)
+        /// can never be touched; (2) uncheck the single save-row's first
+        /// checkbox column via mouse simulation - the checkboxes are XTP
+        /// custom-drawn so UIA TogglePattern is unavailable; the click point is
+        /// the first checkbox-column HEADER rect (X) at the data-row cell rect
+        /// (Y), both from UIA BoundingRectangle (physical screen px, so no
+        /// ClientToScreen); (3) click OK to commit the don't-save; (4) hand the
+        /// resulting "Mart Offline" dialog to the proven DismissMartOfflineDialog
+        /// (toolbar 3rd button = Set All to Close + OK). The model opens
+        /// "Unlocked", so there is a single (save) checkbox - no lock column.
+        /// </summary>
+        private static void CloseSaveModelsWithoutSaving(IntPtr dlg, Action<string> log)
+        {
+            try
+            {
+                var root = AutomationElement.FromHandle(dlg);
+                if (root == null) { log?.Invoke("  [SM-CLOSE] UIA root null"); return; }
+
+                // (1) Single-row guard: count data rows by their 'Mart://' path
+                // cell, and locate the 'Model_1*' name cell for the row Y.
+                var customs = root.FindAll(TreeScope.Descendants,
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Custom));
+                int rowCount = 0;
+                AutomationElement modelCell = null;
+                foreach (AutomationElement c in customs)
+                {
+                    string n = ""; try { n = c.Current.Name ?? ""; } catch { }
+                    if (n.StartsWith("Mart:", StringComparison.OrdinalIgnoreCase)) rowCount++;
+                    if (modelCell == null && n.Contains("*")) modelCell = c;
+                }
+                log?.Invoke($"  [SM-CLOSE] data rows (Mart:// cells) = {rowCount}");
+                if (rowCount != 1)
+                {
+                    log?.Invoke($"  [SM-CLOSE] >>> ABORT: expected exactly 1 row, found {rowCount}. Leaving dialog for manual (v2 protection). <<<");
+                    return;
+                }
+                if (modelCell == null) { log?.Invoke("  [SM-CLOSE] could not locate model-name cell (Model_1*); ABORT (leaving for manual)"); return; }
+
+                // (2) Geometry: first checkbox-column header X, data row Y.
+                System.Windows.Rect rowRect = default;
+                try { rowRect = modelCell.Current.BoundingRectangle; } catch { }
+                var headers = root.FindAll(TreeScope.Descendants,
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Header));
+                System.Windows.Rect firstColRect = default; bool haveCol = false;
+                int hi = 0;
+                foreach (AutomationElement h in headers)
+                {
+                    string hn = ""; try { hn = h.Current.Name ?? ""; } catch { }
+                    System.Windows.Rect hr = default; try { hr = h.Current.BoundingRectangle; } catch { }
+                    log?.Invoke($"  [SM-CLOSE]   header[{hi}] name='{hn}' rect=({(int)hr.Left},{(int)hr.Top},{(int)hr.Right},{(int)hr.Bottom})");
+                    if (!haveCol && string.IsNullOrEmpty(hn) && hr.Width > 2 && hr.Width < 80)
+                    {
+                        firstColRect = hr; haveCol = true;
+                    }
+                    hi++;
+                }
+                if (!haveCol || rowRect.Height <= 0)
+                {
+                    log?.Invoke("  [SM-CLOSE] could not derive checkbox column / row geometry; ABORT (leaving for manual - do NOT click OK with the save box still checked).");
+                    return;
+                }
+
+                // UIA BoundingRectangle is physical screen px; SendMouseClickAt
+                // expects screen coords -> no ClientToScreen (unlike the
+                // LVM_GETSUBITEMRECT Apply-to-Right path).
+                int clickX = (int)(firstColRect.Left + firstColRect.Width / 2);
+                int clickY = (int)(rowRect.Top + rowRect.Height / 2);
+                log?.Invoke($"  [SM-CLOSE] unchecking save column at screen=({clickX},{clickY})");
+                // Force the dialog foreground + active from this bg thread: the
+                // XTP report grid only processes the checkbox hit-test when its
+                // window is active, and a bare SetForegroundWindow fails from a
+                // non-foreground thread (verified 2026-05-29: prod run left the
+                // save box checked -> v1 not closed, 2 PUs). ForceForeground
+                // uses AttachThreadInput to lift the foreground-lock.
+                ForceForeground(dlg);
+                Thread.Sleep(250);
+
+                // Confirm the checkbox screen point actually belongs to the Save
+                // Models dialog (not the busy overlay / another window covering
+                // it). If something else is on top, the mouse click would hit
+                // THAT and silently no-op, then OK would SAVE v1 (the merge
+                // prompt). So if the point is not within the dialog, ABORT
+                // before clicking - leave it for manual (never risk a save).
+                IntPtr atPoint = WindowFromPoint(new POINT { X = clickX, Y = clickY });
+                IntPtr atRoot = GetAncestor(atPoint, GA_ROOT);
+                log?.Invoke($"  [SM-CLOSE] WindowFromPoint({clickX},{clickY})=0x{atPoint.ToInt64():X} root=0x{atRoot.ToInt64():X} (dlg=0x{dlg.ToInt64():X})");
+                if (atRoot != dlg && atPoint != dlg)
+                {
+                    log?.Invoke("  [SM-CLOSE] >>> ABORT: click point is covered by another window (not the Save Models dialog) - NOT clicking (avoid spurious save). Leaving for manual. <<<");
+                    return;
+                }
+
+                // VERIFIED click: confirm the cursor actually reached the
+                // checkbox cell BEFORE firing. The checkbox state itself is not
+                // UIA-readable (XTP custom-drawn), so we cannot confirm the
+                // toggle - but we CAN confirm the cursor landed on target. If
+                // SetCursorPos clipped (DPI / multi-monitor), ABORT WITHOUT
+                // clicking OK: OK with the save box still checked would SAVE v1
+                // (a spurious Mart version). The dialog is left for manual.
+                if (!GetCursorPos(out POINT savedCur))
+                {
+                    log?.Invoke("  [SM-CLOSE] GetCursorPos failed; ABORT (leaving for manual, no OK)");
+                    return;
+                }
+                bool landedOk = false;
+                try
+                {
+                    ShowCursor(false);
+                    SetCursorPos(clickX, clickY);
+                    Thread.Sleep(40);
+                    GetCursorPos(out POINT landed);
+                    landedOk = Math.Abs(landed.X - clickX) <= 3 && Math.Abs(landed.Y - clickY) <= 3;
+                    if (!landedOk)
+                    {
+                        log?.Invoke($"  [SM-CLOSE] cursor landed ({landed.X},{landed.Y}) != target ({clickX},{clickY}) - ABORT, NOT clicking OK (avoid spurious save). Leaving for manual.");
+                    }
+                    else
+                    {
+                        mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, IntPtr.Zero);
+                        Thread.Sleep(40);
+                        mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, IntPtr.Zero);
+                    }
+                }
+                finally { try { SetCursorPos(savedCur.X, savedCur.Y); ShowCursor(true); } catch { } }
+                if (!landedOk) return;   // never click OK if the uncheck click did not land
+
+                // (3) Click OK to commit the don't-save via a TARGETED UIA
+                // Invoke on the OK button (AutomationId="1"). WM_COMMAND IDOK
+                // did NOT close this XTP dialog (verified 2026-05-29 prod: the
+                // dialog stayed open). UIA Invoke works (proven in debug); the
+                // earlier 11s slowness was the full descendant scan in
+                // ClickButtonByName - FindFirst on id=1 is fast.
+                Thread.Sleep(300);
+                bool okClicked = false;
+                try
+                {
+                    var okBtn = root.FindFirst(TreeScope.Descendants,
+                        new AndCondition(
+                            new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button),
+                            new PropertyCondition(AutomationElement.AutomationIdProperty, "1")));
+                    if (okBtn != null && okBtn.TryGetCurrentPattern(InvokePattern.Pattern, out object okInv))
+                    {
+                        ((InvokePattern)okInv).Invoke();
+                        okClicked = true;
+                        log?.Invoke("  [SM-CLOSE] OK invoked via UIA (id=1) - save unchecked -> v1 will NOT be saved");
+                    }
+                }
+                catch (Exception ex) { log?.Invoke($"  [SM-CLOSE] OK UIA err: {ex.Message}"); }
+                if (!okClicked)
+                {
+                    log?.Invoke("  [SM-CLOSE] OK UIA not found - fallback WM_COMMAND IDOK");
+                    PostMessage(dlg, WM_COMMAND, MakeWParam(IDOK, 0), IntPtr.Zero);
+                }
+                Thread.Sleep(500);
+
+                // (4) Drive the follow-up "Mart Offline" dialog to Save-to=Close.
+                IntPtr martOffline = WaitForDialog("Mart Offline", 3000);
+                if (martOffline == IntPtr.Zero)
+                {
+                    log?.Invoke("  [SM-CLOSE] no Mart Offline dialog (suppressed or v1 closed directly) - done.");
+                    return;
+                }
+                log?.Invoke($"  [SM-CLOSE] Mart Offline 0x{martOffline.ToInt64():X} - setting Save-to=Close + OK via DismissMartOfflineDialog");
+                DismissMartOfflineDialog(martOffline, log);
+            }
+            catch (Exception ex) { log?.Invoke($"  [SM-CLOSE] threw: {ex.Message}"); }
+        }
+
         public static async Task CloseDbCCSessionCleanAsync(CCSession s, Action<string> log)
         {
             if (s == null) return;
@@ -2464,6 +3145,156 @@ namespace EliteSoft.Erwin.AddIn.Services
             SendMessage(mdiClient, WM_MDIACTIVATE, martMdi, IntPtr.Zero);
             Thread.Sleep(100);  // let the switch settle
             return true;
+        }
+
+        // ---- UI-Open version path (Faz 2) MDI helpers ----
+
+        /// <summary>Finds erwin's MDIClient under the main frame, or Zero.</summary>
+        private static IntPtr FindMdiClientOf(IntPtr main)
+        {
+            IntPtr mdi = IntPtr.Zero;
+            if (main == IntPtr.Zero) return mdi;
+            EnumChildWindows(main, (h, _) =>
+            {
+                var cls = new StringBuilder(64);
+                GetClassName(h, cls, cls.Capacity);
+                if (cls.ToString() == "MDIClient") { mdi = h; return false; }
+                return true;
+            }, IntPtr.Zero);
+            return mdi;
+        }
+
+        /// <summary>Direct MDI child frames whose title contains "Mart://".</summary>
+        private static System.Collections.Generic.List<IntPtr> EnumMartMdiChildHandles(IntPtr mdiClient)
+        {
+            var list = new System.Collections.Generic.List<IntPtr>();
+            if (mdiClient == IntPtr.Zero) return list;
+            IntPtr child = GetWindow(mdiClient, GW_CHILD);
+            while (child != IntPtr.Zero)
+            {
+                if (GetTitle(child).IndexOf("Mart://", StringComparison.OrdinalIgnoreCase) >= 0)
+                    list.Add(child);
+                child = GetWindow(child, GW_HWNDNEXT);
+            }
+            return list;
+        }
+
+        /// <summary>The currently active MDI child (WM_MDIGETACTIVE), or Zero.</summary>
+        private static IntPtr GetActiveMdiChild(IntPtr mdiClient)
+        {
+            if (mdiClient == IntPtr.Zero) return IntPtr.Zero;
+            return SendMessage(mdiClient, WM_MDIGETACTIVE, IntPtr.Zero, IntPtr.Zero);
+        }
+
+        /// <summary>Activate a SPECIFIC MDI child (used to flip Left back to the
+        /// dirty model after opening the version child).</summary>
+        private static void ActivateMdiChildHandle(IntPtr mdiClient, IntPtr child, Action<string> log)
+        {
+            if (mdiClient == IntPtr.Zero || child == IntPtr.Zero) return;
+            log?.Invoke($"  [MDI-ACT] activating specific child 0x{child.ToInt64():X} title='{GetTitle(child)}'");
+            SendMessage(mdiClient, WM_MDIACTIVATE_MSG, child, IntPtr.Zero);
+            Thread.Sleep(150);
+        }
+
+        /// <summary>Poll until a NEW "Mart://" MDI child (not in <paramref name="before"/>)
+        /// appears, returning its hwnd, or Zero on timeout.</summary>
+        private static IntPtr WaitForNewMartMdiChild(IntPtr mdiClient, System.Collections.Generic.HashSet<IntPtr> before, int timeoutMs, Action<string> log)
+        {
+            int waited = 0;
+            while (waited < timeoutMs)
+            {
+                foreach (var h in EnumMartMdiChildHandles(mdiClient))
+                {
+                    if (!before.Contains(h))
+                    {
+                        log?.Invoke($"  [MDI-OPEN] new MDI child appeared 0x{h.ToInt64():X} title='{GetTitle(h)}'");
+                        return h;
+                    }
+                }
+                Thread.Sleep(200);
+                waited += 200;
+            }
+            log?.Invoke("  [MDI-OPEN] no new MDI child within timeout");
+            return IntPtr.Zero;
+        }
+
+        /// <summary>Gracefully close a specific MDI child via WM_CLOSE (runs
+        /// erwin's normal model-close handler). For a CLEAN child this closes
+        /// silently and releases the PU WITHOUT the PUs.Remove active-root
+        /// invalidation (verified by the 2026-05-29 spike). Best-effort sweep of
+        /// any Close Model / Mart Offline prompt that a dirty child might raise.</summary>
+        public static void CloseMartMdiChild(IntPtr child, Action<string> log)
+        {
+            if (child == IntPtr.Zero || !IsWindow(child)) { log?.Invoke("  [MDI-CLOSE] child gone/invalid - nothing to close"); return; }
+            log?.Invoke($"  [MDI-CLOSE] WM_CLOSE -> child 0x{child.ToInt64():X} title='{GetTitle(child)}'");
+            PostMessage(child, WM_CLOSE_MSG, IntPtr.Zero, IntPtr.Zero);
+            Thread.Sleep(400);
+            // A clean version child closes silently; if a prompt appears (dirty),
+            // ride out the standard Close Model + Mart Offline chain.
+            try
+            {
+                IntPtr closeDlg = WaitForDialog("Close Model", 1200);
+                if (closeDlg != IntPtr.Zero) HandleCloseModelDialogChain(log);
+            }
+            catch (Exception ex) { log?.Invoke($"  [MDI-CLOSE] dialog sweep err: {ex.Message}"); }
+        }
+
+        /// <summary>
+        /// Select the in-memory model whose version matches <paramref name="version"/>
+        /// from the wizard Right Model page "Open Models in Memory" DataGrid
+        /// (id=1083) - the same control the From-DB pipeline uses, so NO catalog
+        /// "Load..." is needed (the version was already opened as an MDI child).
+        /// Both rows are the same model ("Model_1"), so we match by the version
+        /// token in the row Name (e.g. "Model_1 v1"), preferring a row WITHOUT a
+        /// " (N)" duplicate suffix. All rows are logged for diagnosis. Returns
+        /// false (no firstRow fallback) if no version-matched row is found.
+        /// </summary>
+        private static bool SelectInMemoryModelOnRightPage(IntPtr ccWizard, int version, Action<string> log)
+        {
+            var ccRoot = AutomationElement.FromHandle(ccWizard);
+            if (ccRoot == null) { log?.Invoke("  [INMEM] UIA FromHandle null on wizard"); return false; }
+            var grid = ccRoot.FindFirst(TreeScope.Descendants,
+                new AndCondition(
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.DataGrid),
+                    new PropertyCondition(AutomationElement.AutomationIdProperty, "1083")));
+            if (grid == null) { log?.Invoke("  [INMEM] 'Open Models in Memory' DataGrid id=1083 not found"); return false; }
+
+            AutomationElement match = null, dupMatch = null;
+            for (int attempt = 0; attempt < 10 && match == null; attempt++)
+            {
+                var rows = grid.FindAll(TreeScope.Descendants,
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.DataItem));
+                int ri = 0;
+                foreach (AutomationElement r in rows)
+                {
+                    string rn = ""; try { rn = (r.Current.Name ?? "").Trim(); } catch { }
+                    if (attempt == 0) log?.Invoke($"  [INMEM] row[{ri++}] = '{rn}'");
+                    var vm = System.Text.RegularExpressions.Regex.Match(rn, @"v(\d+)", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                    if (!vm.Success || !int.TryParse(vm.Groups[1].Value, out int rv) || rv != version) continue;
+                    if (rn.IndexOf('(') < 0) { match = r; break; }   // prefer the non-duplicate row
+                    if (dupMatch == null) dupMatch = r;
+                }
+                if (match == null) match = dupMatch;
+                if (match == null) Thread.Sleep(250);
+            }
+            if (match == null)
+            {
+                log?.Invoke($"  [INMEM] no in-memory row for v{version} (is the version opened as an MDI child + does its row show the version?) - aborting");
+                return false;
+            }
+            try
+            {
+                if (match.TryGetCurrentPattern(SelectionItemPattern.Pattern, out object sip))
+                {
+                    ((SelectionItemPattern)sip).Select();
+                    log?.Invoke($"  [INMEM] selected in-memory v{version} row '{match.Current.Name}'");
+                    Thread.Sleep(150);
+                    return true;
+                }
+                log?.Invoke("  [INMEM] matched row has no SelectionItemPattern");
+                return false;
+            }
+            catch (Exception ex) { log?.Invoke($"  [INMEM] select err: {ex.Message}"); return false; }
         }
 
         /// <summary>
@@ -2612,6 +3443,27 @@ namespace EliteSoft.Erwin.AddIn.Services
             var sb = new StringBuilder(256);
             GetWindowText(hWnd, sb, sb.Capacity);
             return sb.ToString();
+        }
+
+        /// <summary>
+        /// SPIKE diagnostic (2026-05-29): log whether an MDI child's title
+        /// carries the dirty marker ("*"). Called at the Review pipeline's key
+        /// transitions so the debug log pinpoints EXACTLY which step dirties
+        /// the loaded version (open / in-memory select / compare / RD). The
+        /// investigation (medium confidence) points at erwin's CC engine
+        /// marking the right model dirty during diff computation; these
+        /// checkpoints turn that into hard evidence. Cheap and harmless, so
+        /// left unconditional (not DebugMode-gated).
+        /// </summary>
+        private static void LogChildDirty(string when, IntPtr child, Action<string> log)
+        {
+            if (child == IntPtr.Zero || !IsWindow(child))
+            {
+                log?.Invoke($"  [REVIEW-DIRTY] {when}: child gone/invalid");
+                return;
+            }
+            string t = GetTitle(child);
+            log?.Invoke($"  [REVIEW-DIRTY] {when}: dirty={(t.Contains("*") ? "YES" : "no")} title='{t}'");
         }
 
         private static HashSet<IntPtr> EnumerateVisibleDialogs()

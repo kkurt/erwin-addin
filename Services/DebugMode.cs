@@ -25,7 +25,7 @@ namespace EliteSoft.Erwin.AddIn.Services
     /// </summary>
     public static class DebugMode
     {
-        private const int DefaultDelayMs = 5000;
+        private const int DefaultDelayMs = 3000;
 
         private static bool _enabled;
 
@@ -38,9 +38,9 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         /// <summary>
         /// Delay applied at every <see cref="Pause"/> call when
-        /// <see cref="Enabled"/> is true. 5 000 ms by default - long enough
-        /// for a human to read the screen, short enough that a complete
-        /// pipeline run finishes inside a coffee break.
+        /// <see cref="Enabled"/> is true. 3 000 ms by default - a consistent,
+        /// equal settle between pipeline steps (user asked for even ~3s gaps,
+        /// 2026-05-29) that also lets a human read the screen.
         /// </summary>
         public static int TransitionDelayMs { get; set; } = DefaultDelayMs;
 

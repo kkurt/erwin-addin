@@ -59,6 +59,23 @@ namespace EliteSoft.Erwin.AddIn.Services
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate void SetUseDiagramSelectionFn(int enabled);
 
+        // RECON (dev): dumps the current foreground window's full control tree
+        // to the bridge log. Used to discover Review / Complete Compare /
+        // Resolve Differences control IDs without guessing.
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate void DumpForegroundWindowTreeFn();
+
+        // RECON (dev): toggles WM_COMMAND/WM_NOTIFY logging on the foreground
+        // window (subclass). Returns 1=started, 0=stopped, -1=error.
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int ToggleReconCommandCaptureFn();
+
+        // SPIKE (dev): MDI probes for the UI-Open version path.
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate void DumpMdiChildrenFn(IntPtr mainHwnd);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int GracefulCloseActiveMdiChildFn(IntPtr mainHwnd);
+
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate int InstallObserverHookFn();
 
@@ -227,6 +244,10 @@ namespace EliteSoft.Erwin.AddIn.Services
         private static GetCapturedFEWPageOptionsFn _getCapturedFEWPO;
         private static SetDebugKeepWindowsVisibleFn _setDebugKeepWindowsVisible;
         private static SetUseDiagramSelectionFn _setUseDiagramSelection;
+        private static DumpForegroundWindowTreeFn _dumpForegroundWindowTree;
+        private static ToggleReconCommandCaptureFn _toggleReconCommandCapture;
+        private static DumpMdiChildrenFn _dumpMdiChildren;
+        private static GracefulCloseActiveMdiChildFn _gracefulCloseActiveMdiChild;
         private static IntPtr _hiddenWizardHwnd = IntPtr.Zero;
 
         // D1-spike: CC state inspection delegates
@@ -386,6 +407,23 @@ namespace EliteSoft.Erwin.AddIn.Services
                     IntPtr setObjFilterProc = GetProcAddress(_bridgeModule, "SetUseDiagramSelection");
                     if (setObjFilterProc != IntPtr.Zero)
                         _setUseDiagramSelection = Marshal.GetDelegateForFunctionPointer<SetUseDiagramSelectionFn>(setObjFilterProc);
+
+                    // RECON (dev): foreground window-tree dumper.
+                    IntPtr dumpFgProc = GetProcAddress(_bridgeModule, "DumpForegroundWindowTree");
+                    if (dumpFgProc != IntPtr.Zero)
+                        _dumpForegroundWindowTree = Marshal.GetDelegateForFunctionPointer<DumpForegroundWindowTreeFn>(dumpFgProc);
+
+                    IntPtr toggleCmdProc = GetProcAddress(_bridgeModule, "ToggleReconCommandCapture");
+                    if (toggleCmdProc != IntPtr.Zero)
+                        _toggleReconCommandCapture = Marshal.GetDelegateForFunctionPointer<ToggleReconCommandCaptureFn>(toggleCmdProc);
+
+                    IntPtr dumpMdiProc = GetProcAddress(_bridgeModule, "DumpMdiChildren");
+                    if (dumpMdiProc != IntPtr.Zero)
+                        _dumpMdiChildren = Marshal.GetDelegateForFunctionPointer<DumpMdiChildrenFn>(dumpMdiProc);
+
+                    IntPtr gracefulCloseProc = GetProcAddress(_bridgeModule, "GracefulCloseActiveMdiChild");
+                    if (gracefulCloseProc != IntPtr.Zero)
+                        _gracefulCloseActiveMdiChild = Marshal.GetDelegateForFunctionPointer<GracefulCloseActiveMdiChildFn>(gracefulCloseProc);
 
                     // D1-spike: CC state inspection
                     IntPtr ccAs  = GetProcAddress(_bridgeModule, "CCInsp_GetFEDataActionSummary");
@@ -1219,6 +1257,82 @@ namespace EliteSoft.Erwin.AddIn.Services
             {
                 log?.Invoke($"NativeBridge: SetUseDiagramSelection threw: {ex.GetType().Name}: {ex.Message}");
             }
+        }
+
+        /// <summary>
+        /// RECON (dev): dump the current foreground window's full control tree
+        /// (class / id / text / rect / toolbar cmd ids) to the native-bridge
+        /// log. Used during Faz 2a to discover the real control identifiers of
+        /// erwin's Review / Complete Compare / Resolve Differences dialogs so
+        /// the Faz 2b automation drives them without guessing. No-op on older
+        /// bridge builds without the export.
+        /// </summary>
+        public static void DumpForegroundWindowTree(Action<string> log = null)
+        {
+            if (_dumpForegroundWindowTree == null)
+            {
+                log?.Invoke("NativeBridge: DumpForegroundWindowTree export missing (rebuild native-bridge).");
+                return;
+            }
+            try
+            {
+                _dumpForegroundWindowTree();
+                log?.Invoke("NativeBridge: dumped foreground window tree to bridge log (search '[RECON]').");
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"NativeBridge: DumpForegroundWindowTree threw: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// RECON (dev): toggle WM_COMMAND / WM_NOTIFY capture on the current
+        /// foreground window. First call subclasses + logs (search
+        /// '[RECON-CMD]' in the bridge log); second call restores. Used to
+        /// learn the Resolve Differences toolbar cmd ids and the Object-View
+        /// arrow notifications. No-op on older bridge builds.
+        /// </summary>
+        public static void ToggleReconCommandCapture(Action<string> log = null)
+        {
+            if (_toggleReconCommandCapture == null)
+            {
+                log?.Invoke("NativeBridge: ToggleReconCommandCapture export missing (rebuild native-bridge).");
+                return;
+            }
+            try
+            {
+                int rc = _toggleReconCommandCapture();
+                log?.Invoke($"NativeBridge: recon command capture {(rc == 1 ? "STARTED" : rc == 0 ? "STOPPED" : "ERROR")} (search '[RECON-CMD]').");
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"NativeBridge: ToggleReconCommandCapture threw: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// SPIKE (dev): log every open-model MDI child under erwin's MDIClient
+        /// (marks the active one) to the bridge log ('[SPIKE-MDI]'). Confirms
+        /// whether a 2nd Mart version coexists as its own child (U1).
+        /// </summary>
+        public static void DumpMdiChildren(IntPtr mainHwnd, Action<string> log = null)
+        {
+            if (_dumpMdiChildren == null) { log?.Invoke("NativeBridge: DumpMdiChildren export missing (rebuild bridge)."); return; }
+            try { _dumpMdiChildren(mainHwnd); log?.Invoke("NativeBridge: dumped MDI children (search '[SPIKE-MDI]')."); }
+            catch (Exception ex) { log?.Invoke($"NativeBridge: DumpMdiChildren threw: {ex.GetType().Name}: {ex.Message}"); }
+        }
+
+        /// <summary>
+        /// SPIKE (dev): post WM_CLOSE to the ACTIVE MDI child (graceful close,
+        /// runs erwin's model-close handler -> Close Model / Mart Offline). The
+        /// user activates the version child first. Tests U2 (clean PU release
+        /// without active-root invalidation). Logs to '[SPIKE-MDI]'.
+        /// </summary>
+        public static void GracefulCloseActiveMdiChild(IntPtr mainHwnd, Action<string> log = null)
+        {
+            if (_gracefulCloseActiveMdiChild == null) { log?.Invoke("NativeBridge: GracefulCloseActiveMdiChild export missing (rebuild bridge)."); return; }
+            try { int rc = _gracefulCloseActiveMdiChild(mainHwnd); log?.Invoke($"NativeBridge: GracefulCloseActiveMdiChild rc={rc} (search '[SPIKE-MDI]')."); }
+            catch (Exception ex) { log?.Invoke($"NativeBridge: GracefulCloseActiveMdiChild threw: {ex.GetType().Name}: {ex.Message}"); }
         }
 
         public static void CloseHiddenWizardIfAny()
