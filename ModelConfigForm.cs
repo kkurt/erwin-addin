@@ -508,11 +508,8 @@ namespace EliteSoft.Erwin.AddIn
                 if (isReModel)
                 {
                     Log($"Skipping validations for RE model '{_connectedModelName}' (openPuCount={openPuCount})");
-                    // Still populate DDL combos for RE models
-                    cmbLeftModel.Items.Clear();
-                    cmbLeftModel.Items.Add($"Active Model ({_connectedModelName})");
-                    cmbLeftModel.SelectedIndex = 0;
-                    lblOpenedModel.Text = $"Opened Model: {_connectedModelName} (with last changes)";
+                    // Source display: same single-line label the normal path uses.
+                    lblOpenedModel.Text = $"{_connectedModelName} (with last changes)";
                     return;
                 }
 
@@ -3742,7 +3739,12 @@ namespace EliteSoft.Erwin.AddIn
                 {
                     int v = ParseRightVersion();
                     int activeV = ParseActivePuVersion();
-                    bool leftIsActive = LeftIsActiveModel();
+                    // Source (Left) is always the open active model now (the
+                    // cmbLeftModel single-entry combo was deleted 2026-05-30).
+                    // Kept as a local for readability + so the dormant Faz-3
+                    // (useCompleteCompare = !leftIsActive) branch still
+                    // compiles.
+                    bool leftIsActive = true;
                     // Same-version fast path requires the LEFT to be the active
                     // (dirty) model AND the RIGHT to be its own version: that is
                     // the proven "dirty vs last saved" OnFE route. Any other
@@ -5647,9 +5649,17 @@ namespace EliteSoft.Erwin.AddIn
             bool fromMart = rbFromMart.Checked;
             bool fromDB = rbFromDB.Checked;
 
-            // Right-side version combo is locked for now; user will re-enable it when
-            // the multi-version compare path is wired up.
-            cmbRightModel.Enabled = false;
+            // RIGHT version combo is only meaningful for the Mart compare path
+            // (Review = active vs older version); From-DB compares against the
+            // live RE'd DB and has no version pick. RebuildRightCombo populates
+            // a "(no lower version)" placeholder when no older v exists - keep
+            // that disabled state by gating on the first item starting with 'v'.
+            // (Note: with the cmbLeftModel-deleted refactor 2026-05-30, items
+            // always start with 'v' for any _martVersion >= 1, so the gate is
+            // currently a defensive no-op; left in place for safety.)
+            bool hasRealVersions = cmbRightModel.Items.Count > 0
+                && (cmbRightModel.Items[0]?.ToString()?.StartsWith("v") ?? false);
+            cmbRightModel.Enabled = fromMart && hasRealVersions;
             btnConfigureDB.Visible = fromDB;
             btnSelectDbTables.Visible = fromDB;
             lblSelectedTableCount.Visible = fromDB;
@@ -5912,7 +5922,6 @@ namespace EliteSoft.Erwin.AddIn
         /// </summary>
         private void PopulateVersionCombos()
         {
-            cmbLeftModel.Items.Clear();
             cmbRightModel.Items.Clear();
 
             try
@@ -5965,76 +5974,48 @@ namespace EliteSoft.Erwin.AddIn
                 // useCompleteCompare code path is kept dormant, not deleted.)
                 string vTag = version >= 1 ? $"v{version} " : "";
                 string activeLabel = $"{modelName} {vTag}(with last changes)";
-                cmbLeftModel.Items.Add(activeLabel);
-                lblOpenedModel.Text = $"Opened Model: {activeLabel}"; // legacy field, hidden
+                // lblOpenedModel is the VISIBLE source-side display (the prior
+                // single-entry cmbLeftModel ComboBox was DELETED 2026-05-30 -
+                // one-entry combo was pointless UX). Plain text inside the
+                // "Source (Left)" group, no "Opened Model:" prefix needed.
+                lblOpenedModel.Text = activeLabel;
 
-                // Selecting index 0 fires OnLeftModelChanged, which builds the
-                // RIGHT combo cascade (versions <= active, default = latest).
-                cmbLeftModel.SelectedIndex = 0;
+                // RIGHT version combo no longer cascades via a hidden
+                // SelectedIndexChanged event - call it directly here once the
+                // active version is known.
                 RebuildRightCombo();
             }
             catch (Exception ex)
             {
                 Log($"PopulateVersionCombos error: {ex.Message}");
-                cmbLeftModel.Items.Add("Active Model (with last changes)");
-                cmbLeftModel.SelectedIndex = 0;
-                lblOpenedModel.Text = "Opened Model: (active, with last changes)";
+                lblOpenedModel.Text = "Active Model (with last changes)";
                 cmbRightModel.Items.Add("(Mart Baseline)");
                 cmbRightModel.SelectedIndex = 0;
             }
         }
 
-        /// <summary>
-        /// True when the Source (Left) combo has the active "with last changes"
-        /// model selected (index 0). Saved-version selections (index &gt; 0)
-        /// indicate a Mart-vs-Mart compare where neither side is the live model.
-        /// </summary>
-        private bool LeftIsActiveModel() => cmbLeftModel.SelectedIndex <= 0;
+        // LeftIsActiveModel / ParseLeftVersion / OnLeftModelChanged were
+        // DELETED 2026-05-30 along with the cmbLeftModel ComboBox they read.
+        // The Source (Left) is always the open Mart model, so each method's
+        // invariant collapsed: LeftIsActiveModel -> always true, ParseLeftVersion
+        // -> always _martVersion, OnLeftModelChanged -> direct RebuildRightCombo
+        // call from PopulateVersionCombos. The lone external caller of
+        // LeftIsActiveModel (BtnAlterWizardProd_Click martMode branch) now
+        // inlines `bool leftIsActive = true;` (kept as a local for readability +
+        // to keep the dormant Faz-3 useCompleteCompare branch compilable).
 
         /// <summary>
-        /// Parses the Source (Left) version number from the selected combo text
-        /// (e.g. "Model_1 v2 (with last changes)" or "v1 (Version 1)" -&gt; 2/1).
-        /// Returns -1 when not parseable.
-        /// </summary>
-        private int ParseLeftVersion()
-        {
-            try
-            {
-                string sel = cmbLeftModel.SelectedItem?.ToString() ?? "";
-                var m = System.Text.RegularExpressions.Regex.Match(sel, @"v(\d+)");
-                if (m.Success && int.TryParse(m.Groups[1].Value, out int v)) return v;
-            }
-            catch { /* fall through to -1 */ }
-            return -1;
-        }
-
-        /// <summary>Fires when the Source (Left) selection changes - rebuilds RIGHT.</summary>
-        private void OnLeftModelChanged()
-        {
-            try { RebuildRightCombo(); }
-            catch (Exception ex) { Log($"OnLeftModelChanged error: {ex.Message}"); }
-        }
-
-        /// <summary>
-        /// Rebuilds the Target (Right) combo based on the Source (Left)
-        /// selection. When LEFT is the active-dirty model (version N), RIGHT
-        /// lists vN..v1 (default vN -&gt; "dirty vs last saved", today's
-        /// behavior). When LEFT is a saved version vM, RIGHT lists v(M-1)..v1
-        /// (strictly below, default highest). v1-on-the-left has no lower
-        /// version, so RIGHT is disabled with a placeholder.
+        /// Rebuilds the Target (Right) combo with the list of older Mart
+        /// versions to compare against. Since the Source (Left) is always the
+        /// open active model (version <c>_martVersion</c>), the list is
+        /// v(activeV)..v1 (default = highest, which is "dirty vs last saved").
         /// </summary>
         private void RebuildRightCombo()
         {
-            if (cmbLeftModel.SelectedIndex < 0) return;
             cmbRightModel.Items.Clear();
 
-            bool leftIsActive = cmbLeftModel.SelectedIndex == 0;
             int activeV = _martVersion > 0 ? _martVersion : 1;
-            int leftV = leftIsActive ? activeV : ParseLeftVersion();
-            if (leftV <= 0) leftV = activeV;
-
-            int top = leftIsActive ? leftV : leftV - 1;
-            for (int v = top; v >= 1; v--)
+            for (int v = activeV; v >= 1; v--)
                 cmbRightModel.Items.Add($"v{v} (Version {v})");
 
             if (cmbRightModel.Items.Count > 0)

@@ -530,31 +530,25 @@ namespace EliteSoft.Erwin.AddIn
             this.grpDdlSource.ForeColor = clrTextSecondary;
             this.tabDdlGeneration.Controls.Add(this.grpDdlSource);
 
-            // lblOpenedModel is kept as a hidden field: legacy code still
-            // assigns its .Text (harmless when not shown). The visible Source
-            // control is now cmbLeftModel (2026-05-28 multi-version compare).
+            // Source (Left) display: plain text showing the open model + its
+            // "(with last changes)" suffix. The Source is always the currently
+            // open model (Faz 3 / Complete Compare was explored 2026-05-29 and
+            // found redundant - the user only ever wants to compare the LIVE
+            // model against a chosen older version on the RIGHT), so the prior
+            // single-entry ComboBox (cmbLeftModel) was pointless UX and was
+            // DELETED 2026-05-30 along with its handler chain
+            // (OnLeftModelChanged / LeftIsActiveModel / ParseLeftVersion).
+            // RebuildRightCombo is now called DIRECTLY from PopulateVersionCombos
+            // rather than via a cmbLeftModel.SelectedIndex = 0 -> SIC cascade.
             this.lblOpenedModel = new System.Windows.Forms.Label();
             this.lblOpenedModel.Location = new System.Drawing.Point(12, 22);
             this.lblOpenedModel.Size = new System.Drawing.Size(360, 22);
-            this.lblOpenedModel.Text = "Opened Model: (none)";
+            this.lblOpenedModel.Text = "(no model loaded)";
             this.lblOpenedModel.Font = fontBodyBold;
             this.lblOpenedModel.ForeColor = clrTextPrimary;
             this.lblOpenedModel.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
-            this.lblOpenedModel.Visible = false;
+            this.lblOpenedModel.Visible = true;
             this.grpDdlSource.Controls.Add(this.lblOpenedModel);
-
-            // Source (Left) model selector. First item = active model with its
-            // unsaved changes ("Model_1 v2 (with last changes)"); the rest are
-            // the saved Mart versions descending. Selecting a version reshapes
-            // the Target (Right) combo via OnLeftModelChanged (cascade).
-            this.cmbLeftModel = new System.Windows.Forms.ComboBox();
-            this.cmbLeftModel.Location = new System.Drawing.Point(12, 21);
-            this.cmbLeftModel.Size = new System.Drawing.Size(360, 24);
-            this.cmbLeftModel.DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList;
-            this.cmbLeftModel.Font = fontCaption;
-            this.cmbLeftModel.Visible = true;
-            this.cmbLeftModel.SelectedIndexChanged += (s, ev) => OnLeftModelChanged();
-            this.grpDdlSource.Controls.Add(this.cmbLeftModel);
 
             // Restored 2026-05-07 per user request. Triggers erwin's native
             // "Review" toolbar button via Win32 (Win32Helper.InvokeToolbarButton)
@@ -598,8 +592,10 @@ namespace EliteSoft.Erwin.AddIn
             this.cmbRightModel.Size = new System.Drawing.Size(322, 24);
             this.cmbRightModel.DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList;
             this.cmbRightModel.Font = fontCaption;
-            // Enabled 2026-05-28: multi-version compare. Contents cascade from
-            // the Source (Left) selection - see OnLeftModelChanged.
+            // Enabled 2026-05-28: multi-version compare. Contents are populated
+            // by RebuildRightCombo (called from PopulateVersionCombos at init,
+            // after the active Mart version is known). OnRightSourceChanged
+            // toggles Enabled based on the From-Mart vs From-DB radio.
             this.cmbRightModel.Enabled = true;
             this.grpDdlTarget.Controls.Add(this.cmbRightModel);
 
@@ -815,7 +811,6 @@ namespace EliteSoft.Erwin.AddIn
 #if !PACKAGED
         private System.Windows.Forms.Button btnAlterWizardProdDebug;
 #endif
-        private System.Windows.Forms.ComboBox cmbLeftModel;
         private System.Windows.Forms.ComboBox cmbRightModel;
         // txtFEOptionXml + btnBrowseFEOption removed 2026-05-27 (dead UI; see
         // matching note in the designer constructor block).

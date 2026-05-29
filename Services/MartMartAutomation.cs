@@ -600,109 +600,175 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// Review-path Apply-to-Right: synthesize a real mouse click on the
-        /// Apply-to-Right arrow (listview id=200, row 0, subitem 6) of the
-        /// Resolve Differences dialog to cascade the active dirty v2 (LEFT)
-        /// changes onto the older version v1 (RIGHT). Returns true if the click
-        /// fired an EDR transaction (the apply registered) - the precondition
-        /// for ClickRightAlterScriptInRdAsync to read valid CC state.
+        /// SHARED Apply-to-Right primitive used by both the From-DB
+        /// (DriveCCDbAndApply) and Review (ApplyToRightArrowOnReviewRd)
+        /// pipelines. Synthesizes a real mouse click on the RD listview's
+        /// row-0 Apply-to-Right arrow (id=200, subitem 6), retries up to 2
+        /// times, waits for the EDR transaction to settle, then waits for
+        /// the RIGHT Alter Script toolbar button (cmd 1057 =
+        /// <see cref="CMD_RD_RIGHT_ALTER_SCRIPT"/>) to report TBSTATE_ENABLED
+        /// so the caller's 1057 click does not no-op on a still-disabled
+        /// button. Returns true iff the click registered an EDR delta.
         ///
-        /// DELIBERATE COPY of the proven From-DB Apply-to-Right block
-        /// (DriveCCDbAndApply ~lines 820-934), kept separate for now so the
-        /// working From-DB pipeline is not destabilised; to be unified into one
-        /// shared helper once the Review DDL pipeline is proven end-to-end
-        /// (committed follow-up, see project memory). XTP filters synthetic
-        /// WM_LBUTTON*, so a raw mouse_event (SetCursorPos + down/up via
-        /// SendMouseClickAt) is the only path; a 2-attempt retry covers a
-        /// first-click miss before the listview hot-track zone settles.
+        /// XTP filters synthetic WM_LBUTTON*, so a raw mouse_event
+        /// (SetCursorPos + down/up via <see cref="SendMouseClickAt(int, int, Action{string})"/>)
+        /// is the only path; the 2-attempt retry covers a first-click miss
+        /// before the listview hot-track zone settles.
+        ///
+        /// Caller is responsible for OUTER bracketing (splash/overlayToggle
+        /// on/off, pre-call foreground/visibility prep, any final post-call
+        /// hide / restore) - this helper only does per-attempt
+        /// SetForegroundWindow + optional per-attempt HideWindow.
+        /// </summary>
+        /// <param name="rd">Resolve Differences dialog HWND.</param>
+        /// <param name="logPrefix">Per-line tag (e.g. "DB-7", "REVIEW-APPLY")
+        /// prepended inside square brackets to every log line.</param>
+        /// <param name="log">Log sink.</param>
+        /// <param name="hideAfterClick">If true, <see cref="HideWindow"/>
+        /// immediately after each mouse click and <see cref="UnhideWindow"/>
+        /// before retry. Cuts ~500ms of perceptible flash per attempt - the
+        /// From-DB pattern. If false, leave RD as-is and let the caller hide
+        /// at the end - the Review pattern.</param>
+        /// <param name="dumpItems">If true, log the first 8 listview rows
+        /// (col0/col4/col7 + arrow rect) before clicking. Useful for the
+        /// deeper DB-vs-Mart tree (From-DB); disabled for the flat
+        /// active-vs-version compare (Review).</param>
+        /// <param name="pollMaxMs">Listview-ready poll cap (typical 800-1500ms).</param>
+        /// <param name="pollStep">Listview-ready poll interval (typical 5-50ms).</param>
+        private static bool ApplyToRightArrowAndWaitForRas(
+            IntPtr rd, string logPrefix, Action<string> log,
+            bool hideAfterClick, bool dumpItems,
+            int pollMaxMs, int pollStep)
+        {
+            if (rd == IntPtr.Zero || !IsWindow(rd)) { log?.Invoke($"  [{logPrefix}] RD invalid"); return false; }
+
+            // Poll the RD listview (id=200) until it has >=1 item AND the
+            // row-0 arrow subitem rect is non-zero. Clicking too early fires
+            // a bogus EDR tx that makes OnFE emit "No schema to generate".
+            IntPtr lv = IntPtr.Zero;
+            int polled = 0;
+            while (polled < pollMaxMs)
+            {
+                lv = FindListViewById(rd, 200, log: null);
+                if (lv != IntPtr.Zero)
+                {
+                    int cnt = SendMessage(lv, LVM_GETITEMCOUNT, IntPtr.Zero, IntPtr.Zero).ToInt32();
+                    if (cnt > 0)
+                    {
+                        RECT testRc = new RECT { left = LVIR_BOUNDS, top = 6, right = 0, bottom = 0 };
+                        SendMessage(lv, LVM_GETSUBITEMRECT, new IntPtr(0), ref testRc);
+                        if (testRc.right > testRc.left && testRc.bottom > testRc.top)
+                        {
+                            log?.Invoke($"  [{logPrefix}] listview ready after {polled}ms (items={cnt}, arrow rect ok)");
+                            break;
+                        }
+                    }
+                }
+                Thread.Sleep(pollStep);
+                polled += pollStep;
+            }
+            if (lv == IntPtr.Zero) { log?.Invoke($"  [{logPrefix}] listview id=200 not found within {pollMaxMs}ms"); return false; }
+
+            if (dumpItems)
+            {
+                int total = SendMessage(lv, LVM_GETITEMCOUNT, IntPtr.Zero, IntPtr.Zero).ToInt32();
+                int dumpCount = Math.Min(total, 8);
+                log?.Invoke($"  [{logPrefix}] [LV-DUMP] first {dumpCount} of {total} item(s):");
+                for (int i = 0; i < dumpCount; i++)
+                {
+                    string c0 = GetListViewItemText(lv, i, 0);
+                    string c4 = GetListViewItemText(lv, i, 4);   // left model name col
+                    string c7 = GetListViewItemText(lv, i, 7);   // right model name col
+                    RECT rrc = new RECT { left = LVIR_BOUNDS, top = 6, right = 0, bottom = 0 };
+                    SendMessage(lv, LVM_GETSUBITEMRECT, new IntPtr(i), ref rrc);
+                    log?.Invoke($"    item[{i}] col0='{c0}' col4='{c4}' col7='{c7}' arrow=({rrc.left},{rrc.top})-({rrc.right},{rrc.bottom})");
+                }
+            }
+
+            RECT rc = new RECT { left = LVIR_BOUNDS, top = 6, right = 0, bottom = 0 };
+            SendMessage(lv, LVM_GETSUBITEMRECT, new IntPtr(0), ref rc);
+            POINT pt = new POINT { X = (rc.left + rc.right) / 2, Y = (rc.top + rc.bottom) / 2 };
+            if (!ClientToScreen(lv, ref pt)) { log?.Invoke($"  [{logPrefix}] ClientToScreen failed"); return false; }
+            log?.Invoke($"  [{logPrefix}] click target (screen) = ({pt.X},{pt.Y})");
+
+            int txBefore = NativeBridgeService.GetEdrTxCount();
+            if (!GetCursorPos(out POINT saved)) { log?.Invoke($"  [{logPrefix}] GetCursorPos failed"); return false; }
+
+            int txAfter = txBefore;
+            for (int attempt = 1; attempt <= 2; attempt++)
+            {
+                SetForegroundWindow(rd);
+                try
+                {
+                    ShowCursor(false);
+                    SendMouseClickAt(pt.X, pt.Y, log);
+                    Thread.Sleep(20);
+                }
+                finally
+                {
+                    SetCursorPos(saved.X, saved.Y);
+                    ShowCursor(true);
+                }
+                if (hideAfterClick) { try { HideWindow(rd); } catch { } }
+                log?.Invoke($"  [{logPrefix}] attempt {attempt}: click fired{(hideAfterClick ? " + RD hidden" : "")}, waiting for EDR tx settle");
+                txAfter = WaitForEdrTxSettle(txBefore, timeoutMs: 2500, stableMs: 350, log);
+                if (txAfter > txBefore) { log?.Invoke($"  [{logPrefix}] attempt {attempt}: tx delta = {txAfter - txBefore}"); break; }
+                log?.Invoke($"  [{logPrefix}] attempt {attempt}: no tx - retrying...");
+                if (hideAfterClick) { try { UnhideWindow(rd); } catch { } }
+                Thread.Sleep(100);
+            }
+
+            if (txAfter <= txBefore)
+            {
+                log?.Invoke($"  [{logPrefix}] [WARN] click did not trigger EDR tx after 2 attempts.");
+                return false;
+            }
+
+            // After Apply-to-Right, RIGHT Alter Script (cmd 1057) becomes
+            // enabled and LEFT (1056) goes DISABLED. Wait for 1057 here so
+            // the caller's 1057 click does not no-op on a still-disabled
+            // toolbar button (also dumps every RD toolbar button's enabled
+            // state as [RAS-WAIT] for diagnostic).
+            WaitForRdAlterScriptEnabled(rd, CMD_RD_RIGHT_ALTER_SCRIPT, log);
+            return true;
+        }
+
+        /// <summary>
+        /// Review-path Apply-to-Right: thin wrapper around
+        /// <see cref="ApplyToRightArrowAndWaitForRas"/>. Cascades the active
+        /// dirty v2 (LEFT) changes onto the older version v1 (RIGHT) on the
+        /// Resolve Differences dialog. Returns true iff the click fired an
+        /// EDR transaction (the precondition for the caller's 1057 click).
+        ///
+        /// Caller-specific bracketing kept here: brings RD foreground +
+        /// unhides it BEFORE the helper measures + clicks (in production
+        /// RD may be hidden/layered, so an unprepped mouse_event would miss);
+        /// re-hides it AFTER on success when not in debug-visible mode (the
+        /// helper itself does not hide-per-attempt for the Review pattern).
         /// </summary>
         public static bool ApplyToRightArrowOnReviewRd(IntPtr rd, Action<string> log)
         {
             if (rd == IntPtr.Zero || !IsWindow(rd)) { log?.Invoke("  [REVIEW-APPLY] RD invalid"); return false; }
             try
             {
-                // Poll the RD listview (id=200) until it has >=1 item AND the
-                // row-0 arrow subitem rect is non-zero. Clicking too early fires
-                // a bogus EDR tx that makes OnFE emit "No schema to generate".
-                IntPtr lv = IntPtr.Zero;
-                int polled = 0; const int pollStep = 50; const int pollMaxMs = 1500;
-                while (polled < pollMaxMs)
-                {
-                    lv = FindListViewById(rd, 200, log: null);
-                    if (lv != IntPtr.Zero)
-                    {
-                        int cnt = SendMessage(lv, LVM_GETITEMCOUNT, IntPtr.Zero, IntPtr.Zero).ToInt32();
-                        if (cnt > 0)
-                        {
-                            RECT testRc = new RECT { left = LVIR_BOUNDS, top = 6, right = 0, bottom = 0 };
-                            SendMessage(lv, LVM_GETSUBITEMRECT, new IntPtr(0), ref testRc);
-                            if (testRc.right > testRc.left && testRc.bottom > testRc.top)
-                            {
-                                log?.Invoke($"  [REVIEW-APPLY] listview ready after {polled}ms (items={cnt}, arrow rect ok)");
-                                break;
-                            }
-                        }
-                    }
-                    Thread.Sleep(pollStep);
-                    polled += pollStep;
-                }
-                if (lv == IntPtr.Zero) { log?.Invoke($"  [REVIEW-APPLY] listview id=200 not found within {pollMaxMs}ms"); return false; }
-
-                // Make the RD visible + on top BEFORE measuring/clicking. In
-                // production (non-debug) the wizard/dialogs are hidden, so the
-                // mouse click would otherwise land on an off-screen / layered
-                // window and miss. Mirrors ClickRightAlterScriptInRd's unhide.
+                // Pre-helper foreground prep: in production RD may be hidden
+                // or layered (matches ClickRightAlterScriptInRd's unhide).
                 try { BringWindowToTop(rd); SetForegroundWindow(rd); UnhideWindow(rd); } catch { }
                 Thread.Sleep(60);
 
-                int total = SendMessage(lv, LVM_GETITEMCOUNT, IntPtr.Zero, IntPtr.Zero).ToInt32();
-                log?.Invoke($"  [REVIEW-APPLY] LV items={total}; clicking row 0 Apply-to-Right arrow (subitem 6)");
+                bool applied = ApplyToRightArrowAndWaitForRas(
+                    rd, "REVIEW-APPLY", log,
+                    hideAfterClick: false, dumpItems: false,
+                    pollMaxMs: 1500, pollStep: 50);
 
-                RECT rc = new RECT { left = LVIR_BOUNDS, top = 6, right = 0, bottom = 0 };
-                SendMessage(lv, LVM_GETSUBITEMRECT, new IntPtr(0), ref rc);
-                POINT pt = new POINT { X = (rc.left + rc.right) / 2, Y = (rc.top + rc.bottom) / 2 };
-                if (!ClientToScreen(lv, ref pt)) { log?.Invoke("  [REVIEW-APPLY] ClientToScreen failed"); return false; }
-                log?.Invoke($"  [REVIEW-APPLY] click target (screen) = ({pt.X},{pt.Y})");
-
-                int txBefore = NativeBridgeService.GetEdrTxCount();
-                if (!GetCursorPos(out POINT saved)) { log?.Invoke("  [REVIEW-APPLY] GetCursorPos failed"); return false; }
-
-                int txAfter = txBefore;
-                for (int attempt = 1; attempt <= 2; attempt++)
-                {
-                    SetForegroundWindow(rd);
-                    try
-                    {
-                        ShowCursor(false);
-                        SendMouseClickAt(pt.X, pt.Y, log);
-                        Thread.Sleep(20);
-                    }
-                    finally
-                    {
-                        SetCursorPos(saved.X, saved.Y);
-                        ShowCursor(true);
-                    }
-                    log?.Invoke($"  [REVIEW-APPLY] attempt {attempt}: click fired, waiting for EDR tx settle");
-                    txAfter = WaitForEdrTxSettle(txBefore, timeoutMs: 2500, stableMs: 350, log);
-                    if (txAfter > txBefore) { log?.Invoke($"  [REVIEW-APPLY] attempt {attempt}: tx delta = {txAfter - txBefore}"); break; }
-                    log?.Invoke($"  [REVIEW-APPLY] attempt {attempt}: no tx - retrying...");
-                    Thread.Sleep(100);
-                }
-                bool applied = txAfter > txBefore;
-                if (!applied) { log?.Invoke("  [REVIEW-APPLY] [WARN] click did not trigger EDR tx after 2 attempts."); return false; }
-
-                // Re-hide the RD in production (reduce flash). The toolbar still
-                // answers TB_* messages while hidden, and ClickRightAlterScriptInRd
-                // re-unhides it for the 1057 click.
-                if (!DebugMode.KeepDialogsVisible) { try { HideWindow(rd); } catch { } }
-
-                // After Apply-to-Right, the RIGHT Alter Script button
-                // (cmd 1057) becomes enabled (the LEFT one, 1056, stays
-                // DISABLED - that was the bug: we were clicking 1056). Wait for
-                // 1057 to be enabled before the caller invokes
-                // ClickRightAlterScriptInRdAsync(rd, CMD_RD_RIGHT_ALTER_SCRIPT).
-                WaitForRdAlterScriptEnabled(rd, CMD_RD_RIGHT_ALTER_SCRIPT, log);
-                return true;
+                // Re-hide RD in production (reduce flash). ClickRightAlterScript
+                // re-unhides it for the 1057 click. NOTE: this now runs AFTER
+                // WaitForRdAlterScriptEnabled (inside the helper) rather than
+                // before, so RD stays visible an extra ~0-300ms vs the prior
+                // hand-written body; acceptable trade-off for one source of
+                // truth across both pipelines.
+                if (applied && !DebugMode.KeepDialogsVisible) { try { HideWindow(rd); } catch { } }
+                return applied;
             }
             catch (Exception ex) { log?.Invoke($"  [REVIEW-APPLY] threw: {ex.GetType().Name}: {ex.Message}"); return false; }
         }
@@ -1097,129 +1163,31 @@ namespace EliteSoft.Erwin.AddIn.Services
                 log?.Invoke($"  [DB-6] Resolve Differences = 0x{resolveDlg.ToInt64():X}");
                 session.ResolveDifferences = resolveDlg;
 
-                // From here: identical to Mart-Mart pipeline (form transparent,
-                // listview ready poll with items>0 guard, mouse click on
-                // subItem=6 arrow, RD hide, EDR settle).
+                // Apply-to-Right via the shared helper
+                // (ApplyToRightArrowAndWaitForRas, see ~line 600). Caller-side
+                // bracketing: overlayToggle makes the addin form click-through
+                // so the mouse-sim reaches the RD listview; restored in finally
+                // even on exception. Helper-side parameters chosen to match the
+                // prior inline behaviour:
+                //   hideAfterClick=true  - hide RD per attempt + unhide on
+                //                          retry (cuts ~500ms flash; the
+                //                          Mart-Mart / From-DB pattern).
+                //   dumpItems=true       - log first 8 LV rows for tree-depth
+                //                          diagnostics (DB compare is deeper
+                //                          than Mart-Mart).
+                //   poll 5/800           - the prior tight poll cadence.
+                // On success the helper internally waits for RIGHT Alter Script
+                // (cmd 1057) to be TBSTATE_ENABLED, so the next 1057 click
+                // lands. (1056=LEFT is DISABLED after Apply-to-Right; clicking
+                // it was the prior bug.)
                 try { overlayToggle?.Invoke(false); } catch { }
-
-                IntPtr lv = IntPtr.Zero;
-                int polled = 0;
-                const int pollStep = 5;
-                const int pollMaxMs = 800;
-                while (polled < pollMaxMs)
-                {
-                    lv = FindListViewById(resolveDlg, 200, log: null);
-                    if (lv != IntPtr.Zero)
-                    {
-                        IntPtr cnt = SendMessage(lv, LVM_GETITEMCOUNT, IntPtr.Zero, IntPtr.Zero);
-                        if (cnt.ToInt32() > 0)
-                        {
-                            RECT testRc = new RECT { left = LVIR_BOUNDS, top = 6, right = 0, bottom = 0 };
-                            SendMessage(lv, LVM_GETSUBITEMRECT, new IntPtr(0), ref testRc);
-                            if (testRc.right > testRc.left && testRc.bottom > testRc.top)
-                            {
-                                log?.Invoke($"  [DB-7] listview ready after {polled}ms (items={cnt.ToInt32()}, arrow rect ok)");
-                                break;
-                            }
-                        }
-                    }
-                    Thread.Sleep(pollStep);
-                    polled += pollStep;
-                }
-                if (lv == IntPtr.Zero)
-                {
-                    log?.Invoke($"  [DB-7] listview id=200 not found within {pollMaxMs}ms");
-                    try { overlayToggle?.Invoke(true); } catch { }
-                    return session;
-                }
-
-                // Diagnostic: dump first 8 items so we can identify which
-                // row is the "Model" / "Tables" container with the apply-
-                // to-right arrow that actually cascades changes. Mart-Mart
-                // pipeline used item=0 because there's only one root
-                // (Model). DB-mart compare with hundreds of differences
-                // probably has a deeper tree (Database -> Schema ->
-                // Tables -> Columns) where item=0 is no-op.
-                int totalItems = SendMessage(lv, LVM_GETITEMCOUNT, IntPtr.Zero, IntPtr.Zero).ToInt32();
-                int dumpCount = Math.Min(totalItems, 8);
-                log?.Invoke($"  [DB-7] [LV-DUMP] first {dumpCount} of {totalItems} item(s):");
-                for (int i = 0; i < dumpCount; i++)
-                {
-                    string itemText = GetListViewItemText(lv, i, 0);
-                    string col4Text = GetListViewItemText(lv, i, 4);   // left model name col
-                    string col7Text = GetListViewItemText(lv, i, 7);   // right model name col
-                    RECT rowRc = new RECT { left = LVIR_BOUNDS, top = 6, right = 0, bottom = 0 };
-                    SendMessage(lv, LVM_GETSUBITEMRECT, new IntPtr(i), ref rowRc);
-                    log?.Invoke($"    item[{i}] col0='{itemText}' col4='{col4Text}' col7='{col7Text}' arrow=({rowRc.left},{rowRc.top})-({rowRc.right},{rowRc.bottom})");
-                }
-
-                RECT rc = new RECT { left = LVIR_BOUNDS, top = 6, right = 0, bottom = 0 };
-                SendMessage(lv, LVM_GETSUBITEMRECT, new IntPtr(0), ref rc);
-                POINT pt = new POINT { X = (rc.left + rc.right) / 2, Y = (rc.top + rc.bottom) / 2 };
-                if (!ClientToScreen(lv, ref pt))
-                {
-                    log?.Invoke("  [DB-7] ClientToScreen failed");
-                    try { overlayToggle?.Invoke(true); } catch { }
-                    return session;
-                }
-                log?.Invoke($"  [DB-7] click target (screen) = ({pt.X},{pt.Y})");
-
-                int txBefore = NativeBridgeService.GetEdrTxCount();
-                if (!GetCursorPos(out POINT saved))
-                {
-                    log?.Invoke("  [DB-7] GetCursorPos failed");
-                    try { overlayToggle?.Invoke(true); } catch { }
-                    return session;
-                }
-
-                // NOTE: a temporary "manual inspection" AddinMessageDialog used
-                // to pause here when dbgPauseBeforeApply was set. Removed
-                // 2026-05-29: DriveCCDbAndApply runs on a background Task.Run
-                // thread, so a modal WinForms dialog shown from here is not
-                // pumped and its OK cannot be clicked -> erwin appears locked.
-                // Debug pacing already comes from DebugMode.Pause + visible
-                // dialogs; this blocking prompt added nothing but the deadlock.
-                int txAfter = txBefore;
                 try
                 {
-                    for (int attempt = 1; attempt <= 2; attempt++)
-                    {
-                        SetForegroundWindow(resolveDlg);
-                        try
-                        {
-                            ShowCursor(false);
-                            SendMouseClickAt(pt.X, pt.Y, log);
-                            Thread.Sleep(20);
-                        }
-                        finally
-                        {
-                            SetCursorPos(saved.X, saved.Y);
-                            ShowCursor(true);
-                        }
-                        HideWindow(resolveDlg);
-                        log?.Invoke($"  [DB-7] attempt {attempt}: click fired + RD hidden, waiting for EDR tx settle");
-                        txAfter = WaitForEdrTxSettle(txBefore, timeoutMs: 2500, stableMs: 350, log);
-                        if (txAfter > txBefore)
-                        {
-                            log?.Invoke($"  [DB-7] attempt {attempt}: tx delta = {txAfter - txBefore}");
-                            break;
-                        }
-                        log?.Invoke($"  [DB-7] attempt {attempt}: no tx - retrying...");
-                        UnhideWindow(resolveDlg);
-                        Thread.Sleep(100);
-                    }
-                    session.Applied = (txAfter - txBefore) > 0;
-                    if (!session.Applied)
-                        log?.Invoke("  [DB-7] [WARN] mouse click did not trigger EDR tx after 2 attempts.");
-                    else
-                        // Apply-to-Right cascaded the dirty Mart (LEFT) onto the
-                        // RE'd DB (RIGHT), so the RIGHT Alter Script (cmd 1057)
-                        // becomes enabled while the LEFT one (1056) goes DISABLED.
-                        // Clicking 1056 was the bug ("FE Wizard did not appear",
-                        // verified 2026-05-29 - same as the Review path). Wait for
-                        // 1057 to be enabled here (also dumps the RD toolbar
-                        // button states) so the caller's 1057 click lands.
-                        WaitForRdAlterScriptEnabled(resolveDlg, CMD_RD_RIGHT_ALTER_SCRIPT, log);
+                    bool applied = ApplyToRightArrowAndWaitForRas(
+                        resolveDlg, "DB-7", log,
+                        hideAfterClick: true, dumpItems: true,
+                        pollMaxMs: 800, pollStep: 5);
+                    session.Applied = applied;
                 }
                 finally
                 {
