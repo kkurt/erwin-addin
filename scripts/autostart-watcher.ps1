@@ -167,6 +167,7 @@ public static class WatcherWmPoster {
     public const uint WM_MDIMAXIMIZE  = 0x0225;
     public const uint WM_CLOSE        = 0x0010;
     public const int  SW_HIDE         = 0;
+    public const int  SW_SHOW         = 5;
     public const uint SWP_NOSIZE      = 0x0001;
     public const uint SWP_NOZORDER    = 0x0004;
     public const uint SWP_NOACTIVATE  = 0x0010;
@@ -236,6 +237,25 @@ public static class WatcherWmPoster {
     // Returns: 0 = dialog never appeared (post may have been dropped),
     // 1 = dialog found, hidden, and close posted (activation expected).
     // Total cost ~300-800 ms depending on how fast erwin opens the dialog.
+    // Structural verification: an Add-In Manager dialog hosts a list
+    // control (typically SysListView32) showing the registered addins.
+    // Transient erwin #32770s (error popups, simple alerts) do not, so
+    // checking for ANY child window with "List" in its class name is a
+    // reliable filter for "this is the Add-In Manager" when the title
+    // string is localized and we cannot match it directly.
+    public static bool HasAddinManagerStructure(IntPtr dlg) {
+        bool hasList = false;
+        EnumChildWindows(dlg, (h, _) => {
+            var cls = new StringBuilder(64);
+            GetClassNameW(h, cls, cls.Capacity);
+            if (cls.ToString().IndexOf("List", StringComparison.OrdinalIgnoreCase) >= 0) {
+                hasList = true; return false;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return hasList;
+    }
+
     public static int TriggerLazyActivation(IntPtr mainFrame, uint erwinPid) {
         // 1179 = Manage Add-Ins dialog (from erwin string table +
         // EM_CMP.dll dispatch). Verified 2026-05-26 from the user's
@@ -243,49 +263,71 @@ public static class WatcherWmPoster {
         // 1181 into a bound state on subsequent PostMessages.
         PostMessageW(mainFrame, 0x0111, (IntPtr)1179, IntPtr.Zero);
 
-        // Poll up to 2 s for the dialog to appear. 50 ms granularity so
-        // we catch it before its initial WM_PAINT (typical Win32 dialog
-        // creation -> first paint window is 80-150 ms).
+        // Poll up to 2 s for the dialog to appear. STRICT match: try
+        // localized title fragments first; if none match, accept a
+        // #32770 owned by erwin that has Add-In Manager STRUCTURE (a
+        // list control). The OLD "any #32770" fallback sometimes picked
+        // a transient unrelated dialog, hid+closed THAT, then the real
+        // Add-In Manager opened later and stayed open (user-reported
+        // intermittent bug 2026-05-29).
+        string[] titles = new[] { "Add-In", "Add-in", "Eklenti" };
         IntPtr dlg = IntPtr.Zero;
         for (int i = 0; i < 40 && dlg == IntPtr.Zero; i++) {
             System.Threading.Thread.Sleep(50);
-            // Title substring filter is intentionally loose ("Add-In")
-            // so localized strings ("Add-in Yoneticisi" / "Eklenti...")
-            // still match. If user has multiple #32770 dialogs open
-            // unrelated to addins, the substring should still pick the
-            // right one.
-            dlg = FindDialogByProcess(erwinPid, "Add-In");
-            if (dlg == IntPtr.Zero) {
-                // Some localizations may not contain "Add-In" - fall
-                // back to ANY #32770 owned by erwin. We just posted the
-                // command 50 ms ago so a fresh dialog is almost
-                // certainly ours.
-                dlg = FindDialogByProcess(erwinPid, null);
+            foreach (var t in titles) {
+                dlg = FindDialogByProcess(erwinPid, t);
+                if (dlg != IntPtr.Zero) break;
             }
+            if (dlg != IntPtr.Zero) break;
+            // Structural fallback: walk erwin's #32770s and accept one
+            // with a List child (the addin list). Replaces the old
+            // permissive "any #32770" pick.
+            EnumWindows((h, _) => {
+                uint p; GetWindowThreadProcessId(h, out p);
+                if (p != erwinPid) return true;
+                var c = new StringBuilder(64);
+                GetClassNameW(h, c, c.Capacity);
+                if (c.ToString() != "#32770") return true;
+                if (HasAddinManagerStructure(h)) { dlg = h; return false; }
+                return true;
+            }, IntPtr.Zero);
         }
         if (dlg == IntPtr.Zero) return 0;
 
-        // Hide ASAP: combine ShowWindow(SW_HIDE) + SetWindowPos with
-        // SWP_HIDEWINDOW for redundancy. If the dialog already painted,
-        // user sees a brief flash; if we caught it before paint, zero
-        // flash. Either way the activation work happens inside erwin's
-        // dialog setup BEFORE we get here, so by the time we hide it
-        // the addin cmd id binding is already done.
+        // Hide (SW_HIDE only, NO offscreen move): if the close-verify
+        // loop below fails we un-hide so the user can dismiss the
+        // dialog manually instead of leaving it stranded offscreen
+        // (the prior offscreen+SWP_HIDEWINDOW combo did exactly that).
         ShowWindow(dlg, SW_HIDE);
-        SetWindowPos(dlg, IntPtr.Zero, -32000, -32000, 0, 0,
-            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_HIDEWINDOW);
 
         // Give erwin a moment to finish per-addin CoCreateInstance +
-        // cmd id binding. 200 ms is generous; the work is mostly already
-        // done when the dialog's WM_INITDIALOG returned.
+        // cmd id binding. 200 ms is generous; the work is mostly done
+        // by the time WM_INITDIALOG returned.
         System.Threading.Thread.Sleep(200);
 
-        // Close cleanly. WM_CLOSE on a #32770 invokes the default
-        // close handler which is equivalent to Cancel. PostMessage so
-        // we don't block. The activation has already happened; cleanup
-        // can run async.
-        PostMessageW(dlg, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
-        return 1;
+        // Close-and-verify loop: WM_CLOSE then poll IsWindow; if still
+        // alive, fall back to WM_COMMAND IDCANCEL (2). Up to ~2 s of
+        // attempts. Replaces the prior fire-and-forget single WM_CLOSE
+        // (and unconditional success log) that was intermittently lost
+        // when posted before the dialog's modal loop was ready.
+        for (int attempt = 0; attempt < 10; attempt++) {
+            PostMessageW(dlg, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+            System.Threading.Thread.Sleep(100);
+            if (!IsWindow(dlg)) return 1;
+            // IDCANCEL = standard dialog "Cancel" command id; on a
+            // #32770 it routes through the same handler as WM_CLOSE
+            // but via the dialog manager's command path - useful when
+            // WM_CLOSE itself was filtered/queued behind another
+            // message.
+            PostMessageW(dlg, 0x0111, (IntPtr)2, IntPtr.Zero);
+            System.Threading.Thread.Sleep(100);
+            if (!IsWindow(dlg)) return 1;
+        }
+
+        // Close attempts exhausted - un-hide so the user can dismiss
+        // it manually (better than stranding it hidden).
+        ShowWindow(dlg, SW_SHOW);
+        return 2;
     }
 
     // Activate + maximize the active MDI child to flip erwin's
@@ -567,7 +609,8 @@ while ($true) {
                 $actResult = [WatcherWmPoster]::TriggerLazyActivation($mainHwnd, [uint32]$targetPid)
                 switch ($actResult) {
                     0 { Write-Log "Lazy activation: dialog never appeared (WM_COMMAND 1179 may have been dropped)" }
-                    1 { Write-Log "Lazy activation: Add-Ins dialog opened, hidden, closed - cmd id binding should be live now" }
+                    1 { Write-Log "Lazy activation: Add-Ins dialog opened, hidden, closed cleanly - cmd id binding should be live now" }
+                    2 { Write-Log "Lazy activation: WARN dialog opened but close attempts exhausted - dialog un-hidden so user can dismiss it manually. Cmd id binding likely OK (activation work happens before close)." }
                 }
                 Start-Sleep -Milliseconds 100
 
