@@ -31,7 +31,8 @@ public class NamingStandardEngineTests
         string regex = "",
         bool autoApply = false,
         bool isRequired = false,
-        string errorMessage = "test error")
+        string errorMessage = "test error",
+        RuleApplyOn applyOn = RuleApplyOn.Both)
         => new()
         {
             Id = 1,
@@ -46,6 +47,7 @@ public class NamingStandardEngineTests
             RegexpPattern = regex,
             ErrorMessage = errorMessage,
             AutoApply = autoApply,
+            ApplyOn = applyOn,
             IsActive = true,
         };
 
@@ -347,5 +349,225 @@ public class NamingStandardEngineTests
         // commas are ignored rather than treated as "match empty source".
         NamingValidationEngine.MatchesCsv("Date", ", ,Date").Should().BeTrue();
         NamingValidationEngine.MatchesCsv("",     ", ,Date").Should().BeFalse();
+    }
+
+    // ============================================================
+    // Matrix coverage 2026-05-31. The full matrix is RuleType x
+    // ApplyOn x IsRequired x AutoApply = 5 x 3 x 2 x 2 = 60. The
+    // cases below lock the behaviour the live History/Log bug
+    // depended on (rule#17 Vp prefix unconditional, rule#21 _HISTORY
+    // suffix conditional Both, rule#1019 Required Name_Qualifier
+    // Both, rule#1022 Length Definition Create) plus the
+    // gap-analysis "must hold forever" invariants the production
+    // pipeline relies on. New tests deliberately do NOT mock SCAPI -
+    // every case is pure-engine (unconditional rules + name input
+    // only) so they run in milliseconds and never depend on COM
+    // marshalling.
+    // ============================================================
+
+    // ---------- MatchesApplyOn gate (3 x 2 truth table) ----------
+
+    [Theory]
+    [InlineData(RuleApplyOn.Create, true,  true)]
+    [InlineData(RuleApplyOn.Create, false, false)]
+    [InlineData(RuleApplyOn.Update, true,  false)]
+    [InlineData(RuleApplyOn.Update, false, true)]
+    [InlineData(RuleApplyOn.Both,   true,  true)]
+    [InlineData(RuleApplyOn.Both,   false, true)]
+    public void MatchesApplyOn_truth_table(RuleApplyOn applyOn, bool isNew, bool expected)
+    {
+        // Locks the 6-cell truth table that every rule kind shares.
+        // The live History bug bypassed this gate by losing the
+        // entity name across an auto-rename; if MatchesApplyOn itself
+        // ever drifts, regressions surface here BEFORE shipping.
+        var rule = Rule(NamingRuleKind.Prefix, prefix: "X", applyOn: applyOn);
+        NamingValidationEngine.MatchesApplyOn(rule, isNew).Should().Be(expected);
+    }
+
+    // ---------- Length matrix (Create / Update / Both x Req T/F) ----------
+
+    [Fact]
+    public void Length_ApplyOn_Both_IsRequired_false_fires_on_empty()
+    {
+        // rule#1022 analogue with ApplyOn=Both: the History fix
+        // exposed that some admins set Length rules to Both rather
+        // than Create. Empty + not required + Length must still warn.
+        var rule = Rule(NamingRuleKind.Length, lenOp: ">", lenVal: 10,
+                        isRequired: false, applyOn: RuleApplyOn.Both);
+        NamingValidationEngine.EvaluateRule(rule, "").Should().ContainSingle()
+            .Which.RuleName.Should().Be("Length");
+    }
+
+    [Fact]
+    public void Length_ApplyOn_Update_IsRequired_true_fires_required_on_empty()
+    {
+        // Update gate + IsRequired true + empty: Step 1 emits Required,
+        // does NOT continue into Length pattern check (proven by
+        // Empty_with_IsRequired_true_does_NOT_also_fire_pattern_check).
+        // Locks the contract for the legacy-data-grandfathering use case
+        // admin uses Update + IsRequired for.
+        var rule = Rule(NamingRuleKind.Length, lenOp: ">", lenVal: 5,
+                        isRequired: true, applyOn: RuleApplyOn.Update);
+        var results = NamingValidationEngine.EvaluateRule(rule, "");
+        results.Should().ContainSingle().Which.RuleName.Should().Be("Required");
+    }
+
+    // ---------- Required RuleType (first-class kind) ----------
+
+    [Fact]
+    public void Required_ruletype_fires_on_empty_even_when_IsRequired_flag_is_false()
+    {
+        // RuleType=Required implies "value must be non-empty"
+        // regardless of the IsRequired flag (admin 2026-05-25 spec).
+        // rule#1019 analogue.
+        var rule = Rule(NamingRuleKind.Required, isRequired: false,
+                        applyOn: RuleApplyOn.Both);
+        NamingValidationEngine.EvaluateRule(rule, "").Should().ContainSingle()
+            .Which.RuleName.Should().Be("Required");
+    }
+
+    [Fact]
+    public void Required_ruletype_passes_when_value_is_non_empty()
+    {
+        var rule = Rule(NamingRuleKind.Required, isRequired: true,
+                        applyOn: RuleApplyOn.Both);
+        NamingValidationEngine.EvaluateRule(rule, "Customer").Should().BeEmpty();
+    }
+
+    // ---------- Prefix matrix ----------
+
+    [Theory]
+    [InlineData("DM_", "DM_CUSTOMER", true)]   // prefix present -> pass
+    [InlineData("DM_", "CUSTOMER",    false)]  // prefix missing -> fire
+    [InlineData("DM_", "dm_customer", true)]   // case-insensitive match
+    public void Prefix_pattern_check_matrix(string prefix, string name, bool shouldPass)
+    {
+        var rule = Rule(NamingRuleKind.Prefix, prefix: prefix,
+                        applyOn: RuleApplyOn.Both);
+        var results = NamingValidationEngine.EvaluateRule(rule, name);
+        if (shouldPass) results.Should().BeEmpty();
+        else results.Should().ContainSingle().Which.RuleName.Should().Be("Prefix");
+    }
+
+    // ---------- Suffix matrix ----------
+
+    [Theory]
+    [InlineData("_T", "CUSTOMER_T", true)]
+    [InlineData("_T", "CUSTOMER",   false)]
+    [InlineData("_T", "customer_t", true)]
+    public void Suffix_pattern_check_matrix(string suffix, string name, bool shouldPass)
+    {
+        var rule = Rule(NamingRuleKind.Suffix, suffix: suffix,
+                        applyOn: RuleApplyOn.Both);
+        var results = NamingValidationEngine.EvaluateRule(rule, name);
+        if (shouldPass) results.Should().BeEmpty();
+        else results.Should().ContainSingle().Which.RuleName.Should().Be("Suffix");
+    }
+
+    // ---------- ApplyNamingStandards: AutoApply x ApplyOn x isNew matrix --------
+
+    [Fact]
+    public void ApplyNamingStandards_unconditional_Prefix_Both_AutoApply_true_isNew_true_applies()
+    {
+        // rule#17 analogue: unconditional Vp prefix, ApplyOn=Both,
+        // AutoApply=true. Must add Vp on the creation gesture.
+        NamingStandardService.Instance.SeedForTesting(new[]
+        {
+            Rule(NamingRuleKind.Prefix, prefix: "Vp", autoApply: true,
+                 applyOn: RuleApplyOn.Both),
+        });
+        try
+        {
+            var applied = NamingValidationEngine.ApplyNamingStandards(
+                "Table", "owner_test", scapiObject: null, autoOnly: true,
+                propertyCode: "Physical_Name", isNew: true);
+            applied.Should().Be("Vpowner_test");
+        }
+        finally { NamingStandardService.Instance.SeedForTesting(System.Array.Empty<NamingStandardRule>()); }
+    }
+
+    [Fact]
+    public void ApplyNamingStandards_unconditional_Prefix_Both_AutoApply_true_isNew_false_still_applies()
+    {
+        // ApplyOn=Both must fire regardless of isNew. The History bug
+        // depended on this guarantee even when the deferred check
+        // path passed isNew=false.
+        NamingStandardService.Instance.SeedForTesting(new[]
+        {
+            Rule(NamingRuleKind.Prefix, prefix: "Vp", autoApply: true,
+                 applyOn: RuleApplyOn.Both),
+        });
+        try
+        {
+            var applied = NamingValidationEngine.ApplyNamingStandards(
+                "Table", "owner_test", scapiObject: null, autoOnly: true,
+                propertyCode: "Physical_Name", isNew: false);
+            applied.Should().Be("Vpowner_test");
+        }
+        finally { NamingStandardService.Instance.SeedForTesting(System.Array.Empty<NamingStandardRule>()); }
+    }
+
+    [Fact]
+    public void ApplyNamingStandards_unconditional_Prefix_Create_AutoApply_true_isNew_false_does_NOT_apply()
+    {
+        // Spec: ApplyOn=Create filtered out when isNew=false. The
+        // working Log case fires Vp on the SECOND scoped check
+        // (isNew=true) because of this gate. Verifies the engine
+        // honours ApplyOn=Create literally.
+        NamingStandardService.Instance.SeedForTesting(new[]
+        {
+            Rule(NamingRuleKind.Prefix, prefix: "Vp", autoApply: true,
+                 applyOn: RuleApplyOn.Create),
+        });
+        try
+        {
+            var applied = NamingValidationEngine.ApplyNamingStandards(
+                "Table", "owner_test", scapiObject: null, autoOnly: true,
+                propertyCode: "Physical_Name", isNew: false);
+            applied.Should().Be("owner_test");
+        }
+        finally { NamingStandardService.Instance.SeedForTesting(System.Array.Empty<NamingStandardRule>()); }
+    }
+
+    [Fact]
+    public void ApplyNamingStandards_unconditional_Suffix_AutoApply_false_skipped_when_autoOnly_true()
+    {
+        // autoOnly:true is the silent auto-apply path. AutoApply=false
+        // rules must be deferred to the manual ask-user path.
+        NamingStandardService.Instance.SeedForTesting(new[]
+        {
+            Rule(NamingRuleKind.Suffix, suffix: "_T", autoApply: false,
+                 applyOn: RuleApplyOn.Both),
+        });
+        try
+        {
+            NamingValidationEngine.ApplyNamingStandards(
+                "Table", "Entity1", scapiObject: null, autoOnly: true,
+                propertyCode: "Physical_Name", isNew: true).Should().Be("Entity1");
+
+            NamingValidationEngine.ApplyNamingStandards(
+                "Table", "Entity1", scapiObject: null, autoOnly: false,
+                propertyCode: "Physical_Name", isNew: true).Should().Be("Entity1_T");
+        }
+        finally { NamingStandardService.Instance.SeedForTesting(System.Array.Empty<NamingStandardRule>()); }
+    }
+
+    [Fact]
+    public void ApplyNamingStandards_idempotent_does_not_double_apply_prefix()
+    {
+        // Already prefixed names are NOT re-prefixed (verified
+        // case-insensitive via Prefix_pattern_check_matrix).
+        NamingStandardService.Instance.SeedForTesting(new[]
+        {
+            Rule(NamingRuleKind.Prefix, prefix: "Vp", autoApply: true,
+                 applyOn: RuleApplyOn.Both),
+        });
+        try
+        {
+            NamingValidationEngine.ApplyNamingStandards(
+                "Table", "Vpowner_test", scapiObject: null, autoOnly: true,
+                propertyCode: "Physical_Name", isNew: true).Should().Be("Vpowner_test");
+        }
+        finally { NamingStandardService.Instance.SeedForTesting(System.Array.Empty<NamingStandardRule>()); }
     }
 }

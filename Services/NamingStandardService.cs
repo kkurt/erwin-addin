@@ -461,6 +461,39 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// Test-only seed. Replaces the rule cache with the supplied set and
+        /// marks the service as loaded so <c>ApplyNamingStandards</c> /
+        /// <c>ValidateObjectName</c> orchestration tests can exercise the
+        /// full engine without hitting the admin DB or mocking SCAPI. The
+        /// dictionary keying / sort behaviour matches
+        /// <see cref="LoadStandards"/> so a test-seeded ruleset behaves
+        /// identically to a DB-loaded one. Production code paths never call
+        /// this; only the test project (<c>tests/ErwinAddIn.Tests</c>) does.
+        /// </summary>
+        public void SeedForTesting(IEnumerable<NamingStandardRule> rules)
+        {
+            _allRules.Clear();
+            _byKey.Clear();
+            _lastError = null;
+            if (rules != null)
+            {
+                foreach (var r in rules)
+                {
+                    if (r == null) continue;
+                    _allRules.Add(r);
+                    var key = (r.ObjectType ?? "", r.PropertyCode ?? "");
+                    if (!_byKey.TryGetValue(key, out var list))
+                    {
+                        list = new List<NamingStandardRule>();
+                        _byKey[key] = list;
+                    }
+                    list.Add(r);
+                }
+            }
+            _isLoaded = true;
+        }
+
+        /// <summary>
         /// Distinct PROPERTY_CODE values that have at least one active rule
         /// for the given object type. Used by the new-entity validation path
         /// in <c>TableTypeMonitorService</c> so it can iterate every property

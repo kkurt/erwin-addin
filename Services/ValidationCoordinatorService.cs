@@ -2624,7 +2624,21 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // ValidateCommittedPendingAttrs path: every entity here is a
                 // pending placeholder whose inline-edit just closed - it is
                 // effectively a creation gesture, so isNew=true uniformly.
-                var entitiesToNamingCheck = new List<(string Name, bool IsNew)>();
+                //
+                // We queue by ObjectId, NOT by name. Between this queue point
+                // and the drain (~line 2783) a nested FireNewEntityPipeline ->
+                // Required UDP prompt -> FlushPendingTableNamingChecks chain
+                // can fire an ApplyOn=Both AutoApply=true Suffix rule (e.g.
+                // rule#21 TableClass=History -> '_HISTORY' suffix) and silently
+                // rename the entity. A name-keyed queue would then call
+                // RunScopedTableNamingCheck with the obsolete name, the
+                // entity-walk lookup inside it would miss, and every
+                // isNew=true rule (rule#17 Vp prefix, rule#1019 Required
+                // Name_Qualifier, rule#1022 Length Definition) would never
+                // evaluate. Verified 2026-05-31 against owner_test +
+                // TableClass=History. FallbackName is kept only for the
+                // entity-disappeared race (delete during the modal pump).
+                var entitiesToNamingCheck = new List<(string EntityId, string FallbackName, bool IsNew)>();
 
                 foreach (dynamic entity in allEntities)
                 {
@@ -2649,7 +2663,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     {
                         string liveEntityName = tableName;
                         Log($"[PENDING-ENTITY] commit edge for entityId={entityId} liveName='{liveEntityName}' - queuing naming check (isNew=true)");
-                        entitiesToNamingCheck.Add((liveEntityName, IsNew: true));
+                        entitiesToNamingCheck.Add((entityId, liveEntityName, IsNew: true));
                         _pendingNamedEntities.Remove(entityId);
 
                         // Fire the new-entity pipeline (model standards,
@@ -2780,10 +2794,54 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // keeps the two streams (glossary results from attrs, naming
                 // standard result from the entity) from racing the same modal
                 // pump and re-entering the timer through the message loop.
-                foreach (var (entityName, isNew) in entitiesToNamingCheck)
+                //
+                // Bug fix 2026-05-31 (History+Both+Required scenario): between
+                // queueing (line 2652) and this drain, a nested
+                // FireNewEntityPipeline -> Required UDP prompt ->
+                // FlushPendingTableNamingChecks chain can auto-rename the
+                // entity via an ApplyOn=Both AutoApply=true conditional Suffix
+                // rule. Re-walk the model by ObjectId here and use the LIVE
+                // Physical_Name; fall back to the queued name only if the
+                // entity was deleted out from under us during the modal pump.
+                if (entitiesToNamingCheck.Count > 0)
                 {
-                    try { RunScopedTableNamingCheck(entityName, isNew: isNew); }
-                    catch (Exception ex) { Log($"ValidateCommittedPendingAttrs: naming check err for '{entityName}': {ex.Message}"); }
+                    var liveNameById = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                    dynamic resolveAllEntities = null;
+                    try
+                    {
+                        resolveAllEntities = modelObjects.Collect(root, "Entity");
+                        if (resolveAllEntities != null)
+                        {
+                            var queuedIds = new HashSet<string>(
+                                entitiesToNamingCheck.Select(q => q.EntityId),
+                                StringComparer.OrdinalIgnoreCase);
+                            foreach (dynamic e in resolveAllEntities)
+                            {
+                                if (e == null) continue;
+                                string eid = null;
+                                try { eid = e.ObjectId?.ToString(); } catch { continue; }
+                                if (string.IsNullOrEmpty(eid) || !queuedIds.Contains(eid)) continue;
+                                string liveName = null;
+                                try { liveName = GetTableName(e); } catch { /* keep null - falls back */ }
+                                if (!string.IsNullOrEmpty(liveName))
+                                    liveNameById[eid] = liveName;
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"ValidateCommittedPendingAttrs: live-name re-resolve walk threw {ex.GetType().Name}: {ex.Message} - falling back to queued names for all entries");
+                    }
+                    finally { ReleaseCom(resolveAllEntities); }
+
+                    foreach (var (entityId, fallbackName, isNew) in entitiesToNamingCheck)
+                    {
+                        string resolvedName = liveNameById.TryGetValue(entityId, out var live) ? live : fallbackName;
+                        if (!string.Equals(resolvedName, fallbackName, StringComparison.Ordinal))
+                            Log($"ValidateCommittedPendingAttrs: entityId={entityId} renamed from queued '{fallbackName}' to live '{resolvedName}' between queue + drain - using live name for scoped naming check (isNew={isNew})");
+                        try { RunScopedTableNamingCheck(resolvedName, isNew: isNew); }
+                        catch (Exception ex) { Log($"ValidateCommittedPendingAttrs: naming check err for '{resolvedName}': {ex.Message}"); }
+                    }
                 }
             }
             finally

@@ -88,7 +88,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// matches; <c>Create</c> matches only when <paramref name="isNew"/>
         /// is true; <c>Update</c> matches only when it is false.
         /// </summary>
-        internal static bool MatchesApplyOn(NamingStandardRule rule, bool isNew)
+        public static bool MatchesApplyOn(NamingStandardRule rule, bool isNew)
         {
             if (rule == null) return false;
             switch (rule.ApplyOn)
