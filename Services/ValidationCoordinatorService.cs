@@ -266,6 +266,29 @@ namespace EliteSoft.Erwin.AddIn.Services
             new HashSet<string>(StringComparer.Ordinal);
 
         /// <summary>
+        /// Entity IDs that are currently inside a placeholder-commit
+        /// gesture (= ValidateCommittedPendingAttrs has lifted them out
+        /// of <see cref="_pendingNamedEntities"/> and is about to drain
+        /// their isNew=true scoped naming check). Kept SEPARATE from
+        /// <see cref="_pendingNamedEntities"/> because Required-UDP
+        /// modal pump may fire ScanForRenamesEventDriven INSIDE
+        /// ValidateCommittedPendingAttrs - at that point
+        /// <see cref="_pendingNamedEntities"/> has already been
+        /// cleared for the entity (line ~2670), so the rename-detect
+        /// branch's <c>wasPending</c> bool reads false and the
+        /// deferred scoped check loses the creationGesture context.
+        /// This set bridges that gap: ScanForRenamesEventDriven also
+        /// checks here, so the deferred check gets creationGesture=true
+        /// and the auto-apply pass merges Create + Update rules into
+        /// one engine call / one modal (verified 2026-05-31 against
+        /// the TableClass=Parametre two-modal split bug).
+        /// Cleared inside ValidateCommittedPendingAttrs.finally after
+        /// the drain completes.
+        /// </summary>
+        private readonly HashSet<string> _creationGestureEntityIds =
+            new HashSet<string>(StringComparer.Ordinal);
+
+        /// <summary>
         /// True when the column's Physical_Name is still in erwin's
         /// placeholder state (just created, no user-typed name yet).
         /// Mirrors the early-return guard in ValidateGlossary so the
@@ -1849,16 +1872,28 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // Required Name_Qualifier dialog rule#1019 because the
                     // rename detection here always passed isNew=false).
                     bool wasPending = _pendingNamedEntities.Remove(id);
-                    bool entityIsNew = wasPending;
+                    // Bridge: ValidateCommittedPendingAttrs may have
+                    // already lifted this id out of _pendingNamedEntities
+                    // and added it to _creationGestureEntityIds. When the
+                    // Required-UDP modal pump dispatches us mid-drain,
+                    // wasPending reads false but the gesture is still
+                    // active - the bridge set tells us so. Verified
+                    // 2026-05-31 against the TableClass=Parametre run
+                    // where the first deferred check fired with cg=false
+                    // because _pendingNamedEntities had already been
+                    // cleared at line ~2670 before this hook reached the
+                    // Remove call.
+                    bool inCreationGesture = _creationGestureEntityIds.Contains(id);
+                    bool entityIsNew = wasPending || inCreationGesture;
                     if (entityIsNew)
-                        Log($"  rename '{oldName}' -> '{newName}' is placeholder commit (was in _pendingNamedEntities) - treating as new-entity creation flow (isNew=true)");
+                        Log($"  rename '{oldName}' -> '{newName}' is placeholder commit (wasPending={wasPending}, inCreationGesture={inCreationGesture}) - treating as new-entity creation flow (isNew=true, creationGesture=true)");
 
-                    // wasPending=true means this rename detection IS the
-                    // placeholder-commit gesture, so widen the rule gate so
-                    // Create+Update+Both rules batch into one engine pass
-                    // (one consolidated modal) - prevents the Vp prefix vs
-                    // _PRM/_HISTORY suffix two-modal split user reported
-                    // 2026-05-31 with TableClass=Parametre / =History.
+                    // creationGesture=true widens MatchesApplyOn so
+                    // Create+Update+Both rules batch into ONE engine
+                    // pass / ONE consolidated modal - prevents the Vp
+                    // prefix vs _PRM/_HISTORY suffix two-modal split
+                    // user reported 2026-05-31 with TableClass=Parametre
+                    // / =History.
                     try { RunScopedTableNamingCheck(newName, isNew: entityIsNew, creationGesture: entityIsNew); }
                     catch (Exception ex) { Log($"ScanForRenamesEventDriven scoped check err for '{newName}': {ex.Message}"); }
                 }
@@ -2625,6 +2660,10 @@ namespace EliteSoft.Erwin.AddIn.Services
             dynamic modelObjects = null;
             dynamic root = null;
             dynamic allEntities = null;
+            // Declared at method scope so the finally block can drain
+            // _creationGestureEntityIds for every queued id even if the
+            // try body throws mid-walk.
+            var entitiesToNamingCheck = new List<(string EntityId, string FallbackName, bool IsNew)>();
             try
             {
                 try { modelObjects = _session.ModelObjects; root = modelObjects?.Root; }
@@ -2660,7 +2699,9 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // evaluate. Verified 2026-05-31 against owner_test +
                 // TableClass=History. FallbackName is kept only for the
                 // entity-disappeared race (delete during the modal pump).
-                var entitiesToNamingCheck = new List<(string EntityId, string FallbackName, bool IsNew)>();
+                // (Hoisted to method scope above so the finally block can
+                // clear _creationGestureEntityIds for every queued id
+                // even if this body throws mid-walk.)
 
                 foreach (dynamic entity in allEntities)
                 {
@@ -2687,6 +2728,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                         Log($"[PENDING-ENTITY] commit edge for entityId={entityId} liveName='{liveEntityName}' - queuing naming check (isNew=true)");
                         entitiesToNamingCheck.Add((entityId, liveEntityName, IsNew: true));
                         _pendingNamedEntities.Remove(entityId);
+                        // Bridge for the nested ScanForRenamesEventDriven
+                        // path fired during the Required-UDP modal pump:
+                        // _pendingNamedEntities is now empty for this id,
+                        // but the gesture is still active until the drain
+                        // at line ~2850 runs. Cleared in the finally block.
+                        _creationGestureEntityIds.Add(entityId);
 
                         // Fire the new-entity pipeline (model standards,
                         // question wizard, UDP defaults, unconditional
@@ -2873,6 +2920,22 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
             finally
             {
+                // Drain complete (or thrown out) - the creation gesture is
+                // over for every entity we tracked. Clear the bridge set so
+                // a subsequent unrelated rename detection on the same id
+                // does not incorrectly widen its rule gate. Best-effort:
+                // try/catch wraps the whole loop because the finally must
+                // never throw on top of an in-flight exception.
+                try
+                {
+                    foreach (var (eid, _, _) in entitiesToNamingCheck)
+                    {
+                        if (!string.IsNullOrEmpty(eid))
+                            _creationGestureEntityIds.Remove(eid);
+                    }
+                }
+                catch (Exception ex) { Log($"ValidateCommittedPendingAttrs.finally: _creationGestureEntityIds cleanup threw {ex.GetType().Name}: {ex.Message}"); }
+
                 ReleaseCom(allEntities);
                 ReleaseCom(root);
                 ReleaseCom(modelObjects);
