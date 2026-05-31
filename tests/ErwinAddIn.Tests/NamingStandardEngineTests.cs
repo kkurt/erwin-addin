@@ -75,12 +75,37 @@ public class NamingStandardEngineTests
     }
 
     [Fact]
-    public void Empty_value_with_IsRequired_false_skips_rule_entirely()
+    public void Empty_value_with_IsRequired_false_LENGTH_rule_still_fires()
     {
-        // Spec: empty + not required → no violation, pattern check skipped.
+        // Spec (refined 2026-05-31): empty + not required short-circuits
+        // for Prefix / Suffix / Regexp (those checks are meaningless on
+        // empty), but Length WITH '>' or '>=' operator is meaningful even
+        // on empty - "must be at least N characters" on an empty value
+        // is a real, actionable violation (admin rule#1022:
+        // TABLE.Definition len > 10 req=False, intended to warn when the
+        // user leaves Comment blank).
         var rule = Rule(NamingRuleKind.Length, lenOp: ">=", lenVal: 5, isRequired: false);
         var results = NamingValidationEngine.EvaluateRule(rule, "");
-        results.Should().BeEmpty();
+        results.Should().ContainSingle(r => !r.IsValid)
+            .Which.RuleName.Should().Be("Length");
+    }
+
+    [Fact]
+    public void Empty_value_with_IsRequired_false_NON_LENGTH_rules_still_skip()
+    {
+        // Prefix / Suffix / Regexp do NOT fire on empty + not required -
+        // those checks are meaningless on an empty value (a Prefix rule
+        // saying "must start with 'Vp'" on an empty optional field
+        // would emit a useless violation the user can never satisfy
+        // without filling the field).
+        var prefix = Rule(NamingRuleKind.Prefix, prefix: "DM_", isRequired: false);
+        NamingValidationEngine.EvaluateRule(prefix, "").Should().BeEmpty();
+
+        var suffix = Rule(NamingRuleKind.Suffix, suffix: "_T", isRequired: false);
+        NamingValidationEngine.EvaluateRule(suffix, "").Should().BeEmpty();
+
+        var regex = Rule(NamingRuleKind.Regexp, regex: "^[A-Z_]+$", isRequired: false);
+        NamingValidationEngine.EvaluateRule(regex, "").Should().BeEmpty();
     }
 
     [Fact]
@@ -266,11 +291,18 @@ public class NamingStandardEngineTests
     }
 
     [Fact]
-    public void Null_object_name_with_IsRequired_false_is_skipped()
+    public void Null_object_name_with_IsRequired_false_LENGTH_rule_fires()
     {
+        // Refined 2026-05-31: Length rules are evaluated even on null/
+        // empty values when IsRequired is false (admin's "> N" is a
+        // meaningful "at-least N characters" expectation regardless of
+        // whether the user has typed anything yet). Non-Length rules
+        // still short-circuit in that case (covered by the Prefix /
+        // Suffix / Regexp variant above).
         var rule = Rule(NamingRuleKind.Length, lenOp: ">", lenVal: 0, isRequired: false);
         var results = NamingValidationEngine.EvaluateRule(rule, null!);
-        results.Should().BeEmpty();
+        results.Should().ContainSingle(r => !r.IsValid)
+            .Which.RuleName.Should().Be("Length");
     }
 
     // ---------- C3 condition: CSV IN-match ----------

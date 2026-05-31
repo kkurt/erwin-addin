@@ -434,9 +434,25 @@ namespace EliteSoft.Erwin.AddIn.Services
                         !string.IsNullOrEmpty(rule.ErrorMessage)
                             ? rule.ErrorMessage
                             : "Value is required", rule));
+                    return;
                 }
-                // Empty + not required: skip pattern check entirely.
-                return;
+
+                // Empty + not required: Prefix / Suffix / Regexp do not
+                // usefully match against an empty value (a Prefix rule
+                // saying "must start with 'Vp'" on an empty field would
+                // emit a useless violation the user can never satisfy
+                // without filling the field, which is by definition not
+                // required). Length is the exception: "len > 10" on an
+                // empty value is `0 > 10 = false`, a real and actionable
+                // violation - the admin is saying "if this field is
+                // *expected* to have content (even though optional), it
+                // must be at least N characters". User reported 2026-05-31
+                // that rule#1022 (TABLE.Definition, len > 10, req=False)
+                // failed to warn on an empty Comment - the desired
+                // semantic. Fall through to the pattern check ONLY for
+                // Length; the other kinds still short-circuit.
+                if (rule.RuleType != NamingRuleKind.Length)
+                    return;
             }
 
             // Step 3: pattern check (Step 2 - AutoApply - lives in ApplyNamingStandards).

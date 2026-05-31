@@ -1819,7 +1819,25 @@ namespace EliteSoft.Erwin.AddIn.Services
                         _pendingNamedEntities.Add(id);
                         continue;
                     }
-                    try { RunScopedTableNamingCheck(newName); }
+
+                    // Mirror the heartbeat-tick rename branch (line ~1245):
+                    // a rename FROM a placeholder name that the user has
+                    // been carrying in `_pendingNamedEntities` is the
+                    // placeholder-commit gesture - functionally a creation,
+                    // not a post-create edit. The downstream
+                    // ApplyNamingStandards / NamingValidationEngine paths
+                    // filter rules by ApplyOn=Create using the `isNew`
+                    // flag, so getting this wrong silently drops every
+                    // apply=Create rule (verified 2026-05-31: TableClass=
+                    // History flow lost the Vp prefix rule#17 and the
+                    // Required Name_Qualifier dialog rule#1019 because the
+                    // rename detection here always passed isNew=false).
+                    bool wasPending = _pendingNamedEntities.Remove(id);
+                    bool entityIsNew = wasPending;
+                    if (entityIsNew)
+                        Log($"  rename '{oldName}' -> '{newName}' is placeholder commit (was in _pendingNamedEntities) - treating as new-entity creation flow (isNew=true)");
+
+                    try { RunScopedTableNamingCheck(newName, isNew: entityIsNew); }
                     catch (Exception ex) { Log($"ScanForRenamesEventDriven scoped check err for '{newName}': {ex.Message}"); }
                 }
             }
