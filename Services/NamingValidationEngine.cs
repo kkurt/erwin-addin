@@ -51,7 +51,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <param name="isNew">Set to <c>true</c> when the target object/column was just created
         /// in this validation pass; false (default) for edits to existing ones. Filters rules
         /// by their <see cref="NamingStandardRule.ApplyOn"/> gate.</param>
-        public static List<NamingValidationResult> ValidateObjectName(string objectType, string objectName, dynamic scapiObject = null, string propertyCode = DefaultPropertyCode, bool isNew = false, bool creationGesture = false)
+        public static List<NamingValidationResult> ValidateObjectName(string objectType, string objectName, dynamic scapiObject = null, string propertyCode = DefaultPropertyCode, bool isNew = false)
         {
             var results = new List<NamingValidationResult>();
 
@@ -69,11 +69,8 @@ namespace EliteSoft.Erwin.AddIn.Services
             {
                 // ApplyOn context gate (2026-05-25): admin can scope a rule
                 // to fire only on Create / only on Update / Both. Skip
-                // rules that do not match the current context. The
-                // creationGesture override (2026-05-31) widens the gate
-                // for placeholder-commit flows so Create + Update rules
-                // batch into one engine pass / one modal.
-                if (!MatchesApplyOn(rule, isNew, creationGesture)) continue;
+                // rules that do not match the current context.
+                if (!MatchesApplyOn(rule, isNew)) continue;
 
                 // UDP condition check: skip rule if condition doesn't match
                 if (!IsRuleApplicable(rule, objectType, scapiObject))
@@ -92,43 +89,26 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// is true; <c>Update</c> matches only when it is false.
         /// </summary>
         /// <summary>
-        /// Gate that decides whether a rule fires on this evaluation
-        /// based on the rule's ApplyOn axis and the call-site context.
+        /// Strict ApplyOn gate. Create rules fire only when
+        /// <paramref name="isNew"/> is true, Update rules only when it
+        /// is false, Both always.
         ///
         /// <para>
-        /// <paramref name="isNew"/> is the legacy creation-vs-edit flag:
-        /// Create rules fire only when isNew=true, Update rules only
-        /// when isNew=false, Both always.
-        /// </para>
-        /// <para>
-        /// <paramref name="creationGesture"/> is the 2026-05-31
-        /// placeholder-commit override. A placeholder commit (user
-        /// types a real name into the placeholder Edit and presses
-        /// Enter / Tab / click-away) is ONE atomic user gesture that
-        /// simultaneously CREATES the entity AND UPDATES its first
-        /// required-UDP value - so any rule the admin marked Create
-        /// AND any rule marked Update should evaluate in the same
-        /// engine pass to produce ONE consolidated modal rather than
-        /// the (Vp prefix) + (_PRM suffix) chain of two modals the user
-        /// hit on 2026-05-31 with TableClass=Parametre. When this flag
-        /// is true the gate widens to accept Create AND Update AND
-        /// Both rules simultaneously; isNew remains the input from the
-        /// caller but is no longer the deciding factor. Default is
-        /// false so every existing call site (Column Editor open,
-        /// heartbeat drift, FinalValidateClosedTable, post-rename
-        /// validation) keeps strict Create/Update separation.
+        /// 2026-05-31 history: a brief detour (commits 2aca8cb +
+        /// c50a5be) added a <c>creationGesture</c> override that
+        /// widened this gate to fire BOTH Create AND Update rules
+        /// during a placeholder commit. That was the wrong semantic -
+        /// user explicit rule "ApplyOn=Update rules MUST NEVER fire on
+        /// creation". The override was reverted; the bridge
+        /// <c>_creationGestureEntityIds</c> in
+        /// <c>ValidationCoordinatorService</c> survives but now
+        /// propagates <c>isNew=true</c> instead of a separate
+        /// widening flag. The engine stays strict.
         /// </para>
         /// </summary>
-        public static bool MatchesApplyOn(NamingStandardRule rule, bool isNew, bool creationGesture = false)
+        public static bool MatchesApplyOn(NamingStandardRule rule, bool isNew)
         {
             if (rule == null) return false;
-            if (creationGesture)
-            {
-                // Within a placeholder-commit gesture every ApplyOn
-                // value evaluates - the gesture is both a Create AND
-                // an Update from the engine's point of view.
-                return true;
-            }
             switch (rule.ApplyOn)
             {
                 case RuleApplyOn.Create: return isNew;
@@ -169,7 +149,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// compute what the name would look like with manual rules.
         /// </para>
         /// </summary>
-        public static string ApplyNamingStandards(string objectType, string objectName, dynamic scapiObject = null, bool autoOnly = true, string propertyCode = DefaultPropertyCode, bool isNew = false, bool creationGesture = false)
+        public static string ApplyNamingStandards(string objectType, string objectName, dynamic scapiObject = null, bool autoOnly = true, string propertyCode = DefaultPropertyCode, bool isNew = false)
         {
             if (string.IsNullOrEmpty(objectName)) return objectName;
             if (!NamingStandardService.Instance.IsLoaded) return objectName;
@@ -184,14 +164,11 @@ namespace EliteSoft.Erwin.AddIn.Services
             // conditioning UDP changes was rejected as a UX regression
             // 2026-05-07.
             // Materialise once so we can iterate twice (strip-then-apply).
-            // The creationGesture override (2026-05-31) widens
-            // MatchesApplyOn so a placeholder commit can apply Create AND
-            // Update rules in the same pass / single modal.
             var rules = NamingStandardService.Instance
                 .GetByObjectTypeAndProperty(objectType, propertyCode)
                 .Where(r => r != null
                             && (r.RuleType == NamingRuleKind.Prefix || r.RuleType == NamingRuleKind.Suffix)
-                            && MatchesApplyOn(r, isNew, creationGesture))
+                            && MatchesApplyOn(r, isNew))
                 .ToList();
 
             string result = objectName;

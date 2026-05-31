@@ -230,22 +230,14 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// (via the comparer) keeps the set deduplicated across multiple
         /// ticks that observed the same pending entity.
         /// </summary>
-        // 2026-05-31: tuple grew from (Name, IsNew) to (Name, IsNew,
-        // CreationGesture). The third bool propagates the placeholder-
-        // commit override through the defer queue so the flushed check
-        // can widen MatchesApplyOn to accept both Create AND Update
-        // rules together (one engine pass / one consolidated modal).
-        // Equality is still name-only so the dedup contract is
-        // unchanged - the comparer just preserves whichever
-        // (IsNew, CreationGesture) value landed first.
-        private readonly HashSet<(string Name, bool IsNew, bool CreationGesture)> _pendingTableNamingChecks =
-            new HashSet<(string, bool, bool)>(new PendingNamingCheckComparer());
+        private readonly HashSet<(string Name, bool IsNew)> _pendingTableNamingChecks =
+            new HashSet<(string, bool)>(new PendingNamingCheckComparer());
 
-        private sealed class PendingNamingCheckComparer : IEqualityComparer<(string Name, bool IsNew, bool CreationGesture)>
+        private sealed class PendingNamingCheckComparer : IEqualityComparer<(string Name, bool IsNew)>
         {
-            public bool Equals((string Name, bool IsNew, bool CreationGesture) x, (string Name, bool IsNew, bool CreationGesture) y) =>
+            public bool Equals((string Name, bool IsNew) x, (string Name, bool IsNew) y) =>
                 string.Equals(x.Name, y.Name, StringComparison.OrdinalIgnoreCase);
-            public int GetHashCode((string Name, bool IsNew, bool CreationGesture) obj) =>
+            public int GetHashCode((string Name, bool IsNew) obj) =>
                 obj.Name == null ? 0 : StringComparer.OrdinalIgnoreCase.GetHashCode(obj.Name);
         }
 
@@ -270,18 +262,25 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// gesture (= ValidateCommittedPendingAttrs has lifted them out
         /// of <see cref="_pendingNamedEntities"/> and is about to drain
         /// their isNew=true scoped naming check). Kept SEPARATE from
-        /// <see cref="_pendingNamedEntities"/> because Required-UDP
+        /// <see cref="_pendingNamedEntities"/> because the Required-UDP
         /// modal pump may fire ScanForRenamesEventDriven INSIDE
         /// ValidateCommittedPendingAttrs - at that point
         /// <see cref="_pendingNamedEntities"/> has already been
         /// cleared for the entity (line ~2670), so the rename-detect
         /// branch's <c>wasPending</c> bool reads false and the
-        /// deferred scoped check loses the creationGesture context.
-        /// This set bridges that gap: ScanForRenamesEventDriven also
-        /// checks here, so the deferred check gets creationGesture=true
-        /// and the auto-apply pass merges Create + Update rules into
-        /// one engine call / one modal (verified 2026-05-31 against
-        /// the TableClass=Parametre two-modal split bug).
+        /// deferred scoped check would otherwise lose the isNew=true
+        /// signal of the creation gesture.
+        /// <para>
+        /// 2026-05-31 history: was first wired to widen
+        /// <c>MatchesApplyOn</c> via an orthogonal <c>creationGesture</c>
+        /// flag (commits 2aca8cb + c50a5be). User rejected that
+        /// semantic - ApplyOn=Update rules MUST NEVER fire on a new
+        /// entity. The widening was reverted; the bridge now serves
+        /// the simpler and correct purpose of PROPAGATING
+        /// <c>isNew=true</c> from the placeholder commit into the
+        /// nested rename hook, so the strict ApplyOn gate naturally
+        /// filters Update rules out (engine semantic stays untouched).
+        /// </para>
         /// Cleared inside ValidateCommittedPendingAttrs.finally after
         /// the drain completes.
         /// </summary>
@@ -1444,19 +1443,11 @@ namespace EliteSoft.Erwin.AddIn.Services
                         // Keep the isNew flag on the deferred entry so the
                         // editor-close flush can still pick "Discard New
                         // Table" over "Revert Change".
-                        // Heartbeat-rename branch is the same placeholder-
-                        // commit gesture as the ScanForRenamesEventDriven /
-                        // ValidateCommittedPendingAttrs paths: entityIsNew
-                        // is true precisely when the entity was lifted out
-                        // of _pendingNamedEntities here, so the gesture
-                        // qualifies for the creationGesture widening (so a
-                        // Create rule + an Update rule + a Both rule batch
-                        // into one engine pass / one consolidated modal).
-                        if (_pendingTableNamingChecks.Add((entityName, entityIsNew, entityIsNew)))
-                            Log($"DiagramHeartbeat: deferring naming check on '{entityName}' (editor open, isNew={entityIsNew}, creationGesture={entityIsNew})");
+                        if (_pendingTableNamingChecks.Add((entityName, entityIsNew)))
+                            Log($"DiagramHeartbeat: deferring naming check on '{entityName}' (editor open, isNew={entityIsNew})");
                         continue;
                     }
-                    try { RunScopedTableNamingCheck(entityName, isNew: entityIsNew, creationGesture: entityIsNew); }
+                    try { RunScopedTableNamingCheck(entityName, isNew: entityIsNew); }
                     catch (Exception ex) { Log($"DiagramHeartbeat: naming check err for '{entityName}': {ex.Message}"); }
                 }
             }
@@ -1877,24 +1868,24 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // and added it to _creationGestureEntityIds. When the
                     // Required-UDP modal pump dispatches us mid-drain,
                     // wasPending reads false but the gesture is still
-                    // active - the bridge set tells us so. Verified
-                    // 2026-05-31 against the TableClass=Parametre run
-                    // where the first deferred check fired with cg=false
-                    // because _pendingNamedEntities had already been
-                    // cleared at line ~2670 before this hook reached the
-                    // Remove call.
+                    // active - the bridge set tells us so.
+                    //
+                    // Bridge purpose 2026-05-31 (corrected semantic, see
+                    // header comment on _creationGestureEntityIds): we
+                    // PROPAGATE isNew=true to the deferred scoped check.
+                    // The strict ApplyOn gate then naturally filters out
+                    // Update rules (rule#22 _PRM, ApplyOn=Update, MUST
+                    // NEVER fire on a new entity per user rule). Only
+                    // Create + Both rules fire -> ONE engine pass ->
+                    // ONE consolidated modal (Vp prefix is Create / Both
+                    // so it lands together with whatever Create-side
+                    // Suffix the active TableClass dictates, if any).
                     bool inCreationGesture = _creationGestureEntityIds.Contains(id);
                     bool entityIsNew = wasPending || inCreationGesture;
                     if (entityIsNew)
-                        Log($"  rename '{oldName}' -> '{newName}' is placeholder commit (wasPending={wasPending}, inCreationGesture={inCreationGesture}) - treating as new-entity creation flow (isNew=true, creationGesture=true)");
+                        Log($"  rename '{oldName}' -> '{newName}' is placeholder commit (wasPending={wasPending}, inCreationGesture={inCreationGesture}) - treating as new-entity creation flow (isNew=true)");
 
-                    // creationGesture=true widens MatchesApplyOn so
-                    // Create+Update+Both rules batch into ONE engine
-                    // pass / ONE consolidated modal - prevents the Vp
-                    // prefix vs _PRM/_HISTORY suffix two-modal split
-                    // user reported 2026-05-31 with TableClass=Parametre
-                    // / =History.
-                    try { RunScopedTableNamingCheck(newName, isNew: entityIsNew, creationGesture: entityIsNew); }
+                    try { RunScopedTableNamingCheck(newName, isNew: entityIsNew); }
                     catch (Exception ex) { Log($"ScanForRenamesEventDriven scoped check err for '{newName}': {ex.Message}"); }
                 }
             }
@@ -2245,10 +2236,10 @@ namespace EliteSoft.Erwin.AddIn.Services
             if (_pendingTableNamingChecks.Count == 0) return;
             var queued = _pendingTableNamingChecks.ToArray();
             _pendingTableNamingChecks.Clear();
-            Log($"Editor close: flushing {queued.Length} deferred naming check(s): {string.Join(", ", queued.Select(q => $"{q.Name}(isNew={q.IsNew}, cg={q.CreationGesture})"))}");
-            foreach (var (entityName, isNew, creationGesture) in queued)
+            Log($"Editor close: flushing {queued.Length} deferred naming check(s): {string.Join(", ", queued.Select(q => $"{q.Name}(isNew={q.IsNew})"))}");
+            foreach (var (entityName, isNew) in queued)
             {
-                try { RunScopedTableNamingCheck(entityName, isNew: isNew, creationGesture: creationGesture); }
+                try { RunScopedTableNamingCheck(entityName, isNew: isNew); }
                 catch (Exception ex) { Log($"FlushPendingTableNamingChecks: err for '{entityName}': {ex.Message}"); }
             }
         }
@@ -2909,11 +2900,11 @@ namespace EliteSoft.Erwin.AddIn.Services
                         if (!string.Equals(resolvedName, fallbackName, StringComparison.Ordinal))
                             Log($"ValidateCommittedPendingAttrs: entityId={entityId} renamed from queued '{fallbackName}' to live '{resolvedName}' between queue + drain - using live name for scoped naming check (isNew={isNew})");
                         // entitiesToNamingCheck entries originate exclusively
-                        // from a [PENDING-ENTITY] placeholder-commit (see
-                        // line ~2666). The whole drain is by construction
-                        // the creation gesture - widen the rule gate so
-                        // Create+Update rules batch into one engine pass.
-                        try { RunScopedTableNamingCheck(resolvedName, isNew: isNew, creationGesture: isNew); }
+                        // from a [PENDING-ENTITY] placeholder-commit, so
+                        // isNew is true uniformly - the strict ApplyOn
+                        // gate filters Update rules correctly without any
+                        // gesture-widening flag.
+                        try { RunScopedTableNamingCheck(resolvedName, isNew: isNew); }
                         catch (Exception ex) { Log($"ValidateCommittedPendingAttrs: naming check err for '{resolvedName}': {ex.Message}"); }
                     }
                 }
@@ -3280,7 +3271,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// (DEPENDS_ON_UDP_ID) read live UDP values off the entity and apply
         /// only when the condition matches.
         /// </summary>
-        private void RunScopedTableNamingCheck(string tableName, IDictionary<string, string> baselineOverride = null, bool isNew = false, bool creationGesture = false)
+        private void RunScopedTableNamingCheck(string tableName, IDictionary<string, string> baselineOverride = null, bool isNew = false)
         {
             if (string.IsNullOrEmpty(tableName)) return;
             if (_validationSuspended) return;
@@ -3303,16 +3294,16 @@ namespace EliteSoft.Erwin.AddIn.Services
             // branch, so a defer collision there is impossible in practice.
             if (_scopedCheckInProgress)
             {
-                if (_pendingTableNamingChecks.Add((tableName, isNew, creationGesture)))
-                    Log($"RunScopedTableNamingCheck: deferring '{tableName}' (isNew={isNew}, creationGesture={creationGesture}) - check already in progress");
+                if (_pendingTableNamingChecks.Add((tableName, isNew)))
+                    Log($"RunScopedTableNamingCheck: deferring '{tableName}' (isNew={isNew}) - check already in progress");
                 return;
             }
             _scopedCheckInProgress = true;
-            try { RunScopedTableNamingCheckCore(tableName, baselineOverride, isNew, creationGesture); }
+            try { RunScopedTableNamingCheckCore(tableName, baselineOverride, isNew); }
             finally { _scopedCheckInProgress = false; }
         }
 
-        private void RunScopedTableNamingCheckCore(string tableName, IDictionary<string, string> baselineOverride = null, bool isNew = false, bool creationGesture = false)
+        private void RunScopedTableNamingCheckCore(string tableName, IDictionary<string, string> baselineOverride = null, bool isNew = false)
         {
 
             dynamic modelObjects = null;
@@ -3346,8 +3337,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                     if (!EntityNameMatchesTitle(nameForMatch, tableName))
                         continue;
 
-                    Log($"Scoped naming check on '{nameForMatch}' (isNew={isNew}, creationGesture={creationGesture})");
-                    _tableTypeMonitor.ValidateNamingStandard("Table", nameForMatch, entity, baselineOverride: baselineOverride, isNew: isNew, creationGesture: creationGesture);
+                    Log($"Scoped naming check on '{nameForMatch}' (isNew={isNew})");
+                    _tableTypeMonitor.ValidateNamingStandard("Table", nameForMatch, entity, baselineOverride: baselineOverride, isNew: isNew);
                     return;
                 }
             }
