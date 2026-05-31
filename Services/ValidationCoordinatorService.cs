@@ -3278,6 +3278,62 @@ namespace EliteSoft.Erwin.AddIn.Services
             if (_sessionLost || _disposed) return;
             if (_tableTypeMonitor == null) return;
             if (!NamingStandardService.Instance.IsLoaded) return;
+
+            // Creation-gesture bridge (2026-06-01): every caller path
+            // (defer flush from PromptForMissingRequiredUdps modal pump,
+            // direct DiagramHeartbeatTick post-rename re-check,
+            // ScanForRenamesEventDriven inline-edit-close, etc.) must
+            // see isNew=true while the entity is still inside its
+            // placeholder-commit gesture. Earlier attempts wired the
+            // override into specific callers (ScanForRenamesEventDriven)
+            // but missed others (the deferred re-check after
+            // FlushPendingTableNamingChecks auto-renames the entity).
+            // Centralising the override here covers every caller in one
+            // place: if isNew is already true we keep it; if the bridge
+            // set is empty (the common case) the cost is one Count read;
+            // otherwise we walk the entity collection once and override
+            // when the queued name resolves to an entityId still inside
+            // the creation gesture. Verified 2026-06-01 against the
+            // TableClass=History run where the flush-fired check landed
+            // with isNew=false because the heartbeat enqueued it that
+            // way, so the Vp Create-only prefix never evaluated.
+            if (!isNew && _creationGestureEntityIds.Count > 0 && _session != null && !_sessionLost)
+            {
+                dynamic mmObj = null, mmRoot = null, mmEntities = null;
+                try
+                {
+                    mmObj = _session.ModelObjects;
+                    mmRoot = mmObj?.Root;
+                    if (mmRoot != null)
+                    {
+                        mmEntities = mmObj.Collect(mmRoot, "Entity");
+                        if (mmEntities != null)
+                        {
+                            foreach (dynamic e in mmEntities)
+                            {
+                                if (e == null) continue;
+                                string nm = null;
+                                try { nm = GetTableName(e); } catch { continue; }
+                                if (!EntityNameMatchesTitle(nm, tableName)) continue;
+                                string eid = null;
+                                try { eid = e.ObjectId?.ToString(); } catch { break; }
+                                if (!string.IsNullOrEmpty(eid) && _creationGestureEntityIds.Contains(eid))
+                                {
+                                    Log($"RunScopedTableNamingCheck: '{tableName}' (entityId={eid}) is in active creation gesture - overriding isNew=False to True so Create-only rules evaluate");
+                                    isNew = true;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex) { Log($"RunScopedTableNamingCheck: creation-gesture bridge probe threw {ex.GetType().Name}: {ex.Message}"); }
+                finally
+                {
+                    ReleaseCom(mmEntities);
+                    ReleaseCom(mmRoot);
+                }
+            }
             // Reentrancy guard. The downstream ValidateNamingStandard opens
             // a modal dialog whose pump fires our WindowMonitorTimer again -
             // re-entry would stack popups indefinitely. When the gate is
