@@ -276,6 +276,26 @@ namespace EliteSoft.Erwin.AddIn
                 using (Services.AddinLogger.BeginScope("Activator.CreateInstance(SCAPI)"))
                     scapi = Activator.CreateInstance(scapiType);
 
+                // Drop the in-process bootstrap cache on every FRESH addin
+                // invocation (form not already open). The .NET CLR AppDomain
+                // hosting this COM addin stays alive across Tools > Add-Ins
+                // "unload" + reload cycles, so DatabaseService.Instance's
+                // BootstrapConfig (captured at first Execute) would otherwise
+                // pin the OLD HKLM/HKCU registry values forever - admins
+                // editing the registry had to restart erwin or hit the dev-
+                // only Reload Config button (user-reported 2026-05-30). The
+                // ClearCache is cheap (~ms registry stat) and only runs on
+                // fresh form creation, not on bring-to-front re-clicks.
+                try
+                {
+                    Services.DatabaseService.Instance.ClearCache();
+                    Services.AddinLogger.Log("Execute: bootstrap cache cleared - registry will be re-read on form init.");
+                }
+                catch (Exception ex)
+                {
+                    Services.AddinLogger.Log($"Execute: ClearCache err: {ex.GetType().Name}: {ex.Message}");
+                }
+
                 using (Services.AddinLogger.BeginScope("new ModelConfigForm(scapi)"))
                     _activeForm = new ModelConfigForm(scapi);
                 _activeForm.StartPosition = FormStartPosition.CenterScreen;

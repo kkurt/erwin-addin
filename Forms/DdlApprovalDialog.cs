@@ -1,5 +1,6 @@
 using System;
 using System.Drawing;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using EliteSoft.Erwin.AddIn.Services;
 
@@ -11,7 +12,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
     /// Generation tab. Header summarises what is being approved, the
     /// RichTextBox shows the SQL (dark theme + VS-Code-flavoured highlight,
     /// same palette as the legacy inline view), and the user either Cancels
-    /// or hits Sent to Approve which calls
+    /// or hits Send to Approve which calls
     /// <see cref="DdlApprovalService"/> to persist the row.
     /// </summary>
     public sealed class DdlApprovalDialog : Form
@@ -183,7 +184,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
             // FlowLayoutPanel grows right-to-left as we add children, so the
             // FIRST control added (Send) lands at the right edge and each
             // subsequent control stacks to its left. Final visual order
-            // (left to right): Copy | Cancel | Sent to Approve.
+            // (left to right): Copy | Cancel | Send to Approve.
             var flowButtons = new FlowLayoutPanel
             {
                 Dock = DockStyle.Right,
@@ -198,7 +199,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
 
             _btnSend = new Button
             {
-                Text = "Sent to Approve",
+                Text = "Send to Approve",
                 Size = new Size(160, 32),
                 FlatStyle = FlatStyle.Flat,
                 BackColor = Color.FromArgb(46, 125, 50),
@@ -354,17 +355,94 @@ namespace EliteSoft.Erwin.AddIn.Forms
             }
         }
 
+        // Win32 clipboard P/Invoke - bypasses .NET's Clipboard wrapper which
+        // requires STA + an OLE clipboard message pump.
+        //
+        // BACKGROUND: erwin loads this COM addin on an MTA thread - any
+        // System.Windows.Forms.Clipboard.SetText call from there throws
+        // "Current thread must be set to single thread apartment (STA) mode
+        // before OLE calls can be made" (user-reported 2026-05-30).
+        //
+        // FIRST FIX ATTEMPT (also user-reported, 2026-05-30): spin a transient
+        // STA Thread + Clipboard.SetText + Join. The Join FROZE erwin because
+        // a worker STA thread has no message loop, and Clipboard.SetText's
+        // internal OLE handshake (clipboard viewer chain notification +
+        // delayed-render support) waits for a windows message it never gets.
+        // The UI/COM thread blocked on Join -> hard hang.
+        //
+        // FINAL FIX: write the clipboard text via the raw Win32 user32 API
+        // (OpenClipboard / EmptyClipboard / SetClipboardData / CloseClipboard).
+        // No OLE, no STA requirement, no message pump - works from any thread.
+        // Ownership of the GlobalAlloc'd HGLOBAL transfers to the clipboard
+        // on a successful SetClipboardData call; if SetClipboardData fails we
+        // GlobalFree the block ourselves.
+        [DllImport("user32.dll", SetLastError = true)] private static extern bool OpenClipboard(IntPtr hWndNewOwner);
+        [DllImport("user32.dll", SetLastError = true)] private static extern bool CloseClipboard();
+        [DllImport("user32.dll", SetLastError = true)] private static extern bool EmptyClipboard();
+        [DllImport("user32.dll", SetLastError = true)] private static extern IntPtr SetClipboardData(uint uFormat, IntPtr hMem);
+        [DllImport("kernel32.dll", SetLastError = true)] private static extern IntPtr GlobalAlloc(uint uFlags, UIntPtr dwBytes);
+        [DllImport("kernel32.dll", SetLastError = true)] private static extern IntPtr GlobalLock(IntPtr hMem);
+        [DllImport("kernel32.dll", SetLastError = true)] private static extern bool GlobalUnlock(IntPtr hMem);
+        [DllImport("kernel32.dll", SetLastError = true)] private static extern IntPtr GlobalFree(IntPtr hMem);
+        private const uint GMEM_MOVEABLE = 0x0002;
+        private const uint CF_UNICODETEXT = 13;
+
+        /// <summary>
+        /// MTA-safe clipboard write. Uses Win32 user32 directly to avoid the
+        /// STA/OLE-clipboard requirement of <see cref="Clipboard"/>. Returns
+        /// true on success; on failure the caller surfaces the error in
+        /// <c>_lblStatus</c> so the user can copy-by-hand instead.
+        /// </summary>
+        private bool SetClipboardWin32(string text)
+        {
+            if (text == null) text = string.Empty;
+            int charCount = text.Length + 1; // +1 for NUL
+            int byteCount = charCount * 2;   // Unicode
+            IntPtr hMem = GlobalAlloc(GMEM_MOVEABLE, (UIntPtr)byteCount);
+            if (hMem == IntPtr.Zero) return false;
+            bool transferredOwnership = false;
+            try
+            {
+                IntPtr p = GlobalLock(hMem);
+                if (p == IntPtr.Zero) return false;
+                try
+                {
+                    Marshal.Copy(text.ToCharArray(), 0, p, text.Length);
+                    Marshal.WriteInt16(p, text.Length * 2, 0); // NUL terminator
+                }
+                finally { GlobalUnlock(hMem); }
+
+                // OpenClipboard with our form's handle so the OS attributes
+                // the clipboard owner correctly (and EmptyClipboard fires the
+                // expected ownership-change event).
+                if (!OpenClipboard(this.Handle)) return false;
+                try
+                {
+                    EmptyClipboard();
+                    if (SetClipboardData(CF_UNICODETEXT, hMem) == IntPtr.Zero) return false;
+                    transferredOwnership = true; // clipboard owns hMem now
+                    return true;
+                }
+                finally { CloseClipboard(); }
+            }
+            finally
+            {
+                if (!transferredOwnership && hMem != IntPtr.Zero) GlobalFree(hMem);
+            }
+        }
+
         private void BtnCopy_Click(object sender, EventArgs e)
         {
             try
             {
                 string text = !string.IsNullOrEmpty(_rtb.SelectedText) ? _rtb.SelectedText : _ddlText;
                 if (string.IsNullOrEmpty(text)) return;
-                Clipboard.SetText(text);
+                if (!SetClipboardWin32(text))
+                    throw new InvalidOperationException("Win32 clipboard write failed (OpenClipboard/SetClipboardData returned 0).");
                 _btnCopy.Text = "Copied";
                 // Brief revert so the user sees confirmation without us
                 // permanently masking the original label.
-                var revert = new Timer { Interval = 900 };
+                var revert = new System.Windows.Forms.Timer { Interval = 900 };
                 revert.Tick += (s, ev) =>
                 {
                     revert.Stop();
@@ -471,13 +549,55 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 return;
             }
 
-            // Success: keep the popup open so the user sees the inserted ID.
-            // Cancel button re-labels to "Close" - explicit dismissal only.
+            // Success: update the status strip (kept for users who alt-tab
+            // back to the review window later) then surface an explicit
+            // confirmation modal so the operator knows BOTH steps - the
+            // Mart commit AND the approval-queue insert - completed.
+            // Without the modal the success signal was just a colour
+            // change on a status label, which user feedback 2026-05-31
+            // flagged as too subtle for a multi-step pipeline.
             _lblStatus.ForeColor = Color.FromArgb(46, 125, 50);
             _lblStatus.Text = $"Submitted to approval queue. ID = {newId}.";
             _btnCancel.Text = "Close";
             _btnCancel.Enabled = true;
             _btnCopy.Enabled = true;
+
+            try
+            {
+                // AddinMessageDialog (not MessageBox) keeps the popup on
+                // the addin's design language (Segoe UI + accent stripe +
+                // borderless header) instead of the legacy Win32 grey
+                // chrome that visually blends with erwin's own dialogs -
+                // user rule 2026-05-31 (re-iterated; rule has existed
+                // since AddinMessageDialog was introduced 2026-05-15
+                // but was not formalised in lessons.md before today).
+                Forms.AddinMessageDialog.Show(
+                    this,
+                    $"Model committed to Mart and submitted to the approval queue.\n\nApproval Queue ID: {newId}",
+                    "Success",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                // Never let a UI hiccup mask the actual success - the row
+                // is already in the queue, just log and move on.
+                _log($"DdlApprovalDialog: success AddinMessageDialog.Show threw {ex.GetType().Name}: {ex.Message}");
+            }
+
+            // Auto-close after the user dismisses the success modal -
+            // the review window has nothing useful left to do (DDL is
+            // queued, no follow-up action expected). Close the form,
+            // which also disposes the RTB / fonts that BuildUi created.
+            try
+            {
+                DialogResult = DialogResult.OK;
+                Close();
+            }
+            catch (Exception ex)
+            {
+                _log($"DdlApprovalDialog: auto-close after success threw {ex.GetType().Name}: {ex.Message}");
+            }
         }
 
         private void ReenableForRetry()

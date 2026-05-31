@@ -620,27 +620,13 @@ namespace EliteSoft.Erwin.AddIn
             this.btnConfigureDB.Click += new System.EventHandler(this.BtnConfigureDB_Click);
             this.grpDdlTarget.Controls.Add(this.btnConfigureDB);
 
-            this.btnSelectDbTables = new System.Windows.Forms.Button();
-            this.btnSelectDbTables.Location = new System.Drawing.Point(195, 47);
-            this.btnSelectDbTables.Size = new System.Drawing.Size(120, 24);
-            this.btnSelectDbTables.Text = "Select Tables...";
-            this.btnSelectDbTables.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
-            this.btnSelectDbTables.BackColor = System.Drawing.Color.White;
-            this.btnSelectDbTables.FlatAppearance.BorderColor = clrBorder;
-            this.btnSelectDbTables.Font = fontCaption;
-            this.btnSelectDbTables.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnSelectDbTables.Visible = false;
-            this.btnSelectDbTables.Click += new System.EventHandler(this.BtnSelectDbTables_Click);
-            this.grpDdlTarget.Controls.Add(this.btnSelectDbTables);
-
-            this.lblSelectedTableCount = new System.Windows.Forms.Label();
-            this.lblSelectedTableCount.Location = new System.Drawing.Point(320, 51);
-            this.lblSelectedTableCount.Size = new System.Drawing.Size(115, 20);
-            this.lblSelectedTableCount.Text = "";
-            this.lblSelectedTableCount.Font = fontCaption;
-            this.lblSelectedTableCount.ForeColor = clrTextSecondary;
-            this.lblSelectedTableCount.Visible = false;
-            this.grpDdlTarget.Controls.Add(this.lblSelectedTableCount);
+            // Note (2026-05-30): the "Select Tables..." button + the
+            // "(N of M selected)" label were DELETED. The From-DB pipeline
+            // now always reverse-engineers EVERY entity in the active model
+            // (CollectModelTablePhysicalNames). When the user wants to scope
+            // the alter script, they use the "Only Selected Objects" checkbox
+            // below + a diagram selection; the DDL is post-filtered by
+            // Physical_Name match.
 
             // ----- Group: Options -----
             this.grpDdlOptions = new System.Windows.Forms.GroupBox();
@@ -817,8 +803,6 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.RadioButton rbFromMart;
         private System.Windows.Forms.RadioButton rbFromDB;
         private System.Windows.Forms.Button btnConfigureDB;
-        private System.Windows.Forms.Button btnSelectDbTables;
-        private System.Windows.Forms.Label lblSelectedTableCount;
         private System.Windows.Forms.GroupBox grpDdlSource;
         private System.Windows.Forms.GroupBox grpDdlTarget;
         private System.Windows.Forms.GroupBox grpDdlOptions;

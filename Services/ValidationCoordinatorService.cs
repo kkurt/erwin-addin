@@ -3634,6 +3634,22 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     // the slow path below. Run the lock check here before
                                     // continuing so locked UDPs are still reverted.
                                     EnforceLockedAttributeUdps(attr, objectId, existingSnap.PhysicalName);
+
+                                    // Same blind-spot for cascade-source UDPs (e.g.
+                                    // DATA_CATEGORY -> KVKK / INTEGRITY / CONFIDENTIALITY
+                                    // auto-fill via DependencySetRuntimeService). Editing
+                                    // a non-locked cascade-source UDP does not touch
+                                    // Physical_Name / Physical_Data_Type either, so the
+                                    // fast-pass was silently bypassing the cascade
+                                    // evaluation in the slow path - user reported
+                                    // 2026-05-31 that selecting DATA_CATEGORY on a
+                                    // column did NOT auto-fill its dependent UDPs.
+                                    // CheckAttributeUdpDependencies is read-only +
+                                    // idempotent (compare-against-snapshot, fire handler
+                                    // only on a real delta), so calling it here in the
+                                    // fast path costs ~1-3 property reads per cascade-
+                                    // source UDP without re-running CreateSnapshot.
+                                    CheckAttributeUdpDependencies(attr, objectId, existingSnap.PhysicalName);
                                     continue;
                                 }
                             }

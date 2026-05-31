@@ -4,6 +4,291 @@ A running log of corrections and non-obvious findings that future sessions
 should not have to rediscover. Each entry is a short rule, the reason, and
 how to apply it.
 
+## 2026-05-31: Never use System.Windows.Forms.MessageBox - use AddinMessageDialog
+
+**Rule:** every user-facing modal popup must go through
+`EliteSoft.Erwin.AddIn.Forms.AddinMessageDialog.Show(...)`, NOT
+`System.Windows.Forms.MessageBox.Show(...)`. Same signature, drop-in
+replacement.
+
+**Why:** the standard Win32 `MessageBox` chrome (grey title bar,
+default system fonts, classic icon glyphs) visually blends with
+erwin's own warning / error dialogs. The user cannot tell at a glance
+which popup came from our addin vs. from erwin's internal flow, and
+the inconsistent look feels stale on Win11. `AddinMessageDialog`
+exists exactly for this (introduced 2026-05-15, see its class header
+comment in `Forms/AddinMessageDialog.cs`): borderless chrome, Segoe
+UI palette, accent stripe matching the icon severity, TopMost
+lifetime guard, multi-monitor positioning - so every addin popup has
+a recognisable identity.
+
+The rule existed informally since 2026-05-15 but was NOT recorded
+here. The success-confirmation modal added 2026-05-31 shipped with a
+raw `MessageBox.Show` call; user caught it on the first screenshot.
+Formal entry added today to prevent regression.
+
+**How to apply:**
+
+1. NEW popup code: always
+   `EliteSoft.Erwin.AddIn.Forms.AddinMessageDialog.Show(owner, body, title, buttons, icon)`.
+   Same args as `MessageBox.Show`, same `DialogResult` return.
+2. EDITING an existing `MessageBox.Show` callsite for any reason
+   (translation, wording change, button set change): swap it to
+   `AddinMessageDialog.Show` in the same edit.
+3. Do NOT mass-rewrite all remaining `MessageBox.Show` calls in
+   unrelated commits - same scope discipline as the UI English rule
+   below. A dedicated cleanup PR should grep for `MessageBox\.Show\(`
+   across the repo and migrate every direct caller.
+
+## 2026-05-31: UI strings are ALWAYS English (user-facing, not logs)
+
+**Rule:** every user-visible UI string must be in English. This covers:
+
+- MessageBox titles and bodies
+- Form / Dialog / TabPage titles (`Form.Text`)
+- Button labels, label text, status strips
+- ToolTip text, placeholder text
+- Inline error / warning messages rendered to the user
+
+NOT covered (free to stay in any language per project convention):
+
+- `AddinLogger` / `Log` / `Debug.WriteLine` calls (backend diagnostics)
+- Comments and XML doc (CLAUDE.md allows the author's language for these)
+- SQL queries, locator strings, regex patterns, file paths
+- Admin DB content shown verbatim (CONFIG names, UDP names, etc - that
+  is user-authored data, not our UI copy)
+- Chat with the user (continue in Turkish per CLAUDE.md)
+
+**Why:** the addin is deployed to mixed-language teams (Turkish admins,
+English compliance reviewers, support engineers reading screenshots).
+Mixed-language UI strings make screenshots ambiguous in incident
+reports and force translators to handle interleaved language. The
+earlier success modal added today shipped Turkish briefly and was
+caught in user review the same minute; sweep plus rule formalisation
+on 2026-05-31 to prevent regression.
+
+**How to apply:**
+
+1. Before introducing any new UI string, ask: will the END USER see
+   this? If yes, write it in English.
+2. When editing an existing UI string, take the chance to translate it
+   if you spot Turkish.
+3. Do NOT mass-rewrite existing Turkish UI strings in unrelated
+   commits - keep the PR scoped to the feature you are working on. The
+   sweep below tracks the backlog for a dedicated cleanup pass.
+
+> Sweep 2026-05-31 found 26 user-visible Turkish UI strings across 6
+> files. Tracked for follow-up cleanup; not addressed in this commit.
+> Highest-impact items: `Forms/DdlApprovalDialog.cs:569`,
+> `ModelConfigForm.cs:3469`, `Services/ValidationCoordinatorService.cs:3389`.
+
+## 2026-05-31: Mart commit from inside addin = drive ribbon WM_COMMAND, not SCAPI pu.Save
+
+**Rule:** to commit a dirty Mart-bound PU to Mart from inside the
+addin, drive erwin's own ribbon Mart > Save flow via WM_COMMAND, NOT
+SCAPI pu.Save. The SCAPI path is permanently closed in-process; the
+ribbon path is the only one that actually advances the Mart version.
+
+**Why:**
+
+| Path | What happens |
+|------|--------------|
+| `pu.Save()` bare | Silent LOCAL .erwin file write. Returns True, but Mart version does NOT advance. This is what `[pu.Save destructive]` was always documenting - the destination is local disk, not Mart. |
+| `pu.Save(martUri, "OVM=Yes")` | `COMException: Persistence Unit Component ! Mart user interface is active. Only connection established by a user via Mart user interface is available for use via the API.` SCAPI permanently blocks in-process Mart URI save while erwin's Mart UI is up. Memory `[reference_scapi_mart_ui_active_block]`. |
+| Ribbon Mart > Save (manual user click) | `MCXModelIncrementalSaveCommand::Write` runs through the description dialog and commits. Mart version advances cleanly. Verified end-to-end 2026-05-31 (v5 -> v6). |
+| **WM_COMMAND 1061 to XTPMainFrame from in-process** | Same dispatch path as the manual click - SCAPI block does not apply (it only fires for SCAPI pu.Save calls, not for the native UI command pipeline). Verified working 2026-05-31. |
+
+**How to apply:**
+
+1. `Services/MartSaveAutomation.cs` wraps the full automation chain.
+   Public API: `SaveWithDescriptionAsync(erwinMainHwnd, description, timeoutMs, log)`.
+2. Cmd id discovery (one-time, captured 2026-05-31 via Ctrl+Alt+C
+   recon during a manual save):
+   - Ribbon Mart > Save: **1061** (0x425) - stable across erwin
+     restarts, observed at 21:37 / 01:30 / 02:48 in wmcmd.log.
+   - Description dialog class: **`#32770`** (standard Win32 dialog).
+   - Description dialog title prefix: **`Description for `**
+     (variable suffix is "'<model>' Version <N>").
+   - Description Edit child control id: **1081**, class `Edit`.
+   - Save button control id: **1 (IDOK)** - native dialog convention,
+     no custom MFC cmd id (a big relief - no second WmCommandLogger
+     bootstrap needed).
+3. Automation sequence inside `MartSaveAutomation`:
+   - `SetWinEventHook(EVENT_OBJECT_CREATE..NAMECHANGE, OUTOFCONTEXT)`
+     on the erwin process id. Filters by class + title prefix; race
+     guard via `Interlocked.Exchange` on a once-flag (CREATE +
+     NAMECHANGE can both fire for the same dialog).
+   - `PostMessage(erwinMain, WM_COMMAND, 1061, 0)` from this thread.
+   - Hook callback (on whatever thread WinEvent dispatch picks):
+     a. `ShowWindow(dialog, SW_HIDE)` BEFORE first paint (zero-flash).
+     b. `GetDlgItem(dialog, 1081)` for the Edit child, fallback to
+        `FindWindowEx(dialog, NULL, "Edit", NULL)` if the id changes.
+     c. `SendMessage(edit, WM_SETTEXT, 0, description)`.
+     d. `PostMessage(dialog, WM_COMMAND, IDOK, 0)`.
+   - Wait for `EVENT_OBJECT_DESTROY` on the captured dialog HWND =
+     commit chain finished. Separate hook on DESTROY so we know
+     when to stop waiting.
+   - Finally block: unhook BOTH WinEvents; if dialog is still alive
+     re-show it with `SW_SHOW` so an interrupted run does not leave
+     the user with an invisible-modal-stuck session.
+4. Caller (`SaveCurrentModelWithDescription` in `ModelConfigForm.cs`)
+   re-probes `pu.IsDirty` afterwards via `VersionCompareService.ProbeDirty()`
+   - True post-save means the UI flow completed but the commit silently
+   failed; surface that as a hard failure so the queue insert is
+   aborted and the popup status strip shows the error.
+5. Cmd id 1061 is hardcoded today. If erwin renumbers it in a future
+   build, harvest with the existing `WmCommandLogger` pattern (subclass
+   XTPMainFrame, user clicks Mart > Save once, persist captured wParam
+   to `HKCU\Software\EliteSoft\ErwinAddIn\Watcher\MartSaveCmdId`).
+   Same 2-click bootstrap UX the user already accepted for addin
+   auto-load (memory `[reference_addin_autoload_postmessage]`).
+
+The earlier attempts removed by this commit:
+- `BridgeSetMartSaveDescription` call from `SaveCurrentModelWithDescription`
+  (the bridge hook for SetDescription is still installed and useful as
+  a research probe; it just is no longer on the critical save path).
+- `TryDeleteStaleDuplicatePuSnapshot` helper + Generate DDL fast-path
+  call to it. The artifact deletion was a real fix for the
+  `+01000000.erwin_isc` collision, but ONLY for the obsolete pu.Save
+  code path. With WM_COMMAND we never call pu.Save so the collision
+  never occurs - the helper is dead code. If the artifact collision
+  ever resurfaces on a different path, the cleanup pattern is in git
+  history (commit before this one).
+- 2-argument `_currentModel.Save(martUri, "OVM=Yes")` attempt - meta-sync
+  pattern that works in a standalone process but is blocked by
+  SCAPI's in-process Mart UI check.
+
+## 2026-05-31: Duplicate-PU snapshot artifact blocks pu.Save (error code 42cc3e78)
+
+**Rule:** the Generate DDL hidden Alter Script wizard (the F2-PAIR /
+`RunSilentAlterDdlWithServerMs` path in `scripts/native-bridge/native-bridge.cpp`)
+creates a session-less duplicate PU via
+`PersistenceUnits.Create(...;Duplicate=YES, modelLongId)`, and erwin
+writes an open-time `.erwin_isc` snapshot for that duplicate at
+`%TEMP%\{ModelLongId}+01000000.erwin_isc`. The wizard close path does
+NOT delete it - the file lingers across runs and silently collides with
+the NEXT `pu.Save()` of the active model.
+
+`pu.Save` on a Mart-bound PU needs the `+01000000` slot for its own
+next-version snapshot during the Mart commit. It calls Win32 delete on
+the stale path, fails, and raises a `COMException` with the message:
+
+    Persistence Unit Component ! Failed to delete
+    {<GUID>}+01000000 file due to an error with error code 42cc3e78.
+
+This breaks the DDL Review "Send to Approve" Mart-save end-of-flow. The
+file is NOT held by a real process handle - `rm` from the shell removes
+it cleanly and erwin keeps running normally - it is "dangling artifact +
+slot reuse collision" rather than a true lock.
+
+**Why pu.Save destructive memory does not apply here:** the older note
+`[pu.Save / SaveEx / SaveToPlatform all destructive]` referred to live
+PU teardown (full addin re-init + Mart re-open). This bug is a clean
+file-delete failure during the commit; the addin keeps its PU after
+`pu.Save` throws, and the queue insert path runs immediately afterwards
+in the same session.
+
+**How to apply:**
+
+1. End of every Generate DDL path that drives the hidden Alter Script
+   wizard, call `TryDeleteStaleDuplicatePuSnapshot("[ROUTE] <which>")`
+   (root-cause sweep - "the run that created the artifact cleans it up").
+   Already wired into the same-version fast path in `ModelConfigForm.cs`
+   immediately after the busy overlay close in the `finally` block.
+2. Start of any code path that calls `pu.Save()` on the active model
+   (today: `SaveCurrentModelWithDescription` only), also call the helper
+   as belt-and-suspenders so a crash that skipped the pipeline cleanup
+   does not break Send to Approve on the next attempt.
+3. The cleaner root-cause fix (release the duplicate PU from inside the
+   bridge's wizard-close handler) is parked. When picked up, look at the
+   F2-PAIR cleanup branch and call `PUs.Remove(dupPu, false)` -
+   memory `[reference_rescript_pu_removable]` confirms session-less
+   duplicates accept the remove cleanly.
+4. The helper uses `PuLocatorReader.Read(pu, true, log)` for the
+   locator + a regex on `modelLongId=(\{[0-9A-Fa-f-]+\})`. Mart-bound
+   PUs return their full enriched locator (`erwin://Mart://Mart/...
+   ?&version=N&modelLongId={GUID}+00000000`) through this reader -
+   plain `pu.Locator` returns empty on r10.10 (memory
+   `[reference_pu_locator_empty_r10]`).
+
+The helper is best-effort: all exceptions stay inside it. A delete
+failure (genuinely locked file) logs the COM-style error and lets
+`pu.Save` surface the same COMException to the user - we want the real
+error in the log, not a silent mask.
+
+## 2026-05-31: UdpSyncEngine vs DependencySetRuntime ListValues turf war
+
+**Rule:** when computing or applying UDP diffs in `UdpSyncEngine`, treat
+"admin defines a List UDP with `ListOptions.Count == 0`" as
+"admin delegates list content management to runtime". Skip BOTH the
+ListValues compare in `ComputeDiff` AND the `tag_Udp_Values_List` write
+in `SetPropertyTypeTags` when the existing model value is non-empty.
+
+**Why:** the addin has TWO writers competing for `tag_Udp_Values_List`:
+
+1. `UdpSyncEngine.Apply` (admin source of truth) - writes admin's
+   joined list values.
+2. `UdpRuntimeService.UpdateListUdpsFromDependencySet` - writes
+   DB-table-derived values whenever `DependencySetRuntimeService` has
+   a `TABLE -> UDP` mapping for that UDP.
+
+When admin defines an ASSET UDP with no static options but a dependency
+set fills it from `[ASSET]` (3 rows: Asset1, Asset2, Asset3), the writer
+fight produces a perpetual "Sync UDP definitions from config?" dialog:
+
+    Diff:    admin=''(0)         vs model='Asset1,Asset2,Asset3'(20) -> "List options changed"
+    Apply:   wrote='' (admin)    -> Property_Type cleared
+    Runtime: writes 'Asset1,...' (dep-set re-fill, fires within ~1s)
+    Save:    persists 'Asset1,...' to Mart (runtime won the race)
+    Reopen:  model='Asset1,...' vs admin='' -> SAME diff -> infinite loop
+
+Verified 2026-05-31 against ASSET / MODEL UDP in user's MetaRepo Mart;
+log signature (search `UdpSyncEngine.Apply DIAG` + `list values updated
+from dependency set` in `%TEMP%\erwin-addin-debug.log`):
+
+    UDP diff DIAG [Model.Physical.ASSET] ListValues:
+      admin   (0 chars): ''
+      model   (20 chars): 'Asset1,Asset2,Asset3'
+      admin opts (0): []
+    ...
+    UdpSyncEngine.Apply DIAG [ASSET] tag_Udp_Values_List:
+      before  (20 chars): 'Asset1,Asset2,Asset3'
+      wrote   (0 chars): ''
+      readback(0 chars): ''
+    ...
+    UdpRuntime: Model.Physical.ASSET list values updated from
+                dependency set (3 items): Asset1,Asset2,Asset3
+
+**How to apply:**
+
+1. Heuristic `adminUdp.ListOptions.Count == 0` is intentional - a List
+   UDP with zero static options is semantically useless without a
+   runtime fill source (empty dropdowns help no one). Treating this
+   as "runtime-managed" needs no new admin-schema flag and no new
+   dependency on `DependencySetRuntimeService` plumbed into
+   `UdpSyncEngine`. The trade-off: an admin who genuinely intends a
+   List UDP with zero options to STAY empty in the model will see the
+   model's existing values preserved instead of cleared. That is the
+   less-destructive failure mode and matches the "never delete user
+   data without a positive signal" rule.
+2. Type / Default / Description diff axes are unaffected - admin still
+   owns those even for runtime-filled UDPs (the dropdown content is
+   dynamic, but the data type and description are static admin facts).
+3. Create path (when the Property_Type does not yet exist) still
+   writes the empty list - the model has no value to preserve there,
+   and `DependencySetRuntime` will fill it on the next tick.
+4. If the codebase ever grows a true `IS_RUNTIME_FILLED` flag on
+   `MC_UDP_DEFINITION`, swap the heuristic for that flag (the read
+   path is in `UdpSyncEngine.FetchSnapshot`) - the call sites already
+   route through `ComputeDiff` + `SetPropertyTypeTags`.
+
+Tests: `UdpSyncEngineDiffTests` adds two guard cases -
+`List_admin_with_zero_options_skips_ListValues_diff_when_model_has_values`
+proves the loop is broken on the diff side;
+`List_admin_with_zero_options_still_flags_Type_drift` proves the
+guard does not over-suppress (Type/Default/Description still flow
+through for the same UDP).
+
 ## 2026-05-23 (b): Naming-rule popups MUST serialize with PromptForMissingRequiredUdps
 
 **Rule:** any code path that calls `RequiredFieldDialog.Show` /

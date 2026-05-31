@@ -227,6 +227,63 @@ public class UdpSyncEngineDiffTests
     }
 
     [Fact]
+    public void List_admin_with_zero_options_skips_ListValues_diff_when_model_has_values()
+    {
+        // Runtime-managed list guard (regression for the "Sync UDP definitions
+        // from config?" dialog re-appearing forever bug, verified 2026-05-31
+        // on ASSET UDP):
+        //
+        // Admin defines ASSET as a List UDP but supplies 0 static options
+        // because DependencySetRuntimeService fills tag_Udp_Values_List
+        // from a DB table at runtime (the dropdown content is dynamic).
+        // Without the guard the diff fires "List options changed" forever:
+        // Apply writes "", runtime re-fills with N, Save persists N, reopen
+        // sees model=N vs admin=0 -> same diff next cycle.
+        //
+        // After the guard, ListValues compare is skipped entirely when
+        // admin.ListOptions.Count == 0; Type/Default/Description axes still
+        // sync normally (covered by other tests).
+        var snapshot = new List<UdpDefinitionSnapshot>
+        {
+            AdminUdp(1, "ASSET", objectType: "Model", udpType: "List"),  // 0 options
+        };
+        var model = AsMap(ModelUdp(
+            "Model.Physical.ASSET",
+            dataTypeId: 6,                                                  // already List
+            currentListValues: "Asset1,Asset2,Asset3"));                    // runtime-filled
+
+        var diff = UdpSyncEngine.ComputeDiff(snapshot, model);
+
+        diff.IsEmpty.Should().BeTrue(
+            "admin defines no static options, so list content is delegated to runtime; " +
+            "diff must NOT flag ListValues or the sync dialog loops forever");
+    }
+
+    [Fact]
+    public void List_admin_with_zero_options_still_flags_Type_drift()
+    {
+        // Sibling of the above: the zero-options guard ONLY suppresses the
+        // ListValues axis. If admin defines a List UDP (runtime-filled) but
+        // the model currently has it as a Text Property_Type, that is a
+        // genuine type drift the user needs to see + Apply.
+        var snapshot = new List<UdpDefinitionSnapshot>
+        {
+            AdminUdp(1, "ASSET", objectType: "Model", udpType: "List"),  // 0 options
+        };
+        var model = AsMap(ModelUdp(
+            "Model.Physical.ASSET",
+            dataTypeId: 2,                                                  // Text - wrong type
+            currentListValues: ""));
+
+        var diff = UdpSyncEngine.ComputeDiff(snapshot, model);
+
+        diff.Updates.Should().HaveCount(1);
+        var u = diff.Updates[0];
+        u.Changes.Should().HaveFlag(UdpUpdateChanges.Type);
+        u.Changes.Should().NotHaveFlag(UdpUpdateChanges.ListValues);
+    }
+
+    [Fact]
     public void Default_change_only_emits_Update_with_DefaultChange()
     {
         var snapshot = new List<UdpDefinitionSnapshot>

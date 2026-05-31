@@ -79,12 +79,27 @@ namespace EliteSoft.Erwin.AddIn.Services
         private static int InsertMssql(DbConnection conn, int configId, string modelName, string modelLocator,
             string sourceMode, string dbmsType, string ddlText, string note, string submittedBy)
         {
+            // STATUS column is NOT NULL. The CREATE TABLE script defines a
+            // DEFAULT 'Pending' constraint (DF_DDL_APPROVAL_QUEUE_STATUS) but
+            // production deployments have been observed without that default
+            // applied (user-reported 2026-05-30: "Cannot insert NULL into
+            // column 'STATUS', table MetaRepoTmp.dbo.DDL_APPROVAL_QUEUE"),
+            // so we set the initial status explicitly to be schema-drift
+            // independent. Valid values per the table comment + workflow
+            // model: 'Pending' / 'Approved' / 'Rejected'.
+            // STATUS + SUBMITTED_AT both have DEFAULT constraints in the
+            // CREATE TABLE script ('Pending' / SYSUTCDATETIME()) but production
+            // deployments have been observed without those defaults applied
+            // (user-reported 2026-05-30: NULL-into-STATUS then NULL-into-
+            // SUBMITTED_AT). Set both explicitly so the INSERT is schema-drift
+            // independent. STATUS literal 'Pending'; SUBMITTED_AT as a parameter
+            // (DateTime.UtcNow) to stay dialect-portable.
             const string sql = @"
 INSERT INTO [dbo].[DDL_APPROVAL_QUEUE]
-    ([CONFIG_ID],[MODEL_NAME],[MODEL_LOCATOR],[SOURCE_MODE],[DBMS_TYPE],[DDL_TEXT],[NOTE],[SUBMITTED_BY])
+    ([CONFIG_ID],[MODEL_NAME],[MODEL_LOCATOR],[SOURCE_MODE],[DBMS_TYPE],[DDL_TEXT],[NOTE],[STATUS],[SUBMITTED_BY],[SUBMITTED_AT])
 OUTPUT INSERTED.[ID]
 VALUES
-    (@configId, @modelName, @modelLocator, @sourceMode, @dbmsType, @ddlText, @note, @submittedBy);";
+    (@configId, @modelName, @modelLocator, @sourceMode, @dbmsType, @ddlText, @note, 'Pending', @submittedBy, @submittedAt);";
             using var cmd = DatabaseService.Instance.CreateCommand(sql, conn);
             AddParam(cmd, "@configId",    DbType.Int32,    configId);
             AddParam(cmd, "@modelName",   DbType.String,   (object)modelName    ?? DBNull.Value);
@@ -94,6 +109,7 @@ VALUES
             AddParam(cmd, "@ddlText",     DbType.String,   ddlText);
             AddParam(cmd, "@note",        DbType.String,   string.IsNullOrEmpty(note) ? (object)DBNull.Value : note);
             AddParam(cmd, "@submittedBy", DbType.String,   (object)submittedBy  ?? DBNull.Value);
+            AddParam(cmd, "@submittedAt", DbType.DateTime, DateTime.UtcNow);
             var scalar = cmd.ExecuteScalar();
             return Convert.ToInt32(scalar);
         }
@@ -104,11 +120,15 @@ VALUES
             // Oracle's RETURNING ... INTO needs an output parameter; the easier
             // cross-version path is to RETURN the new ID via a SELECT after
             // INSERT inside a single anonymous block.
+            // Explicit STATUS = 'Pending' for the same schema-drift reason
+            // documented in InsertMssql above.
+            // Explicit STATUS + SUBMITTED_AT for the schema-drift reason
+            // documented in InsertMssql.
             const string sql = @"
 INSERT INTO DDL_APPROVAL_QUEUE
-    (CONFIG_ID, MODEL_NAME, MODEL_LOCATOR, SOURCE_MODE, DBMS_TYPE, DDL_TEXT, NOTE, SUBMITTED_BY)
+    (CONFIG_ID, MODEL_NAME, MODEL_LOCATOR, SOURCE_MODE, DBMS_TYPE, DDL_TEXT, NOTE, STATUS, SUBMITTED_BY, SUBMITTED_AT)
 VALUES
-    (:configId, :modelName, :modelLocator, :sourceMode, :dbmsType, :ddlText, :note, :submittedBy)
+    (:configId, :modelName, :modelLocator, :sourceMode, :dbmsType, :ddlText, :note, 'Pending', :submittedBy, :submittedAt)
 RETURNING ID INTO :newId";
             using var cmd = DatabaseService.Instance.CreateCommand(sql, conn);
             AddParam(cmd, ":configId",    DbType.Int32,    configId);
@@ -119,6 +139,7 @@ RETURNING ID INTO :newId";
             AddParam(cmd, ":ddlText",     DbType.String,   ddlText);
             AddParam(cmd, ":note",        DbType.String,   string.IsNullOrEmpty(note) ? (object)DBNull.Value : note);
             AddParam(cmd, ":submittedBy", DbType.String,   (object)submittedBy  ?? DBNull.Value);
+            AddParam(cmd, ":submittedAt", DbType.DateTime, DateTime.UtcNow);
             var outp = cmd.CreateParameter();
             outp.ParameterName = ":newId";
             outp.DbType = DbType.Int32;
@@ -131,11 +152,13 @@ RETURNING ID INTO :newId";
         private static int InsertPostgres(DbConnection conn, int configId, string modelName, string modelLocator,
             string sourceMode, string dbmsType, string ddlText, string note, string submittedBy)
         {
+            // Explicit STATUS + SUBMITTED_AT for the schema-drift reason
+            // documented in InsertMssql.
             const string sql = @"
 INSERT INTO ""DDL_APPROVAL_QUEUE""
-    (""CONFIG_ID"",""MODEL_NAME"",""MODEL_LOCATOR"",""SOURCE_MODE"",""DBMS_TYPE"",""DDL_TEXT"",""NOTE"",""SUBMITTED_BY"")
+    (""CONFIG_ID"",""MODEL_NAME"",""MODEL_LOCATOR"",""SOURCE_MODE"",""DBMS_TYPE"",""DDL_TEXT"",""NOTE"",""STATUS"",""SUBMITTED_BY"",""SUBMITTED_AT"")
 VALUES
-    (@configId, @modelName, @modelLocator, @sourceMode, @dbmsType, @ddlText, @note, @submittedBy)
+    (@configId, @modelName, @modelLocator, @sourceMode, @dbmsType, @ddlText, @note, 'Pending', @submittedBy, @submittedAt)
 RETURNING ""ID"";";
             using var cmd = DatabaseService.Instance.CreateCommand(sql, conn);
             AddParam(cmd, "@configId",    DbType.Int32,    configId);
@@ -146,6 +169,7 @@ RETURNING ""ID"";";
             AddParam(cmd, "@ddlText",     DbType.String,   ddlText);
             AddParam(cmd, "@note",        DbType.String,   string.IsNullOrEmpty(note) ? (object)DBNull.Value : note);
             AddParam(cmd, "@submittedBy", DbType.String,   (object)submittedBy  ?? DBNull.Value);
+            AddParam(cmd, "@submittedAt", DbType.DateTime, DateTime.UtcNow);
             var scalar = cmd.ExecuteScalar();
             return Convert.ToInt32(scalar);
         }

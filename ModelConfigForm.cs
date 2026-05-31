@@ -2343,6 +2343,19 @@ namespace EliteSoft.Erwin.AddIn
                 if (config != null && config.IsConfigured)
                 {
                     _lblDbValue.Text = $"{config.Host}/{config.Database} ({DatabaseService.Instance.GetDbType()})";
+                    _lblDbValue.ForeColor = Color.FromArgb(40, 40, 40); // primary
+                }
+                else
+                {
+                    // CLEAR stale value. Without this branch, a previous
+                    // successful load would leave the OLD host/database string
+                    // visible (visually overlapping the red "(no config: ...)"
+                    // warning on the Config row above), making the user think
+                    // the addin was still wired to the old registry data even
+                    // after a successful HKLM change + reload (user reported
+                    // 2026-05-30, screenshot showed garbled overlap).
+                    _lblDbValue.Text = "(not configured)";
+                    _lblDbValue.ForeColor = Color.FromArgb(120, 120, 120); // secondary/gray
                 }
 
                 var bootstrapService = new RegistryBootstrapService();
@@ -3731,6 +3744,50 @@ namespace EliteSoft.Erwin.AddIn
                     Services.DebugMode.Pause("From-DB route selected - starting silent RE + CC pipeline", log);
                     var (dbScript, dbErr) = await RunFromDbDdlPipelineAsync(log);
                     Services.DebugMode.Pause("From-DB pipeline returned - about to render DDL", log);
+
+                    // "Only Selected Objects" post-filter for the From-DB path
+                    // (2026-05-30): the From-DB wizard does NOT raise a "Use
+                    // current diagram selections?" popup, so the bridge's
+                    // SetUseDiagramSelection toggle has no effect here. Instead
+                    // we read the currently selected entities from erwin's
+                    // Overview pane (Win32Helper.GetDiagramSelectedEntities),
+                    // map them to Physical_Name via SCAPI, and regex-filter the
+                    // captured DDL to only the matching ALTER blocks.
+                    //
+                    // No-selection path is treated as a hard error per user
+                    // decision 2026-05-30 ("Hata + iptal"): if the user enabled
+                    // the filter checkbox but has nothing selected on the
+                    // diagram, we surface the message and skip the render
+                    // entirely rather than dump the unfiltered DDL.
+                    if (chkFilterObjects.Checked
+                        && !string.IsNullOrWhiteSpace(dbScript)
+                        && string.IsNullOrEmpty(dbErr))
+                    {
+                        var erwinMain = Services.Win32Helper.GetErwinMainWindow();
+                        string modelName = _connectedModelName ?? "";
+                        var selectedEntities = (erwinMain != IntPtr.Zero && !string.IsNullOrEmpty(modelName))
+                            ? Services.Win32Helper.GetDiagramSelectedEntities(erwinMain, modelName)
+                            : new List<string>();
+                        if (selectedEntities == null || selectedEntities.Count == 0)
+                        {
+                            log("[From-DB] 'Only Selected Objects' checked but no entity is selected on the active diagram - aborting render.");
+                            dbScript = null;
+                            dbErr = "Lutfen diyagramda 1+ entity secip 'Generate DDL'i tekrar tiklayin (\"Only Selected Objects\" isaretli).";
+                        }
+                        else
+                        {
+                            var map = MapEntityNamesToPhysicalNames(selectedEntities);
+                            var physNames = new HashSet<string>(map.Values, StringComparer.OrdinalIgnoreCase);
+                            log($"[From-DB] filtering DDL by {physNames.Count} physical name(s): [{string.Join(", ", physNames)}] (logical: [{string.Join(", ", selectedEntities)}])");
+                            string filtered = FilterFromDbDdlByPhysicalNames(dbScript, physNames, log);
+                            if (string.IsNullOrWhiteSpace(filtered))
+                            {
+                                log("[From-DB] post-filter result is EMPTY (no DDL blocks reference the selected entities) - rendering empty result.");
+                            }
+                            dbScript = filtered;
+                        }
+                    }
+
                     script = dbScript;
                     err = dbErr;
                     sourceMode = "FromDB";
@@ -4014,8 +4071,20 @@ namespace EliteSoft.Erwin.AddIn
                                                 // appeared to hang erwin on teardown (cf.
                                                 // reference_layered_wizard_compositor_leak). Both stay
                                                 // visible during the capture.
+                                                // "Only Selected Objects" requires walking the Object
+                                                // Filter wizard page so its "Use current diagram
+                                                // selections? You have N entity selected" popup fires
+                                                // (the bridge then answers Yes via the
+                                                // SetUseDiagramSelection toggle). The default jump
+                                                // SKIPS that page and would silently drop the
+                                                // filter - regression verified 2026-05-30. When the
+                                                // user did not enable the filter, keep using the
+                                                // faster jump.
+                                                bool onlySelected = chkFilterObjects.Enabled && chkFilterObjects.Checked;
                                                 bool previewOk = await Services.MartMartAutomation
-                                                    .ClickWizardPreviewTabAsync(capturedWizard, (Action<string>)log);
+                                                    .ClickWizardPreviewTabAsync(capturedWizard, (Action<string>)log,
+                                                        overlayToggle: null,
+                                                        requireObjectFilterPass: onlySelected);
                                                 if (!previewOk)
                                                 {
                                                     err = "Wizard Next-loop / Preview tab failed.";
@@ -4344,23 +4413,42 @@ namespace EliteSoft.Erwin.AddIn
         }
 
         /// <summary>
-        /// Programmatic Mart save: pushes the supplied version description
-        /// into MCXGDMPersister_Mart::SetDescription via the native bridge
-        /// and then invokes pu.Save() so the description is stamped on the
-        /// new Mart version without erwin's own description dialog ever
-        /// surfacing. Returns true on commit success.
+        /// Programmatic Mart commit invoked by the DDL Review "Send to
+        /// Approve" button before the approval-queue insert. Returns true
+        /// to let the caller proceed with the insert; false aborts.
         ///
-        /// IMPORTANT: the bridge's SetDescription cache is populated the
-        /// first time erwin itself calls SetDescription during the running
-        /// erwin session (i.e. the user does ONE manual Mart save). Before
-        /// that bootstrap, BridgeSetMartSaveDescription returns -2 and we
-        /// surface "manual save needed first" to the user. After bootstrap
-        /// the flow is fully programmatic and the description from the
-        /// popup is used verbatim.
+        /// Mechanism (2026-05-31 rewrite): drives erwin's own ribbon
+        /// Mart > Save flow from inside the addin via
+        /// <see cref="Services.MartSaveAutomation"/>. The earlier
+        /// SCAPI-based pu.Save(martUri, "OVM=Yes") path was blocked
+        /// in-process by "Mart user interface is active" (memory
+        /// reference_scapi_mart_ui_active_block), and the bare
+        /// pu.Save() variant silently wrote a LOCAL .erwin file
+        /// without ever advancing the Mart version. The native UI path
+        /// (PostMessage WM_COMMAND 1061 on XTPMainFrame, hidden
+        /// description dialog auto-fill, IDOK) is what the user's manual
+        /// click does anyway - we just drive it programmatically with
+        /// the description prefilled and the dialog SW_HIDE'd so the
+        /// user sees zero UI.
+        ///
+        /// Behaviour:
+        ///   1. Dirty gate via <see cref="Services.VersionCompareService.ProbeDirty"/>.
+        ///      Clean model = nothing to commit = return true so the
+        ///      caller still inserts the queue row.
+        ///   2. Resolve erwin's XTPMainFrame HWND via
+        ///      <see cref="Services.Win32Helper.GetErwinMainWindow"/>.
+        ///   3. Hand off to
+        ///      <see cref="Services.MartSaveAutomation.SaveWithDescriptionAsync"/> -
+        ///      that runs the WinEvent hook + dialog automation chain.
+        ///   4. Re-probe dirty as positive-signal commit proof. After
+        ///      a successful Mart commit pu.IsDirty MUST flip to false;
+        ///      if it stays true the commit silently failed and we
+        ///      surface that to the user (queue insert is aborted, the
+        ///      status strip shows the error).
         /// </summary>
         private System.Threading.Tasks.Task<bool> SaveCurrentModelWithDescription(string description)
         {
-            return System.Threading.Tasks.Task.Run(() =>
+            return System.Threading.Tasks.Task.Run(async () =>
             {
                 if (_currentModel == null)
                 {
@@ -4368,31 +4456,86 @@ namespace EliteSoft.Erwin.AddIn
                     return false;
                 }
 
-                // Resolve the persister and push description BEFORE Save so
-                // MCXModelIncrementalSaveCommand picks it up when pu.Save
-                // runs. Bridge looks the persister up by model name via the
-                // static MCXGDMPersister_Mart::FindPersister(CString) -
-                // hook-independent, works on the very first call.
-                string modelName = _connectedModelName ?? string.Empty;
-                int rc = Services.NativeBridgeService.SetMartSaveDescription(modelName, description, (Action<string>)Log);
-                Log($"SaveCurrentModelWithDescription: SetMartSaveDescription rc={rc} model='{modelName}'");
-                if (rc == -2)
-                {
-                    Log("SaveCurrentModelWithDescription: persister lookup failed - model name may not match the Mart locator key.");
-                }
-
+                // Step 1: dirty gate. Clean model = nothing to commit.
+                Services.VersionCompareService.DirtyProbe beforeDirty;
                 try
                 {
-                    object saveRc = _currentModel.Save();
-                    bool ok = saveRc is bool b ? b : true;
-                    Log($"SaveCurrentModelWithDescription: pu.Save() returned {saveRc} (ok={ok})");
-                    return ok;
+                    var probeService = new Services.VersionCompareService(_scapi, _currentModel, (Action<string>)Log);
+                    beforeDirty = probeService.ProbeDirty();
                 }
                 catch (Exception ex)
                 {
-                    Log($"SaveCurrentModelWithDescription: pu.Save threw {ex.GetType().Name}: {ex.Message}");
+                    Log($"SaveCurrentModelWithDescription: ProbeDirty threw {ex.GetType().Name}: {ex.Message} - assuming dirty.");
+                    beforeDirty = new Services.VersionCompareService.DirtyProbe(true, "(probe-error)");
+                }
+
+                Log($"SaveCurrentModelWithDescription: dirty before save = {beforeDirty.IsDirty} (source={beforeDirty.Source})");
+
+                if (!beforeDirty.IsDirty)
+                {
+                    Log("SaveCurrentModelWithDescription: model is clean (no unsaved changes) - skipping Mart save, proceeding with approval queue insert.");
+                    return true;
+                }
+
+                // Step 2: resolve erwin's main XTPMainFrame HWND.
+                IntPtr erwinMain = IntPtr.Zero;
+                try
+                {
+                    erwinMain = Services.Win32Helper.GetErwinMainWindow();
+                }
+                catch (Exception ex)
+                {
+                    Log($"SaveCurrentModelWithDescription: GetErwinMainWindow threw {ex.GetType().Name}: {ex.Message}");
+                }
+                if (erwinMain == IntPtr.Zero)
+                {
+                    Log("SaveCurrentModelWithDescription: erwin XTPMainFrame HWND not resolvable - aborting.");
                     return false;
                 }
+                Log($"SaveCurrentModelWithDescription: erwin main HWND = 0x{erwinMain.ToInt64():X}");
+
+                // Step 3: drive the native Mart Save flow. 15s timeout
+                // covers cold Mart connections (manual flow ground-truth
+                // 2026-05-31: ~10s end-to-end including SCAPI init).
+                bool uiOk = await Services.MartSaveAutomation.SaveWithDescriptionAsync(
+                    erwinMain, description ?? string.Empty, timeoutMs: 15000, (Action<string>)Log)
+                    .ConfigureAwait(false);
+                Log($"SaveCurrentModelWithDescription: MartSaveAutomation.SaveWithDescriptionAsync returned {uiOk}");
+                if (!uiOk)
+                {
+                    Log("SaveCurrentModelWithDescription: UI automation reported failure - aborting (queue insert will NOT happen).");
+                    return false;
+                }
+
+                // Step 4: post-save dirty re-probe as positive proof
+                // that the commit actually flushed the dirty buffer.
+                Services.VersionCompareService.DirtyProbe afterDirty;
+                try
+                {
+                    var postProbe = new Services.VersionCompareService(_scapi, _currentModel, (Action<string>)Log);
+                    afterDirty = postProbe.ProbeDirty();
+                }
+                catch (Exception ex)
+                {
+                    Log($"SaveCurrentModelWithDescription: post-save ProbeDirty threw {ex.GetType().Name}: {ex.Message}");
+                    afterDirty = new Services.VersionCompareService.DirtyProbe(false, "(post-probe-error)");
+                }
+
+                Log($"SaveCurrentModelWithDescription: dirty after save = {afterDirty.IsDirty} (source={afterDirty.Source})");
+
+                // If the probe could not read any dirty property at all
+                // (Source="(unknown)") we cannot tell if the commit
+                // succeeded - trust the UI automation rc and proceed.
+                // Otherwise: still-dirty after a successful UI flow
+                // means erwin opened + IDOK'd the dialog but the commit
+                // did not flush. That is a real failure - flag it.
+                if (afterDirty.IsDirty && afterDirty.Source != "(unknown)" && afterDirty.Source != "(post-probe-error)")
+                {
+                    Log("SaveCurrentModelWithDescription: UI automation completed but PU is STILL dirty after the save - treating as commit failure.");
+                    return false;
+                }
+
+                return true;
             });
         }
 
@@ -4935,7 +5078,6 @@ namespace EliteSoft.Erwin.AddIn
         private long _dbTargetServer = 0;
         private int _dbTargetVersion = 0;
         private string _dbSchema = "";
-        private List<string> _dbSelectedTables = new List<string>();
         // Raw fields for in-process RE pipeline (DSN created at runtime).
         private string _dbHost = "";
         private string _dbName = "";
@@ -5035,14 +5177,15 @@ namespace EliteSoft.Erwin.AddIn
                     $"  Configure dialog selection = {_dbTargetServer} (DB type code {_dbTypeCode})\n" +
                     "Open 'Configure...' on the From DB row and pick the DB type whose dialect matches the active model.");
 
-            // Step 2: tables must be explicitly selected. No silent
-            // "all-tables" fallback (feedback_no_silent_fallback) - user
-            // must pick the comparison set up front so the resulting alter
-            // DDL is never wider than what they asked for.
-            var tableList = new List<string>(_dbSelectedTables ?? new List<string>());
+            // Step 2: reverse-engineer EVERY entity in the active model. The
+            // old "Select Tables..." picker was deleted 2026-05-30 - one-click
+            // UX was confusing + the "Only Selected Objects" post-filter
+            // (chkFilterObjects + diagram selection -> Physical_Name regex)
+            // covers the narrower-scope use case without a separate dialog.
+            var tableList = CollectModelTablePhysicalNames();
             if (tableList.Count == 0)
-                return (null, "No tables selected. Use 'Select Tables...' on the From DB row first.");
-            log($"[From-DB] using {tableList.Count} selected table(s).");
+                return (null, "Active model has no entities to reverse-engineer.");
+            log($"[From-DB] using all {tableList.Count} model table(s).");
 
             // ALL addin monitoring services suspended for the entire
             // pipeline. Validation alone wasn't enough: log 13:12-13:15
@@ -5464,18 +5607,16 @@ namespace EliteSoft.Erwin.AddIn
                 if (string.IsNullOrEmpty(_dbConnectionString)) return;
             }
 
-            // Tables: default to ALL model tables when user hasn't picked explicitly
-            var tableList = new List<string>(_dbSelectedTables ?? new List<string>());
+            // Tables: always ALL model tables (the "Select Tables..." picker
+            // was deleted 2026-05-30; narrower-scope comparison now goes
+            // through "Only Selected Objects" + diagram selection).
+            var tableList = CollectModelTablePhysicalNames();
             if (tableList.Count == 0)
             {
-                tableList = CollectModelTablePhysicalNames();
-                if (tableList.Count == 0)
-                {
-                    ErwinAddIn.ShowTopMostMessage("Active model has no tables to compare.", "From DB");
-                    return;
-                }
-                Log($"DDL: From DB using default (all {tableList.Count} model tables).");
+                ErwinAddIn.ShowTopMostMessage("Active model has no tables to compare.", "From DB");
+                return;
             }
+            Log($"DDL: From DB using all {tableList.Count} model tables.");
 
             // Schema validation: RE returns empty if no schema/owner filter
             if (string.IsNullOrWhiteSpace(_dbSchema))
@@ -5644,6 +5785,132 @@ namespace EliteSoft.Erwin.AddIn
             return result;
         }
 
+        /// <summary>
+        /// Maps a set of entity NAMES (logical, as shown in erwin's Overview
+        /// pane when entities are selected on the diagram) to their SCAPI
+        /// Physical_Name (the table identifier that appears inside ALTER
+        /// TABLE [schema].[NAME] in the generated DDL). Names that have no
+        /// matching entity fall through to the logical name itself, so the
+        /// downstream regex filter still has a chance to match. Used by the
+        /// From-DB post-process DDL filter ("Only Selected Objects").
+        /// </summary>
+        private Dictionary<string, string> MapEntityNamesToPhysicalNames(IEnumerable<string> entityNames)
+        {
+            var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (entityNames == null) return map;
+            var wanted = new HashSet<string>(entityNames, StringComparer.OrdinalIgnoreCase);
+            if (wanted.Count == 0) return map;
+            if (_currentModel == null)
+            {
+                foreach (var n in wanted) map[n] = n;
+                return map;
+            }
+            dynamic sess = null; bool ownSess = false;
+            try
+            {
+                bool hasSess = false;
+                try { hasSess = _currentModel.HasSession(); } catch { }
+                if (hasSess)
+                {
+                    int sc = 0; try { sc = _scapi.Sessions.Count; } catch { }
+                    for (int i = 0; i < sc; i++)
+                    {
+                        try
+                        {
+                            dynamic s = _scapi.Sessions.Item(i);
+                            bool open = false; try { open = s.IsOpen(); } catch { }
+                            string puN = ""; try { puN = s.PersistenceUnit?.Name?.ToString() ?? ""; } catch { }
+                            string curN = ""; try { curN = _currentModel.Name?.ToString() ?? ""; } catch { }
+                            if (open && puN == curN) { sess = s; break; }
+                        }
+                        catch { }
+                    }
+                }
+                if (sess == null)
+                {
+                    sess = _scapi.Sessions.Add();
+                    sess.Open(_currentModel, 0, 0);
+                    ownSess = true;
+                }
+                dynamic mo = sess.ModelObjects;
+                dynamic ents = mo.Collect(mo.Root, "Entity");
+                foreach (dynamic ent in ents)
+                {
+                    try
+                    {
+                        string name = "";
+                        try { name = ent.Name?.ToString() ?? ""; } catch { }
+                        if (string.IsNullOrWhiteSpace(name) || !wanted.Contains(name)) continue;
+                        string phys = "";
+                        try { phys = ent.Properties("Physical_Name")?.Value?.ToString() ?? ""; } catch { }
+                        if (string.IsNullOrWhiteSpace(phys)) phys = name;
+                        map[name] = phys;
+                    }
+                    catch { }
+                }
+                // Any wanted name that did not resolve falls back to itself so
+                // the regex still has a chance (entity might have been renamed).
+                foreach (var n in wanted) if (!map.ContainsKey(n)) map[n] = n;
+            }
+            catch (Exception ex) { Log($"DDL: MapEntityNamesToPhysicalNames err: {ex.Message}"); }
+            finally
+            {
+                if (ownSess && sess != null) { try { sess.Close(); } catch { } }
+            }
+            return map;
+        }
+
+        /// <summary>
+        /// Splits alter DDL into <c>go</c>-delimited statement blocks and keeps
+        /// only those that reference one of the supplied physical table names.
+        /// Matches against the bracketed identifier (e.g. <c>[dbo].[NAME]</c>)
+        /// AND against an unbracketed word boundary (case-insensitive), so the
+        /// filter survives dialect-specific quoting differences. Blocks that
+        /// touch no listed table - DROP statements for unrelated objects,
+        /// pre-script / post-script blobs, etc - are dropped.
+        /// </summary>
+        private static string FilterFromDbDdlByPhysicalNames(string ddl, HashSet<string> physicalNames, Action<string> log = null)
+        {
+            if (string.IsNullOrEmpty(ddl) || physicalNames == null || physicalNames.Count == 0)
+                return ddl;
+            // Split on lines that are just "go" (case-insensitive, optional
+            // surrounding whitespace, optional CR).
+            var blocks = System.Text.RegularExpressions.Regex.Split(ddl, @"(?im)^\s*go\s*\r?$");
+            var keptBlocks = new List<string>();
+            int matched = 0, skipped = 0;
+            foreach (var blockRaw in blocks)
+            {
+                string block = blockRaw?.Trim() ?? "";
+                if (block.Length == 0) continue;
+                bool hit = false;
+                foreach (var phys in physicalNames)
+                {
+                    if (string.IsNullOrWhiteSpace(phys)) continue;
+                    string esc = System.Text.RegularExpressions.Regex.Escape(phys);
+                    // Match [NAME] (bracketed, common in SQL Server output) OR
+                    // a free-standing identifier (word boundaries) for dialects
+                    // without bracket quoting.
+                    string pattern = $@"(\[{esc}\]|\b{esc}\b)";
+                    if (System.Text.RegularExpressions.Regex.IsMatch(block, pattern, System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+                    {
+                        hit = true; break;
+                    }
+                }
+                if (hit) { keptBlocks.Add(block); matched++; }
+                else { skipped++; }
+            }
+            log?.Invoke($"  [DDL-FILTER] kept {matched} block(s), dropped {skipped}; against {physicalNames.Count} physical name(s).");
+            if (keptBlocks.Count == 0) return ""; // honest: nothing matched
+            var sb = new System.Text.StringBuilder();
+            foreach (var b in keptBlocks)
+            {
+                sb.Append(b);
+                if (!b.EndsWith("\n")) sb.AppendLine();
+                sb.AppendLine("go");
+            }
+            return sb.ToString();
+        }
+
         private void OnRightSourceChanged()
         {
             bool fromMart = rbFromMart.Checked;
@@ -5661,19 +5928,21 @@ namespace EliteSoft.Erwin.AddIn
                 && (cmbRightModel.Items[0]?.ToString()?.StartsWith("v") ?? false);
             cmbRightModel.Enabled = fromMart && hasRealVersions;
             btnConfigureDB.Visible = fromDB;
-            btnSelectDbTables.Visible = fromDB;
-            lblSelectedTableCount.Visible = fromDB;
 
-            // "Only Selected Objects" is honoured natively by the Alter Script
-            // Wizard's Object Filter page (the "Use current diagram selections?"
-            // popup), which only exists on the From-Mart compare path. From-DB
-            // runs a different pipeline with no such page, so disable + clear
-            // the option there rather than leave a checkbox that silently does
-            // nothing.
-            chkFilterObjects.Enabled = fromMart;
-            if (!fromMart) chkFilterObjects.Checked = false;
-
-            UpdateSelectedTableCountLabel();
+            // "Only Selected Objects" is honoured by BOTH paths (2026-05-30):
+            //  - From-Mart: erwin's Alter Script Wizard Object Filter page
+            //    raises a "Use current diagram selections?" popup; the bridge
+            //    answers Yes via SetUseDiagramSelection so the wizard scopes
+            //    natively (when the user enables the checkbox, the caller
+            //    routes through the Next-loop so the Object Filter page is
+            //    actually visited - see ClickWizardPreviewTab's
+            //    requireObjectFilterPass parameter).
+            //  - From-DB: the wizard does not raise that popup, so we instead
+            //    post-process the captured DDL with a regex filter against the
+            //    SCAPI Physical_Name of every entity currently selected on the
+            //    diagram (Win32Helper.GetDiagramSelectedEntities).
+            // Either way the checkbox stays enabled regardless of the radio.
+            chkFilterObjects.Enabled = true;
 
             if (fromDB)
             {
@@ -5725,176 +5994,6 @@ namespace EliteSoft.Erwin.AddIn
             }
         }
 
-        private void UpdateSelectedTableCountLabel()
-        {
-            if (_dbSelectedTables != null && _dbSelectedTables.Count > 0)
-                lblSelectedTableCount.Text = $"{_dbSelectedTables.Count} table(s) selected";
-            else
-                lblSelectedTableCount.Text = "(defaults to ALL model tables)";
-        }
-
-        /// <summary>
-        /// Fetches the live DB's BASE TABLE list via ODBC and shows a
-        /// CheckedListBox picker. User chooses which DB tables to include
-        /// in the From-DB compare. No fallback to model tables: if the DB
-        /// is not configured or the query fails, we surface a clear error
-        /// rather than silently swapping in a different data source.
-        /// </summary>
-        private void BtnSelectDbTables_Click(object sender, EventArgs e)
-        {
-            // Require DB connection to be configured first - no fallback.
-            bool dbConfigured =
-                (!string.IsNullOrWhiteSpace(_dbHost) || !string.IsNullOrWhiteSpace(_dbConnectionString))
-                && _dbTypeCode != 0;
-            if (!dbConfigured)
-            {
-                ErwinAddIn.ShowTopMostMessage(
-                    "Configure the DB connection first (click Configure on the From DB row).",
-                    "Select DB Tables");
-                return;
-            }
-
-            // _dbConnectionString is erwin's pipe-separated locator (used by
-            // the RE pipeline), NOT an ADO.NET connection string. The ODBC
-            // connection string for the table-listing query is rebuilt from
-            // the captured DbConnectionForm fields - same fields the Test
-            // Connection button uses on that form, so a successful Test
-            // there guarantees this query path can connect too.
-            List<string> dbTables = Services.DbTableBrowserService.FetchTables(
-                dbTypeCode: _dbTypeCode,
-                host: _dbHost,
-                database: _dbName,
-                dsnName: _dbDsnName,
-                useNative: _dbUseNative,
-                useWindowsAuth: _dbUseWindowsAuth,
-                user: _dbUser,
-                password: _dbPassword,
-                schemaFilter: _dbSchema,
-                log: Log);
-
-            if (dbTables == null)
-            {
-                // FetchTables logged the specific failure (bad connection
-                // string, ODBC driver missing, query failed, etc).
-                ErwinAddIn.ShowTopMostMessage(
-                    "Could not list tables from the DB. See Debug Log for details.",
-                    "Select DB Tables");
-                return;
-            }
-
-            if (dbTables.Count == 0)
-            {
-                string suffix = string.IsNullOrWhiteSpace(_dbSchema)
-                    ? ""
-                    : $" matching schema filter '{_dbSchema}'";
-                ErwinAddIn.ShowTopMostMessage(
-                    $"DB has no base tables{suffix}.",
-                    "Select DB Tables");
-                return;
-            }
-
-            // Default: previously selected stay checked; first time, all checked.
-            var preChecked = new HashSet<string>(
-                (_dbSelectedTables != null && _dbSelectedTables.Count > 0)
-                    ? _dbSelectedTables
-                    : dbTables,
-                StringComparer.OrdinalIgnoreCase);
-
-            var result = ShowTableSelectionDialog(dbTables, preChecked);
-            if (result != null)
-            {
-                _dbSelectedTables = result;
-                UpdateSelectedTableCountLabel();
-                Log($"DDL: {result.Count} of {dbTables.Count} DB table(s) selected for From DB compare.");
-            }
-        }
-
-        /// <summary>
-        /// Lightweight inline dialog: CheckedListBox + Select All/None + OK/Cancel.
-        /// Returns selected table list or null on cancel.
-        /// </summary>
-        private List<string> ShowTableSelectionDialog(List<string> tables, HashSet<string> preChecked)
-        {
-            using (var dlg = new Form())
-            {
-                dlg.Text = "Select DB Tables to Compare";
-                dlg.StartPosition = FormStartPosition.CenterParent;
-                dlg.Size = new System.Drawing.Size(420, 520);
-                dlg.FormBorderStyle = FormBorderStyle.FixedDialog;
-                dlg.MaximizeBox = false;
-                dlg.MinimizeBox = false;
-                dlg.TopMost = true;
-
-                var lbl = new Label
-                {
-                    Text = $"Model tables ({tables.Count}). Checked = include in DB reverse engineer.",
-                    Location = new System.Drawing.Point(12, 10),
-                    Size = new System.Drawing.Size(380, 30)
-                };
-                dlg.Controls.Add(lbl);
-
-                var clb = new CheckedListBox
-                {
-                    Location = new System.Drawing.Point(12, 45),
-                    Size = new System.Drawing.Size(378, 380),
-                    CheckOnClick = true,
-                    IntegralHeight = false
-                };
-                foreach (var t in tables)
-                    clb.Items.Add(t, preChecked.Contains(t));
-                dlg.Controls.Add(clb);
-
-                var btnAll = new Button
-                {
-                    Text = "Select All",
-                    Location = new System.Drawing.Point(12, 432),
-                    Size = new System.Drawing.Size(90, 26)
-                };
-                btnAll.Click += (s, e) =>
-                {
-                    for (int i = 0; i < clb.Items.Count; i++) clb.SetItemChecked(i, true);
-                };
-                dlg.Controls.Add(btnAll);
-
-                var btnNone = new Button
-                {
-                    Text = "Select None",
-                    Location = new System.Drawing.Point(108, 432),
-                    Size = new System.Drawing.Size(90, 26)
-                };
-                btnNone.Click += (s, e) =>
-                {
-                    for (int i = 0; i < clb.Items.Count; i++) clb.SetItemChecked(i, false);
-                };
-                dlg.Controls.Add(btnNone);
-
-                var btnOk = new Button
-                {
-                    Text = "OK",
-                    DialogResult = DialogResult.OK,
-                    Location = new System.Drawing.Point(208, 432),
-                    Size = new System.Drawing.Size(85, 26)
-                };
-                dlg.Controls.Add(btnOk);
-                dlg.AcceptButton = btnOk;
-
-                var btnCancel = new Button
-                {
-                    Text = "Cancel",
-                    DialogResult = DialogResult.Cancel,
-                    Location = new System.Drawing.Point(300, 432),
-                    Size = new System.Drawing.Size(85, 26)
-                };
-                dlg.Controls.Add(btnCancel);
-                dlg.CancelButton = btnCancel;
-
-                if (dlg.ShowDialog(this) != DialogResult.OK) return null;
-
-                var selected = new List<string>();
-                foreach (var item in clb.CheckedItems) selected.Add(item.ToString());
-                return selected;
-            }
-        }
 
         private int _martVersion = 0;
         private string _martLocator = "";

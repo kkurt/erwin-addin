@@ -163,6 +163,38 @@ namespace EliteSoft.Erwin.AddIn.Services
         [DllImport("user32.dll")]
         private static extern bool GetCursorPos(out POINT lpPoint);
         [DllImport("user32.dll")]
+        private static extern bool ClipCursor(ref RECT lpRect);
+        [DllImport("user32.dll", EntryPoint = "ClipCursor")]
+        private static extern bool ClipCursorRelease(IntPtr lpRect);
+
+        // Robust click primitive: confine the OS cursor to a small box around
+        // the target so the user physically moving the mouse during the click
+        // sequence (SetCursorPos -> sleep -> mouse_event DOWN -> sleep -> UP)
+        // cannot displace the cursor enough to miss the target window.
+        // Released automatically on process exit, plus we Release in finally
+        // so a thrown call cannot trap the cursor. Used by every direct
+        // mouse_event site in this file (SendMouseClickAt, the RAS toolbar
+        // click, the SM-CLOSE uncheck, ClickListViewSubItem). Tightened from
+        // the prior unprotected variant after a user-reported failure mode
+        // 2026-05-30: physical mouse movement during Generate DDL broke the
+        // pipeline chain.
+        private static bool ClipCursorAround(int screenX, int screenY, int radius = 2)
+        {
+            RECT r = new RECT
+            {
+                left   = screenX - radius,
+                top    = screenY - radius,
+                right  = screenX + radius + 1,
+                bottom = screenY + radius + 1,
+            };
+            try { return ClipCursor(ref r); } catch { return false; }
+        }
+
+        private static void ReleaseCursorClip()
+        {
+            try { ClipCursorRelease(IntPtr.Zero); } catch { }
+        }
+        [DllImport("user32.dll")]
         private static extern bool SetCursorPos(int X, int Y);
         [DllImport("user32.dll")]
         private static extern void mouse_event(uint dwFlags, int dx, int dy, uint dwData, IntPtr dwExtraInfo);
@@ -241,20 +273,31 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             // RAW path (proven multi-monitor): SetCursorPos accepts raw
             // screen coords (handles negative + secondary monitors
-            // natively). mouse_event then fires DOWN/UP at current cursor
-            // position. No 0..65535 normalization, no monitor-bound
-            // calculations. Trade-off: cursor visibly jumps - acceptable
-            // since ShowCursor(false) is in effect during the click.
+            // natively). mouse_event then fires DOWN/UP at the CURRENT
+            // cursor position (target is implicit via cursor placement).
+            // No 0..65535 normalization, no monitor-bound calculations.
+            //
+            // Robustness against user-input interference (2026-05-30):
+            // wrap the entire click sequence in ClipCursor confined to a
+            // small box around the target. Without this, the user
+            // physically moving the mouse between SetCursorPos and either
+            // mouse_event call (the prior ~70ms vulnerable window) would
+            // route the synthetic DOWN/UP to the wrong window and snap
+            // the multi-step pipeline (user-reported failure mode: chain
+            // breaks when mouse is moved during Generate DDL). The clip
+            // is released in finally so a thrown call cannot trap the
+            // cursor; ClipCursor is also auto-released when the process
+            // exits, so even a hard crash recovers cleanly. The dropped
+            // 30ms post-SetCursorPos sleep is unnecessary now (the OS
+            // call is synchronous + the clip pins the cursor anyway).
             POINT savedCursor;
             bool savedOk = GetCursorPos(out savedCursor);
-            log?.Invoke($"    [click] target screen=({screenX},{screenY}) raw mouse_event path");
+            log?.Invoke($"    [click] target screen=({screenX},{screenY}) raw mouse_event path (clipped 5x5)");
 
+            bool clipped = ClipCursorAround(screenX, screenY);
             try
             {
                 SetCursorPos(screenX, screenY);
-                Thread.Sleep(30);
-                // Verify cursor actually landed where we asked. Multi-
-                // monitor with weird DPI scaling can clip.
                 if (GetCursorPos(out POINT actual))
                 {
                     int dx = Math.Abs(actual.X - screenX);
@@ -268,6 +311,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
             finally
             {
+                if (clipped) ReleaseCursorClip();
                 if (savedOk)
                 {
                     try { SetCursorPos(savedCursor.X, savedCursor.Y); } catch { }
@@ -2607,6 +2651,11 @@ namespace EliteSoft.Erwin.AddIn.Services
                         // visible cursor, settle delay before press, hold
                         // briefly, then release. Yields a brief cursor jump
                         // (~150ms) but bypasses the filter heuristic.
+                        // 180ms of vulnerable sleeps below (60+80+40) - confine
+                        // the cursor to a 5x5 box around the target so user
+                        // mouse movement cannot route the synthetic clicks to
+                        // the wrong window (user-reported failure 2026-05-30).
+                        bool rasClipped = ClipCursorAround(center.X, center.Y);
                         if (GetCursorPos(out POINT savedCursor))
                         {
                             try
@@ -2620,17 +2669,25 @@ namespace EliteSoft.Erwin.AddIn.Services
                             }
                             finally
                             {
+                                if (rasClipped) ReleaseCursorClip();
                                 SetCursorPos(savedCursor.X, savedCursor.Y);
                             }
                         }
                         else
                         {
-                            SetCursorPos(center.X, center.Y);
-                            Thread.Sleep(60);
-                            mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, IntPtr.Zero);
-                            Thread.Sleep(80);
-                            mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, IntPtr.Zero);
-                            Thread.Sleep(40);
+                            try
+                            {
+                                SetCursorPos(center.X, center.Y);
+                                Thread.Sleep(60);
+                                mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, IntPtr.Zero);
+                                Thread.Sleep(80);
+                                mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, IntPtr.Zero);
+                                Thread.Sleep(40);
+                            }
+                            finally
+                            {
+                                if (rasClipped) ReleaseCursorClip();
+                            }
                         }
                     }
                 }
@@ -2697,12 +2754,12 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <paramref name="overlayToggle"/> ile addin formu click-through yapilir
         /// (mouse wizard'a gecsin). Next-loop'a gore ~5x hizli (600ms vs ~2.5s).
         /// </summary>
-        public static async Task<bool> ClickWizardPreviewTabAsync(IntPtr wizardHwnd, Action<string> log, Action<bool> overlayToggle = null)
+        public static async Task<bool> ClickWizardPreviewTabAsync(IntPtr wizardHwnd, Action<string> log, Action<bool> overlayToggle = null, bool requireObjectFilterPass = false)
         {
-            return await Task.Run(() => ClickWizardPreviewTab(wizardHwnd, log, overlayToggle));
+            return await Task.Run(() => ClickWizardPreviewTab(wizardHwnd, log, overlayToggle, requireObjectFilterPass));
         }
 
-        private static bool ClickWizardPreviewTab(IntPtr wizardHwnd, Action<string> log, Action<bool> overlayToggle = null)
+        private static bool ClickWizardPreviewTab(IntPtr wizardHwnd, Action<string> log, Action<bool> overlayToggle = null, bool requireObjectFilterPass = false)
         {
             if (wizardHwnd == IntPtr.Zero || !IsWindow(wizardHwnd))
             {
@@ -2710,22 +2767,109 @@ namespace EliteSoft.Erwin.AddIn.Services
                 return false;
             }
 
-            // JUMP-to-Preview strategy (2026-05-29). The user's manual flow is:
-            // one Next (Overview -> Option Selection), then a single MOUSE click
-            // on the left-nav "Preview" item, which renders the Preview page and
-            // auto-generates the DDL (ELA -> FEProcessor::GenerateAlterScript ->
-            // bridge GA hook -> DDL buffer) - far faster than walking every page.
+            // The wizard has 6 pages: Overview -> Option Selection -> Summary ->
+            // Owner Override -> Object Filter -> Preview. The Preview page
+            // renders the DDL by triggering ELA -> FEProcessor::GenerateAlterScript
+            // -> the bridge's GA hook -> the DDL capture buffer.
             //
-            // The nav items are NOT in the UIA tree (verified by NAVPROBE dump
-            // 2026-05-29: the only nav element is a single Static container
-            // name='Navigational Pane' aid='1063'; the 6 page labels are
-            // custom-drawn inside it). So there is no element to UIA-Select; the
-            // only way is a mouse-sim at the "Preview" label's PIXEL position,
-            // computed from the live container rect. The wizard stays VISIBLE
-            // (hiding it hung erwin on teardown - see
-            // reference_layered_wizard_compositor_leak), so mouse-sim works.
-            log?.Invoke("  [WPT] Jump strategy: 1x Next then mouse-click the 'Preview' nav item");
+            // TWO strategies, chosen by the caller per the "Only Selected Objects"
+            // checkbox (chkFilterObjects on the addin form):
+            //
+            // 1. JUMP (default, ~1.4s): 1x Next (Overview -> Option Selection),
+            //    then mouse-sim click on the "Preview" left-nav pixel. SKIPS the
+            //    Object Filter page, so the wizard's "Use current diagram
+            //    selections? You have N entity selected" popup NEVER fires - the
+            //    bridge's SetUseDiagramSelection toggle has no effect. Use when
+            //    the user does NOT want diagram-scoped filtering.
+            //
+            // 2. NEXT-LOOP (slower, ~2.5s): post CMD_FE_WIZARD_NEXT 6 times,
+            //    visiting EVERY page including Object Filter. When entities are
+            //    selected on the active diagram + the bridge's
+            //    g_useDiagramSelection flag is YES, the popup fires and the
+            //    bridge (DismissDiagramSelectionPopup) answers Yes -> wizard
+            //    scopes the alter script to the selected entities. Use when the
+            //    user explicitly enabled "Only Selected Objects".
+            //
+            // The jump was the regression that broke "Only Selected Objects" on
+            // the Review / cross-version path (verified by user 2026-05-30); the
+            // Next-loop branch fixes that without giving up the jump's speed on
+            // the common no-filter case.
+            if (requireObjectFilterPass)
+            {
+                log?.Invoke("  [WPT] Next-loop strategy: walking every page so the Object Filter page fires its popup (Only Selected Objects requested)");
+                return WalkNextLoopToPreview(wizardHwnd, log, overlayToggle);
+            }
 
+            log?.Invoke("  [WPT] Jump strategy: 1x Next then mouse-click the 'Preview' nav item (Object Filter skipped - default)");
+            return JumpToPreviewByPixel(wizardHwnd, log, overlayToggle);
+        }
+
+        /// <summary>
+        /// Slower-but-correct fallback that walks every wizard page by posting
+        /// CMD_FE_WIZARD_NEXT until the bridge captures the DDL. Critically it
+        /// VISITS the Object Filter page (page 5), which is where the wizard's
+        /// "Use current diagram selections?" popup fires - the only opportunity
+        /// for the bridge's SetUseDiagramSelection toggle ("Only Selected
+        /// Objects") to take effect.
+        /// </summary>
+        private static bool WalkNextLoopToPreview(IntPtr wizardHwnd, Action<string> log, Action<bool> overlayToggle)
+        {
+            // overlayToggle (production only): make the addin form click-through
+            // so the splash does not block the bridge's popup-dismiss WinEvent
+            // path. Restored in finally even on exception.
+            try { overlayToggle?.Invoke(false); } catch { }
+            try
+            {
+                for (int page = 1; page <= 8; page++)
+                {
+                    Thread.Sleep(500);
+                    string captured = NativeBridgeService.ConsumeLastCapturedDdl();
+                    if (!string.IsNullOrEmpty(captured))
+                    {
+                        log?.Invoke($"  [WPT] DDL captured at page {page} ({captured.Length} chars) - re-stashing for caller");
+                        LastCapturedWizardDdl = captured;
+                        return true;
+                    }
+                    log?.Invoke($"  [WPT] page {page}: posting CMD_FE_WIZARD_NEXT (1766)");
+                    PostMessage(wizardHwnd, WM_COMMAND, MakeWParam(CMD_FE_WIZARD_NEXT, 0), IntPtr.Zero);
+                }
+
+                Thread.Sleep(1500);
+                string finalDdl = NativeBridgeService.ConsumeLastCapturedDdl();
+                if (!string.IsNullOrEmpty(finalDdl))
+                {
+                    log?.Invoke($"  [WPT] DDL captured at end ({finalDdl.Length} chars)");
+                    LastCapturedWizardDdl = finalDdl;
+                    return true;
+                }
+
+                log?.Invoke("  [WPT] Next-loop exhausted without DDL capture");
+                return false;
+            }
+            finally
+            {
+                try { overlayToggle?.Invoke(true); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// Fast path: 1x Next (Overview -> Option Selection) then mouse-sim
+        /// click on the computed "Preview" left-nav pixel. ~1.4s end-to-end.
+        /// Skips the Object Filter page so the bridge's SetUseDiagramSelection
+        /// toggle has no effect on this run - callers wanting "Only Selected
+        /// Objects" must route through WalkNextLoopToPreview instead.
+        ///
+        /// The nav items are NOT in the UIA tree (verified by NAVPROBE dump
+        /// 2026-05-29: the only nav element is a single Static container
+        /// name='Navigational Pane' aid='1063'; the 6 page labels are
+        /// custom-drawn inside it). So there is no element to UIA-Select; the
+        /// only way is a mouse-sim at the "Preview" label's PIXEL position,
+        /// computed from the live container rect. The wizard stays VISIBLE
+        /// (hiding it hung erwin on teardown - see
+        /// reference_layered_wizard_compositor_leak), so mouse-sim works.
+        /// </summary>
+        private static bool JumpToPreviewByPixel(IntPtr wizardHwnd, Action<string> log, Action<bool> overlayToggle)
+        {
             // Step 1: Overview -> Option Selection (matches the user's flow; some
             // wizards only enable later nav items once a prior page is visited).
             PostMessage(wizardHwnd, WM_COMMAND, MakeWParam(CMD_FE_WIZARD_NEXT, 0), IntPtr.Zero);
@@ -3101,6 +3245,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                     return;
                 }
                 bool landedOk = false;
+                // Pin the cursor to a 5x5 box around the target so user mouse
+                // movement during the Sleep(40)+down+sleep+up window cannot
+                // displace it (which would trip the strict landedOk check and
+                // ABORT before the uncheck, leaving v1 unsaved-but-still-
+                // checked - i.e. needing manual handling). User-reported
+                // failure 2026-05-30: (749,202) != (2656,509) ABORT.
+                bool smClipped = ClipCursorAround(clickX, clickY);
                 try
                 {
                     ShowCursor(false);
@@ -3119,7 +3270,11 @@ namespace EliteSoft.Erwin.AddIn.Services
                         mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, IntPtr.Zero);
                     }
                 }
-                finally { try { SetCursorPos(savedCur.X, savedCur.Y); ShowCursor(true); } catch { } }
+                finally
+                {
+                    if (smClipped) ReleaseCursorClip();
+                    try { SetCursorPos(savedCur.X, savedCur.Y); ShowCursor(true); } catch { }
+                }
                 if (!landedOk) return;   // never click OK if the uncheck click did not land
 
                 // (3) Click OK to commit the don't-save via a TARGETED UIA
@@ -4146,6 +4301,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                 return false;
             }
 
+            // 150ms of vulnerable sleeps below (30+40+80) - confine cursor to
+            // a 5x5 box around the listview subitem so user mouse movement
+            // cannot redirect the click (user-reported failure 2026-05-30).
+            bool clipped = ClipCursorAround(pt.X, pt.Y);
             try
             {
                 SetCursorPos(pt.X, pt.Y);
@@ -4157,6 +4316,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
             finally
             {
+                if (clipped) ReleaseCursorClip();
                 SetCursorPos(saved.X, saved.Y);
             }
             log?.Invoke("    mouse_event LEFTDOWN/UP fired, cursor restored");
