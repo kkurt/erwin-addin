@@ -1366,7 +1366,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// Column-Editor-open transition for the parent entity (Glossary-style
         /// scoped check on the table currently in focus).
         /// </summary>
-        internal void ValidateNamingStandard(string objectType, string physicalName, dynamic scapiObject = null, bool isNew = false, IDictionary<string, string> baselineOverride = null)
+        internal void ValidateNamingStandard(string objectType, string physicalName, dynamic scapiObject = null, bool isNew = false, IDictionary<string, string> baselineOverride = null, bool creationGesture = false)
         {
             if (!NamingStandardService.Instance.IsLoaded) return;
 
@@ -1420,7 +1420,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             // Step 1: silently apply AUTO_APPLY=true rules
             if (scapiBoxed != null)
             {
-                string afterAuto = NamingValidationEngine.ApplyNamingStandards(objectType, physicalName, scapiBoxed, autoOnly: true, isNew: isNew);
+                string afterAuto = NamingValidationEngine.ApplyNamingStandards(objectType, physicalName, scapiBoxed, autoOnly: true, isNew: isNew, creationGesture: creationGesture);
                 if (!string.Equals(afterAuto, physicalName, StringComparison.Ordinal))
                 {
                     int transId = _session.BeginNamedTransaction("ApplyAutoNamingStandard");
@@ -1459,7 +1459,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             // Step 2: ask user about AUTO_APPLY=false rules that would still change the name
             if (scapiBoxed != null)
             {
-                string afterAll = NamingValidationEngine.ApplyNamingStandards(objectType, physicalName, scapiBoxed, autoOnly: false, isNew: isNew);
+                string afterAll = NamingValidationEngine.ApplyNamingStandards(objectType, physicalName, scapiBoxed, autoOnly: false, isNew: isNew, creationGesture: creationGesture);
                 if (!string.Equals(afterAll, physicalName, StringComparison.Ordinal))
                 {
                     var answer = AddinMessageDialog.Show(
@@ -1508,7 +1508,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 catch { }
             }
 
-            var results = NamingValidationEngine.ValidateObjectName(objectType, nameToValidate, scapiBoxed, isNew: isNew);
+            var results = NamingValidationEngine.ValidateObjectName(objectType, nameToValidate, scapiBoxed, isNew: isNew, creationGesture: creationGesture);
             var failures = results.Where(r => !r.IsValid).ToList();
 
             // Step 3b (2026-05-16): the admin can author rules on any
@@ -1556,7 +1556,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // by surfacing the live value the engine sees.
                     Log($"NamingValidate: '{objectType}.{propertyCode}' on '{physicalName}' liveValue='{propValue}' isNew={isNew}");
                     var extraResults = NamingValidationEngine.ValidateObjectName(
-                        objectType, propValue, scapiBoxed, propertyCode, isNew: isNew);
+                        objectType, propValue, scapiBoxed, propertyCode, isNew: isNew, creationGesture: creationGesture);
                     failures.AddRange(extraResults.Where(r => !r.IsValid));
                 }
             }
@@ -1839,7 +1839,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                             catch { liveValue = currentTyped; }
 
                             var freshResults = NamingValidationEngine.ValidateObjectName(
-                                objectType, liveValue, scapiBoxed, rf.Rule.PropertyCode, isNew: isNew);
+                                objectType, liveValue, scapiBoxed, rf.Rule.PropertyCode, isNew: isNew, creationGesture: creationGesture);
                             var freshFailure = freshResults?.FirstOrDefault(r => !r.IsValid);
                             if (freshFailure == null)
                             {

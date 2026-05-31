@@ -552,6 +552,129 @@ public class NamingStandardEngineTests
         finally { NamingStandardService.Instance.SeedForTesting(System.Array.Empty<NamingStandardRule>()); }
     }
 
+    // ============================================================
+    // creationGesture override (2026-05-31). Placeholder-commit
+    // gesture batches Create + Update rules into one engine pass /
+    // single modal so the (Vp prefix) + (_PRM suffix) chain that
+    // user hit on TableClass=Parametre / =History no longer shows
+    // two consecutive popups. The flag is orthogonal to isNew - it
+    // never overrides isNew's role in IsRequired emptiness checks
+    // or in baseline lookup; it only widens the ApplyOn gate.
+    // ============================================================
+
+    [Theory]
+    // (applyOn,        isNew, creationGesture, expectedMatch)
+    [InlineData(RuleApplyOn.Create, true,  false, true)]
+    [InlineData(RuleApplyOn.Create, true,  true,  true)]
+    [InlineData(RuleApplyOn.Create, false, false, false)]
+    [InlineData(RuleApplyOn.Create, false, true,  true)]   // widened by cg
+    [InlineData(RuleApplyOn.Update, true,  false, false)]
+    [InlineData(RuleApplyOn.Update, true,  true,  true)]   // widened by cg (THE FIX)
+    [InlineData(RuleApplyOn.Update, false, false, true)]
+    [InlineData(RuleApplyOn.Update, false, true,  true)]
+    [InlineData(RuleApplyOn.Both,   true,  false, true)]
+    [InlineData(RuleApplyOn.Both,   true,  true,  true)]
+    [InlineData(RuleApplyOn.Both,   false, false, true)]
+    [InlineData(RuleApplyOn.Both,   false, true,  true)]
+    public void MatchesApplyOn_creationGesture_truth_table(RuleApplyOn applyOn, bool isNew, bool creationGesture, bool expected)
+    {
+        var rule = Rule(NamingRuleKind.Prefix, prefix: "X", applyOn: applyOn);
+        NamingValidationEngine.MatchesApplyOn(rule, isNew, creationGesture).Should().Be(expected);
+    }
+
+    [Fact]
+    public void ApplyNamingStandards_creationGesture_merges_Create_Prefix_and_Update_Suffix_in_one_pass()
+    {
+        // THE LIVE BUG REGRESSION SEED:
+        // rule#17 analogue: unconditional Vp prefix, ApplyOn=Create
+        // rule#22 analogue: _PRM suffix, ApplyOn=Update
+        // Without creationGesture the engine fires them in DIFFERENT
+        // passes (Create wants isNew=true, Update wants isNew=false)
+        // -> two modals. With creationGesture=true both gates open
+        // simultaneously on a single isNew=true call -> one modal,
+        // final name 'Save_Tmp_2_PRM' becomes 'VpSave_Tmp_2_PRM' in
+        // ONE engine pass.
+        NamingStandardService.Instance.SeedForTesting(new[]
+        {
+            Rule(NamingRuleKind.Prefix, prefix: "Vp", autoApply: true,
+                 applyOn: RuleApplyOn.Create),
+            Rule(NamingRuleKind.Suffix, suffix: "_PRM", autoApply: true,
+                 applyOn: RuleApplyOn.Update),
+        });
+        try
+        {
+            var applied = NamingValidationEngine.ApplyNamingStandards(
+                "Table", "Save_Tmp_2", scapiObject: null, autoOnly: true,
+                propertyCode: "Physical_Name", isNew: true, creationGesture: true);
+            applied.Should().Be("VpSave_Tmp_2_PRM");
+        }
+        finally { NamingStandardService.Instance.SeedForTesting(System.Array.Empty<NamingStandardRule>()); }
+    }
+
+    [Fact]
+    public void ApplyNamingStandards_creationGesture_false_preserves_Update_skip_on_isNew_true()
+    {
+        // Regression guard for existing behaviour: when caller does
+        // NOT pass creationGesture (Column Editor open, drift,
+        // FinalValidateClosedTable, post-rename non-pending check),
+        // an ApplyOn=Update rule MUST stay filtered on isNew=true.
+        // The user wants Update rules to be Update-only outside the
+        // placeholder-commit window.
+        NamingStandardService.Instance.SeedForTesting(new[]
+        {
+            Rule(NamingRuleKind.Prefix, prefix: "Vp", autoApply: true,
+                 applyOn: RuleApplyOn.Create),
+            Rule(NamingRuleKind.Suffix, suffix: "_PRM", autoApply: true,
+                 applyOn: RuleApplyOn.Update),
+        });
+        try
+        {
+            var applied = NamingValidationEngine.ApplyNamingStandards(
+                "Table", "Save_Tmp_2", scapiObject: null, autoOnly: true,
+                propertyCode: "Physical_Name", isNew: true, creationGesture: false);
+            applied.Should().Be("VpSave_Tmp_2"); // _PRM filtered out
+        }
+        finally { NamingStandardService.Instance.SeedForTesting(System.Array.Empty<NamingStandardRule>()); }
+    }
+
+    [Fact]
+    public void ApplyNamingStandards_creationGesture_idempotent_when_decoration_already_present()
+    {
+        // After the first creation-gesture pass applies _PRM and Vp,
+        // a subsequent post-rename re-check (whether creationGesture
+        // true or false) MUST NOT double-decorate. The two-pass
+        // strip-then-apply design at NamingValidationEngine.cs:171+
+        // handles this; this test locks the contract so future
+        // changes to that pipeline cannot regress the bugfix.
+        NamingStandardService.Instance.SeedForTesting(new[]
+        {
+            Rule(NamingRuleKind.Prefix, prefix: "Vp", autoApply: true,
+                 applyOn: RuleApplyOn.Create),
+            Rule(NamingRuleKind.Suffix, suffix: "_PRM", autoApply: true,
+                 applyOn: RuleApplyOn.Update),
+        });
+        try
+        {
+            // First pass produces the decorated name.
+            string first = NamingValidationEngine.ApplyNamingStandards(
+                "Table", "Save_Tmp_2", null, autoOnly: true,
+                propertyCode: "Physical_Name", isNew: true, creationGesture: true);
+            first.Should().Be("VpSave_Tmp_2_PRM");
+
+            // Same input on the second pass with creationGesture=true.
+            NamingValidationEngine.ApplyNamingStandards(
+                "Table", first, null, autoOnly: true,
+                propertyCode: "Physical_Name", isNew: true, creationGesture: true).Should().Be("VpSave_Tmp_2_PRM");
+
+            // Second pass with creationGesture=false (e.g. post-rename
+            // deferred check fired outside the creation window).
+            NamingValidationEngine.ApplyNamingStandards(
+                "Table", first, null, autoOnly: true,
+                propertyCode: "Physical_Name", isNew: false, creationGesture: false).Should().Be("VpSave_Tmp_2_PRM");
+        }
+        finally { NamingStandardService.Instance.SeedForTesting(System.Array.Empty<NamingStandardRule>()); }
+    }
+
     [Fact]
     public void ApplyNamingStandards_idempotent_does_not_double_apply_prefix()
     {
