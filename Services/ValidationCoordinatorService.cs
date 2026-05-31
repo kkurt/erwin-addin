@@ -427,6 +427,58 @@ namespace EliteSoft.Erwin.AddIn.Services
         public void SetTableTypeMonitor(TableTypeMonitorService monitor)
         {
             _tableTypeMonitor = monitor;
+            // Inject the creation-gesture probe so the monitor's direct
+            // ValidateNamingStandard re-runs (Required-input loop +
+            // OnNewEntityDetected pipeline) can honour the same
+            // placeholder-commit override that RunScopedTableNamingCheck
+            // does. Without this the Update-only rules (rule#22 _PRM)
+            // would fire on the post-Required-prompt re-run because the
+            // monitor sees isNew=false there. Verified 2026-06-01.
+            if (monitor != null)
+                monitor.CreationGestureProbe = IsEntityInCreationGesture;
+        }
+
+        /// <summary>
+        /// True when an entity with the given <paramref name="tableName"/>
+        /// is currently inside a placeholder-commit gesture (its ObjectId
+        /// is in <see cref="_creationGestureEntityIds"/>). Cheap when the
+        /// bridge set is empty (one Count read). When the bridge has
+        /// entries, walks the entity collection once to resolve
+        /// name -> id and returns true on the first match. Returns false
+        /// on any error so the gate stays strict outside the gesture.
+        /// </summary>
+        internal bool IsEntityInCreationGesture(string tableName)
+        {
+            if (string.IsNullOrEmpty(tableName)) return false;
+            if (_creationGestureEntityIds.Count == 0) return false;
+            if (_session == null || _sessionLost) return false;
+
+            dynamic mmObj = null, mmRoot = null, mmEntities = null;
+            try
+            {
+                mmObj = _session.ModelObjects;
+                mmRoot = mmObj?.Root;
+                if (mmRoot == null) return false;
+                mmEntities = mmObj.Collect(mmRoot, "Entity");
+                if (mmEntities == null) return false;
+                foreach (dynamic e in mmEntities)
+                {
+                    if (e == null) continue;
+                    string nm = null;
+                    try { nm = GetTableName(e); } catch { continue; }
+                    if (!EntityNameMatchesTitle(nm, tableName)) continue;
+                    string eid = null;
+                    try { eid = e.ObjectId?.ToString(); } catch { break; }
+                    return !string.IsNullOrEmpty(eid) && _creationGestureEntityIds.Contains(eid);
+                }
+                return false;
+            }
+            catch (Exception ex) { Log($"IsEntityInCreationGesture: probe threw {ex.GetType().Name}: {ex.Message}"); return false; }
+            finally
+            {
+                ReleaseCom(mmEntities);
+                ReleaseCom(mmRoot);
+            }
         }
 
         public void SetUdpRuntimeService(UdpRuntimeService service)
@@ -3279,60 +3331,15 @@ namespace EliteSoft.Erwin.AddIn.Services
             if (_tableTypeMonitor == null) return;
             if (!NamingStandardService.Instance.IsLoaded) return;
 
-            // Creation-gesture bridge (2026-06-01): every caller path
-            // (defer flush from PromptForMissingRequiredUdps modal pump,
-            // direct DiagramHeartbeatTick post-rename re-check,
-            // ScanForRenamesEventDriven inline-edit-close, etc.) must
-            // see isNew=true while the entity is still inside its
-            // placeholder-commit gesture. Earlier attempts wired the
-            // override into specific callers (ScanForRenamesEventDriven)
-            // but missed others (the deferred re-check after
-            // FlushPendingTableNamingChecks auto-renames the entity).
-            // Centralising the override here covers every caller in one
-            // place: if isNew is already true we keep it; if the bridge
-            // set is empty (the common case) the cost is one Count read;
-            // otherwise we walk the entity collection once and override
-            // when the queued name resolves to an entityId still inside
-            // the creation gesture. Verified 2026-06-01 against the
-            // TableClass=History run where the flush-fired check landed
-            // with isNew=false because the heartbeat enqueued it that
-            // way, so the Vp Create-only prefix never evaluated.
-            if (!isNew && _creationGestureEntityIds.Count > 0 && _session != null && !_sessionLost)
+            // Creation-gesture bridge (2026-06-01): see
+            // IsEntityInCreationGesture XML doc. Centralised so the
+            // direct ValidateNamingStandard caller (Required-input
+            // re-run loop inside TableTypeMonitorService) can use the
+            // same probe via the injected delegate.
+            if (!isNew && IsEntityInCreationGesture(tableName))
             {
-                dynamic mmObj = null, mmRoot = null, mmEntities = null;
-                try
-                {
-                    mmObj = _session.ModelObjects;
-                    mmRoot = mmObj?.Root;
-                    if (mmRoot != null)
-                    {
-                        mmEntities = mmObj.Collect(mmRoot, "Entity");
-                        if (mmEntities != null)
-                        {
-                            foreach (dynamic e in mmEntities)
-                            {
-                                if (e == null) continue;
-                                string nm = null;
-                                try { nm = GetTableName(e); } catch { continue; }
-                                if (!EntityNameMatchesTitle(nm, tableName)) continue;
-                                string eid = null;
-                                try { eid = e.ObjectId?.ToString(); } catch { break; }
-                                if (!string.IsNullOrEmpty(eid) && _creationGestureEntityIds.Contains(eid))
-                                {
-                                    Log($"RunScopedTableNamingCheck: '{tableName}' (entityId={eid}) is in active creation gesture - overriding isNew=False to True so Create-only rules evaluate");
-                                    isNew = true;
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-                catch (Exception ex) { Log($"RunScopedTableNamingCheck: creation-gesture bridge probe threw {ex.GetType().Name}: {ex.Message}"); }
-                finally
-                {
-                    ReleaseCom(mmEntities);
-                    ReleaseCom(mmRoot);
-                }
+                Log($"RunScopedTableNamingCheck: '{tableName}' is in active creation gesture - overriding isNew=False to True so Create-only rules evaluate");
+                isNew = true;
             }
             // Reentrancy guard. The downstream ValidateNamingStandard opens
             // a modal dialog whose pump fires our WindowMonitorTimer again -

@@ -16,6 +16,23 @@ namespace EliteSoft.Erwin.AddIn.Services
         private bool _isMonitoring;
         private bool _disposed;
 
+        /// <summary>
+        /// Optional probe injected by ValidationCoordinatorService.SetTableTypeMonitor
+        /// that returns true when the named entity is currently inside a
+        /// placeholder-commit gesture. Used by ValidateNamingStandard
+        /// (and any direct caller path that bypasses
+        /// RunScopedTableNamingCheck) to override isNew=false to true so
+        /// Update-only rules stay filtered during the creation flow.
+        /// Verified necessary 2026-06-01: the Required-input re-run loop
+        /// inside ValidateNamingStandard fires after the Required field
+        /// dialog closes, with isNew=false, which made rule#22 _PRM
+        /// (Update + Parametre) apply on a brand-new entity contrary to
+        /// user rule. Null-safe: if the coordinator never injected the
+        /// probe (test code, early bootstrap) ValidateNamingStandard
+        /// keeps the caller's isNew unchanged.
+        /// </summary>
+        internal Func<string, bool> CreationGestureProbe { get; set; }
+
         // Snapshot of entity state: ObjectId -> EntitySnapshot
         private Dictionary<string, EntitySnapshot> _entitySnapshots;
         /// <summary>
@@ -1369,6 +1386,26 @@ namespace EliteSoft.Erwin.AddIn.Services
         internal void ValidateNamingStandard(string objectType, string physicalName, dynamic scapiObject = null, bool isNew = false, IDictionary<string, string> baselineOverride = null)
         {
             if (!NamingStandardService.Instance.IsLoaded) return;
+
+            // Creation-gesture override (2026-06-01): see
+            // CreationGestureProbe XML doc. The Required-input re-run
+            // loop further down this method calls into the engine with
+            // the caller's original isNew, so by overriding once here
+            // every subsequent ApplyNamingStandards / ValidateObjectName
+            // call (Steps 1, 2, 3, 3b, and the inner fresh re-eval at
+            // line 1841) sees the corrected flag.
+            if (!isNew && CreationGestureProbe != null)
+            {
+                try
+                {
+                    if (CreationGestureProbe(physicalName))
+                    {
+                        Log($"ValidateNamingStandard: '{physicalName}' is in active creation gesture - overriding isNew=False to True so Update-only rules stay filtered (e.g. rule#22 _PRM on TableClass=Parametre)");
+                        isNew = true;
+                    }
+                }
+                catch (Exception ex) { Log($"ValidateNamingStandard: CreationGestureProbe threw {ex.GetType().Name}: {ex.Message} - keeping caller isNew={isNew}"); }
+            }
 
             // Capture baseline state at method entry. Step 1 auto-apply may
             // mutate the snapshot mid-method, but a Required-popup Cancel
