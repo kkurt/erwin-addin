@@ -152,6 +152,8 @@ namespace EliteSoft.Erwin.AddIn.Services
         [DllImport("user32.dll")]
         private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
         [DllImport("user32.dll")]
+        private static extern IntPtr GetDlgItem(IntPtr hDlg, int nIDDlgItem);
+        [DllImport("user32.dll")]
         private static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
         private const uint GW_CHILD = 5;
         private const uint GW_HWNDNEXT = 2;
@@ -1137,43 +1139,51 @@ namespace EliteSoft.Erwin.AddIn.Services
                 PostMessage(ccWizard, WM_COMMAND, MakeWParam(CC_NEXT, 0), IntPtr.Zero); Thread.Sleep(300);
                 log?.Invoke($"  [DB-2] at Right Model page, title='{GetTitle(ccWizard)}'");
 
-                // Step 3: select RE'd model from "Open Models in Memory"
-                // DataGrid (id=1083). UIA-based: find DataItem by Name match.
-                var ccRoot = AutomationElement.FromHandle(ccWizard);
-                if (ccRoot == null)
+                // Step 3: select the RE'd model in the "Open Models in Memory"
+                // list (control id=1083) via PURE WIN32 (no UI Automation). That
+                // list is a standard SysListView32 hosted inside the XTP wizard;
+                // the old UIA path (FromHandle + FindFirst DataItem +
+                // SelectionItemPattern) wrapped its items as oleacc / IAccessible
+                // RCWs that, abandoned to GC, crashed erwin's finalizer at teardown
+                // (full dump erwin.exe.50160.dmp = oleacc!AccWrap_Base::Release AV;
+                // UIA elements are cached so the GC drain cannot release them - they
+                // MUST be eliminated, not drained). Find the list by id, locate the
+                // row whose text == reModelName, then select it via LVM_SETITEMSTATE
+                // + a synthesized NM_CLICK - the exact Win32 technique Apply-to-Right
+                // already uses on the RD listview (FindListViewById +
+                // SendSynthesizedNmClick).
+                IntPtr openList = FindListViewById(ccWizard, 1083, log: null);
+                if (openList == IntPtr.Zero)
                 {
-                    log?.Invoke("  [DB-3] UIA FromHandle returned null on CC wizard");
+                    IntPtr probe = FindDescendantById(ccWizard, 1083);
+                    var pcls = new StringBuilder(64);
+                    if (probe != IntPtr.Zero) GetClassName(probe, pcls, pcls.Capacity);
+                    log?.Invoke($"  [DB-3] 'Open Models in Memory' SysListView32 (id=1083) not found via Win32 (probe id=1083 hwnd=0x{probe.ToInt64():X} class='{pcls}')");
                     return session;
                 }
-                var listCond = new AndCondition(
-                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.DataGrid),
-                    new PropertyCondition(AutomationElement.AutomationIdProperty, "1083"));
-                var openModelsList = ccRoot.FindFirst(TreeScope.Descendants, listCond);
-                if (openModelsList == null)
+                int reRow = -1;
+                int rowTotal = SendMessage(openList, LVM_GETITEMCOUNT, IntPtr.Zero, IntPtr.Zero).ToInt32();
+                for (int i = 0; i < rowTotal && reRow < 0; i++)
                 {
-                    log?.Invoke("  [DB-3] 'Open Models in Memory' DataGrid (id=1083) not found");
+                    // Model name may be in col 0 or a later column depending on the
+                    // grid layout; scan the first few subitems for an exact match.
+                    for (int s = 0; s <= 3; s++)
+                    {
+                        string cell = GetListViewItemText(openList, i, s)?.Trim();
+                        if (!string.IsNullOrEmpty(cell)
+                            && string.Equals(cell, reModelName, StringComparison.OrdinalIgnoreCase))
+                        { reRow = i; break; }
+                    }
+                }
+                if (reRow < 0)
+                {
+                    log?.Invoke($"  [DB-3] row name='{reModelName}' not found in Open Models list ({rowTotal} rows) - Win32 scan");
                     return session;
                 }
-                var itemCond = new AndCondition(
-                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.DataItem),
-                    new PropertyCondition(AutomationElement.NameProperty, reModelName));
-                var item = openModelsList.FindFirst(TreeScope.Descendants, itemCond);
-                if (item == null)
-                {
-                    log?.Invoke($"  [DB-3] DataItem name='{reModelName}' not found in Open Models list");
-                    return session;
-                }
-                if (item.TryGetCurrentPattern(SelectionItemPattern.Pattern, out object sip))
-                {
-                    try { ((SelectionItemPattern)sip).Select(); }
-                    catch (Exception ex) { log?.Invoke($"  [DB-3] Select err: {ex.Message}"); }
-                    log?.Invoke($"  [DB-3] selected '{reModelName}' in Open Models list");
-                }
-                else
-                {
-                    log?.Invoke($"  [DB-3] DataItem '{reModelName}' has no SelectionItemPattern");
-                    return session;
-                }
+                var lvi = new LVITEM { stateMask = LVIS_SELECTED | LVIS_FOCUSED, state = LVIS_SELECTED | LVIS_FOCUSED };
+                SendMessageLVItem(openList, LVM_SETITEMSTATE, new IntPtr(reRow), ref lvi);
+                SendSynthesizedNmClick(ccWizard, openList, 1083, reRow, 0, log);
+                log?.Invoke($"  [DB-3] selected '{reModelName}' (row {reRow} of {rowTotal}) in Open Models list via Win32 (LVM_SETITEMSTATE + NM_CLICK). NO UIA.");
                 Thread.Sleep(150);
 
                 // Step 5 (no step 4 - we don't load from external source): Compare
@@ -2877,16 +2887,35 @@ namespace EliteSoft.Erwin.AddIn.Services
 
             // Step 2: read the live "Navigational Pane" rect (handles wherever
             // the wizard opened) and compute the "Preview" label position.
+            // 2026-06-02: read the Navigational Pane (control id=1063) rect via
+            // PURE WIN32 (GetDlgItem / EnumChildWindows + GetWindowRect) instead of
+            // UIA AutomationElement.FromHandle + FindFirst. The UIA path created an
+            // oleacc AccWrap / IAccessible RCW for the Static pane that, abandoned
+            // to GC, crashed erwin's finalizer at teardown (full dump
+            // erwin.exe.34340.dmp = oleacc!AccWrap_Base::Release AV; UIA elements
+            // are cached so the GC drain cannot release them - they MUST be
+            // eliminated, not drained). GetWindowRect returns the same screen-px
+            // rect the UIA BoundingRectangle did, so the calibrated click below is
+            // unchanged.
             System.Windows.Rect pane = default;
             bool gotPane = false;
             try
             {
-                var root = AutomationElement.FromHandle(wizardHwnd);
-                var navEl = root?.FindFirst(TreeScope.Descendants,
-                    new PropertyCondition(AutomationElement.AutomationIdProperty, "1063"));
-                if (navEl != null) { pane = navEl.Current.BoundingRectangle; gotPane = true; }
+                IntPtr paneHwnd = GetDlgItem(wizardHwnd, 1063);
+                if (paneHwnd == IntPtr.Zero) paneHwnd = FindDescendantById(wizardHwnd, 1063);
+                if (paneHwnd != IntPtr.Zero && GetWindowRect(paneHwnd, out RECT pr)
+                    && (pr.right - pr.left) > 10 && (pr.bottom - pr.top) > 10)
+                {
+                    pane = new System.Windows.Rect(pr.left, pr.top, pr.right - pr.left, pr.bottom - pr.top);
+                    gotPane = true;
+                    log?.Invoke($"  [WPT] nav pane (id=1063) rect via Win32: ({pr.left},{pr.top},{pr.right},{pr.bottom})");
+                }
+                else
+                {
+                    log?.Invoke($"  [WPT] nav pane (id=1063) not found via Win32 (paneHwnd=0x{paneHwnd.ToInt64():X})");
+                }
             }
-            catch (Exception ex) { log?.Invoke($"  [WPT] nav-pane read err: {ex.Message}"); }
+            catch (Exception ex) { log?.Invoke($"  [WPT] nav-pane Win32 read err: {ex.Message}"); }
 
             if (!gotPane || pane.Width < 10 || pane.Height < 10)
             {
@@ -3147,6 +3176,103 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// (toolbar 3rd button = Set All to Close + OK). The model opens
         /// "Unlocked", so there is a single (save) checkbox - no lock column.
         /// </summary>
+        /// <summary>
+        /// Pure-Win32 (NO UI Automation) dismissal of the From-DB "Save Models"
+        /// dialog. The UIA-based CloseSaveModelsWithoutSaving creates XTP
+        /// IAccessible RCWs (full dump erwin.exe.48868.dmp = ToolkitPro
+        /// CXTPAccessible / Accessibility.IAccessible) that, abandoned to GC,
+        /// crash erwin's finalizer at teardown. This variant avoids UIA entirely,
+        /// using facts learned from a [RECON-CMD] WndProc capture of a real user
+        /// click: the dialog's grid is child control id=2050, the OK button is
+        /// id=1, and OK fires as WM_COMMAND(MAKEWPARAM(1,0), lParam=okButtonHWND)
+        /// - the lParam=button-HWND is MANDATORY (the XTP handler ignored the old
+        /// WM_COMMAND IDOK with lParam=0, which is why that attempt failed). The
+        /// save checkbox has no UIA-readable / Win32-readable state, so we mouse-
+        /// sim a click on column-0 of the first data row at a coord derived from
+        /// the grid's OWN window rect + offsets calibrated from the captured UIA
+        /// coord (checkbox col center grid.Left+12, first row center grid.Top+31;
+        /// from UIA click 2619,466 vs header rect 2607,435). Keeps the SAME
+        /// WindowFromPoint + landed-OK safety as the UIA version: if the click
+        /// cannot be confirmed on the dialog it ABORTS WITHOUT clicking OK
+        /// (returns false) so a mis-derived coord can NEVER trigger a spurious
+        /// save - the caller then leaves the dialog for manual handling. Returns
+        /// true if it unchecked + posted OK, false if it safely aborted.
+        /// </summary>
+        private static bool CloseSaveModelsWin32(IntPtr dlg, Action<string> log)
+        {
+            try
+            {
+                IntPtr grid  = GetDlgItem(dlg, 2050);   // XTP report grid (from RECON capture)
+                IntPtr okBtn = GetDlgItem(dlg, 1);      // OK button (IDOK)
+                if (grid == IntPtr.Zero || okBtn == IntPtr.Zero)
+                {
+                    log?.Invoke($"  [SM-WIN32] grid(2050)=0x{grid.ToInt64():X} ok(1)=0x{okBtn.ToInt64():X} - one missing, ABORT (leave for manual).");
+                    return false;
+                }
+                if (!GetWindowRect(grid, out RECT gr))
+                {
+                    log?.Invoke("  [SM-WIN32] GetWindowRect(grid) failed - ABORT (leave for manual).");
+                    return false;
+                }
+                int clickX = gr.left + 12;   // checkbox column-0 center (calibrated)
+                int clickY = gr.top + 31;    // first data row center (calibrated)
+                log?.Invoke($"  [SM-WIN32] grid rect=({gr.left},{gr.top},{gr.right},{gr.bottom}) -> checkbox click=({clickX},{clickY}); okBtn=0x{okBtn.ToInt64():X}");
+
+                ForceForeground(dlg);
+                Thread.Sleep(250);
+
+                // Same safety as the UIA path: the click point MUST resolve to the
+                // Save Models dialog; if something covers it, ABORT before clicking
+                // OK (never risk a save). NOTE this confirms "on the dialog", not
+                // "on the checkbox cell" specifically - so the landed-OK check + the
+                // ABORT-on-no-land below are the real guards against a stray save.
+                IntPtr atPoint = WindowFromPoint(new POINT { X = clickX, Y = clickY });
+                IntPtr atRoot = GetAncestor(atPoint, GA_ROOT);
+                if (atRoot != dlg && atPoint != dlg)
+                {
+                    log?.Invoke($"  [SM-WIN32] click point covered by another window (atRoot=0x{atRoot.ToInt64():X} dlg=0x{dlg.ToInt64():X}) - ABORT (leave for manual).");
+                    return false;
+                }
+
+                if (!GetCursorPos(out POINT savedCur)) { log?.Invoke("  [SM-WIN32] GetCursorPos failed - ABORT."); return false; }
+                bool landedOk = false;
+                bool clipped = ClipCursorAround(clickX, clickY);
+                try
+                {
+                    ShowCursor(false);
+                    SetCursorPos(clickX, clickY);
+                    Thread.Sleep(40);
+                    GetCursorPos(out POINT landed);
+                    landedOk = Math.Abs(landed.X - clickX) <= 3 && Math.Abs(landed.Y - clickY) <= 3;
+                    if (landedOk)
+                    {
+                        mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, IntPtr.Zero);
+                        Thread.Sleep(40);
+                        mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, IntPtr.Zero);
+                    }
+                }
+                finally
+                {
+                    if (clipped) ReleaseCursorClip();
+                    try { SetCursorPos(savedCur.X, savedCur.Y); ShowCursor(true); } catch { }
+                }
+                if (!landedOk)
+                {
+                    log?.Invoke("  [SM-WIN32] cursor did not land on target - ABORT, NOT clicking OK (avoid spurious save). Leave for manual.");
+                    return false;
+                }
+
+                // OK via the captured WM_COMMAND form. lParam MUST be the OK button
+                // HWND - the XTP dialog ignores WM_COMMAND IDOK with lParam=0.
+                Thread.Sleep(300);
+                PostMessage(dlg, WM_COMMAND, MakeWParam(IDOK, 0), okBtn);
+                log?.Invoke("  [SM-WIN32] OK posted (WM_COMMAND IDOK, lParam=okBtn) - save unchecked, model discarded. NO UIA used.");
+                Thread.Sleep(500);
+                return true;
+            }
+            catch (Exception ex) { log?.Invoke($"  [SM-WIN32] threw: {ex.Message} - ABORT (leave for manual)."); return false; }
+        }
+
         private static void CloseSaveModelsWithoutSaving(IntPtr dlg, Action<string> log)
         {
             try
@@ -3487,7 +3613,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// Session-lost cascade - see reference_cross_version_orphan_unsolved).
         /// Run via Task.Run (it blocks on Thread.Sleep + the dismiss watcher).
         /// </summary>
-        public static void CloseReModelMdiChild(string reModelName, Action<string> log)
+        public static void CloseReModelMdiChild(string reModelName, Action<string> log, bool leaveSaveDialogForUser = false, bool win32AutoDismiss = false)
         {
             IntPtr main = FindErwinMain();
             if (main == IntPtr.Zero) { log?.Invoke("  [DB-CLOSE] erwin main not found"); return; }
@@ -3522,9 +3648,35 @@ namespace EliteSoft.Erwin.AddIn.Services
             if (sm == IntPtr.Zero) sm = WaitForDialog("Save Model", 1000);
             if (sm != IntPtr.Zero)
             {
-                log?.Invoke($"  [DB-CLOSE] 'Save Models' dialog up 0x{sm.ToInt64():X} - closing without saving (uncheck + OK)");
-                CloseSaveModelsWithoutSaving(sm, log);
-                Thread.Sleep(500);
+                if (win32AutoDismiss)
+                {
+                    // 2026-06-02: dismiss the dialog with PURE WIN32 (no UI
+                    // Automation) - see CloseSaveModelsWin32. This is what
+                    // re-enables full auto-close without the UIA/IAccessible
+                    // finalizer crash. If the Win32 path safely aborts (e.g. the
+                    // calibrated checkbox coord cannot be confirmed on the dialog),
+                    // it returns false and we LEAVE the dialog for the user - never
+                    // risking a spurious save.
+                    log?.Invoke($"  [DB-CLOSE] 'Save Models' dialog up 0x{sm.ToInt64():X} - dismissing via pure Win32 (no UIA).");
+                    bool win32ok = CloseSaveModelsWin32(sm, log);
+                    if (!win32ok)
+                        log?.Invoke("  [DB-CLOSE] Win32 dismiss aborted safely - 'Save Models' dialog LEFT for the user to dismiss (choose Don't Save).");
+                    Thread.Sleep(500);
+                }
+                else if (leaveSaveDialogForUser)
+                {
+                    // Fallback: WM_CLOSE is sent but the dialog is LEFT for the
+                    // user to dismiss manually (a plain user click goes through
+                    // erwin's own UI - no .NET UIA, no abandoned RCW, no crash).
+                    log?.Invoke($"  [DB-CLOSE] 'Save Models' dialog up 0x{sm.ToInt64():X} - LEFT for the user to dismiss (choose Don't Save). NOT auto-handled: auto-dismiss UIA crashes erwin.");
+                    return;
+                }
+                else
+                {
+                    log?.Invoke($"  [DB-CLOSE] 'Save Models' dialog up 0x{sm.ToInt64():X} - closing without saving (uncheck + OK)");
+                    CloseSaveModelsWithoutSaving(sm, log);
+                    Thread.Sleep(500);
+                }
             }
             else
             {
@@ -4195,6 +4347,24 @@ namespace EliteSoft.Erwin.AddIn.Services
                         return false;
                     }
                 }
+                return true;
+            }, IntPtr.Zero);
+            return found;
+        }
+
+        /// <summary>
+        /// Finds the first descendant window (any class, recursively) under
+        /// <paramref name="parent"/> whose control id == <paramref name="wantId"/>.
+        /// Pure Win32 (EnumChildWindows + GetDlgCtrlID) replacement for a UIA
+        /// FindFirst(AutomationIdProperty) - used to avoid the UIA AutomationElement
+        /// -> oleacc/IAccessible RCWs that crash erwin's finalizer at teardown.
+        /// </summary>
+        private static IntPtr FindDescendantById(IntPtr parent, int wantId)
+        {
+            IntPtr found = IntPtr.Zero;
+            EnumChildWindows(parent, (h, _) =>
+            {
+                if (GetDlgCtrlID(h) == wantId) { found = h; return false; }
                 return true;
             }, IntPtr.Zero);
             return found;

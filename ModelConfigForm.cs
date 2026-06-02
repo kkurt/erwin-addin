@@ -1697,6 +1697,16 @@ namespace EliteSoft.Erwin.AddIn
 
                     if (restored > 0)
                         Log($"Restored {restored} hidden tab(s)");
+
+                    // Reveal the diagnostic Step Mode button (created hidden in
+                    // packaged builds) and jump to the DDL Generation tab so the
+                    // field user can run the RDP black-rectangle bisection.
+                    if (btnStepMode != null && !btnStepMode.Visible)
+                    {
+                        btnStepMode.Visible = true;
+                        if (tabDdlGeneration != null) tabControl.SelectedTab = tabDdlGeneration;
+                        Log("Step Mode button revealed on the DDL Generation tab.");
+                    }
                 }
             };
             tabGeneral.Controls.Add(lblCopyright);
@@ -3546,6 +3556,8 @@ namespace EliteSoft.Erwin.AddIn
                 RegisterHotKey(this.Handle, SpikePuHotkeyId, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_P);
                 RegisterHotKey(this.Handle, SpikeCloseHotkeyId, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_X);
                 Log("[SPIKE] hotkeys registered - Ctrl+Alt+M=dump MDI children, Ctrl+Alt+P=dump session PUs, Ctrl+Alt+X=graceful-close ACTIVE MDI child.");
+                // STEP-MODE toggle moved to the dev-only "Step Mode" button
+                // (Ctrl+Alt+S collided with erwin's Scheduler shortcut).
             }
             catch (Exception ex) { Log($"[RECON] RegisterHotKey threw: {ex.Message}"); }
         }
@@ -3584,6 +3596,41 @@ namespace EliteSoft.Erwin.AddIn
             base.WndProc(ref m);
         }
 #endif
+
+        // STEP-MODE state + toggle (RDP black-rectangle bisection diagnostic).
+        // Compiled in ALL builds so the button can exist in packaged too, but in
+        // packaged it is created hidden and only revealed via the existing
+        // Ctrl+Shift+LeftClick gesture on the copyright label (same as the Debug
+        // Log tab). In dev builds the button is visible by default. While armed,
+        // the same-version Generate DDL teardown pops checkpoint MessageBoxes so
+        // the user can pinpoint which step turns the screen black. Diagnostic
+        // only - remove once the trigger is found.
+        private bool _stepModeOn;
+
+        private void BtnStepMode_Click(object sender, EventArgs e)
+        {
+            _stepModeOn = !_stepModeOn;
+            Services.NativeBridgeService.SetStepMode(_stepModeOn, Log);
+            btnStepMode.Text = _stepModeOn ? "Step Mode: ON" : "Step Mode: OFF";
+            btnStepMode.BackColor = _stepModeOn
+                ? System.Drawing.Color.FromArgb(192, 0, 0)     // red = armed
+                : System.Drawing.Color.FromArgb(96, 96, 96);   // gray = off
+            if (_stepModeOn)
+            {
+                ErwinAddIn.ShowTopMostMessage(
+                    "STEP-MODE ACIK.\n\nSimdi 'Generate DDL' (From Mart, dirty vs last saved) butonuna bas. " +
+                    "Teardown'daki her adimda bir checkpoint penceresi cikacak:\n\n" +
+                    "[A] DDL yakalandi, wizard hala acik\n" +
+                    "[B] IDCANCEL+WM_CLOSE gonderildi (wizard kapaniyor)\n" +
+                    "[C] wizard destroy oldu\n" +
+                    "[D] native teardown bitti\n" +
+                    "[E] DDL sonuc penceresi acildi\n\n" +
+                    "Her checkpoint'te diyagrama tiklayip SIYAHLIK olustu mu bak, sonra OK'a bas. " +
+                    "Hangi checkpoint'te siyahlik ilk cikarsa tetikleyici o adim.\n\n" +
+                    "Kapatmak icin butona tekrar bas.",
+                    "Step Mode");
+            }
+        }
 
         private async void BtnAlterWizardProd_Click(object sender, EventArgs e)
         {
@@ -3826,6 +3873,14 @@ namespace EliteSoft.Erwin.AddIn
                         // version + From-DB paths already use the same
                         // ShowBusyOverlay helper - we just hadn't wired it
                         // into the fast path. Restored 2026-05-08.
+                        // 2026-06-02: the alter wizard is HIDDEN again (the black
+                        // rectangle was traced to an add-in HOOK, not the wizard's
+                        // visibility - the 2026-06-01 "leave visible" workaround is
+                        // reverted in the native bridge). With no visible wizard the
+                        // user needs a progress cue, so restore the busy overlay
+                        // (the original pre-Option-A behavior). It's fine for the
+                        // overlay to be TopMost now - there is no visible wizard for
+                        // it to occlude.
                         var fastOverlay = ShowBusyOverlay("Generating DDL, please wait...");
                         Services.DebugMode.Pause("Mart fast path - about to open hidden Alter Script Wizard", log);
                         try
@@ -3846,6 +3901,15 @@ namespace EliteSoft.Erwin.AddIn
                             }
                             catch (Exception ex) { log($"[ROUTE] fast-path overlay close err: {ex.Message}"); }
                         }
+                        // STEP [D]: native teardown + CloseHiddenWizard fully
+                        // returned; report the DDL state so a null (wizard never
+                        // opened) run is not mistaken for a valid leak test.
+                        Services.NativeBridgeService.StepCheckpoint("D",
+                            "GenerateAlterDdl dondu. DDL durumu: " +
+                            (script == null ? "NULL (wizard acilmadi / yakalama basarisiz - BU RUN GECERSIZ TEST)"
+                             : script.Length == 0 ? "BOS (fark yok)"
+                             : script.Length + " karakter") +
+                            ". Native teardown bitti, sonuc penceresi henuz acilmadi.", log);
                     }
                     else if (leftIsActive && LegacyCrossVersionEnabled)
                     {
@@ -3962,21 +4026,26 @@ namespace EliteSoft.Erwin.AddIn
                         }
                         finally
                         {
-                            // Resume monitoring fire-and-forget background even
-                            // if the pipeline threw. StartMonitoring internally
-                            // triggers TakeSnapshot (model walk = several
-                            // seconds UI freeze). Same background-resume
-                            // pattern as From-DB pipeline.
-                            _ = System.Threading.Tasks.Task.Run(() =>
+                            // Resume monitoring on the UI/STA thread (2026-06-02
+                            // crash fix - same as From-DB/Review). _validationService
+                            // .StartMonitoring() does a synchronous SCAPI walk +
+                            // arms WinForms timers; off a threadpool MTA worker that
+                            // cross-apartment-marshals into erwin's STA RCWs during
+                            // teardown -> use-after-free -> 0xC0000005 in coreclr.
+                            // BeginInvoke keeps it in-apartment, non-blocking.
+                            if (this.IsHandleCreated && !this.IsDisposed)
                             {
-                                try { _validationCoordinatorService?.ResumeValidation(); }
-                                catch (Exception ex) { try { log($"[XV] bg ResumeValidation err: {ex.Message}"); } catch { } }
-                                try { _tableTypeMonitorService?.StartMonitoring(); }
-                                catch (Exception ex) { try { log($"[XV] bg StartMonitoring err: {ex.Message}"); } catch { } }
-                                try { _validationService?.StartMonitoring(); }
-                                catch (Exception ex) { try { log($"[XV] bg ColumnValidation StartMonitoring err: {ex.Message}"); } catch { } }
-                                try { log("[XV] monitoring resumed (background)"); } catch { }
-                            });
+                                this.BeginInvoke((Action)(() =>
+                                {
+                                    try { _validationCoordinatorService?.ResumeValidation(); }
+                                    catch (Exception ex) { try { log($"[XV] ResumeValidation err: {ex.Message}"); } catch { } }
+                                    try { _tableTypeMonitorService?.StartMonitoring(); }
+                                    catch (Exception ex) { try { log($"[XV] StartMonitoring err: {ex.Message}"); } catch { } }
+                                    try { _validationService?.StartMonitoring(); }
+                                    catch (Exception ex) { try { log($"[XV] ColumnValidation StartMonitoring err: {ex.Message}"); } catch { } }
+                                    try { log("[XV] monitoring resumed (UI/STA thread)"); } catch { }
+                                }));
+                            }
                             log("[XV] pipeline complete - monitoring resume scheduled to background");
                         }
                     }
@@ -4170,12 +4239,25 @@ namespace EliteSoft.Erwin.AddIn
                                 // pipeline guard + restart the reconnect timer LAST
                                 // so no tick can touch SCAPI while a teardown dialog
                                 // is still up (the modal guard backstops this too).
-                                _ = System.Threading.Tasks.Task.Run(() =>
+                                // Resume monitoring on the UI/STA thread (2026-06-02
+                                // crash fix). _validationService.StartMonitoring()
+                                // (ColumnValidationService) does a synchronous SCAPI
+                                // walk + arms WinForms timers; off a threadpool MTA
+                                // worker that cross-apartment-marshals into erwin's
+                                // STA RCWs during CC/RD teardown -> use-after-free ->
+                                // 0xC0000005 in coreclr. BeginInvoke keeps it in the
+                                // form's STA apartment, non-blocking. (Same fix as the
+                                // From-DB teardown.)
+                                if (this.IsHandleCreated && !this.IsDisposed)
                                 {
-                                    try { _validationCoordinatorService?.ResumeValidation(); } catch (Exception ex) { try { log($"[REVIEW] bg ResumeValidation err: {ex.Message}"); } catch { } }
-                                    try { _tableTypeMonitorService?.StartMonitoring(); } catch (Exception ex) { try { log($"[REVIEW] bg StartMonitoring err: {ex.Message}"); } catch { } }
-                                    try { _validationService?.StartMonitoring(); } catch (Exception ex) { try { log($"[REVIEW] bg ColumnValidation StartMonitoring err: {ex.Message}"); } catch { } }
-                                });
+                                    this.BeginInvoke((Action)(() =>
+                                    {
+                                        try { _validationCoordinatorService?.ResumeValidation(); } catch (Exception ex) { try { log($"[REVIEW] ResumeValidation err: {ex.Message}"); } catch { } }
+                                        try { _tableTypeMonitorService?.StartMonitoring(); } catch (Exception ex) { try { log($"[REVIEW] StartMonitoring err: {ex.Message}"); } catch { } }
+                                        try { _validationService?.StartMonitoring(); } catch (Exception ex) { try { log($"[REVIEW] ColumnValidation StartMonitoring err: {ex.Message}"); } catch { } }
+                                        try { log("[REVIEW] monitoring resumed (UI/STA thread)"); } catch { }
+                                    }));
+                                }
                                 _martMartPipelineActive = false;
                                 try { StartReconnectTimer(); } catch (Exception ex) { log($"[REVIEW] StartReconnectTimer err: {ex.Message}"); }
                                 log("[REVIEW] pipeline complete - graceful teardown attempted (observe-mode); monitoring + reconnect resumed");
@@ -4256,6 +4338,9 @@ namespace EliteSoft.Erwin.AddIn
             }
             else
             {
+                // STEP [E]: all native teardown done; DDL is about to be rendered.
+                // OK here -> the DdlApprovalDialog (our own WinForms modal) opens.
+                Services.NativeBridgeService.StepCheckpoint("E", "Tum native teardown bitti. OK'a basinca DDL sonuc/approval penceresi (kendi WinForms modalimiz) ACILACAK. Bu pencere acilirken siyahlik olusursa tetikleyici bizim dialog, degilse erwin teardown'u.", Log);
                 ShowDDLResult(script, "Alter DDL", sourceMode);
                 Log($"DDL produced ({script.Length} chars). Review popup opened; user can submit to approval queue or cancel.");
                 // The cross-version path now evicts the orphan right-version
@@ -5151,9 +5236,10 @@ namespace EliteSoft.Erwin.AddIn
             // consciously fixes the DB-type pick.
             long activeTargetServer = 0;
             int activeTargetVersion = 0;
+            dynamic pb = null;
             try
             {
-                dynamic pb = _currentModel.PropertyBag();
+                pb = _currentModel.PropertyBag();
                 object tsRaw = pb?.Value("Target_Server");
                 if (tsRaw != null && long.TryParse(tsRaw.ToString(), out long ts))
                     activeTargetServer = ts;
@@ -5164,6 +5250,14 @@ namespace EliteSoft.Erwin.AddIn
             catch (Exception pbEx)
             {
                 return (null, $"Could not read active model dialect: {pbEx.GetType().Name}: {pbEx.Message}");
+            }
+            finally
+            {
+                // Release the active-model PropertyBag RCW (2026-06-02 teardown
+                // crash fix - see ReleaseComSafe). This is a transient bag read,
+                // NOT the long-lived monitoring _session, so dropping the wrapper
+                // is safe and matches ValidationCoordinatorService's practice.
+                ReleaseComSafe(pb);
             }
             if (activeTargetServer == 0)
                 return (null, "Active model has no Target_Server property - cannot derive dialect for RE.");
@@ -5303,9 +5397,10 @@ namespace EliteSoft.Erwin.AddIn
                 // ReverseEngineer-returned-null behavior is undocumented),
                 // surface it so a future GA AV can be traced back to dialect
                 // drift instead of being misdiagnosed.
+                dynamic rePb = null;
                 try
                 {
-                    dynamic rePb = rePU.PropertyBag();
+                    rePb = rePU.PropertyBag();
                     object reTs = rePb?.Value("Target_Server");
                     object reTsv = rePb?.Value("Target_Server_Version");
                     log($"[From-DB] RE'd PU dialect: Target_Server={reTs}, Version={reTsv}");
@@ -5319,6 +5414,12 @@ namespace EliteSoft.Erwin.AddIn
                 {
                     log($"[From-DB] dialect verify err: {diagEx.GetType().Name}: {diagEx.Message}");
                 }
+                finally
+                {
+                    // Release the RE'd-PU PropertyBag RCW (2026-06-02 teardown
+                    // crash fix - see ReleaseComSafe).
+                    ReleaseComSafe(rePb);
+                }
 
                 // Step 3b: VERIFY the RE'd PU is non-empty before driving CC.
                 // SCAPI's RE returns success even when filter excluded all
@@ -5326,22 +5427,36 @@ namespace EliteSoft.Erwin.AddIn
                 int entityCount = 0;
                 int viewCount = 0;
                 dynamic verifySess = null;
+                dynamic mo = null;
+                dynamic root = null;
                 try
                 {
                     verifySess = _scapi.Sessions.Add();
                     verifySess.Open(rePU, 0, 0);
-                    dynamic mo = verifySess.ModelObjects;
-                    dynamic root = mo.Root;
+                    mo = verifySess.ModelObjects;
+                    root = mo.Root;
                     try
                     {
                         dynamic ents = mo.Collect(root, "Entity");
-                        foreach (dynamic _ in ents) entityCount++;
+                        try
+                        {
+                            // Release each per-entity proxy as we count it - on a
+                            // many-table model this foreach materializes hundreds
+                            // of transient STA RCWs that must NOT outlive the
+                            // session (see ReleaseComSafe).
+                            foreach (dynamic e in ents) { entityCount++; ReleaseComSafe(e); }
+                        }
+                        finally { ReleaseComSafe(ents); }
                     }
                     catch (Exception entEx) { log($"[From-DB] Collect Entity err: {entEx.Message}"); }
                     try
                     {
                         dynamic views = mo.Collect(root, "View");
-                        foreach (dynamic _ in views) viewCount++;
+                        try
+                        {
+                            foreach (dynamic v in views) { viewCount++; ReleaseComSafe(v); }
+                        }
+                        finally { ReleaseComSafe(views); }
                     }
                     catch { /* views optional */ }
                 }
@@ -5351,7 +5466,26 @@ namespace EliteSoft.Erwin.AddIn
                 }
                 finally
                 {
-                    if (verifySess != null) { try { verifySess.Close(); } catch { } }
+                    // 2026-06-02 teardown crash fix (dump erwin.exe.29840.dmp):
+                    // release the verify-session graph RCWs (root/mo + the
+                    // per-item proxies above) BEFORE verifySess.Close(), while
+                    // the native session objects are still alive. Close() tears
+                    // those native objects down; any RCW left abandoned to GC is
+                    // finalized later by the CLR finalizer thread, which
+                    // cross-apartment-marshals IUnknown::Release onto erwin's STA
+                    // AFTER the object is freed -> use-after-free AV escalated to
+                    // a fatal ExecutionEngineException. The codebase's own
+                    // ValidationCoordinatorService.ReleaseCom does this for the
+                    // active-model walk; the From-DB pipeline never did, which is
+                    // why this path crashed at teardown.
+                    ReleaseComSafe(root);
+                    ReleaseComSafe(mo);
+                    if (verifySess != null)
+                    {
+                        try { verifySess.Close(); } catch { }
+                        ReleaseComSafe(verifySess);
+                    }
+                    log($"[From-DB] verify-session RCWs released ({entityCount} entity + {viewCount} view proxies)");
                 }
                 log($"[From-DB] RE'd PU contents: {entityCount} entity(ies), {viewCount} view(s)");
                 if (entityCount == 0)
@@ -5371,6 +5505,30 @@ namespace EliteSoft.Erwin.AddIn
                 // Apply-to-Right.
                 if (string.IsNullOrEmpty(rePuName))
                     return (null, "RE'd PU name is empty - cannot select it in CC picker.");
+
+                // 2026-06-02 teardown crash fix (dump erwin.exe.46352.dmp).
+                // Apply-to-Right (inside DriveCCDbAndApplyAsync below) MUTATES the
+                // active model: erwin frees/reshapes entity objects in the live
+                // model graph. Any SCAPI RCW captured BEFORE this point that is
+                // already unreachable (notably the ~entity proxies that
+                // CollectModelTablePhysicalNames walked at the top of the
+                // pipeline and abandoned to GC) would, when the finalizer later
+                // runs it, cross-apartment-marshal IUnknown::Release onto erwin's
+                // STA against an object Apply-to-Right already freed -> use-after-
+                // free AV in coreclr!SafeReleasePreemp -> fatal
+                // ExecutionEngineException ~6s after the pipeline "completes"
+                // (confirmed native stack: RCWCleanupList::CleanupAllWrappers ->
+                // RCW::ReleaseAllInterfaces -> SafeReleasePreemp). Force those
+                // abandoned RCWs to finalize NOW, while their objects are still
+                // alive. Run the barrier on a background thread so the erwin STA
+                // stays free to PUMP and service the cross-apartment Release the
+                // finalizer marshals to it - calling WaitForPendingFinalizers on
+                // the STA itself would deadlock (STA blocked, cannot service the
+                // marshaled call). Explicit FinalReleaseComObject above handles
+                // the RCWs still rooted in this method's locals; this barrier
+                // handles the ones that already went unreachable in helpers.
+                await DrainComFinalizersAsync(log, "pre-apply: active-model SCAPI proxies");
+
                 log($"[From-DB] DriveCCDbAndApply(reModelName='{rePuName}')");
                 sess = await Services.MartMartAutomation.DriveCCDbAndApplyAsync(rePuName, log, overlayToggle, dbgPauseBeforeApply: Services.DebugMode.KeepDialogsVisible);
                 if (sess == null || !sess.Applied)
@@ -5481,6 +5639,17 @@ namespace EliteSoft.Erwin.AddIn
                 }
                 finally
                 {
+                    // 2026-06-02 teardown crash fix (CONFIRMED via full dump
+                    // erwin.exe.48868.dmp + SOS !dumprcw = Accessibility.IAccessible
+                    // / ToolkitPro CXTPAccessible). Drain the UIA-derived IAccessible
+                    // RCWs (from AutomationElement.FromHandle on the CC picker + FE
+                    // wizard) HERE, while the FE wizard (capturedWizard) AND the
+                    // CC/RD windows are ALL still alive - the FE wizard is closed
+                    // just below, the CC/RD in the outer finally. Draining now makes
+                    // the finalizer's cross-apartment IAccessible::Release land on a
+                    // live XTP object instead of a freed one. See DrainComFinalizersAsync.
+                    await DrainComFinalizersAsync(log, "pre-FE-close: CC/FE wizard IAccessible");
+
                     if (capturedWizard != IntPtr.Zero)
                     {
                         try
@@ -5526,6 +5695,70 @@ namespace EliteSoft.Erwin.AddIn
                 // The 3 dead-wait trims (UseCurrentDiagram 500->200, FE wizard
                 // IDCANCEL fixed-1500 -> poll, Mart Offline 1500->500) STAY -
                 // they shave ~2.3s without flicker.
+
+                // 2026-06-02 teardown crash fix (dump erwin.exe.33336.dmp):
+                // release the RE'd PU's RCW FIRST - here at the top of the
+                // finally, while the CC wizard, the RE'd model child and the
+                // PU's native object are ALL still alive, so the drop is a clean
+                // in-apartment refcount decrement. rePU was the LAST abandoned
+                // SCAPI RCW held by a method local after the verify-session graph
+                // was already released; if left to GC, ~6s after this method
+                // returns the CLR finalizer thread cross-apartment-releases it
+                // onto erwin's STA AFTER teardown has torn the RE'd model down ->
+                // use-after-free -> fatal ExecutionEngineException (same dump
+                // signature, just moved later because this RCW outlives the
+                // others). NOTE: an RCW refcount drop is NOT PUs.Remove - the PU
+                // still lingers as a session orphan (Remove would invalidate the
+                // active mart root, hence it stays skipped below).
+                // 2026-06-02 teardown crash fix (ROOT-CAUSE, via user insight +
+                // SCAPI research). The ONLY remaining UIA in the whole teardown is
+                // the "Save Models" dialog raised by WM_CLOSE on the DIRTY RE'd
+                // model (confirmed: [SM-CLOSE] is the sole UIA in the teardown log;
+                // every wizard close is Win32 IDCANCEL). Its XTP IAccessible RCWs
+                // (full dump erwin.exe.48868.dmp = ToolkitPro CXTPAccessible /
+                // Accessibility.IAccessible) are abandoned to GC; when the dialog
+                // is destroyed the finalizer cross-apartment-releases a freed
+                // IAccessible on erwin's STA -> AV -> fatal ExecutionEngineException.
+                // SUPPRESS the dialog at the source by marking the throwaway RE'd
+                // model UNMODIFIED. NOTE rePU.Save(tempPath) does NOT work - it is
+                // a Save-AS copy and does not reset the dirty flag (verified: saved
+                // =True yet the '*' + dialog persisted). The correct lever is the
+                // documented read/WRITE property ISCPersistenceUnit.DirtyBit /
+                // ISCModelSet.DirtyBit (erwin-api-ref-15 6399-6403 + 6241-6245;
+                // live PROPPUT memid 0x60020002 on r10.10). Clear it on the model
+                // set (which drives the MDI '*' title) AND the PU so WM_CLOSE finds
+                // nothing dirty -> no Save Models dialog -> CloseSaveModelsWithout-
+                // Saving never runs -> no UIA RCW. If erwin keeps a separate
+                // per-MDI dirty state and ignores this, the old WM_CLOSE +
+                // uncheck/OK fallback still runs (no worse). Release the ModelSet
+                // RCW in-apartment here (same discipline as rePU) so it does not
+                // become another dangling cross-apartment finalizer release.
+                if (rePU != null)
+                {
+                    try
+                    {
+                        dynamic reMs = null;
+                        try { reMs = rePU.ModelSet(); }
+                        catch (Exception msEx) { log($"[From-DB] rePU.ModelSet() err: {msEx.Message}"); }
+                        if (reMs != null)
+                        {
+                            try { reMs.DirtyBit = false; }
+                            catch (Exception e1) { log($"[From-DB] ModelSet DirtyBit clear err: {e1.Message}"); }
+                            ReleaseComSafe(reMs);
+                        }
+                        try { rePU.DirtyBit = false; }
+                        catch (Exception e2) { log($"[From-DB] PU DirtyBit clear err: {e2.Message}"); }
+                        log("[From-DB] RE'd model DirtyBit=false (PU + ModelSet) - aims to suppress the Save Models dialog (the sole teardown UIA / IAccessible crash source).");
+                    }
+                    catch (Exception dbEx)
+                    {
+                        log($"[From-DB] DirtyBit clear failed ({dbEx.GetType().Name}: {dbEx.Message}) - Save Models dialog may still appear (fallback path).");
+                    }
+                }
+
+                ReleaseComSafe(rePU);
+                rePU = null;
+
                 if (sess != null)
                 {
                     try
@@ -5548,37 +5781,69 @@ namespace EliteSoft.Erwin.AddIn
                 // Discard the throwaway RE'd model (WM_CLOSE + "Save Models"
                 // uncheck+OK). Done AFTER the CC/RD teardown so the wizard no
                 // longer references it.
+                // 2026-06-02 (user decision): INITIATE the close - WM_CLOSE the
+                // RE'd model child so erwin raises its "Save Models" dialog - but
+                // do NOT auto-dismiss that dialog; leave it for the USER to click.
+                // The dialog is the SOLE remaining teardown UIA: auto-dismissing it
+                // (CloseSaveModelsWithoutSaving) needs UI Automation whose abandoned
+                // XTP IAccessible RCWs crash erwin's finalizer (full dump
+                // erwin.exe.48868.dmp = ToolkitPro CXTPAccessible /
+                // Accessibility.IAccessible). Every in-process way to dismiss it
+                // WITHOUT UIA was exhausted: rePU.Save (Save-As, does not clear
+                // dirty); ISCPersistenceUnit/ModelSet.DirtyBit=false (dispatch
+                // succeeds but erwin's GUI keeps a SEPARATE per-MDI dirty flag and
+                // still prompts - verified, the '*' persisted); and the dialog's OK
+                // ignores WM_COMMAND IDOK + its XTP grid only reads via UIA. So the
+                // WM_CLOSE goes out, the dialog appears, and the user dismisses it
+                // (a plain user click = erwin's own UI, no .NET UIA, no abandoned
+                // RCW, no crash). The model actually closes once the user clicks
+                // Don't Save, so tabs do not accumulate. A future bridge-based GUI
+                // SetModifiedFlag could re-enable full auto-close.
                 try
                 {
                     await System.Threading.Tasks.Task.Run(() =>
-                        Services.MartMartAutomation.CloseReModelMdiChild(rePuName, log));
+                        Services.MartMartAutomation.CloseReModelMdiChild(rePuName, log, win32AutoDismiss: true));
                 }
                 catch (Exception ex) { log($"[From-DB] CloseReModelMdiChild err: {ex.Message}"); }
 
-                if (rePU != null)
-                {
-                    // PU.Remove on a CC-touched silent RE'd PU invalidates the
-                    // active mart PU's root object -> Session lost cascade ->
-                    // next user click crash. Skipped entirely; the RE'd PU
-                    // stays as a session orphan.
-                    log("[From-DB] SKIPPING PU.Remove on RE'd PU - call would invalidate active mart PU root and trigger Session lost cascade.");
-                    log("[From-DB] WARNING: RE'd PU stays in SCAPI session as an orphan.");
-                    log("[From-DB] If CC's 'Open Models in Memory' picker shows duplicates next run, restart erwin to reset session.");
-                }
+                // PU.Remove on a CC-touched silent RE'd PU invalidates the active
+                // mart PU's root object -> Session lost cascade -> next user click
+                // crash. It stays SKIPPED; the RE'd PU lingers as a session orphan.
+                // Its managed RCW was already released at the top of this finally
+                // (a refcount drop, NOT a Remove), which fixes the teardown crash
+                // without removing the PU from the session.
+                log("[From-DB] PU.Remove skipped (would invalidate active mart PU root); RE'd PU RCW released, PU lingers as a session orphan until erwin restart.");
+                log("[From-DB] If CC's 'Open Models in Memory' picker shows duplicates next run, restart erwin to reset session.");
 
-                // Monitoring resume FIRE-AND-FORGET background. StartMonitoring
-                // triggers a model walk (multi-second UI freeze if run on the
-                // UI thread). Off-thread so the addin stays responsive.
-                _ = System.Threading.Tasks.Task.Run(() =>
+                // Resume monitoring on the UI/STA thread (2026-06-02 crash fix).
+                // The previous Task.Run ran on a threadpool MTA worker. Two of the
+                // three resume calls are pure flag flips, but the third -
+                // _validationService.StartMonitoring() (ColumnValidationService) -
+                // does a SYNCHRONOUS SCAPI walk (TakeSnapshot -> ModelObjects.Collect)
+                // and arms two WinForms timers. From an MTA thread that forces a
+                // cross-apartment COM marshal into erwin's STA RCWs WHILE the CC/RD
+                // session is tearing down, dereferencing an about-to-die proxy ->
+                // use-after-free -> 0xC0000005 in coreclr (verified offset, same on
+                // the Review teardown). BeginInvoke posts to the form's own UI/STA
+                // thread (where the RCWs + Forms.Timers live) and returns at once, so
+                // teardown is not blocked and the SCAPI stays in-apartment.
+                if (this.IsHandleCreated && !this.IsDisposed)
                 {
-                    try { _validationCoordinatorService?.ResumeValidation(); }
-                    catch (Exception ex) { try { log($"[From-DB] bg ResumeValidation err: {ex.Message}"); } catch { } }
-                    try { _tableTypeMonitorService?.StartMonitoring(); }
-                    catch (Exception ex) { try { log($"[From-DB] bg StartMonitoring err: {ex.Message}"); } catch { } }
-                    try { _validationService?.StartMonitoring(); }
-                    catch (Exception ex) { try { log($"[From-DB] bg ColumnValidation StartMonitoring err: {ex.Message}"); } catch { } }
-                    try { log("[From-DB] monitoring resumed (background)"); } catch { }
-                });
+                    this.BeginInvoke((Action)(() =>
+                    {
+                        try { _validationCoordinatorService?.ResumeValidation(); }
+                        catch (Exception ex) { try { log($"[From-DB] ResumeValidation err: {ex.Message}"); } catch { } }
+                        try { _tableTypeMonitorService?.StartMonitoring(); }
+                        catch (Exception ex) { try { log($"[From-DB] StartMonitoring err: {ex.Message}"); } catch { } }
+                        try { _validationService?.StartMonitoring(); }
+                        catch (Exception ex) { try { log($"[From-DB] ColumnValidation StartMonitoring err: {ex.Message}"); } catch { } }
+                        try { log("[From-DB] monitoring resumed (UI/STA thread)"); } catch { }
+                    }));
+                }
+                else
+                {
+                    try { log("[From-DB] form handle unavailable - monitoring resume skipped (resumes on next model load)"); } catch { }
+                }
                 // Clear the pipeline guard + restart the reconnect timer LAST
                 // so no tick touches SCAPI while cleanup is still settling.
                 _martMartPipelineActive = false;
@@ -5587,6 +5852,73 @@ namespace EliteSoft.Erwin.AddIn
             }
 
             return (script, err);
+        }
+
+        /// <summary>
+        /// Best-effort deterministic release of a SCAPI COM RCW. The From-DB
+        /// pipeline uses it to drop every Runtime Callable Wrapper it creates
+        /// WHILE the underlying native object is still alive, instead of
+        /// abandoning it to the GC. An abandoned SCAPI RCW is finalized later by
+        /// the CLR finalizer thread (MTA); because the wrapped object lives in
+        /// erwin's STA, the finalizer cross-apartment-marshals IUnknown::Release
+        /// onto erwin's STA - and if teardown already freed that object, the
+        /// Release dereferences freed memory (RDI=0x0BADF00D heap poison) inside
+        /// coreclr!SafeReleasePreemp, which the CLR escalates to a fatal
+        /// ExecutionEngineException (crash dump erwin.exe.29840.dmp, 2026-06-02).
+        /// Mirrors the long-standing ValidationCoordinatorService.ReleaseCom.
+        /// Never throws - releasing a scratch wrapper must not break teardown.
+        /// </summary>
+        private static void ReleaseComSafe(object comObject)
+        {
+            if (comObject == null) return;
+            try
+            {
+                if (Marshal.IsComObject(comObject))
+                    Marshal.FinalReleaseComObject(comObject);
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[From-DB] ReleaseComSafe error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Drain pending COM RCW finalizations on a BACKGROUND thread WHILE the
+        /// underlying native objects are still alive. The From-DB pipeline
+        /// abandons two classes of RCW to the GC: SCAPI entity proxies (freed
+        /// when Apply-to-Right mutates the active model) and UIA-derived
+        /// IAccessible RCWs - the XTP <c>CXTPAccessible::XAccessible</c> MSAA
+        /// objects obtained when <c>AutomationElement.FromHandle</c> drives the
+        /// CC "Open Models in Memory" picker and the FE-wizard navigation (freed
+        /// when those XTP wizard windows are destroyed at teardown). When erwin
+        /// frees the native object, the CLR finalizer later cross-apartment-
+        /// marshals <c>IUnknown::Release</c> onto erwin's STA against a freed
+        /// object (NULL vtable) -> AV in <c>coreclr!SafeReleasePreemp</c> ->
+        /// fatal <c>ExecutionEngineException</c> ~6s after the pipeline reports
+        /// complete. (Identified from full dump erwin.exe.48868.dmp via SOS
+        /// !dumprcw = Accessibility.IAccessible / ToolkitPro1850 CXTPAccessible.)
+        /// Forcing the finalizers to run NOW, while the objects live, makes that
+        /// Release land on a live object. MUST run on a background thread so
+        /// erwin's STA stays free to PUMP and service the marshaled cross-
+        /// apartment Release - a GC.WaitForPendingFinalizers on the STA itself
+        /// would deadlock (STA blocked, cannot service the marshaled call).
+        /// </summary>
+        private static async System.Threading.Tasks.Task DrainComFinalizersAsync(Action<string> log, string where)
+        {
+            try
+            {
+                await System.Threading.Tasks.Task.Run(() =>
+                {
+                    GC.Collect();
+                    GC.WaitForPendingFinalizers();
+                    GC.Collect();
+                });
+                log?.Invoke($"[From-DB] COM finalizer drain complete ({where} - native objects still alive)");
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"[From-DB] COM finalizer drain err ({where}): {ex.Message}");
+            }
         }
 
         /// <summary>

@@ -926,6 +926,7 @@ WScript.Quit 0
             string tempDsn = null;
             string tempReOptionXml = null;
             System.Data.IDbConnection sqlConnLong = null;
+            dynamic propBag = null;
             try
             {
                 if (string.IsNullOrWhiteSpace(host) || string.IsNullOrWhiteSpace(database))
@@ -975,7 +976,7 @@ WScript.Quit 0
                 // Create blank PU for RE
                 Type pbType = Type.GetTypeFromProgID("ERwin9.SCAPI.PropertyBag.9.0");
                 if (pbType == null) throw new InvalidOperationException("SCAPI PropertyBag ProgID not registered.");
-                dynamic propBag = Activator.CreateInstance(pbType);
+                propBag = Activator.CreateInstance(pbType);
                 propBag.Add("Model_Type", modelType);
                 propBag.Add("Target_Server", (int)targetServerCode);
                 propBag.Add("Target_Server_Version", targetServerVersion);
@@ -1019,6 +1020,20 @@ WScript.Quit 0
             }
             finally
             {
+                // Release the RE options PropertyBag RCW deterministically.
+                // rePU is the return value and MUST survive; propBag is scratch
+                // (consumed by ReverseEngineer above) and is released here so it
+                // is never abandoned to the CLR finalizer (2026-06-02 From-DB
+                // teardown crash fix - a finalizer cross-apartment Release on a
+                // freed SCAPI object faults inside coreclr!SafeReleasePreemp and
+                // escalates to a fatal ExecutionEngineException). See
+                // ModelConfigForm.ReleaseComSafe for the full rationale.
+                try
+                {
+                    if (propBag != null && System.Runtime.InteropServices.Marshal.IsComObject(propBag))
+                        System.Runtime.InteropServices.Marshal.FinalReleaseComObject(propBag);
+                }
+                catch (Exception ex) { log?.Invoke($"RE: propBag release err: {ex.Message}"); }
                 try { sqlConnLong?.Close(); sqlConnLong?.Dispose(); } catch { }
                 try { if (tempDsn != null) OdbcDsnHelper.DeleteDsn(tempDsn, log); } catch { }
                 try { if (!string.IsNullOrEmpty(tempReOptionXml) && File.Exists(tempReOptionXml)) File.Delete(tempReOptionXml); } catch { }
