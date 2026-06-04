@@ -345,6 +345,85 @@ static GenerateFeFn    g_origGenerateFe    = nullptr;
 
 // Thread-safe latest captured GDMModelSetI* pointer (from GenerateFEScript detour).
 static volatile LONG64 g_lastCapturedModelSet = 0;
+
+// Set while OUR automated alter-script pipeline drives a (covered) wizard. The GA
+// detour reads this to force erwin's GenerateAlterScript showProgress=FALSE for our
+// runs only: erwin's progress CWnd, when composed-then-destroyed while the wizard is
+// occluded behind our cover on RDP, orphans its DWM redirection surface (the
+// black-rectangle leak). The user's MANUAL wizard runs with this flag clear, so it
+// keeps showProgress=1 and a visible progress bar (and stays leak-free because a
+// genuinely-visible progress window composes+destroys cleanly).
+static volatile LONG g_automationActive = 0;
+
+// (A) RDP black-rectangle HOOK-BISECTION (2026-06-02). When true, InstallHook
+// arms ONLY the two detours essential to the same-version Generate DDL capture
+// (the GenerateAlterScript GA detour + the FEWPageOptions ctor hook) and SKIPS
+// every other diagnostic / other-pipeline hook: AddItem, SetDescription, the
+// ECX Sync/Display callbacks, GenerateFEScript, ALL EM_ECC/EM_EOU/MCX observer
+// detours (incl. CERwinFEData SetAS/SetMs/GetAS/Clear), FEWPagePreviewEx, the
+// CC-state poller thread, ELA::OnFE, and the EDR + ECC pipeline hooks. The user
+// confirmed addin-OFF = no black, addin-ON = black on alter-script generate, and
+// every hook BODY read so far is read-only - so the corruptor is likely one of
+// these inline patches on erwin's core FE/render functions. If the black
+// vanishes with this minimal set, a stripped hook was the cause (then bisect
+// which); if it persists, the culprit is GA or FEWCtor -> move DDL capture to a
+// separate Worker process. Flip to false to restore full instrumentation.
+// true => strip the AddItem-class PASSIVE DIAGNOSTIC observers that corrupt
+// erwin's render on RDP (CERwinFEData SetAS/SetMs/GetAS/Clear, MCX/ECC observers,
+// FEWPagePreviewEx, GenerateFEScript, CC-POLL, ECX Sync/Display). Leaves the
+// FUNCTIONAL set: GA detour + FEWPageOptions ctor (here) + ElaOnFe/EDR/ECC-
+// ShowERwinCCWiz (installed unconditionally below - they fire only on CC flows,
+// not erwin's plain Actions>Alter Script, so they do NOT reintroduce the
+// manual-alter black). 2026-06-02: kept true as the production config after the
+// 2nd corruptor (a stripped FE-path observer) was isolated the same way AddItem
+// (the 1st) was.
+static const bool kMinimalHooksForBlackRectTest = true;
+
+// CONFIRMED 2026-06-02: the GDMActionSummary::AddItem hook (GdmAsAddItemHook) is
+// THE RDP black-rectangle corruptor. Correlation was 100% across builds
+// (AddItem ON => black, OFF => clean) and user-verified: with AddItem off the
+// black is gone even with the wizard hidden. The hook fires on EVERY action-
+// summary append (incl. the alter-compare diff build) and reentrantly calls 3
+// erwin GDM item methods (id/owner/type) per append, corrupting erwin's render
+// state. It is ALSO dead code: its capture (DrainChangeRecords / GetChangedAttributeIds)
+// has ZERO production consumers - it was a Phase-1C spike to test whether
+// event-driven detection could replace the C# DiagramHeartbeat count-delta
+// (conclusion: no, heartbeat is the universal sensor). So removing it costs
+// nothing. Kept as its OWN flag (independent of the minimal-hooks strip) so the
+// other hooks can be restored for From-DB/Mart-Mart while AddItem stays off.
+static const bool kInstallAddItemHook = false;
+
+// Functional From-DB/Mart-Mart hooks (ElaOnFe + EDR + ECC-pipeline). 2026-06-02
+// option (A): turned back ON, but with ELA::OnFE converted to a DIRECT-CALL (see
+// kElaOnFeDirectCall) instead of a corrupting inline detour. History: adding
+// these as detours brought the black back on erwin's plain manual Alter Script
+// + hung erwin, because the ELA::OnFE DETOUR (which fires on EVERY alter)
+// corrupts the render. The orchestrator only needs to CALL OnFE, not patch it,
+// so we resolve its address and call directly (erwin's own OnFE runs unpatched
+// = no corruption). EDR + ECC stay as detours for now (they fire only on
+// Apply-to-Right / CC-wizard, not every alter); if From-DB/Mart-Mart still show
+// black, convert/strip those next.
+static const bool kInstallPipelineHooks = true;
+
+// ELA::OnFE: resolve+call DIRECTLY (no inline detour). The detour was the 2nd
+// confirmed black-rectangle corruptor (fires on every alter). Calling the
+// un-patched address is RDP-safe. Cost: no g_lastOnFeMs observation (the
+// orchestrator must pass an explicit RIGHT-side ms; its primary path does).
+static const bool kElaOnFeDirectCall = true;
+
+// EDR + ECC-pipeline detours. NEEDED by From-DB/Mart-Mart Apply-to-Right (the
+// EDR tx-settle gate - GetEdrTxCount; with EDR off the Apply-to-Right times out
+// "EDR tx wait TIMEOUT 0->0" and produces no DDL). 2026-06-02 isolation test
+// RESULT: EDR/ECC are NOT the From-DB teardown corruptor - with them OFF the
+// SAME System.ExecutionEngineException (CLR GC-heap corruption, coreclr+0xD1E70,
+// confirmed via dump) still fires at teardown. So the corruption is the COM-RCW
+// lifetime of the silent-RE + CC + close-RE'd-model + orphan-PU teardown, NOT
+// the detours. In-process From-DB/Mart-Mart therefore needs a Worker process
+// (separate erwin, no orphan/RCW in the user's session) - see
+// reference_cross_version_orphan_unsolved. Kept ON (EDR is required + harmless
+// to the black/heap) so the in-process pipeline at least captures the DDL.
+static const bool kInstallEdrEccHooks = true;
+
 static volatile LONG   g_feCallCount          = 0;
 
 // Most-recent DDL captured from FEProcessor::GenerateAlterScript + GetScript.
@@ -637,8 +716,23 @@ static int __cdecl GenerateAlterHook(void* self, void* modelSet, void* actionSum
 
     int rv = -1;
     if (g_origGenerateAlter) {
+        // RDP black-rectangle FIX EXPERIMENT (2026-06-01): no longer force
+        // showProgress=false. The old override existed to avoid an "occluded
+        // progress-CWnd" surface leak back when the wizard was hidden/occluded.
+        // Under Option A the wizard is genuinely VISIBLE, so that rationale is
+        // gone. Step-mode bisection pinned the black to the wizard DESTROY
+        // (checkpoint [B]) and the "clicked objects render black" symptom = GDI/
+        // render-state corruption; showProgress=false is an ABNORMAL erwin code
+        // path, whereas the manual wizard (proven leak-free per the original
+        // note) runs with showProgress=1 / a visible progress bar. Let erwin use
+        // its own showProgress so the generate follows the normal, proven path.
+        // If the black persists at [B] after this, revert and try a post-destroy
+        // recomposition / IDCANCEL-only close instead.
+        bool sp = showProgress;
+        LogLine("[GA] showProgress=%d (NOT overridden; Option A visible-wizard normal path; automationActive=%ld)",
+            (int)sp, InterlockedCompareExchange(&g_automationActive, 0, 0));
         __try {
-            rv = g_origGenerateAlter(self, modelSet, actionSummary, parent, showProgress);
+            rv = g_origGenerateAlter(self, modelSet, actionSummary, parent, sp);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             LogLine("[GA] trampoline SEH 0x%08lX", GetExceptionCode());
         }
@@ -733,38 +827,60 @@ extern "C" __declspec(dllexport) int __cdecl InstallHook(void) {
     // Per-property granularity: column edits, in-place renames, bulk edits,
     // mart sync - they all funnel through AddItem. Failure is non-fatal,
     // we just lose event-driven validation.
-    int addItemRc = InstallAddItemHook();
-    LogLine("[ADDITEM] InstallAddItemHook rc=%d", addItemRc);
+    // AddItem hook: now a BLACK-RECTANGLE SUSPECT (2026-06-02). Correlation
+    // across 3 builds is consistent: AddItem ON => black, AddItem OFF => clean
+    // (full hooks=on=black; minimal=off=clean "gitti gibi"; minimal+AddItem-on
+    // =black). It inline-detours GDMActionSummary::AddItem (via a this-adjust
+    // thunk) and fires heavily during the alter-compare's action-summary build,
+    // so a subtle trampoline/thunk issue could corrupt erwin's render state
+    // (visible as black on the next repaint / wizard close). Re-stripped under
+    // the minimal flag to test. Cost while stripped: lose macro-commit
+    // validation coverage (model-open/editor-open); New Table/New Column
+    // detection is unaffected (it uses the C# DiagramHeartbeat count-delta).
+    if (kInstallAddItemHook) {
+        int addItemRc = InstallAddItemHook();
+        LogLine("[ADDITEM] InstallAddItemHook rc=%d", addItemRc);
+    } else {
+        LogLine("[ADDITEM] NOT installed - confirmed RDP black-rectangle corruptor 2026-06-02 + dead diagnostic code (no production consumer). Permanently disabled.");
+    }
 
     // Install hook on MCXGDMPersister_Mart::SetDescription so the
     // approval popup can later push a description into the Mart save
     // pipeline without showing erwin's own description dialog. Hook also
     // captures the active persister pointer the first time any manual
     // save fires, which the bridge invoker needs as its `this` argument.
-    int setDescRc = InstallSetDescriptionHook();
-    LogLine("[SETDESC] InstallSetDescriptionHook rc=%d", setDescRc);
+    if (!kMinimalHooksForBlackRectTest) {
+        int setDescRc = InstallSetDescriptionHook();
+        LogLine("[SETDESC] InstallSetDescriptionHook rc=%d", setDescRc);
+    } else {
+        LogLine("[SETDESC] skipped (minimal-hooks black-rect test)");
+    }
 
     // ----- v2 chained callbacks (kept as diagnostic) ----------------------
-    HMODULE ecx = GetModuleHandleW(L"EM_ECX.dll");
-    if (!ecx) ecx = LoadLibraryW(L"EM_ECX.dll");
-    if (!ecx) {
-        LogLine("ERR: EM_ECX.dll not found (GetLastError=0x%lX)", GetLastError());
+    if (!kMinimalHooksForBlackRectTest) {
+        HMODULE ecx = GetModuleHandleW(L"EM_ECX.dll");
+        if (!ecx) ecx = LoadLibraryW(L"EM_ECX.dll");
+        if (!ecx) {
+            LogLine("ERR: EM_ECX.dll not found (GetLastError=0x%lX)", GetLastError());
+        } else {
+            LogLine("EM_ECX.dll handle = %p", (void*)ecx);
+            SetSyncCallbackFn setSync = (SetSyncCallbackFn)GetProcAddress(ecx, kSetSyncSym);
+            GetSyncCallbackFn getSync = (GetSyncCallbackFn)GetProcAddress(ecx, kGetSyncSym);
+            if (setSync) {
+                if (getSync) g_priorSync = getSync();
+                setSync(&SyncCallback);
+                LogLine("[SYNC] installed (prior=%p, ours=%p)", (void*)g_priorSync, (void*)&SyncCallback);
+            }
+            SetDisplayCallbackFn setDisp = (SetDisplayCallbackFn)GetProcAddress(ecx, kSetDisplaySym);
+            GetDisplayCallbackFn getDisp = (GetDisplayCallbackFn)GetProcAddress(ecx, kGetDisplaySym);
+            if (setDisp) {
+                if (getDisp) g_priorDisplay = getDisp();
+                setDisp(&DisplayCallback);
+                LogLine("[DISP] installed (prior=%p, ours=%p)", (void*)g_priorDisplay, (void*)&DisplayCallback);
+            }
+        }
     } else {
-        LogLine("EM_ECX.dll handle = %p", (void*)ecx);
-        SetSyncCallbackFn setSync = (SetSyncCallbackFn)GetProcAddress(ecx, kSetSyncSym);
-        GetSyncCallbackFn getSync = (GetSyncCallbackFn)GetProcAddress(ecx, kGetSyncSym);
-        if (setSync) {
-            if (getSync) g_priorSync = getSync();
-            setSync(&SyncCallback);
-            LogLine("[SYNC] installed (prior=%p, ours=%p)", (void*)g_priorSync, (void*)&SyncCallback);
-        }
-        SetDisplayCallbackFn setDisp = (SetDisplayCallbackFn)GetProcAddress(ecx, kSetDisplaySym);
-        GetDisplayCallbackFn getDisp = (GetDisplayCallbackFn)GetProcAddress(ecx, kGetDisplaySym);
-        if (setDisp) {
-            if (getDisp) g_priorDisplay = getDisp();
-            setDisp(&DisplayCallback);
-            LogLine("[DISP] installed (prior=%p, ours=%p)", (void*)g_priorDisplay, (void*)&DisplayCallback);
-        }
+        LogLine("[SYNC/DISP] ECX chained callbacks skipped (minimal-hooks black-rect test)");
     }
 
     // ----- v3 inline detour on GenerateAlterScript ------------------------
@@ -801,18 +917,22 @@ extern "C" __declspec(dllexport) int __cdecl InstallHook(void) {
     LogLine("OK: GenerateAlterScript detour armed. trampoline=%p", tramp);
 
     // ----- Faz 1: detour GenerateFEScript for silent ModelSet capture -----
-    void* genFe = GetProcAddress(fep, kGenFeSym);
-    if (!genFe) {
-        LogLine("WARN: GenerateFEScript export missing - pointer capture disabled");
-    } else {
-        LogLine("GenerateFEScript addr = %p", genFe);
-        void* trampFe = nullptr;
-        if (!InstallInlineHook(genFe, (void*)&GenerateFeHook, &trampFe)) {
-            LogLine("WARN: GenerateFEScript detour NOT installed (unsafe prologue)");
+    if (!kMinimalHooksForBlackRectTest) {
+        void* genFe = GetProcAddress(fep, kGenFeSym);
+        if (!genFe) {
+            LogLine("WARN: GenerateFEScript export missing - pointer capture disabled");
         } else {
-            g_origGenerateFe = (GenerateFeFn)trampFe;
-            LogLine("OK: GenerateFEScript detour armed. trampoline=%p", trampFe);
+            LogLine("GenerateFEScript addr = %p", genFe);
+            void* trampFe = nullptr;
+            if (!InstallInlineHook(genFe, (void*)&GenerateFeHook, &trampFe)) {
+                LogLine("WARN: GenerateFEScript detour NOT installed (unsafe prologue)");
+            } else {
+                g_origGenerateFe = (GenerateFeFn)trampFe;
+                LogLine("OK: GenerateFEScript detour armed. trampoline=%p", trampFe);
+            }
         }
+    } else {
+        LogLine("[FE-DETOUR] GenerateFEScript detour skipped (minimal-hooks black-rect test)");
     }
 
     // ----- Faz A: install observer detours eagerly -----
@@ -1517,6 +1637,36 @@ static void InstallObserverHooks(void) {
         LogLine("[OBS] cannot install - Faz2 symbols not resolved");
         return;
     }
+
+    if (kMinimalHooksForBlackRectTest) {
+        // Minimal mode (black-rect bisection): install ONLY the FEWPageOptions
+        // ctor hook (so OpenAlterScriptWizardHidden detects the wizard) and
+        // resolve the direct InvokePreview address (CallInvokePreviewOnCaptured
+        // needs it). SKIP every other observer detour (PrepareServer/InitClientAs/
+        // MCX/ApplyDiff/EccBuild/EccExec/SetAS/SetMs/GetAS/Clear/FEWPagePreviewEx).
+        HMODULE eouMin = GetModuleHandleW(L"EM_EOU.dll");
+        if (!eouMin) eouMin = LoadLibraryW(L"EM_EOU.dll");
+        if (eouMin) {
+            void* fewSym = GetProcAddress(eouMin, kFEWPageOptionsCtorSym);
+            if (fewSym) {
+                void* trampMin = nullptr;
+                if (InstallInlineHook(fewSym, (void*)&FEWCtorHook, &trampMin)) {
+                    g_origFEWCtor = (FEWCtorFn)trampMin;
+                    LogLine("[OBS] (minimal) FEWPageOptions ctor hook ok @ %p", fewSym);
+                } else LogLine("[OBS] (minimal) FEWPageOptions ctor hook FAILED");
+            } else LogLine("[OBS] (minimal) FEWPageOptions ctor symbol missing");
+            void* ipSym = GetProcAddress(eouMin, kInvokePreviewSym);
+            if (ipSym) {
+                g_directInvokePreview = (InvokePreviewFn)ipSym;
+                LogLine("[OBS] (minimal) InvokePreview @ %p (direct, no detour)", ipSym);
+            } else LogLine("[OBS] (minimal) InvokePreview symbol missing");
+        } else {
+            LogLine("[OBS] (minimal) EM_EOU.dll not loaded");
+        }
+        LogLine("[OBS] (minimal) all other observer detours SKIPPED (black-rect bisection)");
+        return;
+    }
+
     LogLine("[OBS] installing observer detours...");
     void* tramp = nullptr;
     if (InstallInlineHook((void*)g_prepareServer, (void*)&PrepareServerHook, &tramp)) {
@@ -1941,6 +2091,61 @@ extern "C" __declspec(dllexport) int __cdecl GetDebugKeepWindowsVisible(void) {
     return (int)InterlockedCompareExchange(&g_dbgKeepWindowsVisible, 0, 0);
 }
 
+// ---------------------------------------------------------------------------
+// STEP-MODE (2026-06-01 - RDP black-rectangle bisection).
+//
+// The black-rectangle leak reproduces on BOTH the production AND the debug
+// Generate DDL buttons (user-confirmed 2026-06-01), so it is NOT the
+// hide/cover/showProgress/3s-pause divergence - it lives in the COMMON
+// open -> Next-loop -> Preview -> destroy path. To pinpoint the exact step
+// that turns the screen black, step-mode pops a MessageBox checkpoint before
+// and after each teardown operation. The user clicks diagram objects while a
+// checkpoint is up (the box is OWNERLESS, so it does NOT disable erwin's UI
+// thread - the user can interact with the diagram and watch for black), notes
+// whether black appeared, then clicks OK to run the next step. Whichever pair
+// of checkpoints brackets the first appearance of black identifies the trigger.
+//
+// CRITICAL: the box blocks only OUR worker thread, not erwin's UI thread. The
+// wizard is destroyed by erwin's UI thread processing the posted IDCANCEL /
+// WM_CLOSE, so it can (and will) destroy WHILE checkpoint [B] is up - that is
+// intentional: it lets the user see the destroy-induced black in real time.
+//
+// Gated by g_stepModeEnabled (separate from debug-visible). Default OFF;
+// armed via the SetStepMode export (Ctrl+Alt+S dev hotkey). Production users
+// never see a checkpoint. Pure diagnostic - remove once the trigger is found.
+static volatile LONG g_stepModeEnabled = 0;
+
+extern "C" __declspec(dllexport) void __cdecl SetStepMode(int enabled) {
+    InterlockedExchange(&g_stepModeEnabled, enabled ? 1 : 0);
+    LogLine("[STEP] step-mode %s", enabled ? "ENABLED (checkpoints will pop)" : "disabled");
+}
+
+// Show a checkpoint MessageBox if step-mode is armed; no-op otherwise.
+// tag = short id ([A]..[E]); whatJustRan = ASCII description of the step that
+// just completed. Owner=NULL so erwin stays interactive behind the box.
+static void StepCheckpoint(const char* tag, const char* whatJustRan) {
+    if (InterlockedCompareExchange(&g_stepModeEnabled, 0, 0) == 0) return;
+    LogLine("[STEP] checkpoint %s reached - %s (waiting for user OK)", tag, whatJustRan);
+    char buf[1200];
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+        "CHECKPOINT %s\n\n"
+        "Az once calisan adim:\n%s\n\n"
+        "1) Diyagrama / objelere TIKLA (bu kutu erwin'i kilitlemiyor).\n"
+        "2) SIYAHLIK olustu mu? Not et: %s -> EVET / HAYIR\n"
+        "3) Bir sonraki adim icin OK'a bas.",
+        tag, whatJustRan, tag);
+    wchar_t wbuf[1200];
+    MultiByteToWideChar(CP_UTF8, 0, buf, -1, wbuf, 1200);
+    MessageBoxW(NULL, wbuf, L"erwin DDL - STEP MODE", MB_OK | MB_TOPMOST | MB_SETFOREGROUND);
+    LogLine("[STEP] checkpoint %s - user clicked OK, continuing", tag);
+}
+
+// Exported so the managed side can place checkpoints [D]/[E] (after the native
+// teardown returns) with the same prompt + the same g_stepModeEnabled gate.
+extern "C" __declspec(dllexport) void __cdecl StepCheckpointExport(const char* tag, const char* whatJustRan) {
+    StepCheckpoint(tag ? tag : "(?)", whatJustRan ? whatJustRan : "(?)");
+}
+
 // ===================================================================
 // RECON: foreground window-tree dumper (Faz 2a, dev only)
 // ===================================================================
@@ -2096,20 +2301,149 @@ extern "C" __declspec(dllexport) int __cdecl GracefulCloseActiveMdiChild(void* m
     return 0;
 }
 
-// Hide a wizard window aggressively: make it transparent (alpha=0) AND move
-// off-screen. Using WS_EX_LAYERED with alpha=0 ensures it's not drawn at all
-// even momentarily, so no flash is perceptible. Skipped entirely when
-// g_dbgKeepWindowsVisible is set so a human can observe the pipeline.
+// Hide a wizard window so the user never sees it, WITHOUT making it
+// WS_EX_LAYERED.
+//
+// 2026-06-01: the previous approach (WS_EX_LAYERED + alpha=0 + move off-screen)
+// is the ROOT CAUSE of the "siyahlik" black-rectangle leak on RDP / Terminal
+// Server. Per-session/remote DWM does NOT release a layered window's redirection
+// surface when the window is destroyed; the surface stays mapped and every
+// subsequent erwin paint shows through as a black rectangle, process-wide, until
+// a full erwin restart (no repaint clears it). Clearing the WS_EX_LAYERED bit
+// before destroy does not help (the surface is already allocated), and the
+// ClearWizardLayeredAndFlush "1x1@(0,0) opaque + RedrawWindow + DwmFlush" release
+// trick only works on the LOCAL console where DWM observes the on-screen paint -
+// it runs but leaks on RDP. Verified by external live experiments on the real
+// wizard (c:\work\repro-wizard-live*.ps1): layered->destroy leaks; SW_HIDE
+// (never layered)->destroy does NOT leak.
+//
+// Fix: SW_HIDE ONLY. SW_HIDE removes the window from composition entirely
+// (no surface) and is leak-free on RDP - PROVEN by the live experiment
+// (repro-wizard-live2.ps1 -Method swhide: SW_HIDE at its current position then
+// destroy => no black rectangle).
+//
+// Do NOT move the window off-screen to (-32000,-32000). The off-screen park is
+// itself a leak trigger on RDP independent of WS_EX_LAYERED: a window that was
+// composited on-screen, then moved off the visible desktop and destroyed,
+// orphans its surface back onto the visible region (the original 2026-05-05
+// theory was right that off-screen is the problem - it just blamed only the
+// layered bit). A first SW_HIDE+off-screen build (2026-06-01) still leaked;
+// removing the move fixed it. SW_HIDE leaves the (now hidden, never-painted)
+// window at its real position so destroy releases cleanly.
+//
+// Skipped entirely when g_dbgKeepWindowsVisible is set so a human can observe.
 static void HideWizardAggressive(HWND hwnd) {
     if (InterlockedCompareExchange(&g_dbgKeepWindowsVisible, 0, 0) != 0) {
         LogLine("[DBG-VISIBLE] HideWizardAggressive skipped for hwnd=0x%p (debug mode on)", hwnd);
         return;
     }
-    LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED | WS_EX_TOOLWINDOW);
-    SetLayeredWindowAttributes(hwnd, 0, 0 /* fully transparent */, LWA_ALPHA);
-    SetWindowPos(hwnd, NULL, -32000, -32000, 0, 0,
-        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    ShowWindow(hwnd, SW_HIDE);
+    LogLine("[HIDE] hwnd=%p SW_HIDE only (no WS_EX_LAYERED, no off-screen move)", hwnd);
+}
+
+// ---------------------------------------------------------------------------
+// Opaque "wizard cover" (2026-06-01 - Candidate B, RDP black-rectangle fix).
+//
+// ROOT CAUSE recap: on RDP / Terminal Server (per-session DWM) the silent
+// alter-script DDL capture leaked black rectangles. SW_HIDE alone is leak-free
+// ONLY for hide-then-immediate-destroy; but the production IPS-CALL Next-loop
+// (WM_COMMAND 1766) plus GenerateAlterScript(showProgress=1) force erwin to
+// COMPOSE page/progress child windows UNDER the hidden sheet, which RDP DWM then
+// orphans when the whole tree is destroyed -> black blocks process-wide until
+// erwin restart (no repaint clears them). The EMPIRICALLY PROVEN no-leak path
+// (matrix item 4 / DEBUG mode) is to keep the wizard VISIBLE so every child
+// window gets a normal composited show->destroy lifecycle. To keep the
+// operation SILENT we leave the wizard visible but draw an opaque, NON-layered,
+// top-most cover over the whole monitor for the duration. The cover is itself a
+// normal visible window, so destroying it does not leak. Used ONLY for the
+// navigated alter-script wizard; the cleanup cascade keeps plain SW_HIDE (no
+// navigation -> no leak, proven by the watcher Add-In Manager SW_HIDE+close).
+static HWND g_wizCover = nullptr;
+static const wchar_t* kWizCoverClass = L"ErwinWizCoverCls";
+
+static LRESULT CALLBACK WizCoverWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_ERASEBKGND) {
+        RECT rc; GetClientRect(h, &rc);
+        HBRUSH br = CreateSolidBrush(RGB(245, 246, 248));
+        FillRect((HDC)w, &rc, br);
+        DeleteObject(br);
+        return 1;
+    }
+    if (m == WM_PAINT) {
+        PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
+        RECT rc; GetClientRect(h, &rc);
+        HBRUSH br = CreateSolidBrush(RGB(245, 246, 248));
+        FillRect(dc, &rc, br);
+        DeleteObject(br);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(40, 42, 54));
+        HFONT fnt = CreateFontW(42, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        HGDIOBJ oldF = SelectObject(dc, fnt);
+        DrawTextW(dc, L"Generating DDL, please wait...", -1, &rc,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SelectObject(dc, oldF);
+        DeleteObject(fnt);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+// Show the opaque cover over the monitor the wizard is on, and DO NOT hide the
+// wizard (it stays VISIBLE behind the cover - that is the no-leak condition).
+// No-op in debug-visible mode so a human can watch the pipeline. Paired with
+// HideWizardCover() at teardown; both run on the worker thread that drives the
+// pipeline (OpenAlterScriptWizardHidden + CloseHiddenWizard are sequential on
+// the same thread, so DestroyWindow's same-thread requirement is met).
+static void ShowWizardCoverOver(HWND wizard) {
+    if (InterlockedCompareExchange(&g_dbgKeepWindowsVisible, 0, 0) != 0) {
+        LogLine("[COVER] skipped (debug-visible mode) - wizard stays visible, uncovered");
+        return;
+    }
+    if (g_wizCover && IsWindow(g_wizCover)) return;
+    HINSTANCE hInst = GetModuleHandleW(NULL);
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = WizCoverWndProc;
+        wc.hInstance = hInst;
+        wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_WAIT);   // IDC_WAIT is an integer resource; cast for the W variant (file isn't built /DUNICODE)
+        wc.lpszClassName = kWizCoverClass;
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+    HWND ref = (wizard && IsWindow(wizard)) ? wizard : FindErwinMain();
+    HMONITOR mon = MonitorFromWindow(ref, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFO mi = {}; mi.cbSize = sizeof(mi);
+    RECT r = { 0, 0, 1920, 1080 };
+    if (GetMonitorInfoW(mon, &mi)) r = mi.rcMonitor;
+    g_wizCover = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        kWizCoverClass, L"", WS_POPUP,
+        r.left, r.top, r.right - r.left, r.bottom - r.top,
+        NULL, NULL, hInst, NULL);
+    if (g_wizCover) {
+        ShowWindow(g_wizCover, SW_SHOWNA);
+        UpdateWindow(g_wizCover);   // synchronous paint - works without a msg pump on this worker thread
+        LogLine("[COVER] shown over monitor (%ld,%ld %ldx%ld); wizard hwnd=%p left VISIBLE behind it (no SW_HIDE)",
+            r.left, r.top, r.right - r.left, r.bottom - r.top, wizard);
+    } else {
+        // Cover failed: leave the wizard VISIBLE (user sees it briefly) rather
+        // than SW_HIDE it, because SW_HIDE+navigation is exactly what leaks.
+        LogLine("[COVER] CreateWindowExW failed err=0x%lX - wizard left visible (no cover, no SW_HIDE to avoid leak)", GetLastError());
+    }
+}
+
+// Destroy the opaque cover. Must run on the same thread that created it.
+static void HideWizardCover() {
+    if (g_wizCover) {
+        if (IsWindow(g_wizCover)) DestroyWindow(g_wizCover);
+        g_wizCover = nullptr;
+        LogLine("[COVER] destroyed");
+    }
 }
 
 // Reverses HideWizardAggressive's WS_EX_LAYERED|WS_EX_TOOLWINDOW + alpha=0
@@ -2202,13 +2536,28 @@ static void CALLBACK WizardWinEventCb(
     // Check title. At OBJECT_CREATE it might still be empty; retry at
     // OBJECT_SHOW / NAMECHANGE.
     if (LooksLikeAlterScriptWizard(hwnd)) {
-        HideWizardAggressive(hwnd);
+        // 2026-06-02: re-hide the wizard. The black-rectangle leak was traced to
+        // an add-in HOOK (minimal-hooks build => no black, user-confirmed), NOT
+        // to the wizard's visibility - so the "Option A leave-visible" workaround
+        // (2026-06-01) is no longer needed and is reverted here. The earlier
+        // "every hide variant still leaks" conclusion was the HOOK corruption
+        // misattributed to hiding. HideWizardAggressive uses SW_HIDE only (no
+        // WS_EX_LAYERED, no off-screen move - the historically clean variant); a
+        // genuinely-hidden destroy with the corrupting hook removed does not
+        // orphan a surface. Keeps the pipeline silent + fast (no visible wizard).
         InterlockedExchange64(&g_hiddenWizardHwnd, (LONG64)hwnd);
-        LogLine("[WIN-EVT] hid wizard via WinEvent event=%lu hwnd=%p", event, hwnd);
+        HideWizardAggressive(hwnd);
+        LogLine("[WIN-EVT] wizard hidden (SW_HIDE) event=%lu hwnd=%p", event, hwnd);
     }
 }
 
 extern "C" __declspec(dllexport) void* __cdecl OpenAlterScriptWizardHidden(void) {
+    // Defensive: tear down any opaque cover stranded by a prior failed run
+    // before we open + cover a fresh wizard (runs on this same worker thread).
+    HideWizardCover();
+    // Mark OUR automation active so the GA detour forces showProgress=false for
+    // the generate that fires while this wizard is occluded behind the cover.
+    InterlockedExchange(&g_automationActive, 1);
     HWND mainHwnd = FindErwinMain();
     if (!mainHwnd) { LogLine("[OPEN-WIZ] erwin main window not found"); return nullptr; }
     LogLine("[OPEN-WIZ] erwin main = %p", (void*)mainHwnd);
@@ -2216,6 +2565,10 @@ extern "C" __declspec(dllexport) void* __cdecl OpenAlterScriptWizardHidden(void)
     // Baseline: what dialogs exist BEFORE we trigger the shortcut?
     auto before = EnumerateVisibleDialogs();
     LogLine("[OPEN-WIZ] baseline: %zu visible dialogs", before.size());
+    // RDP wizard-open debug 2026-06-01: the FEWCtor 15s timeout reproduces with
+    // an accumulating baseline dialog count - dump each so we can identify what
+    // Ctrl+Alt+T leaves open (a prompt that is NOT our FEWPageOptions wizard).
+    LogAllVisibleDialogs("[OPEN-WIZ] baseline");
 
     // Reset signals so we can poll for the NEXT fire.
     InterlockedExchange(&g_autoOpenCtorFired, 0);
@@ -2239,9 +2592,44 @@ extern "C" __declspec(dllexport) void* __cdecl OpenAlterScriptWizardHidden(void)
         WINEVENT_OUTOFCONTEXT);
     LogLine("[OPEN-WIZ] WinEvent hook = %p", (void*)evHook);
 
-    // Bring erwin to foreground so keyboard input is delivered there.
-    SetForegroundWindow(mainHwnd);
-    Sleep(80);
+    // Bring erwin's main frame to the foreground RELIABLY before injecting the
+    // Ctrl+Alt+T accelerator. SendInput delivers to the foreground thread's
+    // FOCUSED window; when Generate DDL is clicked the addin form ('Elite Soft
+    // Erwin Model Configurator') is foreground, and a plain SetForegroundWindow
+    // from this background worker thread does NOT transfer foreground while
+    // another same-process window owns it - so the keystroke misses erwin's main
+    // frame and the alter wizard never opens (verified 2026-06-01: MANUAL
+    // Ctrl+Alt+T opens the wizard fine, but the automated SendInput path times
+    // out at 15s; accumulating baseline dialog count confirmed the keys were
+    // landing somewhere other than the main frame). The AttachThreadInput trick
+    // shares input state with the current-foreground + main UI threads so
+    // SetForegroundWindow / BringWindowToTop / SetFocus actually take effect.
+    HWND fgBefore = GetForegroundWindow();
+    {
+        wchar_t t[200] = {0}, c[80] = {0};
+        if (fgBefore) { GetWindowTextW(fgBefore, t, 199); GetClassNameW(fgBefore, c, 79); }
+        LogLine("[OPEN-WIZ] foreground BEFORE steal: hwnd=%p class='%ls' title='%ls'", fgBefore, c, t);
+    }
+    DWORD myThread   = GetCurrentThreadId();
+    DWORD fgThread   = fgBefore ? GetWindowThreadProcessId(fgBefore, nullptr) : 0;
+    DWORD mainThread = GetWindowThreadProcessId(mainHwnd, nullptr);
+    bool attFg   = (fgThread   && fgThread   != myThread) && (AttachThreadInput(myThread, fgThread,   TRUE) != 0);
+    bool attMain = (mainThread && mainThread != myThread && mainThread != fgThread) && (AttachThreadInput(myThread, mainThread, TRUE) != 0);
+    if (IsIconic(mainHwnd)) ShowWindow(mainHwnd, SW_RESTORE);
+    BOOL sfgRv = SetForegroundWindow(mainHwnd);
+    BringWindowToTop(mainHwnd);
+    SetActiveWindow(mainHwnd);
+    SetFocus(mainHwnd);
+    if (attMain) AttachThreadInput(myThread, mainThread, FALSE);
+    if (attFg)   AttachThreadInput(myThread, fgThread,   FALSE);
+    Sleep(120);
+    {
+        HWND fg = GetForegroundWindow();
+        wchar_t t[200] = {0}, c[80] = {0};
+        if (fg) { GetWindowTextW(fg, t, 199); GetClassNameW(fg, c, 79); }
+        LogLine("[OPEN-WIZ] foreground steal: SetForegroundWindow rv=%d attFg=%d attMain=%d; foreground AFTER: hwnd=%p class='%ls' title='%ls' (main=%p)",
+            (int)sfgRv, (int)attFg, (int)attMain, fg, c, t, mainHwnd);
+    }
 
     // Simulate Ctrl+Alt+T via SendInput.
     INPUT inputs[6] = {};
@@ -2293,9 +2681,11 @@ extern "C" __declspec(dllexport) void* __cdecl OpenAlterScriptWizardHidden(void)
         for (HWND x : nowList) {
             if (before.find(x) != before.end()) continue;
             if (LooksLikeAlterScriptWizard(x)) {
-                HideWizardAggressive(x);
+                // 2026-06-02: re-hide (see WizardWinEventCb). Black was a HOOK,
+                // not visibility; SW_HIDE is the clean hide now the hook is gone.
                 InterlockedExchange64(&g_hiddenWizardHwnd, (LONG64)x);
-                LogLine("[OPEN-WIZ] fallback-hid wizard hwnd=%p", (void*)x);
+                HideWizardAggressive(x);
+                LogLine("[OPEN-WIZ] fallback wizard hidden (SW_HIDE) hwnd=%p", (void*)x);
                 UnhookWinEvent(evHook);
                 return (void*)x;
             }
@@ -2325,6 +2715,18 @@ extern "C" __declspec(dllexport) void __cdecl CloseHiddenWizard(void* hwnd) {
     PostMessage(h, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
     // Also post WM_CLOSE as a fallback in case IDCANCEL routes elsewhere.
     PostMessage(h, WM_CLOSE, 0, 0);
+
+    // Candidate B teardown: the wizard was kept VISIBLE behind g_wizCover (not
+    // SW_HIDE), so let it (and any child page/progress windows) finish
+    // destroying BEHIND the cover - a visible-window destroy gives DWM a clean
+    // uncover-repaint and does not orphan a surface on RDP - THEN remove the
+    // cover to reveal the clean diagram. HideWizardCover runs on this same
+    // worker thread that created the cover (DestroyWindow same-thread rule).
+    Sleep(150);
+    HideWizardCover();
+    // Our automated pipeline is done; let the user's MANUAL wizard keep its
+    // visible progress bar (showProgress unchanged when this flag is clear).
+    InterlockedExchange(&g_automationActive, 0);
     InterlockedExchange64(&g_hiddenWizardHwnd, 0);
     // Invalidate the cached FEWPageOptions / FEWPagePreviewEx 'this' pointers.
     // The C++ objects are destroyed when the CPropertySheet modal loop exits;
@@ -2490,14 +2892,14 @@ extern "C" __declspec(dllexport) const char* __cdecl CallInvokePreviewOnCaptured
         // 2026-05-08 on second consecutive Generate DDL click. Sleep is
         // split so the dismiss probe runs both early (popup just appeared)
         // and late (popup paint finished, button accepts BM_CLICK).
-        Sleep(150);
+        Sleep(100);   // trimmed 150->100 (snappier; keeps the early dismiss probe)
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
         DismissDiagramSelectionPopup();
-        Sleep(200);
+        Sleep(120);   // trimmed 200->120 (late dismiss probe; popup paint still settles)
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
@@ -2532,7 +2934,7 @@ extern "C" __declspec(dllexport) const char* __cdecl CallInvokePreviewOnCaptured
     } else {
         // Non-empty path: GA fired with DDL but the actual Preview page
         // initialization can lag the last Next click by a few hundred ms.
-        Sleep(400);
+        Sleep(250);   // trimmed 400->250 (snappier Preview settle)
         MSG settleMsg;
         while (PeekMessageW(&settleMsg, nullptr, 0, 0, PM_REMOVE)) {
             TranslateMessage(&settleMsg);
@@ -2549,6 +2951,15 @@ extern "C" __declspec(dllexport) const char* __cdecl CallInvokePreviewOnCaptured
     ddl = g_lastCapturedDdl;
     g_lastCapturedDdl = nullptr;
     LeaveCriticalSection(&g_ddlLock);
+
+    // STEP [A]: Next-loop done; the wizard is still ALIVE on the Preview page
+    // and (post-2026-06-01 RDP fix) genuinely visible. No close message yet.
+    // Report whether the GA detour actually captured a DDL this run so a
+    // no-diff / no-capture run is not mistaken for a real leak test.
+    if (ddl)
+        StepCheckpoint("A", "DDL YAKALANDI; wizard hala Preview'da ACIK ve gorunur. Henuz HICBIR kapatma mesaji yok.");
+    else
+        StepCheckpoint("A", "DDL YOK (GA detour atesleme yok / fark yok); wizard hala ACIK. Henuz HICBIR kapatma mesaji yok. (Gercek leak testi icin DDL uretilmeli.)");
 
     // Force-finish the wizard before returning. Without this loop the
     // managed-side CloseHiddenWizard fires PostMessage IDCANCEL but
@@ -2574,6 +2985,10 @@ extern "C" __declspec(dllexport) const char* __cdecl CallInvokePreviewOnCaptured
     LogLine("[IPS-CALL] forcing wizard finish before return (hwnd=%p)", wizard);
     PostMessage(wizard, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
     PostMessage(wizard, WM_CLOSE, 0, 0);
+    // STEP [B]: IDCANCEL + WM_CLOSE posted to erwin's UI thread. The MFC
+    // CPropertySheet destroy chain runs on erwin's UI thread and may complete
+    // WHILE this checkpoint box is up - this is intentional, watch the diagram.
+    StepCheckpoint("B", "IDCANCEL + WM_CLOSE gonderildi. Wizard yikimi simdi erwin UI thread'inde basliyor. BU KUTU ACIKKEN diyagrama bak: siyahlik wizard kapanirken mi olusuyor?");
     int waitTotal = 0;
     while (IsWindow(wizard) && waitTotal < 3000) {
         Sleep(100);
@@ -2596,6 +3011,11 @@ extern "C" __declspec(dllexport) const char* __cdecl CallInvokePreviewOnCaptured
         // for the next OpenAlterScriptWizardHidden call.
         InterlockedExchange64(&g_hiddenWizardHwnd, 0);
     }
+
+    // STEP [C]: wait loop done; the wizard is (normally) fully DESTROYED now -
+    // its page/progress child windows are gone. If black appeared between [A]
+    // and here, erwin's CPropertySheet destroy on RDP is the trigger.
+    StepCheckpoint("C", "Wizard DESTROY zinciri tamamlandi (IsWindow=false). Tum page/progress child pencereleri yok edildi.");
 
     if (ddl) {
         LogLine("[IPS-CALL] SUCCESS - %zu chars of DDL via GA detour", strlen(ddl));
@@ -3777,25 +4197,42 @@ static void ResolveCCInspectionSymbols(void) {
         LogLine("[CC-INSP] EM_ECC.dll not loaded");
     }
 
-    // Auto-start the CC-state poller so user doesn't need to click anything.
-    // It runs for the entire erwin session and emits one log line per change.
-    CCInsp_StartPoller();
-    LogLine("[CC-INSP] CC-state poller started (100ms interval)");
+    // CC-state poller: PURE DIAGNOSTIC (no consumer) + an always-running
+    // AddItem-class observer of erwin globals. Keep it OFF in the minimal/
+    // production config.
+    if (!kMinimalHooksForBlackRectTest) {
+        CCInsp_StartPoller();
+        LogLine("[CC-INSP] CC-state poller started (100ms interval)");
+    } else {
+        LogLine("[CC-INSP] CC-state poller skipped (diagnostic, no consumer)");
+    }
 
-    // Auto-install the ELA::OnFE detour so we can log every alter-script
-    // entry (whether programmatic or via the 'Right Alter Script' button).
-    int rcHook = CCInsp_InstallOnFeHook();
-    LogLine("[CC-INSP] OnFE hook install rc=%d", rcHook);
-
-    // Auto-install EDR transaction-tracker hooks so we can capture the
-    // RIGHT-side modelSet during CC + Apply-to-Right without requiring
-    // the user to click 'Right Alter Script' manually first.
-    int rcEdr = CCInsp_InstallEdrHooks();
-    LogLine("[CC-INSP] EDR hooks install rc=%d", rcEdr);
-
-    // Auto-install CC pipeline hooks in EM_ECC to observe which CWizInterface
-    // entry point the Complete Compare + Apply-to-Right flow actually uses.
-    InstallEccPipelineHooks();
+    // FUNCTIONAL pipeline hooks - install UNCONDITIONALLY (needed by From-DB and
+    // Mart-Mart cross-version). By design these fire only inside a Complete-
+    // Compare / Resolve-Differences / Apply-to-Right flow, NOT erwin's plain
+    // Actions>Alter Script, so they do NOT reintroduce the manual-alter black
+    // (the FE-path passive observers that DID are stripped via the minimal flag):
+    //   - ElaOnFe (ELA::OnFE): GenerateMartMartDdlViaOnFE drives the wizard via
+    //     its trampoline + g_lastOnFeMs fallback (Mart-Mart).
+    //   - EDR: GetEdrTxCount() tx-settle gate consumed by ApplyToRightArrowAnd
+    //     WaitForRas in BOTH From-DB and Mart-Mart; g_lastEdrMs primary MS.
+    //   - ECC ShowERwinCCWiz: g_lastCcWizMs1 ms1 capture (Mart-Mart).
+    // If a From-DB / Mart-Mart run later shows black, one of THESE is a second-
+    // tier corruptor (ElaOnFe is the wildcard) -> bisect or go Worker-process.
+    if (kInstallPipelineHooks) {
+        int rcHook = CCInsp_InstallOnFeHook();   // DIRECT-CALL mode (no detour) when kElaOnFeDirectCall
+        LogLine("[CC-INSP] OnFE resolve rc=%d (DIRECT-CALL, no detour - Mart-Mart)", rcHook);
+        if (kInstallEdrEccHooks) {
+            int rcEdr = CCInsp_InstallEdrHooks();
+            LogLine("[CC-INSP] EDR hooks install rc=%d (functional: From-DB/Mart-Mart Apply-to-Right)", rcEdr);
+            InstallEccPipelineHooks();
+            LogLine("[CC-INSP] ECC pipeline hooks installed (ShowERwinCCWiz functional)");
+        } else {
+            LogLine("[CC-INSP] EDR + ECC detours SKIPPED (heap-corruption isolation test; Apply-to-Right uses timing fallback)");
+        }
+    } else {
+        LogLine("[CC-INSP] OnFE / EDR / ECC-pipeline SKIPPED - ELA::OnFE detour corrupts the render on RDP (fires on every alter). From-DB/Mart-Mart need a Worker process instead. Same-version works without these.");
+    }
 }
 
 // Exported: returns CERwinFEData::GetActionSummary() or null.
@@ -4479,6 +4916,17 @@ extern "C" __declspec(dllexport) int __cdecl CCInsp_InstallOnFeHook(void) {
     if (!ela) return -1;
     void* target = GetProcAddress(ela, kElaOnFeSym);
     if (!target) { LogLine("[ONFE-HOOK] OnFE symbol not found"); return -2; }
+    if (kElaOnFeDirectCall) {
+        // DIRECT-CALL mode (2026-06-02): cache the UN-PATCHED address and DO NOT
+        // install a detour. The inline patch on ELA::OnFE was the 2nd confirmed
+        // black-rectangle corruptor (it fires on every alter); calling the
+        // address directly does not corrupt. g_origElaOnFe stays null, so
+        // g_lastOnFeMs is never captured -> callers must pass an explicit ms
+        // (the Mart-Mart orchestrator's primary path already does).
+        g_elaOnFe = (ElaOnFeFn)target;
+        LogLine("[ONFE-HOOK] DIRECT-CALL: g_elaOnFe=%p (no detour - RDP-safe)", target);
+        return 0;
+    }
     if (g_origElaOnFe) { LogLine("[ONFE-HOOK] already installed"); return 1; }
     void* tramp = nullptr;
     if (!InstallInlineHook(target, (void*)&ElaOnFeHook, &tramp)) {
