@@ -21,6 +21,12 @@
 param(
     [switch]$Zip,
     [string]$License,
+    # License expiration date, forwarded to KeyGen as --expires. Any string
+    # DateTime.TryParse can read is accepted (yyyy-MM-dd recommended for
+    # culture-independence). When omitted, the license is perpetual. Only
+    # meaningful with -License; specifying -Expires without -License is a
+    # hard error.
+    [string]$Expires,
     # MetaRepo bootstrap seed. Param names (-DBHost, -DBPort, -DBName, -DBUserName,
     # -DBPassword, -DBType) match the registry value names under
     # SOFTWARE\EliteSoft\MetaRepo\Bootstrap. PowerShell parameter binding is
@@ -54,7 +60,9 @@ if ($Help) {
     Write-Host "Usage:" -ForegroundColor Yellow
     Write-Host "  .\package.ps1                                    Publish to default folder (no compression)"
     Write-Host "  .\package.ps1 -Zip                               Create ZIP at <scriptDir>\dist"
-    Write-Host "  .\package.ps1 -Zip -License HWID                 Embed hardware license"
+    Write-Host "  .\package.ps1 -Zip -License HWID                 Embed perpetual hardware license"
+    Write-Host "  .\package.ps1 -Zip -License HWID -Expires 2027-01-01"
+    Write-Host "                                                   Embed license that expires on 2027-01-01"
     Write-Host "  .\package.ps1 -PackageName MyDevPkg              Folder output to C:\EliteSoft\MyDevPkg"
     Write-Host "  .\package.ps1 -PackageName MyDevPkg -Zip         ZIP at C:\EliteSoft\MyDevPkg\MyDevPkg.zip"
     Write-Host "  .\package.ps1 -DBHost srv -DBName MR \           Bake bootstrap config (DB connection) into"
@@ -91,6 +99,7 @@ if (-not $isAdmin) {
     $elevateArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`""
     if ($Zip)                                  { $elevateArgs += " -Zip" }
     if ($License)                              { $elevateArgs += " -License `"$License`"" }
+    if ($Expires)                              { $elevateArgs += " -Expires `"$Expires`"" }
     if ($DBHost)                               { $elevateArgs += " -DBHost `"$DBHost`"" }
     if ($DBPort)                               { $elevateArgs += " -DBPort `"$DBPort`"" }
     if ($DBName)                               { $elevateArgs += " -DBName `"$DBName`"" }
@@ -100,6 +109,27 @@ if (-not $isAdmin) {
     if ($PackageName)                          { $elevateArgs += " -PackageName `"$PackageName`"" }
     Start-Process powershell.exe -ArgumentList $elevateArgs -Verb RunAs
     exit
+}
+
+# Validate -Expires up front so we fail before the 30+ second publish step
+# rather than 30+ seconds in when KeyGen would reject it. Empty string =
+# perpetual (default KeyGen behaviour); any non-empty value MUST parse as a
+# DateTime and MUST be paired with -License (otherwise the user wired the
+# flag to a no-op build).
+$expiresDate = $null
+if ($Expires) {
+    if (-not $License) {
+        Write-Host "ERROR: -Expires requires -License (expires only applies when a license is being embedded)." -ForegroundColor Red
+        exit 1
+    }
+    $parsed = [datetime]::MinValue
+    if (-not [datetime]::TryParse($Expires, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)) {
+        Write-Host "ERROR: -Expires value '$Expires' is not a valid date. Use YYYY-MM-DD (e.g. 2027-01-01)." -ForegroundColor Red
+        exit 1
+    }
+    # Normalize to ISO date for the KeyGen CLI call so culture / time-zone
+    # surprises can't change the embedded date.
+    $expiresDate = $parsed.ToUniversalTime()
 }
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -134,6 +164,34 @@ if ($PackageName) {
 if ($Zip) { $format = "ZIP" } else { $format = "FOLDER" }
 
 Write-Host "=== Elite Soft Erwin Add-In - Package ($format) ===" -ForegroundColor Cyan
+
+# STEP 0: Native bridge (cl.exe) - MUST run before publish.
+# package.ps1 only COPIES the native DLL (via the csproj <Copy> task that
+# copies scripts\native-bridge\ErwinNativeBridge.dll into the publish output);
+# it never compiled it. So a packaged build could SILENTLY ship a stale native
+# DLL whenever native-bridge.cpp changed since the last build-and-run (exactly
+# the trap that shipped Emre an old DLL on 2026-06-01). Rebuild it here,
+# UNCONDITIONALLY (no Test-AnyNewer gate like build-and-run uses): packaging is
+# an infrequent release op where shipping the correct binary beats the ~3-8s
+# cl.exe cost. build.ps1 sets $ErrorActionPreference=Stop and throws on compile
+# failure, so any error halts the package before publish (never ships a half
+# build). A missing build script is a loud warning, not a hard stop, so a
+# package can still be cut from a committed DLL on a box without VS BuildTools.
+Write-Host "`n[0] Building native bridge (cl.exe)..." -ForegroundColor Yellow
+$bridgeScript = Join-Path $scriptDir "scripts\native-bridge\build.ps1"
+$bridgeDll    = Join-Path $scriptDir "scripts\native-bridge\ErwinNativeBridge.dll"
+if (Test-Path $bridgeScript) {
+    & $bridgeScript
+    if (-not (Test-Path $bridgeDll)) {
+        Write-Host "Native bridge build failed - DLL not produced! Aborting package (would ship a stale/missing native DLL)." -ForegroundColor Red
+        Write-Host "`nPress any key to exit..." -ForegroundColor Gray
+        $null = (Get-Host).UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+        exit 1
+    }
+    Write-Host "  Native bridge rebuilt." -ForegroundColor Green
+} else {
+    Write-Host "  WARNING: native bridge build script not found at $bridgeScript - packaging the EXISTING scripts\native-bridge\ErwinNativeBridge.dll as-is (it may be stale)." -ForegroundColor Yellow
+}
 
 # STEP 1: Publish
 Write-Host "`n[1] Publishing release build..." -ForegroundColor Yellow
@@ -202,7 +260,20 @@ $null = (Get-Host).UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
 
     Copy-Item $privateKeySource $privateKeyTarget -Force
     Push-Location $keyGenDir
-    dotnet run --project $keyGenProject -c Debug -- genlicense --hwid $License --licensee "ErwinAddIn" --features "ErwinAddIn" -o $licenseOutput
+    # Build the KeyGen argument list as an array so the splat preserves
+    # quoting semantics even when --expires is omitted. KeyGen treats a
+    # missing --expires as perpetual (DateTime.MaxValue).
+    $keyGenArgs = @(
+        'genlicense'
+        '--hwid',     $License
+        '--licensee', 'ErwinAddIn'
+        '--features', 'ErwinAddIn'
+        '-o',         $licenseOutput
+    )
+    if ($expiresDate) {
+        $keyGenArgs += @('--expires', $expiresDate.ToString('yyyy-MM-dd'))
+    }
+    dotnet run --project $keyGenProject -c Debug -- @keyGenArgs
     $exitCode = $LASTEXITCODE
     Pop-Location
     Remove-Item $privateKeyTarget -Force -ErrorAction SilentlyContinue
@@ -213,7 +284,8 @@ $null = (Get-Host).UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
 $null = (Get-Host).UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
         exit 1
     }
-    Write-Host "  License embedded" -ForegroundColor Green
+    $expiresLabel = if ($expiresDate) { $expiresDate.ToString('yyyy-MM-dd') } else { 'Perpetual' }
+    Write-Host "  License embedded (expires: $expiresLabel)" -ForegroundColor Green
 }
 
 # STEP 3 (legacy injection components - REMOVED 2026-05-26):
@@ -234,6 +306,10 @@ $null = (Get-Host).UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
 [System.IO.File]::Copy((Join-Path $scriptDir "installer\install-impl.ps1"),    (Join-Path $publishDir "install-impl.ps1"),    $true)
 [System.IO.File]::Copy((Join-Path $scriptDir "installer\install.bat"),    (Join-Path $publishDir "install.bat"),    $true)
 [System.IO.File]::Copy((Join-Path $scriptDir "installer\uninstall.bat"),  (Join-Path $publishDir "uninstall.bat"),  $true)
+# watcher-control.ps1 is dot-sourced by install-impl.ps1 via $PSScriptRoot;
+# it MUST sit next to install-impl.ps1 in the package or every install fails
+# with "watcher-control.ps1 not found".
+[System.IO.File]::Copy((Join-Path $scriptDir "installer\watcher-control.ps1"), (Join-Path $publishDir "watcher-control.ps1"), $true)
 [System.IO.File]::Copy((Join-Path $scriptDir "scripts\autostart-watcher.ps1"), (Join-Path $publishDir "autostart-watcher.ps1"), $true)
 
 # STEP 6: Bake bootstrap seed (DB connection) into the package when any of the

@@ -4,6 +4,47 @@ A running log of corrections and non-obvious findings that future sessions
 should not have to rediscover. Each entry is a short rule, the reason, and
 how to apply it.
 
+## 2026-06-02: A "COM-RCW lifetime" crash is not "unsolvable / needs a Worker" until you (a) read the dump's native stacks and (b) try deterministic Marshal release
+
+**Rule:** when an in-process SCAPI pipeline crashes erwin with a fatal
+`System.ExecutionEngineException` at teardown, do NOT jump to "the COM
+lifetime is unfixable, rebuild it out-of-process in a Worker". First:
+(1) find the real crash dump (`%LOCALAPPDATA%\CrashDumps\erwin.exe.*.dmp`)
+and walk the NATIVE stacks of BOTH the finalizer thread and the faulting
+STA thread; (2) check whether the pipeline ever calls
+`Marshal.ReleaseComObject` / `FinalReleaseComObject` on the RCWs it
+creates - if it does not, that is almost certainly the bug.
+
+**Why:** the From-DB / Review / cross-version teardown EEE was pinned for
+weeks as "orphan-PU RCW lifetime, Worker is the real fix", and an earlier
+"is it apartment?" test was mis-run (it moved monitoring RESUME to the STA
+via BeginInvoke, which changed the wrong knob and 'ruled out' apartment).
+The dump (`erwin.exe.29840.dmp`, 2026-06-02) proved the exact mechanism:
+the CLR finalizer thread (MTA) drains abandoned SCAPI RCWs via
+`RCWCleanupList::CleanupAllWrappers`, cross-apartment-marshals
+`IUnknown::Release` onto erwin's main STA, and that Release faults inside
+`coreclr!SafeReleasePreemp` on an already-freed object (RDI=0x0BADF00D
+heap poison) -> CLR escalates the AV to a FailFast EEE. The whole
+in-process pipeline had ZERO COM releases (every SCAPI RCW was abandoned
+to GC); the same-version path ships clean precisely because it creates no
+2nd-model RCWs. The codebase's own `ValidationCoordinatorService.ReleaseCom`
+already does the right thing for the active-model walk - the From-DB path
+just never adopted it. So the standard cure (deterministic in-STA release
+before teardown frees the natives) was never even attempted before
+reaching for the much heavier Worker / separate-Windows-logon design.
+
+**How to apply:** release every SCAPI RCW you create (sessions,
+ModelObjects, Root, Collect results AND each per-item proxy in a foreach,
+PropertyBags) deterministically, on the STA, BEFORE the native objects are
+torn down - reuse `ReleaseComSafe` (ModelConfigForm) /
+`ValidationCoordinatorService.ReleaseCom`. Release per-item proxies inside
+the loop and the collection/root/modelObjects before `session.Close()`.
+Avoid `GC.WaitForPendingFinalizers` on the STA (it can deadlock if a
+finalizer must marshal a Release back to that blocked STA). Note
+`FinalReleaseComObject(rePU)` (an RCW refcount drop) is NOT the same as
+`PUs.Remove` (engine removal that invalidates the active mart root) - the
+former is safe, the latter is why Remove was skipped.
+
 ## 2026-05-31: Never use System.Windows.Forms.MessageBox - use AddinMessageDialog
 
 **Rule:** every user-facing modal popup must go through

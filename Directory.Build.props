@@ -1,0 +1,7 @@
+<Project>
+  <!-- Managed by Elite Release Manager: single source of the add-in product version.
+       The ErwinAlterDdl/ subtree keeps its own Directory.Build.props (nearest wins). -->
+  <PropertyGroup>
+    <Version>0.1.0-alpha</Version>
+  </PropertyGroup>
+</Project>

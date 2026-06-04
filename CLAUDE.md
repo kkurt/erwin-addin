@@ -86,7 +86,7 @@
 - **Hata yutma yasağına uy:** bir exception'ı görmezden geldiğini yakalarsam Faz baştan başlar
 
 
-Hiçbir yerde emdash kullanma! Scriptlerde ve dökümantasyonda!
+Hiçbir yerde emdash kullanma! Script,dökümantasyonlar ve kodda!
 
 Her zaman benim söylediğim doğru olmayabilir, yanlış analiz etmiş olabilirim.
 Söylediklerimi sorgula, ayrıca senin de çözüm için bulduğun  mantıklarını  da sorgula. Bunları unutma!

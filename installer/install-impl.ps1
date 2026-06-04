@@ -69,6 +69,12 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Shared watcher control helpers (Stop-AddinWatcher / Start-AddinWatcher).
+# Dot-sourced here so both the Uninstall and Install paths can use them
+# without conditional re-loading. The file lives next to install-impl.ps1
+# both in the repo (installer/) and in the packaged install (publish dir).
+. (Join-Path $PSScriptRoot 'watcher-control.ps1')
+
 if ($Help) {
     Write-Host ""
     Write-Host "Elite Soft Erwin Add-In - Installer" -ForegroundColor Cyan
@@ -240,64 +246,11 @@ function Unregister-ComUserScope([string]$clsid, [string]$progId) {
     }
 }
 
-# Stop any running autostart-watcher.ps1 processes via named-event signal then
-# Stop-Process fallback. Replaces the deprecated WMI Win32_Process.Terminate
-# pattern (SEP's AGR.Terminate!g2 heuristic flags powershell.exe killing
-# another powershell.exe via WMI). Used by BOTH install (before re-deploying
-# files) and uninstall (before removing $installDir which holds the watcher
-# script). Without this on uninstall, the orphan watcher kept running after
-# scheduled task was removed, and the next install had to clean it up
-# itself - cosmetic but confusing, and could rarely lock files in the
-# install dir.
-#
-# The named event signal currently does not reach the watcher because its
-# main loop polls with Start-Sleep instead of WaitOne; the 3 s grace is a
-# best-effort window before Stop-Process. Keeping the Set call regardless so
-# if/when the watcher loop is rewritten to honour the event, no script-side
-# change is needed.
-function Stop-WatcherProcesses {
-    $shutdownEventName = 'EliteSoft.ErwinAddIn.Watcher.Shutdown'
-    try {
-        $watcherPids = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -match 'autostart-watcher' } |
-            Select-Object -ExpandProperty ProcessId)
+# Stop-WatcherProcesses extracted into installer/watcher-control.ps1 as
+# Stop-AddinWatcher (which also resyncs Task Scheduler state). The helper
+# is dot-sourced at the top of this script and used by both the install
+# and uninstall paths below.
 
-        if ($watcherPids.Count -eq 0) { return }
-
-        Write-Host "  Found $($watcherPids.Count) running watcher PID(s): $($watcherPids -join ', ')" -ForegroundColor Gray
-
-        $evt = $null
-        try {
-            $created = $false
-            $evt = [System.Threading.EventWaitHandle]::new($false, [System.Threading.EventResetMode]::ManualReset, $shutdownEventName, [ref]$created)
-            [void]$evt.Set()
-            Write-Host "  Signaled '$shutdownEventName'; waiting up to 3s for graceful exit" -ForegroundColor Gray
-        } catch {
-            Write-Host "  (named event signal failed: $($_.Exception.Message); will fall back to Stop-Process)" -ForegroundColor DarkGray
-        }
-
-        $waitDeadline = (Get-Date).AddSeconds(3)
-        while ((Get-Date) -lt $waitDeadline) {
-            $stillAlive = @($watcherPids | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
-            if ($stillAlive.Count -eq 0) { break }
-            Start-Sleep -Milliseconds 200
-        }
-
-        $stragglers = @($watcherPids | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
-        foreach ($pidVal in $stragglers) {
-            try {
-                Stop-Process -Id $pidVal -Force -ErrorAction Stop
-                Write-Host "  Force-stopped straggler watcher PID=$pidVal (event did not reach it)" -ForegroundColor Yellow
-            } catch {
-                Write-Host "  WARNING: could not stop watcher PID=${pidVal}: $($_.Exception.Message)" -ForegroundColor Yellow
-            }
-        }
-
-        if ($evt) { try { $evt.Dispose() } catch {} }
-    } catch {
-        Write-Host "  (watcher stop pass threw: $($_.Exception.Message))" -ForegroundColor DarkGray
-    }
-}
 # Add-In is hardcoded to a single erwin DM target. Reading versions from
 # HKLM was unreliable: stale 9.98 keys leaked from old installs and a fresh
 # user (no first-erwin-run yet) had no HKCU subkeys, so install silently
@@ -331,8 +284,14 @@ if ($Uninstall) {
     # Remove-Item, (b) keep PostMessage-ing into erwin after the addin is
     # gone, or (c) get picked up by the next install's pre-flight as a
     # stale process. Matches the install path's stop order.
+    #
+    # Task name vars are declared here (early) instead of at the
+    # Unregister-ScheduledTask point so Stop-AddinWatcher gets the same
+    # names and can resync SCM state before we Unregister.
+    $userTaskName = "EliteSoft Erwin AddIn AutoStart - $env:USERNAME"
+    $sharedTaskName = "EliteSoft Erwin AddIn AutoStart"
     Write-Host "Stopping autostart watcher..." -ForegroundColor Yellow
-    Stop-WatcherProcesses
+    Stop-AddinWatcher -TaskName $userTaskName -LegacyTaskName $sharedTaskName | Out-Null
 
     Write-Host "Unregistering COM component (HKCU)..." -ForegroundColor Yellow
     Unregister-ComUserScope -clsid $clsid -progId $progId
@@ -372,8 +331,9 @@ if ($Uninstall) {
 
     # Remove the per-user Scheduled Task. The legacy shared name might also
     # exist from much older installs - try it too, harmless if absent.
-    $userTaskName = "EliteSoft Erwin AddIn AutoStart - $env:USERNAME"
-    $sharedTaskName = "EliteSoft Erwin AddIn AutoStart"
+    # $userTaskName / $sharedTaskName were declared earlier (Stop block) so
+    # the stop/resync and unregister phases agree on the exact same task
+    # names; do not redeclare here.
     Unregister-ScheduledTask -TaskName $userTaskName -Confirm:$false -ErrorAction SilentlyContinue
     Unregister-ScheduledTask -TaskName $sharedTaskName -Confirm:$false -ErrorAction SilentlyContinue
     Write-Host "  Removed Scheduled Task(s) for autostart" -ForegroundColor Green
@@ -506,26 +466,11 @@ if (-not $dotnetOk) {
 }
 
 # Stop ALL watcher processes (prevents duplicates, unlocks COM host DLL).
-# Order matters: kill the PS process FIRST, then Stop-ScheduledTask AGAIN to
-# resync Task Scheduler state. After Win32_Process.Terminate() the SCM still
-# considers the task "Running" for up to 30 s (until its next poll); the
-# `Start-ScheduledTask` at the end of this script then silently no-ops
-# (MultipleInstancesPolicy=IgnoreNew) and the watcher never comes back. Root
-# cause traced 2026-05-15: 8+ install runs left the watcher dead because of
-# this race.
+# Kill+SCM-resync is centralised in installer/watcher-control.ps1; see
+# that file's header for the race-condition rationale.
 $taskName = "EliteSoft Erwin AddIn AutoStart - $env:USERNAME"
 $legacyTaskName = "EliteSoft Erwin AddIn AutoStart"
-# Stop running watcher PS instances (SEP-clean: named-event signal + graceful
-# wait + Stop-Process fallback; never WMI Terminate). See Stop-WatcherProcesses
-# function comment for the SEP rationale.
-Stop-WatcherProcesses
-try {
-    # Force SCM state Running -> Ready so the later Start-ScheduledTask is
-    # actually honoured. Missing tasks fail silently (legitimate on first
-    # install).
-    Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-    Stop-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue
-} catch { }
+Stop-AddinWatcher -TaskName $taskName -LegacyTaskName $legacyTaskName | Out-Null
 
 # Only OUR OWN erwin (same user + same session) can lock the install dir
 # (LOCALAPPDATA / Program Files) and the COM host DLL we are about to (re)
@@ -1094,41 +1039,12 @@ if (Test-Path -LiteralPath $watcherSource) {
     }
 
     # Start watcher immediately (don't wait for next logon) AND verify the
-    # PowerShell host actually came up. Previous version used
-    # `-ErrorAction SilentlyContinue` plus no verification, so any silent
-    # failure (Task Scheduler state still "Running" from a pre-kill race,
-    # AV quarantine, etc.) left the box with a registered task and no
-    # running watcher. Mirrors the working pattern in build-and-run.ps1.
+    # PowerShell host actually came up. Helper handles the Disabled-task
+    # case, the Start-ScheduledTask error path, and the 3-10s cold-start
+    # poll window. Skipped when registration failed - Start on a missing
+    # task throws.
     if ($registered) {
-        try {
-            Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
-        }
-        catch {
-            Write-Host "  ERROR: Start-ScheduledTask '$taskName' failed:" -ForegroundColor Red
-            Write-Host "    $($_.Exception.Message)" -ForegroundColor Red
-            Write-Host "  Add-in will only auto-load after your next logon." -ForegroundColor Yellow
-        }
-
-        # Poll up to 20 s for the watcher PS process (cold PowerShell start
-        # can take 3-10 s; verified 2026-05-14 build-and-run telemetry).
-        $watcherProc = $null
-        $maxWaitSec = 20
-        $waited = 0
-        while ($waited -lt $maxWaitSec -and -not $watcherProc) {
-            Start-Sleep -Seconds 1
-            $waited++
-            $watcherProc = Get-WmiObject Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-                Where-Object { $_.CommandLine -match 'autostart-watcher' } | Select-Object -First 1
-        }
-        if ($watcherProc) {
-            Write-Host "  Watcher running (PID=$($watcherProc.ProcessId), startup took ${waited}s)" -ForegroundColor Green
-        } else {
-            $watcherLog = Join-Path $env:LOCALAPPDATA 'EliteSoft\ErwinAddIn-Logs\autostart.log'
-            Write-Host "  WARNING: Watcher did not start within ${maxWaitSec}s." -ForegroundColor Red
-            Write-Host "    Check $watcherLog for errors." -ForegroundColor Yellow
-            Write-Host "    Add-in will only auto-load after your next logon, or run:" -ForegroundColor Yellow
-            Write-Host "      Start-ScheduledTask -TaskName '$taskName'" -ForegroundColor Yellow
-        }
+        Start-AddinWatcher -TaskName $taskName | Out-Null
     }
 } else {
     Write-Host "  autostart-watcher.ps1 not found in package, skipping" -ForegroundColor Yellow
