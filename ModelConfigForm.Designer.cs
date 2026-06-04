@@ -39,19 +39,6 @@ namespace EliteSoft.Erwin.AddIn
             this.tabValidation = new System.Windows.Forms.TabPage();
             this.tabTableProcesses = new System.Windows.Forms.TabPage();
             this.tabDdlGeneration = new System.Windows.Forms.TabPage();
-            this.tabAlterCompare = new System.Windows.Forms.TabPage();
-            // Alter Compare tab — inline UI (Phase 3.G)
-            this.lblAlterActiveInfo = new System.Windows.Forms.Label();
-            this.lblAlterDialectInfo = new System.Windows.Forms.Label();
-            this.lblAlterTargetVersionLabel = new System.Windows.Forms.Label();
-            this.cmbAlterTargetVersion = new System.Windows.Forms.ComboBox();
-            this.btnAlterCompare = new System.Windows.Forms.Button();
-            this.progressAlterCompare = new System.Windows.Forms.ProgressBar();
-            this.lblAlterCompareStatus = new System.Windows.Forms.Label();
-            this.lvAlterChanges = new System.Windows.Forms.ListView();
-            this.txtAlterSql = new System.Windows.Forms.TextBox();
-            this.btnCopyAlterSql = new System.Windows.Forms.Button();
-            this.btnSaveAlterSql = new System.Windows.Forms.Button();
 
             // Model tab
             this.grpModel = new System.Windows.Forms.GroupBox();
@@ -111,7 +98,6 @@ namespace EliteSoft.Erwin.AddIn
             this.tabControl.Controls.Add(this.tabValidation);
             this.tabControl.Controls.Add(this.tabTableProcesses);
             this.tabControl.Controls.Add(this.tabDdlGeneration);
-            this.tabControl.Controls.Add(this.tabAlterCompare);
             this.tabControl.Location = new System.Drawing.Point(16, 16);
             this.tabControl.Name = "tabControl";
             this.tabControl.SelectedIndex = 0;
@@ -372,144 +358,6 @@ namespace EliteSoft.Erwin.AddIn
             this.lblTableProcessStatus.Text = "";
             this.lblTableProcessStatus.ForeColor = clrSuccess;
             this.lblTableProcessStatus.Font = fontCaption;
-
-            // ================================================================
-            // TAB: ALTER COMPARE (Phase 3.G inline UI)
-            //   Active PU (dirty allowed) -> selected Mart version -> ALTER SQL.
-            //   Pipeline: VersionCompareService (Live + Worker model providers,
-            //   CC-aligned correlator). No popup; everything renders in the tab.
-            // ================================================================
-            this.tabAlterCompare.Location = new System.Drawing.Point(4, 26);
-            this.tabAlterCompare.Name = "tabAlterCompare";
-            this.tabAlterCompare.Padding = new System.Windows.Forms.Padding(20);
-            this.tabAlterCompare.Size = new System.Drawing.Size(860, 460);
-            this.tabAlterCompare.Text = "Alter Compare";
-            this.tabAlterCompare.UseVisualStyleBackColor = true;
-
-            // Row 1: active model summary
-            this.lblAlterActiveInfo.AutoSize = false;
-            this.lblAlterActiveInfo.Location = new System.Drawing.Point(20, 18);
-            this.lblAlterActiveInfo.Size = new System.Drawing.Size(820, 20);
-            this.lblAlterActiveInfo.Font = fontBodyBold;
-            this.lblAlterActiveInfo.Text = "Active: (no model loaded)";
-            this.lblAlterActiveInfo.ForeColor = clrTextPrimary;
-            this.tabAlterCompare.Controls.Add(this.lblAlterActiveInfo);
-
-            // Row 2: dialect / target server
-            this.lblAlterDialectInfo.AutoSize = false;
-            this.lblAlterDialectInfo.Location = new System.Drawing.Point(20, 40);
-            this.lblAlterDialectInfo.Size = new System.Drawing.Size(820, 20);
-            this.lblAlterDialectInfo.Font = fontBody;
-            this.lblAlterDialectInfo.Text = "Dialect: -";
-            this.lblAlterDialectInfo.ForeColor = clrTextSecondary;
-            this.tabAlterCompare.Controls.Add(this.lblAlterDialectInfo);
-
-            // Row 3: target version combo + compare button + progress
-            this.lblAlterTargetVersionLabel.AutoSize = false;
-            this.lblAlterTargetVersionLabel.Location = new System.Drawing.Point(20, 75);
-            this.lblAlterTargetVersionLabel.Size = new System.Drawing.Size(150, 24);
-            this.lblAlterTargetVersionLabel.Font = fontBody;
-            this.lblAlterTargetVersionLabel.Text = "Target Mart version:";
-            this.lblAlterTargetVersionLabel.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
-            this.tabAlterCompare.Controls.Add(this.lblAlterTargetVersionLabel);
-
-            this.cmbAlterTargetVersion.Location = new System.Drawing.Point(180, 75);
-            this.cmbAlterTargetVersion.Name = "cmbAlterTargetVersion";
-            this.cmbAlterTargetVersion.Size = new System.Drawing.Size(280, 24);
-            this.cmbAlterTargetVersion.DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList;
-            this.cmbAlterTargetVersion.Font = fontBody;
-            this.tabAlterCompare.Controls.Add(this.cmbAlterTargetVersion);
-
-            this.btnAlterCompare.Location = new System.Drawing.Point(470, 73);
-            this.btnAlterCompare.Name = "btnAlterCompare";
-            this.btnAlterCompare.Size = new System.Drawing.Size(120, 28);
-            this.btnAlterCompare.Text = "Compare";
-            this.btnAlterCompare.Font = fontBodyBold;
-            this.btnAlterCompare.UseVisualStyleBackColor = true;
-            this.btnAlterCompare.Enabled = false;
-            this.btnAlterCompare.Click += new System.EventHandler(this.btnAlterCompare_Click);
-            this.tabAlterCompare.Controls.Add(this.btnAlterCompare);
-
-            this.progressAlterCompare.Location = new System.Drawing.Point(600, 77);
-            this.progressAlterCompare.Name = "progressAlterCompare";
-            this.progressAlterCompare.Size = new System.Drawing.Size(240, 18);
-            this.progressAlterCompare.Style = System.Windows.Forms.ProgressBarStyle.Marquee;
-            this.progressAlterCompare.MarqueeAnimationSpeed = 0;
-            this.progressAlterCompare.Visible = false;
-            this.tabAlterCompare.Controls.Add(this.progressAlterCompare);
-
-            // Row 4: status text
-            this.lblAlterCompareStatus.AutoSize = false;
-            this.lblAlterCompareStatus.Location = new System.Drawing.Point(20, 108);
-            this.lblAlterCompareStatus.Size = new System.Drawing.Size(820, 18);
-            this.lblAlterCompareStatus.Font = fontCaption;
-            this.lblAlterCompareStatus.Text = "Open a model to begin.";
-            this.lblAlterCompareStatus.ForeColor = clrTextSecondary;
-            this.tabAlterCompare.Controls.Add(this.lblAlterCompareStatus);
-
-            // Row 5: changes list
-            this.lvAlterChanges.Location = new System.Drawing.Point(20, 132);
-            this.lvAlterChanges.Name = "lvAlterChanges";
-            this.lvAlterChanges.Size = new System.Drawing.Size(820, 130);
-            this.lvAlterChanges.View = System.Windows.Forms.View.Details;
-            this.lvAlterChanges.FullRowSelect = true;
-            this.lvAlterChanges.GridLines = true;
-            this.lvAlterChanges.HideSelection = false;
-            this.lvAlterChanges.Font = fontBody;
-            this.lvAlterChanges.Columns.Add("Change", 180);
-            this.lvAlterChanges.Columns.Add("Class", 100);
-            this.lvAlterChanges.Columns.Add("Name", 200);
-            this.lvAlterChanges.Columns.Add("Detail", 320);
-            this.lvAlterChanges.Anchor = System.Windows.Forms.AnchorStyles.Top
-                | System.Windows.Forms.AnchorStyles.Left
-                | System.Windows.Forms.AnchorStyles.Right;
-            this.tabAlterCompare.Controls.Add(this.lvAlterChanges);
-
-            // Row 6: alter SQL output
-            // Reverted from RichTextBox to TextBox after a 2026-05-09 erwin
-            // crash (coreclr.dll AV at 0x36852a) reproduced when switching
-            // into the Alter Compare tab. RefreshAlterCompareTab calls
-            // txtAlterSql.Clear() during tab activation; on a RichTextBox
-            // that triggers a UIA TextChanged event that erwin's host listener
-            // surfaces unsafely (same family as the Debug Log AppendText AV
-            // documented in memory/reference_winforms_shown_after_dispose).
-            // SQL syntax highlighting via RichTextBox stays in place for the
-            // DDL Generation popup (Forms.DdlApprovalDialog) where there has
-            // been no observed AV.
-            this.txtAlterSql.Location = new System.Drawing.Point(20, 270);
-            this.txtAlterSql.Name = "txtAlterSql";
-            this.txtAlterSql.Size = new System.Drawing.Size(820, 145);
-            this.txtAlterSql.Multiline = true;
-            this.txtAlterSql.ReadOnly = true;
-            this.txtAlterSql.Font = new System.Drawing.Font("Consolas", 9.5F);
-            this.txtAlterSql.ScrollBars = System.Windows.Forms.ScrollBars.Both;
-            this.txtAlterSql.WordWrap = false;
-            this.txtAlterSql.Anchor = System.Windows.Forms.AnchorStyles.Top
-                | System.Windows.Forms.AnchorStyles.Left
-                | System.Windows.Forms.AnchorStyles.Right
-                | System.Windows.Forms.AnchorStyles.Bottom;
-            this.tabAlterCompare.Controls.Add(this.txtAlterSql);
-
-            // Row 7: copy + save buttons (bottom right)
-            this.btnCopyAlterSql.Location = new System.Drawing.Point(550, 425);
-            this.btnCopyAlterSql.Name = "btnCopyAlterSql";
-            this.btnCopyAlterSql.Size = new System.Drawing.Size(140, 28);
-            this.btnCopyAlterSql.Text = "Copy SQL";
-            this.btnCopyAlterSql.Font = fontBodyBold;
-            this.btnCopyAlterSql.Anchor = System.Windows.Forms.AnchorStyles.Bottom | System.Windows.Forms.AnchorStyles.Right;
-            this.btnCopyAlterSql.Enabled = false;
-            this.btnCopyAlterSql.Click += new System.EventHandler(this.btnCopyAlterSql_Click);
-            this.tabAlterCompare.Controls.Add(this.btnCopyAlterSql);
-
-            this.btnSaveAlterSql.Location = new System.Drawing.Point(700, 425);
-            this.btnSaveAlterSql.Name = "btnSaveAlterSql";
-            this.btnSaveAlterSql.Size = new System.Drawing.Size(140, 28);
-            this.btnSaveAlterSql.Text = "Save SQL...";
-            this.btnSaveAlterSql.Font = fontBodyBold;
-            this.btnSaveAlterSql.Anchor = System.Windows.Forms.AnchorStyles.Bottom | System.Windows.Forms.AnchorStyles.Right;
-            this.btnSaveAlterSql.Enabled = false;
-            this.btnSaveAlterSql.Click += new System.EventHandler(this.btnSaveAlterSql_Click);
-            this.tabAlterCompare.Controls.Add(this.btnSaveAlterSql);
 
             // ================================================================
             // TAB 6: DEBUG LOG
@@ -800,19 +648,6 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.TabPage tabGeneral;
         private System.Windows.Forms.TabPage tabValidation;
         private System.Windows.Forms.TabPage tabDdlGeneration;
-        private System.Windows.Forms.TabPage tabAlterCompare;
-        // Alter Compare tab — inline UI
-        private System.Windows.Forms.Label lblAlterActiveInfo;
-        private System.Windows.Forms.Label lblAlterDialectInfo;
-        private System.Windows.Forms.Label lblAlterTargetVersionLabel;
-        private System.Windows.Forms.ComboBox cmbAlterTargetVersion;
-        private System.Windows.Forms.Button btnAlterCompare;
-        private System.Windows.Forms.ProgressBar progressAlterCompare;
-        private System.Windows.Forms.Label lblAlterCompareStatus;
-        private System.Windows.Forms.ListView lvAlterChanges;
-        private System.Windows.Forms.TextBox txtAlterSql;
-        private System.Windows.Forms.Button btnCopyAlterSql;
-        private System.Windows.Forms.Button btnSaveAlterSql;
         private System.Windows.Forms.Label lblOpenedModel;
         private System.Windows.Forms.Button btnMartReview;
         private System.Windows.Forms.Button btnAlterWizardProd;

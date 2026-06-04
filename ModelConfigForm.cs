@@ -1441,14 +1441,19 @@ namespace EliteSoft.Erwin.AddIn
             // checkbox is on for this config, skip the dialog and write the
             // diff straight to the metamodel. Used by admin-managed shops
             // where UDP definitions are centrally controlled and users
-            // should not see a sync prompt every model open. Read from
-            // CONFIG_PROPERTY via the existing PropertyApplicator helper.
+            // should not see a sync prompt every model open. Effective value
+            // via the two-level cascade (model CONFIG_PROPERTY -> corporate
+            // CORPORATE_PROPERTY -> false).
+            // 2026-06-04 KEY FIX: this read the camelCase "ApplyUdpChangesSilently"
+            // which the admin/corporate tables never write (the canonical key is
+            // APPLY_UDP_CHANGES_SILENTLY) - so model-level silent-apply was dead.
+            // Verified ZERO camelCase rows in the DB, so the rename is safe.
             bool silentApply = false;
             try
             {
                 silentApply = _propertyApplicatorService != null
                               && _propertyApplicatorService.IsInitialized
-                              && _propertyApplicatorService.IsPropertyEnabled("ApplyUdpChangesSilently");
+                              && _propertyApplicatorService.IsPropertyEnabled("APPLY_UDP_CHANGES_SILENTLY");
             }
             catch (Exception ex)
             {
@@ -1851,18 +1856,6 @@ namespace EliteSoft.Erwin.AddIn
 
             // Reposition copyright label dynamically below the last card.
             lblCopyright.Location = new Point(24, glossY + glossH + 30 + 12);
-
-            // Hide Alter Compare tab on startup. The feature is functional but
-            // the multi-version compare flow (PlanTargetVersions) is not yet
-            // wired up for production usage and the tab adds visual noise.
-            // Adding it to _hiddenTabs makes it restorable via the Ctrl+Shift+
-            // LeftClick gesture on the copyright label below, same as any
-            // other manually-hidden tab.
-            if (tabAlterCompare != null && tabControl.TabPages.Contains(tabAlterCompare))
-            {
-                tabControl.TabPages.Remove(tabAlterCompare);
-                _hiddenTabs.Add(tabAlterCompare);
-            }
         }
 
         /// <summary>
@@ -2787,35 +2780,24 @@ namespace EliteSoft.Erwin.AddIn
 
         private int GetGlossaryLoadInterval()
         {
-            const int defaultInterval = 1; // 1 minute default
+            // Effective GLOSSARY_LOAD_INTERVAL via the two-level cascade: model
+            // CONFIG_PROPERTY -> corporate CORPORATE_PROPERTY -> built-in 5 minutes
+            // (spec 2026-06-04). The admin Glossary screen writes this row, so the
+            // DB value always wins; 5 only applies when NEITHER level has a row.
+            // minutes must be > 0 to be honoured.
+            const int defaultInterval = 5;
             try
             {
-                if (!DatabaseService.Instance.IsConfigured) return defaultInterval;
-
-                var config = new RegistryBootstrapService().GetConfig();
-                if (config == null || !config.IsConfigured) return defaultInterval;
-
-                // Read GLOSSARY_LOAD_INTERVAL from CONFIG_PROPERTY scoped on the active config.
-                // No "All Models" (ID=1) fallback after the schema rename — admin must put a
-                // row on the per-config record if they want a custom interval.
-                int cfgId = ConfigContextService.Instance.IsInitialized
-                    ? ConfigContextService.Instance.ActiveConfigId
-                    : 0;
-                if (cfgId <= 0) return defaultInterval;
-
-                using (var context = new EliteSoft.MetaAdmin.Shared.Data.RepoDbContext(config))
-                {
-                    var prop = context.ConfigProperties
-                        .FirstOrDefault(p => p.ConfigId == cfgId && p.Key == "GLOSSARY_LOAD_INTERVAL");
-                    if (prop != null && int.TryParse(prop.Value, out int minutes) && minutes > 0)
-                        return minutes;
-                }
+                int minutes = ConfigContextService.Instance.GetEffectiveInt("GLOSSARY_LOAD_INTERVAL", defaultInterval);
+                return minutes > 0 ? minutes : defaultInterval;
             }
             catch (Exception ex)
             {
-                Log($"GetGlossaryLoadInterval error: {ex.Message}");
+                // A real DB read error is SURFACED (logged as an error), not silently
+                // defaulted - a missing row would have returned 5 with no error.
+                Log($"GetGlossaryLoadInterval: DB read error (falling back to {defaultInterval} min): {ex.Message}");
+                return defaultInterval;
             }
-            return defaultInterval;
         }
 
         private void GlossaryRefreshTimer_Tick(object sender, EventArgs e)
@@ -4625,7 +4607,7 @@ namespace EliteSoft.Erwin.AddIn
                 Services.VersionCompareService.DirtyProbe beforeDirty;
                 try
                 {
-                    var probeService = new Services.VersionCompareService(_scapi, _currentModel, (Action<string>)Log);
+                    var probeService = new Services.VersionCompareService(_currentModel, (Action<string>)Log);
                     beforeDirty = probeService.ProbeDirty();
                 }
                 catch (Exception ex)
@@ -4677,7 +4659,7 @@ namespace EliteSoft.Erwin.AddIn
                 Services.VersionCompareService.DirtyProbe afterDirty;
                 try
                 {
-                    var postProbe = new Services.VersionCompareService(_scapi, _currentModel, (Action<string>)Log);
+                    var postProbe = new Services.VersionCompareService(_currentModel, (Action<string>)Log);
                     afterDirty = postProbe.ProbeDirty();
                 }
                 catch (Exception ex)
@@ -6414,6 +6396,19 @@ namespace EliteSoft.Erwin.AddIn
 
         private int _martVersion = 0;
         private string _martLocator = "";
+
+        // DDL Generation gates (admin "DDL Generation Functionality", 2026-06-04).
+        // Each is the EFFECTIVE value of an independent two-level toggle (model
+        // CONFIG_PROPERTY -> corporate CORPORATE_PROPERTY -> built-in false), resolved
+        // once per connect in ApplyDdlGenerationGates() and consumed by the source
+        // radios + RebuildRightCombo. Default false = that DDL source is OFF until the
+        // admin enables it (matches the admin's "Effective: Off (built-in default)").
+        //   _ddlAllowLastSaved        -> From-Mart combo entry v==activeV (dirty vs last saved)
+        //   _ddlAllowPreviousVersions -> From-Mart combo entries v<activeV (older versions)
+        //   _ddlAllowFromDb           -> the "From DB" radio
+        private bool _ddlAllowLastSaved;
+        private bool _ddlAllowPreviousVersions;
+        private bool _ddlAllowFromDb;
         private int _pendingDDLVersion = 0;
 
         // Gates the legacy bridge CC + Apply-to-Right cross-version path
@@ -6436,9 +6431,75 @@ namespace EliteSoft.Erwin.AddIn
         /// Populate Left/Right model version combo boxes.
         /// Version is read from PU locator or erwin window title.
         /// </summary>
+        /// <summary>
+        /// Resolve the admin "DDL Generation Functionality" gates (three INDEPENDENT
+        /// two-level toggles: model CONFIG_PROPERTY -> corporate CORPORATE_PROPERTY ->
+        /// built-in false) into <see cref="_ddlAllowLastSaved"/> /
+        /// <see cref="_ddlAllowPreviousVersions"/> / <see cref="_ddlAllowFromDb"/> and
+        /// apply them to the Generate DDL tab: HIDE a source radio when its function is
+        /// off (RebuildRightCombo omits the matching combo entries), and keep the
+        /// checked radio on a VISIBLE source. Called per connect from
+        /// PopulateVersionCombos. Default false = a source stays OFF until the admin
+        /// enables it (matches the admin's "Effective: Off (built-in default)").
+        /// </summary>
+        private void ApplyDdlGenerationGates()
+        {
+            try
+            {
+                var ctx = ConfigContextService.Instance;
+                _ddlAllowLastSaved        = ctx.GetEffectiveBool("DDL_COMPARE_LAST_SAVED", false);
+                _ddlAllowPreviousVersions = ctx.GetEffectiveBool("DDL_COMPARE_PREVIOUS_VERSIONS", false);
+                _ddlAllowFromDb           = ctx.GetEffectiveBool("DDL_COMPARE_FROM_DB", false);
+            }
+            catch (Exception ex)
+            {
+                // A real DB read error is SURFACED (logged), not silently masked. Fall
+                // back to ALL sources enabled for this cycle so a transient DB blip never
+                // locks the user out of Generate DDL; the gate re-applies on the next
+                // successful connect.
+                Log($"[DDL-GATES] DB read error - showing all sources this cycle: {ex.Message}");
+                _ddlAllowLastSaved = _ddlAllowPreviousVersions = _ddlAllowFromDb = true;
+            }
+
+            Log($"[DDL-GATES] last-saved={_ddlAllowLastSaved}, prev-versions={_ddlAllowPreviousVersions}, from-db={_ddlAllowFromDb}");
+
+            bool martVisible = _ddlAllowLastSaved || _ddlAllowPreviousVersions;
+            rbFromMart.Visible = martVisible;
+            rbFromDB.Visible = _ddlAllowFromDb;
+
+            // Keep the selected source on a VISIBLE radio (hiding a radio does not
+            // uncheck it). Setting Checked raises OnRightSourceChanged, which refreshes
+            // the dependent combo / Configure-DB button state.
+            if (rbFromMart.Checked && !martVisible)
+            {
+                if (_ddlAllowFromDb) rbFromDB.Checked = true; else rbFromMart.Checked = false;
+            }
+            else if (rbFromDB.Checked && !_ddlAllowFromDb)
+            {
+                if (martVisible) rbFromMart.Checked = true; else rbFromDB.Checked = false;
+            }
+            else if (!rbFromMart.Checked && !rbFromDB.Checked)
+            {
+                if (martVisible) rbFromMart.Checked = true;
+                else if (_ddlAllowFromDb) rbFromDB.Checked = true;
+            }
+
+            // No source enabled at all -> point the user at the admin toggle.
+            if (!martVisible && !_ddlAllowFromDb)
+            {
+                lblDDLStatus.Text = "No DDL source is enabled. Enable one in MetaAdmin > AddIn Management > DDL Generation.";
+                lblDDLStatus.ForeColor = System.Drawing.Color.FromArgb(180, 0, 0);
+            }
+        }
+
         private void PopulateVersionCombos()
         {
             cmbRightModel.Items.Clear();
+
+            // Resolve + apply the admin "DDL Generation Functionality" gates (source
+            // radio visibility) before building the right combo, which reads the same
+            // gate flags to decide which version entries to offer.
+            ApplyDdlGenerationGates();
 
             try
             {
@@ -6532,7 +6593,17 @@ namespace EliteSoft.Erwin.AddIn
 
             int activeV = _martVersion > 0 ? _martVersion : 1;
             for (int v = activeV; v >= 1; v--)
+            {
+                // DDL Generation gates (admin "DDL Generation Functionality"): the
+                // highest entry (v == activeV) is the "dirty vs last saved" same-version
+                // compare (DDL_COMPARE_LAST_SAVED); the lower entries (v < activeV) are
+                // the earlier versions (DDL_COMPARE_PREVIOUS_VERSIONS). Omit a class
+                // entirely when its effective toggle is off (hide, per the admin design).
+                bool isLastSaved = (v == activeV);
+                if (isLastSaved && !_ddlAllowLastSaved) continue;
+                if (!isLastSaved && !_ddlAllowPreviousVersions) continue;
                 cmbRightModel.Items.Add($"v{v} (Version {v})");
+            }
 
             if (cmbRightModel.Items.Count > 0)
             {
@@ -6541,7 +6612,8 @@ namespace EliteSoft.Erwin.AddIn
             }
             else
             {
-                cmbRightModel.Items.Add("(no lower version)");
+                // Empty because both Mart toggles are off (or no version exists).
+                cmbRightModel.Items.Add("(no Mart source enabled)");
                 cmbRightModel.SelectedIndex = 0;
                 cmbRightModel.Enabled = false;
             }
@@ -7358,346 +7430,25 @@ namespace EliteSoft.Erwin.AddIn
 
         #endregion
 
-        #region Alter Compare Tab (Phase 3.F)
-
         /// <summary>
-        /// Launches the version-vs-active compare dialog. Baseline is always
-        /// the currently active PU (dirty or clean); the target is a Mart
-        /// version picked inside the dialog. See <see cref="Forms.CompareVersionsForm"/>.
-        /// </summary>
-        /// <summary>
-        /// <summary>
-        /// Tab-switch hook: only initialize the Alter Compare tab the FIRST
-        /// time it's shown for a given active model, or when the model has
-        /// changed. Switching back to the tab after a successful compare
-        /// must NOT wipe the user's results - they need them visible to
-        /// copy / save / inspect.
+        /// Tab-switch hook: logs every tab transition so a future erwin AV can
+        /// be correlated to the tab the user was on. Earlier crashes
+        /// (2026-05-09, coreclr AV during a tab entry) had no log breadcrumbs -
+        /// the addin's own Execute log ended cleanly, and only the Windows WER
+        /// report identified the host module. Logging here gives us a definitive
+        /// last-tab marker.
         /// </summary>
         private void tabControl_SelectedIndexChanged(object sender, EventArgs e)
         {
             try
             {
-                // Defensive: log every tab transition so a future erwin AV can
-                // be correlated to the tab the user was on. Earlier crashes
-                // (2026-05-09, coreclr AV during Alter Compare entry) had no
-                // log breadcrumbs - the addin's own Execute log ended cleanly,
-                // and only the Windows WER report identified the host module.
-                // Logging here gives us a definitive last-tab marker.
                 var sel = tabControl.SelectedTab;
                 Log($"[TAB] -> {sel?.Text ?? "(null)"} ({sel?.Name ?? "-"})");
-
-                if (sel != tabAlterCompare) return;
-
-                // First entry, or active model changed since last init.
-                bool needsInit = !ReferenceEquals(_alterTabInitFor, _currentModel as object);
-                if (needsInit)
-                {
-                    RefreshAlterCompareTab();
-                    _alterTabInitFor = _currentModel as object;
-                }
             }
             catch (Exception ex)
             {
                 Log($"tabControl_SelectedIndexChanged: {ex.GetType().Name}: {ex.Message}");
             }
         }
-
-        // ====================================================================
-        // Alter Compare tab — inline UI (Phase 3.G)
-        //
-        // Active PU (live + dirty buffer) is the baseline; user picks a Mart
-        // version to diff against; VersionCompareService runs the pipeline,
-        // emits alter SQL, and the tab fills in the changes ListView + SQL
-        // textbox in place. No popup dialog is involved.
-        // ====================================================================
-
-        private readonly List<Services.VersionCompareService.TargetVersion> _alterTargetVersions = new();
-        private string _alterLastSql = string.Empty;
-        private string _alterLastDialect = "MSSQL";
-
-        /// <summary>
-        /// Snapshot of the model reference last seen by RefreshAlterCompareTab.
-        /// When the user switches tabs without changing models, the tab keeps
-        /// its previous state (combo selection, ListView contents, SQL text)
-        /// instead of resetting on every tab activation.
-        /// </summary>
-        private object _alterTabInitFor;
-
-        /// <summary>
-        /// Initialize the Alter Compare tab for the current active model:
-        /// read PU metadata, populate the version combo, set status. Only
-        /// touches metadata UI; does NOT clear lvAlterChanges / txtAlterSql
-        /// so that switching tabs after a successful compare keeps results
-        /// visible. Compare-button click is what populates results, and
-        /// pre-populates a fresh state when it runs.
-        /// </summary>
-        private void RefreshAlterCompareTab()
-        {
-            try
-            {
-                if (!_isConnected || _currentModel == null || _scapi == null)
-                {
-                    lblAlterActiveInfo.Text = "Active: (no model loaded)";
-                    lblAlterDialectInfo.Text = "Dialect: -";
-                    cmbAlterTargetVersion.Items.Clear();
-                    _alterTargetVersions.Clear();
-                    btnAlterCompare.Enabled = false;
-                    lblAlterCompareStatus.Text = "Open a model to begin.";
-                    // Stale results from a different model would mislead the
-                    // user, so clear them when there is no model anymore.
-                    lvAlterChanges.Items.Clear();
-                    txtAlterSql.Clear();
-                    _alterLastSql = string.Empty;
-                    btnSaveAlterSql.Enabled = false;
-                    btnCopyAlterSql.Enabled = false;
-                    return;
-                }
-
-                // Degraded mode (ConfigContext failed to resolve a Mart CONFIG
-                // mapping for this model) means the active PU is non-Mart or
-                // unmapped. Calling SCAPI dispatch (PropertyBag, version
-                // queries, dialect probing) on such a PU triggers a NULL deref
-                // deep in EM_GDM whose IDispatchInvoke unwind crashes erwin -
-                // verified 2026-05-09 10:34 against the same PowerDesigner-
-                // imported local file path that already crashed the host on
-                // 2026-05-08. Show a plain "config required" stub instead of
-                // running the SCAPI calls that would AV.
-                if (!Services.ConfigContextService.Instance.IsInitialized)
-                {
-                    lblAlterActiveInfo.Text = "Active: (model loaded, but no CONFIG mapping)";
-                    lblAlterDialectInfo.Text = "Dialect: - (config required)";
-                    cmbAlterTargetVersion.Items.Clear();
-                    _alterTargetVersions.Clear();
-                    btnAlterCompare.Enabled = false;
-                    lblAlterCompareStatus.Text =
-                        "Alter Compare is disabled until a Mart-bound model with a CONFIG mapping is open.";
-                    lvAlterChanges.Items.Clear();
-                    txtAlterSql.Clear();
-                    _alterLastSql = string.Empty;
-                    btnSaveAlterSql.Enabled = false;
-                    btnCopyAlterSql.Enabled = false;
-                    return;
-                }
-
-                var service = new Services.VersionCompareService(_scapi, _currentModel, (Action<string>)Log);
-                var dirty = service.ProbeDirty();
-                var (target, major, minor) = service.ReadActiveTargetServer();
-                var dialect = Services.VersionCompareService.ResolveDialect(target);
-                _alterLastDialect = dialect;
-                int currentVersion = service.ReadActiveVersion();
-                string dirtyTag = dirty.IsDirty ? "Dirty" : "Clean";
-
-                string dirtyHint = dirty.IsDirty
-                    ? "  -  unsaved changes will NOT be in the diff (save first to capture them)"
-                    : "";
-                lblAlterActiveInfo.Text = $"Active: v{currentVersion} ({dirtyTag}){dirtyHint}";
-                lblAlterDialectInfo.Text = string.IsNullOrEmpty(target)
-                    ? $"Dialect: {dialect}"
-                    : $"Dialect: {dialect}  (model target: {target} v{major}.{minor})";
-
-                _alterTargetVersions.Clear();
-                cmbAlterTargetVersion.Items.Clear();
-                foreach (var row in Services.VersionCompareService.PlanTargetVersions(currentVersion, dirty.IsDirty))
-                {
-                    _alterTargetVersions.Add(row);
-                    cmbAlterTargetVersion.Items.Add(row.Label);
-                }
-                if (cmbAlterTargetVersion.Items.Count > 0) cmbAlterTargetVersion.SelectedIndex = 0;
-
-                btnAlterCompare.Enabled = cmbAlterTargetVersion.Items.Count > 0;
-                lblAlterCompareStatus.Text = btnAlterCompare.Enabled
-                    ? "Pick a target version and click Compare."
-                    : "No earlier Mart version available to compare against.";
-
-                // First-init for a new model: clear previous results (they
-                // belonged to the old PU). Subsequent same-model refreshes
-                // are guarded by tabControl_SelectedIndexChanged, so this
-                // path only runs when the user's active model actually
-                // changed.
-                lvAlterChanges.Items.Clear();
-                txtAlterSql.Clear();
-                _alterLastSql = string.Empty;
-                btnSaveAlterSql.Enabled = false;
-                btnCopyAlterSql.Enabled = false;
-            }
-            catch (Exception ex)
-            {
-                Log($"RefreshAlterCompareTab failed: {ex.GetType().Name}: {ex.Message}");
-                lblAlterCompareStatus.Text = $"Init error: {ex.Message}";
-                btnAlterCompare.Enabled = false;
-            }
-        }
-
-        private async void btnAlterCompare_Click(object sender, EventArgs e)
-        {
-            if (cmbAlterTargetVersion.SelectedIndex < 0
-                || cmbAlterTargetVersion.SelectedIndex >= _alterTargetVersions.Count)
-                return;
-            if (!_isConnected || _currentModel == null || _scapi == null)
-            {
-                ErwinAddIn.ShowTopMostMessage("No active erwin model.", "Alter Compare");
-                return;
-            }
-
-            int targetVersion = _alterTargetVersions[cmbAlterTargetVersion.SelectedIndex].Version;
-            SetAlterBusy(true, $"Comparing against Mart v{targetVersion}...");
-            lvAlterChanges.Items.Clear();
-            txtAlterSql.Clear();
-            _alterLastSql = string.Empty;
-            btnSaveAlterSql.Enabled = false;
-            btnCopyAlterSql.Enabled = false;
-
-            try
-            {
-                var service = new Services.VersionCompareService(_scapi, _currentModel, (Action<string>)Log);
-                var outcome = await Task.Run(() =>
-                    service.CompareAsync(targetVersion, System.Threading.CancellationToken.None)).ConfigureAwait(true);
-
-                PopulateAlterChanges(outcome);
-                lblAlterCompareStatus.Text =
-                    $"Done. {outcome.Result.Changes.Count} change(s), {outcome.Script.Statements.Count} statement(s) emitted for {outcome.Dialect}.";
-            }
-            catch (Exception ex)
-            {
-                Log($"AlterCompare failed: {ex.GetType().FullName}: {ex.Message}");
-                Log("--- stack trace ---");
-                Log(ex.ToString());
-                if (ex.InnerException is not null)
-                {
-                    Log("--- inner exception ---");
-                    Log(ex.InnerException.ToString());
-                }
-                lblAlterCompareStatus.Text = "Compare failed. See Debug Log for details.";
-                ErwinAddIn.ShowTopMostMessage(
-                    $"Compare failed:\n\n{ex.GetType().Name}: {ex.Message}\n\n(Full stack in Debug Log.)",
-                    "Alter Compare");
-            }
-            finally
-            {
-                SetAlterBusy(false);
-            }
-        }
-
-        private void PopulateAlterChanges(Services.CompareOutcome outcome)
-        {
-            lvAlterChanges.BeginUpdate();
-            try
-            {
-                foreach (var change in outcome.Result.Changes)
-                {
-                    var row = new ListViewItem(new[]
-                    {
-                        change.GetType().Name,
-                        change.Target.Class,
-                        change.Target.Name,
-                        DescribeAlterChangeDetail(change),
-                    });
-                    lvAlterChanges.Items.Add(row);
-                }
-            }
-            finally
-            {
-                lvAlterChanges.EndUpdate();
-            }
-
-            var sb = new System.Text.StringBuilder();
-            sb.AppendLine($"-- ALTER SQL for {outcome.Dialect} ({outcome.Script.Statements.Count} statement(s))");
-            sb.AppendLine($"-- From: Mart version selected above   To: active model (current dirty state)");
-            sb.AppendLine();
-            foreach (var stmt in outcome.Script.Statements)
-            {
-                if (!string.IsNullOrWhiteSpace(stmt.Comment)) sb.AppendLine("-- " + stmt.Comment);
-                sb.AppendLine(stmt.Sql);
-                if (outcome.Dialect == "MSSQL") sb.AppendLine("GO");
-                sb.AppendLine();
-            }
-            _alterLastSql = sb.ToString();
-            _alterLastDialect = outcome.Dialect;
-            // Plain TextBox - syntax highlighting reverted (see Designer.cs note
-            // on the txtAlterSql declaration: RichTextBox.Clear() during tab
-            // refresh raised a UIA event that crashed erwin host).
-            txtAlterSql.Text = _alterLastSql;
-            txtAlterSql.SelectionStart = 0;
-            txtAlterSql.ScrollToCaret();
-            bool hasSql = !string.IsNullOrEmpty(_alterLastSql);
-            btnSaveAlterSql.Enabled = hasSql;
-            btnCopyAlterSql.Enabled = hasSql;
-        }
-
-        private static string DescribeAlterChangeDetail(EliteSoft.Erwin.AlterDdl.Core.Models.Change change) => change switch
-        {
-            EliteSoft.Erwin.AlterDdl.Core.Models.EntityRenamed er => $"from '{er.OldName}'",
-            EliteSoft.Erwin.AlterDdl.Core.Models.SchemaMoved sm => $"{sm.OldSchema} -> {sm.NewSchema}",
-            EliteSoft.Erwin.AlterDdl.Core.Models.AttributeAdded aa => $"in {aa.ParentEntity.Name}",
-            EliteSoft.Erwin.AlterDdl.Core.Models.AttributeDropped ad => $"from {ad.ParentEntity.Name}",
-            EliteSoft.Erwin.AlterDdl.Core.Models.AttributeRenamed ar => $"{ar.ParentEntity.Name}: '{ar.OldName}' -> '{ar.Target.Name}'",
-            EliteSoft.Erwin.AlterDdl.Core.Models.AttributeTypeChanged at => $"{at.ParentEntity.Name}.{at.Target.Name}: {at.LeftType} -> {at.RightType}",
-            EliteSoft.Erwin.AlterDdl.Core.Models.AttributeNullabilityChanged an => $"{an.ParentEntity.Name}.{an.Target.Name}: {(an.LeftNullable ? "NULL" : "NOT NULL")} -> {(an.RightNullable ? "NULL" : "NOT NULL")}",
-            EliteSoft.Erwin.AlterDdl.Core.Models.AttributeDefaultChanged ad => $"{ad.ParentEntity.Name}.{ad.Target.Name}: '{ad.LeftDefault}' -> '{ad.RightDefault}'",
-            EliteSoft.Erwin.AlterDdl.Core.Models.AttributeIdentityChanged ai => $"{ai.ParentEntity.Name}.{ai.Target.Name}: {ai.LeftHasIdentity} -> {ai.RightHasIdentity}",
-            EliteSoft.Erwin.AlterDdl.Core.Models.KeyGroupAdded ka => $"{ka.Kind} on {ka.ParentEntity.Name}",
-            EliteSoft.Erwin.AlterDdl.Core.Models.KeyGroupDropped kd => $"{kd.Kind} on {kd.ParentEntity.Name}",
-            EliteSoft.Erwin.AlterDdl.Core.Models.KeyGroupRenamed kr => $"{kr.Kind} on {kr.ParentEntity.Name}: '{kr.OldName}' -> '{kr.Target.Name}'",
-            EliteSoft.Erwin.AlterDdl.Core.Models.ForeignKeyRenamed fr => $"from '{fr.OldName}'",
-            EliteSoft.Erwin.AlterDdl.Core.Models.TriggerRenamed tr => $"from '{tr.OldName}'",
-            EliteSoft.Erwin.AlterDdl.Core.Models.SequenceRenamed sr => $"from '{sr.OldName}'",
-            EliteSoft.Erwin.AlterDdl.Core.Models.ViewRenamed vr => $"from '{vr.OldName}'",
-            _ => string.Empty,
-        };
-
-        private void btnCopyAlterSql_Click(object sender, EventArgs e)
-        {
-            if (string.IsNullOrEmpty(_alterLastSql)) return;
-            try
-            {
-                Clipboard.SetText(_alterLastSql);
-                lblAlterCompareStatus.Text = $"Copied {_alterLastSql.Length:N0} chars to clipboard.";
-            }
-            catch (Exception ex)
-            {
-                Log($"Copy SQL failed: {ex.GetType().Name}: {ex.Message}");
-                ErwinAddIn.ShowTopMostMessage($"Copy failed:\n\n{ex.Message}", "Copy Error");
-            }
-        }
-
-        private void btnSaveAlterSql_Click(object sender, EventArgs e)
-        {
-            if (string.IsNullOrEmpty(_alterLastSql)) return;
-            using var dlg = new SaveFileDialog
-            {
-                Filter = "SQL script (*.sql)|*.sql|All files (*.*)|*.*",
-                FileName = $"alter-{_alterLastDialect.ToLowerInvariant()}-{DateTime.Now:yyyyMMdd-HHmmss}.sql",
-                Title = "Save Alter SQL",
-                OverwritePrompt = true,
-            };
-            if (dlg.ShowDialog(this) != DialogResult.OK) return;
-            try
-            {
-                System.IO.File.WriteAllText(dlg.FileName, _alterLastSql,
-                    new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
-                lblAlterCompareStatus.Text = $"Saved to {dlg.FileName}";
-            }
-            catch (Exception ex)
-            {
-                ErwinAddIn.ShowTopMostMessage(
-                    $"Save failed:\n\n{ex.Message}",
-                    "Save Error");
-            }
-        }
-
-        private void SetAlterBusy(bool busy, string status = null)
-        {
-            btnAlterCompare.Enabled = !busy && cmbAlterTargetVersion.Items.Count > 0;
-            cmbAlterTargetVersion.Enabled = !busy;
-            bool hasSql = !busy && !string.IsNullOrEmpty(_alterLastSql);
-            btnSaveAlterSql.Enabled = hasSql;
-            btnCopyAlterSql.Enabled = hasSql;
-            progressAlterCompare.Visible = busy;
-            progressAlterCompare.MarqueeAnimationSpeed = busy ? 30 : 0;
-            if (status != null) lblAlterCompareStatus.Text = status;
-            Cursor = busy ? Cursors.WaitCursor : Cursors.Default;
-        }
-
-        #endregion
     }
 }
