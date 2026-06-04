@@ -6,6 +6,22 @@ using System.Linq;
 namespace EliteSoft.Erwin.AddIn.Services
 {
     /// <summary>
+    /// Enforcement mode for a model element (column/term) that has NO match in the
+    /// external glossary. Backed by the two-level config key GLOSSARY_REQUIRED_OPTION
+    /// (2026-06-04); default OPTIONAL_SILENT. Only meaningful when USE_EXTERNAL_GLOSSARY
+    /// effective=true. The member names match the stored VALUE strings verbatim.
+    /// </summary>
+    public enum GlossaryRequiredOption
+    {
+        /// <summary>Block: keep the existing warn + rename-to-"PLEASE CHANGE IT" / delete.</summary>
+        REQUIRED,
+        /// <summary>Allow the value but WARN (no rename / delete).</summary>
+        OPTIONAL_WARNING,
+        /// <summary>Allow silently - no popup, no rename / delete (default).</summary>
+        OPTIONAL_SILENT
+    }
+
+    /// <summary>
     /// Glossary service with dynamic mapping support.
     /// Reads glossary config from DG_TABLE_MAPPING (MAPPING_CODE='GLOSSARY') + DG_TABLE_MAPPING_COLUMN.
     /// Cache: Dictionary&lt;matchValue, Dictionary&lt;targetUdp, value&gt;&gt;
@@ -37,6 +53,13 @@ namespace EliteSoft.Erwin.AddIn.Services
         private Dictionary<string, string> _termTypeMap;
         private Dictionary<string, string> _termTypeByMatch;
 
+        // Two-level config (2026-06-04), resolved ONCE at LoadGlossary and cached for
+        // the per-edit matcher: the external-glossary feature gate + the unmatched-
+        // element enforcement mode (model CONFIG_PROPERTY -> corporate CORPORATE_PROPERTY
+        // -> default). Avoids a per-column DB read.
+        private bool _useExternalGlossary;
+        private GlossaryRequiredOption _requiredOption = GlossaryRequiredOption.OPTIONAL_SILENT;
+
         public event Action<string> OnLog;
 
         public static GlossaryService Instance
@@ -67,6 +90,11 @@ namespace EliteSoft.Erwin.AddIn.Services
         public int Count => _glossaryCache.Count;
         public string LastError => _lastError;
 
+        /// <summary>USE_EXTERNAL_GLOSSARY effective gate (set at LoadGlossary). When false the glossary is not loaded.</summary>
+        public bool IsExternalGlossaryEnabled => _useExternalGlossary;
+        /// <summary>GLOSSARY_REQUIRED_OPTION effective mode for unmatched elements (default OPTIONAL_SILENT).</summary>
+        public GlossaryRequiredOption RequiredOption => _requiredOption;
+
         /// <summary>
         /// Load glossary using DG_TABLE_MAPPING config.
         /// </summary>
@@ -90,6 +118,24 @@ namespace EliteSoft.Erwin.AddIn.Services
                     Log($"GlossaryService: {_lastError}");
                     return false;
                 }
+
+                // 2026-06-04: gate the WHOLE external-glossary feature on the effective
+                // USE_EXTERNAL_GLOSSARY (model CONFIG_PROPERTY -> corporate
+                // CORPORATE_PROPERTY -> false). When disabled, do not load -> IsLoaded
+                // stays false -> every downstream glossary matcher is naturally skipped
+                // (they all early-return on !glossary.IsLoaded). A real DB read error
+                // propagates to the outer catch (LastError surfaced), never a silent off.
+                _useExternalGlossary = ConfigContextService.Instance.GetEffectiveBool("USE_EXTERNAL_GLOSSARY", false);
+                if (!_useExternalGlossary)
+                {
+                    _isLoaded = false;
+                    Log("GlossaryService: USE_EXTERNAL_GLOSSARY effective=false - external glossary disabled, not loading.");
+                    return false;
+                }
+                // Enforcement mode for columns with no glossary match (default OPTIONAL_SILENT).
+                _requiredOption = ConfigContextService.Instance.GetEffectiveEnum(
+                    "GLOSSARY_REQUIRED_OPTION", GlossaryRequiredOption.OPTIONAL_SILENT);
+                Log($"GlossaryService: USE_EXTERNAL_GLOSSARY=true, GLOSSARY_REQUIRED_OPTION={_requiredOption}");
 
                 string repoDbType = DatabaseService.Instance.GetDbType();
 
@@ -278,7 +324,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // so the same code path adapts to per-model overrides.
                     if (!string.IsNullOrEmpty(_termTypeColumn) || _termTypeMap.Count > 0)
                     {
-                        bool termTypeEnabled = ReadModelPropertyBool(conn, repoDbType, "USE_TERM_TYPE_MAPPING");
+                        bool termTypeEnabled = ConfigContextService.Instance.GetEffectiveBool("USE_TERM_TYPE_MAPPING", false);
                         if (!termTypeEnabled)
                         {
                             Log($"GlossaryService: TermType mapping disabled by USE_TERM_TYPE_MAPPING flag — clearing {_termTypeMap.Count} concept mapping(s)");
@@ -586,65 +632,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                 default:
                     return @"SELECT [SOURCE_COLUMN], [TARGET_TYPE], [TARGET_FIELD] FROM [dbo].[DG_TABLE_MAPPING_COLUMN]
                             WHERE [TABLE_MAPPING_ID] = @mappingId ORDER BY [SORT_ORDER]";
-            }
-        }
-
-        /// <summary>
-        /// Read a boolean CONFIG_PROPERTY value scoped to the active config. Returns false
-        /// when the row is missing or the value is anything other than "Yes" / "True" / "1"
-        /// — same convention as PropertyApplicatorService.
-        /// </summary>
-        private bool ReadModelPropertyBool(DbConnection conn, string repoDbType, string key)
-        {
-            try
-            {
-                var ctx = ConfigContextService.Instance;
-                if (!ctx.IsInitialized) return false;
-
-                string query;
-                switch (repoDbType?.ToUpper())
-                {
-                    case "POSTGRESQL":
-                        query = @"SELECT ""VALUE"" FROM ""CONFIG_PROPERTY""
-                                  WHERE ""KEY"" = @key AND ""CONFIG_ID"" = @cfgId
-                                  LIMIT 1";
-                        break;
-                    case "ORACLE":
-                        query = @"SELECT VALUE FROM CONFIG_PROPERTY
-                                  WHERE KEY = :key AND CONFIG_ID = :cfgId
-                                  FETCH FIRST 1 ROWS ONLY";
-                        break;
-                    case "MSSQL":
-                    default:
-                        query = @"SELECT TOP 1 [VALUE] FROM [dbo].[CONFIG_PROPERTY]
-                                  WHERE [KEY] = @key AND [CONFIG_ID] = @cfgId";
-                        break;
-                }
-
-                using (var cmd = DatabaseService.Instance.CreateCommand(query, conn))
-                {
-                    var pKey = cmd.CreateParameter();
-                    pKey.ParameterName = repoDbType == "ORACLE" ? ":key" : "@key";
-                    pKey.Value = key;
-                    cmd.Parameters.Add(pKey);
-
-                    var pCfg = cmd.CreateParameter();
-                    pCfg.ParameterName = repoDbType == "ORACLE" ? ":cfgId" : "@cfgId";
-                    pCfg.Value = ctx.ActiveConfigId;
-                    cmd.Parameters.Add(pCfg);
-
-                    var result = cmd.ExecuteScalar();
-                    if (result == null || result == DBNull.Value) return false;
-                    string value = result.ToString().Trim();
-                    return value.Equals("Yes", StringComparison.OrdinalIgnoreCase)
-                        || value.Equals("True", StringComparison.OrdinalIgnoreCase)
-                        || value == "1";
-                }
-            }
-            catch (Exception ex)
-            {
-                Log($"GlossaryService: ReadModelPropertyBool('{key}') error: {ex.Message}");
-                return false;
             }
         }
 

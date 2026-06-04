@@ -1,6 +1,8 @@
 using System;
 using System.Data.Common;
+using System.Linq;
 using System.Text.RegularExpressions;
+using EliteSoft.MetaAdmin.Shared.Data;
 
 namespace EliteSoft.Erwin.AddIn.Services
 {
@@ -163,8 +165,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             if (string.IsNullOrWhiteSpace(locator)) return null;
 
-            // Mirrors VersionCompareService.BuildMartLocatorForTarget so a
-            // single regex governs how we read the active PU's path stem.
+            // Single regex governs how we read the active PU's Mart path stem.
             var m = Regex.Match(locator, @"Mart://Mart/(?<path>[^?&]+?)(?:[?&]|$)",
                 RegexOptions.IgnoreCase);
             if (!m.Success) return null;
@@ -258,6 +259,118 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
 
             return true;
+        }
+
+        #endregion
+
+        #region Two-level effective-value resolver (model CONFIG_PROPERTY -> corporate CORPORATE_PROPERTY -> code default)
+
+        /// <summary>
+        /// Resolve the EFFECTIVE raw string value of a policy key under the
+        /// two-level cascade (added 2026-06-04 alongside the admin CORPORATE_PROPERTY
+        /// table):
+        ///   1. MODEL override: the CONFIG_PROPERTY row for <see cref="ActiveConfigId"/>,
+        ///      if a row exists (model "(Inherit)" == that row is absent/deleted);
+        ///   2. else CORPORATE default: the CORPORATE_PROPERTY row for
+        ///      <see cref="CorporateId"/> (= CONFIG.CORPORATE_ID), if a row exists;
+        ///   3. else null -> the caller applies its built-in code default.
+        ///
+        /// This is a CASCADE, not an error-fallback. A MISSING row at either level
+        /// is normal and yields the cascade/default. A REAL DB read error is NOT
+        /// swallowed here - it propagates so the caller surfaces it to the user/log
+        /// (rule: never silently fall back to the default on a genuine read failure).
+        /// Returns null when the addin is unconfigured (no bootstrap / no config),
+        /// which is the same "no value -> default" outcome the addin already degrades
+        /// to elsewhere.
+        ///
+        /// Uses the shared EF <see cref="RepoDbContext"/> + the MetaShared
+        /// ConfigProperty / CorporateProperty entities so the per-DbType quoting is
+        /// handled by EF (no hand-written MSSQL/PG/Oracle SQL to keep in sync).
+        /// </summary>
+        public string GetEffective(string key)
+        {
+            if (string.IsNullOrEmpty(key)) return null;
+
+            var config = DatabaseService.Instance.GetConfig();
+            if (config == null || !config.IsConfigured) return null; // unconfigured -> default
+
+            using (var ctx = new RepoDbContext(config))
+            {
+                if (ActiveConfigId > 0)
+                {
+                    string model = ctx.ConfigProperties
+                        .Where(p => p.ConfigId == ActiveConfigId && p.Key == key)
+                        .Select(p => p.Value)
+                        .FirstOrDefault();
+                    if (model != null) return model; // model row present (incl. empty string) wins
+                }
+
+                if (CorporateId.HasValue)
+                {
+                    string corp = ctx.CorporateProperties
+                        .Where(p => p.CorporateId == CorporateId.Value && p.Key == key)
+                        .Select(p => p.Value)
+                        .FirstOrDefault();
+                    if (corp != null) return corp;
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Effective bool for <paramref name="key"/>. Primary parse is the spec
+        /// format bool.TryParse ("True"/"False", case-insensitive); a legacy
+        /// "Yes"/"1" value is also honoured so pre-existing rows do not silently
+        /// flip to the default. Missing at both levels -> <paramref name="defaultValue"/>.
+        /// </summary>
+        public bool GetEffectiveBool(string key, bool defaultValue)
+            => ParseEffectiveBool(GetEffective(key), defaultValue);
+
+        /// <summary>Effective int for <paramref name="key"/>; missing/unparseable -> <paramref name="defaultValue"/>.</summary>
+        public int GetEffectiveInt(string key, int defaultValue)
+            => ParseEffectiveInt(GetEffective(key), defaultValue);
+
+        /// <summary>Effective enum for <paramref name="key"/> (case-insensitive); missing/unparseable -> <paramref name="defaultValue"/>.</summary>
+        public TEnum GetEffectiveEnum<TEnum>(string key, TEnum defaultValue) where TEnum : struct
+            => ParseEffectiveEnum(GetEffective(key), defaultValue);
+
+        // --- Pure (DB-free, unit-testable) value parsers. The DB cascade lives in
+        // GetEffective; these turn its raw string into bool/int/enum. Public static to
+        // mirror ParseMartPath - the test project covers them directly (the cascade
+        // itself is exercised live when the add-in attaches to a Mart model). ---
+
+        /// <summary>
+        /// Primary parse is bool.TryParse ("True"/"False", case-insensitive); a legacy
+        /// "Yes"/"1" (or "No"/"0") value is also honoured so pre-existing rows do not
+        /// silently flip to the default. Null/blank/unparseable -> <paramref name="defaultValue"/>.
+        /// </summary>
+        public static bool ParseEffectiveBool(string value, bool defaultValue)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return defaultValue;
+            string v = value.Trim();
+            if (bool.TryParse(v, out bool b)) return b;
+            if (v.Equals("Yes", StringComparison.OrdinalIgnoreCase) || v == "1") return true;
+            if (v.Equals("No", StringComparison.OrdinalIgnoreCase) || v == "0") return false;
+            return defaultValue;
+        }
+
+        /// <summary>int.TryParse on the trimmed value; null/blank/unparseable -> <paramref name="defaultValue"/>.</summary>
+        public static int ParseEffectiveInt(string value, int defaultValue)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return defaultValue;
+            return int.TryParse(value.Trim(), out int i) ? i : defaultValue;
+        }
+
+        /// <summary>
+        /// Case-insensitive Enum.TryParse + Enum.IsDefined guard (so a numeric string or
+        /// an out-of-range name does not slip through). Null/blank/unparseable -> default.
+        /// </summary>
+        public static TEnum ParseEffectiveEnum<TEnum>(string value, TEnum defaultValue) where TEnum : struct
+        {
+            if (string.IsNullOrWhiteSpace(value)) return defaultValue;
+            return Enum.TryParse(value.Trim(), ignoreCase: true, out TEnum e) && Enum.IsDefined(typeof(TEnum), e)
+                ? e : defaultValue;
         }
 
         #endregion

@@ -84,8 +84,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // disabled. We still set _isLoaded=true at the end so the
                     // service reports "loaded" (callers query IsExternalEnabled
                     // separately to decide whether to actually validate).
-                    _isExternalEnabled = ReadConfigPropertyBool(connection, dbType, "USE_EXTERNAL_DOMAIN");
-                    System.Diagnostics.Debug.WriteLine($"DomainDefService: USE_EXTERNAL_DOMAIN = {_isExternalEnabled}");
+                    // Effective USE_EXTERNAL_DOMAIN: model CONFIG_PROPERTY -> corporate
+                    // CORPORATE_PROPERTY -> false (2026-06-04 two-level cascade). A real DB
+                    // read error is NOT swallowed here (the resolver propagates it) - it
+                    // surfaces via the outer catch (_lastError + load fails) instead of
+                    // silently disabling domain validation.
+                    _isExternalEnabled = ConfigContextService.Instance.GetEffectiveBool("USE_EXTERNAL_DOMAIN", false);
+                    System.Diagnostics.Debug.WriteLine($"DomainDefService: USE_EXTERNAL_DOMAIN (effective) = {_isExternalEnabled}");
 
                     if (!_isExternalEnabled)
                     {
@@ -135,66 +140,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                 _lastError = ex.Message;
                 _isLoaded = false;
                 System.Diagnostics.Debug.WriteLine($"DomainDefService.LoadDomainDefs error: {ex.Message}");
-                return false;
-            }
-        }
-
-        /// <summary>
-        /// Read a boolean CONFIG_PROPERTY value scoped to the active config.
-        /// Mirrors GlossaryService.ReadModelPropertyBool - same convention.
-        /// Returns false when the row is missing or the value is anything
-        /// other than 'Yes' / 'True' / '1'.
-        /// </summary>
-        private bool ReadConfigPropertyBool(System.Data.Common.DbConnection conn, string repoDbType, string key)
-        {
-            try
-            {
-                var ctx = ConfigContextService.Instance;
-                if (!ctx.IsInitialized) return false;
-
-                string query;
-                switch (repoDbType?.ToUpper())
-                {
-                    case "POSTGRESQL":
-                        query = @"SELECT ""VALUE"" FROM ""CONFIG_PROPERTY""
-                                  WHERE ""KEY"" = @key AND ""CONFIG_ID"" = @cfgId
-                                  LIMIT 1";
-                        break;
-                    case "ORACLE":
-                        query = @"SELECT VALUE FROM CONFIG_PROPERTY
-                                  WHERE KEY = :key AND CONFIG_ID = :cfgId
-                                  FETCH FIRST 1 ROWS ONLY";
-                        break;
-                    case "MSSQL":
-                    default:
-                        query = @"SELECT TOP 1 [VALUE] FROM [dbo].[CONFIG_PROPERTY]
-                                  WHERE [KEY] = @key AND [CONFIG_ID] = @cfgId";
-                        break;
-                }
-
-                using (var cmd = DatabaseService.Instance.CreateCommand(query, conn))
-                {
-                    var pKey = cmd.CreateParameter();
-                    pKey.ParameterName = repoDbType == "ORACLE" ? ":key" : "@key";
-                    pKey.Value = key;
-                    cmd.Parameters.Add(pKey);
-
-                    var pCfg = cmd.CreateParameter();
-                    pCfg.ParameterName = repoDbType == "ORACLE" ? ":cfgId" : "@cfgId";
-                    pCfg.Value = ctx.ActiveConfigId;
-                    cmd.Parameters.Add(pCfg);
-
-                    var result = cmd.ExecuteScalar();
-                    if (result == null || result == DBNull.Value) return false;
-                    string value = result.ToString().Trim();
-                    return value.Equals("Yes", StringComparison.OrdinalIgnoreCase)
-                        || value.Equals("True", StringComparison.OrdinalIgnoreCase)
-                        || value == "1";
-                }
-            }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine($"DomainDefService: ReadConfigPropertyBool('{key}') error: {ex.Message}");
                 return false;
             }
         }

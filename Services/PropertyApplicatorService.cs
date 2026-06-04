@@ -754,27 +754,20 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// </summary>
         public bool IsPropertyEnabled(string propertyKey)
         {
+            // Effective value via the two-level cascade (2026-06-04): model
+            // CONFIG_PROPERTY -> corporate CORPORATE_PROPERTY -> false. Single fix
+            // point - the DELETE_AUTO_CREATED_INDEX_PK + APPLY_UDP_CHANGES_SILENTLY
+            // callers inherit the cascade. A MISSING row is the normal "not set" ->
+            // false; a real DB read error is SURFACED (logged) rather than silently
+            // masked, and false is the safe direction for both gates (index kept /
+            // UDP dialog shown).
             try
             {
-                var bootstrapService = new RegistryBootstrapService();
-                var config = bootstrapService.GetConfig();
-                if (config == null || !config.IsConfigured) return false;
-                if (_configId <= 0) return false;
-
-                using (var context = new RepoDbContext(config))
-                {
-                    var prop = context.ConfigProperties
-                        .FirstOrDefault(p => p.ConfigId == _configId && p.Key == propertyKey);
-                    if (prop == null) return false;
-
-                    return prop.Value.Equals("Yes", StringComparison.OrdinalIgnoreCase)
-                        || prop.Value.Equals("True", StringComparison.OrdinalIgnoreCase)
-                        || prop.Value == "1";
-                }
+                return ConfigContextService.Instance.GetEffectiveBool(propertyKey, false);
             }
             catch (Exception ex)
             {
-                Log($"PropertyApplicator: IsPropertyEnabled({propertyKey}) error: {ex.Message}");
+                Log($"PropertyApplicator: IsPropertyEnabled({propertyKey}) DB read error (treated as disabled): {ex.Message}");
                 return false;
             }
         }

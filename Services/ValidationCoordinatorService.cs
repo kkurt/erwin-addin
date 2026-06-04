@@ -5076,16 +5076,31 @@ namespace EliteSoft.Erwin.AddIn.Services
 
             if (!glossary.HasEntry(state.PhysicalName))
             {
-                Log($"Glossary validation FAILED: {state.TableName}.{state.PhysicalName}");
-                _pendingResults.Add(new CollectedValidationResult
+                // 2026-06-04 GLOSSARY_REQUIRED_OPTION enforcement (effective value cached on
+                // GlossaryService; the whole feature is already gated by USE_EXTERNAL_GLOSSARY
+                // - the glossary would not be IsLoaded otherwise):
+                //   OPTIONAL_SILENT (default) -> accept silently: do NOT queue a result
+                //                                (no popup, no rename/delete);
+                //   OPTIONAL_WARNING / REQUIRED -> queue so the consolidated popup warns.
+                //                                  ShowConsolidatedPopup then renames/deletes
+                //                                  ONLY for REQUIRED.
+                if (glossary.RequiredOption == GlossaryRequiredOption.OPTIONAL_SILENT)
                 {
-                    ValidationType = CollectedValidationResultType.Glossary,
-                    TableName = state.TableName,
-                    ColumnName = state.PhysicalName,
-                    Message = "Column name not found in glossary. Please use a column name from the glossary.",
-                    Attribute = attr,
-                    ObjectId = state.ObjectId
-                });
+                    Log($"Glossary no-match accepted (OPTIONAL_SILENT): {state.TableName}.{state.PhysicalName}");
+                }
+                else
+                {
+                    Log($"Glossary validation FAILED ({glossary.RequiredOption}): {state.TableName}.{state.PhysicalName}");
+                    _pendingResults.Add(new CollectedValidationResult
+                    {
+                        ValidationType = CollectedValidationResultType.Glossary,
+                        TableName = state.TableName,
+                        ColumnName = state.PhysicalName,
+                        Message = "Column name not found in glossary. Please use a column name from the glossary.",
+                        Attribute = attr,
+                        ObjectId = state.ObjectId
+                    });
+                }
             }
             else
             {
@@ -6117,19 +6132,32 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // 2026-05-07: explicit timing markers around the post-OK work so the
                 // user can see exactly how long delete / rename takes vs how long
                 // the popup itself was on-screen.
-                var sw = System.Diagnostics.Stopwatch.StartNew();
-                bool editorOpen = !string.IsNullOrEmpty(_activeColumnEditorTable);
-                Log($"[POPUP] OK clicked - dispatching {(editorOpen ? "rename" : "delete")} for {glossaryResults.Count} column(s)");
-                if (editorOpen)
+                // 2026-06-04 GLOSSARY_REQUIRED_OPTION: the destructive rename-to-
+                // "PLEASE CHANGE IT" / delete is the REQUIRED enforcement ONLY.
+                // OPTIONAL_WARNING shows the warning popup above but ACCEPTS the value
+                // (no rename/delete); OPTIONAL_SILENT never queued a glossary result so
+                // it never reaches here. Domain/naming results are unaffected.
+                var glossaryMode = GlossaryService.Instance.RequiredOption;
+                if (glossaryResults.Count > 0 && glossaryMode == GlossaryRequiredOption.REQUIRED)
                 {
-                    RenameInvalidGlossaryColumns(glossaryResults);
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    bool editorOpen = !string.IsNullOrEmpty(_activeColumnEditorTable);
+                    Log($"[POPUP] OK clicked - REQUIRED: dispatching {(editorOpen ? "rename" : "delete")} for {glossaryResults.Count} column(s)");
+                    if (editorOpen)
+                    {
+                        RenameInvalidGlossaryColumns(glossaryResults);
+                    }
+                    else
+                    {
+                        DeleteInvalidGlossaryColumns(glossaryResults);
+                    }
+                    sw.Stop();
+                    Log($"[POPUP] post-OK action took {sw.ElapsedMilliseconds} ms");
                 }
-                else
+                else if (glossaryResults.Count > 0)
                 {
-                    DeleteInvalidGlossaryColumns(glossaryResults);
+                    Log($"[POPUP] OK clicked - glossary mode {glossaryMode}: value ACCEPTED, no rename/delete for {glossaryResults.Count} column(s)");
                 }
-                sw.Stop();
-                Log($"[POPUP] post-OK action took {sw.ElapsedMilliseconds} ms");
             }
             finally
             {
