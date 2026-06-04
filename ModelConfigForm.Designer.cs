@@ -689,6 +689,28 @@ namespace EliteSoft.Erwin.AddIn
             this.tabDdlGeneration.Controls.Add(this.btnAlterWizardProdDebug);
 #endif
 
+            // RDP black-rectangle STEP-MODE toggle. Exists in ALL builds (the
+            // checkpoint plumbing is always compiled); in PACKAGED it is created
+            // HIDDEN and revealed via Ctrl+Shift+LeftClick on the copyright label
+            // (same gesture as the Debug Log tab) so a field user (Emre) can run
+            // the diagnostic without a "Step Mode" button shipping visibly. In dev
+            // builds it is visible by default. Replaces the old Ctrl+Alt+S hotkey
+            // (collided with erwin's Scheduler shortcut).
+            this.btnStepMode = new System.Windows.Forms.Button();
+            this.btnStepMode.Location = new System.Drawing.Point(12, 210);
+            this.btnStepMode.Size = new System.Drawing.Size(175, 26);
+            this.btnStepMode.Text = "Step Mode: OFF";
+            this.btnStepMode.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnStepMode.BackColor = System.Drawing.Color.FromArgb(96, 96, 96); // gray = off
+            this.btnStepMode.ForeColor = System.Drawing.Color.White;
+            this.btnStepMode.Font = new System.Drawing.Font("Segoe UI", 9f, System.Drawing.FontStyle.Bold);
+            this.btnStepMode.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnStepMode.Click += new System.EventHandler(this.BtnStepMode_Click);
+#if PACKAGED
+            this.btnStepMode.Visible = false;   // revealed via Ctrl+Shift+LeftClick on the copyright label
+#endif
+            this.tabDdlGeneration.Controls.Add(this.btnStepMode);
+
             this.lblDDLStatus = new System.Windows.Forms.Label();
 #if !PACKAGED
             // Debug button sits to the right of the production button; status
@@ -797,6 +819,7 @@ namespace EliteSoft.Erwin.AddIn
 #if !PACKAGED
         private System.Windows.Forms.Button btnAlterWizardProdDebug;
 #endif
+        private System.Windows.Forms.Button btnStepMode;
         private System.Windows.Forms.ComboBox cmbRightModel;
         // txtFEOptionXml + btnBrowseFEOption removed 2026-05-27 (dead UI; see
         // matching note in the designer constructor block).

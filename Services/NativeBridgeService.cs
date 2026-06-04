@@ -59,6 +59,17 @@ namespace EliteSoft.Erwin.AddIn.Services
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate void SetUseDiagramSelectionFn(int enabled);
 
+        // STEP-MODE (dev, 2026-06-01): RDP black-rectangle bisection. SetStepMode
+        // arms/disarms; StepCheckpointExport pops a MessageBox checkpoint (no-op
+        // when disarmed) so the user can pinpoint which teardown step turns the
+        // screen black. Strings are ANSI (ASCII-safe Turkish, no diacritics).
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate void SetStepModeFn(int enabled);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate void StepCheckpointExportFn(
+            [MarshalAs(UnmanagedType.LPStr)] string tag,
+            [MarshalAs(UnmanagedType.LPStr)] string whatJustRan);
+
         // RECON (dev): dumps the current foreground window's full control tree
         // to the bridge log. Used to discover Review / Complete Compare /
         // Resolve Differences control IDs without guessing.
@@ -244,6 +255,8 @@ namespace EliteSoft.Erwin.AddIn.Services
         private static GetCapturedFEWPageOptionsFn _getCapturedFEWPO;
         private static SetDebugKeepWindowsVisibleFn _setDebugKeepWindowsVisible;
         private static SetUseDiagramSelectionFn _setUseDiagramSelection;
+        private static SetStepModeFn _setStepMode;
+        private static StepCheckpointExportFn _stepCheckpoint;
         private static DumpForegroundWindowTreeFn _dumpForegroundWindowTree;
         private static ToggleReconCommandCaptureFn _toggleReconCommandCapture;
         private static DumpMdiChildrenFn _dumpMdiChildren;
@@ -407,6 +420,16 @@ namespace EliteSoft.Erwin.AddIn.Services
                     IntPtr setObjFilterProc = GetProcAddress(_bridgeModule, "SetUseDiagramSelection");
                     if (setObjFilterProc != IntPtr.Zero)
                         _setUseDiagramSelection = Marshal.GetDelegateForFunctionPointer<SetUseDiagramSelectionFn>(setObjFilterProc);
+
+                    // STEP-MODE (dev): RDP black-rectangle bisection checkpoints.
+                    // Older bridge builds without these exports => SetStepMode /
+                    // StepCheckpoint silently no-op (diagnostic only).
+                    IntPtr setStepProc = GetProcAddress(_bridgeModule, "SetStepMode");
+                    if (setStepProc != IntPtr.Zero)
+                        _setStepMode = Marshal.GetDelegateForFunctionPointer<SetStepModeFn>(setStepProc);
+                    IntPtr stepCpProc = GetProcAddress(_bridgeModule, "StepCheckpointExport");
+                    if (stepCpProc != IntPtr.Zero)
+                        _stepCheckpoint = Marshal.GetDelegateForFunctionPointer<StepCheckpointExportFn>(stepCpProc);
 
                     // RECON (dev): foreground window-tree dumper.
                     IntPtr dumpFgProc = GetProcAddress(_bridgeModule, "DumpForegroundWindowTree");
@@ -1174,28 +1197,38 @@ namespace EliteSoft.Erwin.AddIn.Services
             // The FEW-CTOR hook fires synchronously during wizard creation,
             // so g_capturedFEWPO is now set to the live wizard's options.
 
-            // Debug pause: in debug mode the wizard is now visible on-screen
-            // before we drive it. Give the dev a chance to actually see the
-            // wizard before the GA detour fires.
-            DebugMode.Pause("hidden alter wizard opened - inspect it", log);
-
-            // Step 2: call Invoke → GA detour captures DDL.
-            string ddl = CallInvokePreviewDirect(log);
-
-            // Debug pause: DDL has been captured but the wizard is still open.
-            // Hold it open so the dev can read the Preview page in debug runs.
-            DebugMode.Pause("DDL captured - wizard still open for review", log);
-
-            // Step 3: always close the hidden wizard. It's a MODAL CPropertySheet,
-            // and leaving it alive locks the erwin main window (title shows
-            // "Read-Only"). Closing it has a small cost (next call re-opens
-            // in ~700ms) but keeps erwin usable between calls.
-            if (_hiddenWizardHwnd != IntPtr.Zero && _closeHiddenWizard != null)
+            // The wizard is now kept VISIBLE behind a native opaque cover (RDP
+            // black-rectangle fix). The whole drive+close MUST run in try/finally
+            // so CloseHiddenWizard - which destroys that cover - always runs even
+            // if CallInvokePreviewDirect throws; otherwise the opaque cover would
+            // be stranded full-screen on the user's session.
+            string ddl = null;
+            try
             {
-                log?.Invoke($"NativeBridge: closing hidden wizard hwnd=0x{_hiddenWizardHwnd.ToInt64():X}");
-                try { _closeHiddenWizard(_hiddenWizardHwnd); } catch (Exception ex)
-                { log?.Invoke($"NativeBridge: close wizard threw: {ex.Message}"); }
-                _hiddenWizardHwnd = IntPtr.Zero;
+                // Debug pause: in debug mode the wizard is now visible on-screen
+                // before we drive it. Give the dev a chance to actually see the
+                // wizard before the GA detour fires.
+                DebugMode.Pause("hidden alter wizard opened - inspect it", log);
+
+                // Step 2: call Invoke → GA detour captures DDL.
+                ddl = CallInvokePreviewDirect(log);
+
+                // Debug pause: DDL has been captured but the wizard is still open.
+                // Hold it open so the dev can read the Preview page in debug runs.
+                DebugMode.Pause("DDL captured - wizard still open for review", log);
+            }
+            finally
+            {
+                // Step 3: always close the hidden wizard. It's a MODAL CPropertySheet,
+                // and leaving it alive locks the erwin main window (title shows
+                // "Read-Only"). CloseHiddenWizard also tears down the opaque cover.
+                if (_hiddenWizardHwnd != IntPtr.Zero && _closeHiddenWizard != null)
+                {
+                    log?.Invoke($"NativeBridge: closing hidden wizard hwnd=0x{_hiddenWizardHwnd.ToInt64():X}");
+                    try { _closeHiddenWizard(_hiddenWizardHwnd); } catch (Exception ex)
+                    { log?.Invoke($"NativeBridge: close wizard threw: {ex.Message}"); }
+                    _hiddenWizardHwnd = IntPtr.Zero;
+                }
             }
             return ddl;
         }
@@ -1230,6 +1263,32 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// Force the native bridge wizard-visibility flag directly, independent of
+        /// <see cref="DebugMode.KeepDialogsVisible"/> (so NO debug pauses fire). Used
+        /// for the one-time-per-session DWM warm-up: the first production Generate
+        /// keeps the Alter Script wizard VISIBLE so the DWM builds its composition
+        /// surface from a real on-screen render (RDP only warms that way), which
+        /// prevents the cold-start "black rectangle" leak on subsequent silent runs.
+        /// </summary>
+        public static void SetWizardVisible(bool visible, Action<string> log = null)
+        {
+            if (_setDebugKeepWindowsVisible == null)
+            {
+                log?.Invoke("NativeBridge: SetDebugKeepWindowsVisible export missing (older bridge) - DWM warm-up is a no-op. Rebuild native-bridge.");
+                return;
+            }
+            try
+            {
+                _setDebugKeepWindowsVisible(visible ? 1 : 0);
+                log?.Invoke($"NativeBridge: wizard visibility forced {(visible ? "VISIBLE (one-time DWM warm-up)" : "HIDDEN")}.");
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"NativeBridge: SetWizardVisible threw: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        /// <summary>
         /// Tell the bridge how to answer erwin's "Use current diagram
         /// selections?" Object Filter popup on the next pipeline run:
         /// <paramref name="onlySelected"/> true -> Yes (scope the alter script
@@ -1256,6 +1315,52 @@ namespace EliteSoft.Erwin.AddIn.Services
             catch (Exception ex)
             {
                 log?.Invoke($"NativeBridge: SetUseDiagramSelection threw: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// STEP-MODE (dev, 2026-06-01): arm/disarm the RDP black-rectangle
+        /// bisection checkpoints. When armed, the same-version Generate DDL
+        /// teardown pops a MessageBox before/after each destroy-related step so
+        /// the user can pinpoint which one turns the screen black. No-op on
+        /// older bridge builds without the export.
+        /// </summary>
+        public static void SetStepMode(bool enabled, Action<string> log = null)
+        {
+            if (_setStepMode == null)
+            {
+                log?.Invoke("NativeBridge: SetStepMode export missing (rebuild native-bridge to use step-mode).");
+                return;
+            }
+            try
+            {
+                _setStepMode(enabled ? 1 : 0);
+                log?.Invoke($"NativeBridge: step-mode {(enabled ? "ENABLED (checkpoints will pop)" : "disabled")}.");
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"NativeBridge: SetStepMode threw: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// STEP-MODE (dev): pop a managed-side checkpoint [D]/[E] with the same
+        /// prompt and the same native g_stepModeEnabled gate (no-op when
+        /// disarmed). <paramref name="tag"/> is a short id; <paramref name="whatJustRan"/>
+        /// is an ASCII (no diacritics) description of the step just completed.
+        /// </summary>
+        public static void StepCheckpoint(string tag, string whatJustRan, Action<string> log = null)
+        {
+            if (_stepCheckpoint == null) return;
+            try
+            {
+                _stepCheckpoint(tag, whatJustRan);
+            }
+            catch (Exception ex)
+            {
+                // Diagnostic checkpoint must never abort the DDL pipeline, but
+                // do not swallow silently (project rule: no empty catch).
+                log?.Invoke($"NativeBridge: StepCheckpoint('{tag}') threw: {ex.GetType().Name}: {ex.Message}");
             }
         }
 

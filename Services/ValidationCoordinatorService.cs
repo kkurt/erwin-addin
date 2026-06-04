@@ -85,9 +85,6 @@ namespace EliteSoft.Erwin.AddIn.Services
         [DllImport("user32.dll")]
         private static extern bool EnumWindows(EnumWindowsProc enumProc, IntPtr lParam);
 
-        [DllImport("user32.dll", CharSet = CharSet.Auto)]
-        private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
-
         [DllImport("user32.dll")]
         private static extern bool IsWindowVisible(IntPtr hWnd);
 
@@ -848,10 +845,20 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             try
             {
-                var erwinProcesses = System.Diagnostics.Process.GetProcessesByName("erwin");
-                if (erwinProcesses.Length == 0) return "";
+                // Resolve erwin's REAL main frame (caption starts "erwin DM") via the
+                // hang-proof finder, then read its title with a timeout-bounded
+                // WM_GETTEXT. The old Process.GetProcessesByName("erwin")[0].MainWindowTitle
+                // had two faults that froze erwin's UI thread (hang dump 2026-06-03,
+                // this heartbeat path): (1) MainWindowHandle picks the first owner-less
+                // top-level window, which after a version-compare teardown can be a
+                // leftover visible #32770 dialog parked on a non-pumping worker thread;
+                // (2) MainWindowTitle then does a synchronous GetWindowText to it,
+                // blocking forever. GetErwinMainWindow now skips hung windows and
+                // GetWindowTextNoHang can never block.
+                IntPtr mainHwnd = Win32Helper.GetErwinMainWindow();
+                if (mainHwnd == IntPtr.Zero) return "";
 
-                string windowTitle = erwinProcesses[0].MainWindowTitle;
+                string windowTitle = Win32Helper.GetWindowTextNoHang(mainHwnd);
                 if (string.IsNullOrEmpty(windowTitle)) return "";
 
                 // Parse: "erwin DM - [ModelName : ModelName* (Read-Only)] - ..."
@@ -3008,9 +3015,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             {
                 if (!IsWindowVisible(hWnd)) return true;
 
-                StringBuilder title = new StringBuilder(512);
-                GetWindowText(hWnd, title, 512);
-                string windowTitle = title.ToString();
+                string windowTitle = Win32Helper.GetWindowTextNoHang(hWnd);
 
                 if (windowTitle.Contains("Column") && windowTitle.Contains("Editor"))
                 {
@@ -3052,9 +3057,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             EnumWindows((hWnd, lParam) =>
             {
                 if (!IsWindowVisible(hWnd)) return true;
-                var title = new StringBuilder(512);
-                GetWindowText(hWnd, title, 512);
-                string t = title.ToString();
+                string t = Win32Helper.GetWindowTextNoHang(hWnd);
                 if (t.StartsWith("User Defined Properties", StringComparison.OrdinalIgnoreCase))
                 {
                     found = true;
@@ -3083,9 +3086,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             {
                 if (!IsWindowVisible(hWnd)) return true;
 
-                StringBuilder title = new StringBuilder(512);
-                GetWindowText(hWnd, title, 512);
-                string windowTitle = title.ToString();
+                string windowTitle = Win32Helper.GetWindowTextNoHang(hWnd);
 
                 // Entity Editor: "Table '...' Editor" with NO "Column '...'".
                 if (windowTitle.Contains("Table '")

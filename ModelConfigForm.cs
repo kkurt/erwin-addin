@@ -158,6 +158,11 @@ namespace EliteSoft.Erwin.AddIn
         // BtnAlterWizardProd_Click is still running. ReconnectTimer_Tick early-
         // returns while this is set; the pipeline also stops the timer outright.
         private volatile bool _martMartPipelineActive;
+        // One-time-per-addin-session DWM warm-up guard. The first PRODUCTION
+        // Generate DDL keeps the Alter Script wizard visible once (so the DWM warms
+        // its on-screen surface); every later run is silent. Reset only by an addin
+        // reload (new erwin session), which matches the DWM surface lifetime.
+        private bool _dwmWarmedThisSession;
         private DateTime? _lastGlossaryRefreshTime;
         private volatile bool _isRefreshingGlossary;
 
@@ -191,11 +196,14 @@ namespace EliteSoft.Erwin.AddIn
                 {
                     IntPtr fg = Services.Win32Helper.GetForegroundWindowPublic();
                     var classSb = new System.Text.StringBuilder(128);
-                    var titleSb = new System.Text.StringBuilder(256);
                     Services.Win32Helper.GetClassNamePublic(fg, classSb, classSb.Capacity);
-                    Services.Win32Helper.GetWindowTextPublic(fg, titleSb, titleSb.Capacity);
+                    // Timeout-bounded: this Deactivate diagnostic fires on the UI
+                    // thread during foreground-stealing teardown; a raw GetWindowText
+                    // to the new foreground window (possibly a hung erwin dialog)
+                    // would freeze the UI thread (hang class 2026-06-03).
+                    string fgTitle = Services.Win32Helper.GetWindowTextNoHang(fg);
                     uint fgPid = Services.Win32Helper.GetWindowThreadProcessIdPublic(fg);
-                    Log($"[FOCUS] form Deactivate -> fg=0x{fg.ToInt64():X} class='{classSb}' title='{titleSb}' pid={fgPid}");
+                    Log($"[FOCUS] form Deactivate -> fg=0x{fg.ToInt64():X} class='{classSb}' title='{fgTitle}' pid={fgPid}");
                 }
                 catch (Exception ex) { Log($"[FOCUS] Deactivate diag failed: {ex.Message}"); }
             };
@@ -710,7 +718,7 @@ namespace EliteSoft.Erwin.AddIn
             {
                 // 1. Raw main-window title (no regex, no bracket extraction).
                 IntPtr hWnd = Services.Win32Helper.GetErwinMainWindow();
-                string rawTitle = hWnd != IntPtr.Zero ? Services.Win32Helper.GetWindowTextSafe(hWnd) : "(no erwin main window)";
+                string rawTitle = hWnd != IntPtr.Zero ? Services.Win32Helper.GetWindowTextNoHang(hWnd) : "(no erwin main window)";
                 Log($"{tag}: rawTitle='{rawTitle}'");
                 Log($"{tag}: parsedTitleLoc='{Services.PuLocatorReader.ReadFromWindowTitle() ?? string.Empty}' boundName='{_connectedModelName ?? string.Empty}'");
 
@@ -3493,7 +3501,7 @@ namespace EliteSoft.Erwin.AddIn
             }
 
             Log("[REVIEW] Triggering erwin Review...");
-            bool invoked = Services.Win32Helper.InvokeToolbarButton(hWnd, "Review", Log);
+            bool invoked = Services.MartMartAutomation.PostMartReviewCommand(hWnd, Log);
 
             if (invoked)
                 Log("[REVIEW] Review triggered.");
@@ -3642,6 +3650,10 @@ namespace EliteSoft.Erwin.AddIn
             // up the flag flip via SyncDebugVisibility, called at the next
             // line below where it already lives in the production path.
             Services.DebugMode.Enabled = (sender == btnAlterWizardProdDebug);
+            // The debug button keeps the long human-read settle; reset it here in case a
+            // prior forced-interactive production run lowered TransitionDelayMs (it is a
+            // static, so it persists across clicks until reset).
+            if (Services.DebugMode.Enabled) Services.DebugMode.TransitionDelayMs = 3000;
 #endif
             if (!_isConnected || _currentModel == null)
             {
@@ -3752,7 +3764,61 @@ namespace EliteSoft.Erwin.AddIn
             // Alter Script Wizard transitions. Pushed here (not at addin
             // init) so the dev "Generate DDL (debug)" button's per-click
             // flag flip takes effect on the very next pipeline dispatch.
+            //
+            // 2026-06-03: the PIXEL-JUMP paths (From-DB + cross-version Review) REACH the
+            // FE Alter Script wizard's Preview by mouse-sim on its nav pane, and the
+            // cross-version path also walks a multi-page CC/Review navigation. Both REQUIRE
+            // the interactive wizard mode the "Generate DDL (debug)" button uses: VISIBLE
+            // windows (so the pixel-jump can actually click the wizard) + SETTLE pauses (so
+            // each wizard page renders before the next step probes it). The production-
+            // silent mode (hidden SW_HIDE wizard, no pauses) breaks BOTH - proven by the
+            // user 2026-06-03 and three dumps: hidden wizard = no DDL; the in-memory list
+            // probe races (id=1083 not found -> "did not reach Resolve Differences"); and
+            // the half-driven state corrupts erwin and crashes its native diagram engine on
+            // the ;Duplicate release (tsm15editor / EM_ERD null-deref 50400, then a heap-
+            // corruption FailFast 5140). The debug button (DebugMode.Enabled=true) captures
+            // DDL AND tears down clean. Same-version (OnFE) needs NONE of this (no CC
+            // wizard, no pixel-jump) so it stays silent/fast. So force the interactive mode
+            // for the pixel-jump routes here - the GREEN button then behaves like the debug
+            // button FOR THOSE PATHS ONLY. The pauses are background Thread.Sleeps on the
+            // worker thread (they pace the wizard, they do NOT hang the add-in UI), and
+            // DebugMode.Enabled is re-decided per click (line ~3652) so this never leaks to
+            // the next run. Trade-off accepted by the user: a briefly visible wizard + a
+            // few seconds slower, in exchange for a working + crash-free compare.
+            if (!Services.DebugMode.Enabled)
+            {
+                int rvForMode = martMode ? ParseRightVersion() : 0;
+                int avForMode = martMode ? ParseActivePuVersion() : 0;
+                bool crossVersionPixelJump = martMode && rvForMode > 0 && avForMode > 0 && rvForMode != avForMode;
+                if (dbMode || crossVersionPixelJump)
+                {
+                    Services.DebugMode.Enabled = true;
+                    // Faster than the debug button: the debug button keeps the long
+                    // 3000 ms human-read settle; this production interactive run only
+                    // needs each wizard page to RENDER before the next step probes it
+                    // (the id=1083 race needs a real settle, but not 3 s). Tunable - if a
+                    // page still races, raise it; if rock-solid, lower it.
+                    Services.DebugMode.TransitionDelayMs = 1200;
+                    log("[ROUTE] pixel-jump path (" + (dbMode ? "From-DB" : "cross-version v" + avForMode + " vs v" + rvForMode) +
+                        ") - INTERACTIVE wizard mode (visible windows + 1200 ms settle, faster than the debug button's 3000 ms). " +
+                        "Required for DDL capture + crash-free teardown; same-version OnFE stays silent.");
+                }
+            }
             Services.NativeBridgeService.SyncDebugVisibility(log);
+
+            // DWM warm-up (2026-06-03): the production path hides the Alter Script
+            // wizard before its first paint, so RDP composites an unrendered (black)
+            // surface = the "black rectangle" leak. A single on-screen render warms
+            // the DWM for the rest of the session. On the FIRST production Generate
+            // this session (NOT the debug button - that is already visible), force
+            // the wizard VISIBLE once (no debug pauses) so the DWM warms; mark warmed
+            // after a successful capture below so later runs stay silent.
+            bool dwmWarmupRun = !Services.DebugMode.KeepDialogsVisible && !_dwmWarmedThisSession;
+            if (dwmWarmupRun)
+            {
+                Services.NativeBridgeService.SetWizardVisible(true, log);
+                log("[DWM-WARMUP] first production Generate this session - keeping the Alter Script wizard VISIBLE once to warm the DWM surface (prevents cold-start black rectangles). Subsequent runs are silent.");
+            }
 
             // "Only Selected Objects": tell the bridge to answer YES to erwin's
             // "Use current diagram selections?" Object Filter popup so the alter
@@ -4070,6 +4136,12 @@ namespace EliteSoft.Erwin.AddIn
                         }
                         else
                         {
+                            // This path is one of the pixel-jump routes forced into
+                            // INTERACTIVE wizard mode at the top of this handler (visible
+                            // windows + short settle pauses). keepVisible / SyncDebugVisibility
+                            // therefore see DebugMode.Enabled=true here, exactly like the
+                            // debug button - the wizard renders (pixel-jump can click it) and
+                            // the CC/Review navigation settles between pages (no id=1083 race).
                             bool keepVisible = Services.DebugMode.KeepDialogsVisible;
                             Services.NativeBridgeService.SyncDebugVisibility(log);
 
@@ -4277,6 +4349,14 @@ namespace EliteSoft.Erwin.AddIn
             catch (Exception ex)
             {
                 err = $"{ex.GetType().Name}: {ex.Message}";
+            }
+
+            // A visible wizard ran this session (debug button OR the one-time warm-up
+            // that produced DDL) => the DWM surface is warm; later production runs can
+            // stay silent without the black-rectangle leak.
+            if (Services.DebugMode.KeepDialogsVisible || (dwmWarmupRun && !string.IsNullOrEmpty(script)))
+            {
+                _dwmWarmedThisSession = true;
             }
 
             if (err != null)
@@ -5311,6 +5391,11 @@ namespace EliteSoft.Erwin.AddIn
             // When DebugMode.KeepDialogsVisible is true: no busy overlay, no
             // transparency tricks, and the pipeline injects Pause()s between
             // phases so the user can actually read the screens.
+            // From-DB is one of the pixel-jump routes forced into INTERACTIVE wizard mode
+            // at the top of BtnAlterWizardProd_Click (visible windows + short settle
+            // pauses), so dbgVisible reflects DebugMode.Enabled=true here, exactly like the
+            // debug button: no busy overlay, and the FE wizard (made visible by the run's
+            // SyncDebugVisibility) is reachable by the pixel-jump.
             bool dbgVisible = Services.DebugMode.KeepDialogsVisible;
             Form overlay = dbgVisible ? null : ShowBusyOverlay("Generating From-DB DDL, please wait...");
             Action<bool> overlayToggle = dbgVisible ? (Action<bool>)null : (visible =>

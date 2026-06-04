@@ -24,9 +24,6 @@ namespace EliteSoft.Erwin.AddIn.Services
         [DllImport("user32.dll")]
         private static extern bool EnumWindows(EnumWindowsProc enumProc, IntPtr lParam);
 
-        [DllImport("user32.dll", CharSet = CharSet.Auto)]
-        private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
-
         [DllImport("user32.dll")]
         private static extern bool IsWindowVisible(IntPtr hWnd);
 
@@ -198,9 +195,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             {
                 if (!IsWindowVisible(hWnd)) return true;
 
-                StringBuilder title = new StringBuilder(256);
-                GetWindowText(hWnd, title, 256);
-                string windowTitle = title.ToString();
+                string windowTitle = Win32Helper.GetWindowTextNoHang(hWnd);
 
                 // Check for Column Editor window pattern: "Oracle Table 'X' Column 'Y' Editor"
                 // or similar patterns with "Column" and "Editor"

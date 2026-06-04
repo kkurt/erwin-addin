@@ -33,8 +33,9 @@ namespace EliteSoft.Erwin.AddIn.Services
         // Win32 / window enumeration
         [DllImport("user32.dll")]
         private static extern IntPtr PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-        private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+        // GetWindowText P/Invoke removed 2026-06-03: every title read on this class
+        // now routes through Win32Helper.GetWindowTextNoHang (SendMessageTimeout +
+        // SMTO_ABORTIFHUNG) so a hung window can never freeze erwin's UI thread.
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         private static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
         [DllImport("user32.dll")]
@@ -132,6 +133,206 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         [DllImport("user32.dll", EntryPoint = "SendMessageW")]
         private static extern IntPtr SendMessageLVItem(IntPtr hWnd, uint Msg, IntPtr wParam, ref LVITEM lParam);
+
+        // ----- ComboBox (CB_*) + TreeView (TVM_*) messages for the Mart version
+        // picker (catalog tree id=2054, version combo id=2111). The add-in runs
+        // IN-PROCESS inside erwin.exe, so a managed AllocHGlobal buffer pointer is
+        // valid in the control's address space (no VirtualAllocEx - same idiom as
+        // GetListViewItemText). erwin is a Unicode build, so text is read as UTF-16.
+        private const uint CB_GETCOUNT     = 0x0146;
+        private const uint CB_GETLBTEXTLEN = 0x0149;
+        private const uint CB_GETLBTEXT    = 0x0148;
+        private const uint CB_SETCURSEL    = 0x014E;
+        private const uint CB_SELECTSTRING = 0x014D;
+        private const int  CBN_SELCHANGE   = 1;
+        [DllImport("user32.dll", EntryPoint = "SendMessageW")]
+        private static extern IntPtr SendMessageCb(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetParent(IntPtr hWnd);
+
+        private const uint TVM_FIRST       = 0x1100;
+        private const uint TVM_EXPAND      = TVM_FIRST + 2;    // 0x1102
+        private const uint TVM_GETNEXTITEM = TVM_FIRST + 10;   // 0x110A
+        private const uint TVM_SELECTITEM  = TVM_FIRST + 11;   // 0x110B
+        private const uint TVM_GETITEMW    = TVM_FIRST + 62;   // 0x113E
+        private const int  TVGN_ROOT   = 0x0000;
+        private const int  TVGN_NEXT   = 0x0001;
+        private const int  TVGN_CHILD  = 0x0004;
+        private const int  TVGN_CARET  = 0x0009;
+        private const int  TVE_EXPAND  = 0x0002;
+        private const uint TVIF_TEXT   = 0x0001;
+        private const uint TVIF_HANDLE = 0x0010;
+        [StructLayout(LayoutKind.Sequential)]
+        private struct TVITEM
+        {
+            public uint mask;
+            public IntPtr hItem;
+            public uint state;
+            public uint stateMask;
+            public IntPtr pszText;
+            public int cchTextMax;
+            public int iImage;
+            public int iSelectedImage;
+            public int cChildren;
+            public IntPtr lParam;
+        }
+        [DllImport("user32.dll", EntryPoint = "SendMessageW")]
+        private static extern IntPtr SendMessageTvItem(IntPtr hWnd, uint Msg, IntPtr wParam, ref TVITEM lParam);
+
+        private static string GetTreeItemText(IntPtr tree, IntPtr hItem)
+        {
+            IntPtr buf = Marshal.AllocHGlobal(512);
+            try
+            {
+                var ti = new TVITEM { mask = TVIF_TEXT | TVIF_HANDLE, hItem = hItem, pszText = buf, cchTextMax = 255 };
+                SendMessageTvItem(tree, TVM_GETITEMW, IntPtr.Zero, ref ti);
+                return Marshal.PtrToStringUni(buf) ?? "";
+            }
+            catch { return ""; }
+            finally { Marshal.FreeHGlobal(buf); }
+        }
+
+        private static string GetComboItemText(IntPtr combo, int index)
+        {
+            int len = SendMessageCb(combo, CB_GETLBTEXTLEN, new IntPtr(index), IntPtr.Zero).ToInt32();
+            if (len <= 0 || len > 1024) return "";
+            IntPtr buf = Marshal.AllocHGlobal((len + 1) * 2);
+            try
+            {
+                SendMessageCb(combo, CB_GETLBTEXT, new IntPtr(index), buf);
+                return Marshal.PtrToStringUni(buf) ?? "";
+            }
+            catch { return ""; }
+            finally { Marshal.FreeHGlobal(buf); }
+        }
+
+        // The FE Alter Script wizard "Option Set" combo is id=1207, a standard
+        // ComboBox (verified via Ctrl+Alt+D RECON 2026-06-03). When the active model
+        // carries a STALE user-selected option-set FILE xml for a different DB version,
+        // the wizard's Generate raises "XML File is not compatible for Forward
+        // Engineering / The Database Versions are different". That error modal
+        // interrupts the hidden-wizard teardown so the WS_EX_LAYERED surface is never
+        // released -> the DWM black rectangles return. This selects the BUILT-IN
+        // "Alter Schema Generation" option set (no file, DB-version-agnostic, always
+        // compatible) in that case. Left UNTOUCHED: our own admin cfg
+        // (erwin_addin_ddl_fe_opt_cfg*.xml applied via FEModel_DDL for the correct
+        // version) and an already-default selection. Pure Win32, no UIA.
+        private static void EnsureCompatibleOptionSet(IntPtr wizardHwnd, Action<string> log)
+        {
+            try
+            {
+                IntPtr combo = FindDescendantById(wizardHwnd, 1207);
+                if (combo == IntPtr.Zero) { log?.Invoke("  [OPT-SET] Option Set combo (id=1207) not found - skip."); return; }
+                var ccls = new StringBuilder(32);
+                GetClassName(combo, ccls, ccls.Capacity);
+                if (ccls.ToString().IndexOf("ComboBox", StringComparison.OrdinalIgnoreCase) < 0)
+                {
+                    log?.Invoke($"  [OPT-SET] id=1207 not a ComboBox (class='{ccls}') - skip.");
+                    return;
+                }
+                string current = (GetTitle(combo) ?? "").Trim();
+                if (current.IndexOf("erwin_addin_ddl_fe_opt_cfg", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    log?.Invoke($"  [OPT-SET] combo on our admin cfg ('{current}') - compatible, leaving it.");
+                    return;
+                }
+                if (current.StartsWith("Alter Schema", StringComparison.OrdinalIgnoreCase))
+                {
+                    log?.Invoke($"  [OPT-SET] combo already on built-in default ('{current}') - leaving it.");
+                    return;
+                }
+                IntPtr strPtr = Marshal.StringToHGlobalUni("Alter Schema Generation");
+                try
+                {
+                    IntPtr idx = SendMessageCb(combo, CB_SELECTSTRING, new IntPtr(-1), strPtr);
+                    if (idx.ToInt64() < 0)
+                    {
+                        log?.Invoke($"  [OPT-SET] 'Alter Schema Generation' not found in combo (current='{current}') - left as-is.");
+                        return;
+                    }
+                    IntPtr parent = GetParent(combo);
+                    PostMessage(parent == IntPtr.Zero ? wizardHwnd : parent, WM_COMMAND, MakeWParam(1207, CBN_SELCHANGE), combo);
+                    log?.Invoke($"  [OPT-SET] stale option '{current}' -> selected built-in 'Alter Schema Generation' (idx {idx.ToInt64()}) + CBN_SELCHANGE. Prevents incompatible-XML error / black rectangles. NO UIA.");
+                }
+                finally { Marshal.FreeHGlobal(strPtr); }
+            }
+            catch (Exception ex) { log?.Invoke($"  [OPT-SET] threw: {ex.Message} - left as-is."); }
+        }
+
+        // Depth-first search of the tree (the start node, its siblings, and ALL
+        // their descendants) for an item whose text == wanted. The Mart catalog
+        // tree nests libraries under a "Mart" root, so a siblings-only search at
+        // the root level misses "Kursat" (a CHILD of "Mart") - mirror the old UIA
+        // FindFirst(Descendants). Lazy Mart nodes populate children only on expand,
+        // so expand a node before descending if it reports no children yet. `budget`
+        // (shared by ref) bounds the walk against a malformed/huge tree.
+        private static IntPtr FindTreeItemByTextDeep(IntPtr tree, IntPtr start, string wanted, ref int budget)
+        {
+            IntPtr n = start;
+            while (n != IntPtr.Zero && budget > 0)
+            {
+                budget--;
+                if (string.Equals(GetTreeItemText(tree, n).Trim(), wanted, StringComparison.OrdinalIgnoreCase)) return n;
+                IntPtr child = SendMessage(tree, TVM_GETNEXTITEM, new IntPtr(TVGN_CHILD), n);
+                if (child == IntPtr.Zero)
+                {
+                    SendMessage(tree, TVM_EXPAND, new IntPtr(TVE_EXPAND), n);   // lazy-load children
+                    child = SendMessage(tree, TVM_GETNEXTITEM, new IntPtr(TVGN_CHILD), n);
+                }
+                if (child != IntPtr.Zero)
+                {
+                    IntPtr hit = FindTreeItemByTextDeep(tree, child, wanted, ref budget);
+                    if (hit != IntPtr.Zero) return hit;
+                }
+                n = SendMessage(tree, TVM_GETNEXTITEM, new IntPtr(TVGN_NEXT), n);
+            }
+            return IntPtr.Zero;
+        }
+
+        // Pure-Win32 (no UIA) click of a #32770 dialog button by its visible text.
+        // Replaces AutomationElement.FromHandle(popup)+ClickButtonByName(pop,...) whose
+        // oleacc IAccessible RCWs crash erwin's finalizer at teardown. Finds the first
+        // "Button"-class child whose caption (minus the & accelerator) matches one of
+        // `names`, then dispatches WM_COMMAND with its control id (lParam=button HWND,
+        // the XTP-safe form).
+        private static bool ClickDialogButtonByTextWin32(IntPtr dlg, string[] names, Action<string> log)
+        {
+            if (dlg == IntPtr.Zero) return false;
+            IntPtr btn = IntPtr.Zero;
+            EnumChildWindows(dlg, (h, _) =>
+            {
+                var cls = new StringBuilder(32);
+                GetClassName(h, cls, cls.Capacity);
+                if (cls.ToString().IndexOf("Button", StringComparison.OrdinalIgnoreCase) < 0) return true;
+                string t = (GetTitle(h) ?? "").Replace("&", "").Trim();
+                foreach (var nm in names)
+                {
+                    if (string.Equals(t, nm, StringComparison.OrdinalIgnoreCase)) { btn = h; return false; }
+                }
+                return true;
+            }, IntPtr.Zero);
+            if (btn == IntPtr.Zero)
+            {
+                log?.Invoke($"  [POP-WIN32] no button matching [{string.Join(",", names)}] found in dialog 0x{dlg.ToInt64():X}");
+                return false;
+            }
+            int id = GetDlgCtrlID(btn);
+            string label = (GetTitle(btn) ?? "").Replace("&", "").Trim();
+            PostMessage(dlg, WM_COMMAND, MakeWParam(id, 0), btn);
+            log?.Invoke($"  [POP-WIN32] clicked '{label}' (id={id}) via WM_COMMAND. NO UIA.");
+            return true;
+        }
+
+        // Public Win32 trigger of Mart > Review (cmd 1168) for the addin's manual
+        // Review entry point, replacing Win32Helper.InvokeToolbarButton (UIA).
+        public static bool PostMartReviewCommand(IntPtr erwinMain, Action<string> log)
+        {
+            if (erwinMain == IntPtr.Zero) return false;
+            ForceForeground(erwinMain);
+            PostMessage(erwinMain, WM_COMMAND, MakeWParam(CMD_MART_REVIEW, 0), IntPtr.Zero);
+            log?.Invoke($"  Mart > Review posted (WM_COMMAND {CMD_MART_REVIEW}). NO UIA.");
+            return true;
+        }
 
         // RD's toolbars are standard Win32 ToolbarWindow32 controls
         // (verified by RAS-DUMP). Existing TB_BUTTONCOUNT/TB_GETBUTTON +
@@ -364,6 +565,14 @@ namespace EliteSoft.Erwin.AddIn.Services
         private const int CMD_LOAD_BUTTON     = 1082;    // Right Model page: Load button
         private const int CMD_RD_ALTER_SCRIPT = 1056;    // Resolve Differences toolbar: LEFT Alter Script (From-DB direction)
         private const int CMD_RD_RIGHT_ALTER_SCRIPT = 1057; // RD toolbar: RIGHT Alter Script (enabled after Apply-to-Right; Review direction). 1056 is LEFT and DISABLED post-apply - verified by RD toolbar dump 2026-05-29
+        // Mart ribbon command ids captured via Ctrl+Alt+C [RECON-CMD] (2026-06-03):
+        // Mart > Open (open a version as its own MDI child) = 1060; Mart > Review
+        // (active-dirty vs the open version) = 1168. Posting WM_COMMAND with these
+        // replaces Win32Helper.InvokeToolbarButton, whose AutomationElement.FromHandle
+        // scan of the XTP ribbon created CXTPAccessible IAccessible RCWs that, abandoned
+        // to GC, crashed erwin's finalizer ~6s after teardown (dump erwin.exe.50436).
+        private const int CMD_MART_OPEN_VERSION = 1060;
+        private const int CMD_MART_REVIEW       = 1168;
         private const int IDCANCEL = 2;
         private const int IDOK     = 1;
         private const int IDYES    = 6;
@@ -530,11 +739,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                 DebugMode.Pause($"about to open v{rightVersion} as its own MDI child (Mart > Open)", log);
                 var dlgsBeforeOpen = EnumerateVisibleDialogs();
                 log?.Invoke("  [REVIEW-1] Mart > Open (open older version as MDI child)");
-                if (!Win32Helper.InvokeToolbarButton(erwinMain, "Open", log))
-                {
-                    log?.Invoke("  [REVIEW] 'Open' toolbar button not found.");
-                    return null;
-                }
+                // Mart > Open via WM_COMMAND 1060 (RECON-captured) instead of
+                // Win32Helper.InvokeToolbarButton (UIA on the XTP ribbon -> dangling
+                // CXTPAccessible RCW -> finalizer crash). WaitForNewDialog below
+                // verifies the picker actually opened.
+                ForceForeground(erwinMain);
+                PostMessage(erwinMain, WM_COMMAND, MakeWParam(CMD_MART_OPEN_VERSION, 0), IntPtr.Zero);
+                log?.Invoke($"  [REVIEW] Mart > Open posted (WM_COMMAND {CMD_MART_OPEN_VERSION}). NO UIA.");
                 IntPtr picker = WaitForNewDialog(dlgsBeforeOpen, "Open picker", 6000, log);
                 if (picker == IntPtr.Zero) { log?.Invoke("  [REVIEW] Open picker did not appear."); return null; }
                 if (!keepVisible) HideWindow(picker);
@@ -569,11 +780,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                 else
                 {
                     log?.Invoke("  [REVIEW-3] launching Mart > Review (LEFT = active dirty model)");
-                    if (!Win32Helper.InvokeToolbarButton(erwinMain, "Review", log))
-                    {
-                        log?.Invoke("  [REVIEW] 'Review' toolbar button not found.");
-                        return session;
-                    }
+                    // Mart > Review via WM_COMMAND 1168 (RECON-captured) instead of
+                    // UIA InvokeToolbarButton. WaitForNewDialog below verifies the
+                    // wizard opened.
+                    ForceForeground(erwinMain);
+                    PostMessage(erwinMain, WM_COMMAND, MakeWParam(CMD_MART_REVIEW, 0), IntPtr.Zero);
+                    log?.Invoke($"  [REVIEW] Mart > Review posted (WM_COMMAND {CMD_MART_REVIEW}). NO UIA.");
                 }
                 IntPtr ccWizard = WaitForNewDialog(dialogsBeforeReview, useCompleteCompare ? "Complete Compare wizard" : "Review wizard", 6000, log);
                 if (ccWizard == IntPtr.Zero)
@@ -622,11 +834,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                 {
                     try
                     {
-                        var pop = AutomationElement.FromHandle(popup);
-                        if (pop != null) ClickButtonByName(pop, new[] { "No", "Hayır", "Cancel", "İptal" });
+                        ClickDialogButtonByTextWin32(popup, new[] { "No", "Hayır", "Cancel", "İptal" }, log);
                     }
                     catch { }
-                    log?.Invoke("  [REVIEW] unexpected popup after Compare - dismissed; aborting.");
+                    log?.Invoke("  [REVIEW] unexpected popup after Compare - dismissed (Win32); aborting.");
                     return session;
                 }
 
@@ -1725,6 +1936,61 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// Pure-Win32 (NO UI Automation) variant of <see cref="DismissMartOfflineDialog"/>
+        /// for the Review / cross-version teardown. The UIA version calls
+        /// AutomationElement.FromHandle, which creates an XTP IAccessible RCW that,
+        /// abandoned to GC, crashes erwin's finalizer when the dialog is destroyed
+        /// (the same teardown ExecutionEngineException class eliminated for From-DB).
+        /// This variant creates NO AutomationElement at all: it reuses the already
+        /// pure-Win32 toolbar path (<see cref="TryClickMartOfflineToolbarViaWmCommand"/>:
+        /// TB_GETBUTTON command id + WM_COMMAND) to set Save-to=Close, then clicks OK
+        /// via Win32 (GetDlgItem(IDOK) + WM_COMMAND IDOK with lParam = OK-button HWND -
+        /// the form the XTP dialog honours; lParam=0 is ignored). If the toolbar path
+        /// fails it does NOT click OK (OK while a row is still Save-to=Offline spawns a
+        /// Save As picker) and leaves the dialog for the user - never a spurious save.
+        /// </summary>
+        private static void DismissMartOfflineDialogWin32(IntPtr martOffline, Action<string> log)
+        {
+            if (martOffline == IntPtr.Zero) return;
+            try
+            {
+                ForceForeground(martOffline);
+                Thread.Sleep(200);
+
+                // Set Save-to=Close via the existing Win32 toolbar path (no UIA).
+                // offRoot is unused inside that helper, so pass null.
+                bool toolbarOk = TryClickMartOfflineToolbarViaWmCommand(martOffline, null, log);
+                if (!toolbarOk)
+                {
+                    log?.Invoke("  [MO-WIN32] toolbar 'Set to Close' (Win32) failed - NOT clicking OK (OK with Save-to=Offline spawns a Save As picker). Leaving Mart Offline for manual.");
+                    return;
+                }
+
+                Thread.Sleep(250);
+
+                // OK via Win32. lParam MUST be the OK button HWND (same XTP quirk as
+                // the Save Models dialog: WM_COMMAND IDOK with lParam=0 is ignored).
+                IntPtr okBtn = GetDlgItem(martOffline, 1);
+                if (okBtn == IntPtr.Zero)
+                {
+                    log?.Invoke("  [MO-WIN32] OK button (IDOK=1) not found - posting WM_COMMAND IDOK to the dialog as a fallback.");
+                    PostMessage(martOffline, WM_COMMAND, MakeWParam(IDOK, 0), IntPtr.Zero);
+                }
+                else
+                {
+                    PostMessage(martOffline, WM_COMMAND, MakeWParam(IDOK, 0), okBtn);
+                    log?.Invoke($"  [MO-WIN32] OK posted (WM_COMMAND IDOK, lParam=okBtn 0x{okBtn.ToInt64():X}). NO UIA used.");
+                }
+
+                Thread.Sleep(500);
+                log?.Invoke(IsWindow(martOffline)
+                    ? "  [MO-WIN32] WARN Mart Offline still alive after Win32 OK - may need manual close."
+                    : "  [MO-WIN32] Mart Offline dismissed (pure Win32).");
+            }
+            catch (Exception ex) { log?.Invoke($"  [MO-WIN32] threw: {ex.Message}"); }
+        }
+
+        /// <summary>
         /// Walks the Mart Offline dialog's toolbar (ControlType.ToolBar) and
         /// invokes the button whose accessible name signals "Close" / "Set
         /// to Close" / "Discard". Logs every button's name so the next run
@@ -2295,218 +2561,144 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         private static bool SelectMartVersionInPicker(IntPtr martDlg, int version, string catalogPath, Action<string> log)
         {
+            // PURE WIN32 (no UIA). The old UIA path (AutomationElement.FromHandle on
+            // this picker dialog + its catalog tree / model grid / version combo /
+            // Open button) created oleacc AccWrap IAccessible RCWs that, abandoned to
+            // GC, crashed erwin's finalizer ~6s after the picker closed (confirmed via
+            // dump erwin.exe.43564 = oleacc!AccWrap_Base::Release AV on a freed
+            // 0x0BADF00D IUnknown). The add-in is in-process, so control text buffers
+            // are read directly. FAIL-SAFE: any failure -> IDCANCEL + return false
+            // (NEVER load a wrong model; that crashes erwin).
             try
             {
-                var root = AutomationElement.FromHandle(martDlg);
-                if (root == null) return false;
-
-                // Step 0: navigate the catalog tree to our target folder. Without
-                // this, the model list is empty and the version combo is disabled.
-                // `catalogPath` looks like "Kursat/MetaRepo" or just "Kursat";
-                // we only need the folder segments (first N-1), the last segment
-                // is the model name and goes into the DataGrid.
-                if (!string.IsNullOrEmpty(catalogPath))
-                {
-                    var tree = root.FindFirst(TreeScope.Descendants,
-                        new PropertyCondition(AutomationElement.AutomationIdProperty, "2054"));
-                    if (tree != null)
-                    {
-                        // Walk path segments. Trailing segment is the MODEL name
-                        // (not a tree node), so stop before it.
-                        var segs = catalogPath.Split(new[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries);
-                        int walkCount = Math.Max(0, segs.Length - 1);
-                        AutomationElement node = tree;
-                        for (int i = 0; i < walkCount; i++)
-                        {
-                            var child = node.FindFirst(TreeScope.Descendants,
-                                new AndCondition(
-                                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.TreeItem),
-                                    new PropertyCondition(AutomationElement.NameProperty, segs[i])));
-                            if (child == null) { log?.Invoke($"    catalog node '{segs[i]}' not found"); break; }
-                            try
-                            {
-                                if (child.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out object ec))
-                                    ((ExpandCollapsePattern)ec).Expand();
-                                if (child.TryGetCurrentPattern(SelectionItemPattern.Pattern, out object si))
-                                    ((SelectionItemPattern)si).Select();
-                                else
-                                    child.SetFocus();
-                                log?.Invoke($"    catalog navigated: '{segs[i]}'");
-                            }
-                            catch (Exception ex) { log?.Invoke($"    catalog '{segs[i]}' select err: {ex.Message}"); }
-                            Thread.Sleep(250);
-                            node = child;
-                        }
-                    }
-                    else
-                    {
-                        log?.Invoke("    catalog tree (id=2054) not found");
-                    }
-                }
-
-                // Step 1: select the model row whose name matches the active
-                // model's catalog name (last segment of catalogPath, e.g.
-                // "MetaRepo") - NOT the first row. Selecting firstRow loaded the
-                // WRONG model (e.g. "CrashTest", alphabetically first in the
-                // Kursat catalog) which crashed erwin (verified 2026-05-29).
-                // There is deliberately NO fallback to firstRow: loading a
-                // different model is far worse than failing cleanly.
                 string wantModel = "";
                 try
                 {
                     var segs2 = (catalogPath ?? "").Split(new[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries);
                     if (segs2.Length > 0) wantModel = segs2[segs2.Length - 1];
                 }
-                catch { /* wantModel stays empty -> handled below */ }
+                catch { /* wantModel stays empty -> grid step handles it */ }
 
-                var grid = root.FindFirst(TreeScope.Descendants,
-                    new PropertyCondition(AutomationElement.AutomationIdProperty, "30270"));
-                if (grid == null)
+                // Step 0: catalog tree (id=2054) - walk folder segments (all but the
+                // last, which is the model name). Best-effort: if the tree cannot be
+                // walked, proceed (the grid may already be populated for the active
+                // catalog); the grid step below safe-aborts if the model is missing.
+                if (!string.IsNullOrEmpty(catalogPath))
                 {
-                    log?.Invoke("    [WARN] model grid (id=30270) not found");
-                    PostMessage(martDlg, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero);
-                    return false;
-                }
-
-                // Poll: the grid populates asynchronously after catalog
-                // navigation / From-Mart selection. Reading it once can race and
-                // find an empty/partial list -> "model not found" -> spurious
-                // abort. Retry up to ~3 s until the named model row appears.
-                // Exact (trimmed, case-insensitive) match preferred; a substring
-                // match is a guarded fallback. NEVER firstRow.
-                AutomationElement modelRow = null;
-                for (int attempt = 0; attempt < 12 && modelRow == null; attempt++)
-                {
-                    var rows = grid.FindAll(TreeScope.Descendants,
-                        new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.DataItem));
-                    AutomationElement containsRow = null;
-                    int ri = 0;
-                    foreach (AutomationElement r in rows)
+                    IntPtr tree = FindDescendantById(martDlg, 2054);
+                    var tcls = new StringBuilder(64);
+                    if (tree != IntPtr.Zero) GetClassName(tree, tcls, tcls.Capacity);
+                    if (tree != IntPtr.Zero && tcls.ToString().IndexOf("SysTreeView32", StringComparison.OrdinalIgnoreCase) >= 0)
                     {
-                        string rn = ""; try { rn = (r.Current.Name ?? "").Trim(); } catch { }
-                        if (attempt == 0) log?.Invoke($"    model list row[{ri++}] = '{rn}'");
-                        if (string.IsNullOrEmpty(wantModel) || string.IsNullOrEmpty(rn)) continue;
-                        if (string.Equals(rn, wantModel, StringComparison.OrdinalIgnoreCase)) { modelRow = r; break; }
-                        if (containsRow == null && rn.IndexOf(wantModel, StringComparison.OrdinalIgnoreCase) >= 0) containsRow = r;
+                        var segs = catalogPath.Split(new[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries);
+                        int walkCount = Math.Max(0, segs.Length - 1);
+                        IntPtr scope = SendMessage(tree, TVM_GETNEXTITEM, new IntPtr(TVGN_ROOT), IntPtr.Zero);
+                        for (int i = 0; i < walkCount && scope != IntPtr.Zero; i++)
+                        {
+                            int findBudget = 5000;
+                            // FindTreeItemByTextDeep walks descendants and lazy-expands
+                            // collapsed nodes on demand, so no pre-expand pass is needed.
+                            IntPtr m = FindTreeItemByTextDeep(tree, scope, segs[i], ref findBudget);
+                            if (m == IntPtr.Zero) { log?.Invoke($"    [PICK] catalog node '{segs[i]}' not found in tree"); break; }
+                            SendMessage(tree, TVM_EXPAND, new IntPtr(TVE_EXPAND), m);
+                            SendMessage(tree, TVM_SELECTITEM, new IntPtr(TVGN_CARET), m);
+                            log?.Invoke($"    [PICK] catalog navigated: '{segs[i]}'");
+                            Thread.Sleep(300);
+                            scope = SendMessage(tree, TVM_GETNEXTITEM, new IntPtr(TVGN_CHILD), m);
+                        }
                     }
-                    if (modelRow == null) modelRow = containsRow;
-                    if (modelRow == null) Thread.Sleep(250);
-                }
-                if (modelRow == null)
-                {
-                    log?.Invoke($"    [WARN] model '{wantModel}' not found in picker grid after poll - aborting (refusing to load a different model)");
-                    PostMessage(martDlg, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero);
-                    return false;
-                }
-                try
-                {
-                    if (modelRow.TryGetCurrentPattern(SelectionItemPattern.Pattern, out object sip))
-                        ((SelectionItemPattern)sip).Select();
                     else
-                        modelRow.SetFocus();
-                    log?.Invoke($"    selected model row '{wantModel}'");
-                    Thread.Sleep(250);
+                    {
+                        log?.Invoke($"    [PICK] catalog tree id=2054 not a SysTreeView32 (class='{tcls}') - skipping tree nav (relying on default catalog).");
+                    }
                 }
-                catch (Exception ex)
+
+                // Step 1: model grid (id=30270) - select the row whose name == wantModel.
+                IntPtr modelGrid = FindListViewById(martDlg, 30270, log: null);
+                if (modelGrid == IntPtr.Zero)
                 {
-                    log?.Invoke($"    model row select err: {ex.Message}");
+                    IntPtr probe = FindDescendantById(martDlg, 30270);
+                    var gcls = new StringBuilder(64);
+                    if (probe != IntPtr.Zero) GetClassName(probe, gcls, gcls.Capacity);
+                    log?.Invoke($"    [PICK] model grid id=30270 not a SysListView32 (hwnd=0x{probe.ToInt64():X} class='{gcls}') - cannot drive via Win32; ABORT (IDCANCEL).");
                     PostMessage(martDlg, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero);
                     return false;
                 }
-
-                // Step 2: locate the Open Version ComboBox (AutomationId=2111), expand it,
-                // enumerate its ListItems, pick the one matching our target version.
-                var versionCombo = root.FindFirst(TreeScope.Descendants,
-                    new AndCondition(
-                        new PropertyCondition(AutomationElement.AutomationIdProperty, "2111"),
-                        new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ComboBox)));
-                if (versionCombo == null)
+                int modelRow = -1;
+                for (int attempt = 0; attempt < 12 && modelRow < 0; attempt++)
                 {
-                    log?.Invoke("    [WARN] Open Version combo (id=2111) not found");
-                    PostMessage(martDlg, WM_COMMAND, MakeWParam(IDOK, 0), IntPtr.Zero);
+                    int rt = SendMessage(modelGrid, LVM_GETITEMCOUNT, IntPtr.Zero, IntPtr.Zero).ToInt32();
+                    for (int i = 0; i < rt; i++)
+                    {
+                        string cell = "";
+                        for (int s = 0; s <= 3; s++)
+                        {
+                            string c = GetListViewItemText(modelGrid, i, s)?.Trim();
+                            if (!string.IsNullOrEmpty(c)) { cell = c; break; }
+                        }
+                        if (attempt == 0) log?.Invoke($"    [PICK] model row[{i}] = '{cell}'");
+                        if (!string.IsNullOrEmpty(wantModel) && !string.IsNullOrEmpty(cell)
+                            && string.Equals(cell, wantModel, StringComparison.OrdinalIgnoreCase)) { modelRow = i; break; }
+                    }
+                    if (modelRow < 0) Thread.Sleep(250);
+                }
+                if (modelRow < 0)
+                {
+                    log?.Invoke($"    [PICK] model '{wantModel}' not found in grid - ABORT (IDCANCEL, refusing to load a different model).");
+                    PostMessage(martDlg, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero);
                     return false;
                 }
+                var mlvi = new LVITEM { stateMask = LVIS_SELECTED | LVIS_FOCUSED, state = LVIS_SELECTED | LVIS_FOCUSED };
+                SendMessageLVItem(modelGrid, LVM_SETITEMSTATE, new IntPtr(modelRow), ref mlvi);
+                SendSynthesizedNmClick(martDlg, modelGrid, 30270, modelRow, 0, log);
+                log?.Invoke($"    [PICK] selected model row '{wantModel}' (row {modelRow}) via Win32.");
+                Thread.Sleep(250);
 
-                try
+                // Step 2: version combo (id=2111) - pick the item matching `version`.
+                IntPtr combo = FindDescendantById(martDlg, 2111);
+                var ccls = new StringBuilder(64);
+                if (combo != IntPtr.Zero) GetClassName(combo, ccls, ccls.Capacity);
+                if (combo == IntPtr.Zero || ccls.ToString().IndexOf("ComboBox", StringComparison.OrdinalIgnoreCase) < 0)
                 {
-                    if (versionCombo.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out object ecp))
-                    {
-                        ((ExpandCollapsePattern)ecp).Expand();
-                        Thread.Sleep(300);
-                        log?.Invoke("    version combo expanded");
-                    }
+                    log?.Invoke($"    [PICK] version combo id=2111 not a ComboBox (hwnd=0x{combo.ToInt64():X} class='{ccls}') - ABORT (IDCANCEL).");
+                    PostMessage(martDlg, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero);
+                    return false;
                 }
-                catch (Exception ex) { log?.Invoke($"    expand err: {ex.Message}"); }
-
-                // Enumerate ListItems now-visible inside the combo's dropdown.
-                var items = versionCombo.FindAll(TreeScope.Descendants,
-                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ListItem));
-                log?.Invoke($"    version combo: {items.Count} items");
-
+                int cnt = SendMessageCb(combo, CB_GETCOUNT, IntPtr.Zero, IntPtr.Zero).ToInt32();
+                int sel = -1;
                 string vs = version.ToString();
-                AutomationElement target = null;
-                int idx = 0;
-                foreach (AutomationElement el in items)
+                for (int i = 0; i < cnt; i++)
                 {
-                    string n = "";
-                    try { n = el.Current.Name ?? ""; } catch { }
-                    log?.Invoke($"      version[{idx++}] name='{n}'");
-                    if (string.IsNullOrEmpty(n)) continue;
-                    bool match =
-                        System.Text.RegularExpressions.Regex.IsMatch(n,
-                            @"(?i)\bversion\s+" + System.Text.RegularExpressions.Regex.Escape(vs) + @"\b")
-                        || n.Equals(vs, StringComparison.OrdinalIgnoreCase)
-                        || n.StartsWith($"v{vs}", StringComparison.OrdinalIgnoreCase);
-                    if (match) { target = el; break; }
+                    string it = GetComboItemText(combo, i).Trim();
+                    log?.Invoke($"    [PICK] version combo[{i}] = '{it}'");
+                    if (string.IsNullOrEmpty(it)) continue;
+                    bool match = System.Text.RegularExpressions.Regex.IsMatch(it, @"(?i)\bversion\s+" + System.Text.RegularExpressions.Regex.Escape(vs) + @"\b")
+                        || it.Equals(vs, StringComparison.OrdinalIgnoreCase)
+                        || it.StartsWith($"v{vs}", StringComparison.OrdinalIgnoreCase);
+                    if (match) { sel = i; break; }
                 }
-
-                if (target == null)
+                if (sel < 0)
                 {
-                    log?.Invoke($"    no match for version '{vs}' among {items.Count} combo items");
-                    // Cancel rather than Open a wrong version, to avoid compare-to-self.
+                    log?.Invoke($"    [PICK] no combo item matches version '{vs}' among {cnt} - ABORT (IDCANCEL, refusing wrong version).");
+                    PostMessage(martDlg, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero);
                     return false;
                 }
+                SendMessageCb(combo, CB_SETCURSEL, new IntPtr(sel), IntPtr.Zero);
+                PostMessage(martDlg, WM_COMMAND, MakeWParam(2111, CBN_SELCHANGE), combo);
+                log?.Invoke($"    [PICK] version combo set to index {sel} (v{vs}) via CB_SETCURSEL + CBN_SELCHANGE.");
+                Thread.Sleep(200);
 
-                try
+                // Step 3: Open (id=2059).
+                IntPtr openBtn = GetDlgItem(martDlg, 2059);
+                if (openBtn == IntPtr.Zero) openBtn = FindDescendantById(martDlg, 2059);
+                if (openBtn != IntPtr.Zero)
                 {
-                    string tn = target.Current.Name ?? "";
-                    log?.Invoke($"    selecting '{tn}'");
-                    if (target.TryGetCurrentPattern(SelectionItemPattern.Pattern, out object sip2))
-                        ((SelectionItemPattern)sip2).Select();
-                    else
-                        target.SetFocus();
-                    Thread.Sleep(200);
-                }
-                catch (Exception ex) { log?.Invoke($"    select err: {ex.Message}"); }
-
-                // Collapse the combo to commit the selection.
-                try
-                {
-                    if (versionCombo.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out object ecp2))
-                        ((ExpandCollapsePattern)ecp2).Collapse();
-                }
-                catch { }
-                Thread.Sleep(150);
-
-                // NOTE: we open the version WITHOUT a lock type ("Unlocked",
-                // the picker default). The 2026-05-29 spike proved a read-only
-                // lock (Shared Lock) does NOT stop erwin's CC engine from
-                // dirtying the right model during compare, AND it adds a second
-                // "lock" checkbox column to the Save Models close dialog. Since
-                // we close the version without saving anyway, Unlocked is
-                // simplest (single save checkbox to clear).
-
-                // Step 3: click Open (AutomationId=2059) or fall back to WM_COMMAND IDOK.
-                var openBtn = root.FindFirst(TreeScope.Descendants,
-                    new PropertyCondition(AutomationElement.AutomationIdProperty, "2059"));
-                if (openBtn != null && openBtn.TryGetCurrentPattern(InvokePattern.Pattern, out object ip))
-                {
-                    ((InvokePattern)ip).Invoke();
-                    log?.Invoke("    Open button invoked via UIA");
+                    PostMessage(martDlg, WM_COMMAND, MakeWParam(2059, 0), openBtn);
+                    log?.Invoke("    [PICK] Open posted (WM_COMMAND id=2059, lParam=btn). NO UIA.");
                 }
                 else
                 {
-                    log?.Invoke("    Open button not found via UIA, sending WM_COMMAND IDOK");
+                    log?.Invoke("    [PICK] Open button id=2059 not found - fallback WM_COMMAND IDOK.");
                     PostMessage(martDlg, WM_COMMAND, MakeWParam(IDOK, 0), IntPtr.Zero);
                 }
                 Thread.Sleep(600);
@@ -2514,7 +2706,8 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
             catch (Exception ex)
             {
-                log?.Invoke($"    SelectMartVersionInPicker threw: {ex.Message}");
+                log?.Invoke($"    [PICK] SelectMartVersionInPicker (Win32) threw: {ex.Message} - ABORT (IDCANCEL).");
+                try { PostMessage(martDlg, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero); } catch { /* dialog may be gone */ }
                 return false;
             }
         }
@@ -2840,6 +3033,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                         LastCapturedWizardDdl = captured;
                         return true;
                     }
+                    // On the Option Selection page (page 2) apply the option-set
+                    // setting BEFORE advancing (user requirement 2026-06-03: this
+                    // page must not be skipped). Switches a stale incompatible file
+                    // option to the built-in default to avoid the "XML not
+                    // compatible" error that brings back the DWM black rectangles.
+                    if (page == 2) { EnsureCompatibleOptionSet(wizardHwnd, log); Thread.Sleep(150); }
                     log?.Invoke($"  [WPT] page {page}: posting CMD_FE_WIZARD_NEXT (1766)");
                     PostMessage(wizardHwnd, WM_COMMAND, MakeWParam(CMD_FE_WIZARD_NEXT, 0), IntPtr.Zero);
                 }
@@ -2884,6 +3083,17 @@ namespace EliteSoft.Erwin.AddIn.Services
             // wizards only enable later nav items once a prior page is visited).
             PostMessage(wizardHwnd, WM_COMMAND, MakeWParam(CMD_FE_WIZARD_NEXT, 0), IntPtr.Zero);
             Thread.Sleep(600);
+
+            // Step 1b: NOW on the Option Selection page - apply the option-set
+            // setting HERE, before going to Preview (user requirement 2026-06-03:
+            // this page must NOT be skipped / no direct jump to Preview). If the
+            // model's retained option set is a stale incompatible file (wrong DB
+            // version), switch to the built-in "Alter Schema Generation" so the
+            // wizard's Generate does not throw "XML not compatible / different DB
+            // versions" - that error interrupts the hidden-wizard teardown and
+            // brings back the DWM black rectangles.
+            EnsureCompatibleOptionSet(wizardHwnd, log);
+            Thread.Sleep(150);
 
             // Step 2: read the live "Navigational Pane" rect (handles wherever
             // the wizard opened) and compute the "Preview" label position.
@@ -3026,8 +3236,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 log?.Invoke($"  [POP] erwin popup detected hwnd=0x{popup.ToInt64():X} title='{title}' - dismissing with No");
                 try
                 {
-                    var pop = AutomationElement.FromHandle(popup);
-                    if (pop != null) ClickButtonByName(pop, new[] { "No", "Hayir", "Hayır" });
+                    ClickDialogButtonByTextWin32(popup, new[] { "No", "Hayir", "Hayır" }, log);
                 }
                 catch (Exception ex) { log?.Invoke($"  [POP] dismiss err: {ex.Message}"); }
                 Thread.Sleep(300);
@@ -3144,10 +3353,18 @@ namespace EliteSoft.Erwin.AddIn.Services
                     log?.Invoke("  [REVIEW-CLEAN] version child gone/invalid - nothing to close.");
                 }
 
-                // Close the "Save Models" prompt WITHOUT saving (uncheck the
-                // single save row + OK), then drive the follow-up "Mart Offline"
-                // dialog to Save-to=Close. CloseSaveModelsWithoutSaving enforces
-                // the single-row guard internally.
+                // Close the "Save Models" prompt WITHOUT saving, then drive the
+                // follow-up "Mart Offline" dialog to Save-to=Close - BOTH via PURE
+                // WIN32 (2026-06-02), matching the From-DB teardown fix. The old
+                // CloseSaveModelsWithoutSaving + DismissMartOfflineDialog path used
+                // UI Automation (AutomationElement.FromHandle on these two dialogs),
+                // whose abandoned XTP IAccessible RCWs crash erwin's finalizer when
+                // the dialogs are destroyed (the same teardown ExecutionEngine-
+                // Exception fixed for From-DB). CloseSaveModelsWin32 runs with
+                // guardSingleRow=true for v2 protection (the active dirty model must
+                // never be in this dialog). If the Save Models Win32 dismiss safely
+                // aborts (guard / cursor-land safety) we leave both dialogs for the
+                // user and do NOT touch Mart Offline.
                 IntPtr dlg = WaitForDialog("Save Models", 3000);
                 if (dlg == IntPtr.Zero) { dlg = WaitForDialog("Close Model", 1500); }
                 if (dlg == IntPtr.Zero)
@@ -3155,7 +3372,20 @@ namespace EliteSoft.Erwin.AddIn.Services
                     log?.Invoke("  [REVIEW-CLEAN] no Save Models / Close Model dialog - v1 closed silently; teardown clean.");
                     return;
                 }
-                CloseSaveModelsWithoutSaving(dlg, log);
+                bool smOk = CloseSaveModelsWin32(dlg, log, guardSingleRow: true);
+                if (!smOk)
+                {
+                    log?.Invoke("  [REVIEW-CLEAN] Save Models Win32 dismiss aborted (guard/safety) - dialog LEFT for the user; skipping Mart Offline.");
+                    return;
+                }
+                IntPtr martOff = WaitForDialog("Mart Offline", 1500);
+                if (martOff == IntPtr.Zero)
+                {
+                    log?.Invoke("  [REVIEW-CLEAN] no Mart Offline dialog after Save Models - v1 closed. Teardown clean (pure Win32, no UIA).");
+                    return;
+                }
+                log?.Invoke($"  [REVIEW-CLEAN] Mart Offline 0x{martOff.ToInt64():X} - dismissing via pure Win32 (no UIA).");
+                DismissMartOfflineDialogWin32(martOff, log);
             }
             catch (Exception ex) { log?.Invoke($"  [REVIEW-CLEAN] threw: {ex.GetType().Name}: {ex.Message}"); }
         }
@@ -3198,7 +3428,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// save - the caller then leaves the dialog for manual handling. Returns
         /// true if it unchecked + posted OK, false if it safely aborted.
         /// </summary>
-        private static bool CloseSaveModelsWin32(IntPtr dlg, Action<string> log)
+        private static bool CloseSaveModelsWin32(IntPtr dlg, Action<string> log, bool guardSingleRow = false)
         {
             try
             {
@@ -3209,6 +3439,39 @@ namespace EliteSoft.Erwin.AddIn.Services
                     log?.Invoke($"  [SM-WIN32] grid(2050)=0x{grid.ToInt64():X} ok(1)=0x{okBtn.ToInt64():X} - one missing, ABORT (leave for manual).");
                     return false;
                 }
+
+                // v2 PROTECTION (Review / cross-version): the Save Models dialog must
+                // list EXACTLY the one model we are closing. The active dirty model
+                // (Review's v2) is a separate, un-closed MDI child that erwin never
+                // lists here - but if it ever did, unchecking only row 0 + OK would
+                // SAVE it as a spurious Mart version. The old UIA path counted '*'
+                // name cells; do the Win32 equivalent when the grid is a standard
+                // list (LVM_GETITEMCOUNT). If the grid is the XTP report (not
+                // LVM-countable) we cannot count, so we rely on the caller's SCOPED
+                // close (it WM_CLOSEs only the specific child) and log the class so
+                // this can be hardened later. From-DB passes guardSingleRow=false
+                // (a single file-based model, no other model in the session).
+                if (guardSingleRow)
+                {
+                    var gcls = new StringBuilder(64);
+                    GetClassName(grid, gcls, gcls.Capacity);
+                    string gc = gcls.ToString();
+                    if (gc.IndexOf("SysListView32", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        int rows = SendMessage(grid, LVM_GETITEMCOUNT, IntPtr.Zero, IntPtr.Zero).ToInt32();
+                        if (rows != 1)
+                        {
+                            log?.Invoke($"  [SM-WIN32] >>> ABORT: guardSingleRow expected exactly 1 row, found {rows} (v2 protection). Leaving for manual. <<<");
+                            return false;
+                        }
+                        log?.Invoke("  [SM-WIN32] guardSingleRow OK: grid lists exactly 1 row.");
+                    }
+                    else
+                    {
+                        log?.Invoke($"  [SM-WIN32] guardSingleRow: grid class='{gc}' not LVM-countable (XTP report); relying on the caller's scoped single-child close (the active model is never listed here).");
+                    }
+                }
+
                 if (!GetWindowRect(grid, out RECT gr))
                 {
                     log?.Invoke("  [SM-WIN32] GetWindowRect(grid) failed - ABORT (leave for manual).");
@@ -3752,50 +4015,52 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// </summary>
         private static bool SelectInMemoryModelOnRightPage(IntPtr ccWizard, int version, Action<string> log)
         {
-            var ccRoot = AutomationElement.FromHandle(ccWizard);
-            if (ccRoot == null) { log?.Invoke("  [INMEM] UIA FromHandle null on wizard"); return false; }
-            var grid = ccRoot.FindFirst(TreeScope.Descendants,
-                new AndCondition(
-                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.DataGrid),
-                    new PropertyCondition(AutomationElement.AutomationIdProperty, "1083")));
-            if (grid == null) { log?.Invoke("  [INMEM] 'Open Models in Memory' DataGrid id=1083 not found"); return false; }
-
-            AutomationElement match = null, dupMatch = null;
-            for (int attempt = 0; attempt < 10 && match == null; attempt++)
+            // PURE WIN32 (no UIA): the "Open Models in Memory" list (id=1083) is a
+            // SysListView32 in the wizard. The old UIA path (FromHandle + FindAll
+            // DataItem + SelectionItemPattern) created oleacc IAccessible RCWs that,
+            // abandoned to GC, crashed erwin's finalizer at teardown (same AccWrap AV
+            // as the version picker). Mirror DriveCCDbAndApply Step 3.
+            IntPtr openList = FindListViewById(ccWizard, 1083, log: null);
+            if (openList == IntPtr.Zero)
             {
-                var rows = grid.FindAll(TreeScope.Descendants,
-                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.DataItem));
-                int ri = 0;
-                foreach (AutomationElement r in rows)
+                IntPtr probe = FindDescendantById(ccWizard, 1083);
+                var pcls = new StringBuilder(64);
+                if (probe != IntPtr.Zero) GetClassName(probe, pcls, pcls.Capacity);
+                log?.Invoke($"  [INMEM] id=1083 SysListView32 not found via Win32 (probe hwnd=0x{probe.ToInt64():X} class='{pcls}')");
+                return false;
+            }
+            int matchRow = -1, dupRow = -1;
+            for (int attempt = 0; attempt < 10 && matchRow < 0; attempt++)
+            {
+                int rowTotal = SendMessage(openList, LVM_GETITEMCOUNT, IntPtr.Zero, IntPtr.Zero).ToInt32();
+                for (int i = 0; i < rowTotal; i++)
                 {
-                    string rn = ""; try { rn = (r.Current.Name ?? "").Trim(); } catch { }
-                    if (attempt == 0) log?.Invoke($"  [INMEM] row[{ri++}] = '{rn}'");
+                    string rn = "";
+                    for (int s = 0; s <= 3; s++)
+                    {
+                        string cell = GetListViewItemText(openList, i, s)?.Trim();
+                        if (!string.IsNullOrEmpty(cell)) { rn = cell; break; }
+                    }
+                    if (attempt == 0) log?.Invoke($"  [INMEM] row[{i}] = '{rn}'");
                     var vm = System.Text.RegularExpressions.Regex.Match(rn, @"v(\d+)", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
                     if (!vm.Success || !int.TryParse(vm.Groups[1].Value, out int rv) || rv != version) continue;
-                    if (rn.IndexOf('(') < 0) { match = r; break; }   // prefer the non-duplicate row
-                    if (dupMatch == null) dupMatch = r;
+                    if (rn.IndexOf('(') < 0) { matchRow = i; break; }   // prefer the non-duplicate row
+                    if (dupRow < 0) dupRow = i;
                 }
-                if (match == null) match = dupMatch;
-                if (match == null) Thread.Sleep(250);
+                if (matchRow < 0 && dupRow >= 0) matchRow = dupRow;
+                if (matchRow < 0) Thread.Sleep(250);
             }
-            if (match == null)
+            if (matchRow < 0)
             {
-                log?.Invoke($"  [INMEM] no in-memory row for v{version} (is the version opened as an MDI child + does its row show the version?) - aborting");
+                log?.Invoke($"  [INMEM] no in-memory row for v{version} - aborting (NO UIA)");
                 return false;
             }
-            try
-            {
-                if (match.TryGetCurrentPattern(SelectionItemPattern.Pattern, out object sip))
-                {
-                    ((SelectionItemPattern)sip).Select();
-                    log?.Invoke($"  [INMEM] selected in-memory v{version} row '{match.Current.Name}'");
-                    Thread.Sleep(150);
-                    return true;
-                }
-                log?.Invoke("  [INMEM] matched row has no SelectionItemPattern");
-                return false;
-            }
-            catch (Exception ex) { log?.Invoke($"  [INMEM] select err: {ex.Message}"); return false; }
+            var lvi = new LVITEM { stateMask = LVIS_SELECTED | LVIS_FOCUSED, state = LVIS_SELECTED | LVIS_FOCUSED };
+            SendMessageLVItem(openList, LVM_SETITEMSTATE, new IntPtr(matchRow), ref lvi);
+            SendSynthesizedNmClick(ccWizard, openList, 1083, matchRow, 0, log);
+            log?.Invoke($"  [INMEM] selected in-memory v{version} (row {matchRow}) via Win32 (LVM_SETITEMSTATE + NM_CLICK). NO UIA.");
+            Thread.Sleep(150);
+            return true;
         }
 
         /// <summary>
@@ -3857,9 +4122,9 @@ namespace EliteSoft.Erwin.AddIn.Services
                     GetClassName(h, clsBuf, clsBuf.Capacity);
                     int id = GetDlgCtrlID(h);
                     if (id == 0) return true;
-                    var titleBuf = new StringBuilder(128);
-                    GetWindowText(h, titleBuf, titleBuf.Capacity);
-                    string txt = titleBuf.ToString();
+                    // Timeout-bounded read (hang class 2026-06-03): a hung child
+                    // would otherwise block this UI-thread enumeration on WM_GETTEXT.
+                    string txt = Win32Helper.GetWindowTextNoHang(h);
                     if (string.IsNullOrEmpty(txt) && clsBuf.ToString() != "Button"
                         && clsBuf.ToString() != "ComboBox" && clsBuf.ToString() != "ListBox") return true;
                     log?.Invoke($"    hwnd=0x{h.ToInt64():X} cls='{clsBuf}' id={id} text='{txt}'");
@@ -3941,9 +4206,11 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         private static string GetTitle(IntPtr hWnd)
         {
-            var sb = new StringBuilder(256);
-            GetWindowText(hWnd, sb, sb.Capacity);
-            return sb.ToString();
+            // Timeout-bounded chokepoint: GetTitle backs ~all MDI / CC-wizard title
+            // reads on the UI-thread pipeline. A raw GetWindowText to a hung window
+            // would freeze erwin (hang dump 2026-06-03); GetWindowTextNoHang returns
+            // "" on a non-pumping target instead of blocking the UI thread.
+            return Win32Helper.GetWindowTextNoHang(hWnd);
         }
 
         /// <summary>

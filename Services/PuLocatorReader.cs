@@ -103,9 +103,13 @@ namespace EliteSoft.Erwin.AddIn.Services
             {
                 var hWnd = Win32Helper.GetErwinMainWindow();
                 if (hWnd == IntPtr.Zero) return string.Empty;
-                var sb = new System.Text.StringBuilder(1024);
-                Win32Helper.GetWindowTextPublic(hWnd, sb, sb.Capacity);
-                var title = sb.ToString();
+                // Timeout-bounded read: ReadFromWindowTitle runs on the STA/UI
+                // thread via the 500ms reconnect timer (count>1 tab-switch branch,
+                // every tick with 2+ PUs open). A raw GetWindowText to a hung /
+                // non-pumping main-frame thread would freeze erwin (same hang class
+                // as the 2026-06-03 monitor-heartbeat dump). SMTO_ABORTIFHUNG
+                // returns "" instead of blocking.
+                var title = Win32Helper.GetWindowTextNoHang(hWnd);
                 var m = Regex.Match(title,
                     @"\[(?<base>(?:[Mm]art://)[^\s\]]+)(?:\s*:\s*v(?<v>\d+))?",
                     RegexOptions.IgnoreCase);

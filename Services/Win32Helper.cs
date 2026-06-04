@@ -239,9 +239,15 @@ namespace EliteSoft.Erwin.AddIn.Services
                 GetWindowThreadProcessId(hWnd, out uint pid);
                 if (!erwinPids.Contains(pid)) return true;
 
-                var sb = new StringBuilder(512);
-                GetWindowText(hWnd, sb, sb.Capacity);
-                string title = sb.ToString();
+                // Timeout-bounded read: after a version-compare teardown a leftover
+                // visible #32770 dialog can be parked on a non-pumping worker thread
+                // (stuck on a Mart socket). A plain GetWindowText (synchronous
+                // WM_GETTEXT) to it blocks this enum - and thus the UI-thread caller
+                // (monitor heartbeat / reconnect modal-check) - forever (hang dump
+                // 2026-06-03, frozen on HWND 0xC304DE, a #32770 on a stuck thread).
+                // SMTO_ABORTIFHUNG returns "" for such a window so the enum skips it
+                // and still reaches erwin's real "erwin DM" main frame.
+                string title = GetWindowTextNoHang(hWnd);
 
                 // erwin's main window title starts with "erwin DM"
                 if (title.IndexOf("erwin DM", StringComparison.OrdinalIgnoreCase) >= 0)
@@ -802,13 +808,14 @@ namespace EliteSoft.Erwin.AddIn.Services
             {
                 var sbClass = new StringBuilder(256);
                 GetClassName(hWnd, sbClass, sbClass.Capacity);
-                var sbText = new StringBuilder(512);
-                GetWindowText(hWnd, sbText, sbText.Capacity);
                 results.Add(new ChildWindowInfo
                 {
                     Handle = hWnd,
                     ClassName = sbClass.ToString(),
-                    Text = sbText.ToString()
+                    // Timeout-bounded per-child read: a single hung child would
+                    // otherwise block the whole enumeration - and the UI thread -
+                    // on a synchronous WM_GETTEXT (hang class 2026-06-03).
+                    Text = GetWindowTextNoHang(hWnd)
                 });
                 return true;
             }, IntPtr.Zero);
@@ -835,6 +842,29 @@ namespace EliteSoft.Erwin.AddIn.Services
             return sb.ToString();
         }
 
+        // Non-hanging window-title read for UI-thread MONITORING timers.
+        // GetWindowText sends WM_GETTEXT synchronously; if hWnd belongs to a hung /
+        // non-pumping thread (e.g. a leftover pipeline window) it blocks the calling
+        // (UI) thread forever - confirmed via hang dump 2026-06-03 (OnWindowMonitorTick
+        // -> IsColumnEditorOpen -> EnumWindows -> GetWindowText -> NtUserMessageCall,
+        // whole app frozen). SendMessageTimeout with SMTO_ABORTIFHUNG returns "" instead
+        // of hanging. Use this ONLY in the persistent UI-thread monitor scans.
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, IntPtr wParam, StringBuilder lParam, uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
+
+        // IntPtr-lParam overload for fixed-size messages (e.g. SB_GETTEXTLENGTH)
+        // that return their result via lpdwResult rather than a text buffer.
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam, uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
+
+        public static string GetWindowTextNoHang(IntPtr hWnd, int timeoutMs = 100)
+        {
+            var sb = new StringBuilder(512);
+            // 0x000D = WM_GETTEXT, 0x0002 = SMTO_ABORTIFHUNG.
+            IntPtr ok = SendMessageTimeout(hWnd, 0x000D, (IntPtr)512, sb, 0x0002, (uint)timeoutMs, out _);
+            return ok == IntPtr.Zero ? "" : sb.ToString();
+        }
+
         [DllImport("user32.dll", CharSet = CharSet.Auto)]
         private static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, StringBuilder lParam);
 
@@ -852,10 +882,16 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             try
             {
-                int len = (int)SendMessage(hWndStatusBar, SB_GETTEXTLENGTH, (IntPtr)partIndex, IntPtr.Zero);
-                if ((len & 0xFFFF) == 0) return "";
-                var sb = new StringBuilder((len & 0xFFFF) + 1);
-                SendMessage(hWndStatusBar, SB_GETTEXT, (IntPtr)partIndex, sb);
+                // Timeout-bounded (SMTO_ABORTIFHUNG): erwin's status bar is owned by
+                // the main UI thread; reading it from a hung state would otherwise
+                // block on a synchronous SB_GETTEXT (hang class 2026-06-03).
+                if (SendMessageTimeout(hWndStatusBar, SB_GETTEXTLENGTH, (IntPtr)partIndex, IntPtr.Zero, 0x0002, 100, out IntPtr lenRes) == IntPtr.Zero)
+                    return "";
+                int len = (int)lenRes & 0xFFFF;
+                if (len == 0) return "";
+                var sb = new StringBuilder(len + 1);
+                if (SendMessageTimeout(hWndStatusBar, SB_GETTEXT, (IntPtr)partIndex, sb, 0x0002, 100, out _) == IntPtr.Zero)
+                    return "";
                 return sb.ToString();
             }
             catch { return ""; }
