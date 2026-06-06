@@ -48,6 +48,9 @@ param(
     # in C:\EliteSoft\<PackageName> at the end. Useful for shipping
     # customer-specific bundles (e.g. -PackageName "ErwinAddIn-TTKOM-2026.05.08").
     [string]$PackageName,
+    # Output directory (tool-driven): the .zip lands directly in here as <PackageName>.zip
+    # (implies -Zip). When omitted, the legacy C:\EliteSoft\<PackageName> layout is used.
+    [string]$OutDir,
     [Alias('?')]
     [switch]$Help
 )
@@ -143,7 +146,16 @@ Set-Location $scriptDir
 #   -PackageName (folder) -> publish directly to C:\EliteSoft\<PackageName> (only files,
 #                            no zip artifact).
 $targetRoot = "C:\EliteSoft"
-if ($PackageName) {
+$effectiveName = if ($PackageName) { $PackageName } else { "ErwinAddIn" }
+if ($OutDir) {
+    # Tool-driven: zip lands directly in OutDir as <name>.zip (staged in a sibling that is
+    # removed after zipping). -OutDir always implies a zip.
+    $Zip        = $true
+    $targetDir  = $OutDir
+    $publishDir = Join-Path $OutDir "$effectiveName.staging"
+    $zipFile    = Join-Path $OutDir "$effectiveName.zip"
+    $distDir    = $OutDir
+} elseif ($PackageName) {
     $targetDir   = Join-Path $targetRoot $PackageName
     if ($Zip) {
         $publishDir = Join-Path $targetRoot "$PackageName.staging"
@@ -185,7 +197,7 @@ if (Test-Path $bridgeScript) {
     if (-not (Test-Path $bridgeDll)) {
         Write-Host "Native bridge build failed - DLL not produced! Aborting package (would ship a stale/missing native DLL)." -ForegroundColor Red
         Write-Host "`nPress any key to exit..." -ForegroundColor Gray
-        $null = (Get-Host).UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+        $null = $(if (-not [Console]::IsOutputRedirected) { (Get-Host).UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') })
         exit 1
     }
     Write-Host "  Native bridge rebuilt." -ForegroundColor Green
@@ -201,7 +213,7 @@ dotnet publish ErwinAddIn.csproj -c Release -r win-x64 --self-contained false -p
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Publish failed!" -ForegroundColor Red
     Write-Host "`nPress any key to exit..." -ForegroundColor Gray
-$null = (Get-Host).UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+$null = $(if (-not [Console]::IsOutputRedirected) { (Get-Host).UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') })
     exit 1
 }
 
@@ -244,13 +256,13 @@ if ($License) {
     if (-not (Test-Path $keyGenProject)) {
         Write-Host "  KeyGen not found: $keyGenProject" -ForegroundColor Red
         Write-Host "`nPress any key to exit..." -ForegroundColor Gray
-$null = (Get-Host).UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+$null = $(if (-not [Console]::IsOutputRedirected) { (Get-Host).UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') })
         exit 1
     }
     if (-not (Test-Path $privateKeySource)) {
         Write-Host "  Private key not found: $privateKeySource" -ForegroundColor Red
         Write-Host "`nPress any key to exit..." -ForegroundColor Gray
-$null = (Get-Host).UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+$null = $(if (-not [Console]::IsOutputRedirected) { (Get-Host).UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') })
         exit 1
     }
 
@@ -281,7 +293,7 @@ $null = (Get-Host).UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
     if ($exitCode -ne 0) {
         Write-Host "  License generation failed!" -ForegroundColor Red
         Write-Host "`nPress any key to exit..." -ForegroundColor Gray
-$null = (Get-Host).UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+$null = $(if (-not [Console]::IsOutputRedirected) { (Get-Host).UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') })
         exit 1
     }
     $expiresLabel = if ($expiresDate) { $expiresDate.ToString('yyyy-MM-dd') } else { 'Perpetual' }
@@ -325,7 +337,7 @@ if ($hasBootstrap) {
     if (-not $DBHost -or -not $DBName) {
         Write-Host "`n  ERROR: Bootstrap seed requires both -DBHost and -DBName (got DBHost='$DBHost', DBName='$DBName')." -ForegroundColor Red
         Write-Host "`nPress any key to exit..." -ForegroundColor Gray
-        $null = (Get-Host).UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+        $null = $(if (-not [Console]::IsOutputRedirected) { (Get-Host).UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') })
         exit 1
     }
     $seedObj = [ordered]@{
@@ -378,7 +390,7 @@ if ($Zip) {
     if ($srcItems.Count -eq 0) {
         Write-Host "  ERROR: $publishDir is empty - nothing to compress." -ForegroundColor Red
         Write-Host "`nPress any key to exit..." -ForegroundColor Gray
-        $null = (Get-Host).UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+        $null = $(if (-not [Console]::IsOutputRedirected) { (Get-Host).UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') })
         exit 1
     }
     Compress-Archive -LiteralPath $srcItems -DestinationPath $tempZip -CompressionLevel Optimal -Force
@@ -396,7 +408,7 @@ if ($Zip) {
     # the .zip to survive in C:\EliteSoft\<PackageName>. Skip cleanup in the
     # default flow because $publishDir = C:\EliteSoft\ErwinAddIn is the
     # historical "I want both files and zip somewhere" output.
-    if ($PackageName -and (Test-Path -LiteralPath $publishDir) -and ($publishDir -ne $targetDir)) {
+    if ((Test-Path -LiteralPath $publishDir) -and ($publishDir -ne $targetDir)) {
         try {
             Remove-Item -LiteralPath $publishDir -Recurse -Force -ErrorAction Stop
             Write-Host "  Cleaned staging $publishDir" -ForegroundColor Gray
@@ -423,4 +435,4 @@ Write-Host "  3. If no DB seed was baked, install.bat will prompt for credential
 Write-Host "  Uninstall: double-click uninstall.bat" -ForegroundColor Gray
 
 Write-Host "`nPress any key to exit..." -ForegroundColor Gray
-$null = (Get-Host).UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+$null = $(if (-not [Console]::IsOutputRedirected) { (Get-Host).UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') })
