@@ -1680,7 +1680,10 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                 foreach (var rf in requiredFailures)
                 {
-                    string fieldLabel = $"{objectType}.{rf.Rule.PropertyCode}";
+                    // Show the OBJECT NAME (the table) + a friendly property label,
+                    // e.g. "VpDBMS_LIBRARY (Comment)" - the raw "Table.Definition"
+                    // was meaningless to the user (2026-06-06).
+                    string fieldLabel = $"{physicalName} ({NamingValidationEngine.FriendlyPropertyLabel(rf.Rule.PropertyCode)})";
                     var cancelMode = isNew ? Forms.RequiredOperationMode.Create : Forms.RequiredOperationMode.Update;
 
                     // Pre-fill the dialog with the property's current value -

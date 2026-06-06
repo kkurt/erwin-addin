@@ -4,6 +4,36 @@ A running log of corrections and non-obvious findings that future sessions
 should not have to rediscover. Each entry is a short rule, the reason, and
 how to apply it.
 
+## 2026-06-06: Any MODAL popup added to a per-change validation path MUST take a reentrancy guard, or it loops/stacks ad infinitum
+
+**Rule:** before you make `ValidateColumnNamingStandard` (or any method on the
+ProcessAttributeChanges / pending-name / heartbeat path) raise a MODAL dialog
+(`RequiredFieldDialog`, `AddinMessageDialog`, MessageBox...), gate it with a
+`_xxxInProgress` flag set in a `try/finally` wrapper, and ALSO bail on that flag
+at the top of `WindowMonitorTimer_Tick` and in `MonitorTimer_Tick`'s guard list.
+The Table path already does this via `_scopedCheckInProgress`; the Column path
+did not (it historically only validated `Physical_Name`, which auto-applies or
+passes silently, so it rarely showed a modal).
+
+**Why:** a modal pumps the message loop while it is up. The 100 ms
+`WindowMonitorTimer` fires during the pump and re-runs the SAME pending-name
+rename detection - but the attribute snapshot has not advanced yet (the
+`_attributeSnapshots[aid] = snapshot` at the end of the pending-name block only
+runs AFTER `ProcessAttributeChanges` returns, i.e. after the modal closes). So
+the reentrant tick sees `<default> -> DENEME` again, opens another modal, and so
+on. 2026-06-06: the new `COLUMN.Definition` ("comment required") Step-3b made the
+column path raise a modal on every inline-add/rename, which surfaced this latent
+loop as endless stacked "Kolon Comment alani 0 olamaz" popups (log: the same
+`PENDING-NAME ... renamed to 'DENEME' ... -> NamingValidate Column.Definition`
+block repeating every ~230 ms).
+
+**How to apply:** wrapper pattern - `if (_columnNamingCheckInProgress) return;
+_columnNamingCheckInProgress = true; try { ...Core(); } finally {
+_columnNamingCheckInProgress = false; }`. Note `WindowMonitorTimer_Tick` does NOT
+check `_isProcessingChange` (only `MonitorTimer_Tick` does), so the window-monitor
+needs its OWN bail on the new flag. Confirm the snapshot-advance line in the
+pending-name handler runs after the validation returns, not before.
+
 ## 2026-06-02: A "COM-RCW lifetime" crash is not "unsolvable / needs a Worker" until you (a) read the dump's native stacks and (b) try deterministic Marshal release
 
 **Rule:** when an in-process SCAPI pipeline crashes erwin with a fatal

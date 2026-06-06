@@ -287,6 +287,26 @@ namespace EliteSoft.Erwin.AddIn.Services
             return readAccessor;
         }
 
+        /// <summary>
+        /// Human-friendly label for a naming rule's PROPERTY_CODE, used in the
+        /// Required-field dialog so the user sees "Comment"/"Owner"/"Name" instead
+        /// of the raw SCAPI accessor ("Definition"/"Name_Qualifier"/"Physical_Name").
+        /// Unknown codes pass through unchanged. (2026-06-06)
+        /// </summary>
+        public static string FriendlyPropertyLabel(string propertyCode)
+        {
+            if (string.IsNullOrEmpty(propertyCode)) return "";
+            switch (propertyCode)
+            {
+                case "Definition":         return "Comment";
+                case "Name_Qualifier":     return "Owner";
+                case "Physical_Name":      return "Name";
+                case "Logical_Name":       return "Logical Name";
+                case "Physical_Data_Type": return "Data Type";
+                default:                   return propertyCode;
+            }
+        }
+
         #region Private Helpers
 
         /// <summary>

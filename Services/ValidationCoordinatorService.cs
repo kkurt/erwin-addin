@@ -48,6 +48,12 @@ namespace EliteSoft.Erwin.AddIn.Services
         // editor close so the next open re-baselines.
         private bool _entityEditorWasOpen;
         private string _activeEntityEditorTable;
+        // Model Editor ("Model 'X' Editor") lifecycle. On the open->close edge we
+        // run a READ-ONLY model-level naming validation (e.g. rule#1028
+        // MODEL.Definition req=True -> "model description required") and warn.
+        // Nothing validated model-level rules on close before, so an empty
+        // required model description was never flagged (2026-06-05).
+        private bool _modelEditorWasOpen;
         // _entityEditorUdpSnapshot field removed 2026-05-22 along with the
         // Table-UDP delta enforcement that was its only consumer.
         // Reentrancy guard. MessageBox.Show pumps the message loop while
@@ -57,6 +63,12 @@ namespace EliteSoft.Erwin.AddIn.Services
         // ad infinitum. Verified 2026-05-07: 30+ nested popups in one
         // session of clicking the TABLE_TYPE combo to "LOG".
         private bool _scopedCheckInProgress;
+        // Mirror of _scopedCheckInProgress for the COLUMN naming path
+        // (ValidateColumnNamingStandard). Its Required-field popup is modal and
+        // pumps the loop; without this guard a reentrant timer tick re-runs the
+        // same column's rename/Definition validation and stacks popups ad
+        // infinitum (2026-06-06 loop after the COLUMN.Definition Step-3b).
+        private bool _columnNamingCheckInProgress;
         private bool _sessionLost;
 
         // (Phase-2D 2026-05-06: chunked-cycle batch state retired - the full-model
@@ -904,7 +916,7 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         private void MonitorTimer_Tick(object sender, EventArgs e)
         {
-            if (_sessionLost || !_isMonitoring || _disposed || _isProcessingChange || _validationSuspended || _isCheckingForChanges) return;
+            if (_sessionLost || !_isMonitoring || _disposed || _isProcessingChange || _validationSuspended || _isCheckingForChanges || _columnNamingCheckInProgress) return;
             // 2026-05-25: while a locked-column dialog is up, skip the
             // entire heartbeat. SCAPI walks during the dialog's nested
             // message pump otherwise hog the UI thread and block OK
@@ -2311,6 +2323,10 @@ namespace EliteSoft.Erwin.AddIn.Services
             // reads inside the dialog's nested pump steal time slices
             // from input processing.
             if (_lockedDialogShowing) return;
+            // 2026-06-06: skip while a column naming Required-field popup is up.
+            // That dialog pumps the loop; re-entering here re-detects the same
+            // pending rename and stacks another popup (see _columnNamingCheckInProgress).
+            if (_columnNamingCheckInProgress) return;
 
             // Safety: check if model is still open BEFORE touching the session.
             if (!IsModelStillOpen()) { HandleSessionLost(); return; }
@@ -2611,6 +2627,32 @@ namespace EliteSoft.Erwin.AddIn.Services
                     _entityEditorWasOpen = entityEditorIsOpen;
                 }
 
+                // --- Model Editor ("Model 'X' Editor") close detection (2026-06-05).
+                // Model-level naming rules (e.g. rule#1028 MODEL.Definition req=True,
+                // rule#1027 MODEL.Name regex) had NO event-driven trigger - the only
+                // model validation was the on-demand Validation tab, and even that
+                // checked the name only. So closing the Model Editor with an empty
+                // required description never warned. Mirror the Column/Entity Editor
+                // close edge: on the open->closed transition run a READ-ONLY model
+                // validation and surface a warning popup. We deliberately do NOT
+                // write back to the model object (a model rename/definition write
+                // from the watchdog is riskier than column/table writes, and the
+                // Definition is a free-text paragraph better fixed in the editor),
+                // so this is warn-only.
+                bool modelEditorIsOpen = IsModelEditorOpen();
+                if (_modelEditorWasOpen && !modelEditorIsOpen)
+                {
+                    // Re-entrancy: flip state BEFORE the popup pumps the loop (same
+                    // hazard documented on the Entity Editor branch above).
+                    _modelEditorWasOpen = false;
+                    try { ValidateModelOnEditorClose(); }
+                    catch (Exception ex) { Log($"ValidateModelOnEditorClose err: {ex.Message}"); }
+                }
+                else
+                {
+                    _modelEditorWasOpen = modelEditorIsOpen;
+                }
+
                 // --- Inline-edit (Model Explorer label edit + diagram column
                 // inline edit) close detection (Phase-2F, 2026-05-13).
                 //
@@ -2674,6 +2716,173 @@ namespace EliteSoft.Erwin.AddIn.Services
                     ex.Message.Contains("RPC") || ex.Message.Contains("0x800"))
                     HandleSessionLost();
             }
+        }
+
+        /// <summary>
+        /// Detects erwin's Model Editor dialog. Title shape (r10.10, English UI):
+        ///   "Model 'MetaRepo' Editor"
+        /// The leading <c>Model '</c> anchor keeps it distinct from the Column
+        /// Editor (".. Column 'x' .. Editor"), the Entity Editor ("Table 'x'
+        /// Editor"), erwin's main window ("erwin DM - ..") and the add-in's own
+        /// warning popup (title "Model Validation", no quote). GetWindowTextNoHang
+        /// can never block on a non-pumping thread.
+        /// </summary>
+        private bool IsModelEditorOpen()
+        {
+            bool found = false;
+            EnumWindows((hWnd, lParam) =>
+            {
+                if (!IsWindowVisible(hWnd)) return true;
+                string t = Win32Helper.GetWindowTextNoHang(hWnd);
+                if (t.StartsWith("Model '", StringComparison.Ordinal)
+                    && t.EndsWith("Editor", StringComparison.Ordinal))
+                {
+                    found = true;
+                    return false; // stop enumeration
+                }
+                return true;
+            }, IntPtr.Zero);
+            return found;
+        }
+
+        /// <summary>
+        /// Model-level naming ENFORCEMENT, fired when the Model Editor closes.
+        /// Reads the model root object's rule-targeted properties (Name,
+        /// Definition, ...) and, for every REQUIRED rule that is violated, opens
+        /// the same RequiredFieldDialog the Column/Table paths use so the user can
+        /// type a valid value, which is written back to the model (Definition =
+        /// description, Name = model rename). A regex rule (e.g. rule#1027
+        /// MODEL.Name ^[A-Z_]+$) re-prompts until the typed value clears it; Cancel
+        /// leaves the model as-is. Guarded by _columnNamingCheckInProgress so the
+        /// modal's message pump does not re-enter the monitor timers.
+        ///
+        /// Config FibaEmre_SQL MODEL rules (verified 2026-06-06): rule#1027 Name
+        /// Regexp ^[A-Z_]+$ (req), rule#1028 Definition Required (req).
+        /// </summary>
+        private void ValidateModelOnEditorClose()
+        {
+            if (_validationSuspended || !NamingStandardService.Instance.IsLoaded) return;
+            if (_columnNamingCheckInProgress) return; // a naming required-popup is already up
+            if (!IsModelStillOpen()) return;
+
+            dynamic root;
+            try { root = _session.ModelObjects.Root; }
+            catch (Exception ex) { Log($"ValidateModelOnEditorClose: cannot read model root: {ex.Message}"); return; }
+            if (root == null) return;
+            object rootBoxed = root;
+
+            // Read a model property by the rule's accessor. The model NAME lives on
+            // the root object's Name accessor, not a property-collection member;
+            // everything else (Definition, ...) is a direct SCAPI property read. An
+            // unsurfaced property is treated as empty so a Required rule still fires.
+            string ReadVal(string code)
+            {
+                if (string.Equals(code, "Name", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(code, "Physical_Name", StringComparison.OrdinalIgnoreCase))
+                {
+                    try { return root.Name?.ToString() ?? ""; } catch { return ""; }
+                }
+                try { return root.Properties(code)?.Value?.ToString() ?? ""; }
+                catch (Exception ex)
+                {
+                    Log($"Naming standard: SCAPI did not surface 'Model.{code}' (treating as empty): {ex.Message}");
+                    return "";
+                }
+            }
+
+            _columnNamingCheckInProgress = true;
+            try
+            {
+                var requiredProps = NamingStandardService.Instance.GetRequiredPropertyCodes("Model");
+                string modelName;
+                try { modelName = root.Name?.ToString() ?? ""; } catch { modelName = ""; }
+
+                foreach (var code in NamingStandardService.Instance.GetPropertyCodes("Model"))
+                {
+                    string value = ReadVal(code);
+                    var res = NamingValidationEngine.ValidateObjectName("Model", value, rootBoxed, code, isNew: false);
+                    var fail = res?.FirstOrDefault(r => !r.IsValid);
+                    if (fail == null) continue;
+
+                    Log($"NamingValidate: 'Model.{code}' on '{modelName}' liveValue='{value}' -> rule#{fail.Rule?.Id} ({fail.RuleName})");
+
+                    bool isRequired = string.Equals(fail.RuleName, "Required", StringComparison.Ordinal)
+                                      || (requiredProps != null && requiredProps.Contains(code));
+                    if (!isRequired)
+                    {
+                        // No current MODEL rule is non-required, but stay honest: a
+                        // non-required violation is a warning, not a forced input.
+                        AddinMessageDialog.Show(fail.ErrorMessage, "Model Validation",
+                            MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        continue;
+                    }
+
+                    // Show the OBJECT NAME (the model) + a friendly property label,
+                    // e.g. "Fiba_SQLEmred (Comment)" instead of raw "Model.Definition".
+                    string fieldLabel = $"{modelName} ({NamingValidationEngine.FriendlyPropertyLabel(code)})";
+                    string writeAccessor = NamingValidationEngine.WriteAccessorFor(code);
+                    bool isNameCode = string.Equals(code, "Name", StringComparison.OrdinalIgnoreCase)
+                                      || string.Equals(code, "Physical_Name", StringComparison.OrdinalIgnoreCase);
+
+                    var currentFail = fail;
+                    while (currentFail != null)
+                    {
+                        string seed = ReadVal(code);
+                        var rc = EliteSoft.Erwin.AddIn.Forms.RequiredFieldDialog.Show(
+                            title: "Required field",
+                            message: currentFail.ErrorMessage,
+                            fieldLabel: fieldLabel,
+                            out string typed,
+                            owner: null,
+                            initialValue: seed,
+                            mode: Forms.RequiredOperationMode.Update,
+                            objectKind: "Model");
+
+                        if (rc != DialogResult.OK || string.IsNullOrEmpty(typed))
+                        {
+                            Log($"Model required field cancelled: {fieldLabel} (left as-is)");
+                            break;
+                        }
+
+                        int transId = _session.BeginNamedTransaction("RequiredModelField");
+                        try
+                        {
+                            if (isNameCode)
+                            {
+                                // Model name: try the property-collection accessor,
+                                // fall back to the root's direct Name setter.
+                                try { root.Properties(writeAccessor).Value = typed; }
+                                catch { root.Name = typed; }
+                            }
+                            else
+                            {
+                                root.Properties(writeAccessor).Value = typed;
+                            }
+                            _session.CommitTransaction(transId);
+                            Log($"Model required field filled: {fieldLabel} = '{typed}'");
+                        }
+                        catch (Exception ex)
+                        {
+                            try { _session.RollbackTransaction(transId); } catch (Exception rbEx) { Log($"RequiredModelField rollback err: {rbEx.Message}"); }
+                            Log($"Model required field write failed for {fieldLabel}: {ex.Message}");
+                            AddinMessageDialog.Show(
+                                $"'{typed}' degeri {fieldLabel} alanina yazilamadi.\n\nSCAPI hata:\n{ex.Message}",
+                                "Model alani yazilamadi",
+                                MessageBoxButtons.OK,
+                                MessageBoxIcon.Error);
+                            break;
+                        }
+
+                        // Re-validate: a value can satisfy "required" yet still fail a
+                        // regex (the Name must also match ^[A-Z_]+$). Re-prompt until
+                        // the property clears all its rules or the user cancels.
+                        string after = ReadVal(code);
+                        var freshRes = NamingValidationEngine.ValidateObjectName("Model", after, rootBoxed, code, isNew: false);
+                        currentFail = freshRes?.FirstOrDefault(r => !r.IsValid);
+                    }
+                }
+            }
+            finally { _columnNamingCheckInProgress = false; }
         }
 
         /// <summary>
@@ -5147,6 +5356,22 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             if (_validationSuspended) return;
             if (!NamingStandardService.Instance.IsLoaded) return;
+            // Reentrancy guard (2026-06-06): the Required-field popup in the core
+            // method is MODAL and pumps the message loop, re-firing the monitor
+            // timers. A reentrant tick that re-validates the same column before the
+            // outer call advanced the attribute snapshot stacks another modal popup,
+            // then a third, ad infinitum - the exact hazard _scopedCheckInProgress
+            // guards on the Table path. (Exposed by the COLUMN.Definition Step-3b,
+            // which made this path raise modals where Physical_Name validation
+            // rarely did, so the latent loop became visible spam.)
+            if (_columnNamingCheckInProgress) return;
+            _columnNamingCheckInProgress = true;
+            try { ValidateColumnNamingStandardCore(attr, state, isNew); }
+            finally { _columnNamingCheckInProgress = false; }
+        }
+
+        private void ValidateColumnNamingStandardCore(dynamic attr, AttributeValidationSnapshot state, bool isNew = false)
+        {
             if (string.IsNullOrEmpty(state.PhysicalName) ||
                 state.PhysicalName.Equals("<default>", StringComparison.OrdinalIgnoreCase) ||
                 state.PhysicalName.StartsWith("<default>", StringComparison.OrdinalIgnoreCase))
@@ -5257,6 +5482,47 @@ namespace EliteSoft.Erwin.AddIn.Services
             var results = NamingValidationEngine.ValidateObjectName("Column", state.PhysicalName, attrBoxed, isNew: isNew);
             var failures = results.Where(r => !r.IsValid).ToList();
 
+            // Step 3b (2026-06-05): the admin can author Column rules on any
+            // PROPERTY_DEF, not just Physical_Name - e.g. COLUMN.Definition with
+            // Length > 0 + IS_REQUIRED ("column comment is mandatory"). Until now
+            // ValidateColumnNamingStandard only ran the Physical_Name rules above,
+            // so those non-name rules never fired on a column add/rename (the
+            // matching Table path already does this loop - see
+            // TableTypeMonitorService "Step 3b"). Mirror it here: iterate every
+            // non-Physical_Name property code that has Column rules, read the live
+            // value via direct SCAPI access, and accumulate violations into the
+            // SAME failures pipeline so Required rules get the input dialog and the
+            // rest go to the consolidated warning.
+            if (attrBoxed != null)
+            {
+                foreach (var propertyCode in NamingStandardService.Instance.GetPropertyCodes("Column"))
+                {
+                    if (string.Equals(propertyCode, "Physical_Name", StringComparison.OrdinalIgnoreCase))
+                        continue; // already covered by the Physical_Name run above
+
+                    string propValue;
+                    try
+                    {
+                        propValue = attr?.Properties(propertyCode)?.Value?.ToString() ?? "";
+                    }
+                    catch (Exception ex)
+                    {
+                        // SCAPI may not surface the property on a freshly-added
+                        // column (e.g. an unset Definition raises "does not use a
+                        // property of <X> type"). That is exactly the empty state a
+                        // Length > 0 / Required rule is meant to catch, so treat the
+                        // unset property as an empty string and validate.
+                        propValue = "";
+                        Log($"Naming standard: SCAPI did not surface 'Column.{propertyCode}' on this column (treating as empty): {ex.Message}");
+                    }
+
+                    Log($"NamingValidate: 'Column.{propertyCode}' on '{state.TableName}.{state.PhysicalName}' liveValue='{propValue}' isNew={isNew}");
+                    var extraResults = NamingValidationEngine.ValidateObjectName(
+                        "Column", propValue, attrBoxed, propertyCode, isNew: isNew);
+                    failures.AddRange(extraResults.Where(r => !r.IsValid));
+                }
+            }
+
             // Required-input pass (2026-05-17 C3 follow-up, updated 2026-05-20):
             // Req=true violations get an inline input dialog. Cancel routes
             // through the Create-delete / Update-revert contract; on Cancel
@@ -5303,7 +5569,10 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                 foreach (var rf in requiredFailures)
                 {
-                    string fieldLabel = $"Column.{rf.Rule.PropertyCode}";
+                    // Show the OBJECT NAME (table.column) + a friendly property label,
+                    // e.g. "VpE_LOG.ID (Comment)" - the raw "Column.Definition" was
+                    // meaningless to the user (2026-06-06).
+                    string fieldLabel = $"{state.TableName}.{state.PhysicalName} ({NamingValidationEngine.FriendlyPropertyLabel(rf.Rule.PropertyCode)})";
                     var cancelMode = isNew ? Forms.RequiredOperationMode.Create : Forms.RequiredOperationMode.Update;
 
                     // Pre-fill the dialog with the column's current value
