@@ -1,129 +1,94 @@
-# Alter Script: UI Automation'dan Tam Programmatic'e Geçiş
+# Task: Generate DDL - dynamic "Send" / "Send to Approve" button + no-approval REST callback
 
-## Amaç
+## Goal (from user)
+In the Generate DDL flow (DdlApprovalDialog, shown after Generate DDL):
+- If an APPROVAL is configured for the active config -> button stays **"Send to Approve"**, existing flow runs.
+  REST callback is NOT fired by the add-in (admin fires it after the approve step). (user-confirmed)
+- If NO approval is configured -> button is **"Send"**; on click -> save -> then, if a REST callback is
+  configured for the config, call it (same logic as the admin approval screen). (user-confirmed)
+- The REST call must use the SAME logic as admin's approval-screen callback. Moving that logic to the
+  shared MetaShared assembly is approved by the user.
 
-`BtnAlterWizardProd_Click` mevcutta `WizardAutomationService` (1254 satır WM_COMMAND + UIA) ile erwin'in CC + RD + Alter Script wizard'larını sürüyor. Bu fragile. Native detour spike (ee49220) erwin'in kendi `FEProcessor::GenerateAlterScript` export'unu çağırabildiğimizi kanıtladı. Bu planla tüm akışı **sıfır UI** yapıyoruz — erwin'in C++ internal fonksiyonlarını doğrudan C++ köprüsüyle çağırıyoruz.
+## Authoritative facts (from investigation)
+- "Approval exists" == `ApprovalConfigService.GetApprovers(configId).Count > 0` (APPROVAL_APPROVER rows).
+- REST callback config == `APPROVAL_CALLBACK` (1:1 config) + `APPROVAL_CALLBACK_PARAM` (encrypted params)
+  + the referenced REST_API `CONNECTION_DEF` row (host/port/creds, DPAPI-encrypted).
+- Reference invoker: `ApprovalCallbackInvoker.InvokeAsync(int configId, DdlApprovalQueue queueRow)`
+  (erwin-admin/Services) -> tokens {{DDL}}/{{MODEL}}/{{CONFIG}}/{{NOTE}}/{{SUBMITTED_BY}}/{{DBMS}},
+  GET query / POST-PUT JSON body, Basic auth, 30s timeout, returns {Success, HttpStatus, Message}.
+  Admin records the outcome via `DdlApprovalService.RecordCallbackResult` -> CALLBACK_STATUS/AT/RESPONSE.
+- Both `ApprovalConfigService` and `ApprovalCallbackInvoker` depend ONLY on MetaShared (RepoDbContext,
+  entities, IApprovalConfigService/IApprovalCallbackInvoker/IBootstrapService/PasswordEncryptionService)
+  + BCL. No WinForms/app deps -> clean to move to MetaShared.
+- Add-in already builds `new RepoDbContext(DatabaseService.Instance.GetConfig())` (CorporateContextService),
+  so an `IBootstrapService` adapter over DatabaseService is trivial.
+- Add-in `DdlApprovalService.Submit` inserts DDL_APPROVAL_QUEUE (CONFIG_ID, MODEL_NAME, MODEL_LOCATOR,
+  SOURCE_MODE, DBMS_TYPE, DDL_TEXT, NOTE, STATUS='Pending', SUBMITTED_BY, SUBMITTED_AT) and returns new ID.
+- Add-in has NO HttpClient anywhere today; reuse the shared invoker.
 
-## Ana Prensipler (DOKUNMA)
+## Plan
 
-- [x] Alter DDL'i biz üretmiyoruz — erwin'in `FEProcessor::GenerateAlterScript` üretiyor
-- [x] Diff mantığı biz yazmıyoruz — erwin'in `MCXInvokeCompleteCompare` + `MCXMartModelUtilities` yapıyor
-- [x] C++ köprüsü SADECE native fonksiyonları sarıyor, iş mantığı eklemiyor
-- [x] Erwin sürüm değişikliklerinde güvenlik için dynamic GetProcAddress + symbol fingerprint guard
+### Phase 0 - Share the REST logic via MetaShared (erwin-admin)
+- [ ] Move `erwin-admin/Services/ApprovalConfigService.cs` -> `erwin-admin/MetaShared/Services/`
+      (namespace `EliteSoft.MetaAdmin.Services` -> `EliteSoft.MetaAdmin.Shared.Services`).
+- [ ] Move `erwin-admin/Services/ApprovalCallbackInvoker.cs` -> `erwin-admin/MetaShared/Services/`
+      (same namespace change).
+- [ ] Update admin-app references (DI registration + any `using`) to the new namespace.
+- [ ] Build erwin-admin (app + MetaShared) green.
 
-## Kritik Native Fonksiyonlar (doğrulanmış, dumpbin teyit)
+### Phase 1 - Add-in: detect "approval exists" + REST availability
+- [ ] Add `Services/AddinBootstrapService.cs` : `IBootstrapService` wrapping `DatabaseService.Instance.GetConfig()`.
+- [ ] In `ModelConfigForm.ShowDdlForApproval`: build `ApprovalConfigService(bootstrap)`, compute
+      `hasApprovers = svc.GetApprovers(ActiveConfigId).Count > 0`; pass `hasApprovers` to the dialog ctor.
 
-```
-EM_FEP.dll:
-  ?CreateObject@FEProcessor@@SAPEAVCObject@@XZ               (static factory)
-  ?GenerateAlterScript@FEProcessor@@QEAA...                  (the alter engine)
-  ?GenerateFEScript@FEProcessor@@QEAA?AW4eFEPResult@@PEAVGDMModelSetI@@PEAVCWnd@@@Z
-  ?GetScript@FEProcessor@@QEAA...                            (returns vector<CString>&)
+### Phase 2 - Dynamic button text
+- [ ] `DdlApprovalDialog`: new ctor param `bool hasApprovers`; set `_btnSend.Text = hasApprovers ? "Send to Approve" : "Send"`.
 
-EM_MCX.dll:
-  ??0MCXInvokeCompleteCompare@@QEAA@PEAVGDMModelSetI@@0PEAVGDMActionSummary@@1@Z   (ctor)
-  ?Execute@MCXInvokeCompleteCompare@@UEAA_NPEAVGDMModelSetI@@@Z
-  ??1MCXInvokeCompleteCompare@@UEAA@XZ                       (dtor)
-  ?PrepareServerModelSet@MCXMartModelUtilities@@SA...        (baseline from Mart)
-  ?InitializeClientActionSummary@MCXMartModelUtilities@@SA...
-  ?GetMartVersionId@MCXMartModelUtilities@@SA...
-  ?DoesModelHaveUnsavedChanges@MCXMartModelUtilities@@SA...
-```
+### Phase 3 - No-approval flow: Send -> save -> REST
+- [ ] `DdlApprovalDialog.BtnSend_Click`: keep current steps (ConfirmSubmitDialog -> Mart save ->
+      DdlApprovalService.Submit). For the `!hasApprovers` branch, after the queue-row insert:
+      - build an in-memory `DdlApprovalQueue` (DdlText/ModelName/Note/SubmittedBy/DbmsType/ConfigId),
+      - `await new ApprovalCallbackInvoker(approvalCfg, bootstrap).InvokeAsync(configId, queueRow)`,
+      - `DdlApprovalService.RecordCallbackResult(newId, result)` (stamp CALLBACK_STATUS/AT/RESPONSE),
+      - show the REST result to the user (success/failure); do NOT swallow a failure.
+- [ ] Approval branch (`hasApprovers`): unchanged - no REST from the add-in.
 
-## Tek Blocker: `GDMModelSetI*` Kaynağı
+### Phase 4 - Add-in DdlApprovalService.RecordCallbackResult
+- [ ] Add raw-SQL `UPDATE DDL_APPROVAL_QUEUE SET CALLBACK_STATUS=@s, CALLBACK_AT=@t, CALLBACK_RESPONSE=@r
+      WHERE ID=@id` (MSSQL/Oracle/PG dialect parity with the existing Submit inserts).
 
-SCAPI `ISCPersistenceUnit` → `GDMModelSetI*` çevirisi YOK (EAL.dll opaque). Çözüm: `GenerateFEScript`'e detour + biz bir kez `FEModel_DDL` çağırdığımızda pointer'ı yakala → cache.
+### Phase 5 - Build + verify
+- [ ] Build erwin-addin + erwin-admin green; run add-in test suite.
+- [ ] Manual: a config WITH approvers -> "Send to Approve" + current flow; a config WITHOUT approvers
+      -> "Send" + REST fired + CALLBACK_* stamped.
 
-## Faz 1 — Pointer Capture Altyapısı (1 gün)
+## Decisions (user-confirmed 2026-06-06)
+1. No-approval queue row STATUS = **'ApprovedBySystem'**.
+2. No-approval "Send" STILL inserts a DDL_APPROVAL_QUEUE row. YES.
+3. "kaydet" == existing Mart save (SaveCurrentModelWithDescription) still runs. YES.
+4. REST: await + show result + stamp CALLBACK_* before closing (blocking). YES.
 
-### 1a. native-bridge.cpp (v5)
-- [ ] `GenerateFEScript` export'una inline detour ekle (v3-tarzı 14-byte trampoline — prologue zaten güvenli gibi, doğrula)
-- [ ] Detour içinde `modelSet` pointer'ını thread-safe cache'e yaz (`g_lastCapturedModelSet` atomic)
-- [ ] Yeni export: `GetLastCapturedModelSet()` → IntPtr döndürür
-- [ ] Yeni export: `ResetCapturedModelSet()` (debug/reset için)
+## Review (done 2026-06-06)
+- [x] Phase 0: moved ApprovalConfigService + ApprovalCallbackInvoker into MetaShared/Services
+      (namespace -> EliteSoft.MetaAdmin.Shared.Services; +`using EliteSoft.MetaAdmin.Services` for
+      PasswordEncryptionService; +[SupportedOSPlatform("windows")]). CompositionRoot unchanged (already
+      imports Shared.Services). MetaShared builds 0/0.
+- [x] Phase 1: reused the EXISTING `DatabaseService.Instance.BootstrapService` (no new adapter needed).
+      ShowDdlForApproval computes `hasApprovers = ApprovalConfigService(bootstrap).GetApprovers(configId).Count>0`
+      (fail-safe -> approval path on error), passes it to the dialog.
+- [x] Phase 2: DdlApprovalDialog button text `_hasApprovers ? "Send to Approve" : "Send"`.
+- [x] Phase 3: BtnSend_Click - status `Pending`/`ApprovedBySystem`; no-approval branch fires shared
+      ApprovalCallbackInvoker.InvokeAsync + RecordCallbackResult + conditional success/failure modal.
+      Approval branch unchanged. Errors surfaced (no swallow).
+- [x] Phase 4: DdlApprovalService.Submit gained a `status` param; new RecordCallbackResult (MSSQL/Oracle/PG
+      UPDATE of CALLBACK_STATUS/AT/RESPONSE).
+- [x] Phase 5: erwin-addin builds 0/0 + 157 tests pass; MetaShared builds 0/0; admin app compiles (output
+      copy blocked only by the running MetaAdmin.Erwin process - not a code error).
 
-### 1b. NativeBridgeService.cs
-- [ ] `IntPtr GetLastCapturedModelSet()` P/Invoke
-- [ ] `void ResetCapturedModelSet()` P/Invoke
-- [ ] `EnsureActiveModelSetCaptured(dynamic currentPU)` yardımcı — cache boşsa bir kere `currentPU.FEModel_DDL(tempPath, "")` tetikle, detour yakalayacak, cache dolu olacak
+## Files changed
+- erwin-admin: MetaShared/Services/ApprovalConfigService.cs (moved), MetaShared/Services/ApprovalCallbackInvoker.cs (moved),
+  deleted Services/ApprovalConfigService.cs + Services/ApprovalCallbackInvoker.cs.
+- erwin-addin: ModelConfigForm.cs (ShowDdlForApproval), Forms/DdlApprovalDialog.cs, Services/DdlApprovalService.cs.
 
-### 1c. Doğrulama
-- [ ] Erwin, addin açık, manuel test: `_currentModel.FEModel_DDL(...)` çağır, log'da `[FE] captured modelSet=0x...` satırını gör
-- [ ] NativeBridgeService.GetLastCapturedModelSet() non-zero IntPtr dönüyor
-
-## Faz 2 — MCX + FEProcessor Pipeline (2 gün)
-
-### 2a. native-bridge.cpp wrappers
-- [ ] `PrepareServerModelSet` export'unu resolve et
-- [ ] `InitializeClientActionSummary` export'unu resolve et
-- [ ] `MCXInvokeCompleteCompare` ctor/Execute/dtor export'larını resolve et
-- [ ] `FEProcessor::CreateObject` + dtor resolve et
-- [ ] Yeni C++ fonksiyon: `RunSilentAlterDdl(GDMModelSetI* client) → char*` (UTF-8 alter DDL veya null)
-  - `PrepareServerModelSet(client, &as1)` → serverMs
-  - `InitializeClientActionSummary(client, &as2)`
-  - 1KB buffer allocate → MCXInvokeCompleteCompare ctor
-  - `cc.Execute(client)` → populates as2
-  - `FEProcessor::CreateObject()` → fep instance
-  - `fep->GenerateAlterScript(client, as2, nullptr, false)`
-  - `vector<CString>& ddl = fep->GetScript()` → concat to single UTF-8 string
-  - Free server/summary resources, return malloc'd string
-- [ ] Yeni export: `GenerateAlterDdlForActiveModel(IntPtr modelSet) → LPSTR` (caller frees via `FreeDdlBuffer`)
-- [ ] Yeni export: `FreeDdlBuffer(LPSTR)`
-
-### 2b. NativeBridgeService.cs
-- [ ] `string GenerateAlterDdl(dynamic currentPU)` high-level API
-  - `EnsureActiveModelSetCaptured(currentPU)`
-  - `IntPtr ms = GetLastCapturedModelSet()`
-  - P/Invoke `GenerateAlterDdlForActiveModel(ms)`
-  - UTF-8 → managed string; native buffer'ı free et
-  - Null/boş döndüyse "no differences" tut
-
-### 2c. Doğrulama
-- [ ] Dirty V3 açık, basit test formu: `NativeBridgeService.GenerateAlterDdl(_currentModel)` çağır
-- [ ] Dönen DDL, wizard UI'nın ürettiği DDL ile birebir aynı
-- [ ] "No differences" senaryosu (model temizse) temiz string/null döner
-
-## Faz 3 — UI Entegrasyonu + Eski Kod Silme (1 gün)
-
-### 3a. ModelConfigForm.cs
-- [ ] `BtnAlterWizardProd_Click` yeniden yaz:
-  - `WizardAutomationService` kullanma
-  - Wait dialog aç
-  - Background thread: `NativeBridgeService.GenerateAlterDdl(_currentModel)`
-  - DDL rtbDDLOutput'a
-  - Status güncelle
-- [ ] `cmbRightModel`'den version number okunup `NativeBridgeService`'e iletilmesi
-  - Not: MCX kendisi baseline'ı seçiyor mu, yoksa version biz söylüyor muyuz? Faz 2'de netleştir
-
-### 3b. Silinecekler
-- [ ] `Services/WizardAutomationService.cs` komple sil (~1254 satır)
-- [ ] `ModelConfigForm.cs` içindeki wizard-related state (`rePUToCleanup` gibi) temizle
-- [ ] `ErwinAddIn.csproj`'da WizardAutomationService referansı varsa kaldır
-- [ ] Memory note `reference_alter_script_wizard_automation.md` "deprecated" olarak işaretle (ama silme — referans için dursun)
-
-### 3c. Doğrulama
-- [ ] `dotnet build` temiz
-- [ ] Happy path: "From Mart" Alter DDL üretimi çalışıyor, UI görünmüyor
-- [ ] Erwin UI donmuyor (background thread temiz)
-
-## Faz 4 — Edge Cases + Hata Yönetimi (1 gün)
-
-- [ ] `DoesModelHaveUnsavedChanges`'ı ön-kontrol olarak ekle — temiz modelde ne olur?
-- [ ] Dirty transaction durumu: native tarafa göndermeden önce commit gerekiyor mu?
-- [ ] `PrepareServerModelSet` null dönerse (Mart erişimi yok) → kullanıcıya anlamlı hata
-- [ ] Bridge DLL yüklenmemişse → kullanıcıya "native bridge unavailable" mesajı + eski akışa düş (feature flag)
-- [ ] Symbol resolution fail ederse (erwin sürümü farklı) → log + graceful degradation
-- [ ] Thread safety: aynı anda 2 alter-ddl request gelmez ama yine de mutex koy
-
-## Doğrulama (Genel)
-
-- [ ] Happy path: dirty V3 vs baseline, Preview ekranındaki DDL ile biri bir aynı
-- [ ] Hızlı: erwin UI otomasyonu ~10s idi, hedef <1s
-- [ ] Erwin yeniden başlatılırsa bridge yeniden inject oluyor, sorunsuz çalışıyor
-- [ ] Eski wizard-automation kod yolu çalışmıyor (feature flag ile kapalı) — wizard açılmıyor
-
-## Sonrası
-
-- UI: `lblDDLStatus` yeni akışa uygun mesajlar
-- Memory/documentation: `reference_silent_re_pattern.md` gibi bir `reference_silent_alter_script_pattern.md` yaz
-- Production: regular DLL build → CI, release
+## Not committed. Manual verify pending (needs add-in + admin redeploy with apps closed).
+</content>

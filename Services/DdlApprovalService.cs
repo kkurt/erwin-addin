@@ -48,7 +48,8 @@ namespace EliteSoft.Erwin.AddIn.Services
             string dbmsType,
             string ddlText,
             string note,
-            Action<string> log)
+            Action<string> log,
+            string status = "Pending")
         {
             if (configId <= 0)
                 throw new ArgumentException("configId must be a resolved CONFIG.ID", nameof(configId));
@@ -56,28 +57,66 @@ namespace EliteSoft.Erwin.AddIn.Services
                 throw new ArgumentException("sourceMode must be set", nameof(sourceMode));
             if (string.IsNullOrEmpty(ddlText))
                 throw new ArgumentException("ddlText must be non-empty", nameof(ddlText));
+            if (string.IsNullOrWhiteSpace(status))
+                throw new ArgumentException("status must be set", nameof(status));
 
             string dbType = DatabaseService.Instance.GetDbType();
             string submittedBy = SafeUserName();
 
-            log?.Invoke($"DdlApproval.Submit: dbType={dbType}, configId={configId}, source={sourceMode}, ddlLen={ddlText.Length}, hasNote={(string.IsNullOrEmpty(note) ? "no" : "yes")}");
+            log?.Invoke($"DdlApproval.Submit: dbType={dbType}, configId={configId}, source={sourceMode}, status={status}, ddlLen={ddlText.Length}, hasNote={(string.IsNullOrEmpty(note) ? "no" : "yes")}");
 
             using (var conn = DatabaseService.Instance.CreateConnection())
             {
                 conn.Open();
                 int newId = dbType?.ToUpper() switch
                 {
-                    "POSTGRESQL" => InsertPostgres(conn, configId, modelName, modelLocator, sourceMode, dbmsType, ddlText, note, submittedBy),
-                    "ORACLE"     => InsertOracle  (conn, configId, modelName, modelLocator, sourceMode, dbmsType, ddlText, note, submittedBy),
-                    _            => InsertMssql   (conn, configId, modelName, modelLocator, sourceMode, dbmsType, ddlText, note, submittedBy),
+                    "POSTGRESQL" => InsertPostgres(conn, configId, modelName, modelLocator, sourceMode, dbmsType, ddlText, note, submittedBy, status),
+                    "ORACLE"     => InsertOracle  (conn, configId, modelName, modelLocator, sourceMode, dbmsType, ddlText, note, submittedBy, status),
+                    _            => InsertMssql   (conn, configId, modelName, modelLocator, sourceMode, dbmsType, ddlText, note, submittedBy, status),
                 };
                 log?.Invoke($"DdlApproval.Submit: inserted ID={newId}");
                 return newId;
             }
         }
 
+        /// <summary>
+        /// Stamp the REST-callback outcome onto a queue row's CALLBACK_* columns.
+        /// Used by the add-in's "Send" (no-approval) path after it fires the REST
+        /// callback - mirrors the admin tool's
+        /// <c>DdlApprovalService.RecordCallbackResult</c>. Throws on DB failure
+        /// (no silent swallow); the caller surfaces it.
+        /// </summary>
+        public void RecordCallbackResult(int queueId, string callbackStatus, DateTime callbackAt, string callbackResponse, Action<string> log)
+        {
+            if (queueId <= 0)
+                throw new ArgumentException("queueId must be a valid DDL_APPROVAL_QUEUE.ID", nameof(queueId));
+
+            string dbType = DatabaseService.Instance.GetDbType();
+            string sql = dbType?.ToUpper() switch
+            {
+                "POSTGRESQL" => @"UPDATE ""DDL_APPROVAL_QUEUE"" SET ""CALLBACK_STATUS""=@s, ""CALLBACK_AT""=@t, ""CALLBACK_RESPONSE""=@r WHERE ""ID""=@id",
+                "ORACLE"     => @"UPDATE DDL_APPROVAL_QUEUE SET CALLBACK_STATUS=:s, CALLBACK_AT=:t, CALLBACK_RESPONSE=:r WHERE ID=:id",
+                _            => @"UPDATE [dbo].[DDL_APPROVAL_QUEUE] SET [CALLBACK_STATUS]=@s, [CALLBACK_AT]=@t, [CALLBACK_RESPONSE]=@r WHERE [ID]=@id",
+            };
+            bool oracle = string.Equals(dbType, "ORACLE", StringComparison.OrdinalIgnoreCase);
+            string p(string n) => oracle ? ":" + n : "@" + n;
+
+            log?.Invoke($"DdlApproval.RecordCallbackResult: id={queueId}, status={callbackStatus}");
+
+            using (var conn = DatabaseService.Instance.CreateConnection())
+            {
+                conn.Open();
+                using var cmd = DatabaseService.Instance.CreateCommand(sql, conn);
+                AddParam(cmd, p("s"),  DbType.String,   string.IsNullOrEmpty(callbackStatus)   ? (object)DBNull.Value : callbackStatus);
+                AddParam(cmd, p("t"),  DbType.DateTime, callbackAt);
+                AddParam(cmd, p("r"),  DbType.String,   string.IsNullOrEmpty(callbackResponse) ? (object)DBNull.Value : callbackResponse);
+                AddParam(cmd, p("id"), DbType.Int32,    queueId);
+                cmd.ExecuteNonQuery();
+            }
+        }
+
         private static int InsertMssql(DbConnection conn, int configId, string modelName, string modelLocator,
-            string sourceMode, string dbmsType, string ddlText, string note, string submittedBy)
+            string sourceMode, string dbmsType, string ddlText, string note, string submittedBy, string status)
         {
             // STATUS column is NOT NULL. The CREATE TABLE script defines a
             // DEFAULT 'Pending' constraint (DF_DDL_APPROVAL_QUEUE_STATUS) but
@@ -99,7 +138,7 @@ INSERT INTO [dbo].[DDL_APPROVAL_QUEUE]
     ([CONFIG_ID],[MODEL_NAME],[MODEL_LOCATOR],[SOURCE_MODE],[DBMS_TYPE],[DDL_TEXT],[NOTE],[STATUS],[SUBMITTED_BY],[SUBMITTED_AT])
 OUTPUT INSERTED.[ID]
 VALUES
-    (@configId, @modelName, @modelLocator, @sourceMode, @dbmsType, @ddlText, @note, 'Pending', @submittedBy, @submittedAt);";
+    (@configId, @modelName, @modelLocator, @sourceMode, @dbmsType, @ddlText, @note, @status, @submittedBy, @submittedAt);";
             using var cmd = DatabaseService.Instance.CreateCommand(sql, conn);
             AddParam(cmd, "@configId",    DbType.Int32,    configId);
             AddParam(cmd, "@modelName",   DbType.String,   (object)modelName    ?? DBNull.Value);
@@ -108,6 +147,7 @@ VALUES
             AddParam(cmd, "@dbmsType",    DbType.String,   (object)dbmsType     ?? DBNull.Value);
             AddParam(cmd, "@ddlText",     DbType.String,   ddlText);
             AddParam(cmd, "@note",        DbType.String,   string.IsNullOrEmpty(note) ? (object)DBNull.Value : note);
+            AddParam(cmd, "@status",      DbType.String,   status);
             AddParam(cmd, "@submittedBy", DbType.String,   (object)submittedBy  ?? DBNull.Value);
             AddParam(cmd, "@submittedAt", DbType.DateTime, DateTime.UtcNow);
             var scalar = cmd.ExecuteScalar();
@@ -115,7 +155,7 @@ VALUES
         }
 
         private static int InsertOracle(DbConnection conn, int configId, string modelName, string modelLocator,
-            string sourceMode, string dbmsType, string ddlText, string note, string submittedBy)
+            string sourceMode, string dbmsType, string ddlText, string note, string submittedBy, string status)
         {
             // Oracle's RETURNING ... INTO needs an output parameter; the easier
             // cross-version path is to RETURN the new ID via a SELECT after
@@ -128,7 +168,7 @@ VALUES
 INSERT INTO DDL_APPROVAL_QUEUE
     (CONFIG_ID, MODEL_NAME, MODEL_LOCATOR, SOURCE_MODE, DBMS_TYPE, DDL_TEXT, NOTE, STATUS, SUBMITTED_BY, SUBMITTED_AT)
 VALUES
-    (:configId, :modelName, :modelLocator, :sourceMode, :dbmsType, :ddlText, :note, 'Pending', :submittedBy, :submittedAt)
+    (:configId, :modelName, :modelLocator, :sourceMode, :dbmsType, :ddlText, :note, :status, :submittedBy, :submittedAt)
 RETURNING ID INTO :newId";
             using var cmd = DatabaseService.Instance.CreateCommand(sql, conn);
             AddParam(cmd, ":configId",    DbType.Int32,    configId);
@@ -138,6 +178,7 @@ RETURNING ID INTO :newId";
             AddParam(cmd, ":dbmsType",    DbType.String,   (object)dbmsType     ?? DBNull.Value);
             AddParam(cmd, ":ddlText",     DbType.String,   ddlText);
             AddParam(cmd, ":note",        DbType.String,   string.IsNullOrEmpty(note) ? (object)DBNull.Value : note);
+            AddParam(cmd, ":status",      DbType.String,   status);
             AddParam(cmd, ":submittedBy", DbType.String,   (object)submittedBy  ?? DBNull.Value);
             AddParam(cmd, ":submittedAt", DbType.DateTime, DateTime.UtcNow);
             var outp = cmd.CreateParameter();
@@ -150,7 +191,7 @@ RETURNING ID INTO :newId";
         }
 
         private static int InsertPostgres(DbConnection conn, int configId, string modelName, string modelLocator,
-            string sourceMode, string dbmsType, string ddlText, string note, string submittedBy)
+            string sourceMode, string dbmsType, string ddlText, string note, string submittedBy, string status)
         {
             // Explicit STATUS + SUBMITTED_AT for the schema-drift reason
             // documented in InsertMssql.
@@ -158,7 +199,7 @@ RETURNING ID INTO :newId";
 INSERT INTO ""DDL_APPROVAL_QUEUE""
     (""CONFIG_ID"",""MODEL_NAME"",""MODEL_LOCATOR"",""SOURCE_MODE"",""DBMS_TYPE"",""DDL_TEXT"",""NOTE"",""STATUS"",""SUBMITTED_BY"",""SUBMITTED_AT"")
 VALUES
-    (@configId, @modelName, @modelLocator, @sourceMode, @dbmsType, @ddlText, @note, 'Pending', @submittedBy, @submittedAt)
+    (@configId, @modelName, @modelLocator, @sourceMode, @dbmsType, @ddlText, @note, @status, @submittedBy, @submittedAt)
 RETURNING ""ID"";";
             using var cmd = DatabaseService.Instance.CreateCommand(sql, conn);
             AddParam(cmd, "@configId",    DbType.Int32,    configId);
@@ -168,6 +209,7 @@ RETURNING ""ID"";";
             AddParam(cmd, "@dbmsType",    DbType.String,   (object)dbmsType     ?? DBNull.Value);
             AddParam(cmd, "@ddlText",     DbType.String,   ddlText);
             AddParam(cmd, "@note",        DbType.String,   string.IsNullOrEmpty(note) ? (object)DBNull.Value : note);
+            AddParam(cmd, "@status",      DbType.String,   status);
             AddParam(cmd, "@submittedBy", DbType.String,   (object)submittedBy  ?? DBNull.Value);
             AddParam(cmd, "@submittedAt", DbType.DateTime, DateTime.UtcNow);
             var scalar = cmd.ExecuteScalar();

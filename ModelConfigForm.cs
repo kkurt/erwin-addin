@@ -4547,6 +4547,26 @@ namespace EliteSoft.Erwin.AddIn
             // execute against, which is what the approval reviewer needs.
             string dbmsType = ReadActivePuTargetServer();
 
+            // Does this config have an approval workflow? Approvers are defined in
+            // APPROVAL_APPROVER; a non-empty list means "Send to Approve" (the admin
+            // approves and fires the REST callback later). Empty means "Send": the
+            // add-in saves as 'ApprovedBySystem' and fires the REST callback itself.
+            // On a check error, fail toward the SAFE existing behaviour (approval
+            // path, no auto-REST) and surface it - never silently auto-send.
+            bool hasApprovers;
+            try
+            {
+                var bootstrap = Services.DatabaseService.Instance.BootstrapService;
+                hasApprovers = new EliteSoft.MetaAdmin.Shared.Services.ApprovalConfigService(bootstrap)
+                    .GetApprovers(ctx.ActiveConfigId).Count > 0;
+                Log($"ShowDdlForApproval: config {ctx.ActiveConfigId} hasApprovers={hasApprovers}");
+            }
+            catch (Exception ex)
+            {
+                Log($"ShowDdlForApproval: approver check failed ({ex.Message}); defaulting to approval path (Send to Approve, no auto-REST).");
+                hasApprovers = true;
+            }
+
             using var dlg = new Forms.DdlApprovalDialog(
                 ddlText:           ddl,
                 configId:          ctx.ActiveConfigId,
@@ -4554,6 +4574,7 @@ namespace EliteSoft.Erwin.AddIn
                 modelLocator:      modelLocator,
                 sourceMode:        sourceMode ?? "Unknown",
                 dbmsType:          dbmsType,
+                hasApprovers:      hasApprovers,
                 log:               (Action<string>)Log,
                 martSaveCallback:  SaveCurrentModelWithDescription);
             dlg.ShowDialog(this);
@@ -6326,6 +6347,9 @@ namespace EliteSoft.Erwin.AddIn
             bool hasRealVersions = cmbRightModel.Items.Count > 0
                 && (cmbRightModel.Items[0]?.ToString()?.StartsWith("v") ?? false);
             cmbRightModel.Enabled = fromMart && hasRealVersions;
+            // Keep the 1-version label / combo display in sync with the source radio
+            // (From-DB hides the label and shows the disabled combo).
+            ApplyRightTargetSingleChoiceDisplay();
             btnConfigureDB.Visible = fromDB;
 
             // "Only Selected Objects" is honoured by BOTH paths (2026-05-30):
@@ -6617,6 +6641,30 @@ namespace EliteSoft.Erwin.AddIn
                 cmbRightModel.SelectedIndex = 0;
                 cmbRightModel.Enabled = false;
             }
+
+            ApplyRightTargetSingleChoiceDisplay();
+        }
+
+        /// <summary>
+        /// Mirror the Source side: a Target (Right) with exactly ONE real version to
+        /// compare against is shown as a plain label, not a 1-entry dropdown (the
+        /// Source side did this 2026-05-30 by replacing cmbLeftModel with
+        /// lblOpenedModel). The combo stays populated + selected BEHIND the label so
+        /// ParseRightVersion() keeps reading the real selection. Only applies on the
+        /// From-Mart path with a real "v.." entry; From-DB / "(no Mart source
+        /// enabled)" keep the (disabled) combo as before. Called from
+        /// RebuildRightCombo and OnRightSourceChanged. (2026-06-06)
+        /// </summary>
+        private void ApplyRightTargetSingleChoiceDisplay()
+        {
+            bool singleRealChoice =
+                rbFromMart.Checked
+                && cmbRightModel.Items.Count == 1
+                && (cmbRightModel.Items[0]?.ToString()?.StartsWith("v") ?? false);
+
+            lblRightModel.Text = singleRealChoice ? (cmbRightModel.Items[0]?.ToString() ?? "") : "";
+            lblRightModel.Visible = singleRealChoice;
+            cmbRightModel.Visible = !singleRealChoice;
         }
 
         #endregion

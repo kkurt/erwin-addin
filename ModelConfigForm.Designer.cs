@@ -447,6 +447,20 @@ namespace EliteSoft.Erwin.AddIn
             this.cmbRightModel.Enabled = true;
             this.grpDdlTarget.Controls.Add(this.cmbRightModel);
 
+            // Label shown INSTEAD of cmbRightModel when the Target has exactly one
+            // real version to compare against (mirrors lblOpenedModel on the Source
+            // side - a 1-entry dropdown is pointless UX). Same bounds as the combo;
+            // ApplyRightTargetSingleChoiceDisplay() toggles which one is visible.
+            this.lblRightModel = new System.Windows.Forms.Label();
+            this.lblRightModel.Location = new System.Drawing.Point(110, 22);
+            this.lblRightModel.Size = new System.Drawing.Size(322, 22);
+            this.lblRightModel.Text = "";
+            this.lblRightModel.Font = fontBodyBold;
+            this.lblRightModel.ForeColor = clrTextPrimary;
+            this.lblRightModel.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
+            this.lblRightModel.Visible = false;
+            this.grpDdlTarget.Controls.Add(this.lblRightModel);
+
             this.rbFromDB = new System.Windows.Forms.RadioButton();
             this.rbFromDB.Location = new System.Drawing.Point(12, 49);
             this.rbFromDB.Size = new System.Drawing.Size(80, 20);
@@ -656,6 +670,7 @@ namespace EliteSoft.Erwin.AddIn
 #endif
         private System.Windows.Forms.Button btnStepMode;
         private System.Windows.Forms.ComboBox cmbRightModel;
+        private System.Windows.Forms.Label lblRightModel;
         // txtFEOptionXml + btnBrowseFEOption removed 2026-05-27 (dead UI; see
         // matching note in the designer constructor block).
         private System.Windows.Forms.RadioButton rbFromMart;

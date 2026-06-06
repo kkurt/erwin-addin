@@ -3,6 +3,8 @@ using System.Drawing;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using EliteSoft.Erwin.AddIn.Services;
+using EliteSoft.MetaAdmin.Shared.Services;        // ApprovalConfigService / ApprovalCallbackInvoker (no-approval REST)
+using EliteSoft.MetaAdmin.Shared.Data.Entities;   // DdlApprovalQueue (token source for the callback)
 
 namespace EliteSoft.Erwin.AddIn.Forms
 {
@@ -23,6 +25,13 @@ namespace EliteSoft.Erwin.AddIn.Forms
         private readonly string _modelLocator;
         private readonly string _sourceMode;
         private readonly string _dbmsType;
+        // True when the active config has at least one APPROVAL_APPROVER. Drives
+        // both the button text ("Send to Approve" vs "Send") and the post-submit
+        // flow: with approvers the row goes in as 'Pending' and the admin fires the
+        // REST callback on approve; without approvers the add-in inserts it as
+        // 'ApprovedBySystem' and fires the REST callback itself (same logic, shared
+        // ApprovalCallbackInvoker). (2026-06-06)
+        private readonly bool _hasApprovers;
         private readonly Action<string> _log;
         // Callback supplied by the owner (ModelConfigForm). Invoked AFTER
         // the user confirms submission. Takes the version description the
@@ -47,6 +56,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
             string modelLocator,
             string sourceMode,
             string dbmsType,
+            bool hasApprovers,
             Action<string> log,
             Func<string, System.Threading.Tasks.Task<bool>> martSaveCallback = null)
         {
@@ -56,6 +66,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
             _modelLocator      = modelLocator;
             _sourceMode        = sourceMode;
             _dbmsType          = dbmsType;
+            _hasApprovers      = hasApprovers;
             _log               = log ?? (_ => { });
             _martSaveCallback  = martSaveCallback;
 
@@ -199,7 +210,10 @@ namespace EliteSoft.Erwin.AddIn.Forms
 
             _btnSend = new Button
             {
-                Text = "Send to Approve",
+                // No approver configured for this config -> this is a direct send
+                // (the add-in fires the REST callback itself), so the verb is just
+                // "Send" rather than "Send to Approve".
+                Text = _hasApprovers ? "Send to Approve" : "Send",
                 Size = new Size(160, 32),
                 FlatStyle = FlatStyle.Flat,
                 BackColor = Color.FromArgb(46, 125, 50),
@@ -523,8 +537,12 @@ namespace EliteSoft.Erwin.AddIn.Forms
             // lives on the new Mart commit and does not need duplicating
             // in our DB).
             string note = _txtNote.Text;
+            // With approvers the row waits for the admin ('Pending'); without, there
+            // is no gate so it is auto-approved by the system and the add-in fires
+            // the REST callback itself.
+            string status = _hasApprovers ? "Pending" : "ApprovedBySystem";
 
-            _lblStatus.Text = "Submitting to approval queue...";
+            _lblStatus.Text = _hasApprovers ? "Submitting to approval queue..." : "Saving...";
             Application.DoEvents();
 
             int newId;
@@ -538,57 +556,142 @@ namespace EliteSoft.Erwin.AddIn.Forms
                     dbmsType:    _dbmsType,
                     ddlText:     _ddlText,
                     note:        note,
-                    log:         _log);
+                    log:         _log,
+                    status:      status);
             }
             catch (Exception ex)
             {
                 _log($"DdlApprovalDialog: submit failed: {ex.GetType().Name}: {ex.Message}");
                 _lblStatus.ForeColor = Color.FromArgb(192, 57, 43);
-                _lblStatus.Text = $"Queue insert failed: {ex.Message}";
+                _lblStatus.Text = $"Save failed: {ex.Message}";
                 ReenableForRetry();
                 return;
             }
 
-            // Success: update the status strip (kept for users who alt-tab
-            // back to the review window later) then surface an explicit
-            // confirmation modal so the operator knows BOTH steps - the
-            // Mart commit AND the approval-queue insert - completed.
-            // Without the modal the success signal was just a colour
-            // change on a status label, which user feedback 2026-05-31
-            // flagged as too subtle for a multi-step pipeline.
-            _lblStatus.ForeColor = Color.FromArgb(46, 125, 50);
-            _lblStatus.Text = $"Submitted to approval queue. ID = {newId}.";
+            // Step 5 (no-approval path only): there is no approver gate, so the
+            // change is auto-approved. Fire the configured REST callback NOW - the
+            // SAME shared ApprovalCallbackInvoker the admin tool runs after its
+            // approve step - and stamp the outcome onto the queue row's CALLBACK_*
+            // columns. With approvers the add-in does NOT call REST; the admin
+            // fires it on approve.
+            string restSummary = null;   // null => no REST attempted / none configured
+            bool restFailed = false;
+            if (!_hasApprovers)
+            {
+                try
+                {
+                    var bootstrap = DatabaseService.Instance.BootstrapService;
+                    var approvalCfg = new ApprovalConfigService(bootstrap);
+                    var cb = approvalCfg.GetCallback(_configId);
+                    if (cb != null && cb.RestConnectionId != null)
+                    {
+                        _lblStatus.Text = "Calling REST callback...";
+                        Application.DoEvents();
+
+                        var queueRow = new DdlApprovalQueue
+                        {
+                            Id          = newId,
+                            ConfigId    = _configId,
+                            ModelName   = _modelName,
+                            DdlText     = _ddlText,
+                            Note        = note,
+                            SubmittedBy = Environment.UserName,
+                            DbmsType    = _dbmsType,
+                        };
+
+                        var invoker = new ApprovalCallbackInvoker(approvalCfg, bootstrap);
+                        var result = await invoker.InvokeAsync(_configId, queueRow).ConfigureAwait(true);
+
+                        restFailed = !result.Success;
+                        restSummary = result.Message;
+
+                        try
+                        {
+                            DdlApprovalService.Instance.RecordCallbackResult(
+                                newId,
+                                result.Success ? "Success" : "Failed",
+                                DateTime.UtcNow,
+                                result.Message,
+                                _log);
+                        }
+                        catch (Exception ex)
+                        {
+                            // The REST call already happened; failing to record the
+                            // CALLBACK_* audit columns must not mask it - log + append.
+                            _log($"DdlApprovalDialog: RecordCallbackResult failed: {ex.Message}");
+                            restSummary = (restSummary ?? "") + $" (audit write failed: {ex.Message})";
+                        }
+                    }
+                    else
+                    {
+                        _log($"DdlApprovalDialog: no REST callback configured for config {_configId}; skipping.");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Do not swallow: the row IS saved, but the REST step errored.
+                    _log($"DdlApprovalDialog: REST callback threw {ex.GetType().Name}: {ex.Message}");
+                    restFailed = true;
+                    restSummary = ex.Message;
+                }
+            }
+
+            // Success: the row is saved (and, for the no-approval path, the REST
+            // callback - if any - has been attempted). Update the status strip and
+            // surface an explicit confirmation modal (user rule 2026-05-31: the
+            // colour-change-only signal was too subtle for a multi-step pipeline).
+            _lblStatus.ForeColor = restFailed ? Color.FromArgb(192, 57, 43) : Color.FromArgb(46, 125, 50);
+            _lblStatus.Text = _hasApprovers
+                ? $"Submitted to approval queue. ID = {newId}."
+                : (restFailed ? $"Saved (ID {newId}); REST callback FAILED." : $"Saved. ID = {newId}.");
             _btnCancel.Text = "Close";
             _btnCancel.Enabled = true;
             _btnCopy.Enabled = true;
 
             try
             {
-                // AddinMessageDialog (not MessageBox) keeps the popup on
-                // the addin's design language (Segoe UI + accent stripe +
-                // borderless header) instead of the legacy Win32 grey
-                // chrome that visually blends with erwin's own dialogs -
-                // user rule 2026-05-31 (re-iterated; rule has existed
-                // since AddinMessageDialog was introduced 2026-05-15
-                // but was not formalised in lessons.md before today).
-                Forms.AddinMessageDialog.Show(
-                    this,
-                    $"Model committed to Mart and submitted to the approval queue.\n\nApproval Queue ID: {newId}",
-                    "Success",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Information);
+                // AddinMessageDialog (not MessageBox) keeps the popup on the addin's
+                // design language - user rule (lessons.md).
+                string body;
+                MessageBoxIcon icon;
+                string title;
+                if (_hasApprovers)
+                {
+                    body = $"Model committed to Mart and submitted to the approval queue.\n\nApproval Queue ID: {newId}";
+                    icon = MessageBoxIcon.Information;
+                    title = "Success";
+                }
+                else if (restSummary == null)
+                {
+                    body = $"Model committed to Mart and saved.\n\nQueue ID: {newId}\n(No REST callback is configured for this config.)";
+                    icon = MessageBoxIcon.Information;
+                    title = "Success";
+                }
+                else if (restFailed)
+                {
+                    body = $"Model committed to Mart and saved (Queue ID: {newId}),\nbut the REST callback FAILED:\n\n{restSummary}";
+                    icon = MessageBoxIcon.Warning;
+                    title = "Saved - callback failed";
+                }
+                else
+                {
+                    body = $"Model committed to Mart, saved, and the REST callback succeeded.\n\nQueue ID: {newId}\n{restSummary}";
+                    icon = MessageBoxIcon.Information;
+                    title = "Success";
+                }
+
+                Forms.AddinMessageDialog.Show(this, body, title, MessageBoxButtons.OK, icon);
             }
             catch (Exception ex)
             {
-                // Never let a UI hiccup mask the actual success - the row
-                // is already in the queue, just log and move on.
+                // Never let a UI hiccup mask the actual success - the row is
+                // already saved, just log and move on.
                 _log($"DdlApprovalDialog: success AddinMessageDialog.Show threw {ex.GetType().Name}: {ex.Message}");
             }
 
-            // Auto-close after the user dismisses the success modal -
-            // the review window has nothing useful left to do (DDL is
-            // queued, no follow-up action expected). Close the form,
-            // which also disposes the RTB / fonts that BuildUi created.
+            // Auto-close after the user dismisses the modal - the review window has
+            // nothing useful left to do. Close the form (also disposes the RTB /
+            // fonts that BuildUi created).
             try
             {
                 DialogResult = DialogResult.OK;
