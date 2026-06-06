@@ -1187,7 +1187,17 @@ namespace EliteSoft.Erwin.AddIn.Services
                 _hiddenWizardHwnd = IntPtr.Zero;
             }
             log?.Invoke("NativeBridge: opening hidden wizard (force-fresh, ignoring any stale FEWPO)...");
-            _hiddenWizardHwnd = _openHiddenWizard();
+            // The wizard re-reads the model's persisted DDL FE-option XML path on
+            // open. That path is a per-user/per-session temp path; if it was baked
+            // by a DIFFERENT Windows user/RDP session it does not exist here, and
+            // erwin pops a modal "... erwin_addin_ddl_fe_opt_cfg{N}.xml was not
+            // found" that blocks the (blocking) auto-open -> returns 0. Run a
+            // tightly-scoped background watcher that clicks OK on exactly that
+            // modal so the wizard continues with erwin's defaults and still opens.
+            using (FeOptionPopupDismisser.Start(log))
+            {
+                _hiddenWizardHwnd = _openHiddenWizard();
+            }
             if (_hiddenWizardHwnd == IntPtr.Zero)
             {
                 log?.Invoke("NativeBridge: failed to auto-open wizard.");
