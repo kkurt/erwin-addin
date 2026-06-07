@@ -439,8 +439,25 @@ namespace EliteSoft.Erwin.AddIn.Services
                     return result;
                 }
 
+                // Admin UDP leaf names (last segment of each expected full
+                // path), e.g. "Entity.Physical.TableClass" -> "TableClass". A
+                // model UDP whose Property_Type Name is the bare leaf
+                // ("TableClass") rather than the full path is the same UDP -
+                // erwin's own UDP editor STORES the full path and only DISPLAYS
+                // the leaf, while erwin's MIMB importer and MetaSync's
+                // RenameCreatedUdpsToLeaf store the bare leaf (verified
+                // 2026-06-07). The value accessor is owner+scope+leaf and
+                // name-label-independent, so both forms address the same UDP.
+                // We therefore also detail-read leaf entries that match an admin
+                // leaf and key the map on the canonical "{Owner}.{Scope}.{Leaf}"
+                // form (BuildCanonicalKey) so the diff recognises either naming.
+                HashSet<string>? leafWanted = filter != null
+                    ? new HashSet<string>(filter.Select(ExtractUdpName), StringComparer.OrdinalIgnoreCase)
+                    : null;
+
                 int seen = 0;
                 int detail = 0;
+                int leafMatched = 0;
                 foreach (dynamic pt in propertyTypes)
                 {
                     seen++;
@@ -452,26 +469,59 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                     result.AllNames.Add(fullName);
 
-                    // Cheap filter first: skip detail reads when admin
-                    // doesn't care about this name. Names cache still
-                    // captures every entry above.
-                    if (filter != null && !filter.Contains(fullName)) continue;
+                    // Detail-read when admin asked for this exact full path OR
+                    // when this is a bare-leaf entry whose leaf matches an admin
+                    // UDP name. The leaf branch carries the cost of one extra
+                    // owner-type tag read, but only for the handful of leaf
+                    // entries sharing an admin name - built-in Property_Types
+                    // that merely collide on the leaf resolve to a null owner
+                    // and get skipped below, so cost stays negligible.
+                    bool exactWanted = filter == null || filter.Contains(fullName);
+                    bool leafCandidate = !exactWanted
+                        && leafWanted != null
+                        && !IsFullPathName(fullName)
+                        && leafWanted.Contains(ExtractUdpName(fullName));
+
+                    if (!exactWanted && !leafCandidate) continue;
+
+                    // Owner + scope come from the Name for full-path entries;
+                    // bare-leaf entries need the metamodel tags to reconstruct
+                    // the canonical key.
+                    string ownerTag = leafCandidate ? ReadStringProperty(pt, "tag_Udp_Owner_Type") : "";
+                    string isPhysTag = leafCandidate ? ReadStringProperty(pt, "tag_Is_Physical") : "";
+                    string isLogTag = leafCandidate ? ReadStringProperty(pt, "tag_Is_Logical") : "";
+
+                    string? canonicalKey = BuildCanonicalKey(fullName, ownerTag, isPhysTag, isLogTag);
+                    if (canonicalKey == null)
+                        // Bare leaf that is not a resolvable UDP (a built-in
+                        // Property_Type sharing the name) - ignore it so it
+                        // cannot fabricate a false match.
+                        continue;
 
                     var snap = new ModelUdpSnapshot
                     {
                         FullName = fullName,
-                        OwnerClass = ExtractOwnerClass(fullName),
+                        OwnerClass = ExtractOwnerClass(canonicalKey),
                         UdpName = ExtractUdpName(fullName),
                         CurrentDataTypeId = ReadIntProperty(pt, "tag_Udp_Data_Type"),
                         CurrentDefault = ReadStringProperty(pt, "tag_Udp_Default_Value"),
                         CurrentListValues = ReadStringProperty(pt, "tag_Udp_Values_List"),
                         CurrentDescription = ReadStringProperty(pt, "Definition"),
                     };
-                    result.Map[fullName] = snap;
+
+                    // Prefer a full-path entry over a leaf entry if a model
+                    // somehow carries both for the same canonical UDP (a
+                    // duplicate left by a prior bad Apply). Either resolves the
+                    // diff; the full-path one is the canonical record.
+                    if (!result.Map.ContainsKey(canonicalKey) || !leafCandidate)
+                        result.Map[canonicalKey] = snap;
                     detail++;
+                    if (leafCandidate) leafMatched++;
                 }
 
-                Log($"UdpSyncEngine.WalkModelUdps: seen={seen}, detailReads={detail}, namesCached={result.AllNames.Count}, filter={(filter != null ? filter.Count.ToString() : "none")}");
+                Log($"UdpSyncEngine.WalkModelUdps: seen={seen}, detailReads={detail}, " +
+                    $"leafMatched={leafMatched}, namesCached={result.AllNames.Count}, " +
+                    $"filter={(filter != null ? filter.Count.ToString() : "none")}");
             }
             catch (Exception ex)
             {
@@ -515,6 +565,139 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             int last = fullName.LastIndexOf('.');
             return last >= 0 && last < fullName.Length - 1 ? fullName.Substring(last + 1) : fullName;
+        }
+
+        /// <summary>
+        /// True when <paramref name="name"/> is a three-part UDP path
+        /// <c>Owner.Scope.Leaf</c> (at least two dots) rather than a bare leaf.
+        /// </summary>
+        private static bool IsFullPathName(string name)
+        {
+            int firstDot = name.IndexOf('.');
+            return firstDot > 0 && name.IndexOf('.', firstDot + 1) > firstDot;
+        }
+
+        /// <summary>
+        /// Resolve a metamodel <c>tag_Udp_Owner_Type</c> value to the canonical
+        /// SCAPI owner-class string. Accepts BOTH forms erwin stores:
+        /// <list type="bullet">
+        /// <item>the objectId/GUID form erwin, MIMB and MetaSync use, e.g.
+        /// <c>{E7AB3CC0-47AD-4A10-8972-C0FB869EE7CB}+40200003</c> (only the
+        /// numeric suffix is load-bearing); and</item>
+        /// <item>the plain class string the addin itself writes, e.g.
+        /// <c>Entity</c> (UdpConstants warns the plain string does not round-trip
+        /// for Model, so a robust reader must handle the GUID form too).</item>
+        /// </list>
+        /// Returns null for an empty or unrecognised tag - the caller treats
+        /// that as "not a UDP we can canonicalise" and skips the entry, which is
+        /// exactly what filters out a built-in Property_Type that merely shares
+        /// a leaf name with an admin UDP. GUID suffixes mirror MetaSync
+        /// UdpConstants and erwin-admin ParseOwnerCategory.
+        /// </summary>
+        public static string? OwnerClassFromOwnerTypeTag(string? ownerTypeTag)
+        {
+            if (string.IsNullOrWhiteSpace(ownerTypeTag)) return null;
+            string t = ownerTypeTag.Trim();
+
+            int plus = t.LastIndexOf('+');
+            string suffix = plus >= 0 ? t.Substring(plus + 1) : t;
+            switch (suffix)
+            {
+                case "40200002": return "Model";
+                case "40200003": return "Entity";
+                case "40200004": return "Relationship";
+                case "40200005": return "Attribute";
+                case "40200006": return "Key_Group";
+                case "40200007": return "Domain";
+                // Subject_Area owner-type GUID disagrees across tools: MetaSync
+                // uses +40200026, erwin-admin uses +40200016. Accept both - the
+                // diff only ever projects the classes MapObjectTypeToOwnerClass
+                // supports, so over-accepting here is harmless.
+                case "40200016":
+                case "40200026": return "Subject_Area";
+                case "40200102": return "ER_Diagram";
+            }
+
+            switch (t.ToLowerInvariant())
+            {
+                case "model": return "Model";
+                case "entity": return "Entity";
+                case "attribute": return "Attribute";
+                case "subject_area": return "Subject_Area";
+                case "view": return "View";
+                case "stored_procedure": return "Stored_Procedure";
+                case "key_group": return "Key_Group";
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Compute the canonical match key <c>{Owner}.{Scope}.{Leaf}</c> for a
+        /// model Property_Type, tolerant of BOTH metamodel naming conventions
+        /// erwin accepts for the same UDP:
+        /// <list type="bullet">
+        /// <item>full path <c>Entity.Physical.TableClass</c> - what erwin's own
+        /// UDP editor stores and what the addin creates; and</item>
+        /// <item>bare leaf <c>TableClass</c> - what erwin's MIMB importer and
+        /// MetaSync's <c>RenameCreatedUdpsToLeaf</c> store (the editor still
+        /// DISPLAYS only the leaf either way, verified 2026-06-07).</item>
+        /// </list>
+        /// The SCAPI value accessor is owner+scope+leaf and independent of the
+        /// stored Name label, so the two forms are the same UDP; keying the diff
+        /// on this canonical identity stops an imported (leaf-named) model UDP
+        /// from being misread as a missing Create. Full-path entries trust the
+        /// embedded owner/scope verbatim; bare-leaf entries reconstruct them
+        /// from <c>tag_Udp_Owner_Type</c> + the physical/logical flags (default
+        /// Physical, the scope admin defines). Returns null when a bare leaf
+        /// cannot be resolved to a UDP owner, so the caller skips it rather than
+        /// fabricating a match.
+        /// </summary>
+        public static string? BuildCanonicalKey(
+            string? rawName, string? ownerTypeTag, string? isPhysicalTag, string? isLogicalTag)
+        {
+            if (string.IsNullOrEmpty(rawName)) return null;
+
+            int firstDot = rawName!.IndexOf('.');
+            int secondDot = firstDot >= 0 ? rawName.IndexOf('.', firstDot + 1) : -1;
+            if (firstDot > 0 && secondDot > firstDot && secondDot < rawName.Length - 1)
+            {
+                string ownerSeg = rawName.Substring(0, firstDot);
+                string scopeSeg = rawName.Substring(firstDot + 1, secondDot - firstDot - 1);
+                string leafSeg = rawName.Substring(secondDot + 1);
+                return $"{ownerSeg}.{scopeSeg}.{leafSeg}";
+            }
+
+            string? owner = OwnerClassFromOwnerTypeTag(ownerTypeTag);
+            if (owner == null) return null;
+            string scope = ResolveUdpScope(isPhysicalTag, isLogicalTag);
+            return $"{owner}.{scope}.{rawName}";
+        }
+
+        /// <summary>
+        /// Pick the canonical scope segment for a bare-leaf UDP from its
+        /// physical/logical flags. A logical-only UDP keeps the Logical scope;
+        /// physical and unknown both canonicalise to Physical (the scope the
+        /// admin snapshot always uses), so a missing flag never spuriously
+        /// diverts a Physical UDP onto the Logical key.
+        /// </summary>
+        private static string ResolveUdpScope(string? isPhysicalTag, string? isLogicalTag)
+        {
+            bool logical = ParseErwinBool(isLogicalTag);
+            bool physical = ParseErwinBool(isPhysicalTag);
+            return (logical && !physical) ? "Logical" : "Physical";
+        }
+
+        /// <summary>
+        /// Parse an erwin metamodel boolean tag. SCAPI surfaces these as
+        /// "True"/"False" strings or VARIANT_BOOL numerics ("1"/"-1"/"0").
+        /// </summary>
+        private static bool ParseErwinBool(string? raw)
+        {
+            if (string.IsNullOrEmpty(raw)) return false;
+            string r = raw!.Trim();
+            return r.Equals("True", StringComparison.OrdinalIgnoreCase)
+                || r == "1"
+                || r == "-1";
         }
 
         private static int ReadIntProperty(dynamic pt, string propertyName)
@@ -835,8 +1018,18 @@ namespace EliteSoft.Erwin.AddIn.Services
                 dynamic mmRoot = mmObjects.Root;
 
                 // Build a one-pass lookup of existing Property_Type objects
-                // keyed by their canonical Name. Used by Update to find the
-                // target without re-collecting on each entry.
+                // keyed by their CANONICAL match key (BuildCanonicalKey) so an
+                // Update finds its target whether the model stored the Name as
+                // the full path "Entity.Physical.X" or the bare leaf "X" (erwin
+                // MIMB / MetaSync style). Without this a leaf-named existing UDP
+                // would miss the Update lookup, fall through to Create, and
+                // inject a duplicate ".Physical." Property_Type - the exact
+                // harm this fix removes. Owner-type tags are read only for the
+                // few bare-leaf entries whose leaf matches a pending Update, so
+                // the enumeration stays cheap on big metamodels.
+                var updateLeaves = new HashSet<string>(
+                    diff.Updates.Select(e => ExtractUdpName(e.FullName)),
+                    StringComparer.OrdinalIgnoreCase);
                 var ptByName = new Dictionary<string, dynamic>(StringComparer.OrdinalIgnoreCase);
                 try
                 {
@@ -847,8 +1040,31 @@ namespace EliteSoft.Erwin.AddIn.Services
                         string ptName;
                         try { ptName = pt.Name ?? ""; } catch { continue; }
                         if (string.IsNullOrEmpty(ptName)) continue;
-                        if (!ptByName.ContainsKey(ptName))
-                            ptByName[ptName] = pt;
+
+                        if (IsFullPathName(ptName))
+                        {
+                            string keyFull = BuildCanonicalKey(ptName, null, null, null) ?? ptName;
+                            if (!ptByName.ContainsKey(keyFull))
+                                ptByName[keyFull] = pt;
+                        }
+                        else
+                        {
+                            // Register bare names under the raw key (cheap) and,
+                            // only when the leaf matches a pending Update, also
+                            // under the canonical key (one owner-type tag read).
+                            if (!ptByName.ContainsKey(ptName))
+                                ptByName[ptName] = pt;
+                            if (updateLeaves.Contains(ptName))
+                            {
+                                string? keyLeaf = BuildCanonicalKey(
+                                    ptName,
+                                    ReadStringProperty(pt, "tag_Udp_Owner_Type"),
+                                    ReadStringProperty(pt, "tag_Is_Physical"),
+                                    ReadStringProperty(pt, "tag_Is_Logical"));
+                                if (keyLeaf != null && !ptByName.ContainsKey(keyLeaf))
+                                    ptByName[keyLeaf] = pt;
+                            }
+                        }
                     }
                 }
                 catch (Exception ex)

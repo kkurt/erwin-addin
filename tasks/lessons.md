@@ -1387,3 +1387,51 @@ were invisible.
 report the median (or report the min, since variability is one-sided
 upward). Per-component scopes (`AddinLogger.BeginScope`) make the
 component-level wins visible even when the total moves around.
+
+---
+
+## 2026-06-07 - UDP Property_Type naming: erwin stores full-path, displays leaf; match by canonical identity not Name string
+
+**Context:** A MetaSync-imported model (Demo/SQL/dev_1/Ek_Kart v1) showed the
+"Sync UDP definitions from config?" screen proposing a Create for "TableClass"
+even though the UDP already existed in the model. Apply then created a duplicate
+`Entity.Physical.TableClass` next to the existing one.
+
+**Root cause (proven, not inferred):**
+- erwin's canonical metamodel `Property_Type.Name` for a UDP is the three-part
+  full path `<Owner>.<Physical|Logical>.<Leaf>` (erwin API Ref 15.0 sec 4495;
+  verified live: a UDP created in erwin's OWN UDP editor serialises to
+  `Entity.Physical.ZZPROBE_TABLE` in the .erwin file). erwin's editors DISPLAY
+  only the leaf, so a full-path Name still shows cleanly as "ZZPROBE_TABLE".
+- MetaSync deliberately runs `RenameCreatedUdpsToLeaf` (a "cosmetic post-pass")
+  that overwrites the canonical full path with the bare leaf to mimic MIMB
+  import style. erwin tolerates it: owner lives in `tag_Udp_Owner_Type` (GUID
+  suffix, e.g. `+40200003`=Entity) and values link by Long_Id, so the leaf form
+  fully functions.
+- The add-in's `UdpSyncEngine` matched model UDPs by the EXACT Name string
+  (`{Owner}.Physical.{Name}`), so a leaf-named import missed and was misread as
+  a missing Create.
+- The SCAPI VALUE accessor (`obj.Properties("Entity.Physical.X").Value`) is
+  owner+scope+leaf and INDEPENDENT of the stored Name label (confirmed across
+  4 codebases: add-in, admin, meta-sync, ScapiTest), so naming rules and value
+  reads were NOT broken on imported models - only the sync diff's match.
+
+**Fix:** match by canonical IDENTITY, not the Name string. `BuildCanonicalKey`
+normalises either form to `{Owner}.{Scope}.{Leaf}`, deriving the owner from
+`tag_Udp_Owner_Type` (GUID-suffix OR plain-class form) for bare leaves.
+`WalkModelUdps` keys its map on it and detail-reads leaf entries matching an
+admin leaf; `Apply` keys `ptByName` on it too so an Update finds a leaf-named
+target instead of creating a duplicate. The add-in's CREATE stays full-path
+(canonical). Mirrors what MetaSync + erwin-admin already do internally.
+
+**Why (the trap):** I initially leaned "leaf is erwin-native (MIMB)". That was
+WRONG - it conflated DISPLAY with STORAGE. erwin STORES full-path. A 6-agent
+research workflow + a live experiment (create UDP in erwin's editor, inspect
+the .erwin file) settled it. Lesson: when "which convention is canonical?"
+decides a fix, get the live ground truth (native-tool output on disk), do not
+infer from one tool's behaviour or one comment.
+
+**How to apply:** never match erwin UDPs by the `Property_Type.Name` string
+alone - it is convention-dependent (full path vs leaf). Key on
+owner-from-`tag_Udp_Owner_Type` + leaf. Reading UDP VALUES is already
+name-independent (reconstruct `{Owner}.Physical.{leaf}`), so that path was fine.

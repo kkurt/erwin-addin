@@ -43,8 +43,9 @@ flowchart TD
 | Layer | File | Responsibility |
 |-------|------|----------------|
 | Snapshot fetch | [Services/UdpSyncEngine.cs](../Services/UdpSyncEngine.cs) `FetchSnapshot` | Read `MC_UDP_DEFINITION` + `MC_UDP_LIST_OPTION` for the active CONFIG. Normalise admin `Boolean` UDPs to `List(True, False)` at this boundary. |
-| Metamodel walk | `UdpSyncEngine.WalkModelUdps` | Single level-1 session pass that returns both the filter-resolved `ModelUdpSnapshot` map and the full Property_Type name set. The names set feeds `ModelConfigForm._cachedPropertyTypeNames` so `ValidationCoordinator` does not walk again. |
+| Metamodel walk | `UdpSyncEngine.WalkModelUdps` | Single level-1 session pass that returns both the canonical-keyed `ModelUdpSnapshot` map and the full Property_Type name set. The names set feeds `ModelConfigForm._cachedPropertyTypeNames` so `ValidationCoordinator` does not walk again. The map is keyed on the canonical identity from `BuildCanonicalKey` so a UDP is matched whether its `Property_Type.Name` is the full path `Entity.Physical.X` or the bare leaf `X`. |
 | Diff (pure) | `UdpSyncEngine.ComputeDiff` | Pairs snapshot rows against the model map by canonical `<Owner>.Physical.<Name>`. Emits only Create + Update. |
+| Canonical key | `UdpSyncEngine.BuildCanonicalKey` | erwin's own UDP editor STORES the full path `Owner.Scope.Leaf` and only DISPLAYS the leaf; erwin's MIMB importer and MetaSync's `RenameCreatedUdpsToLeaf` store the bare leaf. The value accessor is owner+scope+leaf and name-label-independent, so both forms are the same UDP. This helper normalises either form to `{Owner}.{Scope}.{Leaf}`, deriving the owner from `tag_Udp_Owner_Type` (GUID-suffix form e.g. `+40200003`=Entity, or the plain class string) for bare leaves, so an imported (leaf-named) model UDP is not misread as a missing Create. |
 | Apply | `UdpSyncEngine.Apply` | Single named transaction, Updates then Creates. Type / default / list-values / definition all written in place. EBS-1057 unique-name conflicts are tolerated. |
 | Dialog | [Forms/UdpSyncDialog.cs](../Forms/UdpSyncDialog.cs) | Borderless modal with action chips, summary counters, drag-by-header, multi-monitor positioning. |
 | Wire-up | [ModelConfigForm.RunUdpSyncIfNeeded](../ModelConfigForm.cs) | Runs between dep-set load and `UdpRuntime.Initialize`. Deferred `ShowDialog` via `BeginInvoke` so it does not deadlock `Form.Load`. |
@@ -309,7 +310,10 @@ Two specific things to know:
 1. **Filtered walk** - `WalkModelUdps(namesOfInterest)` reads
    `tag_Udp_Data_Type` / `tag_Udp_Default_Value` / `tag_Udp_Values_List` /
    `Definition` only for the handful of `Property_Type`s whose `Name`
-   matches admin's expected set. Without the filter the walk reads
+   matches admin's expected set (full path) OR whose bare leaf matches an
+   admin UDP leaf (leaf-named imports). The leaf branch reads one extra
+   `tag_Udp_Owner_Type` to reconstruct the canonical key, but only for the
+   few leaf entries sharing an admin name. Without the filter the walk reads
    4 × 1500 = 6000 dynamic-dispatch properties = ~18 s.
 
 2. **Single walk for two consumers** - `WalkModelUdps` returns both the

@@ -572,4 +572,142 @@ public class UdpSyncEngineDiffTests
         UdpSyncEngine.MapUdpTypeToErwinDataTypeId(udpType).Should().Be(expected);
     }
 
+    // === Canonical-key matching (2026-06-07) ===
+    // erwin stores a UDP's Property_Type Name as the full path
+    // "Owner.Scope.Leaf" but its MIMB importer and MetaSync's
+    // RenameCreatedUdpsToLeaf store the bare leaf. Both are the same UDP (value
+    // accessor is owner+scope+leaf, name-label-independent). These tests pin the
+    // canonicalisation that lets the diff recognise either naming.
+
+    [Theory]
+    [InlineData("{E7AB3CC0-47AD-4A10-8972-C0FB869EE7CB}+40200002", "Model")]
+    [InlineData("{E7AB3CC0-47AD-4A10-8972-C0FB869EE7CB}+40200003", "Entity")]
+    [InlineData("{E7AB3CC0-47AD-4A10-8972-C0FB869EE7CB}+40200005", "Attribute")]
+    [InlineData("{E7AB3CC0-47AD-4A10-8972-C0FB869EE7CB}+40200026", "Subject_Area")]
+    [InlineData("{E7AB3CC0-47AD-4A10-8972-C0FB869EE7CB}+40200016", "Subject_Area")]
+    [InlineData("Entity", "Entity")]   // addin writes the plain class string
+    [InlineData("model", "Model")]
+    [InlineData("ATTRIBUTE", "Attribute")]
+    public void OwnerClassFromOwnerTypeTag_resolves_guid_and_plain_forms(string tag, string expected)
+    {
+        UdpSyncEngine.OwnerClassFromOwnerTypeTag(tag).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData(null)]
+    [InlineData("   ")]
+    [InlineData("{E7AB3CC0-47AD-4A10-8972-C0FB869EE7CB}+99999999")] // unknown suffix
+    [InlineData("NotAClass")]
+    public void OwnerClassFromOwnerTypeTag_returns_null_for_unknown(string? tag)
+    {
+        UdpSyncEngine.OwnerClassFromOwnerTypeTag(tag).Should().BeNull();
+    }
+
+    [Fact]
+    public void BuildCanonicalKey_full_path_is_returned_verbatim()
+    {
+        // Already canonical: owner + scope come from the Name; tags ignored.
+        UdpSyncEngine.BuildCanonicalKey("Entity.Physical.TableClass", null, null, null)
+            .Should().Be("Entity.Physical.TableClass");
+        UdpSyncEngine.BuildCanonicalKey("Attribute.Logical.KVKK", "ignored", "False", "True")
+            .Should().Be("Attribute.Logical.KVKK");
+    }
+
+    [Theory]
+    // bare leaf + GUID owner tag (MIMB / MetaSync) + physical flag
+    [InlineData("TableClass", "{E7AB3CC0-47AD-4A10-8972-C0FB869EE7CB}+40200003", "True", "False", "Entity.Physical.TableClass")]
+    // bare leaf + plain-string owner tag (addin) + physical
+    [InlineData("TableClass", "Entity", "1", "0", "Entity.Physical.TableClass")]
+    // model-level leaf
+    [InlineData("Application", "{E7AB3CC0-47AD-4A10-8972-C0FB869EE7CB}+40200002", "True", "False", "Model.Physical.Application")]
+    // logical-only leaf keeps the Logical scope
+    [InlineData("Flag", "Entity", "False", "True", "Entity.Logical.Flag")]
+    // unknown physical/logical defaults to Physical (the admin scope)
+    [InlineData("Owner", "{E7AB3CC0-47AD-4A10-8972-C0FB869EE7CB}+40200005", "", "", "Attribute.Physical.Owner")]
+    public void BuildCanonicalKey_leaf_reconstructs_from_tags(
+        string leaf, string ownerTag, string isPhys, string isLog, string expected)
+    {
+        UdpSyncEngine.BuildCanonicalKey(leaf, ownerTag, isPhys, isLog).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("TableClass", "")]            // bare leaf, no owner tag => not a resolvable UDP
+    [InlineData("TableClass", "NotAClass")]   // bare leaf, unrecognised owner
+    [InlineData("", "Entity")]                // empty name
+    public void BuildCanonicalKey_returns_null_when_leaf_cannot_resolve_owner(string leaf, string ownerTag)
+    {
+        UdpSyncEngine.BuildCanonicalKey(leaf, ownerTag, "True", "False").Should().BeNull();
+    }
+
+    [Fact]
+    public void Leaf_named_model_udp_is_recognised_not_emitted_as_Create()
+    {
+        // The Ek_Kart repro: admin defines TableClass(List, 3 opts) on Table.
+        // The model carries it as a bare leaf "TableClass" (MetaSync import).
+        // WalkModelUdps keys the map on the canonical form; ComputeDiff must
+        // then MATCH it (no Create) and, with identical content, no Update.
+        var admin = new[]
+        {
+            AdminUdp(1, "TableClass", objectType: "Table", udpType: "List",
+                listOptions: new[] { "LOG", "HISTORY", "STAGING" }),
+        };
+
+        string canonicalKey = UdpSyncEngine.BuildCanonicalKey(
+            "TableClass",
+            "{E7AB3CC0-47AD-4A10-8972-C0FB869EE7CB}+40200003", // Entity owner GUID
+            "True", "False")!;
+        canonicalKey.Should().Be("Entity.Physical.TableClass");
+
+        var model = new Dictionary<string, ModelUdpSnapshot>
+        {
+            [canonicalKey] = new ModelUdpSnapshot
+            {
+                FullName = "TableClass",          // stored bare in the model
+                OwnerClass = "Entity",
+                UdpName = "TableClass",
+                CurrentDataTypeId = 6,            // List
+                CurrentListValues = "LOG,HISTORY,STAGING",
+            },
+        };
+
+        var diff = UdpSyncEngine.ComputeDiff(admin, model);
+
+        diff.Creates.Should().BeEmpty("the leaf-named UDP already exists and must be recognised");
+        diff.Updates.Should().BeEmpty("content is identical");
+    }
+
+    [Fact]
+    public void Leaf_named_model_udp_with_content_drift_emits_Update_not_Create()
+    {
+        // Same leaf-named UDP, but the model's list options drifted from admin.
+        // Must be a single in-place Update (not a Create + duplicate).
+        var admin = new[]
+        {
+            AdminUdp(1, "TableClass", objectType: "Table", udpType: "List",
+                listOptions: new[] { "LOG", "HISTORY" }),
+        };
+
+        string canonicalKey = UdpSyncEngine.BuildCanonicalKey(
+            "TableClass", "Entity", "True", "False")!;
+
+        var model = new Dictionary<string, ModelUdpSnapshot>
+        {
+            [canonicalKey] = new ModelUdpSnapshot
+            {
+                FullName = "TableClass",
+                OwnerClass = "Entity",
+                UdpName = "TableClass",
+                CurrentDataTypeId = 6,
+                CurrentListValues = "LOG",       // missing HISTORY
+            },
+        };
+
+        var diff = UdpSyncEngine.ComputeDiff(admin, model);
+
+        diff.Creates.Should().BeEmpty();
+        diff.Updates.Should().HaveCount(1);
+        diff.Updates[0].Changes.Should().HaveFlag(UdpUpdateChanges.ListValues);
+    }
+
 }
