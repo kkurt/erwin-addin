@@ -710,4 +710,66 @@ public class UdpSyncEngineDiffTests
         diff.Updates[0].Changes.Should().HaveFlag(UdpUpdateChanges.ListValues);
     }
 
+    // === Definition-not-supported tolerance (2026-06-08) ===
+    // meta-sync / MIMB imports produce leaner Property_Types that lack a
+    // Definition; reading it throws, so DescriptionSupported is false. The diff
+    // must skip the Description comparison for those, else an admin description
+    // loops forever as a never-appliable "Description changed" Update.
+
+    [Fact]
+    public void Description_diff_skipped_when_model_udp_lacks_Definition()
+    {
+        var admin = new[]
+        {
+            AdminUdp(1, "TableClass", objectType: "Table", udpType: "List",
+                description: "some admin description", listOptions: new[] { "A", "B" }),
+        };
+        var model = new Dictionary<string, ModelUdpSnapshot>
+        {
+            ["Entity.Physical.TableClass"] = new ModelUdpSnapshot
+            {
+                FullName = "Entity.Physical.TableClass",
+                OwnerClass = "Entity",
+                UdpName = "TableClass",
+                CurrentDataTypeId = 6,
+                CurrentListValues = "A,B",
+                CurrentDescription = "",       // read returned empty...
+                DescriptionSupported = false,  // ...because Definition is absent
+            },
+        };
+
+        var diff = UdpSyncEngine.ComputeDiff(admin, model);
+
+        diff.Creates.Should().BeEmpty();
+        diff.Updates.Should().BeEmpty("Description diff must be skipped when the model UDP cannot carry a Definition");
+    }
+
+    [Fact]
+    public void Description_diff_still_fires_when_Definition_is_supported()
+    {
+        var admin = new[]
+        {
+            AdminUdp(1, "TableClass", objectType: "Table", udpType: "List",
+                description: "new desc", listOptions: new[] { "A", "B" }),
+        };
+        var model = new Dictionary<string, ModelUdpSnapshot>
+        {
+            ["Entity.Physical.TableClass"] = new ModelUdpSnapshot
+            {
+                FullName = "Entity.Physical.TableClass",
+                OwnerClass = "Entity",
+                UdpName = "TableClass",
+                CurrentDataTypeId = 6,
+                CurrentListValues = "A,B",
+                CurrentDescription = "",       // empty in the model
+                DescriptionSupported = true,   // native/addin UDP carries Definition
+            },
+        };
+
+        var diff = UdpSyncEngine.ComputeDiff(admin, model);
+
+        diff.Updates.Should().HaveCount(1);
+        diff.Updates[0].Changes.Should().HaveFlag(UdpUpdateChanges.Description);
+    }
+
 }

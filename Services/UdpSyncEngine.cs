@@ -64,6 +64,19 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         /// <summary>Current Definition field (admin description, sentinel-free).</summary>
         public string CurrentDescription { get; set; } = "";
+
+        /// <summary>
+        /// False when the model's Property_Type does NOT carry a Definition
+        /// property (reading it throws "does not use a property of Definition
+        /// type"). erwin's own UDP editor and the addin create UDPs WITH a
+        /// Definition, but meta-sync / MIMB imports produce leaner Property_Types
+        /// that lack it (verified 2026-06-08 against ZZPROBE.xml + Ek_Kart v2).
+        /// When false the diff MUST skip the Description comparison: the model
+        /// cannot store a description, so proposing a "Description changed" Update
+        /// would loop forever (Apply cannot write Definition either). Defaults to
+        /// true so a normal/native UDP is compared as before.
+        /// </summary>
+        public bool DescriptionSupported { get; set; } = true;
     }
 
     /// <summary>Diff action emitted by <see cref="UdpSyncEngine.ComputeDiff"/>.</summary>
@@ -498,6 +511,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                         // cannot fabricate a false match.
                         continue;
 
+                    // Definition is read with explicit support-tracking: a
+                    // meta-sync / MIMB import produces a leaner Property_Type that
+                    // does NOT carry Definition (the read throws), which the diff
+                    // must treat as "cannot compare a description" rather than
+                    // "description is empty" - otherwise an admin description loops
+                    // forever as a never-appliable "Description changed" Update.
+                    string currentDescription = ReadStringPropertyTracked(pt, "Definition", out bool descriptionSupported);
                     var snap = new ModelUdpSnapshot
                     {
                         FullName = fullName,
@@ -506,7 +526,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                         CurrentDataTypeId = ReadIntProperty(pt, "tag_Udp_Data_Type"),
                         CurrentDefault = ReadStringProperty(pt, "tag_Udp_Default_Value"),
                         CurrentListValues = ReadStringProperty(pt, "tag_Udp_Values_List"),
-                        CurrentDescription = ReadStringProperty(pt, "Definition"),
+                        CurrentDescription = currentDescription,
+                        DescriptionSupported = descriptionSupported,
                     };
 
                     // Prefer a full-path entry over a leaf entry if a model
@@ -721,6 +742,28 @@ namespace EliteSoft.Erwin.AddIn.Services
             catch { return ""; }
         }
 
+        /// <summary>
+        /// Read a string property AND report whether the Property_Type actually
+        /// carries it. <paramref name="supported"/> is false when SCAPI throws
+        /// "does not use a property of ... type" - i.e. a leaner meta-sync / MIMB
+        /// Property_Type that lacks the property. Lets the diff tell "property
+        /// absent" apart from "property present but empty".
+        /// </summary>
+        private static string ReadStringPropertyTracked(dynamic pt, string propertyName, out bool supported)
+        {
+            try
+            {
+                var raw = pt.Properties(propertyName)?.Value;
+                supported = true;
+                return raw?.ToString() ?? "";
+            }
+            catch
+            {
+                supported = false;
+                return "";
+            }
+        }
+
         #endregion
 
         #region Diff (pure)
@@ -885,15 +928,27 @@ namespace EliteSoft.Erwin.AddIn.Services
                     }
                 }
 
-                string adminDesc = adminUdp.Description ?? "";
-                string modelDesc = match.CurrentDescription ?? "";
-                if (!string.Equals(
-                        NormalizeForErwinListCompare(adminDesc),
-                        NormalizeForErwinListCompare(modelDesc),
-                        StringComparison.Ordinal))
+                // Description (Definition) comparison - SKIPPED when the model's
+                // Property_Type does not carry a Definition (meta-sync / MIMB
+                // imports). Those objects can neither read nor write Definition,
+                // so an admin description on such a UDP would otherwise surface as
+                // a "Description changed" Update that Apply can never satisfy,
+                // looping on every model open. Same authority-to-enforce logic as
+                // the runtime-managed list guard above: no writable target => no
+                // diff. erwin-native + addin-created UDPs keep Definition and are
+                // compared as before.
+                if (match.DescriptionSupported)
                 {
-                    changes |= UdpUpdateChanges.Description;
-                    detailParts.Add("Description changed");
+                    string adminDesc = adminUdp.Description ?? "";
+                    string modelDesc = match.CurrentDescription ?? "";
+                    if (!string.Equals(
+                            NormalizeForErwinListCompare(adminDesc),
+                            NormalizeForErwinListCompare(modelDesc),
+                            StringComparison.Ordinal))
+                    {
+                        changes |= UdpUpdateChanges.Description;
+                        detailParts.Add("Description changed");
+                    }
                 }
 
                 if (changes == UdpUpdateChanges.None)
