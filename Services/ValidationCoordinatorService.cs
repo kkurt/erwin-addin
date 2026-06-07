@@ -916,7 +916,7 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         private void MonitorTimer_Tick(object sender, EventArgs e)
         {
-            if (_sessionLost || !_isMonitoring || _disposed || _isProcessingChange || _validationSuspended || _isCheckingForChanges || _columnNamingCheckInProgress) return;
+            if (_sessionLost || !_isMonitoring || _disposed || _isProcessingChange || _validationSuspended || _isCheckingForChanges || _columnNamingCheckInProgress || _scopedCheckInProgress) return;
             // 2026-05-25: while a locked-column dialog is up, skip the
             // entire heartbeat. SCAPI walks during the dialog's nested
             // message pump otherwise hog the UI thread and block OK
@@ -2327,6 +2327,12 @@ namespace EliteSoft.Erwin.AddIn.Services
             // That dialog pumps the loop; re-entering here re-detects the same
             // pending rename and stacks another popup (see _columnNamingCheckInProgress).
             if (_columnNamingCheckInProgress) return;
+            // 2026-06-06: same hazard for the TABLE naming path - its auto-apply
+            // "Naming standard applied" modal (TableTypeMonitorService) sets
+            // _scopedCheckInProgress and pumps the loop; without this bail the tick
+            // re-enters, validates the just-added columns, and stacks a column
+            // Required-field popup ON TOP of the table modal (before its OK).
+            if (_scopedCheckInProgress) return;
 
             // Safety: check if model is still open BEFORE touching the session.
             if (!IsModelStillOpen()) { HandleSessionLost(); return; }
