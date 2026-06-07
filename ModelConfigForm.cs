@@ -135,6 +135,12 @@ namespace EliteSoft.Erwin.AddIn
         // metamodel itself as a fallback. Reset on every connect so a fresh
         // walk happens after model switches.
         private HashSet<string> _cachedPropertyTypeNames;
+        // Locator of the last model whose UDP-sync walk actually surfaced UDPs.
+        // Used to tell a genuine "model has no UDPs" apart from an incomplete
+        // metamodel read on a transient reconnect (Mart Save-As + Cancel), where
+        // the walk momentarily returns zero Property_Types for a model that
+        // already has them. See RunUdpSyncIfNeeded (2026-06-08).
+        private string _udpLastGoodWalkLocator;
 
         // State tracking
         private Timer _glossaryRefreshTimer;
@@ -1399,10 +1405,33 @@ namespace EliteSoft.Erwin.AddIn
                     // Share the all-names set with the connect-level cache so
                     // ValidationCoordinator does not redo the walk. Saves the
                     // 2.2 s EnsureAllUdpsExist pass we used to run separately.
+                    var previousPropertyTypeNames = _cachedPropertyTypeNames;
                     _cachedPropertyTypeNames = walk.AllNames;
 
                     diff = UdpSyncEngine.ComputeDiff(snapshot, walk.Map);
                     Log($"UDP sync diff: creates={diff.Creates.Count}, updates={diff.Updates.Count}");
+
+                    // Incomplete-metamodel-read guard (2026-06-08): a Mart
+                    // "Save As" + Cancel (and similar transient reconnects) fires
+                    // this sync while erwin is still reloading the model, so the
+                    // walk reads a partial Property_Type set that is MISSING the
+                    // UDPs and proposes a phantom "creates=N" for UDPs the model
+                    // already has (verified: TableClass, which exists, surfaced as
+                    // a Create). Distinguish this from a genuine "model has no
+                    // UDPs": fire ONLY when the walk found NONE of the admin UDPs
+                    // AND a prior walk for THIS SAME model (same locator) earlier
+                    // this session DID surface them. Skip the dialog and keep the
+                    // complete cached name set.
+                    if (walk.Map.Count == 0
+                        && !string.IsNullOrEmpty(_lastConnectedLocator)
+                        && string.Equals(_lastConnectedLocator, _udpLastGoodWalkLocator, StringComparison.OrdinalIgnoreCase))
+                    {
+                        Log($"UDP sync: walk surfaced 0 admin UDP(s) but this model already had them earlier this session - treating as an incomplete metamodel read (e.g. Mart Save-As reload) and skipping (phantom creates={diff.Creates.Count}).");
+                        _cachedPropertyTypeNames = previousPropertyTypeNames;
+                        return;
+                    }
+                    if (walk.Map.Count > 0)
+                        _udpLastGoodWalkLocator = _lastConnectedLocator;
 
                     // Diagnostic for the recurring "List options changed" false-positive:
                     // dump expected vs current verbatim, with length and per-codeunit hex,
