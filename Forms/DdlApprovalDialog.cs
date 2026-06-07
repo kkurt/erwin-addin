@@ -648,6 +648,15 @@ namespace EliteSoft.Erwin.AddIn.Forms
             _btnCancel.Enabled = true;
             _btnCopy.Enabled = true;
 
+            // User rule 2026-06-07: the no-approval "Send" path must NOT pop a
+            // success "saved / Queue ID" modal - there is no approval queue to
+            // confirm (the DDL is sent directly via the REST callback) and the
+            // status strip already shows the outcome. A REST callback FAILURE
+            // still pops, because the form auto-closes below and the error would
+            // otherwise vanish unseen. The approval ("Send to Approve") path is
+            // unchanged - its queue confirmation is legitimate.
+            bool showSuccessModal = _approvalEnabled || restFailed;
+
             try
             {
                 // AddinMessageDialog (not MessageBox) keeps the popup on the addin's
@@ -680,7 +689,8 @@ namespace EliteSoft.Erwin.AddIn.Forms
                     title = "Success";
                 }
 
-                Forms.AddinMessageDialog.Show(this, body, title, MessageBoxButtons.OK, icon);
+                if (showSuccessModal)
+                    Forms.AddinMessageDialog.Show(this, body, title, MessageBoxButtons.OK, icon);
             }
             catch (Exception ex)
             {
