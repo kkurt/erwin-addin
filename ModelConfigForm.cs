@@ -4547,24 +4547,26 @@ namespace EliteSoft.Erwin.AddIn
             // execute against, which is what the approval reviewer needs.
             string dbmsType = ReadActivePuTargetServer();
 
-            // Does this config have an approval workflow? Approvers are defined in
-            // APPROVAL_APPROVER; a non-empty list means "Send to Approve" (the admin
-            // approves and fires the REST callback later). Empty means "Send": the
-            // add-in saves as 'ApprovedBySystem' and fires the REST callback itself.
-            // On a check error, fail toward the SAFE existing behaviour (approval
-            // path, no auto-REST) and surface it - never silently auto-send.
-            bool hasApprovers;
+            // Approval routing is driven by the admin "Use Approvement Mechanism"
+            // FLAG (USE_APPROVEMENT_MECHANISM, two-level corporate -> model), NOT by
+            // whether approvers happen to be configured. Flag ON -> "Send to Approve"
+            // (the row stays Pending; the admin approves and fires the REST callback
+            // afterwards). Flag OFF -> "Send": the add-in saves the row as
+            // 'ApprovedBySystem' and fires the REST callback itself. On a read error,
+            // fail toward the SAFE path (approval, no auto-REST) and surface it -
+            // never silently auto-send. (Default when unset = false, per the admin
+            // seed.)
+            bool approvalEnabled;
             try
             {
-                var bootstrap = Services.DatabaseService.Instance.BootstrapService;
-                hasApprovers = new EliteSoft.MetaAdmin.Shared.Services.ApprovalConfigService(bootstrap)
-                    .GetApprovers(ctx.ActiveConfigId).Count > 0;
-                Log($"ShowDdlForApproval: config {ctx.ActiveConfigId} hasApprovers={hasApprovers}");
+                approvalEnabled = Services.ConfigContextService.Instance
+                    .GetEffectiveBool("USE_APPROVEMENT_MECHANISM", false);
+                Log($"ShowDdlForApproval: config {ctx.ActiveConfigId} USE_APPROVEMENT_MECHANISM={approvalEnabled}");
             }
             catch (Exception ex)
             {
-                Log($"ShowDdlForApproval: approver check failed ({ex.Message}); defaulting to approval path (Send to Approve, no auto-REST).");
-                hasApprovers = true;
+                Log($"ShowDdlForApproval: USE_APPROVEMENT_MECHANISM read failed ({ex.Message}); defaulting to approval path (Send to Approve, no auto-REST).");
+                approvalEnabled = true;
             }
 
             using var dlg = new Forms.DdlApprovalDialog(
@@ -4574,7 +4576,7 @@ namespace EliteSoft.Erwin.AddIn
                 modelLocator:      modelLocator,
                 sourceMode:        sourceMode ?? "Unknown",
                 dbmsType:          dbmsType,
-                hasApprovers:      hasApprovers,
+                approvalEnabled:   approvalEnabled,
                 log:               (Action<string>)Log,
                 martSaveCallback:  SaveCurrentModelWithDescription);
             dlg.ShowDialog(this);

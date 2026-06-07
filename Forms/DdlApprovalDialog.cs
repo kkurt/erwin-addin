@@ -25,13 +25,13 @@ namespace EliteSoft.Erwin.AddIn.Forms
         private readonly string _modelLocator;
         private readonly string _sourceMode;
         private readonly string _dbmsType;
-        // True when the active config has at least one APPROVAL_APPROVER. Drives
-        // both the button text ("Send to Approve" vs "Send") and the post-submit
-        // flow: with approvers the row goes in as 'Pending' and the admin fires the
-        // REST callback on approve; without approvers the add-in inserts it as
+        // Driven by the admin USE_APPROVEMENT_MECHANISM flag (NOT the approver
+        // count). Controls both the button text ("Send to Approve" vs "Send") and
+        // the post-submit flow: when ON the row goes in as 'Pending' and the admin
+        // fires the REST callback on approve; when OFF the add-in inserts it as
         // 'ApprovedBySystem' and fires the REST callback itself (same logic, shared
         // ApprovalCallbackInvoker). (2026-06-06)
-        private readonly bool _hasApprovers;
+        private readonly bool _approvalEnabled;
         private readonly Action<string> _log;
         // Callback supplied by the owner (ModelConfigForm). Invoked AFTER
         // the user confirms submission. Takes the version description the
@@ -56,7 +56,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
             string modelLocator,
             string sourceMode,
             string dbmsType,
-            bool hasApprovers,
+            bool approvalEnabled,
             Action<string> log,
             Func<string, System.Threading.Tasks.Task<bool>> martSaveCallback = null)
         {
@@ -66,7 +66,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
             _modelLocator      = modelLocator;
             _sourceMode        = sourceMode;
             _dbmsType          = dbmsType;
-            _hasApprovers      = hasApprovers;
+            _approvalEnabled   = approvalEnabled;
             _log               = log ?? (_ => { });
             _martSaveCallback  = martSaveCallback;
 
@@ -210,10 +210,10 @@ namespace EliteSoft.Erwin.AddIn.Forms
 
             _btnSend = new Button
             {
-                // No approver configured for this config -> this is a direct send
-                // (the add-in fires the REST callback itself), so the verb is just
-                // "Send" rather than "Send to Approve".
-                Text = _hasApprovers ? "Send to Approve" : "Send",
+                // USE_APPROVEMENT_MECHANISM off -> this is a direct send (the add-in
+                // fires the REST callback itself), so the verb is just "Send" rather
+                // than "Send to Approve".
+                Text = _approvalEnabled ? "Send to Approve" : "Send",
                 Size = new Size(160, 32),
                 FlatStyle = FlatStyle.Flat,
                 BackColor = Color.FromArgb(46, 125, 50),
@@ -540,9 +540,9 @@ namespace EliteSoft.Erwin.AddIn.Forms
             // With approvers the row waits for the admin ('Pending'); without, there
             // is no gate so it is auto-approved by the system and the add-in fires
             // the REST callback itself.
-            string status = _hasApprovers ? "Pending" : "ApprovedBySystem";
+            string status = _approvalEnabled ? "Pending" : "ApprovedBySystem";
 
-            _lblStatus.Text = _hasApprovers ? "Submitting to approval queue..." : "Saving...";
+            _lblStatus.Text = _approvalEnabled ? "Submitting to approval queue..." : "Saving...";
             Application.DoEvents();
 
             int newId;
@@ -576,7 +576,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
             // fires it on approve.
             string restSummary = null;   // null => no REST attempted / none configured
             bool restFailed = false;
-            if (!_hasApprovers)
+            if (!_approvalEnabled)
             {
                 try
                 {
@@ -641,7 +641,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
             // surface an explicit confirmation modal (user rule 2026-05-31: the
             // colour-change-only signal was too subtle for a multi-step pipeline).
             _lblStatus.ForeColor = restFailed ? Color.FromArgb(192, 57, 43) : Color.FromArgb(46, 125, 50);
-            _lblStatus.Text = _hasApprovers
+            _lblStatus.Text = _approvalEnabled
                 ? $"Submitted to approval queue. ID = {newId}."
                 : (restFailed ? $"Saved (ID {newId}); REST callback FAILED." : $"Saved. ID = {newId}.");
             _btnCancel.Text = "Close";
@@ -655,7 +655,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 string body;
                 MessageBoxIcon icon;
                 string title;
-                if (_hasApprovers)
+                if (_approvalEnabled)
                 {
                     body = $"Model committed to Mart and submitted to the approval queue.\n\nApproval Queue ID: {newId}";
                     icon = MessageBoxIcon.Information;
