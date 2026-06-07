@@ -757,7 +757,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 if (name.StartsWith("Model.Physical.", StringComparison.OrdinalIgnoreCase))
                                     _modelUdpPaths.Add(name);
                             }
-                            catch { }
+                            catch (Exception ex) { Log($"InitializeModelUdpTracking: Property_Type read skipped: {ex.Message}"); }
                         }
                     }
                     catch { }
@@ -1665,6 +1665,11 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // apply does the SCAPI add itself once the user
                     // acknowledges.
                     var currentLockedAttrNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    // Ordered (name, objectId) capture for the order-enforcement
+                    // pass below - Collect("Attribute") returns columns in their
+                    // on-screen order, which is exactly what we diff against the
+                    // locked block.
+                    var orderedAttrs = new List<(string Name, string ObjectId)>();
                     try
                     {
                         dynamic walkAttrs = modelObjects.Collect(entity, "Attribute");
@@ -1679,7 +1684,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     {
                                         string aName = a.Name ?? "";
                                         if (!string.IsNullOrEmpty(aName))
+                                        {
                                             currentLockedAttrNames.Add(aName);
+                                            string aObjId = "";
+                                            try { aObjId = a.ObjectId?.ToString() ?? ""; } catch { /* objectId unavailable */ }
+                                            orderedAttrs.Add((aName, aObjId));
+                                        }
                                     }
                                     catch { /* skip this attr */ }
                                 }
@@ -1787,6 +1797,82 @@ namespace EliteSoft.Erwin.AddIn.Services
                         // this entity - the deferred path owns the add.
                         return;
                     }
+
+                    // Locked-column ORDER enforcement (2026-06-07): predefined
+                    // locked columns must stay as a contiguous block at the START
+                    // of the table in SORT_ORDER; every user-added column must sit
+                    // AFTER them. Detect any non-locked column the user wedged in
+                    // front of / between the locked block and push it to the end.
+                    // Only locked columns CURRENTLY PRESENT and APPLICABLE define
+                    // the block (conditional locks respected). A plain column is
+                    // moved automatically (delete + re-add at end); a key/FK column
+                    // is warn-only (deleting it would destroy the relationship).
+                    try
+                    {
+                        var presentApplicableLocked = new List<string>();
+                        foreach (var lr in PredefinedColumnService.Instance.GetLocked())
+                        {
+                            if (string.IsNullOrEmpty(lr.ColumnName)) continue;
+                            if (!currentLockedAttrNames.Contains(lr.ColumnName)) continue;
+                            var applic = PredefinedColumnService.Instance.FindApplicableLockedRule(entity, lr.ColumnName);
+                            if (applic != null && applic.Id == lr.Id)
+                                presentApplicableLocked.Add(lr.ColumnName);
+                        }
+
+                        var orderedNames = orderedAttrs.Select(t => t.Name).ToList();
+                        var wedged = PredefinedColumnService.ComputeColumnsWedgedInLockedBlock(orderedNames, presentApplicableLocked);
+
+                        if (wedged.Count > 0)
+                        {
+                            string entityNameForOrder = nameForMatch;
+                            foreach (var wedgedNameRaw in wedged)
+                            {
+                                string capturedName = wedgedNameRaw;
+                                string capturedEntity = entityNameForOrder;
+                                string objId = orderedAttrs
+                                    .FirstOrDefault(t => string.Equals(t.Name, capturedName, StringComparison.OrdinalIgnoreCase)).ObjectId;
+                                bool isKey = !string.IsNullOrEmpty(objId) && _tableTypeMonitor.IsColumnKeyMember(entity, objId);
+                                string dedupe = $"order|{capturedEntity}|{capturedName}";
+
+                                if (isKey)
+                                {
+                                    string detail = "This is a key/foreign-key column, so it was NOT moved automatically.\nPlease move it after the locked columns yourself.";
+                                    Log($"Locked column order: '{capturedEntity}.{capturedName}' is wedged in the locked block but is a key/FK column - warn only (no auto-move).");
+                                    EnqueueLockedColumnDialogAndApply(
+                                        capturedName, capturedEntity, Forms.LockedColumnAction.OrderEnforced, detail, dedupe, null);
+                                }
+                                else
+                                {
+                                    string detail = "It was moved to the end of the table to keep the locked column order.";
+                                    Log($"Locked column order: '{capturedEntity}.{capturedName}' wedged in the locked block - deferring dialog + move-to-end.");
+                                    EnqueueLockedColumnDialogAndApply(
+                                        capturedName, capturedEntity, Forms.LockedColumnAction.OrderEnforced, detail, dedupe,
+                                        () =>
+                                        {
+                                            try
+                                            {
+                                                dynamic moveEntity = ResolveEntityByName(capturedEntity);
+                                                if (moveEntity == null)
+                                                {
+                                                    Log($"Locked column order move: entity '{capturedEntity}' not found at apply time");
+                                                    return;
+                                                }
+                                                _tableTypeMonitor.MoveColumnToEnd(moveEntity, capturedName, capturedEntity);
+                                            }
+                                            catch (Exception ex)
+                                            {
+                                                Log($"Locked column order move FAILED for '{capturedName}' on '{capturedEntity}': {ex.Message}");
+                                            }
+                                        });
+                                }
+                            }
+                            // Deferred dialogs + moves own the mutation for this
+                            // close; skip the normal reevaluate so it cannot race
+                            // the pending column deletes/re-adds.
+                            return;
+                        }
+                    }
+                    catch (Exception orderEx) { Log($"Locked column order enforcement err for '{nameForMatch}': {orderEx.Message}"); }
 
                     // No missing locked columns (or brand-new entity which
                     // is handled by the normal first-add path). Let the

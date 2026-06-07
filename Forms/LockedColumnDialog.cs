@@ -16,7 +16,9 @@ namespace EliteSoft.Erwin.AddIn.Forms
         /// <summary>User changed a property (datatype, nullable, default, PK).</summary>
         PropertyChange,
         /// <summary>User deleted the column. We re-created it.</summary>
-        Delete
+        Delete,
+        /// <summary>User inserted/moved a column into the locked block. We push it to the table end (or, for a key/FK column, ask the user to).</summary>
+        OrderEnforced
     }
 
     /// <summary>
@@ -183,6 +185,12 @@ namespace EliteSoft.Erwin.AddIn.Forms
                         "Column Restored",
                         $"The column \"{columnName}\" is locked by the administrator.",
                         "The deletion was undone - the column was re-created with its original definition."
+                    );
+                case LockedColumnAction.OrderEnforced:
+                    return (
+                        "Column Order Locked",
+                        "The administrator's predefined columns must stay first, in their defined order.",
+                        $"The column \"{columnName}\" was moved after them - new columns are kept at the end of the table."
                     );
                 default:
                     return ("Column Locked", $"The column \"{columnName}\" is locked.", "Your change was reverted.");

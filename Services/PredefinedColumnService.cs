@@ -369,5 +369,49 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             LoadPredefinedColumns(platformDbType);
         }
+
+        /// <summary>
+        /// Pure order-enforcement helper (2026-06-07). Given a table's CURRENT
+        /// column order (<paramref name="actualOrder"/>, the names as
+        /// <c>Collect("Attribute")</c> returns them) and the set of locked
+        /// predefined column names that apply to the entity
+        /// (<paramref name="lockedNames"/>), return the non-locked columns that
+        /// the user has wedged INTO or in front of the locked block - i.e. every
+        /// non-locked column that sits before the last locked column.
+        /// <para>
+        /// The rule (user-confirmed 2026-06-07): locked predefined columns must
+        /// stay as a contiguous block at the START of the table in their
+        /// SORT_ORDER; every user-added column must sit AFTER them. A non-locked
+        /// column appearing before the last locked column violates that and must
+        /// be moved to the end. Result preserves the violating columns' relative
+        /// order. Case-insensitive. No SCAPI, no DB - unit-testable in isolation.
+        /// </para>
+        /// </summary>
+        public static List<string> ComputeColumnsWedgedInLockedBlock(
+            IReadOnlyList<string> actualOrder, ICollection<string> lockedNames)
+        {
+            var result = new List<string>();
+            if (actualOrder == null || actualOrder.Count == 0) return result;
+            if (lockedNames == null || lockedNames.Count == 0) return result;
+
+            var lockedSet = new HashSet<string>(lockedNames, StringComparer.OrdinalIgnoreCase);
+
+            int lastLockedIndex = -1;
+            for (int i = 0; i < actualOrder.Count; i++)
+            {
+                if (!string.IsNullOrEmpty(actualOrder[i]) && lockedSet.Contains(actualOrder[i]))
+                    lastLockedIndex = i;
+            }
+            if (lastLockedIndex < 0) return result; // no locked column present - nothing to enforce
+
+            for (int i = 0; i < lastLockedIndex; i++)
+            {
+                string name = actualOrder[i];
+                if (string.IsNullOrEmpty(name)) continue;
+                if (!lockedSet.Contains(name))
+                    result.Add(name);
+            }
+            return result;
+        }
     }
 }

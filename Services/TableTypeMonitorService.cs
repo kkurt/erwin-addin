@@ -2515,6 +2515,170 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
         }
 
+        /// Attribute definition copied when a wedged user column is moved to the
+        /// end of the table (locked-column order enforcement, 2026-06-07).
+        /// Mirrors <c>ModelConfigForm.CopyAttributeProperties</c> so a moved
+        /// column keeps its full shape. Name + Physical_Name are handled
+        /// separately (they drive the create + the re-read match).
+        private static readonly string[] MovableAttributeProperties =
+        {
+            "Physical_Data_Type",
+            "Logical_Data_Type",
+            "Null_Option",
+            "Definition",
+            "Note",
+            "Default_Value",
+            "Parent_Domain_Ref"
+        };
+
+        /// <summary>
+        /// True when the attribute identified by <paramref name="attrObjectId"/>
+        /// is a member of ANY Key_Group on the entity (PK, AK, or a foreign-key
+        /// group). Generalises <see cref="IsAttributeInPrimaryKey"/> to all key
+        /// types. Used by locked-column ORDER enforcement (2026-06-07) as the
+        /// "safe to delete + re-add" gate: a plain owned column (member of no
+        /// key group) can be moved to the table end without destroying a key or
+        /// foreign-key relationship; a key member cannot, so the enforcement
+        /// only warns for those.
+        /// </summary>
+        public bool IsColumnKeyMember(dynamic entity, string attrObjectId)
+        {
+            if (entity == null || string.IsNullOrEmpty(attrObjectId)) return false;
+            try
+            {
+                dynamic modelObjects = _session.ModelObjects;
+                dynamic groups = modelObjects.Collect(entity, "Key_Group");
+                if (groups == null) return false;
+                foreach (dynamic kg in groups)
+                {
+                    dynamic members;
+                    try { members = modelObjects.Collect(kg, "Key_Group_Member"); }
+                    catch { continue; }
+                    if (members == null) continue;
+                    foreach (dynamic m in members)
+                    {
+                        string memberAttrRef = null;
+                        try { memberAttrRef = m.Properties("Attribute_Ref").Value?.ToString(); }
+                        catch { continue; }
+                        if (string.Equals(memberAttrRef, attrObjectId, StringComparison.OrdinalIgnoreCase))
+                            return true;
+                    }
+                }
+            }
+            catch (Exception ex) { Log($"IsColumnKeyMember err: {ex.Message}"); }
+            return false;
+        }
+
+        /// <summary>
+        /// Move a wedged user column to the END of the entity's attribute list,
+        /// preserving the locked predefined-column block at the start (locked
+        /// column order enforcement, 2026-06-07). erwin SCAPI exposes no column
+        /// reorder, so the only mechanism is capture-properties -> delete ->
+        /// re-add at the end (the collection's <c>Add("Attribute")</c> appends).
+        /// CALLER MUST first confirm the column is safe to move via
+        /// <see cref="IsColumnKeyMember"/> == false - deleting a key/FK column
+        /// would destroy the relationship. Returns true when the column ended up
+        /// re-created at the end.
+        /// </summary>
+        public bool MoveColumnToEnd(dynamic entity, string columnName, string entityName)
+        {
+            if (entity == null || string.IsNullOrEmpty(columnName)) return false;
+            try
+            {
+                dynamic modelObjects = _session.ModelObjects;
+                dynamic attrs = modelObjects.Collect(entity, "Attribute");
+                if (attrs == null) return false;
+
+                // 1. Locate the target + capture its full definition BEFORE delete.
+                dynamic target = null;
+                string physName = columnName;
+                var captured = new Dictionary<string, object>();
+                foreach (dynamic a in attrs)
+                {
+                    if (a == null) continue;
+                    string aName;
+                    try { aName = a.Name ?? ""; } catch { continue; }
+                    if (!string.Equals(aName, columnName, StringComparison.OrdinalIgnoreCase)) continue;
+
+                    target = a;
+                    try
+                    {
+                        string p = a.Properties("Physical_Name").Value?.ToString() ?? "";
+                        if (!string.IsNullOrEmpty(p) && !p.StartsWith("%")) physName = p;
+                    }
+                    catch { /* keep the logical name as physical fallback */ }
+                    foreach (string prop in MovableAttributeProperties)
+                    {
+                        try
+                        {
+                            var v = a.Properties(prop).Value;
+                            if (v != null)
+                            {
+                                string sv = v.ToString();
+                                if (!string.IsNullOrEmpty(sv) && !sv.StartsWith("%"))
+                                    captured[prop] = v;
+                            }
+                        }
+                        catch { /* property not surfaced on this attr - skip */ }
+                    }
+                    break;
+                }
+                if (target == null)
+                {
+                    Log($"MoveColumnToEnd: column '{columnName}' not found on '{entityName}'");
+                    return false;
+                }
+
+                // 2. Delete the wedged column.
+                int delTx = _session.BeginNamedTransaction("MoveColumnToEnd-Delete");
+                try
+                {
+                    modelObjects.Remove(target);
+                    _session.CommitTransaction(delTx);
+                }
+                catch (Exception ex)
+                {
+                    try { _session.RollbackTransaction(delTx); } catch (Exception rb) { Log($"MoveColumnToEnd delete rollback err: {rb.Message}"); }
+                    Log($"MoveColumnToEnd delete FAILED for '{columnName}' on '{entityName}': {ex.Message}");
+                    return false;
+                }
+
+                // 3. Re-create it - Add("Attribute") appends to the END.
+                dynamic newAttr = ErwinUtilities.CreateAttribute(_session, entity, columnName);
+                if (newAttr == null)
+                {
+                    Log($"MoveColumnToEnd: re-create returned null for '{columnName}' on '{entityName}' (column lost)");
+                    return false;
+                }
+
+                // 4. Re-apply the captured definition.
+                int setTx = _session.BeginNamedTransaction("MoveColumnToEnd-Reapply");
+                try
+                {
+                    try { newAttr.Properties("Physical_Name").Value = physName; } catch (Exception ex) { Log($"MoveColumnToEnd reapply Physical_Name err: {ex.Message}"); }
+                    foreach (var kv in captured)
+                    {
+                        try { newAttr.Properties(kv.Key).Value = kv.Value; }
+                        catch (Exception ex) { Log($"MoveColumnToEnd reapply '{kv.Key}' err: {ex.Message}"); }
+                    }
+                    _session.CommitTransaction(setTx);
+                }
+                catch (Exception ex)
+                {
+                    try { _session.RollbackTransaction(setTx); } catch (Exception rb) { Log($"MoveColumnToEnd reapply rollback err: {rb.Message}"); }
+                    Log($"MoveColumnToEnd reapply FAILED for '{columnName}' on '{entityName}': {ex.Message}");
+                }
+
+                Log($"MoveColumnToEnd: '{columnName}' moved to end of '{entityName}' (locked column order preserved)");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log($"MoveColumnToEnd err for '{columnName}' on '{entityName}': {ex.Message}");
+                return false;
+            }
+        }
+
         /// <summary>
         /// Re-create a specific predefined column on the given entity.
         /// Used by the locked-column delete-restore path
