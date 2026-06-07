@@ -44,6 +44,15 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// </summary>
         public bool IsLocked { get; set; }
         public string DefaultValue { get; set; }
+
+        /// <summary>
+        /// User-facing "Comment" (admin column <c>DEFINITION</c>, 2026-06-08).
+        /// When set, the addin writes it to the created column's erwin
+        /// <c>Definition</c> property. Optional - empty when admin left it blank
+        /// or the admin DB predates the column (best-effort load, see
+        /// <see cref="PredefinedColumnService.TryLoadComments"/>).
+        /// </summary>
+        public string Comment { get; set; } = "";
         // Nullable to match admin's schema (admin authored 2026-05-14:
         // "rule-independent predefined columns"). HasValue==false means
         // the column is unconditional and should be added to every new
@@ -201,6 +210,14 @@ namespace EliteSoft.Erwin.AddIn.Services
                             }
                         }
                     }
+
+                    // Best-effort second pass for the optional "Comment" field
+                    // (admin column DEFINITION, 2026-06-08). Kept separate from
+                    // the main load so an older admin DB that predates the column
+                    // still loads every other predefined-column field instead of
+                    // failing the whole query. A missing column leaves Comment=""
+                    // and is logged, not thrown.
+                    TryLoadComments(connection, ctx.ActiveConfigId, dbType);
                 }
 
                 _isLoaded = true;
@@ -254,6 +271,66 @@ namespace EliteSoft.Erwin.AddIn.Services
                             LEFT JOIN [dbo].[MC_UDP_DEFINITION] udp ON pc.[DEPENDS_ON_UDP_ID] = udp.[ID]
                             WHERE pc.[CONFIG_ID] = @cfgId
                             ORDER BY pc.[SORT_ORDER]";
+            }
+        }
+
+        /// <summary>
+        /// Best-effort load of the optional per-column "Comment" (admin column
+        /// <c>DEFINITION</c>, 2026-06-08) which the addin applies as the erwin
+        /// column Definition. Run as a SEPARATE pass on the already-open
+        /// connection so an admin DB that predates the column does not fail the
+        /// whole predefined-column load: a missing column (or any error) is
+        /// logged and leaves every <see cref="PredefinedColumn.Comment"/> empty.
+        /// Merges into the already-loaded rows by ID.
+        /// </summary>
+        private void TryLoadComments(System.Data.Common.DbConnection connection, int configId, string dbType)
+        {
+            if (_columns.Count == 0) return;
+            try
+            {
+                string q;
+                switch (dbType?.ToUpper())
+                {
+                    case "POSTGRESQL":
+                        q = @"SELECT ""ID"", ""DEFINITION"" FROM ""PREDEFINED_COLUMN"" WHERE ""CONFIG_ID"" = @cfgId";
+                        break;
+                    case "ORACLE":
+                        q = @"SELECT ID, DEFINITION FROM PREDEFINED_COLUMN WHERE CONFIG_ID = :cfgId";
+                        break;
+                    case "MSSQL":
+                    default:
+                        q = @"SELECT [ID], [DEFINITION] FROM [dbo].[PREDEFINED_COLUMN] WHERE [CONFIG_ID] = @cfgId";
+                        break;
+                }
+
+                var byId = new Dictionary<int, PredefinedColumn>();
+                foreach (var c in _columns) byId[c.Id] = c;
+
+                using (var command = DatabaseService.Instance.CreateCommand(q, connection))
+                {
+                    var pCfg = command.CreateParameter();
+                    pCfg.ParameterName = dbType == "ORACLE" ? ":cfgId" : "@cfgId";
+                    pCfg.Value = configId;
+                    command.Parameters.Add(pCfg);
+
+                    using (var reader = command.ExecuteReader())
+                    {
+                        while (reader.Read())
+                        {
+                            int id = Convert.ToInt32(reader["ID"]);
+                            string comment = reader["DEFINITION"] == DBNull.Value
+                                ? ""
+                                : reader["DEFINITION"]?.ToString() ?? "";
+                            if (byId.TryGetValue(id, out var col))
+                                col.Comment = comment;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"PredefinedColumnService.TryLoadComments: optional DEFINITION column not loaded ({ex.Message})");
             }
         }
 

@@ -2850,6 +2850,15 @@ namespace EliteSoft.Erwin.AddIn.Services
                             }
                         }
 
+                        // Comment (admin DEFINITION, 2026-06-08) -> erwin column
+                        // Definition. Only written when admin authored one, so a
+                        // blank comment does not stomp anything.
+                        if (!string.IsNullOrEmpty(col.Comment))
+                        {
+                            try { newAttribute.Properties("Definition").Value = col.Comment; }
+                            catch (Exception ex) { Log($"ApplyPredefined({contextLabel}): set Definition (comment) '{col.ColumnName}': {ex.Message}"); }
+                        }
+
                         _session.CommitTransaction(transId);
                     }
                     catch (Exception ex)
