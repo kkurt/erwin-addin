@@ -72,6 +72,21 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// In-memory override of the cached config WITHOUT touching the registry.
+        /// Part of the IBootstrapService contract (added to MetaShared); mirrors
+        /// RegistryBootstrapService.OverrideConfig. Used by short-lived/headless
+        /// flows that must run against a specific connection without disturbing
+        /// the stored HKLM/HKCU Bootstrap. The add-in itself never writes the
+        /// registry (see SaveConfig), so this is the only runtime path to point
+        /// the reader at a caller-supplied config.
+        /// </summary>
+        public void OverrideConfig(BootstrapConfig config)
+        {
+            _cachedConfig = config;
+            _cachedSourceHive = "OVERRIDE";
+        }
+
+        /// <summary>
         /// Diagnostic getter: indicates which hive the cached config came from
         /// ("HKLM" or "HKCU"). Returns null when no config is cached or none
         /// could be read. Useful for surfacing the active source in UI labels
