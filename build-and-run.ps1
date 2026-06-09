@@ -813,13 +813,22 @@ if (-not $task) {
 if (-not $task) {
     Write-Host "  Auto-start task still not configured; addin will not auto-load on model open." -ForegroundColor Red
 } else {
-    # One-shot upgrade: ensure RestartCount is set on already-installed tasks
+    # One-shot upgrade: ensure RestartCount is set on already-installed tasks.
+    # Best-effort: when the task was first registered by an elevated run
+    # (e.g. package-for-dev.ps1, which requests admin), a later standard-user
+    # build-and-run cannot Set-ScheduledTask on it -> "Access is denied". That
+    # is non-fatal: the watcher still runs; only the restart-on-failure upgrade
+    # is skipped. Catch it so it does not surface as a red unhandled error.
     if ($task.Settings.RestartCount -lt 3) {
         Write-Host "  Patching task with restart-on-failure (3 retries, 1 min apart)..." -ForegroundColor Gray
         $newSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
             -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) `
             -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-        Set-ScheduledTask -TaskName $watcherTaskName -Settings $newSettings | Out-Null
+        try {
+            Set-ScheduledTask -TaskName $watcherTaskName -Settings $newSettings -ErrorAction Stop | Out-Null
+        } catch {
+            Write-Host "  Note: restart-on-failure not patched ($($_.Exception.Message.Trim())). Watcher still runs; re-run build-and-run elevated to apply this one-shot upgrade. Skipping (non-fatal)." -ForegroundColor DarkYellow
+        }
     }
 
     # Recycle the watcher process only when the deployed script actually
