@@ -63,6 +63,7 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         private const uint MF_BYPOSITION = 0x0400;
         private const uint WM_COMMAND = 0x0111;
+        private const uint WM_CLOSE = 0x0010;
 
         #endregion
 
@@ -919,6 +920,31 @@ namespace EliteSoft.Erwin.AddIn.Services
 
             SetForegroundWindow(hWnd);
             return PostMessage(hWnd, WM_COMMAND, (IntPtr)menuId, IntPtr.Zero);
+        }
+
+        /// <summary>
+        /// Initiates a graceful shutdown of the erwin host by posting WM_CLOSE
+        /// to its main XTPMainFrame window. This drives erwin's NORMAL exit path,
+        /// so if any open model has unsaved changes erwin raises its own
+        /// "Save changes?" prompt before terminating - no data is lost. We never
+        /// Process.Kill erwin: a hard kill would discard the dirty buffer and has
+        /// historically corrupted Mart sessions / triggered teardown crashes.
+        /// Brought to the foreground first so erwin's save prompt (if any) is
+        /// not stranded behind other windows.
+        /// </summary>
+        /// <returns>
+        /// false if erwin's main window could not be resolved (not running);
+        /// true once WM_CLOSE has been posted. Note: a true return only means the
+        /// message was delivered - the user may still cancel at erwin's save prompt.
+        /// </returns>
+        public static bool CloseErwinMainWindow()
+        {
+            IntPtr hWnd = GetErwinMainWindow();
+            if (hWnd == IntPtr.Zero)
+                return false;
+
+            SetForegroundWindow(hWnd);
+            return PostMessage(hWnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
         }
 
         #endregion
