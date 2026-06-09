@@ -94,10 +94,41 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             try
             {
+                // Dialect-aware query. The original hard-coded "@" parameter
+                // prefix + bare TYPE is MSSQL-only: on Oracle "@cfgId" is not a
+                // bind marker (ORA-00936 "missing expression") and TYPE is a
+                // reserved word, so the admin's DDL/RE option XML silently fell
+                // back to erwin defaults and was never applied (verified
+                // 2026-06-08, repeated ORA-00936 in the Generate-DDL log).
+                // Mirror the dialect conventions the other repo services use
+                // (PredefinedColumnService etc.): Oracle binds with ":" and
+                // quotes the reserved TYPE; Postgres quotes every identifier and
+                // binds with "@"; MSSQL stays as-is.
+                string connType = conn.GetType().Name;
+                bool isOracle = connType.IndexOf("Oracle", StringComparison.OrdinalIgnoreCase) >= 0;
+                bool isPostgres = connType.IndexOf("Npgsql", StringComparison.OrdinalIgnoreCase) >= 0;
+
+                string sql, pCfg, pType;
+                if (isOracle)
+                {
+                    sql = "SELECT CONTENT FROM XML_OPTION WHERE CONFIG_ID = :cfgId AND \"TYPE\" = :type";
+                    pCfg = ":cfgId"; pType = ":type";
+                }
+                else if (isPostgres)
+                {
+                    sql = "SELECT \"CONTENT\" FROM \"XML_OPTION\" WHERE \"CONFIG_ID\" = @cfgId AND \"TYPE\" = @type";
+                    pCfg = "@cfgId"; pType = "@type";
+                }
+                else
+                {
+                    sql = "SELECT CONTENT FROM XML_OPTION WHERE CONFIG_ID = @cfgId AND TYPE = @type";
+                    pCfg = "@cfgId"; pType = "@type";
+                }
+
                 using var cmd = conn.CreateCommand();
-                cmd.CommandText = "SELECT CONTENT FROM XML_OPTION WHERE CONFIG_ID = @cfgId AND TYPE = @type";
-                AddParam(cmd, "@cfgId", configId);
-                AddParam(cmd, "@type", type);
+                cmd.CommandText = sql;
+                AddParam(cmd, pCfg, configId);
+                AddParam(cmd, pType, type);
 
                 object result = cmd.ExecuteScalar();
                 if (result == null || result is DBNull) return null;
