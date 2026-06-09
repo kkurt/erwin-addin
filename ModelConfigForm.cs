@@ -1376,12 +1376,33 @@ namespace EliteSoft.Erwin.AddIn
         /// <c>ShowConfigWarningDialog</c> pattern (see line ~1066) where
         /// modal interaction during Form.Load deadlocks form painting.
         /// </summary>
+        /// <summary>
+        /// How the add-in applies admin UDP definition changes on model load,
+        /// resolved from the inherit cascade (model CONFIG_PROPERTY -> corporate
+        /// CORPORATE_PROPERTY -> default) under the key APPLY_UDP_CHANGES. The
+        /// UPPER_SNAKE member names match the values the admin stores, so
+        /// GetEffectiveEnum parses them directly. Default is WARN_AND_APPLY.
+        /// Replaces the old APPLY_UDP_CHANGES_SILENTLY boolean (2026-06-08).
+        /// </summary>
+        private enum UdpSyncApplyMode { WARN_AND_APPLY, SILENTLY_APPLY, OFF }
+
         private void RunUdpSyncIfNeeded()
         {
             var ctx = ConfigContextService.Instance;
             if (!ctx.IsInitialized || ctx.ActiveConfigId <= 0)
             {
                 Log("UDP sync skipped: no active CONFIG");
+                return;
+            }
+
+            // Apply-policy (tri-state, replaces the old APPLY_UDP_CHANGES_SILENTLY
+            // boolean): OFF skips the sync entirely; SILENTLY_APPLY and
+            // WARN_AND_APPLY both apply EVERY change, differing only in whether
+            // the user is first shown the read-only notification dialog.
+            var udpMode = ctx.GetEffectiveEnum("APPLY_UDP_CHANGES", UdpSyncApplyMode.WARN_AND_APPLY);
+            if (udpMode == UdpSyncApplyMode.OFF)
+            {
+                Log("UDP sync skipped: APPLY_UDP_CHANGES=OFF for this config");
                 return;
             }
 
@@ -1466,35 +1487,19 @@ namespace EliteSoft.Erwin.AddIn
                 return;
             }
 
-            // Silent-apply flag: when admin's "Apply UDP changes silently"
-            // checkbox is on for this config, skip the dialog and write the
-            // diff straight to the metamodel. Used by admin-managed shops
-            // where UDP definitions are centrally controlled and users
-            // should not see a sync prompt every model open. Effective value
-            // via the two-level cascade (model CONFIG_PROPERTY -> corporate
-            // CORPORATE_PROPERTY -> false).
-            // 2026-06-04 KEY FIX: this read the camelCase "ApplyUdpChangesSilently"
-            // which the admin/corporate tables never write (the canonical key is
-            // APPLY_UDP_CHANGES_SILENTLY) - so model-level silent-apply was dead.
-            // Verified ZERO camelCase rows in the DB, so the rename is safe.
-            bool silentApply = false;
-            try
+            // SILENTLY_APPLY: write the diff straight to the metamodel, no
+            // dialog. Used by admin-managed shops where UDP definitions are
+            // centrally controlled and users should not see a prompt every model
+            // open. (mode resolved at the top of this method via the cascade.)
+            if (udpMode == UdpSyncApplyMode.SILENTLY_APPLY)
             {
-                silentApply = _propertyApplicatorService != null
-                              && _propertyApplicatorService.IsInitialized
-                              && _propertyApplicatorService.IsPropertyEnabled("APPLY_UDP_CHANGES_SILENTLY");
-            }
-            catch (Exception ex)
-            {
-                Log($"UDP sync: silent-apply flag read failed: {ex.Message}");
-            }
-
-            if (silentApply)
-            {
-                Log($"UDP sync: silent-apply mode (creates={diff.Creates.Count}, updates={diff.Updates.Count})");
+                Log($"UDP sync: SILENTLY_APPLY (creates={diff.Creates.Count}, updates={diff.Updates.Count})");
                 ApplyUdpDiffSilently(syncEngine, diff);
                 return;
             }
+
+            // Fall through: WARN_AND_APPLY - show the read-only notification
+            // dialog, then apply EVERY change (no per-row opt-out, no Cancel).
 
             if (_udpSyncDialogOpen)
             {
@@ -1521,18 +1526,11 @@ namespace EliteSoft.Erwin.AddIn
                     _udpSyncDialogOpen = true;
                     try
                     {
-                        bool apply = UdpSyncDialog.ShowFor(diffLocal, this, out var selectedDiff);
-                        if (!apply || selectedDiff == null || selectedDiff.IsEmpty)
-                        {
-                            Log($"UDP sync cancelled by user (creates={diffLocal.Creates.Count}, updates={diffLocal.Updates.Count})");
-                            return;
-                        }
-
-                        // The user may have unchecked some rows in the
-                        // dialog; only apply the subset they kept selected.
-                        int skipped = diffLocal.TotalCount - selectedDiff.TotalCount;
-                        if (skipped > 0)
-                            Log($"UDP sync: user opted out of {skipped} row(s) (applying {selectedDiff.TotalCount} of {diffLocal.TotalCount})");
+                        // WARN_AND_APPLY: show the changes read-only (no per-row
+                        // opt-out, no Cancel), then apply ALL of them. The user is
+                        // informed but cannot decline - admin policy.
+                        UdpSyncDialog.ShowInformational(diffLocal, this);
+                        Log($"UDP sync: WARN_AND_APPLY - applying all (creates={diffLocal.Creates.Count}, updates={diffLocal.Updates.Count})");
 
                         // Apply blocks the UI thread for the duration of the
                         // metamodel transaction (SCAPI calls are STA-bound).
@@ -1545,7 +1543,7 @@ namespace EliteSoft.Erwin.AddIn
                         {
                             overlay = ShowBusyOverlay("Applying config UDP definitions to the model, please wait...");
                             Application.DoEvents();
-                            result = engineLocal.Apply(selectedDiff);
+                            result = engineLocal.Apply(diffLocal);
                         }
                         finally
                         {
@@ -1884,7 +1882,74 @@ namespace EliteSoft.Erwin.AddIn
             tabGeneral.Controls.Add(glossCard);
 
             // Reposition copyright label dynamically below the last card.
-            lblCopyright.Location = new Point(24, glossY + glossH + 30 + 12);
+            int footerY = glossY + glossH + 30 + 12;
+            lblCopyright.Location = new Point(24, footerY);
+
+            // --- Footer action: Close erwin ---
+            // Destructive action lives in the bottom-right corner, kept apart
+            // from the configuration cards so it is hard to hit by accident.
+            // Posts WM_CLOSE to erwin's main frame (graceful shutdown - erwin
+            // raises its own "Save changes?" prompt for any dirty model).
+            const int closeBtnW = 120;
+            const int closeBtnH = 30;
+            var btnCloseErwin = new Button
+            {
+                Text = "Close erwin",
+                // Right-align to the card column's right edge (cardX + cardW),
+                // vertically centred on the copyright baseline.
+                Location = new Point((cardX + cardW) - closeBtnW, footerY - 8),
+                Size = new Size(closeBtnW, closeBtnH),
+                Anchor = AnchorStyles.Bottom | AnchorStyles.Right,
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(200, 60, 60),
+                ForeColor = Color.White,
+                Font = fontBold,
+                Cursor = Cursors.Hand,
+                TabStop = false,
+            };
+            btnCloseErwin.FlatAppearance.BorderSize = 0;
+            // Darken on hover so the destructive intent reads clearly.
+            btnCloseErwin.MouseEnter += (s, e) => btnCloseErwin.BackColor = Color.FromArgb(168, 44, 44);
+            btnCloseErwin.MouseLeave += (s, e) => btnCloseErwin.BackColor = Color.FromArgb(200, 60, 60);
+            btnCloseErwin.Click += BtnCloseErwin_Click;
+            tabGeneral.Controls.Add(btnCloseErwin);
+        }
+
+        /// <summary>
+        /// Closes the entire erwin host after explicit confirmation. Routes
+        /// through <see cref="Services.Win32Helper.CloseErwinMainWindow"/>, which
+        /// posts WM_CLOSE to erwin's main frame so erwin's own save-prompt fires
+        /// for any unsaved model (no Process.Kill, no data loss).
+        /// </summary>
+        private void BtnCloseErwin_Click(object sender, EventArgs e)
+        {
+            var result = AddinMessageDialog.Show(
+                this,
+                "This will close erwin completely.\r\n\r\n" +
+                "If any open model has unsaved changes, erwin will ask you to save first.\r\n\r\n" +
+                "Close erwin now?",
+                "Close erwin",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning);
+
+            if (result != DialogResult.Yes)
+            {
+                Log("Close erwin: cancelled by user.");
+                return;
+            }
+
+            Log("Close erwin: posting WM_CLOSE to the erwin main frame.");
+            bool posted = Services.Win32Helper.CloseErwinMainWindow();
+            if (!posted)
+            {
+                Log("Close erwin: erwin main window not found - nothing to close.");
+                AddinMessageDialog.Show(
+                    this,
+                    "Could not locate the erwin main window. erwin may already be closing.",
+                    "Close erwin",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+            }
         }
 
         /// <summary>

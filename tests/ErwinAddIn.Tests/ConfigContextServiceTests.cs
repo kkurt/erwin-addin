@@ -54,4 +54,32 @@ public class ConfigContextServiceTests
     {
         ConfigContextService.ParseMartPath(null!).Should().BeNull();
     }
+
+    // Mirrors the UDP-sync apply policy (APPLY_UDP_CHANGES, 2026-06-08): the
+    // UPPER_SNAKE member names match the values the admin stores, so
+    // GetEffectiveEnum/ParseEffectiveEnum resolve them directly.
+    public enum UdpApplyMode { WARN_AND_APPLY, SILENTLY_APPLY, OFF }
+
+    [Theory]
+    [InlineData("WARN_AND_APPLY", UdpApplyMode.WARN_AND_APPLY)]
+    [InlineData("warn_and_apply", UdpApplyMode.WARN_AND_APPLY)] // case-insensitive
+    [InlineData("SILENTLY_APPLY", UdpApplyMode.SILENTLY_APPLY)]
+    [InlineData("  OFF  ", UdpApplyMode.OFF)]                   // trimmed
+    [InlineData("off", UdpApplyMode.OFF)]
+    public void ParseEffectiveEnum_parses_apply_policy_values(string raw, UdpApplyMode expected)
+    {
+        ConfigContextService.ParseEffectiveEnum(raw, UdpApplyMode.WARN_AND_APPLY).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData(null)]
+    [InlineData("nonsense")]
+    [InlineData("99")] // out-of-range numeric is rejected by the IsDefined guard
+    public void ParseEffectiveEnum_falls_back_to_default_for_blank_or_unknown(string? raw)
+    {
+        ConfigContextService.ParseEffectiveEnum(raw, UdpApplyMode.WARN_AND_APPLY)
+            .Should().Be(UdpApplyMode.WARN_AND_APPLY);
+    }
 }

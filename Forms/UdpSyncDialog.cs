@@ -71,6 +71,9 @@ namespace EliteSoft.Erwin.AddIn.Forms
         private readonly UdpDiff _diff;
         private ListView? _listView;
         private Button? _btnApply;
+        // Warn-and-Apply (informational) mode: read-only notification, no
+        // per-row opt-out, no Cancel - the caller applies every change.
+        private readonly bool _informational;
 
         /// <summary>
         /// Diff filtered to the rows the user kept checked when they clicked
@@ -81,9 +84,10 @@ namespace EliteSoft.Erwin.AddIn.Forms
         /// </summary>
         public UdpDiff? SelectedDiff { get; private set; }
 
-        public UdpSyncDialog(UdpDiff diff)
+        public UdpSyncDialog(UdpDiff diff, bool informational = false)
         {
             _diff = diff ?? throw new ArgumentNullException(nameof(diff));
+            _informational = informational;
             if (_diff.IsEmpty)
                 throw new ArgumentException("UdpSyncDialog should not be opened with an empty diff", nameof(diff));
 
@@ -119,7 +123,9 @@ namespace EliteSoft.Erwin.AddIn.Forms
             // Subtitle / explanation
             var subtitle = new Label
             {
-                Text = "Config definitions differ from this model. Review the changes below, then Apply or Cancel.",
+                Text = informational
+                    ? "Config definitions differ from this model. The changes below are being applied."
+                    : "Config definitions differ from this model. Review the changes below, then Apply or Cancel.",
                 Font = new Font("Segoe UI", 9.5F),
                 ForeColor = ClrTextSecondary,
                 Dock = DockStyle.Top,
@@ -136,22 +142,39 @@ namespace EliteSoft.Erwin.AddIn.Forms
             var footer = BuildFooter(out Button apply, out Button cancel);
             _btnApply = apply;
 
-            // Wire Apply to a custom click handler so we can build the
-            // filtered SelectedDiff before the dialog closes. The button's
-            // DialogResult would normally auto-close on click; we override
-            // by clearing DialogResult and assigning it ourselves after
-            // building the filtered diff.
-            apply.DialogResult = DialogResult.None;
-            apply.Click += BtnApply_Click;
+            if (informational)
+            {
+                // Warn-and-Apply policy: read-only notification. No per-row
+                // opt-out and no Cancel - the caller applies the full diff once
+                // the user acknowledges. The button simply confirms.
+                apply.Text = "OK";
+                cancel.Visible = false;
+            }
+            else
+            {
+                // Wire Apply to a custom click handler so we can build the
+                // filtered SelectedDiff before the dialog closes. The button's
+                // DialogResult would normally auto-close on click; we override
+                // by clearing DialogResult and assigning it ourselves after
+                // building the filtered diff.
+                apply.DialogResult = DialogResult.None;
+                apply.Click += BtnApply_Click;
+            }
 
             // ListView fills the centre. Constructed AFTER header / subtitle /
             // summary are docked so it claims the remaining vertical space.
             var listView = BuildListView();
             _listView = listView;
+            // Informational mode is read-only: hide the per-row checkboxes (the
+            // admin policy applies every change, the user cannot opt rows out).
+            if (informational) listView.CheckBoxes = false;
             PopulateListView(listView);
-            // Track checked-row count so the Apply button can disable when
-            // the user has unchecked everything (nothing to apply).
-            listView.ItemChecked += (_, _) => UpdateApplyEnabled();
+            if (!informational)
+            {
+                // Track checked-row count so the Apply button can disable when
+                // the user has unchecked everything (nothing to apply).
+                listView.ItemChecked += (_, _) => UpdateApplyEnabled();
+            }
 
             // Docking order: Fill child first (claims the middle), then
             // bottom-docked footer + separator, then top-docked items in
@@ -662,6 +685,32 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 return true;
             }
             return false;
+        }
+
+        /// <summary>
+        /// Show the diff as a read-only notification (Warn-and-Apply policy):
+        /// the user sees exactly what is being applied, with no per-row opt-out
+        /// and no Cancel. The caller applies the full diff once this returns -
+        /// the dialog is informational only. Mirrors <see cref="ShowFor"/>'s
+        /// positioning/owner ergonomics.
+        /// </summary>
+        public static void ShowInformational(UdpDiff diff, IWin32Window? owner)
+        {
+            if (diff == null || diff.IsEmpty) return;
+
+            using var dlg = new UdpSyncDialog(diff, informational: true);
+            dlg.PositionOnActiveScreen(owner);
+
+            IWin32Window? effectiveOwner = owner;
+            if (effectiveOwner == null)
+            {
+                var addinForm = EliteSoft.Erwin.AddIn.ErwinAddIn.ActiveForm;
+                if (addinForm != null && !addinForm.IsDisposed && addinForm.IsHandleCreated)
+                    effectiveOwner = addinForm;
+            }
+
+            if (effectiveOwner != null) dlg.ShowDialog(effectiveOwner);
+            else dlg.ShowDialog();
         }
     }
 }
