@@ -103,7 +103,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 Font = new Font("Segoe UI", 12F, FontStyle.Bold),
                 ForeColor = ClrTextPrimary,
                 AutoSize = true,
-                Location = new Point(20, 12)
+                Location = new Point(24, 12)
             };
             var lblSubtitle = new Label
             {
@@ -111,7 +111,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 Font = new Font("Segoe UI", 9F),
                 ForeColor = ClrTextSecondary,
                 AutoSize = true,
-                Location = new Point(20, 38)
+                Location = new Point(24, 38)
             };
             pnlHeader.Controls.Add(lblTitle);
             pnlHeader.Controls.Add(lblSubtitle);
@@ -187,7 +187,12 @@ namespace EliteSoft.Erwin.AddIn.Forms
             {
                 Dock = DockStyle.Fill,
                 BackColor = Color.White,
-                Padding = new Padding(24, 16, 24, 8),
+                // Horizontal margin is driven explicitly by each row's Location.X +
+                // rowWidth (see BuildInputs). WinForms does NOT apply a Panel's
+                // Padding to children placed by absolute Location, so the 24px set
+                // here never took effect: rows sat flush at X=0, 20px left of the
+                // header and visibly cramped. Keep only the vertical padding.
+                Padding = new Padding(0, 16, 0, 8),
                 AutoScroll = true,
                 Tag = "content-panel" // BuildInputs locates this by Tag
             };
@@ -213,7 +218,12 @@ namespace EliteSoft.Erwin.AddIn.Forms
             const int labelHeight = 18;
             const int controlHeight = 24;
             const int rowGap = 14;
-            int rowWidth = pnlContent.ClientSize.Width - 32; // padding inside panel
+            // Symmetric left/right margin. Rows are placed by absolute Location,
+            // which the panel's Padding does not move, so we inset every row by
+            // sideMargin and shrink its width by 2*sideMargin. 24px lines the rows
+            // up with the header title/subtitle (also at X=24).
+            const int sideMargin = 24;
+            int rowWidth = pnlContent.ClientSize.Width - (2 * sideMargin);
 
             foreach (var def in _requiredUdps)
             {
@@ -227,13 +237,13 @@ namespace EliteSoft.Erwin.AddIn.Forms
                     Font = new Font("Segoe UI", 9F, FontStyle.Bold),
                     ForeColor = ClrTextPrimary,
                     AutoSize = false,
-                    Location = new Point(0, y),
+                    Location = new Point(sideMargin, y),
                     Size = new Size(rowWidth, labelHeight)
                 };
                 pnlContent.Controls.Add(lbl);
                 y += labelHeight + 2;
 
-                Control input = BuildInputForUdp(def, new Size(rowWidth, controlHeight), new Point(0, y));
+                Control input = BuildInputForUdp(def, new Size(rowWidth, controlHeight), new Point(sideMargin, y));
                 if (input != null)
                 {
                     _inputs[def.Name] = input;
@@ -249,7 +259,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
                         Font = new Font("Segoe UI", 8F),
                         ForeColor = ClrTextSecondary,
                         AutoSize = false,
-                        Location = new Point(0, y + 2),
+                        Location = new Point(sideMargin, y + 2),
                         Size = new Size(rowWidth, labelHeight)
                     };
                     pnlContent.Controls.Add(help);

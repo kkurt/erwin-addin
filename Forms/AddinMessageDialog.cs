@@ -566,16 +566,13 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 using var dlg = new AddinMessageDialog(text, title, buttons, icon);
                 dlg.PositionOnActiveScreen(owner);
 
-                // Prefer the addin's active form as ShowDialog owner so the
-                // modal-attaches to the right window. Caller's explicit owner
-                // takes precedence when provided.
-                IWin32Window? effectiveOwner = owner;
-                if (effectiveOwner == null)
-                {
-                    var addinForm = EliteSoft.Erwin.AddIn.ErwinAddIn.ActiveForm;
-                    if (addinForm != null && !addinForm.IsDisposed && addinForm.IsHandleCreated)
-                        effectiveOwner = addinForm;
-                }
+                // Owner resolution. A caller-supplied owner always wins. With no
+                // explicit owner we must NOT blindly attach to the addin config
+                // form: that made background notifications (e.g. "Naming standard
+                // applied", raised while the user is working inside erwin) drag the
+                // config window to the front - a reported UX bug. See
+                // ResolveImplicitOwner for the foreground-aware policy.
+                IWin32Window? effectiveOwner = owner ?? ResolveImplicitOwner();
 
                 if (effectiveOwner != null)
                     return dlg.ShowDialog(effectiveOwner);
@@ -587,6 +584,55 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 System.Diagnostics.Debug.WriteLine($"AddinMessageDialog.Show fallback: {ex.Message}");
                 return MessageBox.Show(text, title, buttons, icon);
             }
+        }
+
+        /// <summary>
+        /// Picks the implicit ShowDialog owner when the caller passes none.
+        /// Policy (2026-06-09): attach the popup to whatever window the user is
+        /// actually looking at, so a background notification never drags the
+        /// addin's config window to the front:
+        ///   - config form IS the foreground window -> own it (correct modality
+        ///     for popups the config form itself raised from a button click);
+        ///   - otherwise (the user is inside erwin)  -> own erwin's main frame so
+        ///     the popup floats over erwin and the config form stays where it is;
+        ///   - erwin frame not found                 -> null (ownerless, still
+        ///     TopMost) which likewise never surfaces the config form.
+        /// The dialog keeps TopMost=true + SetForegroundWindow regardless, so it
+        /// is always visible whichever owner we pick here.
+        /// </summary>
+        private static IWin32Window? ResolveImplicitOwner()
+        {
+            try
+            {
+                var addinForm = EliteSoft.Erwin.AddIn.ErwinAddIn.ActiveForm;
+                if (addinForm != null && !addinForm.IsDisposed && addinForm.IsHandleCreated)
+                {
+                    // Only own the config form when it is genuinely the foreground
+                    // window - then the popup was raised from its own UI and should
+                    // be modal to it. GetForegroundWindow returns the top-level
+                    // window, which equals the form handle when it (or a child) has
+                    // focus.
+                    if (GetForegroundWindow() == addinForm.Handle)
+                        return addinForm;
+                }
+
+                IntPtr erwinMain = EliteSoft.Erwin.AddIn.Services.Win32Helper.GetErwinMainWindow();
+                if (erwinMain != IntPtr.Zero)
+                    return new HwndOwner(erwinMain);
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"AddinMessageDialog.ResolveImplicitOwner failed: {ex.Message}");
+            }
+
+            return null; // ownerless TopMost - does not surface the config form
+        }
+
+        /// <summary>Minimal <see cref="IWin32Window"/> over a raw HWND (erwin's main frame).</summary>
+        private sealed class HwndOwner : IWin32Window
+        {
+            public HwndOwner(IntPtr handle) => Handle = handle;
+            public IntPtr Handle { get; }
         }
 
         #endregion

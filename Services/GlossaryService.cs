@@ -195,9 +195,12 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                     if (mappingId == null)
                     {
-                        _lastError = "Glossary not configured. Please configure GLOSSARY mapping in Admin > Data Governance.";
+                        // Keep the user-facing status terse ("Not loaded - Glossary
+                        // not configured.") while preserving the actionable admin
+                        // hint in the log only (2026-06-08 user request).
+                        _lastError = "Glossary not configured.";
                         _isLoaded = false;
-                        Log($"GlossaryService: {_lastError}");
+                        Log($"GlossaryService: {_lastError} Configure GLOSSARY mapping in Admin > Data Governance.");
                         return false;
                     }
 
