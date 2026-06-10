@@ -112,6 +112,32 @@ namespace EliteSoft.Erwin.AddIn
         // mode because no PU set element changed.
         private string _lastObservedTitleLocator = string.Empty;
 
+        // Locators of Mart-version PUs the DDL pipeline opened ITSELF (the
+        // older version loaded as the compare RIGHT side, e.g. v1 in a
+        // v4-vs-v1 run). The reconnect tick must treat these as pipeline
+        // residue, NEVER as a user model switch: adopting one re-binds the
+        // form to the pipeline's copy and UDP sync then dirties it (verified
+        // 2026-06-10 02:08 + 02:37 in erwin-addin-debug.log - 6 UDP creates
+        // were committed into the leftover v1 copy and the Target combo
+        // collapsed to "v1 only"). Registered BEFORE the pipeline posts
+        // Mart > Open, removed in the pipeline finally only when the
+        // POST-CLOSE PU scan proves the copy is gone; if the copy survives
+        // teardown the guard stays armed so ticks keep skipping it until the
+        // user closes the leftover tab manually (surfaced via a warning
+        // dialog - no silent state).
+        private readonly HashSet<string> _pipelineOwnedLocators = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // One-shot latch so the disconnected tick logs "only pipeline-owned
+        // copies are open" once instead of every 500 ms while the user is
+        // still closing the leftover tab. Reset when a real PU is adopted.
+        private bool _loggedPipelineOnlyPusOpen;
+
+        // Two-tick debounce for the tab-switch detector's EMPTY title reads.
+        // A single '' read can be transient (caption stolen by an appearing
+        // dialog - 2026-06-10 crash chain) while a real switch to a local
+        // non-Mart tab keeps reading '' on the next tick too.
+        private bool _emptyTitleDebouncePending;
+
         // Diagnostic counter for the tab-switch polling heartbeat; bumps once
         // per reconnect tick when count>1 and rolls over every ~10 s to emit a
         // single [TabPoll] log line. Kept on the form so the heartbeat
@@ -343,6 +369,42 @@ namespace EliteSoft.Erwin.AddIn
             Log($">>> ConnectToModel({modelIndex}) called. Stack: {new System.Diagnostics.StackTrace(1, false).GetFrame(0)?.GetMethod()?.Name ?? "?"}");
             using var scope = AddinLogger.BeginScope($"ConnectToModel({modelIndex})");
 
+            // HARD refusal gate (2026-06-10 review fix): never bind a PU the
+            // DDL pipeline opened for itself, no matter which call site picked
+            // the index (the reconnect tick's disconnected / count-drop /
+            // session-lost recovery paths all funnel here). Adopting the
+            // pipeline's version copy runs a full re-init and UDP sync INTO
+            // that copy (the 02:08/02:38 incidents). Checked BEFORE any state
+            // teardown so a refusal leaves the current session untouched.
+            // Title fallback OFF: the global window title must never alias
+            // the per-PU locator.
+            if (modelIndex >= 0 && modelIndex < _openModels.Count)
+            {
+                string candidateLoc = string.Empty;
+                try
+                {
+                    candidateLoc = Services.PuLocatorReader.Read(
+                        _openModels[modelIndex], allowWindowTitleFallback: false) ?? string.Empty;
+                }
+                catch (Exception ex) { Log($"ConnectToModel: pipeline-guard locator read failed: {ex.Message}"); }
+                if (_pipelineOwnedLocators.Contains(candidateLoc))
+                {
+                    Log($"ConnectToModel REFUSED: PU[{modelIndex}] locator '{candidateLoc}' is a pipeline-owned version copy. Close that tab WITHOUT saving; staying in the current state.");
+                    return;
+                }
+                // erwin's ephemeral Review copy is equally forbidden: it dies
+                // with the Review wizard and a binding to it dangles (native
+                // AV on the next dispatch - erwin crash 2026-06-10 10:47).
+                // Checked unconditionally, not just while the pipeline guard
+                // is armed: erwin creates these copies for ITS OWN Review
+                // button too.
+                if (candidateLoc.IndexOf(";Duplicate=YES", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    Log($"ConnectToModel REFUSED: PU[{modelIndex}] locator '{candidateLoc}' is erwin's ephemeral ;Duplicate=YES Review copy. Staying in the current state.");
+                    return;
+                }
+            }
+
             // Show splash IMMEDIATELY. _session.Open() below can take 2-4s on large
             // models; without early splash the user sees a 5s dead-time after
             // opening a model in erwin before any add-in feedback appears.
@@ -443,6 +505,7 @@ namespace EliteSoft.Erwin.AddIn
                 // kept in the set with the empty string entry so RE models do
                 // not look "new" on every tick either.
                 _knownLocators.Clear();
+                int pipelineOwnedOpen = 0;
                 try
                 {
                     dynamic puColl = _scapi.PersistenceUnits;
@@ -468,6 +531,16 @@ namespace EliteSoft.Erwin.AddIn
                         // worst.
                         if (loc.IndexOf(";Duplicate=YES", StringComparison.OrdinalIgnoreCase) >= 0)
                             continue;
+                        // Same exclusion for pipeline-owned version copies
+                        // (2026-06-10 review fix): keeping them out of BOTH
+                        // the known set and the count baseline below means a
+                        // surviving leftover can never skew the tick's
+                        // count-drop arithmetic.
+                        if (_pipelineOwnedLocators.Contains(loc))
+                        {
+                            pipelineOwnedOpen++;
+                            continue;
+                        }
                         _knownLocators.Add(loc);
                     }
                 }
@@ -483,7 +556,10 @@ namespace EliteSoft.Erwin.AddIn
 
                 // Record the open PU count so the tick can detect a PU being
                 // CLOSED (the locator-diff path only catches PUs being added).
-                _lastConnectPuCount = openPuCount;
+                // Pipeline-owned copies are excluded so their later close does
+                // not masquerade as the user closing a model (and the leftover
+                // does not mask a REAL close by inflating the baseline).
+                _lastConnectPuCount = Math.Max(0, openPuCount - pipelineOwnedOpen);
 
                 // Snapshot the current active-window-title locator so the tick
                 // can detect a user-driven MDI tab switch between two open
@@ -645,12 +721,37 @@ namespace EliteSoft.Erwin.AddIn
         private int FindPuIndexMatchingTitleLocator(string titleLocator, dynamic persistenceUnits, int count)
         {
             string titleStem = ExtractMartStem(titleLocator);
+            int titleVersion = ExtractLocatorVersion(titleLocator);
 
             for (int i = 0; i < count; i++)
             {
                 string puLoc = string.Empty;
                 try { puLoc = Services.PuLocatorReader.Read(persistenceUnits.Item(i), allowWindowTitleFallback: false) ?? string.Empty; }
                 catch (Exception ex) { Log($"TabSwitch: PU[{i}] locator read error: {ex.Message}"); }
+
+                // Never select a pipeline-owned version copy (2026-06-10
+                // review fix): two versions of one Mart model share the SAME
+                // stem, so without this skip the leftover (when it sits at a
+                // lower index) would be returned for the USER's model and
+                // ConnectToModel would re-init + UDP-sync into the copy.
+                if (_pipelineOwnedLocators.Contains(puLoc))
+                {
+                    Log($"TabSwitch: PU[{i}] skipped (pipeline-owned version copy)");
+                    continue;
+                }
+
+                // Never select erwin's ephemeral Review copy either: its
+                // locator is the ACTIVE model's plus ';Duplicate=YES', i.e.
+                // same stem AND same version, so neither the stem nor the
+                // version check below can tell it apart. Binding it is fatal:
+                // erwin releases the copy when the Review wizard closes and
+                // the next dispatch on the dead PU AVs natively (erwin crash
+                // 2026-06-10 10:47).
+                if (puLoc.IndexOf(";Duplicate=YES", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    Log($"TabSwitch: PU[{i}] skipped (;Duplicate=YES Review copy)");
+                    continue;
+                }
 
                 string puStem = ExtractMartStem(puLoc);
 
@@ -664,7 +765,19 @@ namespace EliteSoft.Erwin.AddIn
                 if (!string.IsNullOrEmpty(titleStem) &&
                     string.Equals(titleStem, puStem, StringComparison.OrdinalIgnoreCase))
                 {
-                    Log($"TabSwitch: matched PU[{i}] by Mart stem '{puStem}'");
+                    // Same stem can mean two open VERSIONS of one Mart model.
+                    // When both sides expose a version number, require them to
+                    // agree (title carries ?VNO=N, PU carries &version=N) so
+                    // tabbing onto v4 never binds a same-stem v1 and vice
+                    // versa. Sides without a readable version keep the old
+                    // stem-only behavior.
+                    int puVersion = ExtractLocatorVersion(puLoc);
+                    if (titleVersion > 0 && puVersion > 0 && titleVersion != puVersion)
+                    {
+                        Log($"TabSwitch: PU[{i}] stem matches but version differs (title v{titleVersion} vs PU v{puVersion}) - continuing");
+                        continue;
+                    }
+                    Log($"TabSwitch: matched PU[{i}] by Mart stem '{puStem}'{(puVersion > 0 ? $" v{puVersion}" : string.Empty)}");
                     return i;
                 }
             }
@@ -699,6 +812,127 @@ namespace EliteSoft.Erwin.AddIn
             int q = s.IndexOf('?');
             if (q >= 0) s = s.Substring(0, q);
             return s.TrimEnd('/');
+        }
+
+        /// <summary>
+        /// Extracts the Mart version number from either locator shape:
+        /// the title-parsed form ("Mart://...?VNO=N") or the PropertyBag
+        /// form ("erwin://Mart://...?&amp;version=N&amp;modelLongId=...").
+        /// Returns -1 when no version parameter is present (local models,
+        /// malformed locators) so callers can treat "unknown" explicitly.
+        /// </summary>
+        private static int ExtractLocatorVersion(string locator)
+        {
+            if (string.IsNullOrEmpty(locator)) return -1;
+            var m = System.Text.RegularExpressions.Regex.Match(
+                locator, @"[?&](?:VNO|version)=(\d+)",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            return m.Success && int.TryParse(m.Groups[1].Value, out int v) ? v : -1;
+        }
+
+        /// <summary>
+        /// Derives the locator of ANOTHER version of the same Mart model by
+        /// swapping the version parameter of the active PU's locator (e.g.
+        /// "...?&amp;version=4&amp;..." -> "...?&amp;version=1&amp;...").
+        /// erwin r10.10 keeps every other locator component (catalog path,
+        /// modelLongId) identical across versions of one model, verified
+        /// 2026-06-10 in erwin-addin-debug.log (v4 and v1 PU locators differ
+        /// only in version=). Returns null when the input has no version
+        /// parameter - the caller must then treat the reconnect guard as
+        /// NOT armed and say so in the log instead of guessing.
+        /// </summary>
+        private static string BuildVersionLocator(string activeLocator, int version)
+        {
+            if (string.IsNullOrEmpty(activeLocator) || version <= 0) return null;
+            string swapped = System.Text.RegularExpressions.Regex.Replace(
+                activeLocator, @"([?&]version=)\d+", "${1}" + version,
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            // The swap must produce a DIFFERENT locator that reads back as the
+            // requested version. An unchanged result (no version= parameter,
+            // VNO-form input which ExtractLocatorVersion accepts but the swap
+            // regex does not, or a same-version input) means "cannot derive":
+            // registering it would put the ACTIVE model's own locator into the
+            // pipeline guard, and the hard refusal gate in ConnectToModel
+            // would then refuse the user's own model. Cross-version callers
+            // always pass version != active, so equality is never legitimate.
+            if (string.Equals(swapped, activeLocator, StringComparison.OrdinalIgnoreCase)) return null;
+            return ExtractLocatorVersion(swapped) == version ? swapped : null;
+        }
+
+        /// <summary>
+        /// True when the active window-title locator points at a Mart-version
+        /// copy the DDL pipeline opened itself (see _pipelineOwnedLocators).
+        /// Stem and version are compared separately because the two locator
+        /// shapes carry the version under different keys (?VNO=N in the title
+        /// vs &amp;version=N in the PropertyBag form), so a plain string
+        /// compare can never match them.
+        /// </summary>
+        private bool IsPipelineOwnedTitleLocator(string titleLocator)
+        {
+            if (_pipelineOwnedLocators.Count == 0 || string.IsNullOrEmpty(titleLocator)) return false;
+            string titleStem = ExtractMartStem(titleLocator);
+            int titleVersion = ExtractLocatorVersion(titleLocator);
+            if (string.IsNullOrEmpty(titleStem) || titleVersion <= 0) return false;
+            foreach (string owned in _pipelineOwnedLocators)
+            {
+                if (string.Equals(titleStem, ExtractMartStem(owned), StringComparison.OrdinalIgnoreCase)
+                    && titleVersion == ExtractLocatorVersion(owned))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// First PU index the reconnect logic may bind to: skips erwin's
+        /// ephemeral ;Duplicate=YES copies and every pipeline-owned version
+        /// copy. Returns -1 when nothing adoptable is open (the caller must
+        /// then wait/disconnect instead of binding pipeline residue). Fast
+        /// path: with no guard armed, index 0 - identical to the historical
+        /// blind PU-0 pick, so behavior only changes while a leftover exists.
+        /// </summary>
+        private int FindFirstAdoptablePuIndex(dynamic persistenceUnits, int count)
+        {
+            if (count <= 0) return -1;
+            if (_pipelineOwnedLocators.Count == 0) return 0;
+            for (int i = 0; i < count; i++)
+            {
+                string loc = string.Empty;
+                try
+                {
+                    loc = Services.PuLocatorReader.Read(
+                        persistenceUnits.Item(i), allowWindowTitleFallback: false) ?? string.Empty;
+                }
+                catch (Exception ex) { Log($"FindFirstAdoptablePuIndex: PU[{i}] locator read err: {ex.Message}"); }
+                if (loc.IndexOf(";Duplicate=YES", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+                if (_pipelineOwnedLocators.Contains(loc)) continue;
+                return i;
+            }
+            return -1;
+        }
+
+        /// <summary>
+        /// Dirty gate for the cross-version Review pipeline (2026-06-10,
+        /// reworked after review): erwin's Mart > Review refuses to open on a
+        /// clean checked-out model. SCAPI dirty probes are unusable for this
+        /// gate - none of the Modified/IsDirty-style names exist on the
+        /// r10.10 PU (VersionCompareService.ProbeDirty therefore always falls
+        /// back to "assume dirty", making a ProbeDirty-based gate inert), and
+        /// DirtyBit is proven to diverge from the GUI dirty state. The gate
+        /// instead reads the GUI signal erwin itself shows: the '*' in the
+        /// active MDI child title, which matched Review's accept/refuse
+        /// behavior in every logged incident. Returns TRUE when the pipeline
+        /// may launch (dirty, or unknown - erwin stays the final authority
+        /// via the refusal-box detection in MartMartAutomation); returns
+        /// FALSE only on a POSITIVE clean reading (Mart-titled active child
+        /// with no asterisk).
+        /// </summary>
+        private bool ProbeActiveModelDirtyForReview(Action<string> log)
+        {
+            bool? dirty = Services.MartMartAutomation.IsActiveMdiChildDirtyByTitle(log);
+            log($"[REVIEW] dirty gate: title-asterisk probe = {(dirty == null ? "unknown (proceeding - erwin decides)" : dirty.Value ? "dirty" : "clean")}");
+            return dirty != false;
         }
 
         /// <summary>
@@ -814,45 +1048,101 @@ namespace EliteSoft.Erwin.AddIn
             {
                 dynamic persistenceUnits = _scapi.PersistenceUnits;
                 int count = persistenceUnits.Count;
+
+                // Pipeline-owned guard maintenance (2026-06-10). While the
+                // guard is armed, read every open PU locator ONCE up front:
+                //  - self-prune: drop guard entries whose PU is gone (closed
+                //    manually or by a late teardown). Runs BEFORE the count==0
+                //    early-return so an all-models-closed state clears the
+                //    guard too; without the prune a stale entry would make the
+                //    add-in ignore a version the user later opens on purpose.
+                //  - openGuardedCount: open PUs that are pipeline residue.
+                //    Every count comparison below uses effectiveCount (real
+                //    models only); otherwise the leftover's +1 masks the user
+                //    closing their own model and the add-in stays bound to a
+                //    dead PU (review finding, 2026-06-10).
+                // Costs one locator read per PU per tick, and only while a
+                // guard entry exists at all.
+                int openGuardedCount = 0;
+                if (_pipelineOwnedLocators.Count > 0)
+                {
+                    var openLocs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    for (int i = 0; i < count; i++)
+                    {
+                        string loc = Services.PuLocatorReader.Read(
+                            persistenceUnits.Item(i),
+                            allowWindowTitleFallback: false) ?? string.Empty;
+                        openLocs.Add(loc);
+                        if (_pipelineOwnedLocators.Contains(loc)) openGuardedCount++;
+                    }
+                    int pruned = _pipelineOwnedLocators.RemoveWhere(l => !openLocs.Contains(l));
+                    if (pruned > 0)
+                        Log($"Reconnect guard: pruned {pruned} pipeline-owned locator(s) - the version copy is closed; normal model-switch handling restored.");
+                }
+                int effectiveCount = count - openGuardedCount;
+
                 if (count == 0) return;
 
                 // Disconnected path: we have no connect cycle yet, no known
-                // locators are recorded - just bind to PU 0 and let
-                // ConnectToModel seed the set.
+                // locators are recorded - bind to the first ADOPTABLE PU (not
+                // pipeline residue, not a ;Duplicate=YES copy) and let
+                // ConnectToModel seed the set. Session-lost recovery funnels
+                // here too, so a blind PU-0 bind would adopt the leftover v1
+                // and UDP-sync into it (review finding, 2026-06-10).
                 if (!_isConnected)
                 {
-                    Log($"Model detected ({count} open). Connecting...");
-
                     _openModels.Clear();
                     for (int i = 0; i < count; i++)
                         _openModels.Add(persistenceUnits.Item(i));
 
-                    if (_openModels.Count > 0)
-                        ConnectToModel(0);
+                    int adoptIdx = FindFirstAdoptablePuIndex(persistenceUnits, count);
+                    if (adoptIdx < 0)
+                    {
+                        // Only pipeline residue remains open. Latch the log so
+                        // the 500 ms tick does not spam it while waiting.
+                        if (!_loggedPipelineOnlyPusOpen)
+                        {
+                            _loggedPipelineOnlyPusOpen = true;
+                            Log("Reconnect: only pipeline-owned version copies are open - staying disconnected. Close the leftover tab WITHOUT saving.");
+                        }
+                        return;
+                    }
+                    _loggedPipelineOnlyPusOpen = false;
+                    Log($"Model detected ({count} open). Connecting to PU[{adoptIdx}]...");
+                    ConnectToModel(adoptIdx);
                     return;
                 }
 
-                // PU count drop detection: when count < known-set size, the
-                // user just closed at least one PU. The add-in's _currentModel
-                // may now point at the closed PU or a stale CONFIG (verified
-                // 2026-05-14 11:46: degraded on Model_12, user closed it and
-                // switched focus back to the Mart model, but tick saw every
-                // remaining PU's locator empty and treated it as "no change",
-                // leaving the add-in stuck in degraded mode). Force a full
-                // re-init so ConfigContext re-resolves against whatever PU is
-                // still open. ConnectToModel(0) is the simplest pick because
-                // titleFallback becomes safe again when only one PU remains.
-                if (count < _knownLocators.Count)
+                // PU count drop detection: when the effective count (real
+                // models only) < known-set size, the user just closed at least
+                // one PU. The add-in's _currentModel may now point at the
+                // closed PU or a stale CONFIG (verified 2026-05-14 11:46:
+                // degraded on Model_12, user closed it and switched focus back
+                // to the Mart model, but tick saw every remaining PU's locator
+                // empty and treated it as "no change", leaving the add-in
+                // stuck in degraded mode). Force a full re-init so
+                // ConfigContext re-resolves against whatever REAL PU is still
+                // open; with only pipeline residue left, drop to the
+                // disconnected state instead of binding the leftover.
+                if (effectiveCount < _knownLocators.Count)
                 {
-                    Log($"PU count dropped {_knownLocators.Count} -> {count}; clearing _globalDataLoaded and reconnecting active PU so ConfigContext re-resolves.");
+                    Log($"PU count dropped {_knownLocators.Count} -> {effectiveCount} (real models; {openGuardedCount} pipeline-owned excluded); clearing _globalDataLoaded and reconnecting so ConfigContext re-resolves.");
                     _globalDataLoaded = false;
 
                     _openModels.Clear();
                     for (int i = 0; i < count; i++)
                         _openModels.Add(persistenceUnits.Item(i));
 
-                    if (_openModels.Count > 0)
-                        ConnectToModel(0);
+                    int adoptIdx = FindFirstAdoptablePuIndex(persistenceUnits, count);
+                    if (adoptIdx >= 0)
+                    {
+                        ConnectToModel(adoptIdx);
+                    }
+                    else
+                    {
+                        Log("Reconnect: no adoptable PU remains (only pipeline-owned copies) - dropping to disconnected state. Close the leftover tab WITHOUT saving.");
+                        HandleSessionLost();
+                    }
                     return;
                 }
 
@@ -893,6 +1183,22 @@ namespace EliteSoft.Erwin.AddIn
                     {
                         continue;
                     }
+
+                    // Skip Mart-version copies the DDL pipeline opened itself
+                    // (the compare RIGHT side, e.g. v1 in a v4-vs-v1 run).
+                    // Same idea as the ;Duplicate=YES guard above: these are
+                    // pipeline artifacts, not user model switches. Adopting one
+                    // ran a full ConnectToModel re-init against the copy and
+                    // UDP sync committed 6 creates INTO it (erwin-addin-debug.log
+                    // 2026-06-10 02:08:19 + 02:38:03), dirtying a model the user
+                    // never opened. The set is maintained by the cross-version
+                    // pipeline (armed pre-open, cleared when teardown proves the
+                    // PU is gone).
+                    if (_pipelineOwnedLocators.Contains(loc))
+                    {
+                        continue;
+                    }
+
                     if (!_knownLocators.Contains(loc))
                     {
                         newIndex = i;
@@ -912,14 +1218,23 @@ namespace EliteSoft.Erwin.AddIn
                     // pulls the add-in out of degraded mode when the user
                     // closes the unmapped local model and goes back to the
                     // Mart-bound one.
-                    if (count < _lastConnectPuCount)
+                    if (effectiveCount < _lastConnectPuCount)
                     {
-                        Log($"PU closed: count {_lastConnectPuCount} -> {count}; reconnecting to PU 0 with full re-init.");
+                        Log($"PU closed: count {_lastConnectPuCount} -> {effectiveCount} (real models; {openGuardedCount} pipeline-owned excluded); reconnecting with full re-init.");
                         _globalDataLoaded = false;
                         _openModels.Clear();
                         for (int i = 0; i < count; i++)
                             _openModels.Add(persistenceUnits.Item(i));
-                        ConnectToModel(0);
+                        int adoptIdx = FindFirstAdoptablePuIndex(persistenceUnits, count);
+                        if (adoptIdx >= 0)
+                        {
+                            ConnectToModel(adoptIdx);
+                        }
+                        else
+                        {
+                            Log("Reconnect: no adoptable PU remains (only pipeline-owned copies) - dropping to disconnected state. Close the leftover tab WITHOUT saving.");
+                            HandleSessionLost();
+                        }
                         return;
                     }
 
@@ -934,7 +1249,12 @@ namespace EliteSoft.Erwin.AddIn
                     // Skipped at count==1 because a single-PU run cannot tab
                     // switch, and the locator-only-diff path already covers
                     // count==2 -> count==1 transitions via PU-close.
-                    if (count > 1)
+                    // effectiveCount (real models only): with one real model
+                    // plus a pipeline leftover there is nothing to legally
+                    // switch TO - the leftover is guarded and the bound model
+                    // is already bound - so the detector would only ever fire
+                    // wrongly (e.g. onto the leftover's title).
+                    if (effectiveCount > 1)
                     {
                         string currentTitleLoc = Services.PuLocatorReader.ReadFromWindowTitle() ?? string.Empty;
 
@@ -961,6 +1281,42 @@ namespace EliteSoft.Erwin.AddIn
 
                         if (!string.Equals(currentTitleLoc, _lastObservedTitleLocator, StringComparison.OrdinalIgnoreCase))
                         {
+                            // Transient-empty debounce (2026-06-10 crash chain):
+                            // ReadFromWindowTitle returned '' for a single read
+                            // while the raw title still showed the bound Mart
+                            // model (ground truth logged at 10:43:26 - a late
+                            // compare wizard was stealing the caption at that
+                            // instant); the resulting false tab-switch bound the
+                            // ;Duplicate copy and erwin later crashed on the dead
+                            // PU. A REAL switch to a local (non-Mart) tab also
+                            // reads '', so empty cannot be ignored outright -
+                            // instead it must persist across TWO consecutive
+                            // ticks (1 s) before it counts. Non-empty changes
+                            // keep firing immediately.
+                            if (string.IsNullOrEmpty(currentTitleLoc)
+                                && !string.IsNullOrEmpty(_lastObservedTitleLocator)
+                                && !_emptyTitleDebouncePending)
+                            {
+                                _emptyTitleDebouncePending = true;
+                                return;
+                            }
+                            _emptyTitleDebouncePending = false;
+
+                            // Tab landed on a Mart-version copy the DDL pipeline
+                            // opened itself (its teardown failed to close it).
+                            // Re-binding would adopt the copy and UDP sync would
+                            // dirty it (2026-06-10 incident), so skip the
+                            // reconnect entirely. The title snapshot is still
+                            // updated: it logs once instead of every 500 ms tick,
+                            // and re-arms the detector so tabbing BACK to the
+                            // user's real model fires a normal reconnect.
+                            if (IsPipelineOwnedTitleLocator(currentTitleLoc))
+                            {
+                                Log($"Tab switch onto pipeline-owned version copy ('{currentTitleLoc}') - NOT reconnecting. Close that tab without saving to clean up.");
+                                _lastObservedTitleLocator = currentTitleLoc;
+                                return;
+                            }
+
                             Log($"Active tab switch detected: window title locator '{_lastObservedTitleLocator}' -> '{currentTitleLoc}'; reconnecting with full re-init.");
                             DumpDiagnosticsForTabSwitch("[TabSwitch] pre-reconnect ground truth", persistenceUnits, count);
                             _globalDataLoaded = false;
@@ -1012,6 +1368,28 @@ namespace EliteSoft.Erwin.AddIn
                                     string loc = Services.PuLocatorReader.Read(
                                         persistenceUnits.Item(i),
                                         allowWindowTitleFallback: false) ?? string.Empty;
+                                    // "Different from bound" must never select a
+                                    // pipeline-owned version copy - with a leftover
+                                    // open it is BY DEFINITION locator-different
+                                    // (2026-06-10 review fix; a transiently empty
+                                    // parsed title lands here and would otherwise
+                                    // adopt the copy directly).
+                                    if (_pipelineOwnedLocators.Contains(loc))
+                                    {
+                                        continue;
+                                    }
+                                    // Same for erwin's ;Duplicate=YES Review copy:
+                                    // it differs from the bound locator only by the
+                                    // suffix, so it is the FIRST thing this loop
+                                    // would pick. Exactly that bound the add-in to
+                                    // the Duplicate at 10:43:29 on 2026-06-10; the
+                                    // copy was released when the user closed the
+                                    // leftover wizard and the dead-PU dispatch
+                                    // crashed erwin (coreclr 0xC0000005).
+                                    if (loc.IndexOf(";Duplicate=YES", StringComparison.OrdinalIgnoreCase) >= 0)
+                                    {
+                                        continue;
+                                    }
                                     if (!string.Equals(loc, boundLoc, StringComparison.OrdinalIgnoreCase))
                                     {
                                         targetIndex = i;
@@ -1029,6 +1407,11 @@ namespace EliteSoft.Erwin.AddIn
                             ConnectToModel(targetIndex);
                             return;
                         }
+
+                        // Title matches the snapshot again - clear any pending
+                        // empty-title debounce so a later real transition gets
+                        // a fresh two-tick window.
+                        _emptyTitleDebouncePending = false;
                     }
 
                     // All open PUs are already in the known set; idle tick.
@@ -1785,9 +2168,12 @@ namespace EliteSoft.Erwin.AddIn
             const int cardW = 892;
 
             // --- Top Card: Repository / Connection / Diagnostics ---
-            // 5 rows fit comfortably in 158px (5 * 26 + 28 padding).
+            // 3 rows fit comfortably in 106px (3 * 26 + 28 padding). The bootstrap
+            // source (Registry hive + Database) moved to its own "System" card below
+            // 2026-06-08 so the resolved-config diagnostics (Config / Warnings / Log)
+            // stay separate from where the connection was bootstrapped from.
             const int repoY = 84;
-            const int repoH = 158;
+            const int repoH = 106;
             var card = CreateSectionCard("Repository", cardX, repoY, cardW, repoH, clrCardBg, clrCardHeader);
             AddCardRow(card, "Config:", "(not loaded)", fontBold, font, 0, out _, out _lblCorporateValue);
 #if !PACKAGED
@@ -1801,14 +2187,12 @@ namespace EliteSoft.Erwin.AddIn
             _lblCorporateValue.MaximumSize = new Size(reloadBtnLeft - 120 - 8, 0);
             _lblCorporateValue.AutoEllipsis = true;
 #endif
-            AddCardRow(card, "Database:",  "(not loaded)", fontBold, font, 1, out _, out _lblDbValue);
-            AddCardRow(card, "Registry:",  "(not loaded)", fontBold, font, 2, out _, out _lblRegistryValue);
             // Warnings row surfaces any service-load failure (schema mismatch,
             // missing rows, ConfigContext degraded mode, ...) so the user does
             // not have to dig through the log file to discover that a
             // background service silently no-op'd. Width is wide because the
             // text can carry multiple semicolon-separated reasons.
-            AddCardRow(card, "Warnings:",  "(none)",       fontBold, font, 3, out _, out _lblWarningsValue);
+            AddCardRow(card, "Warnings:",  "(none)",       fontBold, font, 1, out _, out _lblWarningsValue);
             _lblWarningsValue.MaximumSize = new Size(cardW - 160, 0);
             _lblWarningsValue.AutoSize = true;
             _lblWarningsValue.ForeColor = Color.FromArgb(120, 120, 120);
@@ -1816,11 +2200,26 @@ namespace EliteSoft.Erwin.AddIn
             // with the log file pre-selected. The Debug Log tab was removed
             // 2026-05-07 (UIA event raise from TextBox.AppendText crashed
             // erwin host); the link is the supported way to view the log.
-            AddCardRow(card, "Log file:",  AddinLogger.FilePath, fontBold, font, 4, out _, out _lblLogPathValue);
+            AddCardRow(card, "Log file:",  AddinLogger.FilePath, fontBold, font, 2, out _, out _lblLogPathValue);
             _lblLogPathValue.ForeColor = clrAccent;
             _lblLogPathValue.Cursor = Cursors.Hand;
             _lblLogPathValue.Click += (s, ev) => OpenLogFolder();
             tabGeneral.Controls.Add(card);
+
+            // --- System Card: bootstrap source (which registry hive + which DB) ---
+            // Surfaces WHERE the add-in resolved its connection from. This is the
+            // info that exposes a stale machine-wide (HKLM) seed shadowing the
+            // user's per-user (HKCU) config: Registry = the winning hive
+            // (User (HKCU) / Machine (HKLM)), Database = the bootstrap DB the
+            // add-in actually connected to. Both labels are populated in
+            // UpdateGeneralTab from DatabaseService's own bootstrap reader.
+            // 2 rows fit in 80px (2 * 26 + 28 padding).
+            const int sysY = repoY + repoH + 30 + 16;  // +30 card chrome, +16 spacing
+            const int sysH = 80;
+            var sysCard = CreateSectionCard("System", cardX, sysY, cardW, sysH, clrCardBg, clrCardHeader);
+            AddCardRow(sysCard, "Registry:", "(not loaded)", fontBold, font, 0, out _, out _lblRegistryValue);
+            AddCardRow(sysCard, "Database:", "(not loaded)", fontBold, font, 1, out _, out _lblDbValue);
+            tabGeneral.Controls.Add(sysCard);
 
             // --- Middle Card: Active Model ---
             // The legacy grpModel GroupBox sat here with an etched-border that
@@ -1828,8 +2227,8 @@ namespace EliteSoft.Erwin.AddIn
             // its child labels and re-place them inside a section card body so
             // the visual rhythm stays consistent. grpModel itself is no longer
             // added to the tab.
-            const int modelY = repoY + repoH + 30 + 16;  // +30 for card chrome, +16 spacing
-            const int modelH = 60;
+            const int modelY = sysY + sysH + 30 + 16;  // below the System card; +30 chrome, +16 spacing
+            const int modelH = 44;  // single "Model:" row now that the DBMS line is gone
             var modelCard = CreateSectionCard("Active Model", cardX, modelY, cardW, modelH, clrCardBg, clrCardHeader);
             var modelBody = modelCard.Tag as Panel;
 
@@ -1857,13 +2256,10 @@ namespace EliteSoft.Erwin.AddIn
             lblConnectionStatus.TextAlign = ContentAlignment.MiddleRight;
             modelBody.Controls.Add(lblConnectionStatus);
 
-            lblPlatformStatus.Location = new Point(16, 38);
-            lblPlatformStatus.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
-            lblPlatformStatus.AutoSize = false;
-            lblPlatformStatus.Size = new Size(cardW - 36, 18);
-            lblPlatformStatus.Font = new Font("Segoe UI", 8.5f);
-            lblPlatformStatus.ForeColor = Color.FromArgb(120, 120, 120);
-            modelBody.Controls.Add(lblPlatformStatus);
+            // The DBMS_VERSION_ID / "N standard(s)" status line (lblPlatformStatus)
+            // was removed from the Active Model card 2026-06-08 (user: unnecessary).
+            // The label still exists on grpModel (off-tab) so its setters stay
+            // harmless; it is simply no longer placed in the visible card.
 
             tabGeneral.Controls.Add(modelCard);
 
@@ -2374,6 +2770,12 @@ namespace EliteSoft.Erwin.AddIn
                 using (AddinLogger.BeginScope("UpdateGeneralTab(reload)"))
                     UpdateGeneralTab();
 
+                // Re-apply user-session tracking settings (USER_TRACKING_ENABLED /
+                // USER_TRACKING_INTERVAL_MINUTES). The interval is otherwise read
+                // once at startup, so a mid-session change (e.g. 5 -> 1 min) would
+                // be ignored until erwin restarts. Non-blocking + best-effort.
+                Services.SessionTrackingService.Instance.ReloadSettings();
+
                 Log("Reload Config: complete.");
             }
             catch (Exception ex)
@@ -2463,8 +2865,16 @@ namespace EliteSoft.Erwin.AddIn
                     _lblDbValue.ForeColor = Color.FromArgb(120, 120, 120); // secondary/gray
                 }
 
-                var bootstrapService = new RegistryBootstrapService();
-                _lblRegistryValue.Text = bootstrapService.GetConfigFilePath().StartsWith("HKLM") ? "Machine" : "User";
+                // Use the ACTUAL bootstrap reader DatabaseService resolved the
+                // config with (HKCU-first HklmFirstBootstrapReader), NOT a throwaway
+                // RegistryBootstrapService. The old code probed a different path and
+                // mislabelled the source - it showed "User" while the config had
+                // actually come from the HKLM seed, which is exactly what hid the
+                // KKBDemo-vs-MetaRepoTmp confusion. GetConfigFilePath reflects the
+                // hive the cached config was read from.
+                string hivePath = DatabaseService.Instance.BootstrapService.GetConfigFilePath() ?? "";
+                _lblRegistryValue.Text =
+                    hivePath.StartsWith("HKLM", StringComparison.OrdinalIgnoreCase) ? "Machine (HKLM)" : "User (HKCU)";
 
                 if (_lblWarningsValue != null)
                 {
@@ -3807,6 +4217,12 @@ namespace EliteSoft.Erwin.AddIn
 
             string script = null;
             string err = null;
+            // Set by the cross-version finally when the teardown could not
+            // close the version copy the pipeline opened (the reconnect guard
+            // then stays armed). Surfaced at the dialog tail below: appended
+            // to the failure modal when there is one, otherwise shown as its
+            // own warning - never silently dropped.
+            string pipelineLeftoverWarning = null;
             // Track which pipeline produced the DDL so the approval-queue row
             // captured by Forms.DdlApprovalDialog reflects the actual source
             // (admin needs this to decide which environment / target server
@@ -4195,15 +4611,16 @@ namespace EliteSoft.Erwin.AddIn
                     else
                     {
                         // Current model vs an OLDER Mart version, captured as alter
-                        // DDL. Two modes share the SAME pipeline (open right
+                        // DDL. Two entry wizards share the SAME pipeline (open right
                         // version, reach Resolve Differences, Apply-to-Right + cmd
-                        // 1057 + capture, clean teardown), differing only in the
-                        // entry wizard:
-                        //   - LEFT = "(with last changes)" [leftIsActive]  -> Review
-                        //     wizard (Faz 2): the unsaved buffer is the compare LEFT.
-                        //   - LEFT = "(last saved)" [!leftIsActive]        -> Complete
-                        //     Compare (Faz 3, WM_COMMAND 1082): the current model's
-                        //     last-saved baseline is the compare LEFT.
+                        // 1057 + capture, clean teardown):
+                        //   - DIRTY model  -> Review wizard (Faz 2): the unsaved
+                        //     buffer is the compare LEFT.
+                        //   - CLEAN model  -> Complete Compare (Faz 3, WM_COMMAND
+                        //     1082): the current model's last-saved baseline is the
+                        //     LEFT. Routed by the dirty gate below, and ALSO chosen
+                        //     in-flight when erwin refuses Review on a model the
+                        //     gate thought dirty (the title asterisk over-reports).
                         bool useCompleteCompare = !leftIsActive;
                         string catalog = ParseActivePuCatalog();
                         if (v <= 0 || string.IsNullOrEmpty(catalog))
@@ -4212,6 +4629,29 @@ namespace EliteSoft.Erwin.AddIn
                         }
                         else
                         {
+                            // Dirty gate as a ROUTER, not a blocker (user
+                            // requirement 2026-06-10: a clean model must still
+                            // compare against an older version). A positively
+                            // clean reading means erwin's Mart > Review would
+                            // refuse ("There have been no changes to model
+                            // since it was checked out"), so launch straight
+                            // via Complete Compare (WM_COMMAND 1082) whose
+                            // LEFT is the current model's last-saved state -
+                            // for a clean checked-out model that is the SAME
+                            // compare, with no dirty precondition. A dirty or
+                            // unknown reading keeps the proven Review entry;
+                            // if erwin still refuses (the title asterisk is
+                            // known to over-report - it was set on every
+                            // "clean" run on 2026-06-10 while Review said no
+                            // changes), DriveCompareToResolveDifferences
+                            // dismisses the refusal box and relaunches via
+                            // Complete Compare in the same session.
+                            if (!useCompleteCompare && !ProbeActiveModelDirtyForReview(log))
+                            {
+                                useCompleteCompare = true;
+                                log("[REVIEW] dirty gate: model is positively clean - routing to Complete Compare (1082; Review would refuse).");
+                            }
+
                             // This path is one of the pixel-jump routes forced into
                             // INTERACTIVE wizard mode at the top of this handler (visible
                             // windows + short settle pauses). keepVisible / SyncDebugVisibility
@@ -4230,6 +4670,27 @@ namespace EliteSoft.Erwin.AddIn
                             try { _validationService?.StopMonitoring(); } catch (Exception ex) { log($"[REVIEW] ColumnValidation StopMonitoring err: {ex.Message}"); }
                             log("[REVIEW] monitoring suspended + reconnect timer stopped for pipeline");
 
+                            // Reconnect guard (2026-06-10): register the locator of
+                            // the version PU this pipeline is ABOUT to open so the
+                            // resumed reconnect tick can never mistake it for a user
+                            // model switch (the tick's new-PU scan and the tab-switch
+                            // path both skip pipeline-owned locators). Armed BEFORE
+                            // Mart > Open: the timer is stopped above, but the guard
+                            // must already be in place for the restart in the finally
+                            // because the teardown cannot always prove the PU is gone
+                            // (verified 02:08 + 02:37 incidents: leftover v1 adopted,
+                            // UDP sync dirtied it, form re-bound to v1).
+                            string ownedLocator = BuildVersionLocator(_lastConnectedLocator, v);
+                            if (ownedLocator != null)
+                            {
+                                _pipelineOwnedLocators.Add(ownedLocator);
+                                log($"[REVIEW] reconnect guard armed for pipeline-owned locator '{ownedLocator}'");
+                            }
+                            else
+                            {
+                                log($"[REVIEW] WARN: could not derive a v{v} locator from '{_lastConnectedLocator}' - reconnect guard NOT armed; a leftover v{v} copy would still trigger a model switch.");
+                            }
+
                             var overlay = ShowBusyOverlay("Comparing versions, please wait...");
                             Services.MartMartAutomation.CCSession rsess = null;
                             try
@@ -4245,7 +4706,17 @@ namespace EliteSoft.Erwin.AddIn
 
                                 if (rsess == null || rsess.ResolveDifferences == IntPtr.Zero)
                                 {
-                                    err = "Compare wizard did not reach Resolve Differences (see Debug Log). " +
+                                    // Precise text beats the generic timeout one:
+                                    // ReviewRefusedNoChanges here means erwin refused
+                                    // Review (clean model) AND the in-session Complete
+                                    // Compare relaunch ALSO failed to reach the wizard
+                                    // (when the relaunch works, RD is reached and this
+                                    // branch is never entered).
+                                    err = (rsess != null && rsess.ReviewRefusedNoChanges)
+                                        ? "erwin, Review karşılaştırmasını reddetti (modelde checkout'tan beri değişiklik yok) " +
+                                          "ve Complete Compare ile yeniden deneme de wizard'a ulaşamadı.\n\n" +
+                                          "Ayrıntı için Debug Log'a bakın ve tekrar deneyin."
+                                        : "Compare wizard did not reach Resolve Differences (see Debug Log). " +
                                           "If the active model has no unsaved changes, Review cannot open.";
                                 }
                                 else
@@ -4371,16 +4842,61 @@ namespace EliteSoft.Erwin.AddIn
                                 // dialogs flash briefly but that is acceptable.
                                 try { overlay?.Close(); } catch { }
 
+                                bool teardownModalUp = false;
                                 if (rsess != null)
                                 {
                                     try
                                     {
-                                        LogSessionPUs("REVIEW-PRE-CLOSE", log);
+                                        // SCAPI on this STA thread deadlocks while an
+                                        // erwin modal disables the main window (same
+                                        // hazard the reconnect tick guards against,
+                                        // verified 2026-05-29) - and the teardown has
+                                        // DESIGNED exits that leave Save Models /
+                                        // Mart Offline up for the user. Gate every
+                                        // PU walk here on the modal check.
+                                        if (!Services.Win32Helper.IsErwinMainWindowBlockedByModal())
+                                            LogSessionPUs("REVIEW-PRE-CLOSE", log);
                                         await System.Threading.Tasks.Task.Run(() =>
                                             Services.MartMartAutomation.CloseReviewSession(rsess, (Action<string>)log));
-                                        LogSessionPUs("REVIEW-POST-CLOSE", log);
+                                        teardownModalUp = Services.Win32Helper.IsErwinMainWindowBlockedByModal();
+                                        if (!teardownModalUp)
+                                            LogSessionPUs("REVIEW-POST-CLOSE", log);
+                                        else
+                                            log("[REVIEW] erwin is modal-blocked after teardown (a close dialog was left for the user) - skipping SCAPI PU diagnostics to avoid the STA deadlock.");
                                     }
                                     catch (Exception ex) { log($"[REVIEW] teardown err: {ex.Message}"); }
+                                }
+
+                                // Reconnect guard resolution: disarm only when the
+                                // POST-CLOSE PU scan PROVES the pipeline's version
+                                // copy is gone. The old "v1 closed silently" verdict
+                                // was a false positive (2026-06-10: the PU survived,
+                                // the resumed tick adopted it, UDP sync dirtied it),
+                                // so the guard stays armed on any doubt and the user
+                                // is told explicitly - no silent leftover state. The
+                                // tick also self-prunes the guard once the copy's PU
+                                // disappears, so a manual close re-enables normal
+                                // model-switch handling for that version. When a
+                                // teardown modal is still up, the proof walk is
+                                // skipped entirely (STA deadlock) - keep the guard
+                                // and warn; the tick's prune owns the cleanup.
+                                if (ownedLocator != null)
+                                {
+                                    if (!teardownModalUp && !IsPuLocatorStillLoaded(ownedLocator, log))
+                                    {
+                                        _pipelineOwnedLocators.Remove(ownedLocator);
+                                        log($"[REVIEW] reconnect guard disarmed - pipeline-owned v{v} copy is gone.");
+                                    }
+                                    else
+                                    {
+                                        pipelineLeftoverWarning =
+                                            $"The v{v} copy opened for the compare could not be closed automatically.\n\n" +
+                                            "Close its tab manually WITHOUT saving (choose 'Save to: Close' if the " +
+                                            "Mart Offline dialog asks).\n\n" +
+                                            "Until then the add-in deliberately ignores that copy: no reconnect, " +
+                                            "no UDP sync against it.";
+                                        log($"[REVIEW] WARN: pipeline-owned v{v} copy {(teardownModalUp ? "unverifiable (modal up)" : "still loaded")} after teardown - reconnect guard stays armed; user will be warned to close it without saving.");
+                                    }
                                 }
 
                                 // Resume monitoring fire-and-forget. Clear the
@@ -4433,6 +4949,16 @@ namespace EliteSoft.Erwin.AddIn
             if (Services.DebugMode.KeepDialogsVisible || (dwmWarmupRun && !string.IsNullOrEmpty(script)))
             {
                 _dwmWarmedThisSession = true;
+            }
+
+            // Leftover version copy after a failed teardown: fold the cleanup
+            // instruction into the failure modal when there is one (a single
+            // dialog beats two stacked modals), otherwise it is shown on its
+            // own after the result chain below.
+            if (pipelineLeftoverWarning != null && err != null)
+            {
+                err = err + "\n\n" + pipelineLeftoverWarning;
+                pipelineLeftoverWarning = null;
             }
 
             if (err != null)
@@ -4506,6 +5032,14 @@ namespace EliteSoft.Erwin.AddIn
                 // runs.
                 if (martMode || dbMode)
                     LogSessionPUs("POST-RUN", log);
+            }
+
+            // Success (or no-diff) run that still left the pipeline's version
+            // copy open: tell the user how to clean up. The failure path above
+            // already folded this text into its own modal and nulled it.
+            if (pipelineLeftoverWarning != null)
+            {
+                ErwinAddIn.ShowTopMostMessage(pipelineLeftoverWarning, "Generate DDL - cleanup needed", isError: true);
             }
 
             btnAlterWizardProd.Enabled = true;
@@ -6857,6 +7391,16 @@ namespace EliteSoft.Erwin.AddIn
                 this.WindowState = FormWindowState.Minimized;
                 return;
             }
+
+            // The add-in is genuinely closing now (erwin/Windows shutdown,
+            // TaskKill, or our ForceClose). Stamp the session END_TIME from this
+            // managed close event - it is far more reliable than
+            // AppDomain.ProcessExit, which erwin's native COM-host teardown does
+            // NOT raise dependably (observed: a manual erwin close left END_TIME
+            // NULL). Bounded internally so a slow repo cannot hang the close.
+            try { Services.SessionTrackingService.Instance.NotifyHostClosing(); }
+            catch (Exception ex) { Log($"SessionTracking NotifyHostClosing error: {ex.Message}"); }
+
             base.OnFormClosing(e);
         }
 
@@ -6941,6 +7485,50 @@ namespace EliteSoft.Erwin.AddIn
             catch (Exception ex)
             {
                 log?.Invoke($"  [DIAG {phase}] err: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// True when a PU with exactly this locator is still loaded in the
+        /// SCAPI session. Used by the cross-version pipeline finally to decide
+        /// whether the reconnect guard for the pipeline-opened version copy can
+        /// be disarmed. Read errors return TRUE (keep the guard armed): a guard
+        /// that outlives the copy is self-pruned by the reconnect tick, while a
+        /// guard dropped on a still-loaded copy re-opens the adopt-and-dirty
+        /// hole this fix closes (2026-06-10 incident).
+        /// </summary>
+        private bool IsPuLocatorStillLoaded(string locator, Action<string> log)
+        {
+            try
+            {
+                dynamic pus = _scapi?.PersistenceUnits;
+                if (pus == null) return false;
+                int count = (int)pus.Count;
+                bool anyReadFailed = false;
+                for (int i = 0; i < count; i++)
+                {
+                    dynamic pu = null;
+                    try { pu = pus.Item(i); } catch (Exception ex) { log?.Invoke($"[REVIEW] leftover check: PU[{i}] read err: {ex.Message}"); anyReadFailed = true; continue; }
+                    if (pu == null) continue;
+                    string loc = string.Empty;
+                    try { loc = Services.PuLocatorReader.Read(pu, allowWindowTitleFallback: false) ?? string.Empty; }
+                    catch (Exception ex) { log?.Invoke($"[REVIEW] leftover check: PU[{i}] locator err: {ex.Message}"); anyReadFailed = true; }
+                    if (string.Equals(loc, locator, StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+                // A failed per-PU read means the copy may be hiding behind the
+                // failure - honor the keep-armed-on-doubt contract.
+                if (anyReadFailed)
+                {
+                    log?.Invoke("[REVIEW] leftover check inconclusive (a PU read failed) - keeping reconnect guard armed.");
+                    return true;
+                }
+                return false;
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"[REVIEW] leftover check failed ({ex.Message}) - keeping reconnect guard armed.");
+                return true;
             }
         }
 

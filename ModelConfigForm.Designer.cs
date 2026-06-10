@@ -101,7 +101,7 @@ namespace EliteSoft.Erwin.AddIn
             this.tabControl.Location = new System.Drawing.Point(16, 16);
             this.tabControl.Name = "tabControl";
             this.tabControl.SelectedIndex = 0;
-            this.tabControl.Size = new System.Drawing.Size(948, 580);
+            this.tabControl.Size = new System.Drawing.Size(948, 640);
             this.tabControl.TabIndex = 0;
             this.tabControl.Font = fontBody;
             this.tabControl.SelectedIndexChanged += new System.EventHandler(this.tabControl_SelectedIndexChanged);
@@ -629,14 +629,20 @@ namespace EliteSoft.Erwin.AddIn
             // ================================================================
             this.AutoScaleDimensions = new System.Drawing.SizeF(7F, 17F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
-            this.ClientSize = new System.Drawing.Size(980, 660);
+            // Height raised 660 -> 720 (2026-06-08) to fit the new "System" card on
+            // the General tab without pushing the footer (Close erwin / copyright)
+            // past the visible tab area. The tabControl is Bottom-anchored so it
+            // absorbs the extra height automatically.
+            this.ClientSize = new System.Drawing.Size(980, 720);
             this.Controls.Add(this.tabControl);
             this.Controls.Add(this.pnlStatusSep);
             this.Controls.Add(this.pnlStatusBar);
             this.Font = fontBody;
             this.BackColor = System.Drawing.Color.White;
             this.FormBorderStyle = System.Windows.Forms.FormBorderStyle.Sizable;
-            this.MinimumSize = new System.Drawing.Size(800, 500);
+            // Floor raised 500 -> 700 (2026-06-08) so the General tab's General
+            // cards + Close-erwin footer stay reachable after the new System card.
+            this.MinimumSize = new System.Drawing.Size(800, 700);
             this.MaximizeBox = true;
             this.MinimizeBox = true;
             this.Name = "ModelConfigForm";

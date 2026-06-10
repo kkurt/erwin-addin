@@ -1435,3 +1435,27 @@ infer from one tool's behaviour or one comment.
 alone - it is convention-dependent (full path vs leaf). Key on
 owner-from-`tag_Udp_Owner_Type` + leaf. Reading UDP VALUES is already
 name-independent (reconstruct `{Owner}.Physical.{leaf}`), so that path was fine.
+
+## 2026-06-10: Gating on a probe that does not exist on the live system
+
+**What happened:** Phase 4 of the DDL pipeline fix gated the cross-version
+compare on VersionCompareService.ProbeDirty. The adversarial review proved the
+gate was INERT: none of the probed property names (Modified/IsDirty/Dirty/
+HasChanges) exist on the r10.10 PU dispatch surface, so the probe ALWAYS fell
+back to "assume dirty" and the gate could never block. The plan checkbox said
+"done" while the shipped behavior did not match the promise.
+
+**Why (the trap):** I reused an existing helper because the Save flow calls it,
+without checking whether it ever produced a real reading in production logs
+(every LogSessionPUs line printed "?" for the same probes - the evidence was
+already in the log). A second layer of the same trap followed: the replacement
+signal (title asterisk) was verified for one direction only - asterisk-free
+means clean held, but asterisk-present did NOT mean Review would accept
+(it over-reports right after open).
+
+**How to apply:** before gating any behavior on a probe/signal, (1) grep the
+live debug log for proof the probe ever returned a real value in production,
+(2) verify BOTH directions of the signal against the authority (here: erwin's
+own accept/refuse), and (3) design the gate to fail OPEN toward the authority
+with an in-flight detection of the authoritative answer (the refusal-box
+detection + Complete Compare relaunch is the pattern that survived).

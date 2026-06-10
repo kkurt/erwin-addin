@@ -323,6 +323,27 @@ namespace EliteSoft.Erwin.AddIn.Services
             return true;
         }
 
+        // Concatenates the text of every "Static"-class child of a dialog -
+        // enough to recognize a message box by its body text without touching
+        // UIA (which leaves crash-prone XTP IAccessible RCWs behind).
+        private static string CollectDialogStaticText(IntPtr dlg)
+        {
+            if (dlg == IntPtr.Zero) return string.Empty;
+            var sb = new StringBuilder();
+            EnumChildWindows(dlg, (h, _) =>
+            {
+                var cls = new StringBuilder(32);
+                GetClassName(h, cls, cls.Capacity);
+                if (cls.ToString().IndexOf("Static", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    string t = GetTitle(h);
+                    if (!string.IsNullOrWhiteSpace(t)) sb.Append(t).Append(' ');
+                }
+                return true;
+            }, IntPtr.Zero);
+            return sb.ToString();
+        }
+
         // Public Win32 trigger of Mart > Review (cmd 1168) for the addin's manual
         // Review entry point, replacing Win32Helper.InvokeToolbarButton (UIA).
         public static bool PostMartReviewCommand(IntPtr erwinMain, Action<string> log)
@@ -591,6 +612,42 @@ namespace EliteSoft.Erwin.AddIn.Services
             public IntPtr CCWizard;
             public IntPtr ResolveDifferences;
             public bool Applied;
+            // The MDI child that was active when the pipeline started (the
+            // user's dirty compare-LEFT model). Teardown re-activates it so
+            // the main-window title agrees with the add-in's bound model
+            // again (a wrong active tab reads as a user tab-switch).
+            public IntPtr OriginalChild;
+            // The Mart version the pipeline opened as compare RIGHT. Lets
+            // teardown find a LATE-arriving version child by title when the
+            // open-wait timed out before the child was detected (then
+            // VersionChild is Zero but the window exists anyway).
+            public int RightVersion;
+            // True once the picker's Open was actually clicked - the only
+            // state in which a late version child can exist at all. Teardown
+            // must not title-scan otherwise (it could grab a child the USER
+            // opened, not the pipeline).
+            public bool OpenPosted;
+            // True when erwin answered Mart > Review with its "There have
+            // been no changes to model since it was checked out." info box
+            // instead of the wizard (clean checked-out model). The caller
+            // surfaces a precise error instead of the generic "did not reach
+            // Resolve Differences".
+            public bool ReviewRefusedNoChanges;
+            // True once the Review/CC launch command was posted. Combined
+            // with CCWizard==Zero it means the wizard may still appear LATE
+            // (erwin builds the ;Duplicate=YES copy of the LEFT model before
+            // showing the wizard - 6-15 s on a slow machine, observed
+            // 2026-06-10 10:28/10:43). Teardown then watches for the late
+            // wizard and cancels it so the Duplicate is released under our
+            // control instead of dangling behind an abandoned wizard.
+            public bool WizardLaunchPosted;
+            // Dialog snapshot taken right before the wizard launch post; the
+            // late-wizard watch diffs against it.
+            public System.Collections.Generic.HashSet<IntPtr> DialogsBeforeWizard;
+            // MDI children that existed BEFORE the pipeline opened anything.
+            // The late-child title scan excludes these so a version tab the
+            // user had open all along is never mistaken for pipeline residue.
+            public System.Collections.Generic.HashSet<IntPtr> PreexistingChildren;
             // UI-Open path (Faz 2): the prior-version model opened as its own
             // MDI child to serve as the compare RIGHT side. Closed via
             // CloseMartMdiChild in cleanup (graceful WM_CLOSE - no PUs.Remove).
@@ -730,7 +787,14 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // flip back to it after opening the version child.
                 IntPtr dirtyChild = GetActiveMdiChild(mdiClient);
                 log?.Invoke($"  [REVIEW] active dirty child = 0x{dirtyChild.ToInt64():X} title='{GetTitle(dirtyChild)}'");
-                var beforeChildren = new System.Collections.Generic.HashSet<IntPtr>(EnumMartMdiChildHandles(mdiClient));
+                session.OriginalChild = dirtyChild;
+                session.RightVersion = rightVersion;
+                // ALL children, not just Mart-titled ones: the new-child wait
+                // diffs handles title-independently (see WaitForNewMartMdiChild),
+                // so a pre-existing local (non-Mart) child must be in the
+                // snapshot or it would be misread as the freshly opened version.
+                var beforeChildren = new System.Collections.Generic.HashSet<IntPtr>(EnumAllMdiChildHandles(mdiClient));
+                session.PreexistingChildren = beforeChildren;
 
                 // ---- STEP 1: open the older version as ITS OWN MDI child via
                 // erwin's privileged main "Open" (not SCAPI, not the wizard
@@ -755,7 +819,16 @@ namespace EliteSoft.Erwin.AddIn.Services
                     PostMessage(picker, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero);
                     return session;
                 }
-                IntPtr versionChild = WaitForNewMartMdiChild(mdiClient, beforeChildren, 8000, log);
+                // The picker's Open is now in flight - from here on a version
+                // child may exist even if its detection below times out, so
+                // teardown is allowed to title-scan for a late arrival.
+                session.OpenPosted = true;
+                // 30 s budget (was 8 s): on a cold erwin the Mart open of the
+                // version copy exceeded 10 s and the abort left the half-loaded
+                // PU behind (2026-06-10 02:36 incident). The wait returns as
+                // soon as the child's Mart:// title lands, so warm runs are
+                // not slowed down by the larger ceiling.
+                IntPtr versionChild = WaitForNewMartMdiChild(mdiClient, beforeChildren, 30000, log);
                 if (versionChild == IntPtr.Zero) { log?.Invoke("  [REVIEW] version MDI child did not appear after Open."); return session; }
                 session.VersionChild = versionChild;
                 log?.Invoke($"  [REVIEW-2] v{rightVersion} opened as MDI child 0x{versionChild.ToInt64():X}");
@@ -772,6 +845,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // Compare (Faz 3) uses WM_COMMAND 1082 on the main frame. Both
                 // open a wizard whose Right Model page we navigate to below.
                 var dialogsBeforeReview = EnumerateVisibleDialogs();
+                session.DialogsBeforeWizard = dialogsBeforeReview;
                 if (useCompleteCompare)
                 {
                     log?.Invoke("  [REVIEW-3] launching Complete Compare (WM_COMMAND 1082; LEFT = current model last-saved baseline)");
@@ -787,7 +861,17 @@ namespace EliteSoft.Erwin.AddIn.Services
                     PostMessage(erwinMain, WM_COMMAND, MakeWParam(CMD_MART_REVIEW, 0), IntPtr.Zero);
                     log?.Invoke($"  [REVIEW] Mart > Review posted (WM_COMMAND {CMD_MART_REVIEW}). NO UIA.");
                 }
-                IntPtr ccWizard = WaitForNewDialog(dialogsBeforeReview, useCompleteCompare ? "Complete Compare wizard" : "Review wizard", 6000, log);
+                session.WizardLaunchPosted = true;
+                // 30 s budget (was 6 s): before showing the wizard erwin first
+                // builds the ;Duplicate=YES copy of the LEFT model, which took
+                // 7-15 s on a cold machine (2026-06-10 10:28/10:43 runs). The
+                // old 6 s timeout abandoned a wizard that then appeared late,
+                // stayed open with its Duplicate PU alive, and the dangling
+                // copy ultimately crashed erwin when the user closed the
+                // wizard manually and the add-in later dispatched on the dead
+                // PU. The refusal info box still arrives in <200 ms, so the
+                // larger ceiling costs nothing on the clean-model path.
+                IntPtr ccWizard = WaitForNewDialog(dialogsBeforeReview, useCompleteCompare ? "Complete Compare wizard" : "Review wizard", 30000, log);
                 if (ccWizard == IntPtr.Zero)
                 {
                     log?.Invoke(useCompleteCompare
@@ -795,6 +879,52 @@ namespace EliteSoft.Erwin.AddIn.Services
                         : "  [REVIEW] wizard did not open - active model may have NO changes (Review needs dirty edits).");
                     return session;
                 }
+
+                // Validate the capture (2026-06-10): WaitForNewDialog returns
+                // ANY new dialog. On a clean checked-out model erwin answers
+                // Mart > Review with the "There have been no changes to model
+                // since it was checked out." info box, which the old code
+                // adopted as the wizard and then died 30+ s later at the Right
+                // Model page probe (id=1083 not found) with a misleading
+                // generic error. Recognize the box by its Static text, dismiss
+                // it via its REAL OK button (an OK-only message box ignores
+                // WM_COMMAND IDCANCEL - proven by the modal that survived the
+                // 01:50 run's teardown and blocked the 01:51 run), then
+                // RELAUNCH via Complete Compare (user requirement 2026-06-10:
+                // a clean model MUST still compare against an older version).
+                // erwin's refusal proves the open state equals the checked-out
+                // baseline, so CC's LEFT (the current model's last-saved
+                // state, no dirty precondition - the dormant Faz-3 entry,
+                // built+tested 2026-05-29) is semantically the SAME compare.
+                // The already-open v1 child and the whole downstream wizard
+                // navigation are reused as-is.
+                string staticText = CollectDialogStaticText(ccWizard);
+                if (staticText.IndexOf("There have been no changes", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    log?.Invoke($"  [REVIEW] erwin REFUSED Review: '{staticText.Trim()}' (no changes since checkout) - dismissing the info box and relaunching via Complete Compare.");
+                    if (!ClickDialogButtonByTextWin32(ccWizard, new[] { "OK", "Tamam" }, log))
+                    {
+                        IntPtr okBtn = GetDlgItem(ccWizard, IDOK);
+                        PostMessage(ccWizard, WM_COMMAND, MakeWParam(IDOK, 0), okBtn);
+                        log?.Invoke("  [REVIEW] OK button not found by text - posted WM_COMMAND IDOK as fallback.");
+                    }
+                    session.ReviewRefusedNoChanges = true;
+                    Thread.Sleep(400); // let the info box finish closing before the next dialog snapshot
+
+                    dialogsBeforeReview = EnumerateVisibleDialogs();
+                    session.DialogsBeforeWizard = dialogsBeforeReview;
+                    log?.Invoke("  [REVIEW-3b] launching Complete Compare (WM_COMMAND 1082; LEFT = current model last-saved baseline)");
+                    ForceForeground(erwinMain);
+                    PostMessage(erwinMain, WM_COMMAND, MakeWParam(CMD_COMPLETE_COMPARE, 0), IntPtr.Zero);
+                    useCompleteCompare = true;
+                    ccWizard = WaitForNewDialog(dialogsBeforeReview, "Complete Compare wizard", 30000, log);
+                    if (ccWizard == IntPtr.Zero)
+                    {
+                        log?.Invoke("  [REVIEW] Complete Compare wizard did not open after the Review refusal relaunch.");
+                        return session;
+                    }
+                }
+
                 if (!keepVisible) HideWindow(ccWizard);
                 session.CCWizard = ccWizard;
                 DebugMode.Pause("Review wizard opened", log);
@@ -3303,15 +3433,21 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// Review-path teardown (2026-05-29, synchronous - call via Task.Run so
         /// erwin's STA UI thread stays free to surface its dialogs). Gracefully
         /// IDCANCELs the RD then the CC wizard (releases the ;Duplicate=YES left
-        /// copy), then WM_CLOSEs the loaded version child (v1). erwin's Complete
-        /// Compare dirties v1 during the diff, so WM_CLOSE raises a "Save Models"
-        /// prompt; we close it WITHOUT saving (uncheck the single save row + OK)
-        /// then drive the follow-up "Mart Offline" dialog to Save-to=Close. A hard
-        /// single-row guard (the dialog only ever lists the one model being closed
-        /// = v1; the active dirty v2 is never in it) means v2 can never be touched.
-        /// If the guard trips we leave the dialog for the user. The reconnect
-        /// timer's modal-guard + the pipeline flag staying true keep erwin
-        /// responsive while the dialogs are up.
+        /// copy), then WM_CLOSEs the loaded version child (v1) - adopting a
+        /// LATE-arriving child by title first when the open-wait had timed out.
+        /// The close-dialog cascade ("Save Models" / "Close Model" for a dirty
+        /// child, "Mart Offline" for a clean Mart child - possibly with NO Save
+        /// Models before it) is swept in any order, then the child's death is
+        /// VERIFIED (IsWindow) with one WM_CLOSE retry; an unclosable child is
+        /// reported loudly so the caller's reconnect guard + user warning take
+        /// over (2026-06-10 rework - the old gated chain declared "teardown
+        /// clean" while the child was still open). A hard single-row guard
+        /// (the dialog only ever lists the one model being closed = v1; the
+        /// active dirty v2 is never in it) means v2 can never be touched; if
+        /// the guard trips we leave the dialogs for the user. Finishes by
+        /// re-activating the user's original MDI child. The reconnect timer's
+        /// modal-guard + the pipeline flag staying true keep erwin responsive
+        /// while the dialogs are up.
         /// </summary>
         public static void CloseReviewSession(CCSession s, Action<string> log)
         {
@@ -3319,6 +3455,44 @@ namespace EliteSoft.Erwin.AddIn.Services
             const int IDCANCEL = 2;
             try
             {
+                // Late-wizard adoption (2026-06-10 crash fix): when the launch
+                // was posted but the wizard never got captured (the open-wait
+                // timed out while erwin was still building the ;Duplicate=YES
+                // copy), the wizard can appear AFTER the abort. Left alone it
+                // keeps the Duplicate PU alive; the user eventually closes the
+                // wizard manually, erwin releases the Duplicate, and any
+                // add-in dispatch on a stale binding to it AVs natively
+                // (erwin crash 10:47, coreclr 0xC0000005 in
+                // ParseActivePuVersion). Watch for it briefly and adopt it so
+                // the IDCANCEL below releases the Duplicate under our control.
+                // Skipped on the refusal path (the captured "no changes" box
+                // was already dismissed; no wizard is coming).
+                if (s.WizardLaunchPosted && !s.ReviewRefusedNoChanges
+                    && s.CCWizard == IntPtr.Zero && s.DialogsBeforeWizard != null)
+                {
+                    IntPtr lateWiz = WaitForNewDialog(s.DialogsBeforeWizard, "late compare wizard", 15000, log);
+                    if (lateWiz != IntPtr.Zero)
+                    {
+                        // Don't adopt the no-changes info box as a wizard here
+                        // either (same validation as the launch path).
+                        string lateText = CollectDialogStaticText(lateWiz);
+                        if (lateText.IndexOf("There have been no changes", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            log?.Invoke("  [REVIEW-CLEAN] late dialog is the 'no changes' info box - dismissing via OK, no wizard to cancel.");
+                            ClickDialogButtonByTextWin32(lateWiz, new[] { "OK", "Tamam" }, log);
+                        }
+                        else
+                        {
+                            log?.Invoke($"  [REVIEW-CLEAN] adopted LATE compare wizard 0x{lateWiz.ToInt64():X} ('{GetTitle(lateWiz)}') - cancelling it so erwin releases the ;Duplicate copy.");
+                            s.CCWizard = lateWiz;
+                        }
+                    }
+                    else
+                    {
+                        log?.Invoke("  [REVIEW-CLEAN] no late compare wizard appeared within 15 s - if erwin shows one later, close it manually (Cancel).");
+                    }
+                }
+
                 if (s.ResolveDifferences != IntPtr.Zero && IsWindow(s.ResolveDifferences))
                 {
                     log?.Invoke($"  [REVIEW-CLEAN] IDCANCEL RD 0x{s.ResolveDifferences.ToInt64():X}");
@@ -3332,10 +3506,41 @@ namespace EliteSoft.Erwin.AddIn.Services
                     Thread.Sleep(800);
                 }
 
+                // Late-arrival adoption (2026-06-10): when the open-wait timed
+                // out, VersionChild is Zero but the version copy's window may
+                // exist anyway (it appeared after the abort on a cold erwin).
+                // Find it by version-token title, excluding every child that
+                // already existed before the pipeline (so a tab the USER had
+                // open is never touched) - and only when the pipeline really
+                // clicked the picker's Open (OpenPosted). POLLED for up to
+                // 10 s: this branch fires precisely because the Mart:// title
+                // had not landed within the open-wait, so a single instant
+                // scan would usually miss the still-loading child (review
+                // finding); the poll exits as soon as the title lands.
+                if (s.VersionChild == IntPtr.Zero && s.OpenPosted && s.RightVersion > 0)
+                {
+                    int lateWaited = 0;
+                    while (lateWaited < 10000)
+                    {
+                        IntPtr late = FindPipelineVersionChild(s, log);
+                        if (late != IntPtr.Zero)
+                        {
+                            log?.Invoke($"  [REVIEW-CLEAN] adopted LATE version child 0x{late.ToInt64():X} ('{GetTitle(late)}') after {lateWaited} ms - the open-wait had timed out before it appeared.");
+                            s.VersionChild = late;
+                            break;
+                        }
+                        Thread.Sleep(250);
+                        lateWaited += 250;
+                    }
+                    if (s.VersionChild == IntPtr.Zero)
+                        log?.Invoke("  [REVIEW-CLEAN] late-child poll expired (10 s) - no pipeline version child found by title; the caller's reconnect guard + warning own any surviving PU.");
+                }
+
                 // WM_CLOSE the loaded version child (v1) by HANDLE. erwin's CC
                 // engine dirties v1 during the compare (verified by the
                 // [REVIEW-DIRTY] checkpoints), so this raises a "Save Models"
-                // prompt that CloseSaveModelsWithoutSaving handles below.
+                // prompt that the sweep below handles.
+                bool childKnownGone;
                 if (s.VersionChild != IntPtr.Zero && IsWindow(s.VersionChild))
                 {
                     string vt = GetTitle(s.VersionChild);
@@ -3343,51 +3548,176 @@ namespace EliteSoft.Erwin.AddIn.Services
                     log?.Invoke($"  [REVIEW-CLEAN] WM_CLOSE version child 0x{s.VersionChild.ToInt64():X} (dirty={(wasDirty ? "YES" : "no")}) ('{vt}')");
                     PostMessage(s.VersionChild, WM_CLOSE_MSG, IntPtr.Zero, IntPtr.Zero);
                     Thread.Sleep(600);
-                    if (!IsWindow(s.VersionChild))
+                    childKnownGone = !IsWindow(s.VersionChild);
+                    if (childKnownGone)
                         log?.Invoke("  [REVIEW-CLEAN] version child closed cleanly (no prompt) - session back to the active model only.");
                     else
-                        log?.Invoke("  [REVIEW-CLEAN] version child still alive after WM_CLOSE - handling the Save Models prompt without saving.");
+                        log?.Invoke("  [REVIEW-CLEAN] version child still alive after WM_CLOSE - sweeping the close-dialog cascade.");
                 }
                 else
                 {
                     log?.Invoke("  [REVIEW-CLEAN] version child gone/invalid - nothing to close.");
+                    childKnownGone = true;
                 }
 
-                // Close the "Save Models" prompt WITHOUT saving, then drive the
-                // follow-up "Mart Offline" dialog to Save-to=Close - BOTH via PURE
-                // WIN32 (2026-06-02), matching the From-DB teardown fix. The old
-                // CloseSaveModelsWithoutSaving + DismissMartOfflineDialog path used
-                // UI Automation (AutomationElement.FromHandle on these two dialogs),
-                // whose abandoned XTP IAccessible RCWs crash erwin's finalizer when
-                // the dialogs are destroyed (the same teardown ExecutionEngine-
-                // Exception fixed for From-DB). CloseSaveModelsWin32 runs with
-                // guardSingleRow=true for v2 protection (the active dirty model must
-                // never be in this dialog). If the Save Models Win32 dismiss safely
-                // aborts (guard / cursor-land safety) we leave both dialogs for the
-                // user and do NOT touch Mart Offline.
-                IntPtr dlg = WaitForDialog("Save Models", 3000);
-                if (dlg == IntPtr.Zero) { dlg = WaitForDialog("Close Model", 1500); }
-                if (dlg == IntPtr.Zero)
+                // Close-dialog cascade sweep, in ANY order (2026-06-10 rework).
+                // A version child DIRTIED by the compare raises "Save Models"
+                // (or "Close Model"); a CLEAN Mart-opened child can skip both
+                // and raise "Mart Offline" DIRECTLY. The old chain reached the
+                // Mart Offline handler only after a successful Save Models
+                // dismiss and returned "teardown clean" when no dialog showed -
+                // a false positive: on 2026-06-10 the v1 child had not closed
+                // at all, its PU survived, and the resumed reconnect tick
+                // adopted and UDP-dirtied it. All dismissal is PURE WIN32
+                // (2026-06-02): UIA on these dialogs leaves abandoned XTP
+                // IAccessible RCWs that crash erwin's finalizer.
+                // CloseSaveModelsWin32 keeps guardSingleRow=true so the active
+                // dirty model (never listed in that dialog) cannot be touched;
+                // if the guard trips we leave every dialog for the user.
+                // childKnownGone trims the dead waits: Save Models / Close
+                // Model are raised BEFORE the child window is destroyed, so a
+                // child already observed dead can no longer raise them - only
+                // the trailing Mart Offline can still arrive.
+                if (!SweepVersionChildCloseDialogs(log, childKnownGone, quickRetry: false))
                 {
-                    log?.Invoke("  [REVIEW-CLEAN] no Save Models / Close Model dialog - v1 closed silently; teardown clean.");
                     return;
                 }
-                bool smOk = CloseSaveModelsWin32(dlg, log, guardSingleRow: true);
-                if (!smOk)
+
+                // VERIFY the version child is actually gone - the whole point
+                // of the rework. One retry (WM_CLOSE + a shortened sweep: the
+                // cascade already had one full-length pass); if it still
+                // survives, say so loudly and leave it: the caller's reconnect
+                // guard keeps ignoring its PU and warns the user to close it
+                // manually without saving.
+                if (s.VersionChild != IntPtr.Zero)
                 {
-                    log?.Invoke("  [REVIEW-CLEAN] Save Models Win32 dismiss aborted (guard/safety) - dialog LEFT for the user; skipping Mart Offline.");
-                    return;
+                    if (!WaitForWindowGone(s.VersionChild, 5000))
+                    {
+                        log?.Invoke("  [REVIEW-CLEAN] version child STILL OPEN after sweep - retrying WM_CLOSE once.");
+                        PostMessage(s.VersionChild, WM_CLOSE_MSG, IntPtr.Zero, IntPtr.Zero);
+                        Thread.Sleep(600);
+                        if (!SweepVersionChildCloseDialogs(log, childKnownGone: false, quickRetry: true))
+                        {
+                            return;
+                        }
+                        if (WaitForWindowGone(s.VersionChild, 3000))
+                            log?.Invoke("  [REVIEW-CLEAN] version child closed on retry.");
+                        else
+                            log?.Invoke("  [REVIEW-CLEAN] version child COULD NOT be closed - leaving it open; the reconnect guard keeps its PU ignored and the caller warns the user to close it without saving.");
+                    }
+                    else
+                    {
+                        log?.Invoke("  [REVIEW-CLEAN] version child verified closed.");
+                    }
                 }
-                IntPtr martOff = WaitForDialog("Mart Offline", 1500);
-                if (martOff == IntPtr.Zero)
+
+                // Hand focus back to the model the user was working on. After
+                // the sweep the active MDI child may be the version copy (when
+                // it survived) or whatever erwin promoted after the close; a
+                // wrong active tab makes the main-window title disagree with
+                // the add-in's bound model, which the tab-switch detector
+                // would read as a user switch. (The pipeline-owned guard also
+                // protects against that, but correct focus is the right end
+                // state regardless.)
+                if (s.OriginalChild != IntPtr.Zero && IsWindow(s.OriginalChild))
                 {
-                    log?.Invoke("  [REVIEW-CLEAN] no Mart Offline dialog after Save Models - v1 closed. Teardown clean (pure Win32, no UIA).");
-                    return;
+                    IntPtr erwinMain = FindErwinMain();
+                    IntPtr mdiClient = erwinMain != IntPtr.Zero ? FindMdiClientOf(erwinMain) : IntPtr.Zero;
+                    if (mdiClient != IntPtr.Zero)
+                        ActivateMdiChildHandle(mdiClient, s.OriginalChild, log);
                 }
+            }
+            catch (Exception ex) { log?.Invoke($"  [REVIEW-CLEAN] threw: {ex.GetType().Name}: {ex.Message}"); }
+        }
+
+        /// <summary>
+        /// One pass over the close-dialog cascade a closing Mart version child
+        /// can raise: "Save Models" / "Close Model" first (dirty child), then
+        /// "Mart Offline" UNCONDITIONALLY (a clean Mart child raises it with no
+        /// Save Models before it). Returns false when the Save Models dismiss
+        /// safely aborted (single-row guard / cursor-land safety) - every
+        /// dialog is then deliberately left for the user and the caller must
+        /// stop sweeping. <paramref name="childKnownGone"/> skips the Save
+        /// Models / Close Model waits (those prompts are raised BEFORE the
+        /// child window is destroyed, so a child already observed dead cannot
+        /// raise them) - only the trailing Mart Offline watch remains.
+        /// <paramref name="quickRetry"/> halves the waits for the second
+        /// (retry) pass, whose cascade already had one full-length watch.
+        /// </summary>
+        private static bool SweepVersionChildCloseDialogs(Action<string> log, bool childKnownGone, bool quickRetry)
+        {
+            IntPtr dlg = IntPtr.Zero;
+            if (!childKnownGone)
+            {
+                dlg = WaitForDialog("Save Models", quickRetry ? 1500 : 3000);
+                if (dlg == IntPtr.Zero) { dlg = WaitForDialog("Close Model", quickRetry ? 750 : 1500); }
+                if (dlg != IntPtr.Zero)
+                {
+                    if (!CloseSaveModelsWin32(dlg, log, guardSingleRow: true))
+                    {
+                        log?.Invoke("  [REVIEW-CLEAN] Save Models Win32 dismiss aborted (guard/safety) - dialogs LEFT for the user; skipping Mart Offline.");
+                        return false;
+                    }
+                }
+            }
+            // Longer watch when no Save Models showed: the clean-child path
+            // goes straight to Mart Offline and the cascade may still be
+            // unwinding.
+            IntPtr martOff = WaitForDialog("Mart Offline", dlg == IntPtr.Zero ? (quickRetry ? 1500 : 2500) : 1500);
+            if (martOff != IntPtr.Zero)
+            {
                 log?.Invoke($"  [REVIEW-CLEAN] Mart Offline 0x{martOff.ToInt64():X} - dismissing via pure Win32 (no UIA).");
                 DismissMartOfflineDialogWin32(martOff, log);
             }
-            catch (Exception ex) { log?.Invoke($"  [REVIEW-CLEAN] threw: {ex.GetType().Name}: {ex.Message}"); }
+            else
+            {
+                log?.Invoke("  [REVIEW-CLEAN] no Mart Offline dialog in this sweep.");
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// Finds an MDI child created DURING the pipeline whose title carries
+        /// the compare RIGHT version token (e.g. ": v1 :" inside
+        /// "Mart://...MetaRepo :  v1  : ER_Diagram_164"). Children recorded in
+        /// <see cref="CCSession.PreexistingChildren"/> are excluded so a tab
+        /// the user had open before the run can never match.
+        /// </summary>
+        private static IntPtr FindPipelineVersionChild(CCSession s, Action<string> log)
+        {
+            try
+            {
+                IntPtr erwinMain = FindErwinMain();
+                IntPtr mdiClient = erwinMain != IntPtr.Zero ? FindMdiClientOf(erwinMain) : IntPtr.Zero;
+                if (mdiClient == IntPtr.Zero) return IntPtr.Zero;
+                var token = new System.Text.RegularExpressions.Regex(
+                    @":\s*v" + s.RightVersion + @"\s*:",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                foreach (var h in EnumMartMdiChildHandles(mdiClient))
+                {
+                    if (h == s.OriginalChild) continue;
+                    if (s.PreexistingChildren != null && s.PreexistingChildren.Contains(h)) continue;
+                    if (token.IsMatch(GetTitle(h)))
+                        return h;
+                }
+            }
+            catch (Exception ex) { log?.Invoke($"  [REVIEW-CLEAN] late-child scan err: {ex.Message}"); }
+            return IntPtr.Zero;
+        }
+
+        /// <summary>True once the window handle is gone/destroyed within the
+        /// timeout; false when it is still alive at the deadline.</summary>
+        private static bool WaitForWindowGone(IntPtr hwnd, int timeoutMs)
+        {
+            if (hwnd == IntPtr.Zero) return true;
+            int waited = 0;
+            while (waited < timeoutMs)
+            {
+                if (!IsWindow(hwnd)) return true;
+                Thread.Sleep(250);
+                waited += 250;
+            }
+            return !IsWindow(hwnd);
         }
 
         /// <summary>
@@ -3858,11 +4188,62 @@ namespace EliteSoft.Erwin.AddIn.Services
             return list;
         }
 
+        /// <summary>Every direct MDI child of the MDIClient, title-INDEPENDENT.
+        /// Needed by the new-child wait: erwin creates the child window first
+        /// and writes its final "Mart://..." title only once the model load
+        /// completes, so a Mart-title filter misses a child that is still
+        /// loading (2026-06-10 02:36 incident on a cold erwin).</summary>
+        private static System.Collections.Generic.List<IntPtr> EnumAllMdiChildHandles(IntPtr mdiClient)
+        {
+            var list = new System.Collections.Generic.List<IntPtr>();
+            if (mdiClient == IntPtr.Zero) return list;
+            IntPtr child = GetWindow(mdiClient, GW_CHILD);
+            while (child != IntPtr.Zero)
+            {
+                list.Add(child);
+                child = GetWindow(child, GW_HWNDNEXT);
+            }
+            return list;
+        }
+
         /// <summary>The currently active MDI child (WM_MDIGETACTIVE), or Zero.</summary>
         private static IntPtr GetActiveMdiChild(IntPtr mdiClient)
         {
             if (mdiClient == IntPtr.Zero) return IntPtr.Zero;
             return SendMessage(mdiClient, WM_MDIGETACTIVE, IntPtr.Zero, IntPtr.Zero);
+        }
+
+        /// <summary>
+        /// Reads erwin's GUI dirty indicator for the ACTIVE MDI child: the '*'
+        /// in the child window title (e.g. "Mart://... :  v4  : ER_Diagram_1 * ").
+        /// This is the signal that tracks erwin's Mart &gt; Review behavior in
+        /// every logged 2026-06-10 incident (asterisk-titled runs opened
+        /// Review, asterisk-free runs were refused), unlike SCAPI dirty
+        /// probes: the Modified/IsDirty-style names do not exist on the
+        /// r10.10 PU at all, and DirtyBit is proven to diverge from the GUI
+        /// dirty state. Returns true=dirty, false=POSITIVELY clean,
+        /// null=unknown (no erwin main / MDI child, or the active child is
+        /// not a Mart model) - callers must treat null as "let erwin decide".
+        /// </summary>
+        public static bool? IsActiveMdiChildDirtyByTitle(Action<string> log)
+        {
+            try
+            {
+                IntPtr main = FindErwinMain();
+                if (main == IntPtr.Zero) return null;
+                IntPtr mdi = FindMdiClientOf(main);
+                if (mdi == IntPtr.Zero) return null;
+                IntPtr child = GetActiveMdiChild(mdi);
+                if (child == IntPtr.Zero) return null;
+                string t = GetTitle(child) ?? string.Empty;
+                if (t.IndexOf("Mart://", StringComparison.OrdinalIgnoreCase) < 0) return null;
+                return t.Contains("*");
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"  [REVIEW] dirty-title probe threw: {ex.Message}");
+                return null;
+            }
         }
 
         /// <summary>
@@ -3961,24 +4342,58 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>Poll until a NEW "Mart://" MDI child (not in <paramref name="before"/>)
-        /// appears, returning its hwnd, or Zero on timeout.</summary>
+        /// appears, returning its hwnd, or Zero on timeout.
+        /// Two-stage wait (2026-06-10): erwin creates the MDI child window
+        /// BEFORE the model finishes loading and writes the final "Mart://..."
+        /// title only at the end. On a cold erwin + Mart roundtrip that gap
+        /// blew the old single-stage Mart-titled scan (the v1 PU was already
+        /// in the session but the child was reported missing, the pipeline
+        /// aborted, and the leftover copy caused the reconnect/UDP-dirty
+        /// incident). Stage 1 finds the new HANDLE title-independently;
+        /// stage 2 waits for that handle's title to become a Mart locator.
+        /// <paramref name="before"/> must therefore be snapshotted with
+        /// EnumAllMdiChildHandles, not the Mart-filtered enumerator.</summary>
         private static IntPtr WaitForNewMartMdiChild(IntPtr mdiClient, System.Collections.Generic.HashSet<IntPtr> before, int timeoutMs, Action<string> log)
         {
             int waited = 0;
+            IntPtr candidate = IntPtr.Zero;
             while (waited < timeoutMs)
             {
-                foreach (var h in EnumMartMdiChildHandles(mdiClient))
+                if (candidate == IntPtr.Zero)
                 {
-                    if (!before.Contains(h))
+                    foreach (var h in EnumAllMdiChildHandles(mdiClient))
                     {
-                        log?.Invoke($"  [MDI-OPEN] new MDI child appeared 0x{h.ToInt64():X} title='{GetTitle(h)}'");
-                        return h;
+                        if (!before.Contains(h))
+                        {
+                            candidate = h;
+                            log?.Invoke($"  [MDI-OPEN] new MDI child handle 0x{h.ToInt64():X} (title='{GetTitle(h)}') - waiting for its Mart:// title (model still loading)");
+                            break;
+                        }
+                    }
+                }
+                if (candidate != IntPtr.Zero)
+                {
+                    if (!IsWindow(candidate))
+                    {
+                        // The handle died mid-load (erwin recreates the frame in
+                        // some open paths) - fall back to scanning for the next
+                        // new handle instead of waiting on a corpse.
+                        log?.Invoke($"  [MDI-OPEN] candidate child 0x{candidate.ToInt64():X} vanished - rescanning");
+                        candidate = IntPtr.Zero;
+                    }
+                    else if (GetTitle(candidate).IndexOf("Mart://", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        log?.Invoke($"  [MDI-OPEN] new MDI child appeared 0x{candidate.ToInt64():X} title='{GetTitle(candidate)}' after {waited} ms");
+                        return candidate;
                     }
                 }
                 Thread.Sleep(200);
                 waited += 200;
             }
-            log?.Invoke("  [MDI-OPEN] no new MDI child within timeout");
+            log?.Invoke($"  [MDI-OPEN] no new Mart MDI child within {timeoutMs} ms"
+                + (candidate != IntPtr.Zero
+                    ? $" - a new child 0x{candidate.ToInt64():X} exists but its title never became Mart:// (current: '{GetTitle(candidate)}')"
+                    : string.Empty));
             return IntPtr.Zero;
         }
 
