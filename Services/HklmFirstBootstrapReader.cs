@@ -8,19 +8,22 @@ using Microsoft.Win32;
 namespace EliteSoft.Erwin.AddIn.Services
 {
     /// <summary>
-    /// Add-in side bootstrap config reader. Probes HKLM first, then HKCU. The
-    /// DPAPI scope used to decrypt the encrypted fields is derived from whichever
-    /// hive the values actually came from: LocalMachine for HKLM, CurrentUser
-    /// for HKCU. This lets a single binary serve three real-world deployments:
+    /// Add-in side bootstrap config reader. Probes HKCU FIRST, then HKLM
+    /// (precedence flipped 2026-06-08). The DPAPI scope used to decrypt the
+    /// encrypted fields is derived from whichever hive the values actually came
+    /// from: CurrentUser for HKCU, LocalMachine for HKLM. This lets a single
+    /// binary serve three real-world deployments:
     ///
-    ///   - personal user install: nothing in HKLM, config read from HKCU
-    ///   - corporate GPO/MSI seeded: HKLM populated, HKCU ignored
-    ///   - migration / override: admin clears HKLM, addin immediately falls
-    ///     back to whatever the user had configured in HKCU
+    ///   - personal user install: config read from HKCU (the common case)
+    ///   - corporate GPO/MSI seeded: only HKLM populated, HKCU absent -> HKLM
+    ///   - dev / migration / override: the user's current HKCU wins over any
+    ///     stale machine-wide HKLM seed, so admin changes take effect without
+    ///     first clearing HKLM
     ///
     /// HKLM is read-only from the addin's perspective; corporate IT seeds it
     /// with its own tooling (and is responsible for encrypting credentials
     /// with LocalMachine DPAPI scope). install-impl.ps1 writes HKCU only.
+    /// The class name is historical - HKCU is now read first.
     ///
     /// See docs/INSTALL.md for the complete decision tree.
     /// </summary>
@@ -36,22 +39,27 @@ namespace EliteSoft.Erwin.AddIn.Services
             if (_cachedConfig != null)
                 return _cachedConfig;
 
-            // Try HKLM first. A populated HKLM seed must have both DBHost and DBName;
-            // a partial seed is treated as absent and we fall through to HKCU. This
-            // matches install-impl.ps1's "is HKLM populated?" check exactly.
-            var hklmConfig = TryReadHive(Registry.LocalMachine, DataProtectionScope.LocalMachine);
-            if (hklmConfig != null && hklmConfig.IsConfigured)
-            {
-                _cachedConfig = hklmConfig;
-                _cachedSourceHive = "HKLM";
-                return _cachedConfig;
-            }
-
+            // Precedence flipped 2026-06-08 (user request): HKCU FIRST, then HKLM.
+            // The per-user HKCU seed (what install.bat / the dev edits, and what
+            // the admin tool points at) now wins; HKLM is the corporate/shared
+            // fallback. Previously HKLM-first meant a stale machine-wide seed
+            // (e.g. an old KKBDemo bootstrap) silently shadowed the user's
+            // current HKCU config, so admin changes were invisible to the add-in.
+            // A populated seed must carry both DBHost and DBName; a partial seed
+            // is treated as absent and we fall through.
             var hkcuConfig = TryReadHive(Registry.CurrentUser, DataProtectionScope.CurrentUser);
-            if (hkcuConfig != null)
+            if (hkcuConfig != null && hkcuConfig.IsConfigured)
             {
                 _cachedConfig = hkcuConfig;
                 _cachedSourceHive = "HKCU";
+                return _cachedConfig;
+            }
+
+            var hklmConfig = TryReadHive(Registry.LocalMachine, DataProtectionScope.LocalMachine);
+            if (hklmConfig != null)
+            {
+                _cachedConfig = hklmConfig;
+                _cachedSourceHive = "HKLM";
                 return _cachedConfig;
             }
 
