@@ -5471,6 +5471,21 @@ namespace EliteSoft.Erwin.AddIn.Services
                 return;
             }
 
+            // Locked predefined columns are admin-controlled: their exact name is
+            // part of the admin definition and "Locked" means the column must not
+            // be renamed - by the user OR by a naming rule. Skip naming-standard
+            // application entirely for them. Otherwise a suffix rule (e.g. _DATE on
+            // DateTime columns) rewrites "CreateDate" -> "CreateDate_DATE", which
+            // breaks the name-based locked-order match and gets the column wrongly
+            // shoved to the end of the table (user-confirmed behaviour 2026-06-09:
+            // "Muaf tut"). The check is by current name, which still equals the
+            // admin name here because we run BEFORE any rename would happen.
+            if (PredefinedColumnService.Instance.IsLockedColumnName(state.PhysicalName))
+            {
+                Log($"Column naming skipped: '{state.TableName}.{state.PhysicalName}' is a locked predefined column (admin-owned name).");
+                return;
+            }
+
             // attr MUST be passed so UDP-conditional rules (DEPENDS_ON_UDP_ID) can read
             // the live UDP value off the column. Without it, UDP-conditional rules are skipped.
             // Cast to object to keep the call compile-time resolved (dynamic dispatch breaks

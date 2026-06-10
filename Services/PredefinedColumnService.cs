@@ -396,6 +396,39 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// True when <paramref name="columnName"/> matches the admin-defined name
+        /// of ANY loaded LOCKED predefined column (case-insensitive). Name-only,
+        /// entity-free check used to EXEMPT locked predefined columns from naming
+        /// standards: their exact name is part of the admin definition and
+        /// "Locked" means the column must not be renamed (by the user OR by a
+        /// naming rule). Without this, a suffix rule (e.g. _DATE on DateTime)
+        /// would rewrite "CreateDate" -> "CreateDate_DATE", break the name-based
+        /// locked-order match, and the column would be wrongly moved to the table
+        /// end. Conditional locked rows are included: if a column bearing a locked
+        /// name is present on an entity it was created by that rule, so the name
+        /// is admin-owned regardless of the gating UDP. 2026-06-09.
+        /// </summary>
+        public bool IsLockedColumnName(string columnName)
+        {
+            if (!_isLoaded) return false;
+            return IsLockedColumnName(_columns, columnName);
+        }
+
+        /// <summary>
+        /// Pure name-match core for <see cref="IsLockedColumnName(string)"/>: true
+        /// when any LOCKED row in <paramref name="columns"/> carries
+        /// <paramref name="columnName"/> as its admin name (case-insensitive).
+        /// State-free so it can be unit-tested without a DB load, mirroring
+        /// <see cref="ComputeColumnsWedgedInLockedBlock"/>.
+        /// </summary>
+        public static bool IsLockedColumnName(IEnumerable<PredefinedColumn> columns, string columnName)
+        {
+            if (columns == null || string.IsNullOrEmpty(columnName)) return false;
+            return columns.Any(c => c != null && c.IsLocked
+                && string.Equals(c.ColumnName, columnName, StringComparison.OrdinalIgnoreCase));
+        }
+
+        /// <summary>
         /// Look up the locked rule (if any) that currently APPLIES to the
         /// given column name on the given entity. Conditional locked rules
         /// only protect the column while their gating UDP value matches the
