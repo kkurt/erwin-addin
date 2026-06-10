@@ -314,6 +314,12 @@ namespace EliteSoft.Erwin.AddIn
                 earlySplash = null;
                 using (Services.AddinLogger.BeginScope("ModelConfigForm.Show"))
                     _activeForm.Show();
+
+                // Best-effort user-session tracking + remote shutdown. Idempotent:
+                // starts once per erwin process, survives model switches, and does
+                // all DB work off this thread - it never blocks the add-in. No-op
+                // unless the corporate has USER_TRACKING_ENABLED=True.
+                Services.SessionTrackingService.Instance.Start();
             }
             catch (Exception ex)
             {
