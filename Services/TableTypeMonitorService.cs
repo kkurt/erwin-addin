@@ -350,6 +350,84 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// Enforce MODEL-level required UDPs (admin Object Type = MODEL,
+        /// IS_REQUIRED=true). Triggered once when the model is opened/connected,
+        /// which we treat as the "Update" context, so only UDPs whose Apply On is
+        /// Update or Both (default/empty == Both) are enforced; Create-only UDPs
+        /// (new-model gesture) are skipped. Unlike the new-table path, a MODEL
+        /// cannot be deleted on Cancel - missing values are simply left empty and
+        /// re-prompted on the next open. Best-effort: never throws into the
+        /// caller. Returns true when a prompt was shown.
+        /// </summary>
+        /// <param name="modelRoot">The SCAPI model Root object (Model owner).</param>
+        /// <param name="modelName">Display name for the dialog header.</param>
+        public bool PromptForMissingRequiredModelUdps(dynamic modelRoot, string modelName)
+        {
+            if (modelRoot == null) return false;
+            if (_udpRuntimeService == null || !_udpRuntimeService.IsInitialized) return false;
+
+            Dictionary<string, string> currentValues;
+            try { currentValues = _udpRuntimeService.ReadUdpValues((object)modelRoot, "Model"); }
+            catch (Exception ex)
+            {
+                Log($"PromptForMissingRequiredModelUdps: ReadUdpValues failed on model '{modelName}': {ex.Message}");
+                return false;
+            }
+
+            var missing = UdpDefinitionService.Instance
+                .GetByObjectType("Model")
+                .Where(d => d != null && d.IsRequired)
+                .Where(d => AppliesOnUpdate(d.ApplyOn))   // model-open == Update context
+                .Where(d =>
+                {
+                    if (!currentValues.TryGetValue(d.Name, out var v)) return true;
+                    return string.IsNullOrEmpty(v);
+                })
+                .ToList();
+
+            if (missing.Count == 0) return false;
+
+            Log($"PromptForMissingRequiredModelUdps: model '{modelName}' missing {missing.Count} required UDP(s): {string.Join(", ", missing.Select(m => m.Name))}");
+
+            using (var form = new Forms.RequiredUdpForm(modelName, missing, Forms.RequiredOperationMode.Update, "Model"))
+            {
+                var result = form.ShowDialog();
+                if (result != DialogResult.OK || form.SelectedValues.Count == 0)
+                {
+                    // A MODEL has nothing to delete/revert: leave the UDPs empty;
+                    // they are re-prompted the next time the model is opened.
+                    Log($"PromptForMissingRequiredModelUdps: user cancelled for model '{modelName}' - left empty (re-prompts on next open).");
+                    return true;
+                }
+
+                try
+                {
+                    _udpRuntimeService.WriteUdpValues((object)modelRoot, form.SelectedValues, "Model");
+                    Log($"PromptForMissingRequiredModelUdps: wrote {form.SelectedValues.Count} required UDP value(s) on model '{modelName}'.");
+                }
+                catch (Exception ex)
+                {
+                    Log($"PromptForMissingRequiredModelUdps: WriteUdpValues failed on model '{modelName}': {ex.Message}");
+                }
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// True when a UDP whose admin "Apply On" is <paramref name="applyOn"/>
+        /// should fire in the UPDATE context (model open == update). Mirrors
+        /// <see cref="UdpValidationEngine"/>'s gate: Both always applies, else the
+        /// operation must match. Null/blank defaults to Both. Create-only -> false.
+        /// </summary>
+        public static bool AppliesOnUpdate(string applyOn)
+        {
+            if (string.IsNullOrWhiteSpace(applyOn)) return true; // default Both
+            string a = applyOn.Trim();
+            return a.Equals("Both", StringComparison.OrdinalIgnoreCase)
+                || a.Equals("Update", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
         /// Remove a newly-created entity in response to the user discarding
         /// its Required popup. Wraps the SCAPI <c>modelObjects.Remove</c>
         /// call (same primitive proven by <see cref="ColumnValidationService"/>'s

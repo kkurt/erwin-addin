@@ -395,6 +395,12 @@ namespace EliteSoft.Erwin.AddIn.Services
         private Dictionary<string, string> _lastModelUdpValues;
         private HashSet<string> _modelUdpPaths; // Actual Property_Type paths for model UDPs
 
+        // One-shot MODEL-level required-UDP enforcement on model open. Runs once
+        // per connect, after a short settle so the connect overlay is gone.
+        private bool _modelRequiredUdpsChecked;
+        private int _connectSettleTicks;
+        private const int ConnectSettleTicks = 4; // ~1s at 250ms tick before the model-UDP prompt
+
         // Event for logging
         public event Action<string> OnLog;
 
@@ -509,6 +515,12 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             if (_isMonitoring) return;
             _isMonitoring = true;
+
+            // Re-arm the one-shot MODEL required-UDP check for this connect, so a
+            // model switch / reconnect re-validates the new model. (Harmless if the
+            // values are already filled - the check finds nothing missing.)
+            _modelRequiredUdpsChecked = false;
+            _connectSettleTicks = 0;
 
             // Initialize model change tracking (use same source as detection: window title)
             try
@@ -787,6 +799,35 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// One-shot MODEL-level required-UDP enforcement, invoked from the first
+        /// settled heartbeat after the model connects. Delegates to the table-type
+        /// monitor (which owns the UDP runtime + the Required dialog). Best-effort:
+        /// a failure is logged and never disrupts the heartbeat.
+        /// </summary>
+        private void CheckModelRequiredUdpsOnce(dynamic root)
+        {
+            try
+            {
+                if (_tableTypeMonitor == null || root == null) return;
+
+                string modelName = "";
+                try { modelName = root.Name?.ToString() ?? ""; } catch { /* root.Name may be unavailable */ }
+                if (string.IsNullOrEmpty(modelName))
+                {
+                    try { modelName = root.Properties("Physical_Name")?.Value?.ToString() ?? ""; }
+                    catch { /* fall through to default */ }
+                }
+                if (string.IsNullOrEmpty(modelName)) modelName = "Model";
+
+                _tableTypeMonitor.PromptForMissingRequiredModelUdps(root, modelName);
+            }
+            catch (Exception ex)
+            {
+                Log($"CheckModelRequiredUdpsOnce error (best-effort): {ex.Message}");
+            }
+        }
+
+        /// <summary>
         /// Check if any model-level UDP values changed since last check.
         /// Called from MonitorTimer_Tick (same tick as model change detection).
         /// </summary>
@@ -943,6 +984,21 @@ namespace EliteSoft.Erwin.AddIn.Services
                 dynamic modelObjects = _session.ModelObjects;
                 dynamic root = modelObjects.Root;
                 if (root == null) return;
+
+                // One-shot: enforce MODEL-level required UDPs once the model is
+                // open + settled. The guards above guarantee a live, non-suspended
+                // session; the settle delay lets the connect overlay close first so
+                // the prompt is not hidden behind it. "Model open" == Update context
+                // (Apply On = Update / Both). Runs exactly once per connect; the
+                // modal runs inside this try so _isCheckingForChanges suppresses
+                // reentrant ticks, and the finally resets it on return.
+                if (!_modelRequiredUdpsChecked)
+                {
+                    if (++_connectSettleTicks < ConnectSettleTicks) return;
+                    _modelRequiredUdpsChecked = true;
+                    CheckModelRequiredUdpsOnce(root);
+                    return; // resume normal scanning on the next tick
+                }
 
                 // Phase-2D (2026-05-06): scoped per-table path is the ONLY path.
                 // When a Column Editor is open, scan that one entity. The first time

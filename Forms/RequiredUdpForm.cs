@@ -99,7 +99,11 @@ namespace EliteSoft.Erwin.AddIn.Forms
             };
             var lblTitle = new Label
             {
-                Text = string.IsNullOrEmpty(_tableName) ? "Required Properties" : $"New Table: {_tableName}",
+                // Header adapts to mode + object kind: "New Table: X" on create,
+                // "Model: X" (no "New") when enforcing on an existing object.
+                Text = string.IsNullOrEmpty(_tableName)
+                    ? "Required Properties"
+                    : (_mode == RequiredOperationMode.Create ? $"New {_objectKind}: {_tableName}" : $"{_objectKind}: {_tableName}"),
                 Font = new Font("Segoe UI", 12F, FontStyle.Bold),
                 ForeColor = ClrTextPrimary,
                 AutoSize = true,
@@ -147,10 +151,13 @@ namespace EliteSoft.Erwin.AddIn.Forms
             // user knows Cancel will discard the new object before they
             // click (UPDATE mode currently unused but supported for
             // symmetry with RequiredFieldDialog).
+            // Create: Cancel discards the new object. Update (e.g. MODEL on open):
+            // nothing to delete/revert, so a neutral "Cancel" (defer / re-prompt
+            // next open) reads correctly.
             string cancelText = _mode == RequiredOperationMode.Create
                 ? $"Discard New {_objectKind}"
-                : "Revert Change";
-            int cancelWidth = _mode == RequiredOperationMode.Create ? 170 : 130;
+                : "Cancel";
+            int cancelWidth = _mode == RequiredOperationMode.Create ? 170 : 100;
 
             btnCancel = new Button
             {
