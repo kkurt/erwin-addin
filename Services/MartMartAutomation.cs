@@ -4901,41 +4901,65 @@ namespace EliteSoft.Erwin.AddIn.Services
         private const long WS_EX_LAYERED = 0x00080000;
         private const uint LWA_ALPHA = 0x00000002;
 
+        [DllImport("user32.dll")]
+        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+        private const int SW_HIDE = 0;
+        private const int SW_SHOWNA = 8; // show without activating - never steal focus mid-pipeline
+
+        /// <summary>
+        /// Hides a pipeline-driven erwin window via SW_HIDE ONLY - never
+        /// WS_EX_LAYERED + alpha=0. On RDP / Terminal Server the per-session
+        /// DWM never releases a layered window's redirection surface when the
+        /// window is destroyed: every later erwin paint shows through as a
+        /// PERSISTENT black rectangle until a full erwin restart, and clearing
+        /// the bit before destroy does not help (the surface is already
+        /// allocated). The native bridge learned this 2026-06-01
+        /// (HideWizardAggressive = SW_HIDE only, proven leak-free by the
+        /// repro-wizard-live experiments); this managed twin kept the old
+        /// layered recipe and was re-identified as the leak source 2026-06-11:
+        /// RD gets hidden at the hide-after-apply site, then destroyed by the
+        /// REVIEW-CLEAN IDCANCEL -> one new permanent black patch per pipeline
+        /// run. SW_HIDDEN windows still receive posted WM_COMMANDs, so the
+        /// drive phase (Next / version-pick / Compare) keeps working - same
+        /// precedent as the native silent FE wizard.
+        /// </summary>
         internal static void HideWindow(IntPtr hWnd)
         {
-            try
-            {
-                IntPtr ex = GetWindowLongPtr(hWnd, GWL_EXSTYLE);
-                SetWindowLongPtr(hWnd, GWL_EXSTYLE, new IntPtr(ex.ToInt64() | WS_EX_LAYERED));
-                SetLayeredWindowAttributes(hWnd, 0, 0, LWA_ALPHA);
-            }
+            try { ShowWindow(hWnd, SW_HIDE); }
             catch { }
         }
 
         /// <summary>
-        /// Reverses <see cref="HideWindow"/>: clears the WS_EX_LAYERED bit so
-        /// the window paints normally. Used during cleanup so any modal child
-        /// dialog (e.g. a "Save changes?" prompt) that the wizard pops as
-        /// part of closing is NOT hidden by inherited transparency, which
-        /// would leave erwin's UI thread blocked behind an invisible modal
-        /// for the user to discover via ESC.
+        /// Reverses <see cref="HideWindow"/> (SW_SHOWNA - shows without
+        /// activating so the pipeline never steals focus). Also clears a stale
+        /// WS_EX_LAYERED bit defensively in case the window was hidden by an
+        /// older layered code path in the same session. Used during cleanup so
+        /// any modal child dialog (e.g. a "Save changes?" prompt) the wizard
+        /// pops while closing is not stuck behind an invisible parent.
         /// </summary>
         internal static void UnhideWindow(IntPtr hWnd)
         {
             try
             {
                 IntPtr ex = GetWindowLongPtr(hWnd, GWL_EXSTYLE);
-                SetWindowLongPtr(hWnd, GWL_EXSTYLE, new IntPtr(ex.ToInt64() & ~WS_EX_LAYERED));
+                if ((ex.ToInt64() & WS_EX_LAYERED) != 0)
+                    SetWindowLongPtr(hWnd, GWL_EXSTYLE, new IntPtr(ex.ToInt64() & ~WS_EX_LAYERED));
+                ShowWindow(hWnd, SW_SHOWNA);
             }
             catch { }
         }
 
         /// <summary>
         /// Near-invisible window (alpha=1). Unlike <see cref="HideWindow"/>
-        /// (alpha=0) which makes the window fully transparent and causes
-        /// mouse input to pass through, alpha=1 keeps the window in the OS
+        /// which fully hides the window, alpha=1 keeps the window in the OS
         /// input dispatch table so synthetic mouse events still land on it.
         /// User sees essentially nothing (1% opacity).
+        /// WARNING (2026-06-11, currently unused): this makes the window
+        /// WS_EX_LAYERED, which on RDP leaks a permanent black rectangle when
+        /// the window is later destroyed (see <see cref="HideWindow"/> doc).
+        /// If you ever need it, the target window must be un-layered AND
+        /// survive (not be destroyed) for the session, or use another input
+        /// technique entirely.
         /// </summary>
         internal static void NearInvisibleWindow(IntPtr hWnd)
         {
@@ -4953,10 +4977,16 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         /// <summary>
         /// Moves a window off-screen at (-20000, -20000) keeping its size and
-        /// <c>WS_VISIBLE</c> style intact. Unlike <see cref="HideWindow"/> this
-        /// does NOT use <c>WS_EX_LAYERED + alpha=0</c> - many XTP custom
-        /// controls (listview hot-track arrows) only update their hit-test /
-        /// paint state when the window is genuinely visible to the OS.
+        /// <c>WS_VISIBLE</c> style intact - many XTP custom controls (listview
+        /// hot-track arrows) only update their hit-test / paint state when the
+        /// window is genuinely visible to the OS.
+        /// WARNING (2026-06-11, currently unused): the off-screen park is
+        /// ITSELF a black-rectangle leak trigger on RDP, independent of
+        /// WS_EX_LAYERED - a window composited on-screen, moved off the
+        /// visible desktop and then destroyed orphans its DWM surface back
+        /// onto the visible region (proven by the native bridge's 2026-06-01
+        /// repro-wizard-live experiments). Never destroy a window parked here;
+        /// move it back on-screen first.
         /// </summary>
         internal static void MoveOffScreen(IntPtr hWnd)
         {
