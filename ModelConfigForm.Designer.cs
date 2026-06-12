@@ -112,7 +112,13 @@ namespace EliteSoft.Erwin.AddIn
             this.tabGeneral.Location = new System.Drawing.Point(4, 26);
             this.tabGeneral.Name = "tabGeneral";
             this.tabGeneral.Padding = new System.Windows.Forms.Padding(20);
-            this.tabGeneral.Size = new System.Drawing.Size(940, 550);
+            // MUST track tabControl.Size (948x640 -> page 940x610, -8/-30 chrome).
+            // BuildGeneralTab places the Bottom-anchored footer (copyright +
+            // Close erwin) by absolute Y while THIS serialized size is current;
+            // a stale smaller value makes the anchor capture a negative
+            // bottom-distance and layout then pushes the footer off the page
+            // (invisible footer bug, 2026-06-10).
+            this.tabGeneral.Size = new System.Drawing.Size(940, 610);
             this.tabGeneral.TabIndex = 10;
             this.tabGeneral.Text = "General";
             this.tabGeneral.UseVisualStyleBackColor = true;
