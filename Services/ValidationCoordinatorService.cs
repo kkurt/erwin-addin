@@ -975,6 +975,32 @@ namespace EliteSoft.Erwin.AddIn.Services
                 _modelCheckCounter = 0;
                 CheckForModelChanges();
                 CheckModelUdpChanges();
+
+                // View + Subject Area scan (2026-06-12). Its historical driver
+                // (TableTypeMonitorService.CheckForTableTypeChanges) lost its
+                // caller in Phase-2D, so view checks never ran. The scan can
+                // open MODAL dialogs (new-view pipeline: Required UDP form,
+                // naming popups) whose pump re-fires this timer - hold
+                // _scopedCheckInProgress for the duration so reentrant ticks
+                // bounce off the entry guard, same pattern as
+                // FireNewEntityPipeline.
+                if (_tableTypeMonitor != null)
+                {
+                    bool acquired = !_scopedCheckInProgress;
+                    if (acquired) _scopedCheckInProgress = true;
+                    try
+                    {
+                        _tableTypeMonitor.RunViewAndSubjectAreaScan();
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"View/SA scan error: {ex.Message}");
+                    }
+                    finally
+                    {
+                        if (acquired) _scopedCheckInProgress = false;
+                    }
+                }
             }
 
             try

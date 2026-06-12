@@ -43,6 +43,16 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// for objects that don't get a full snapshot struct.
         /// </summary>
         private Dictionary<string, Dictionary<string, string>> _viewWatchedProperties;
+
+        // View-object checks (2026-06-12, "table checks for views" Faz 1):
+        // first completed view walk is a silent baseline (pre-existing views
+        // must NOT fire the new-view pipeline on model open); per-view UDP
+        // value snapshots back the locked-View-UDP enforcement with the same
+        // "first non-empty set is allowed, later edits revert" semantic as
+        // the table path.
+        private bool _viewBaselineDone;
+        private readonly Dictionary<string, Dictionary<string, string>> _viewUdpSnapshots =
+            new Dictionary<string, Dictionary<string, string>>(StringComparer.Ordinal);
         private Dictionary<string, Dictionary<string, string>> _subjectAreaWatchedProperties;
 
         // Throttle counter for expensive operations (Key_Group/View/SA scans)
@@ -493,6 +503,27 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <returns>True when the entity was successfully removed; false on
         /// any failure (caller treats false as "leave the entity alone" so
         /// the user can manually clean up).</returns>
+        /// <summary>
+        /// Routes the Required-popup Cancel "discard the new object" contract to
+        /// the right delete + bookkeeping for the object's type. Views MUST go
+        /// through <see cref="TryDeleteNewView"/> (cleans the V_ name snapshot,
+        /// watched-property and UDP buckets); routing them to
+        /// <see cref="TryDeleteNewEntity"/> removed the COM object but left the
+        /// view tracking dictionaries stale, so the new-view pipeline kept
+        /// driving a dead object (review finding 2026-06-12).
+        /// </summary>
+        private bool DiscardNewObjectForRequiredCancel(string objectType, dynamic scapiObject, string name)
+        {
+            if (string.Equals(objectType, "View", StringComparison.OrdinalIgnoreCase))
+            {
+                string viewId = "";
+                try { viewId = scapiObject.ObjectId?.ToString() ?? ""; }
+                catch (Exception ex) { Log($"DiscardNewObjectForRequiredCancel: view ObjectId read failed for '{name}': {ex.Message}"); }
+                return TryDeleteNewView(scapiObject, viewId, name);
+            }
+            return TryDeleteNewEntity(scapiObject, name);
+        }
+
         private bool TryDeleteNewEntity(dynamic entity, string physicalName)
         {
             if (entity == null) return false;
@@ -642,6 +673,11 @@ namespace EliteSoft.Erwin.AddIn.Services
             _keyGroupSnapshots.Clear();
             _initialScanCycle = true;
             _diagLoggedEmptyUdp.Clear();
+            // View tracking re-baselines with everything else: the next view
+            // walk re-snapshots silently instead of treating every existing
+            // view as freshly created.
+            _viewBaselineDone = false;
+            _viewUdpSnapshots.Clear();
             Log("TableTypeMonitorService: Snapshot dropped, deferred rebaseline scheduled (next cycle silent)");
         }
 
@@ -1042,6 +1078,19 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// Public driver for the View + Subject Area scan. Wired into
+        /// ValidationCoordinatorService.MonitorTimer_Tick's periodic block
+        /// (2026-06-12): the historical driver, CheckForTableTypeChanges, has
+        /// had NO caller since Phase-2D, so the whole view/SA scan - including
+        /// the pre-existing rename/drift naming checks - was dead code and
+        /// none of the table checks ever fired for views (the user-reported
+        /// symptom). The caller is responsible for the _scopedCheckInProgress
+        /// gate: the new-view pipeline opens modal dialogs whose message pump
+        /// re-fires the monitor timers.
+        /// </summary>
+        public void RunViewAndSubjectAreaScan() => CheckKeyGroupAndViewNaming();
+
+        /// <summary>
         /// Check for new/renamed Key_Group (Index) and View objects and validate naming standards.
         /// </summary>
         private void CheckKeyGroupAndViewNaming()
@@ -1063,6 +1112,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                     dynamic allViews = modelObjects.Collect(root, "View");
                     if (allViews != null)
                     {
+                        // New views found this pass. The pipeline (modal Required
+                        // popup, possible Cancel-delete) MUST run after the COM
+                        // enumeration completes - removing a member while the
+                        // collection is being iterated can wedge the enumerator.
+                        var newViewsThisPass = new List<(dynamic View, string Id, string Name)>();
+
                         foreach (dynamic view in allViews)
                         {
                             if (view == null) continue;
@@ -1084,11 +1139,20 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                                 if (isNew)
                                 {
-                                    // New view — just snapshot, validate on name change
+                                    // Snapshot first (a reentrant tick from the
+                                    // pipeline's modal must see this view as known,
+                                    // never double-firing the pipeline).
                                     _keyGroupSnapshots["V_" + viewId] = viewName;
                                     var bucket = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                                     ReadWatchedProperties(view, "View", bucket);
                                     _viewWatchedProperties[viewId] = bucket;
+                                    RefreshViewUdpSnapshot(view, viewId);
+
+                                    // Pre-existing views on the first walk are
+                                    // baseline, not user gestures; only fire the
+                                    // new-view pipeline once baselined.
+                                    if (_viewBaselineDone)
+                                        newViewsThisPass.Add((view, viewId, viewName));
                                 }
                                 else if (nameChanged)
                                 {
@@ -1100,6 +1164,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                                         _viewWatchedProperties[viewId] = refreshBucket;
                                     }
                                     ReadWatchedProperties(view, "View", refreshBucket);
+                                    CheckViewUdpChanges(view, viewId, viewName);
                                 }
                                 else
                                 {
@@ -1119,9 +1184,19 @@ namespace EliteSoft.Erwin.AddIn.Services
                                         ValidateNamingStandard("View", viewName, view);
                                         ReadWatchedProperties(view, "View", prevBucket);
                                     }
+                                    CheckViewUdpChanges(view, viewId, viewName);
                                 }
                             }
                             catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"View naming check error: {ex.Message}"); }
+                        }
+
+                        // First completed walk = baseline established.
+                        _viewBaselineDone = true;
+
+                        foreach (var nv in newViewsThisPass)
+                        {
+                            try { OnNewViewDetected(nv.View, nv.Id, nv.Name); }
+                            catch (Exception ex) { Log($"OnNewViewDetected error for '{nv.Name}': {ex.Message}"); }
                         }
                     }
                 }
@@ -1193,6 +1268,347 @@ namespace EliteSoft.Erwin.AddIn.Services
             catch (Exception ex)
             {
                 System.Diagnostics.Debug.WriteLine($"CheckKeyGroupAndViewNaming error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// New-VIEW pipeline (2026-06-12, "table checks for views" Faz 1) - the
+        /// view-object analogue of <see cref="OnNewEntityDetected"/>:
+        ///   1. naming standard apply (Create context),
+        ///   2. UDP defaults from the admin's View-scoped definitions,
+        ///   3. required-View-UDP prompt (Cancel discards the new view, same
+        ///      contract as tables).
+        /// Deliberately OUT of scope (user decision 2026-06-12): predefined
+        /// columns (view columns derive from the SELECT - nothing to add) and
+        /// the question wizard (its admin config is TABLE-scoped). View COLUMN
+        /// checks were also ruled out (Faz 2 cancelled).
+        /// </summary>
+        private void OnNewViewDetected(dynamic view, string viewId, string viewName)
+        {
+            if (view == null || string.IsNullOrEmpty(viewName)) return;
+            Log($"OnNewViewDetected: '{viewName}' - running view-object pipeline (UDP defaults + naming + required UDPs)");
+
+            // 1. UDP defaults FIRST (table-path order, see the timer isNew
+            // branch: defaults run before naming so UDP-conditional naming
+            // rules evaluate against the seeded values).
+            if (_udpRuntimeService != null && _udpRuntimeService.IsInitialized)
+            {
+                try
+                {
+                    _udpRuntimeService.ApplyDefaults(view, "View");
+                    Log($"UDP defaults applied for new view '{viewName}'");
+                }
+                catch (Exception ex)
+                {
+                    Log($"OnNewViewDetected: UDP defaults error for '{viewName}': {ex.Message}");
+                }
+            }
+
+            // 2. Naming standard (Create context: ApplyOn=Create/Both rules).
+            // Its Required-popup Cancel may DELETE the view (routed through
+            // TryDeleteNewView, which removes the V_ snapshot) - bail out
+            // before touching the dead COM object.
+            try
+            {
+                ValidateNamingStandard("View", viewName, view, isNew: true);
+            }
+            catch (Exception ex)
+            {
+                Log($"OnNewViewDetected: naming standard error for '{viewName}': {ex.Message}");
+            }
+            if (!_keyGroupSnapshots.ContainsKey("V_" + viewId))
+            {
+                Log($"OnNewViewDetected: '{viewName}' discarded during naming validation - pipeline stopped");
+                return;
+            }
+
+            // Rules may have renamed the view; re-read so the snapshot and the
+            // dialogs below carry the final name (otherwise the next tick sees
+            // our own rename as a user rename).
+            try
+            {
+                string physName = view.Properties("Physical_Name").Value?.ToString() ?? "";
+                string finalName = (!string.IsNullOrEmpty(physName) && !physName.StartsWith("%")) ? physName : (view.Name ?? viewName);
+                if (!string.IsNullOrEmpty(finalName) && finalName != viewName)
+                {
+                    _keyGroupSnapshots["V_" + viewId] = finalName;
+                    viewName = finalName;
+                }
+            }
+            catch (Exception ex) { Log($"OnNewViewDetected: final-name re-read failed for '{viewName}': {ex.Message}"); }
+
+            // 3. Required View UDPs (Cancel deletes the new view, same contract
+            // as tables) - on delete, stop before re-reading the dead object.
+            if (_udpRuntimeService != null && _udpRuntimeService.IsInitialized)
+            {
+                bool cancelledAndDeleted = false;
+                try
+                {
+                    cancelledAndDeleted = PromptForMissingRequiredViewUdps(view, viewId, viewName);
+                }
+                catch (Exception ex)
+                {
+                    Log($"OnNewViewDetected: required-UDP prompt error for '{viewName}': {ex.Message}");
+                }
+                if (cancelledAndDeleted)
+                {
+                    Log($"OnNewViewDetected: '{viewName}' discarded by user via required-UDP Cancel");
+                    return;
+                }
+            }
+
+            // Refresh both baselines now that the pipeline's own writes are in:
+            // - watched properties, so the next drift pass does not re-validate
+            //   our own naming/UDP writes as user edits (table parity);
+            // - UDP values, so seeds register as the locked baseline ("first
+            //   non-empty set allowed").
+            try
+            {
+                if (!_viewWatchedProperties.TryGetValue(viewId, out var bucket))
+                {
+                    bucket = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                    _viewWatchedProperties[viewId] = bucket;
+                }
+                ReadWatchedProperties(view, "View", bucket);
+            }
+            catch (Exception ex) { Log($"OnNewViewDetected: watched-property refresh failed for '{viewName}': {ex.Message}"); }
+            RefreshViewUdpSnapshot(view, viewId);
+        }
+
+        /// <summary>
+        /// View analogue of <see cref="PromptForMissingRequiredUdps"/>: prompts
+        /// for View-scoped IS_REQUIRED UDPs that are still empty after defaults.
+        /// Cancel discards the new view (mirrors the new-table contract). The
+        /// table version's predefined-column cascade has no view counterpart;
+        /// the UDP dependency cascade runs via HandleUdpValueChange("View").
+        /// </summary>
+        /// <returns>True when the user cancelled and the view was deleted.</returns>
+        private bool PromptForMissingRequiredViewUdps(dynamic view, string viewId, string viewName)
+        {
+            Dictionary<string, string> currentValues;
+            try { currentValues = _udpRuntimeService.ReadUdpValues((object)view, "View"); }
+            catch (Exception ex)
+            {
+                Log($"PromptForMissingRequiredViewUdps: ReadUdpValues failed on '{viewName}': {ex.Message}");
+                currentValues = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            }
+
+            var missing = UdpDefinitionService.Instance
+                .GetByObjectType("View")
+                .Where(d => d != null && d.IsRequired)
+                .Where(d =>
+                {
+                    if (!currentValues.TryGetValue(d.Name, out var v)) return true;
+                    return string.IsNullOrEmpty(v);
+                })
+                .ToList();
+
+            if (missing.Count == 0) return false;
+
+            Log($"PromptForMissingRequiredViewUdps: '{viewName}' missing {missing.Count} required UDP(s): {string.Join(", ", missing.Select(m => m.Name))}");
+
+            using (var form = new Forms.RequiredUdpForm(viewName, missing, Forms.RequiredOperationMode.Create, "View"))
+            {
+                var result = form.ShowDialog();
+                if (result != DialogResult.OK || form.SelectedValues.Count == 0)
+                {
+                    Log($"PromptForMissingRequiredViewUdps: user cancelled for '{viewName}' - deleting new view");
+                    return TryDeleteNewView(view, viewId, viewName);
+                }
+
+                try
+                {
+                    _udpRuntimeService.WriteUdpValues((object)view, form.SelectedValues, "View");
+                    Log($"PromptForMissingRequiredViewUdps: wrote {form.SelectedValues.Count} required UDP value(s) on '{viewName}'");
+                }
+                catch (Exception ex)
+                {
+                    Log($"PromptForMissingRequiredViewUdps: WriteUdpValues failed on '{viewName}': {ex.Message}");
+                    return false;
+                }
+
+                // Dependency cascade (DEPENDS_ON_UDP_ID chains between View UDPs)
+                // - same gesture-driven refresh as the table path.
+                foreach (var kvp in form.SelectedValues)
+                {
+                    try { _udpRuntimeService.HandleUdpValueChange(view, kvp.Key, kvp.Value, "View"); }
+                    catch (Exception ex) { Log($"PromptForMissingRequiredViewUdps: dependency cascade failed for '{kvp.Key}': {ex.Message}"); }
+                }
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Removes a newly-created view after the user discarded its Required
+        /// popup (mirrors <see cref="TryDeleteNewEntity"/>). Cleans the view
+        /// tracking snapshots so the next walk does not report a phantom
+        /// "view disappeared".
+        /// </summary>
+        private bool TryDeleteNewView(dynamic view, string viewId, string viewName)
+        {
+            if (view == null) return false;
+
+            int transId = 0;
+            bool transOpen = false;
+            try
+            {
+                dynamic modelObjects = _session.ModelObjects;
+                transId = _session.BeginNamedTransaction("DiscardNewView");
+                transOpen = true;
+
+                modelObjects.Remove(view);
+
+                _session.CommitTransaction(transId);
+                transOpen = false;
+
+                _keyGroupSnapshots.Remove("V_" + viewId);
+                _viewWatchedProperties.Remove(viewId);
+                _viewUdpSnapshots.Remove(viewId);
+
+                Log($"TryDeleteNewView: removed '{viewName}' (objectId={viewId})");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log($"TryDeleteNewView: remove failed for '{viewName}': {ex.Message}");
+                if (transOpen)
+                {
+                    try { _session.RollbackTransaction(transId); }
+                    catch (Exception rbEx) { Log($"TryDeleteNewView: rollback failed: {rbEx.Message}"); }
+                }
+                return false;
+            }
+        }
+
+        /// <summary>Re-reads the view's UDP values into the lock baseline snapshot.</summary>
+        private void RefreshViewUdpSnapshot(dynamic view, string viewId)
+        {
+            if (_udpRuntimeService == null || !_udpRuntimeService.IsInitialized) return;
+            if (string.IsNullOrEmpty(viewId)) return;
+            try
+            {
+                // Zero View-scoped definitions -> ReadUdpValues returns empty at
+                // zero property-read cost; skip storing an empty bucket.
+                var values = _udpRuntimeService.ReadUdpValues((object)view, "View");
+                if (values.Count > 0)
+                    _viewUdpSnapshots[viewId] = values;
+            }
+            catch (Exception ex)
+            {
+                Log($"RefreshViewUdpSnapshot: read failed for view {viewId}: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// View-UDP change observer - mirrors the table semantics in
+        /// <see cref="CheckForUdpValueChanges"/>:
+        ///   - LOCKED UDPs: the FIRST non-empty assignment is allowed (wizards /
+        ///     ApplyDefaults / the Required popup seed the field), every later
+        ///     edit is reverted with the "UDP Kilitli" warning;
+        ///   - other changes run the dependency cascade
+        ///     (<see cref="UdpRuntimeService.HandleUdpValueChange"/>) and re-run
+        ///     the View naming standard so UDP-conditional naming rules
+        ///     (e.g. a prefix scoped to a View UDP value) follow the edit;
+        ///   - cascade writes are absorbed silently by the wholesale snapshot
+        ///     re-read at the end (same timing-based system-write exclusion as
+        ///     the table block - read once BEFORE the cascade, re-read after).
+        /// Cost-gated: exits when the admin defined no View UDPs at all.
+        /// </summary>
+        private void CheckViewUdpChanges(dynamic view, string viewId, string viewName)
+        {
+            if (_udpRuntimeService == null || !_udpRuntimeService.IsInitialized) return;
+            if (!UdpDefinitionService.Instance.IsLoaded) return;
+
+            List<UdpDefinitionRuntime> viewDefs;
+            try
+            {
+                viewDefs = UdpDefinitionService.Instance
+                    .GetByObjectType("View")
+                    .Where(d => d != null)
+                    .ToList();
+            }
+            catch (Exception ex)
+            {
+                Log($"CheckViewUdpChanges: definition read failed: {ex.Message}");
+                return;
+            }
+            if (viewDefs.Count == 0) return;
+
+            Dictionary<string, string> current;
+            try { current = _udpRuntimeService.ReadUdpValues((object)view, "View"); }
+            catch (Exception ex)
+            {
+                Log($"CheckViewUdpChanges: ReadUdpValues failed on '{viewName}': {ex.Message}");
+                return;
+            }
+
+            if (!_viewUdpSnapshots.TryGetValue(viewId, out var prev))
+            {
+                // No baseline yet (e.g. tracking started before the UDP runtime
+                // initialized): seed silently, enforce from the next pass.
+                if (current.Count > 0) _viewUdpSnapshots[viewId] = current;
+                return;
+            }
+
+            var changedPairs = new List<KeyValuePair<string, string>>();
+            foreach (var def in viewDefs)
+            {
+                current.TryGetValue(def.Name, out var newValue);
+                prev.TryGetValue(def.Name, out var oldValue);
+                newValue ??= "";
+                oldValue ??= "";
+                if (newValue == oldValue) continue;
+
+                if (def.IsLocked && !string.IsNullOrEmpty(oldValue))
+                {
+                    try
+                    {
+                        _udpRuntimeService.WriteUdpValues(
+                            (object)view,
+                            new Dictionary<string, string> { [def.Name] = oldValue },
+                            "View");
+                        Log($"UDP '{def.Name}' is locked on view '{viewName}' - reverted '{newValue}' -> '{oldValue}'");
+
+                        AddinMessageDialog.Show(
+                            $"'{def.Name}' UDP'si kilitli. Yeni deger ('{newValue}') reddedildi; '{oldValue}' olarak korundu.",
+                            "UDP Kilitli",
+                            System.Windows.Forms.MessageBoxButtons.OK,
+                            System.Windows.Forms.MessageBoxIcon.Warning);
+                    }
+                    catch (Exception revertEx)
+                    {
+                        Log($"CheckViewUdpChanges: revert failed for '{def.Name}' on '{viewName}': {revertEx.Message}");
+                    }
+                    // Snapshot keeps oldValue - the rejected edit never becomes
+                    // baseline and never feeds the cascade.
+                    continue;
+                }
+
+                Log($"UDP '{def.Name}' changed on view '{viewName}': '{oldValue}' -> '{newValue}'");
+                changedPairs.Add(new KeyValuePair<string, string>(def.Name, newValue));
+            }
+
+            if (changedPairs.Count > 0)
+            {
+                // Dependency cascade + naming re-validation, table parity. The
+                // cascade may write further UDPs; those writes land AFTER the
+                // `current` read above and are captured silently by the re-read
+                // below, never re-entering the lock check.
+                foreach (var kvp in changedPairs)
+                {
+                    try { _udpRuntimeService.HandleUdpValueChange(view, kvp.Key, kvp.Value, "View"); }
+                    catch (Exception ex) { Log($"CheckViewUdpChanges: dependency cascade failed for '{kvp.Key}' on '{viewName}': {ex.Message}"); }
+                }
+                try { ValidateNamingStandard("View", viewName, view); }
+                catch (Exception ex) { Log($"CheckViewUdpChanges: naming re-validation failed for '{viewName}': {ex.Message}"); }
+
+                RefreshViewUdpSnapshot(view, viewId);
+            }
+            else
+            {
+                // Only locked reverts (or nothing): keep the baseline as-is so
+                // rejected values never become baseline.
+                _viewUdpSnapshots[viewId] = prev;
             }
         }
 
@@ -1821,8 +2237,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                         Log($"Required field dialog cancelled: {fieldLabel} (mode={cancelMode})");
                         if (isNew)
                         {
-                            requiredCancelHandled = TryDeleteNewEntity(scapiObject, physicalName);
-                            break; // new entity is either gone or revert failed; either way exit this rf
+                            requiredCancelHandled = DiscardNewObjectForRequiredCancel(objectType, scapiObject, physicalName);
+                            break; // new object is either gone or revert failed; either way exit this rf
                         }
 
                         string baseline = string.Equals(rf.Rule.PropertyCode, "Physical_Name", StringComparison.OrdinalIgnoreCase)
@@ -1987,7 +2403,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 Log($"Required field re-prompt cancelled for {fieldLabel} (mode={cancelMode})");
                                 if (isNew)
                                 {
-                                    requiredCancelHandled = TryDeleteNewEntity(scapiObject, physicalName);
+                                    requiredCancelHandled = DiscardNewObjectForRequiredCancel(objectType, scapiObject, physicalName);
                                 }
                                 else
                                 {
