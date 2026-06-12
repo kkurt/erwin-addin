@@ -198,18 +198,6 @@ namespace EliteSoft.Erwin.AddIn
         private DateTime? _lastGlossaryRefreshTime;
         private volatile bool _isRefreshingGlossary;
 
-        // ---- Command-line trigger (Avenue C) ----
-        // Set true between a WM_COPYDATA trigger and the matching status-sentinel
-        // write so the Generate DDL handler runs CLICK-FREE for an external
-        // caller: the four early guards are pre-checked before firing (no modal
-        // pops), the result-tail modals are suppressed, and the outcome is
-        // reported to %TEMP%\erwin-alter-ddl-status.json. The LEFT side stays the
-        // active open model; the trigger only carries the RIGHT (baseline)
-        // version + an optional output path + a correlation id.
-        private bool _triggerRequestActive;
-        private string _pendingTriggerRid;
-        private string _pendingTriggerOut;
-
         #endregion
 
         #region Constructor
@@ -4077,22 +4065,9 @@ namespace EliteSoft.Erwin.AddIn
             try { UnregisterHotKey(this.Handle, SpikeCloseHotkeyId); } catch { /* best-effort */ }
             base.OnHandleDestroyed(e);
         }
-#endif
-
-        // WM_COPYDATA must be received in ALL builds (packaged too) so an
-        // external process can trigger Generate DDL from the command line
-        // (Avenue C). The WndProc override therefore lives OUTSIDE the dev-only
-        // #if; only the WM_HOTKEY arm (dev recon hotkeys) stays conditional.
-        private const int WM_COPYDATA = 0x004A;
 
         protected override void WndProc(ref Message m)
         {
-            if (m.Msg == WM_COPYDATA)
-            {
-                HandleCopyDataTrigger(ref m);
-                return;
-            }
-#if !PACKAGED
             if (m.Msg == WM_HOTKEY)
             {
                 int hk = m.WParam.ToInt32();
@@ -4112,269 +4087,9 @@ namespace EliteSoft.Erwin.AddIn
                     return;
                 }
             }
-#endif
             base.WndProc(ref m);
         }
-
-        // ===================== Command-line trigger (Avenue C) =====================
-        [StructLayout(LayoutKind.Sequential)]
-        private struct COPYDATASTRUCT { public IntPtr dwData; public int cbData; public IntPtr lpData; }
-        private const long TriggerMagic = 0x44444C31; // 'DDL1'
-
-        // Cold-start tunables. Disposition "" = normal open (surfaces the model in
-        // the GUI). If the in-process Add opens read-only / does not surface as an
-        // MDI child, try "OVM=No" / a GUI-open disposition here. ConnectTimeout
-        // bounds the wait for the reconnect timer's ConnectToModel to bind it.
-        private const string ColdStartDisposition = "";
-        private const int ColdStartConnectTimeoutSec = 40;
-
-        /// <summary>
-        /// Receives an external WM_COPYDATA trigger and fires the SAME Generate
-        /// DDL pipeline a human green-button click runs. Payload (UTF-8):
-        /// <c>v=&lt;rightVersion&gt;;out=&lt;path&gt;;rid=&lt;id&gt;</c>. LEFT = active
-        /// open model; RIGHT (baseline) = <c>v</c>. Pre-checks the handler's four
-        /// guards so the caller gets a status sentinel instead of a popped modal,
-        /// then dispatches the handler via BeginInvoke so WndProc (and the
-        /// sender's SendMessage) returns promptly.
-        /// </summary>
-        private void HandleCopyDataTrigger(ref Message m)
-        {
-            string rid = null, outFile = null, modelPath = null; int rightVersion = -1, leftVersion = -1;
-            try
-            {
-                var cd = (COPYDATASTRUCT)Marshal.PtrToStructure(m.LParam, typeof(COPYDATASTRUCT));
-                if (cd.dwData.ToInt64() != TriggerMagic) { base.WndProc(ref m); return; }
-                var bytes = new byte[cd.cbData];
-                Marshal.Copy(cd.lpData, bytes, 0, cd.cbData);
-                string payload = System.Text.Encoding.UTF8.GetString(bytes);
-                foreach (var part in payload.Split(';'))
-                {
-                    int eq = part.IndexOf('=');
-                    if (eq <= 0) continue;
-                    string k = part.Substring(0, eq).Trim();
-                    string val = part.Substring(eq + 1).Trim();
-                    if (k == "v") int.TryParse(val, out rightVersion);
-                    else if (k == "out") outFile = val;
-                    else if (k == "rid") rid = val;
-                    else if (k == "model") modelPath = val;           // cold-start: Mart path below Mart/ (e.g. Demo/SQL/1_DEV/KKR)
-                    else if (k == "lv") int.TryParse(val, out leftVersion); // cold-start: LEFT (active) version to open
-                }
-                Log($"[TRIGGER] WM_COPYDATA: v={rightVersion} lv={leftVersion} model='{modelPath}' out='{outFile}' rid='{rid}'");
-
-                _pendingTriggerRid = rid;
-                _pendingTriggerOut = string.IsNullOrWhiteSpace(outFile) ? null : outFile;
-                _triggerRequestActive = true;
-                m.Result = (IntPtr)0;
-
-                // COLD-START: no model connected yet. If the caller supplied a
-                // model path + left version, open it IN-PROCESS (the add-in's
-                // _scapi shares the GUI's PersistenceUnits, so Add surfaces the
-                // model in the UI), let the reconnect timer adopt it, then run
-                // the pipeline. Otherwise fail as before.
-                if (!_isConnected || _currentModel == null)
-                {
-                    if (!string.IsNullOrWhiteSpace(modelPath) && leftVersion > 0)
-                    {
-                        m.Result = (IntPtr)1;
-                        int rv = rightVersion;
-                        string mp = modelPath; int lv = leftVersion;
-                        BeginInvoke(new Action(() => ColdStartOpenThenFire(mp, lv, rv)));
-                        return;
-                    }
-                    FailTrigger("not connected / no model open (and no model/lv supplied for cold-start)");
-                    return;
-                }
-
-                // Already connected: fast path (existing behaviour).
-                m.Result = (IntPtr)1;
-                BeginInvoke(new Action(() => RunTriggerAcceptedPath(rightVersion)));
-            }
-            catch (Exception ex)
-            {
-                Log($"[TRIGGER] WM_COPYDATA handling failed: {ex.Message}");
-                try { FailTrigger("trigger handler exception: " + ex.Message); } catch { /* best effort */ }
-            }
-        }
-
-        // Cold-start wait state: after an in-process open we poll until the
-        // reconnect timer's ConnectToModel has set _isConnected + ConfigContext.
-        private System.Windows.Forms.Timer _coldStartTimer;
-        private int _coldStartRightVersion;
-        private DateTime _coldStartDeadlineUtc;
-
-        /// <summary>
-        /// Cold-start step: open the LEFT model version in-process (creds resolved
-        /// from CONNECTION_DEF, no GUI Connect dialog), then wait for the add-in's
-        /// reconnect timer to adopt it before running the pipeline. Runs on the UI/
-        /// STA thread (SCAPI is STA); the Add blocks a few seconds during Mart auth,
-        /// which is fine for an unattended cold start.
-        /// </summary>
-        private void ColdStartOpenThenFire(string modelPath, int leftVersion, int rightVersion)
-        {
-            try
-            {
-                Log($"[COLD] begin: model='{modelPath}' lv={leftVersion} rv={rightVersion}");
-
-                var mi = Services.DdlGenerationService.GetMartConnectionInfo(Log);
-                if (mi == null) { FailTrigger("cold-start: no Mart connection info (CONNECTION_DEF DB_TYPE='MART_API')"); return; }
-
-                string mp = modelPath.Trim().Trim('/');
-                // SCAPI Mart locator with embedded creds; VNO selects the version.
-                string locator = $"mart://Mart/{mp}?TRC=NO;SRV={mi.Value.host};PRT={mi.Value.port};ASR=MartServer;UID={mi.Value.username};PSW={mi.Value.password};VNO={leftVersion}";
-                string masked = System.Text.RegularExpressions.Regex.Replace(locator, @"PSW=[^;]*", "PSW=***");
-                Log($"[COLD] opening LEFT in-process: {masked}  disp='{ColdStartDisposition}'");
-
-                int before = 0; try { before = (int)_scapi.PersistenceUnits.Count; } catch { }
-                dynamic pu;
-                try
-                {
-                    pu = _scapi.PersistenceUnits.Add(locator, ColdStartDisposition);
-                }
-                catch (Exception ex)
-                {
-                    FailTrigger($"cold-start: PersistenceUnits.Add failed ({ex.GetType().Name}): {ex.Message}");
-                    return;
-                }
-                int after = 0; try { after = (int)_scapi.PersistenceUnits.Count; } catch { }
-                string puName = "(?)"; try { puName = pu?.Name?.ToString() ?? "(null)"; } catch { }
-                Log($"[COLD] PersistenceUnits.Add OK: count {before}->{after}, name='{puName}'. Waiting for reconnect-timer adoption...");
-
-                // Make sure the reconnect timer is actually running (it is started
-                // on a bare-erwin form load, but be defensive).
-                try { StartReconnectTimer(); } catch (Exception ex) { Log($"[COLD] StartReconnectTimer note: {ex.Message}"); }
-
-                // Poll (non-blocking) for the add-in to bind the model.
-                _coldStartRightVersion = rightVersion;
-                _coldStartDeadlineUtc = DateTime.UtcNow.AddSeconds(ColdStartConnectTimeoutSec);
-                if (_coldStartTimer == null)
-                {
-                    _coldStartTimer = new System.Windows.Forms.Timer { Interval = 500 };
-                    _coldStartTimer.Tick += ColdStartTimer_Tick;
-                }
-                _coldStartTimer.Start();
-            }
-            catch (Exception ex)
-            {
-                Log($"[COLD] open failed: {ex.Message}");
-                try { FailTrigger("cold-start open exception: " + ex.Message); } catch { /* best effort */ }
-            }
-        }
-
-        private void ColdStartTimer_Tick(object sender, EventArgs e)
-        {
-            try
-            {
-                if (_isConnected && _currentModel != null && ConfigContextService.Instance.IsInitialized)
-                {
-                    _coldStartTimer.Stop();
-                    Log($"[COLD] add-in connected to model '{_connectedModelName}'. Running pipeline (rv={_coldStartRightVersion}).");
-                    RunTriggerAcceptedPath(_coldStartRightVersion);
-                    return;
-                }
-                if (DateTime.UtcNow > _coldStartDeadlineUtc)
-                {
-                    _coldStartTimer.Stop();
-                    FailTrigger($"cold-start: model opened but add-in did not connect within {ColdStartConnectTimeoutSec}s " +
-                                $"(isConnected={_isConnected}, currentModel={(_currentModel != null)}, configInit={ConfigContextService.Instance.IsInitialized})");
-                }
-            }
-            catch (Exception ex)
-            {
-                try { _coldStartTimer.Stop(); } catch { }
-                Log($"[COLD] wait tick failed: {ex.Message}");
-                try { FailTrigger("cold-start wait exception: " + ex.Message); } catch { }
-            }
-        }
-
-        /// <summary>
-        /// Shared "accepted" path for both the already-connected fast path and the
-        /// cold-start path: re-checks the runtime guards, selects the right version,
-        /// and fires the proven Generate DDL pipeline.
-        /// </summary>
-        private void RunTriggerAcceptedPath(int rightVersion)
-        {
-            if (!ConfigContextService.Instance.IsInitialized) { FailTrigger("config context not initialized (model not Mart-mapped)"); return; }
-            if (_martMartPipelineActive) { FailTrigger("pipeline busy - retry shortly"); return; }
-            if (Services.Win32Helper.IsErwinMainWindowBlockedByModal()) { FailTrigger("erwin is blocked by a modal dialog"); return; }
-            // From-Mart availability is decided by the admin DDL gates, NOT
-            // rbFromMart.Visible (a WinForms control on an inactive tab page
-            // reports Visible=false even when the source is enabled).
-            if (!(_ddlAllowLastSaved || _ddlAllowPreviousVersions)) { FailTrigger("From-Mart DDL source is not enabled (admin gates: last-saved + previous-versions both off)"); return; }
-            if (!rbFromMart.Checked) rbFromMart.Checked = true;
-            if (rightVersion <= 0) { FailTrigger($"invalid right version '{rightVersion}'"); return; }
-            if (!TrySelectRightVersion(rightVersion, out string selErr)) { FailTrigger(selErr); return; }
-
-            BtnAlterWizardProd_Click(this, EventArgs.Empty);
-        }
-
-        /// <summary>
-        /// Selects the requested right (baseline) version in the already-populated
-        /// <c>cmbRightModel</c> by matching <see cref="ParseRightVersion"/>'s
-        /// "v&lt;N&gt;" convention. Never calls RebuildRightCombo (it resets the
-        /// selection and is admin-gated); a version hidden by an admin toggle is
-        /// simply absent from Items, so the trigger correctly fails for it.
-        /// </summary>
-        private bool TrySelectRightVersion(int v, out string error)
-        {
-            error = null;
-            try
-            {
-                for (int i = 0; i < cmbRightModel.Items.Count; i++)
-                {
-                    var match = System.Text.RegularExpressions.Regex.Match(cmbRightModel.Items[i].ToString(), @"^v(\d+)");
-                    if (match.Success && int.Parse(match.Groups[1].Value) == v)
-                    {
-                        cmbRightModel.SelectedIndex = i;
-                        Log($"[TRIGGER] right version set to v{v} (combo index {i}).");
-                        return true;
-                    }
-                }
-                var items = string.Join(", ", cmbRightModel.Items.Cast<object>().Select(x => x.ToString()));
-                error = $"requested right version v{v} not available (items: [{items}])";
-                return false;
-            }
-            catch (Exception ex) { error = "right-version select failed: " + ex.Message; return false; }
-        }
-
-        /// <summary>Writes a failure status sentinel and clears the active flag.</summary>
-        private void FailTrigger(string error)
-        {
-            Log("[TRIGGER] aborted: " + error);
-            WriteTriggerStatus(false, 0, error, null);
-            _triggerRequestActive = false;
-        }
-
-        /// <summary>
-        /// Atomically writes the trigger outcome to
-        /// <c>%TEMP%\erwin-alter-ddl-status.json</c> so the external caller can
-        /// distinguish success / no-diff / failure without waiting on any modal.
-        /// </summary>
-        private void WriteTriggerStatus(bool ok, int chars, string error, string outFile)
-        {
-            try
-            {
-                string captured = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "erwin-alter-ddl-captured.sql");
-                string Esc(string s) => s == null ? "null"
-                    : "\"" + s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\r", " ").Replace("\n", " ") + "\"";
-                string json = "{"
-                    + $"\"rid\":{Esc(_pendingTriggerRid)},"
-                    + $"\"ok\":{(ok ? "true" : "false")},"
-                    + $"\"chars\":{chars},"
-                    + $"\"error\":{Esc(error)},"
-                    + $"\"capturedFile\":{Esc(captured)},"
-                    + $"\"outFile\":{Esc(outFile)},"
-                    + $"\"ts\":{Esc(DateTime.UtcNow.ToString("o"))}"
-                    + "}";
-                string path = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "erwin-alter-ddl-status.json");
-                string tmp = path + ".tmp";
-                System.IO.File.WriteAllText(tmp, json, new System.Text.UTF8Encoding(false));
-                if (System.IO.File.Exists(path)) System.IO.File.Delete(path);
-                System.IO.File.Move(tmp, path);
-                Log($"[TRIGGER] status written: ok={ok} chars={chars} -> {path}");
-            }
-            catch (Exception ex) { Log("[TRIGGER] status write failed: " + ex.Message); }
-        }
-        // =================== end command-line trigger (Avenue C) ===================
+#endif
 
         // STEP-MODE state + toggle (RDP black-rectangle bisection diagnostic).
         // Compiled in ALL builds so the button can exist in packaged too, but in
@@ -5255,8 +4970,7 @@ namespace EliteSoft.Erwin.AddIn
                 // stack for postmortem.
                 lblDDLStatus.Text = $"Error: {err}";
                 lblDDLStatus.ForeColor = Color.Red;
-                if (!_triggerRequestActive)
-                    ErwinAddIn.ShowTopMostMessage($"DDL generation failed:\n\n{err}", "Generate DDL", isError: true);
+                ErwinAddIn.ShowTopMostMessage($"DDL generation failed:\n\n{err}", "Generate DDL", isError: true);
             }
             else if (reviewReachedRd && string.IsNullOrEmpty(script))
             {
@@ -5291,8 +5005,7 @@ namespace EliteSoft.Erwin.AddIn
                 }
                 lblDDLStatus.Text = errTitle;
                 lblDDLStatus.ForeColor = Color.Red;
-                if (!_triggerRequestActive)
-                    ErwinAddIn.ShowTopMostMessage(errBody, "Generate DDL", isError: true);
+                ErwinAddIn.ShowTopMostMessage(errBody, "Generate DDL", isError: true);
             }
             else if (script.Length == 0)
             {
@@ -5310,11 +5023,8 @@ namespace EliteSoft.Erwin.AddIn
                 // STEP [E]: all native teardown done; DDL is about to be rendered.
                 // OK here -> the DdlApprovalDialog (our own WinForms modal) opens.
                 Services.NativeBridgeService.StepCheckpoint("E", "Tum native teardown bitti. OK'a basinca DDL sonuc/approval penceresi (kendi WinForms modalimiz) ACILACAK. Bu pencere acilirken siyahlik olusursa tetikleyici bizim dialog, degilse erwin teardown'u.", Log);
-                // A command-line-triggered run is click-free: skip the approval
-                // modal (the captured .sql + status sentinel carry the result).
-                if (!_triggerRequestActive)
-                    ShowDDLResult(script, "Alter DDL", sourceMode);
-                Log($"DDL produced ({script.Length} chars).{(_triggerRequestActive ? " (command-line trigger - approval dialog skipped)" : " Review popup opened; user can submit to approval queue or cancel.")}");
+                ShowDDLResult(script, "Alter DDL", sourceMode);
+                Log($"DDL produced ({script.Length} chars). Review popup opened; user can submit to approval queue or cancel.");
                 // The cross-version path now evicts the orphan right-version
                 // PU before reaching here (see CloseSelectedVersionPU call
                 // inside the cross-version branch). This DIAG dump is the
@@ -5327,30 +5037,9 @@ namespace EliteSoft.Erwin.AddIn
             // Success (or no-diff) run that still left the pipeline's version
             // copy open: tell the user how to clean up. The failure path above
             // already folded this text into its own modal and nulled it.
-            if (pipelineLeftoverWarning != null && !_triggerRequestActive)
+            if (pipelineLeftoverWarning != null)
             {
                 ErwinAddIn.ShowTopMostMessage(pipelineLeftoverWarning, "Generate DDL - cleanup needed", isError: true);
-            }
-
-            // Command-line trigger (Avenue C): report the outcome to the status
-            // sentinel and clear the flag. script/err are final here (this tail
-            // runs on normal completion AND on a caught pipeline exception).
-            if (_triggerRequestActive)
-            {
-                if (err != null) WriteTriggerStatus(false, 0, err, null);
-                else if (script == null) WriteTriggerStatus(false, 0, "erwin returned no DDL buffer (see Debug Log)", null);
-                else if (script.Length == 0) WriteTriggerStatus(true, 0, null, null);
-                else
-                {
-                    string copiedTo = null;
-                    if (_pendingTriggerOut != null)
-                    {
-                        try { System.IO.File.WriteAllText(_pendingTriggerOut, script, new System.Text.UTF8Encoding(false)); copiedTo = _pendingTriggerOut; }
-                        catch (Exception ex) { Log("[TRIGGER] out-file write failed: " + ex.Message); }
-                    }
-                    WriteTriggerStatus(true, script.Length, null, copiedTo);
-                }
-                _triggerRequestActive = false;
             }
 
             btnAlterWizardProd.Enabled = true;
