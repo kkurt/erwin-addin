@@ -1459,3 +1459,31 @@ live debug log for proof the probe ever returned a real value in production,
 own accept/refuse), and (3) design the gate to fail OPEN toward the authority
 with an in-flight detection of the authoritative answer (the refusal-box
 detection + Complete Compare relaunch is the pattern that survived).
+
+## 2026-06-11: In-proc UIA on erwin-native dialogs = delayed OLEACC crash
+
+**What happened:** the Type Resolution guard (Compare-step interceptor) clicked
+the wizard's Finish via UIA (AutomationElement.FromHandle + ClickButtonByName).
+The pipeline SUCCEEDED end-to-end (DDL produced, clean teardown logs), then
+erwin crashed ~5s after "pipeline complete" - WER: OLEACC.dll APPCRASH followed
+by coreclr 0xc0000005. The codebase already encoded this exact lesson in
+ClickDialogButtonByTextWin32's doc: "oleacc IAccessible RCWs crash erwin's
+finalizer at teardown" - I used the UIA path anyway because OTHER call sites
+(ClickButtonByName on transient MessageBox popups) appeared to work.
+
+**Why (the trap):** "UIA works on standard dialogs here" generalized from
+transient OS message boxes to ERWIN-NATIVE wizard windows. We run INSIDE
+erwin's process: a UIA client call bridges through OLEACC in-proc and leaves
+IAccessible RCWs tied to erwin's windows; the crash fires minutes later at
+finalization, far from the call site, so the pipeline log looks perfect.
+The "it crashed" report and the guard's own success log pointed at opposite
+conclusions - only the WER faulting module (OLEACC) connected them.
+
+**How to apply:** (1) NEVER touch erwin-owned windows (wizards, CC cascade,
+Mart dialogs) with UIA from the addin - use the existing pure-Win32 helpers
+(ClickDialogButtonByTextWin32, WM_COMMAND dispatch); UIA is tolerable only for
+OUR OWN WinForms and transient OS message boxes. (2) When a crash is delayed
+past a "successful" pipeline, read the WER faulting module BEFORE re-touching
+pipeline logic (feedback_check_memory_before_crash_chase). (3) Before adding a
+new dialog interaction, grep for an existing "NO UIA" helper first - if one
+exists, its existence IS the warning.

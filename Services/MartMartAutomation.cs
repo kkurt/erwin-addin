@@ -721,7 +721,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     return null;
                 }
 
-                IntPtr resolveDlg = WaitForDialog("Resolve Differences", 10000);
+                IntPtr resolveDlg = WaitForResolveDifferencesHandlingTypeResolution(10000, log);
                 if (resolveDlg == IntPtr.Zero) { log?.Invoke("  RD did not open"); return null; }
                 log?.Invoke($"  RD = 0x{resolveDlg.ToInt64():X} (kept VISIBLE for diag)");
                 session.ResolveDifferences = resolveDlg;
@@ -971,7 +971,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     return session;
                 }
 
-                IntPtr rd = WaitForDialog("Resolve Differences", 10000);
+                IntPtr rd = WaitForResolveDifferencesHandlingTypeResolution(10000, log);
                 if (rd == IntPtr.Zero) { log?.Invoke("  [REVIEW] Resolve Differences did not open."); return session; }
                 log?.Invoke($"  [REVIEW] Resolve Differences = 0x{rd.ToInt64():X}");
                 session.ResolveDifferences = rd;
@@ -1549,6 +1549,11 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // Step 6: wait for Resolve Differences (longer timeout for DB
                 // compare - the RE-vs-mart compare can take more than 10s if
                 // the model has many entities).
+                // No Type Resolution guard here: the RIGHT side is a fresh DB
+                // reverse-engineer with no UDP definitions, so erwin's Type
+                // Resolution wizard cannot appear on the From-DB compare
+                // (user-confirmed 2026-06-11). Mart-vs-mart routes use
+                // WaitForResolveDifferencesHandlingTypeResolution instead.
                 IntPtr resolveDlg = WaitForDialog("Resolve Differences", 30000);
                 if (resolveDlg == IntPtr.Zero)
                 {
@@ -4784,26 +4789,102 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         private static IntPtr WaitForDialog(string titleContains, int timeoutMs)
         {
-            IntPtr result = IntPtr.Zero;
             uint deadline = unchecked((uint)Environment.TickCount) + (uint)timeoutMs;
             while (unchecked((int)((uint)Environment.TickCount - deadline)) < 0)
             {
                 Thread.Sleep(100);
-                uint myPid = (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
-                EnumWindows((hWnd, lp) =>
+                IntPtr found = FindVisibleOwnTopLevel(titleContains);
+                if (found != IntPtr.Zero) return found;
+            }
+            return IntPtr.Zero;
+        }
+
+        /// <summary>Single scan for a visible top-level window of OUR process whose title contains <paramref name="titleContains"/>.</summary>
+        private static IntPtr FindVisibleOwnTopLevel(string titleContains)
+        {
+            IntPtr result = IntPtr.Zero;
+            uint myPid = (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
+            EnumWindows((hWnd, lp) =>
+            {
+                if (!IsWindowVisible(hWnd)) return true;
+                GetWindowThreadProcessId(hWnd, out uint pid);
+                if (pid != myPid) return true;
+                string t = GetTitle(hWnd);
+                if (!string.IsNullOrEmpty(t) && t.IndexOf(titleContains, StringComparison.OrdinalIgnoreCase) >= 0)
                 {
-                    if (!IsWindowVisible(hWnd)) return true;
-                    GetWindowThreadProcessId(hWnd, out uint pid);
-                    if (pid != myPid) return true;
-                    string t = GetTitle(hWnd);
-                    if (!string.IsNullOrEmpty(t) && t.IndexOf(titleContains, StringComparison.OrdinalIgnoreCase) >= 0)
-                    {
-                        result = hWnd;
-                        return false;
-                    }
-                    return true;
-                }, IntPtr.Zero);
-                if (result != IntPtr.Zero) return result;
+                    result = hWnd;
+                    return false;
+                }
+                return true;
+            }, IntPtr.Zero);
+            return result;
+        }
+
+        /// <summary>
+        /// Waits for the Resolve Differences window while watching for erwin's
+        /// "Type Resolution" wizard. That wizard interrupts the CC cascade right
+        /// after Compare when the left/right models carry UDP types with the same
+        /// name but different datatypes (typical for cross-version compares after
+        /// a UDP definition changed). If nobody presses its Finish, Resolve
+        /// Differences never opens: the pipeline times out, no DDL is produced,
+        /// and the half-open wizard cascade can crash erwin during teardown
+        /// (user-reported 2026-06-11, log 20:15 "Resolve Differences did not
+        /// open" followed by an erwin restart). Pressing Finish accepts the
+        /// wizard's default conflict resolutions - the same thing a user does
+        /// manually - and lets the compare proceed.
+        /// Finish is clicked via ClickDialogButtonByTextWin32 (PURE Win32, no
+        /// UIA): in-proc UIA on erwin's own wizards leaves oleacc IAccessible
+        /// RCWs that crash erwin minutes later at teardown - proven 2026-06-11
+        /// (OLEACC.dll APPCRASH at 22:32 after a UIA-clicked Finish at 22:31,
+        /// pipeline itself succeeded). Same lesson the [SM-WIN32]/[MO-WIN32]
+        /// teardown paths already encode with their "NO UIA" rule.
+        /// The timeout is re-armed once after the wizard is dismissed so the
+        /// compare gets its full window again.
+        /// </summary>
+        private static IntPtr WaitForResolveDifferencesHandlingTypeResolution(int timeoutMs, Action<string> log)
+        {
+            const string TypeResolutionTitle = "Type Resolution";
+            bool deadlineReArmed = false;
+            uint lastFinishClickTick = 0;
+            uint deadline = unchecked((uint)Environment.TickCount) + (uint)timeoutMs;
+
+            while (unchecked((int)((uint)Environment.TickCount - deadline)) < 0)
+            {
+                Thread.Sleep(100);
+
+                IntPtr rd = FindVisibleOwnTopLevel("Resolve Differences");
+                if (rd != IntPtr.Zero) return rd;
+
+                IntPtr tr = FindVisibleOwnTopLevel(TypeResolutionTitle);
+                if (tr == IntPtr.Zero) continue;
+
+                // Throttle re-clicks: the wizard needs a moment to process Finish
+                // and close; hammering it every 100 ms just spams the log.
+                uint now = unchecked((uint)Environment.TickCount);
+                if (lastFinishClickTick != 0 && unchecked((int)(now - lastFinishClickTick)) < 1500)
+                    continue;
+                lastFinishClickTick = now;
+
+                bool clicked = false;
+                try
+                {
+                    clicked = ClickDialogButtonByTextWin32(tr, new[] { "Finish", "Son" }, log);
+                }
+                catch (Exception ex)
+                {
+                    log?.Invoke($"  [TYPE-RES] Finish click error on 0x{tr.ToInt64():X}: {ex.Message}");
+                }
+                log?.Invoke(clicked
+                    ? $"  [TYPE-RES] Type Resolution wizard 0x{tr.ToInt64():X} intercepted - Finish pressed (default UDP type resolutions accepted)."
+                    : $"  [TYPE-RES] Type Resolution wizard 0x{tr.ToInt64():X} present but Finish button not found - will retry.");
+
+                if (clicked && !deadlineReArmed)
+                {
+                    // The wizard ate part of the wait; give the compare its full
+                    // timeout again from this point (once only).
+                    deadlineReArmed = true;
+                    deadline = unchecked((uint)Environment.TickCount) + (uint)timeoutMs;
+                }
             }
             return IntPtr.Zero;
         }
