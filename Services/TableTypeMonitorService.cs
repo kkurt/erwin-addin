@@ -2075,6 +2075,70 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// Silently apply AUTO_APPLY=true prefix/suffix naming rules that live
+        /// on ONE property code and persist the result; returns the (possibly
+        /// unchanged) value. Step 1 of <see cref="ValidateNamingStandard"/>
+        /// calls this for Physical_Name (the object's primary name); the
+        /// Step 3b per-property loop calls it for every OTHER property code
+        /// that carries rules - notably View.Name, which has no Physical_Name
+        /// accessor at all, so a view's suffix/prefix rules are authored on
+        /// "Name". Before this existed those rules were never auto-applied: the
+        /// un-suffixed name fell through to validate-only and, because the same
+        /// property also carries an IS_REQUIRED rule (the VIEW.Name regexp),
+        /// escalated to the Required-input popup instead of silently adding the
+        /// suffix (user-reported 2026-06-13).
+        /// </summary>
+        private string AutoApplyNamingForProperty(string objectType, string propertyCode, string currentValue, dynamic scapiObject, bool isNew)
+        {
+            if (scapiObject == null) return currentValue;
+
+            // object-box for the engine call so its internal LINQ lambdas stay
+            // compile-time resolved (dynamic dispatch breaks them - same reason
+            // ValidateNamingStandard boxes scapiObject before calling in).
+            object scapiBoxed = scapiObject;
+            string afterAuto = NamingValidationEngine.ApplyNamingStandards(
+                objectType, currentValue, scapiBoxed, autoOnly: true, propertyCode: propertyCode, isNew: isNew);
+            if (string.Equals(afterAuto, currentValue, StringComparison.Ordinal))
+                return currentValue;
+
+            // Name_Qualifier is read-only; its writes must target Schema_Ref.
+            // For every accessor the addin auto-applies today (Physical_Name,
+            // Name) the write code equals the read code.
+            string writeAccessor = NamingValidationEngine.WriteAccessorFor(propertyCode);
+            int transId = _session.BeginNamedTransaction("ApplyAutoNamingStandard");
+            try
+            {
+                scapiObject.Properties(writeAccessor).Value = afterAuto;
+                _session.CommitTransaction(transId);
+                Log($"Naming standard auto-applied (silent): '{objectType}.{propertyCode}' '{currentValue}' -> '{afterAuto}'");
+                // Modal OK-to-dismiss confirmation (user asked 2026-05-27 that a
+                // silent rename cannot be missed). Owner null -> anchors to the
+                // active form's screen via AddinMessageDialog's monitor logic.
+                AddinMessageDialog.Show(
+                    $"{objectType} '{currentValue}' -> '{afterAuto}'",
+                    "Naming standard applied",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+
+                // Only the primary-name snapshot is keyed by Physical_Name;
+                // other property codes do not participate in _entitySnapshots.
+                if (string.Equals(propertyCode, "Physical_Name", StringComparison.OrdinalIgnoreCase))
+                {
+                    string objectId = scapiObject.ObjectId?.ToString() ?? "";
+                    if (_entitySnapshots.ContainsKey(objectId))
+                        _entitySnapshots[objectId].PhysicalName = afterAuto;
+                }
+                return afterAuto;
+            }
+            catch (Exception ex)
+            {
+                try { _session.RollbackTransaction(transId); } catch (Exception rbEx) { Log($"ApplyAutoNamingStandard rollback error: {rbEx.Message}"); }
+                Log($"Naming standard silent auto-apply failed for '{objectType}.{propertyCode}': {ex.Message}");
+                return currentValue;
+            }
+        }
+
+        /// <summary>
         /// Validate object name against naming standards and log/show results.
         /// </summary>
         /// <summary>
@@ -2156,44 +2220,11 @@ namespace EliteSoft.Erwin.AddIn.Services
             // breaks the LINQ lambdas inside the engine — see CheckEntityKeyGroups for prior art).
             object scapiBoxed = scapiObject;
 
-            // Step 1: silently apply AUTO_APPLY=true rules
-            if (scapiBoxed != null)
-            {
-                string afterAuto = NamingValidationEngine.ApplyNamingStandards(objectType, physicalName, scapiBoxed, autoOnly: true, isNew: isNew);
-                if (!string.Equals(afterAuto, physicalName, StringComparison.Ordinal))
-                {
-                    int transId = _session.BeginNamedTransaction("ApplyAutoNamingStandard");
-                    try
-                    {
-                        scapiObject.Properties("Physical_Name").Value = afterAuto;
-                        _session.CommitTransaction(transId);
-                        Log($"Naming standard auto-applied (silent): '{physicalName}' -> '{afterAuto}'");
-                        // Modal popup (was a transient ToastNotification until
-                        // 2026-05-27): user explicitly asked for an OK-to-
-                        // dismiss confirmation so silent rename auto-apply
-                        // cannot be missed. Owner is null so the dialog
-                        // anchors to ErwinAddIn.ActiveForm's screen per
-                        // AddinMessageDialog's own multi-monitor logic.
-                        AddinMessageDialog.Show(
-                            $"{objectType} '{physicalName}' -> '{afterAuto}'",
-                            "Naming standard applied",
-                            MessageBoxButtons.OK,
-                            MessageBoxIcon.Information);
-
-                        // Update snapshot
-                        string objectId = scapiObject.ObjectId?.ToString() ?? "";
-                        if (_entitySnapshots.ContainsKey(objectId))
-                            _entitySnapshots[objectId].PhysicalName = afterAuto;
-
-                        physicalName = afterAuto;
-                    }
-                    catch (Exception ex)
-                    {
-                        try { _session.RollbackTransaction(transId); } catch (Exception rbEx) { Log($"ApplyAutoNamingStandard rollback error: {rbEx.Message}"); }
-                        Log($"Naming standard silent auto-apply failed: {ex.Message}");
-                    }
-                }
-            }
+            // Step 1: silently apply AUTO_APPLY=true rules to the object's
+            // primary name (Physical_Name). Property codes other than
+            // Physical_Name (e.g. View.Name, which has no Physical_Name
+            // accessor) are auto-applied per-property in the Step 3b loop.
+            physicalName = AutoApplyNamingForProperty(objectType, "Physical_Name", physicalName, scapiObject, isNew);
 
             // Step 2: ask user about AUTO_APPLY=false rules that would still change the name
             if (scapiBoxed != null)
@@ -2294,6 +2325,17 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // didn't fire for property X on new entity Y" reports
                     // by surfacing the live value the engine sees.
                     Log($"NamingValidate: '{objectType}.{propertyCode}' on '{physicalName}' liveValue='{propValue}' isNew={isNew}");
+
+                    // Auto-apply AUTO_APPLY=true prefix/suffix rules that live
+                    // on THIS property code before validating (Steps 1/2 only
+                    // cover Physical_Name). Without this a VIEW.Name '_VVV'
+                    // suffix is never added and the un-suffixed name escalates
+                    // to the Required-input popup because Name also carries a
+                    // required regexp rule (user-reported 2026-06-13).
+                    string autoApplied = AutoApplyNamingForProperty(objectType, propertyCode, propValue, scapiObject, isNew);
+                    if (!string.Equals(autoApplied, propValue, StringComparison.Ordinal))
+                        propValue = autoApplied;
+
                     var extraResults = NamingValidationEngine.ValidateObjectName(
                         objectType, propValue, scapiBoxed, propertyCode, isNew: isNew);
                     failures.AddRange(extraResults.Where(r => !r.IsValid));

@@ -658,4 +658,52 @@ public class NamingStandardEngineTests
         }
         finally { NamingStandardService.Instance.SeedForTesting(System.Array.Empty<NamingStandardRule>()); }
     }
+
+    // ---------- View.Name (non-Physical_Name property) auto-apply ----------
+
+    [Fact]
+    public void ApplyNamingStandards_Suffix_on_View_Name_property_auto_applies()
+    {
+        // Regression seed 2026-06-13: erwin r10 Views have NO Physical_Name
+        // accessor, so a view's suffix/prefix rules are authored on "Name".
+        // The orchestration (TableTypeMonitorService.AutoApplyNamingForProperty)
+        // forwards the property code into the engine - this locks the engine
+        // half of the contract: a Suffix rule keyed on "Name" must auto-apply
+        // when ApplyNamingStandards is called with propertyCode="Name".
+        // Before the fix the suffix was never added and the un-suffixed name
+        // escalated to the Required-input popup (the VIEW.Name rule#1037).
+        NamingStandardService.Instance.SeedForTesting(new[]
+        {
+            new NamingStandardRule
+            {
+                Id = 1037,
+                ObjectType = "View",
+                PropertyCode = "Name",
+                RuleType = NamingRuleKind.Suffix,
+                Suffix = "_VVV",
+                AutoApply = true,
+                ApplyOn = RuleApplyOn.Both,
+                IsActive = true,
+            },
+        });
+        try
+        {
+            // A Physical_Name run finds nothing (no rule on that code) and
+            // leaves the name untouched - exactly why Step 1 was a no-op.
+            NamingValidationEngine.ApplyNamingStandards(
+                "View", "V_6", scapiObject: null, autoOnly: true,
+                propertyCode: "Physical_Name", isNew: true).Should().Be("V_6");
+
+            // The Name run (what the Step 3b loop now performs) applies _VVV.
+            NamingValidationEngine.ApplyNamingStandards(
+                "View", "V_6", scapiObject: null, autoOnly: true,
+                propertyCode: "Name", isNew: true).Should().Be("V_6_VVV");
+
+            // Idempotent: an already-suffixed name is not doubled.
+            NamingValidationEngine.ApplyNamingStandards(
+                "View", "V_6_VVV", scapiObject: null, autoOnly: true,
+                propertyCode: "Name", isNew: true).Should().Be("V_6_VVV");
+        }
+        finally { NamingStandardService.Instance.SeedForTesting(System.Array.Empty<NamingStandardRule>()); }
+    }
 }
