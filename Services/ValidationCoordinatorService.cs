@@ -263,6 +263,23 @@ namespace EliteSoft.Erwin.AddIn.Services
         private Dictionary<string, string> _entityEditorBaseline;
         private string _entityEditorName;
 
+        // When each entity entered _pendingNamedEntities. Backs the stale-
+        // pending fallback (2026-06-13): a drag-create (click + immediate
+        // second click/drag) can open+close erwin's in-place editor within one
+        // 100 ms WindowMonitor tick - or skip it entirely - so the inline-edit
+        // close edge never fires, the rename path never fires (name stays the
+        // default E_<n>), and the entity stayed pending FOREVER with zero
+        // checks (user-reported bypass: 'E_41'). Entries older than
+        // StalePendingEntityMs with no inline edit open are force-committed.
+        private readonly Dictionary<string, DateTime> _pendingEntityAddedAt =
+            new Dictionary<string, DateTime>(StringComparer.Ordinal);
+        // 1.5 s: erwin opens the in-place editor essentially instantly on a
+        // click-create, and an OPEN editor always suppresses the force (the
+        // !inlineEditOpen gate), so this delay only covers the editor's own
+        // appearance latency. 4 s felt sluggish for the drag-create case
+        // (user feedback 2026-06-13).
+        private const int StalePendingEntityMs = 1500;
+
         private readonly HashSet<string> _pendingNamedEntities =
             new HashSet<string>(StringComparer.Ordinal);
 
@@ -412,6 +429,28 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         // Event fired when a model-level UDP value changes (for cascade update)
         public event Action<string, string> OnModelUdpChanged; // udpName, newValue
+
+        /// <summary>
+        /// Raised on the UDP editor's open->closed transition (Tools > User
+        /// Defined Properties - the only place a UDP DEFINITION can be
+        /// deleted). ModelConfigForm runs the admin-UDP recovery there
+        /// (sync re-check + instance-value restore). 2026-06-12.
+        /// </summary>
+        public event Action OnUdpEditorClosed;
+
+        /// <summary>
+        /// Raised on the UDP editor's closed->open transition. ModelConfigForm
+        /// snapshots admin-UDP values here (BEFORE any definition delete can wipe
+        /// them) so the close-edge recovery can restore them. 2026-06-12 Part A.
+        /// </summary>
+        public event Action OnUdpEditorOpened;
+        private bool _udpEditorWasOpen;
+
+        // Admin Model-UDP values snapshotted on UDP-editor open, restored on
+        // close (Part A). _lastModelUdpValues is normally reliable, but copying
+        // it at open time guarantees the pre-delete values survive even if a
+        // tick mutates the live cache between delete and restore.
+        private Dictionary<string, string> _udpRecoveryModel;
 
 
         public ValidationCoordinatorService(dynamic session, dynamic scapi)
@@ -828,6 +867,46 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// Restores MODEL-level UDP values after their definitions were
+        /// recreated by the UDP-editor-close recovery. Source = the open-time
+        /// recovery copy when present (captures pre-delete values), else the
+        /// live baseline. Only writes names tracked with a non-empty value.
+        /// </summary>
+        public void RestoreModelUdpValues(IReadOnlyCollection<string> udpNames)
+        {
+            if (udpNames == null || udpNames.Count == 0) return;
+            if (_udpRuntimeService == null) { Log("RestoreModelUdpValues: UDP runtime not available."); return; }
+
+            var source = (_udpRecoveryModel != null && _udpRecoveryModel.Count > 0)
+                ? _udpRecoveryModel
+                : _lastModelUdpValues;
+
+            var toWrite = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var name in udpNames)
+            {
+                if (!string.IsNullOrEmpty(name)
+                    && source.TryGetValue(name, out var val)
+                    && !string.IsNullOrEmpty(val))
+                {
+                    toWrite[name] = val;
+                }
+            }
+            if (toWrite.Count == 0) { Log("RestoreModelUdpValues: no tracked model values to restore."); return; }
+
+            try
+            {
+                dynamic root = _session.ModelObjects.Root;
+                if (root == null) return;
+                _udpRuntimeService.WriteUdpValues((object)root, toWrite, "Model");
+                Log($"RestoreModelUdpValues: restored {toWrite.Count} model UDP value(s): {string.Join(", ", toWrite.Keys)}");
+            }
+            catch (Exception ex)
+            {
+                Log($"RestoreModelUdpValues failed: {ex.Message}");
+            }
+        }
+
+        /// <summary>
         /// Check if any model-level UDP values changed since last check.
         /// Called from MonitorTimer_Tick (same tick as model change detection).
         /// </summary>
@@ -850,6 +929,44 @@ namespace EliteSoft.Erwin.AddIn.Services
                         string prevVal = "";
                         _lastModelUdpValues.TryGetValue(udpName, out prevVal);
 
+                        // Required-UDP clear protection (2026-06-12): clears
+                        // (non-empty -> empty) were previously ignored entirely
+                        // by the IsNullOrEmpty(val) gate below, so a required
+                        // MODEL UDP (e.g. a List value like Application/Owner)
+                        // could be silently emptied. Restore the previous value
+                        // + warn, mirroring the table/view observers.
+                        if (string.IsNullOrEmpty(val) && !string.IsNullOrEmpty(prevVal)
+                            && _udpRuntimeService != null)
+                        {
+                            var def = UdpDefinitionService.Instance.IsLoaded
+                                ? UdpDefinitionService.Instance.GetByName("Model", udpName)
+                                : null;
+                            if (def != null && def.IsRequired)
+                            {
+                                try
+                                {
+                                    _udpRuntimeService.WriteUdpValues(
+                                        (object)root,
+                                        new Dictionary<string, string> { [udpName] = prevVal },
+                                        "Model");
+                                    Log($"[ModelUDP] '{udpName}' is required - cleared value restored to '{prevVal}'");
+
+                                    Forms.AddinMessageDialog.Show(
+                                        $"UDP '{udpName}' is required. The value cannot be cleared; '{prevVal}' was restored.",
+                                        "UDP Required",
+                                        System.Windows.Forms.MessageBoxButtons.OK,
+                                        System.Windows.Forms.MessageBoxIcon.Warning);
+                                }
+                                catch (Exception revertEx)
+                                {
+                                    Log($"[ModelUDP] required restore failed for '{udpName}': {revertEx.Message}");
+                                }
+                                // _lastModelUdpValues keeps prevVal - the rejected
+                                // clear never becomes baseline.
+                                continue;
+                            }
+                        }
+
                         if (!string.Equals(val, prevVal ?? "", StringComparison.Ordinal) && !string.IsNullOrEmpty(val))
                         {
                             _lastModelUdpValues[udpName] = val;
@@ -857,7 +974,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                             OnModelUdpChanged?.Invoke(udpName, val);
                         }
                     }
-                    catch { }
+                    catch (Exception ex) { Log($"[ModelUDP] check error for '{path}': {ex.Message}"); }
                 }
             }
             catch { }
@@ -1395,6 +1512,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                             if (IsPlaceholderEntityName(displayName))
                             {
                                 _pendingNamedEntities.Add(entityId);
+                                _pendingEntityAddedAt[entityId] = DateTime.UtcNow;
                                 Log($"[PENDING-ENTITY] entityId={entityId} name='{displayName}' - placeholder, holding for inline-edit commit / rename");
                             }
                             else
@@ -1413,6 +1531,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                             if (IsPlaceholderEntityName(displayName))
                             {
                                 _pendingNamedEntities.Add(entityId);
+                                _pendingEntityAddedAt[entityId] = DateTime.UtcNow;
                                 Log($"[PENDING-ENTITY] entityId={entityId} '{prevDisplayName}' -> '{displayName}' (still placeholder) - keeping pending");
                             }
                             else
@@ -1426,6 +1545,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 // of an already-real entity stays
                                 // isNew=false → "Revert Change".
                                 bool wasPending = _pendingNamedEntities.Remove(entityId);
+                                _pendingEntityAddedAt.Remove(entityId);
                                 bool entityIsNew = wasPending;
 
                                 entitiesToNamingCheck.Add((displayName, entityIsNew));
@@ -1474,6 +1594,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                         _entityAttrIdSnapshot.Remove(id);
                         _entityDisplayNameSnapshot.Remove(id);
                         _pendingNamedEntities.Remove(id);
+                        _pendingEntityAddedAt.Remove(id);
                         // Drop pending attr timestamps belonging to the
                         // disappearing entity so the dictionary doesn't grow
                         // unbounded across long sessions.
@@ -2102,6 +2223,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // Required Name_Qualifier dialog rule#1019 because the
                     // rename detection here always passed isNew=false).
                     bool wasPending = _pendingNamedEntities.Remove(id);
+                    _pendingEntityAddedAt.Remove(id);
                     // Bridge: ValidateCommittedPendingAttrs may have
                     // already lifted this id out of _pendingNamedEntities
                     // and added it to _creationGestureEntityIds. When the
@@ -2518,6 +2640,36 @@ namespace EliteSoft.Erwin.AddIn.Services
             // Column-level Locked enforcement and naming-standard
             // enforcement are unaffected.
 
+            // UDP editor close-edge (2026-06-12): the only window where a UDP
+            // DEFINITION can be deleted. On the open->closed transition raise
+            // the recovery event; the form re-runs the admin UDP sync and
+            // restores instance values from session snapshots. The event
+            // handler shows modal UI, so it is raised LAST-wins safe: a
+            // reentrant tick during its pump sees wasOpen=false and no-ops.
+            try
+            {
+                bool udpEditorOpen = IsUdpEditorOpen();
+                if (udpEditorOpen && !_udpEditorWasOpen)
+                {
+                    _udpEditorWasOpen = true;
+                    // Capture the pre-delete admin Model-UDP values now, while the
+                    // definitions still exist, then let the form snapshot table/
+                    // view values too. Silent (read-only) - no modal here.
+                    _udpRecoveryModel = new Dictionary<string, string>(_lastModelUdpValues, StringComparer.OrdinalIgnoreCase);
+                    Log($"UDP editor opened - captured {_udpRecoveryModel.Count} model UDP value(s); requesting table/view snapshot.");
+                    try { OnUdpEditorOpened?.Invoke(); }
+                    catch (Exception evEx) { Log($"OnUdpEditorOpened handler error: {evEx.Message}"); }
+                }
+                else if (!udpEditorOpen && _udpEditorWasOpen)
+                {
+                    _udpEditorWasOpen = false;
+                    Log("UDP editor closed - raising admin-UDP recovery check.");
+                    try { OnUdpEditorClosed?.Invoke(); }
+                    catch (Exception evEx) { Log($"OnUdpEditorClosed handler error: {evEx.Message}"); }
+                }
+            }
+            catch (Exception ex) { Log($"UDP editor edge check error: {ex.Message}"); }
+
             try
             {
                 bool editorIsOpen = IsColumnEditorOpen(out string activeTable);
@@ -2880,6 +3032,36 @@ namespace EliteSoft.Erwin.AddIn.Services
                     try { ScanForLockedColumnRenames("inline-edit-close"); }
                     catch (Exception ex) { Log($"ScanForLockedColumnRenames (inline) err: {ex.Message}"); }
                 }
+
+                // Stale-pending fallback (2026-06-13): a drag-create (click +
+                // immediate second click/drag) can open+close erwin's in-place
+                // editor within one 100 ms tick - or skip it entirely - so the
+                // close edge above never fires, the rename path never fires
+                // (the name stays the default E_<n>), and the new entity sat
+                // pending FOREVER with ZERO checks (user-reported bypass:
+                // 'E_41'). With no inline edit open, anything pending longer
+                // than StalePendingEntityMs counts as committed-as-is.
+                if (!inlineEditOpen && _pendingNamedEntities.Count > 0)
+                {
+                    bool anyStale = false;
+                    var nowUtc = DateTime.UtcNow;
+                    foreach (var pendId in _pendingNamedEntities)
+                    {
+                        if (!_pendingEntityAddedAt.TryGetValue(pendId, out var addedAt)
+                            || (nowUtc - addedAt).TotalMilliseconds >= StalePendingEntityMs)
+                        {
+                            anyStale = true;
+                            break;
+                        }
+                    }
+                    if (anyStale)
+                    {
+                        Log("[PENDING-ENTITY] stale pending entity with no inline edit open - forcing commit validation (drag-create bypass guard).");
+                        try { ValidateCommittedPendingAttrs(); }
+                        catch (Exception ex) { Log($"ValidateCommittedPendingAttrs (stale) err: {ex.Message}"); }
+                    }
+                }
+
                 _wasInlineEditOpen = inlineEditOpen;
             }
             catch (COMException) { HandleSessionLost(); }
@@ -3161,6 +3343,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                         Log($"[PENDING-ENTITY] commit edge for entityId={entityId} liveName='{liveEntityName}' - queuing naming check (isNew=true)");
                         entitiesToNamingCheck.Add((entityId, liveEntityName, IsNew: true));
                         _pendingNamedEntities.Remove(entityId);
+                        _pendingEntityAddedAt.Remove(entityId);
                         // Bridge for the nested ScanForRenamesEventDriven
                         // path fired during the Required-UDP modal pump:
                         // _pendingNamedEntities is now empty for this id,

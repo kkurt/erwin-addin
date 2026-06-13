@@ -299,6 +299,12 @@ namespace EliteSoft.Erwin.AddIn
                 if (puCount == 0)
                 {
                     AddinLogger.Log("No models open - starting reconnect timer");
+                    // The early splash from ErwinAddIn.Execute is normally
+                    // consumed by ConnectToModel below; this branch returns
+                    // before reaching it, so close the splash here or it stays
+                    // on screen forever (user-reported: manual add-in open with
+                    // no model loaded left the splash up, 2026-06-12).
+                    CloseEarlySplash("no models open");
                     lblActiveModel.Text = "(Waiting for model...)";
                     UpdateStatus("No models open. Waiting for a model...", Color.Gray);
                     StartReconnectTimer();
@@ -322,7 +328,33 @@ namespace EliteSoft.Erwin.AddIn
             catch (Exception ex)
             {
                 AddinLogger.Log($"LoadOpenModels FAILED: {ex.GetType().Name}: {ex.Message}");
+                // Same leak as the no-model branch: a failure before
+                // ConnectToModel leaves the early splash unconsumed - and it
+                // would otherwise sit on top of the error dialog.
+                CloseEarlySplash("LoadOpenModels failed");
                 ShowError($"Failed to load models:\n{ex.Message}", "Connection Error");
+            }
+        }
+
+        /// <summary>
+        /// Closes the early splash handed over by ErwinAddIn.Execute when a
+        /// code path returns before <c>ConnectToModel</c> (the normal consumer)
+        /// runs. Idempotent; safe when no splash was attached.
+        /// </summary>
+        private void CloseEarlySplash(string reason)
+        {
+            var splash = _earlySplash;
+            _earlySplash = null;
+            if (splash == null || splash.IsDisposed) return;
+            try
+            {
+                splash.Close();
+                splash.Dispose();
+                AddinLogger.Log($"Early splash closed ({reason}).");
+            }
+            catch (Exception ex)
+            {
+                AddinLogger.Log($"CloseEarlySplash({reason}) error: {ex.Message}");
             }
         }
 
@@ -1566,6 +1598,18 @@ namespace EliteSoft.Erwin.AddIn
                 return;
             }
             Log($"Config: {ctx.ActiveConfigName} (ID={ctx.ActiveConfigId}), corporate='{ctx.CorporateName ?? "(none)"}', mart='{ctx.MartPath}'");
+            // Local-file model with a registered CONFIG (2026-06-13): all
+            // validation features run, but every Mart pipeline stays off -
+            // Review / Generate DDL drive Mart commands + version children and
+            // AV on non-Mart PUs (EM_GDM null deref, verified 2026-05-08).
+            if (!ctx.IsMartModel)
+            {
+                btnAlterWizardProd.Enabled = false;
+                btnMartReview.Enabled = false;
+                lblDDLStatus.Text = "DDL / Review disabled: local-file model (requires a Mart-hosted model).";
+                lblDDLStatus.ForeColor = Color.FromArgb(120, 120, 120);
+                Log("Config resolved for a LOCAL model - Mart-only actions disabled, validation active.");
+            }
             // Successful config resolution: clear degraded markers so the
             // reconnect timer (if still running) won't immediately re-arm.
             _inDegradedMode = false;
@@ -1719,6 +1763,8 @@ namespace EliteSoft.Erwin.AddIn
             _validationCoordinatorService.OnSessionLost += HandleSessionLost;
             _validationCoordinatorService.OnModelChanged += HandleModelChanged;
             _validationCoordinatorService.OnModelUdpChanged += HandleModelUdpChanged;
+            _validationCoordinatorService.OnUdpEditorOpened += HandleUdpEditorOpened;
+            _validationCoordinatorService.OnUdpEditorClosed += HandleUdpEditorClosed;
             _validationCoordinatorService.SetTableTypeMonitor(_tableTypeMonitorService);
             if (_udpRuntimeService.IsInitialized)
                 _validationCoordinatorService.SetUdpRuntimeService(_udpRuntimeService);
@@ -1769,7 +1815,18 @@ namespace EliteSoft.Erwin.AddIn
         /// </summary>
         private enum UdpSyncApplyMode { WARN_AND_APPLY, SILENTLY_APPLY, OFF }
 
-        private void RunUdpSyncIfNeeded()
+        /// <param name="afterApply">Optional continuation invoked AFTER the diff
+        /// is applied to the metamodel, in BOTH policy branches (silent and the
+        /// WARN dialog closure). Used by the UDP-editor-close recovery to
+        /// restore instance VALUES from session snapshots once the deleted
+        /// definitions exist again. Connect-time callers pass null.</param>
+        /// <param name="dialogTitle">Optional context-specific title for the
+        /// WARN_AND_APPLY dialog (e.g. the deletion-recovery wording). Null =
+        /// the generic sync title.</param>
+        /// <param name="dialogSubtitle">Optional context-specific subtitle for
+        /// the WARN_AND_APPLY dialog. Null = the generic explanation.</param>
+        private void RunUdpSyncIfNeeded(Action<UdpDiff> afterApply = null,
+            string dialogTitle = null, string dialogSubtitle = null)
         {
             var ctx = ConfigContextService.Instance;
             if (!ctx.IsInitialized || ctx.ActiveConfigId <= 0)
@@ -1878,6 +1935,8 @@ namespace EliteSoft.Erwin.AddIn
             {
                 Log($"UDP sync: SILENTLY_APPLY (creates={diff.Creates.Count}, updates={diff.Updates.Count})");
                 ApplyUdpDiffSilently(syncEngine, diff);
+                try { afterApply?.Invoke(diff); }
+                catch (Exception ex) { Log($"UDP sync afterApply (silent) failed: {ex.Message}"); }
                 return;
             }
 
@@ -1911,8 +1970,9 @@ namespace EliteSoft.Erwin.AddIn
                     {
                         // WARN_AND_APPLY: show the changes read-only (no per-row
                         // opt-out, no Cancel), then apply ALL of them. The user is
-                        // informed but cannot decline - admin policy.
-                        UdpSyncDialog.ShowInformational(diffLocal, this);
+                        // informed but cannot decline - admin policy. Context
+                        // callers (deletion recovery) supply their own wording.
+                        UdpSyncDialog.ShowInformational(diffLocal, this, dialogTitle, dialogSubtitle);
                         Log($"UDP sync: WARN_AND_APPLY - applying all (creates={diffLocal.Creates.Count}, updates={diffLocal.Updates.Count})");
 
                         // Apply blocks the UI thread for the duration of the
@@ -1945,6 +2005,14 @@ namespace EliteSoft.Erwin.AddIn
                             Log($"UDP sync apply FAILED: {result.Error}");
                             AddConnectWarning($"UDP sync apply failed: {result.Error}");
                         }
+
+                        // Recovery continuation (UDP-editor close path): restore
+                        // instance values now that the definitions exist again.
+                        // Run regardless of partial failure - per-write errors
+                        // are logged inside; values for defs that did not make
+                        // it back simply fail-and-log.
+                        try { afterApply?.Invoke(diffLocal); }
+                        catch (Exception cbEx) { Log($"UDP sync afterApply failed: {cbEx.Message}"); }
 
                         // Cascade refresh AFTER apply so the dependency-set
                         // list values reflect any UDPs the user just
@@ -1988,6 +2056,110 @@ namespace EliteSoft.Erwin.AddIn
         /// (no BeginInvoke deferral needed - silent apply has no modal
         /// pump so it cannot deadlock Form.Load the way ShowDialog could).
         /// </summary>
+        // Re-entrancy guard for the UDP-editor-close recovery: the sync's modal
+        // dialog pumps messages, which re-fires the monitor timers.
+        private bool _udpEditorRecoveryRunning;
+
+        /// <summary>
+        /// Admin-UDP definition recovery ("instant undo", 2026-06-12). erwin's
+        /// UDP editor is the only place a UDP DEFINITION (Property_Type) can be
+        /// deleted - and deleting it silently wipes every instance value with
+        /// it. SCAPI offers no pre-event veto, so the closest achievable to
+        /// "deletion not allowed" is: when the UDP editor closes, re-run the
+        /// admin UDP sync (recreates any deleted admin definitions, with the
+        /// usual APPLY_UDP_CHANGES policy dialog) and then restore the instance
+        /// VALUES from the session's tracking snapshots (tables, views, model).
+        /// Values for objects never tracked this session cannot be recovered.
+        /// </summary>
+        /// <summary>
+        /// UDP editor OPENED: snapshot admin Table/View UDP values now, while the
+        /// definitions still exist, so the close-edge recovery can restore them
+        /// even if a definition is deleted (model-UDP values are captured by the
+        /// coordinator on the same edge). Silent + best-effort - never blocks.
+        /// </summary>
+        private void HandleUdpEditorOpened()
+        {
+            try
+            {
+                _tableTypeMonitorService?.CaptureUdpRecoverySnapshot();
+            }
+            catch (Exception ex)
+            {
+                Log($"HandleUdpEditorOpened error: {ex.Message}");
+            }
+        }
+
+        private void HandleUdpEditorClosed()
+        {
+            if (_udpEditorRecoveryRunning)
+            {
+                Log("UDP editor close: recovery already running - skipped.");
+                return;
+            }
+            _udpEditorRecoveryRunning = true;
+            try
+            {
+                Log("UDP editor closed - checking admin UDP definitions against the model.");
+                // Context-specific wording (user request 2026-06-13): the generic
+                // "Sync UDP definitions from config?" reads like a config drift;
+                // here the cause is a delete/edit of an admin-managed UDP inside
+                // the editor, and the dialog announces the undo.
+                RunUdpSyncIfNeeded(
+                    afterApply: RestoreValuesForCreatedDefs,
+                    dialogTitle: "Admin-managed UDP definitions protected",
+                    dialogSubtitle: "These UDP definitions are managed by the administrator. The change below is being reverted and the values will be restored.");
+            }
+            catch (Exception ex)
+            {
+                Log($"HandleUdpEditorClosed error: {ex.Message}");
+            }
+            finally
+            {
+                _udpEditorRecoveryRunning = false;
+            }
+        }
+
+        /// <summary>
+        /// Restores instance values for just-recreated admin UDP definitions
+        /// from the session snapshots. Grouped by owner type: Table + View
+        /// values live in TableTypeMonitorService's snapshots, Model values in
+        /// the coordinator's model-UDP baseline.
+        /// </summary>
+        private void RestoreValuesForCreatedDefs(UdpDiff diff)
+        {
+            if (diff == null || diff.Creates.Count == 0) return;
+
+            var tableNames = new List<string>();
+            var viewNames = new List<string>();
+            var modelNames = new List<string>();
+            foreach (var c in diff.Creates)
+            {
+                if (c == null || string.IsNullOrEmpty(c.UdpName)) continue;
+                string ot = c.ObjectType?.Trim() ?? "";
+                if (ot.Equals("Table", StringComparison.OrdinalIgnoreCase)) tableNames.Add(c.UdpName);
+                else if (ot.Equals("View", StringComparison.OrdinalIgnoreCase)) viewNames.Add(c.UdpName);
+                else if (ot.Equals("Model", StringComparison.OrdinalIgnoreCase)) modelNames.Add(c.UdpName);
+                // Column-scoped UDP values are not snapshot-tracked per
+                // attribute today; their defaults re-seed via the runtime
+                // cascade. Logged so the gap is visible, never silent.
+                else Log($"UDP recovery: no value-restore path for object type '{ot}' ('{c.UdpName}').");
+            }
+
+            Log($"UDP recovery: restoring values for recreated defs (table={tableNames.Count}, view={viewNames.Count}, model={modelNames.Count}).");
+            try
+            {
+                if ((tableNames.Count > 0 || viewNames.Count > 0) && _tableTypeMonitorService != null)
+                    _tableTypeMonitorService.RestoreTrackedUdpValues(tableNames, viewNames);
+            }
+            catch (Exception ex) { Log($"UDP recovery: table/view value restore failed: {ex.Message}"); }
+            try
+            {
+                if (modelNames.Count > 0 && _validationCoordinatorService != null)
+                    _validationCoordinatorService.RestoreModelUdpValues(modelNames);
+            }
+            catch (Exception ex) { Log($"UDP recovery: model value restore failed: {ex.Message}"); }
+        }
+
         private void ApplyUdpDiffSilently(UdpSyncEngine engine, UdpDiff diff)
         {
             try
@@ -3966,6 +4138,17 @@ namespace EliteSoft.Erwin.AddIn
                 Log("[REVIEW] Aborted: ConfigContext not initialized (no Mart mapping).");
                 return;
             }
+            // Local-file models can be config-initialized since 2026-06-13; the
+            // Mart pipelines still must never run on them (EM_GDM AV).
+            if (!ConfigContextService.Instance.IsMartModel)
+            {
+                ErwinAddIn.ShowTopMostMessage(
+                    "Review requires a Mart-hosted model. The active model is a local file.",
+                    "Review",
+                    isError: false);
+                Log("[REVIEW] Aborted: active model is a local file (Mart required).");
+                return;
+            }
 
             if (Services.Win32Helper.IsErwinMainWindowBlockedByModal())
             {
@@ -4163,6 +4346,28 @@ namespace EliteSoft.Erwin.AddIn
                     "Generate DDL",
                     isError: false);
                 Log("[ROUTE] Aborted: ConfigContext not initialized (no Mart mapping).");
+                return;
+            }
+            // Local-file models can be config-initialized since 2026-06-13; the
+            // Mart pipelines still must never run on them (EM_GDM AV).
+            if (!ConfigContextService.Instance.IsMartModel)
+            {
+                ErwinAddIn.ShowTopMostMessage(
+                    "Generate DDL requires a Mart-hosted model. The active model is a local file.",
+                    "Generate DDL",
+                    isError: false);
+                Log("[ROUTE] Aborted: active model is a local file (Mart required).");
+                return;
+            }
+
+            // Admin gates: with every DDL source off the button is disabled by
+            // ApplyDdlGenerationGates. Same defensive belt as the ConfigContext
+            // guard above - covers the dev-only debug button (which shares this
+            // handler and is never gated) and any future re-enable leak.
+            if (!DdlSourceEnabled)
+            {
+                ErwinAddIn.ShowTopMostMessage("No DDL source is enabled.", "Generate DDL", isError: false);
+                Log("[ROUTE] Aborted: no DDL source is enabled (admin gates all off).");
                 return;
             }
 
@@ -5042,7 +5247,7 @@ namespace EliteSoft.Erwin.AddIn
                 ErwinAddIn.ShowTopMostMessage(pipelineLeftoverWarning, "Generate DDL - cleanup needed", isError: true);
             }
 
-            btnAlterWizardProd.Enabled = true;
+            btnAlterWizardProd.Enabled = DdlSourceEnabled;
 
             // Bring the add-in form back to the foreground. The Ctrl+Alt+T
             // path pushes erwin's main window up, and the brief
@@ -5700,7 +5905,7 @@ namespace EliteSoft.Erwin.AddIn
                     finally
                     {
                         _validationCoordinatorService?.ResumeValidation();
-                        btnAlterWizardProd.Enabled = true;
+                        btnAlterWizardProd.Enabled = DdlSourceEnabled;
                         this.Activate();
                         this.BringToFront();
                     }
@@ -6768,7 +6973,7 @@ namespace EliteSoft.Erwin.AddIn
             finally
             {
                 _validationCoordinatorService?.ResumeValidation();
-                btnAlterWizardProd.Enabled = true;
+                btnAlterWizardProd.Enabled = DdlSourceEnabled;
                 this.TopMost = true;
                 this.Activate();
                 this.BringToFront();
@@ -7063,6 +7268,13 @@ namespace EliteSoft.Erwin.AddIn
         private bool _ddlAllowLastSaved;
         private bool _ddlAllowPreviousVersions;
         private bool _ddlAllowFromDb;
+
+        // True when at least one admin DDL source gate is on. With all sources
+        // off Generate DDL has nothing to run against: ApplyDdlGenerationGates
+        // disables the button, and every post-run re-enable restores THIS value
+        // instead of a literal true so a finally block can never undo the gate.
+        private bool DdlSourceEnabled => _ddlAllowLastSaved || _ddlAllowPreviousVersions || _ddlAllowFromDb;
+
         private int _pendingDDLVersion = 0;
 
         // Gates the legacy bridge CC + Apply-to-Right cross-version path
@@ -7138,11 +7350,12 @@ namespace EliteSoft.Erwin.AddIn
                 else if (_ddlAllowFromDb) rbFromDB.Checked = true;
             }
 
-            // No source enabled at all -> point the user at the admin toggle.
+            // No source enabled at all -> say so and gate the action.
             if (!martVisible && !_ddlAllowFromDb)
             {
-                lblDDLStatus.Text = "No DDL source is enabled. Enable one in MetaAdmin > AddIn Management > DDL Generation.";
+                lblDDLStatus.Text = "No DDL source is enabled.";
                 lblDDLStatus.ForeColor = System.Drawing.Color.FromArgb(180, 0, 0);
+                btnAlterWizardProd.Enabled = false;
             }
         }
 

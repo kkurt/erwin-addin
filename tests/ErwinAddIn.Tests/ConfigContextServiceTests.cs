@@ -55,6 +55,30 @@ public class ConfigContextServiceTests
         ConfigContextService.ParseMartPath(null!).Should().BeNull();
     }
 
+    // Local .erwin file locators (2026-06-13): the canonical key must equal
+    // what the Configuration Warning dialog displays, so an admin-registered
+    // row matches the lookup exactly. Scheme-less per user decision 2026-06-13.
+    [Theory]
+    [InlineData(@"erwin://C:\work\FromPowerDesignerRepo\Demo\SQL_DEV\EK_KART\9\EK_KART.erwin",
+                @"C:\work\FromPowerDesignerRepo\Demo\SQL_DEV\EK_KART\9\EK_KART.erwin")]
+    [InlineData(@"erwin://C:\models\A.erwin?&something=1", @"C:\models\A.erwin")]
+    [InlineData(@"  erwin://C:\models\A.erwin\  ", @"C:\models\A.erwin")]
+    public void ParseLocalModelPath_canonicalizes_file_locators(string locator, string expected)
+    {
+        ConfigContextService.ParseLocalModelPath(locator).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("erwin://Mart://Mart/Demo/SQL/1_DEV/KKR?&version=6")] // Mart -> handled by ParseMartPath
+    [InlineData(@"C:\models\A.erwin")]                                // no erwin:// scheme
+    [InlineData("erwin://")]
+    [InlineData("   ")]
+    [InlineData(null)]
+    public void ParseLocalModelPath_returns_null_for_non_local_locators(string locator)
+    {
+        ConfigContextService.ParseLocalModelPath(locator!).Should().BeNull();
+    }
+
     // Mirrors the UDP-sync apply policy (APPLY_UDP_CHANGES, 2026-06-08): the
     // UPPER_SNAKE member names match the values the admin stores, so
     // GetEffectiveEnum/ParseEffectiveEnum resolve them directly.

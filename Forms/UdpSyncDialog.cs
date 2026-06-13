@@ -84,14 +84,27 @@ namespace EliteSoft.Erwin.AddIn.Forms
         /// </summary>
         public UdpDiff? SelectedDiff { get; private set; }
 
-        public UdpSyncDialog(UdpDiff diff, bool informational = false)
+        // Context-specific header text (e.g. the UDP-editor deletion recovery
+        // sets the deletion-recovery wording); falls back to the generic sync
+        // question. Consumed by both the form Text and BuildHeader's label.
+        private readonly string _titleText;
+
+        /// <param name="titleOverride">Optional context-specific header (used by
+        /// the UDP-editor deletion recovery). Null = generic sync title.</param>
+        /// <param name="subtitleOverride">Optional context-specific explanation
+        /// line. Null = generic sync explanation.</param>
+        public UdpSyncDialog(UdpDiff diff, bool informational = false,
+            string? titleOverride = null, string? subtitleOverride = null)
         {
             _diff = diff ?? throw new ArgumentNullException(nameof(diff));
             _informational = informational;
             if (_diff.IsEmpty)
                 throw new ArgumentException("UdpSyncDialog should not be opened with an empty diff", nameof(diff));
 
-            Text = "Sync UDP definitions from config?";
+            _titleText = string.IsNullOrWhiteSpace(titleOverride)
+                ? "Sync UDP definitions from config?"
+                : titleOverride;
+            Text = _titleText;
             FormBorderStyle = FormBorderStyle.None;
             StartPosition = FormStartPosition.Manual;
             MaximizeBox = false;
@@ -123,9 +136,11 @@ namespace EliteSoft.Erwin.AddIn.Forms
             // Subtitle / explanation
             var subtitle = new Label
             {
-                Text = informational
-                    ? "Config definitions differ from this model. The changes below are being applied."
-                    : "Config definitions differ from this model. Review the changes below, then Apply or Cancel.",
+                Text = !string.IsNullOrWhiteSpace(subtitleOverride)
+                    ? subtitleOverride
+                    : (informational
+                        ? "Config definitions differ from this model. The changes below are being applied."
+                        : "Config definitions differ from this model. Review the changes below, then Apply or Cancel."),
                 Font = new Font("Segoe UI", 9.5F),
                 ForeColor = ClrTextSecondary,
                 Dock = DockStyle.Top,
@@ -223,7 +238,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
 
             var lblTitle = new Label
             {
-                Text = "Sync UDP definitions from config?",
+                Text = _titleText,
                 Font = new Font("Segoe UI", 13F, FontStyle.Bold),
                 ForeColor = ClrTextPrimary,
                 AutoSize = false,
@@ -694,11 +709,12 @@ namespace EliteSoft.Erwin.AddIn.Forms
         /// the dialog is informational only. Mirrors <see cref="ShowFor"/>'s
         /// positioning/owner ergonomics.
         /// </summary>
-        public static void ShowInformational(UdpDiff diff, IWin32Window? owner)
+        public static void ShowInformational(UdpDiff diff, IWin32Window? owner,
+            string? titleOverride = null, string? subtitleOverride = null)
         {
             if (diff == null || diff.IsEmpty) return;
 
-            using var dlg = new UdpSyncDialog(diff, informational: true);
+            using var dlg = new UdpSyncDialog(diff, informational: true, titleOverride, subtitleOverride);
             dlg.PositionOnActiveScreen(owner);
 
             IWin32Window? effectiveOwner = owner;

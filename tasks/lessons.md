@@ -1487,3 +1487,22 @@ past a "successful" pipeline, read the WER faulting module BEFORE re-touching
 pipeline logic (feedback_check_memory_before_crash_chase). (3) Before adding a
 new dialog interaction, grep for an existing "NO UIA" helper first - if one
 exists, its existence IS the warning.
+
+## 2026-06-13: Hardcoded UI strings are ALWAYS English
+
+**What happened:** the UDP deletion-recovery dialog shipped with a Turkish
+title/subtitle ("Admin UDP tanimi korunuyor..."), copied from the tone of the
+pre-existing "UDP Kilitli" popup. The user corrected: fixed (hardcoded) UI
+messages are always English; Turkish appears only in admin-DB-supplied content
+(naming-rule messages, etc.).
+
+**Why (the trap):** one pre-existing Turkish hardcoded popup ("UDP Kilitli")
+looked like a convention and got copied into five new enforcement popups + a
+dialog. A single counter-example is not a convention - the project rule
+(CLAUDE.md "Dil") puts all FIXED text in English; per-customer language lives
+in admin data.
+
+**How to apply:** any new MessageBox/dialog literal -> English. If a string
+needs to be customer-facing Turkish, it belongs in the admin DB (message
+columns), not in code. Swept and converted all six existing occurrences
+(UDP Locked / UDP Required / recovery dialog) the same day.

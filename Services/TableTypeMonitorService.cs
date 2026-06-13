@@ -55,6 +55,17 @@ namespace EliteSoft.Erwin.AddIn.Services
             new Dictionary<string, Dictionary<string, string>>(StringComparer.Ordinal);
         private Dictionary<string, Dictionary<string, string>> _subjectAreaWatchedProperties;
 
+        // UDP-deletion recovery buffer (2026-06-12, "Part A"): admin UDP values
+        // snapshotted when the UDP editor OPENS - i.e. BEFORE a definition delete
+        // can wipe them. Keyed by object id. Independent of the lazy background
+        // UDP backfill (which may not have filled _entitySnapshots yet at editor
+        // close), so the close-edge recovery never loses a value. Rebuilt on each
+        // editor open.
+        private readonly Dictionary<string, Dictionary<string, string>> _udpRecoveryEntity =
+            new Dictionary<string, Dictionary<string, string>>(StringComparer.Ordinal);
+        private readonly Dictionary<string, Dictionary<string, string>> _udpRecoveryView =
+            new Dictionary<string, Dictionary<string, string>>(StringComparer.Ordinal);
+
         // Throttle counter for expensive operations (Key_Group/View/SA scans)
         private int _cycleCount;
         private const int HeavyScanInterval = 4; // Every 4 cycles (2 seconds at 500ms tick)
@@ -503,6 +514,174 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <returns>True when the entity was successfully removed; false on
         /// any failure (caller treats false as "leave the entity alone" so
         /// the user can manually clean up).</returns>
+        /// <summary>
+        /// Snapshots current Table + View admin-UDP values into the recovery
+        /// buffer (<see cref="_udpRecoveryEntity"/> / <see cref="_udpRecoveryView"/>).
+        /// Called on UDP-editor OPEN so the values are captured BEFORE a
+        /// definition delete can wipe them. Bounded: only admin-defined UDP
+        /// names are read (a handful) per object; exits immediately when no
+        /// Table/View UDP definitions exist. Rare user-initiated gesture, so the
+        /// one-off walk is acceptable (same cost class as the restore walk).
+        /// </summary>
+        public void CaptureUdpRecoverySnapshot()
+        {
+            _udpRecoveryEntity.Clear();
+            _udpRecoveryView.Clear();
+            if (_udpRuntimeService == null || !_udpRuntimeService.IsInitialized) return;
+            if (!UdpDefinitionService.Instance.IsLoaded) return;
+
+            bool hasTableDefs = UdpDefinitionService.Instance.GetByObjectType("Table").Any();
+            bool hasViewDefs = UdpDefinitionService.Instance.GetByObjectType("View").Any();
+            if (!hasTableDefs && !hasViewDefs) return;
+
+            try
+            {
+                dynamic modelObjects = _session.ModelObjects;
+                dynamic root = modelObjects.Root;
+                if (root == null) return;
+
+                if (hasTableDefs)
+                {
+                    dynamic entities = modelObjects.Collect(root, "Entity");
+                    if (entities != null)
+                    {
+                        foreach (dynamic entity in entities)
+                        {
+                            if (entity == null) continue;
+                            try
+                            {
+                                string objectId = entity.ObjectId?.ToString() ?? "";
+                                if (string.IsNullOrEmpty(objectId)) continue;
+                                Dictionary<string, string> vals = _udpRuntimeService.ReadUdpValues(entity, "Table");
+                                var nonEmpty = vals
+                                    .Where(kv => !string.IsNullOrEmpty(kv.Value))
+                                    .ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase);
+                                if (nonEmpty.Count > 0) _udpRecoveryEntity[objectId] = nonEmpty;
+                            }
+                            catch (Exception ex) { Log($"CaptureUdpRecoverySnapshot: entity read error: {ex.Message}"); }
+                        }
+                    }
+                }
+
+                if (hasViewDefs)
+                {
+                    dynamic views = modelObjects.Collect(root, "View");
+                    if (views != null)
+                    {
+                        foreach (dynamic view in views)
+                        {
+                            if (view == null) continue;
+                            try
+                            {
+                                string viewId = view.ObjectId?.ToString() ?? "";
+                                if (string.IsNullOrEmpty(viewId)) continue;
+                                Dictionary<string, string> vals = _udpRuntimeService.ReadUdpValues((object)view, "View");
+                                var nonEmpty = vals
+                                    .Where(kv => !string.IsNullOrEmpty(kv.Value))
+                                    .ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase);
+                                if (nonEmpty.Count > 0) _udpRecoveryView[viewId] = nonEmpty;
+                            }
+                            catch (Exception ex) { Log($"CaptureUdpRecoverySnapshot: view read error: {ex.Message}"); }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"CaptureUdpRecoverySnapshot failed: {ex.Message}");
+            }
+            Log($"CaptureUdpRecoverySnapshot: buffered {_udpRecoveryEntity.Count} entit{(_udpRecoveryEntity.Count == 1 ? "y" : "ies")} + {_udpRecoveryView.Count} view(s) with admin UDP values.");
+        }
+
+        /// <summary>
+        /// Restores Table and View UDP values after their DEFINITIONS were
+        /// recreated by the UDP-editor-close recovery (deleting a Property_Type
+        /// wipes every instance value with it). Source = the recovery buffer
+        /// captured on editor OPEN (<see cref="CaptureUdpRecoverySnapshot"/>),
+        /// NOT the lazy background snapshots - so a value is never lost just
+        /// because the backfill had not run yet. One-off Entity/View walks;
+        /// per-object failures are logged, never thrown. Restored values equal
+        /// what was in the model before the delete, so the change observers see
+        /// no diff afterwards.
+        /// </summary>
+        public void RestoreTrackedUdpValues(IReadOnlyCollection<string> tableUdpNames, IReadOnlyCollection<string> viewUdpNames)
+        {
+            if (_udpRuntimeService == null || !_udpRuntimeService.IsInitialized) return;
+
+            int entitiesRestored = 0, viewsRestored = 0;
+            try
+            {
+                dynamic modelObjects = _session.ModelObjects;
+                dynamic root = modelObjects.Root;
+                if (root == null) return;
+
+                if (tableUdpNames != null && tableUdpNames.Count > 0 && _udpRecoveryEntity.Count > 0)
+                {
+                    dynamic entities = modelObjects.Collect(root, "Entity");
+                    if (entities != null)
+                    {
+                        foreach (dynamic entity in entities)
+                        {
+                            if (entity == null) continue;
+                            try
+                            {
+                                string objectId = entity.ObjectId?.ToString() ?? "";
+                                if (string.IsNullOrEmpty(objectId)) continue;
+                                if (!_udpRecoveryEntity.TryGetValue(objectId, out var snapVals) || snapVals == null) continue;
+
+                                var toWrite = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                                foreach (var name in tableUdpNames)
+                                {
+                                    if (snapVals.TryGetValue(name, out var v) && !string.IsNullOrEmpty(v))
+                                        toWrite[name] = v;
+                                }
+                                if (toWrite.Count == 0) continue;
+
+                                _udpRuntimeService.WriteUdpValues(entity, toWrite, "Table");
+                                entitiesRestored++;
+                            }
+                            catch (Exception ex) { Log($"RestoreTrackedUdpValues: entity restore error: {ex.Message}"); }
+                        }
+                    }
+                }
+
+                if (viewUdpNames != null && viewUdpNames.Count > 0 && _udpRecoveryView.Count > 0)
+                {
+                    dynamic views = modelObjects.Collect(root, "View");
+                    if (views != null)
+                    {
+                        foreach (dynamic view in views)
+                        {
+                            if (view == null) continue;
+                            try
+                            {
+                                string viewId = view.ObjectId?.ToString() ?? "";
+                                if (string.IsNullOrEmpty(viewId)) continue;
+                                if (!_udpRecoveryView.TryGetValue(viewId, out var snapVals) || snapVals == null) continue;
+
+                                var toWrite = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                                foreach (var name in viewUdpNames)
+                                {
+                                    if (snapVals.TryGetValue(name, out var v) && !string.IsNullOrEmpty(v))
+                                        toWrite[name] = v;
+                                }
+                                if (toWrite.Count == 0) continue;
+
+                                _udpRuntimeService.WriteUdpValues((object)view, toWrite, "View");
+                                viewsRestored++;
+                            }
+                            catch (Exception ex) { Log($"RestoreTrackedUdpValues: view restore error: {ex.Message}"); }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"RestoreTrackedUdpValues failed: {ex.Message}");
+            }
+            Log($"RestoreTrackedUdpValues: values restored on {entitiesRestored} entit{(entitiesRestored == 1 ? "y" : "ies")}, {viewsRestored} view(s).");
+        }
+
         /// <summary>
         /// Routes the Required-popup Cancel "discard the new object" contract to
         /// the right delete + bookkeeping for the object's type. Views MUST go
@@ -1324,11 +1503,11 @@ namespace EliteSoft.Erwin.AddIn.Services
 
             // Rules may have renamed the view; re-read so the snapshot and the
             // dialogs below carry the final name (otherwise the next tick sees
-            // our own rename as a user rename).
+            // our own rename as a user rename). Views carry no Physical_Name
+            // (see NamePropertyFor) - the name lives in "Name".
             try
             {
-                string physName = view.Properties("Physical_Name").Value?.ToString() ?? "";
-                string finalName = (!string.IsNullOrEmpty(physName) && !physName.StartsWith("%")) ? physName : (view.Name ?? viewName);
+                string finalName = view.Name ?? viewName;
                 if (!string.IsNullOrEmpty(finalName) && finalName != viewName)
                 {
                     _keyGroupSnapshots["V_" + viewId] = finalName;
@@ -1504,7 +1683,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <see cref="CheckForUdpValueChanges"/>:
         ///   - LOCKED UDPs: the FIRST non-empty assignment is allowed (wizards /
         ///     ApplyDefaults / the Required popup seed the field), every later
-        ///     edit is reverted with the "UDP Kilitli" warning;
+        ///     edit is reverted with the "UDP Locked" warning;
         ///   - other changes run the dependency cascade
         ///     (<see cref="UdpRuntimeService.HandleUdpValueChange"/>) and re-run
         ///     the View naming standard so UDP-conditional naming rules
@@ -1570,8 +1749,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                         Log($"UDP '{def.Name}' is locked on view '{viewName}' - reverted '{newValue}' -> '{oldValue}'");
 
                         AddinMessageDialog.Show(
-                            $"'{def.Name}' UDP'si kilitli. Yeni deger ('{newValue}') reddedildi; '{oldValue}' olarak korundu.",
-                            "UDP Kilitli",
+                            $"UDP '{def.Name}' is locked by the administrator. The new value ('{newValue}') was rejected; '{oldValue}' was kept.",
+                            "UDP Locked",
                             System.Windows.Forms.MessageBoxButtons.OK,
                             System.Windows.Forms.MessageBoxIcon.Warning);
                     }
@@ -1581,6 +1760,35 @@ namespace EliteSoft.Erwin.AddIn.Services
                     }
                     // Snapshot keeps oldValue - the rejected edit never becomes
                     // baseline and never feeds the cascade.
+                    continue;
+                }
+
+                // Required-UDP clear protection - same contract as the table
+                // observer: a required View UDP that had a value must not be
+                // cleared; restore + warn. Initial population stays the
+                // new-view prompt's job.
+                if (def.IsRequired && string.IsNullOrEmpty(newValue) && !string.IsNullOrEmpty(oldValue))
+                {
+                    try
+                    {
+                        _udpRuntimeService.WriteUdpValues(
+                            (object)view,
+                            new Dictionary<string, string> { [def.Name] = oldValue },
+                            "View");
+                        Log($"UDP '{def.Name}' is required on view '{viewName}' - cleared value restored to '{oldValue}'");
+
+                        AddinMessageDialog.Show(
+                            $"UDP '{def.Name}' is required. The value cannot be cleared; '{oldValue}' was restored.",
+                            "UDP Required",
+                            System.Windows.Forms.MessageBoxButtons.OK,
+                            System.Windows.Forms.MessageBoxIcon.Warning);
+                    }
+                    catch (Exception revertEx)
+                    {
+                        Log($"CheckViewUdpChanges: required restore failed for '{def.Name}' on '{viewName}': {revertEx.Message}");
+                    }
+                    // Snapshot keeps oldValue; the rejected clear never feeds
+                    // the cascade.
                     continue;
                 }
 
@@ -2671,8 +2879,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 Log($"UDP '{kvp.Key}' is locked on '{physicalName}' - reverted '{kvp.Value}' -> '{oldValue}'");
 
                                 AddinMessageDialog.Show(
-                                    $"'{kvp.Key}' UDP'si kilitli. Yeni deger ('{kvp.Value}') reddedildi; '{oldValue}' olarak korundu.",
-                                    "UDP Kilitli",
+                                    $"UDP '{kvp.Key}' is locked by the administrator. The new value ('{kvp.Value}') was rejected; '{oldValue}' was kept.",
+                                    "UDP Locked",
                                     System.Windows.Forms.MessageBoxButtons.OK,
                                     System.Windows.Forms.MessageBoxIcon.Warning);
                             }
@@ -2683,6 +2891,39 @@ namespace EliteSoft.Erwin.AddIn.Services
                             // Snapshot stays at oldValue; do NOT run dependency
                             // evaluation, predefined-column hooks, or naming
                             // validation for a change we just rejected.
+                            continue;
+                        }
+
+                        // Required-UDP clear protection (2026-06-12): an admin
+                        // IS_REQUIRED UDP must never lose its value once set -
+                        // clearing it (e.g. picking the blank row of a List UDP)
+                        // is rejected and the previous value restored, same
+                        // warn-and-revert contract as the lock above. Initial
+                        // population stays the create-time prompt's job (empty
+                        // oldValue never triggers this).
+                        if (udpDef != null && udpDef.IsRequired
+                            && string.IsNullOrEmpty(kvp.Value) && !string.IsNullOrEmpty(oldValue))
+                        {
+                            try
+                            {
+                                _udpRuntimeService.WriteUdpValues(
+                                    entity,
+                                    new Dictionary<string, string> { [kvp.Key] = oldValue },
+                                    "Table");
+                                Log($"UDP '{kvp.Key}' is required on '{physicalName}' - cleared value restored to '{oldValue}'");
+
+                                AddinMessageDialog.Show(
+                                    $"UDP '{kvp.Key}' is required. The value cannot be cleared; '{oldValue}' was restored.",
+                                    "UDP Required",
+                                    System.Windows.Forms.MessageBoxButtons.OK,
+                                    System.Windows.Forms.MessageBoxIcon.Warning);
+                            }
+                            catch (Exception revertEx)
+                            {
+                                Log($"Required-UDP restore failed for '{kvp.Key}' on '{physicalName}': {revertEx.Message}");
+                            }
+                            // Snapshot stays at oldValue - the rejected clear is
+                            // never treated as a change.
                             continue;
                         }
 

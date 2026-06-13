@@ -47,8 +47,24 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <summary>CONFIG.DBMS_VERSION_ID — used by PropertyApplicator to scope MC_PROPERTY_DEF / MC_QUESTION_DEF.</summary>
         public int? DbmsVersionId { get; private set; }
 
-        /// <summary>The mart path the active model lives under, e.g. "Kursat/MetaRepo". Null for local-file models.</summary>
+        /// <summary>
+        /// The MODEL_CONFIG_MAPPING key the active model resolved (or failed to
+        /// resolve) against. For Mart models this is the mart path stem, e.g.
+        /// "Kursat/MetaRepo"; for LOCAL .erwin files (2026-06-13) it is the
+        /// plain file path, e.g. "C:\work\...\EK_KART.erwin" -
+        /// the same string the Configuration Warning dialog offers to copy, so
+        /// what the admin registers is exactly what the lookup queries.
+        /// </summary>
         public string MartPath { get; private set; }
+
+        /// <summary>
+        /// True when the active model is Mart-hosted. Local-file models can now
+        /// resolve a CONFIG too (validation features), but every Mart pipeline
+        /// (Review, Generate DDL routes - they drive Mart commands and AV on
+        /// non-Mart PUs, EM_GDM null deref verified 2026-05-08) must stay gated
+        /// on this flag, NOT on <see cref="IsInitialized"/> alone.
+        /// </summary>
+        public bool IsMartModel { get; private set; }
 
         public event Action<string> OnLog;
 
@@ -89,6 +105,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 CorporateName = null;
                 DbmsVersionId = null;
                 MartPath = null;
+                IsMartModel = false;
 
                 if (!DatabaseService.Instance.IsConfigured)
                 {
@@ -103,16 +120,32 @@ namespace EliteSoft.Erwin.AddIn.Services
                     return false;
                 }
 
+                // Resolve the MODEL_CONFIG_MAPPING key: Mart stem for Mart
+                // models, canonical file locator for LOCAL .erwin files
+                // (2026-06-13: local models previously short-circuited here
+                // BEFORE any DB lookup, so registering the path the warning
+                // dialog offered could never work - the classic trap).
                 string martPath = ParseMartPath(locator);
-                if (string.IsNullOrEmpty(martPath))
+                if (!string.IsNullOrEmpty(martPath))
                 {
-                    LastError = "No configuration is defined for the model you are trying to load. Add-in controls will be disabled.";
-                    LastErrorPath = locator ?? "";
-                    Log($"ConfigContext: not on Mart (locator='{locator}')");
-                    return false;
+                    IsMartModel = true;
+                    MartPath = martPath;
+                    Log($"ConfigContext: mart path = '{martPath}'");
                 }
-                MartPath = martPath;
-                Log($"ConfigContext: mart path = '{martPath}'");
+                else
+                {
+                    string localPath = ParseLocalModelPath(locator);
+                    if (string.IsNullOrEmpty(localPath))
+                    {
+                        LastError = "No configuration is defined for the model you are trying to load. Add-in controls will be disabled.";
+                        LastErrorPath = locator ?? "";
+                        Log($"ConfigContext: locator is neither Mart nor a local model file (locator='{locator}')");
+                        return false;
+                    }
+                    martPath = localPath;
+                    MartPath = localPath;
+                    Log($"ConfigContext: local model path = '{localPath}' (Mart-only features stay disabled)");
+                }
 
                 string dbType = DatabaseService.Instance.GetDbType();
 
@@ -172,6 +205,39 @@ namespace EliteSoft.Erwin.AddIn.Services
 
             string path = m.Groups["path"].Value.Trim().Trim('/');
             return string.IsNullOrEmpty(path) ? null : path;
+        }
+
+        /// <summary>
+        /// Canonical MODEL_CONFIG_MAPPING key for a LOCAL .erwin file locator.
+        /// Returns the PLAIN file path WITHOUT the "erwin://" scheme (user
+        /// decision 2026-06-13: "C:\work\...\EK_KART.erwin" reads better and is
+        /// what the DB stores). Returns null for Mart locators (those go
+        /// through <see cref="ParseMartPath"/>) and for anything that does not
+        /// look like an erwin file locator. The query suffix (first '?') and
+        /// trailing slashes are trimmed so the string is stable; the
+        /// Configuration Warning dialog shows THIS exact value, keeping
+        /// "what the admin registers" == "what the lookup queries". No
+        /// collision with Mart keys: those are catalog stems like
+        /// "Demo/SQL/1_DEV/KKR", never drive-letter paths.
+        /// </summary>
+        public static string ParseLocalModelPath(string locator)
+        {
+            if (string.IsNullOrWhiteSpace(locator)) return null;
+            if (locator.IndexOf("Mart://", StringComparison.OrdinalIgnoreCase) >= 0) return null;
+
+            string path = locator.Trim();
+            const string scheme = "erwin://";
+            if (!path.StartsWith(scheme, StringComparison.OrdinalIgnoreCase)) return null;
+
+            // Work on the body after the scheme. Only '?' starts a query -
+            // '&' can legally appear inside a Windows file path, so never
+            // split on it.
+            string body = path.Substring(scheme.Length);
+            int q = body.IndexOf('?');
+            if (q >= 0) body = body.Substring(0, q);
+            body = body.Trim().TrimEnd('\\', '/');
+
+            return string.IsNullOrEmpty(body) ? null : body;
         }
 
         #endregion
