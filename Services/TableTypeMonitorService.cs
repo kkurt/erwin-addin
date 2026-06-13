@@ -1503,8 +1503,8 @@ namespace EliteSoft.Erwin.AddIn.Services
 
             // Rules may have renamed the view; re-read so the snapshot and the
             // dialogs below carry the final name (otherwise the next tick sees
-            // our own rename as a user rename). Views carry no Physical_Name
-            // (see NamePropertyFor) - the name lives in "Name".
+            // our own rename as a user rename). erwin r10 Views carry no
+            // Physical_Name property - a view's name lives in "Name".
             try
             {
                 string finalName = view.Name ?? viewName;
