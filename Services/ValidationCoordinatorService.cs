@@ -1139,7 +1139,14 @@ namespace EliteSoft.Erwin.AddIn.Services
                 {
                     if (++_connectSettleTicks < ConnectSettleTicks) return;
                     _modelRequiredUdpsChecked = true;
-                    CheckModelRequiredUdpsOnce(root);
+                    // The unattended DDL worker opens models headlessly; the
+                    // model-required-UDP prompt (a modal) would block it forever.
+                    // Skip it while a worker job owns the connect (see
+                    // ModelConfigForm.DdlWorkerActiveUnattended).
+                    if (ModelConfigForm.DdlWorkerActiveUnattended)
+                        Log("Model-required-UDP prompt skipped (DDL worker unattended).");
+                    else
+                        CheckModelRequiredUdpsOnce(root);
                     return; // resume normal scanning on the next tick
                 }
 

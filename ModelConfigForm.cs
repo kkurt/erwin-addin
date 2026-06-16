@@ -260,11 +260,16 @@ namespace EliteSoft.Erwin.AddIn
         {
             using (AddinLogger.BeginScope("ModelConfigForm_Load"))
                 LoadOpenModels();
+
+            // DDL queue worker: restore the on/off state from HKCU (only the
+            // dedicated console worker user has it set) and start polling if enabled.
+            InitializeDdlWorkerFromRegistry();
         }
 
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
             base.OnFormClosed(e);
+            try { StopDdlWorker(); } catch (Exception ex) { Log($"[DDLWORKER] stop on close err: {ex.Message}"); }
             CleanupResources();
         }
 
@@ -1846,6 +1851,15 @@ namespace EliteSoft.Erwin.AddIn
                 return;
             }
 
+            // DDL queue worker runs unattended: the WARN_AND_APPLY dialog has no one
+            // to dismiss it and would block the worker. Force the silent apply (it
+            // still applies + dirties the model, just no dialog). See DdlWorker.
+            if (DdlWorkerActiveUnattended && udpMode == UdpSyncApplyMode.WARN_AND_APPLY)
+            {
+                Log("UDP sync: forcing SILENTLY_APPLY (DDL worker unattended - no dialog)");
+                udpMode = UdpSyncApplyMode.SILENTLY_APPLY;
+            }
+
             UdpSyncEngine syncEngine;
             UdpDiff diff;
             try
@@ -2313,8 +2327,19 @@ namespace EliteSoft.Erwin.AddIn
                     if (btnStepMode != null && !btnStepMode.Visible)
                     {
                         btnStepMode.Visible = true;
-                        if (tabDdlGeneration != null) tabControl.SelectedTab = tabDdlGeneration;
+                        // Stay on the General tab (user request 2026-06-15): the reveal
+                        // gesture is now mostly used for the worker checkbox here, so do
+                        // NOT auto-jump to the DDL Generation tab. btnStepMode is still
+                        // revealed (on the DDL tab) for when the user switches there.
                         Log("Step Mode button revealed on the DDL Generation tab.");
+                    }
+
+                    // Reveal the DDL queue-worker on/off checkbox (General tab). Same
+                    // gesture; the worker is the dedicated console machine's switch.
+                    if (chkDdlWorker != null && !chkDdlWorker.Visible)
+                    {
+                        chkDdlWorker.Visible = true;
+                        Log("DDL queue worker checkbox revealed on the General tab.");
                     }
                 }
             };
@@ -2429,10 +2454,18 @@ namespace EliteSoft.Erwin.AddIn
             lblModelName.Text = "Model:";
             modelBody.Controls.Add(lblModelName);
 
+            // Long model names (e.g. "CORE BANKING CASH MANAGEMENT MONEY TRANSFER_EFT")
+            // must not run under the right-aligned connection status. Fixed width +
+            // AutoEllipsis gives a single-line "...EFT" clip (AutoEllipsis is ignored
+            // when AutoSize=true, so AutoSize is OFF here). Width spans from x=120 up
+            // to a gap before lblConnectionStatus (which starts at cardW-220).
+            lblActiveModel.AutoSize = false;
             lblActiveModel.Location = new Point(120, 14);
+            lblActiveModel.Size = new Size((cardW - 220) - 120 - 16, 20);
+            lblActiveModel.TextAlign = ContentAlignment.MiddleLeft;
+            lblActiveModel.AutoEllipsis = true;
             lblActiveModel.Font = fontBold;
             lblActiveModel.ForeColor = Color.FromArgb(40, 40, 40);
-            lblActiveModel.AutoSize = true;
             modelBody.Controls.Add(lblActiveModel);
 
             lblConnectionStatus.Anchor = AnchorStyles.Top | AnchorStyles.Right;
@@ -2466,6 +2499,27 @@ namespace EliteSoft.Erwin.AddIn
             // Reposition copyright label dynamically below the last card.
             int footerY = glossY + glossH + 30 + 12;
             lblCopyright.Location = new Point(24, footerY);
+
+            // DDL queue-worker on/off (Phase 1). Built here (not in the designer) so
+            // it sits on the footer row between the copyright (bottom-left) and the
+            // "Close erwin" button (bottom-right) without colliding with the runtime
+            // "Active Model" card. Hidden in ALL builds (only the dedicated console
+            // worker user enables it); revealed via Ctrl+Shift+LeftClick on the
+            // copyright label. State persists in HKCU; CheckedChanged starts/stops the
+            // worker timer (see ModelConfigForm.DdlWorker.cs).
+            chkDdlWorker = new CheckBox
+            {
+                Text = "Enable DDL queue worker (this machine)",
+                Font = new Font("Segoe UI", 9f),
+                ForeColor = Color.FromArgb(120, 120, 120),
+                AutoSize = true,
+                Visible = false,
+                Anchor = AnchorStyles.Bottom | AnchorStyles.Left,
+                Location = new Point(cardX + 300, footerY - 2)
+            };
+            chkDdlWorker.CheckedChanged += ChkDdlWorker_CheckedChanged;
+            tabGeneral.Controls.Add(chkDdlWorker);
+            chkDdlWorker.BringToFront();
 
             // --- Footer action: Close erwin ---
             // Destructive action lives in the bottom-right corner, kept apart
@@ -4220,12 +4274,16 @@ namespace EliteSoft.Erwin.AddIn
         private const int SpikeMdiHotkeyId = 0x534D;   // 'SM'  -> Ctrl+Alt+M dump MDI children
         private const int SpikePuHotkeyId = 0x5350;    // 'SP'  -> Ctrl+Alt+P dump session PUs
         private const int SpikeCloseHotkeyId = 0x5358; // 'SX'  -> Ctrl+Alt+X graceful-close active MDI child
+        private const int SpikeColdFireHotkeyId = 0x5347; // 'SG'  -> Ctrl+Alt+G DDL-worker spike: cold-start fire (linchpin 0a)
+        private const int SpikeColdArmHotkeyId = 0x5342;  // 'SB'  -> Ctrl+Alt+B DDL-worker spike: arm auto-fire under RDP disconnect (linchpin 0b)
         private const uint MOD_ALT = 0x0001, MOD_CONTROL = 0x0002, MOD_NOREPEAT = 0x4000;
         private const uint VK_D = 0x44;
         private const uint VK_C = 0x43;
         private const uint VK_M = 0x4D;
         private const uint VK_P = 0x50;
         private const uint VK_X = 0x58;
+        private const uint VK_G = 0x47;
+        private const uint VK_B = 0x42;
         private const int WM_HOTKEY = 0x0312;
 
         protected override void OnHandleCreated(EventArgs e)
@@ -4247,6 +4305,10 @@ namespace EliteSoft.Erwin.AddIn
                 RegisterHotKey(this.Handle, SpikePuHotkeyId, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_P);
                 RegisterHotKey(this.Handle, SpikeCloseHotkeyId, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_X);
                 Log("[SPIKE] hotkeys registered - Ctrl+Alt+M=dump MDI children, Ctrl+Alt+P=dump session PUs, Ctrl+Alt+X=graceful-close ACTIVE MDI child.");
+                // DDL queue-worker Phase 0 linchpin spike (see ModelConfigForm.Spike.cs).
+                RegisterHotKey(this.Handle, SpikeColdFireHotkeyId, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_G);
+                RegisterHotKey(this.Handle, SpikeColdArmHotkeyId, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_B);
+                Log("[SPIKE] DDL-worker hotkeys registered - Ctrl+Alt+G=cold-start fire (0a), Ctrl+Alt+B=arm auto-fire under RDP disconnect (0b).");
                 // STEP-MODE toggle moved to the dev-only "Step Mode" button
                 // (Ctrl+Alt+S collided with erwin's Scheduler shortcut).
             }
@@ -4260,6 +4322,8 @@ namespace EliteSoft.Erwin.AddIn
             try { UnregisterHotKey(this.Handle, SpikeMdiHotkeyId); } catch { /* best-effort */ }
             try { UnregisterHotKey(this.Handle, SpikePuHotkeyId); } catch { /* best-effort */ }
             try { UnregisterHotKey(this.Handle, SpikeCloseHotkeyId); } catch { /* best-effort */ }
+            try { UnregisterHotKey(this.Handle, SpikeColdFireHotkeyId); } catch { /* best-effort */ }
+            try { UnregisterHotKey(this.Handle, SpikeColdArmHotkeyId); } catch { /* best-effort */ }
             base.OnHandleDestroyed(e);
         }
 
@@ -4283,6 +4347,8 @@ namespace EliteSoft.Erwin.AddIn
                     Services.NativeBridgeService.GracefulCloseActiveMdiChild(h, Log);
                     return;
                 }
+                if (hk == SpikeColdFireHotkeyId) { SpikeColdStartFire(); return; }
+                if (hk == SpikeColdArmHotkeyId) { SpikeColdStartArm(); return; }
             }
             base.WndProc(ref m);
         }
@@ -5189,7 +5255,11 @@ namespace EliteSoft.Erwin.AddIn
                 // stack for postmortem.
                 lblDDLStatus.Text = $"Error: {err}";
                 lblDDLStatus.ForeColor = Color.Red;
-                ErwinAddIn.ShowTopMostMessage($"DDL generation failed:\n\n{err}", "Generate DDL", isError: true);
+                // DDL queue worker runs unattended - suppress the modal (it would
+                // block forever with no one to dismiss it); the outcome is written
+                // to the queue row by FinishCurrentDdlJob below.
+                if (!_ddlQueueActive)
+                    ErwinAddIn.ShowTopMostMessage($"DDL generation failed:\n\n{err}", "Generate DDL", isError: true);
             }
             else if (reviewReachedRd && string.IsNullOrEmpty(script))
             {
@@ -5224,7 +5294,8 @@ namespace EliteSoft.Erwin.AddIn
                 }
                 lblDDLStatus.Text = errTitle;
                 lblDDLStatus.ForeColor = Color.Red;
-                ErwinAddIn.ShowTopMostMessage(errBody, "Generate DDL", isError: true);
+                if (!_ddlQueueActive)
+                    ErwinAddIn.ShowTopMostMessage(errBody, "Generate DDL", isError: true);
             }
             else if (script.Length == 0)
             {
@@ -5242,8 +5313,15 @@ namespace EliteSoft.Erwin.AddIn
                 // STEP [E]: all native teardown done; DDL is about to be rendered.
                 // OK here -> the DdlApprovalDialog (our own WinForms modal) opens.
                 Services.NativeBridgeService.StepCheckpoint("E", "Tum native teardown bitti. OK'a basinca DDL sonuc/approval penceresi (kendi WinForms modalimiz) ACILACAK. Bu pencere acilirken siyahlik olusursa tetikleyici bizim dialog, degilse erwin teardown'u.", Log);
-                ShowDDLResult(script, "Alter DDL", sourceMode);
-                Log($"DDL produced ({script.Length} chars). Review popup opened; user can submit to approval queue or cancel.");
+                if (!_ddlQueueActive)
+                {
+                    ShowDDLResult(script, "Alter DDL", sourceMode);
+                    Log($"DDL produced ({script.Length} chars). Review popup opened; user can submit to approval queue or cancel.");
+                }
+                else
+                {
+                    Log($"DDL produced ({script.Length} chars). DDL queue worker active - approval dialog skipped; result queued to the DB by FinishCurrentDdlJob.");
+                }
                 // The cross-version path now evicts the orphan right-version
                 // PU before reaching here (see CloseSelectedVersionPU call
                 // inside the cross-version branch). This DIAG dump is the
@@ -5256,9 +5334,19 @@ namespace EliteSoft.Erwin.AddIn
             // Success (or no-diff) run that still left the pipeline's version
             // copy open: tell the user how to clean up. The failure path above
             // already folded this text into its own modal and nulled it.
-            if (pipelineLeftoverWarning != null)
+            if (pipelineLeftoverWarning != null && !_ddlQueueActive)
             {
                 ErwinAddIn.ShowTopMostMessage(pipelineLeftoverWarning, "Generate DDL - cleanup needed", isError: true);
+            }
+
+            // DDL queue worker: report this run's outcome (script / err) to the
+            // claimed queue row and clear the active flag so the worker timer can
+            // proceed (close the model + claim the next job). Defined in the
+            // ModelConfigForm.DdlWorker partial. All user-facing modals above are
+            // suppressed while _ddlQueueActive is set.
+            if (_ddlQueueActive)
+            {
+                FinishCurrentDdlJob(script, err);
             }
 
             btnAlterWizardProd.Enabled = DdlSourceEnabled;

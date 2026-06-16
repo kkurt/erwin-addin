@@ -181,6 +181,23 @@ namespace EliteSoft.Erwin.AddIn
             {
                 Services.AddinLogger.Log($"WmCommandLogger install failed (non-fatal): {logEx.GetType().Name}: {logEx.Message}");
             }
+            // Fast path: if the add-in form is ALREADY open, Execute was re-invoked
+            // on an already-initialized add-in (the external auto-load watcher re-posts
+            // its WM_COMMAND whenever a model opens - which the DDL queue worker
+            // triggers on every job). Bring the form to front and return IMMEDIATELY:
+            // do NOT show the "Initializing add-in..." splash or re-run CheckLicense
+            // (both already ran at first load). This removes the redundant ~1 s
+            // reload-splash that flashed on every model open (2026-06-15 user report).
+            // The defensive duplicate of this check further down (after the splash +
+            // license) now only guards an impossible single-call race.
+            if (_activeForm != null && !_activeForm.IsDisposed)
+            {
+                Services.AddinLogger.Log("Execute re-invoked, add-in form already open - bring to front; skip splash + re-init.");
+                try { _activeForm.TopMost = true; _activeForm.BringToFront(); _activeForm.Activate(); _activeForm.TopMost = false; }
+                catch (Exception ex) { Services.AddinLogger.Log($"bring-to-front note: {ex.Message}"); }
+                return;
+            }
+
             // Splash shown BEFORE every heavy step so the user gets immediate
             // feedback. Without this the user saw a 1.5-7 sec dead-time between
             // erwin's model-load completing and the add-in's first paint

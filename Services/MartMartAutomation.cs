@@ -696,7 +696,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 if (martDlg != IntPtr.Zero)
                 {
                     HideWindow(martDlg);
-                    if (!SelectMartVersionInPicker(martDlg, martVersion, catalogPath, log))
+                    if (!SelectMartVersionInPicker(martDlg, martVersion, catalogPath, out _, out _, log))
                     {
                         log?.Invoke("  [WARN] Mart picker select failed");
                         PostMessage(martDlg, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero);
@@ -759,6 +759,82 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <see cref="CloseSession"/> for the Close Model + Mart Offline
         /// teardown that releases the loaded version.
         /// </summary>
+
+        /// <summary>
+        /// Open a specific Mart model version as its own MDI child, unattended,
+        /// for the DDL queue worker. Reuses the exact privileged "Mart > Open" +
+        /// version-picker automation that <see cref="DriveCompareToResolveDifferences"/>
+        /// uses for the RIGHT version (WM_COMMAND 1060 + SelectMartVersionInPicker),
+        /// but stands alone: finds erwin main + MDIClient itself, opens, and returns
+        /// the new child handle (or Zero on any failure). PURE Win32 (no mouse
+        /// simulation), so it works on a headless console session. The add-in's
+        /// reconnect timer then adopts the opened model.
+        /// </summary>
+        internal static IntPtr OpenMartVersionAsMdiChild(int version, string catalogPath, bool keepVisible, out bool transient, out string failReason, Action<string> log)
+        {
+            // transient=true  -> environmental/timing failure worth a RETRY (erwin not
+            //                    Mart-connected, picker/child slow to appear).
+            // transient=false -> PERMANENT data failure (model/version not in the Mart
+            //                    catalog) - the caller must FAIL the job, not retry.
+            transient = true;
+            failReason = null;
+
+            IntPtr erwinMain = FindErwinMain();
+            if (erwinMain == IntPtr.Zero) { failReason = "erwin main window not found"; log?.Invoke("  [WORKER-OPEN] " + failReason); return IntPtr.Zero; }
+
+            IntPtr mdiClient = FindMdiClientOf(erwinMain);
+            if (mdiClient == IntPtr.Zero) { failReason = "erwin MDIClient not found"; log?.Invoke("  [WORKER-OPEN] " + failReason); return IntPtr.Zero; }
+
+            // Snapshot ALL children (title-independent) so the new-child wait can
+            // diff correctly even if a non-Mart child is already present.
+            var beforeChildren = new System.Collections.Generic.HashSet<IntPtr>(EnumAllMdiChildHandles(mdiClient));
+            var dlgsBeforeOpen = EnumerateVisibleDialogs();
+
+            // Mart > Open via WM_COMMAND 1060 (RECON-captured); WaitForNewDialog
+            // verifies the picker opened. NO UIA (XTP ribbon UIA crashes erwin).
+            ForceForeground(erwinMain);
+            PostMessage(erwinMain, WM_COMMAND, MakeWParam(CMD_MART_OPEN_VERSION, 0), IntPtr.Zero);
+            log?.Invoke($"  [WORKER-OPEN] Mart > Open posted (WM_COMMAND {CMD_MART_OPEN_VERSION}) for v{version} '{catalogPath}'. NO UIA.");
+
+            // 20 s budget (vs DriveCompare's 6 s): the worker's FIRST Mart>Open after
+            // a fresh Mart connect loads the catalog tree from the server and the
+            // picker can take >6 s to paint. If it still does not appear, erwin is most
+            // likely not Mart-connected (Open is a no-op then) - transient (retry).
+            IntPtr picker = WaitForNewDialog(dlgsBeforeOpen, "Open picker", 20000, log);
+            if (picker == IntPtr.Zero)
+            {
+                failReason = "Mart > Open picker did not appear within 20s - is erwin connected to Mart? (Mart>Open is a no-op when not Mart-connected)";
+                log?.Invoke("  [WORKER-OPEN] " + failReason);
+                return IntPtr.Zero; // transient stays true
+            }
+            if (!keepVisible) HideWindow(picker);
+
+            if (!SelectMartVersionInPicker(picker, version, catalogPath, out string selErr, out bool dataErr, log))
+            {
+                // dataErr=true -> model/version genuinely missing in the catalog: PERMANENT.
+                transient = !dataErr;
+                failReason = selErr ?? $"could not select v{version} of '{catalogPath}' in the Mart Open picker";
+                log?.Invoke($"  [WORKER-OPEN] picker select failed ({(dataErr ? "PERMANENT data error" : "transient")}): {failReason}");
+                PostMessage(picker, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero);
+                return IntPtr.Zero;
+            }
+
+            // 30 s budget: a cold erwin Mart open can exceed 10 s (matches the
+            // DriveCompare RIGHT-version open ceiling). Slow load -> transient (retry).
+            IntPtr versionChild = WaitForNewMartMdiChild(mdiClient, beforeChildren, 30000, log);
+            if (versionChild == IntPtr.Zero)
+            {
+                failReason = $"model '{catalogPath}' v{version} opened but its MDI child did not appear within 30s (slow Mart load?)";
+                log?.Invoke("  [WORKER-OPEN] " + failReason);
+                return IntPtr.Zero; // transient stays true
+            }
+
+            transient = false;
+            failReason = null;
+            log?.Invoke($"  [WORKER-OPEN] v{version} opened as MDI child 0x{versionChild.ToInt64():X} title='{GetTitle(versionChild)}'");
+            return versionChild;
+        }
+
         /// <summary>
         /// Drives erwin to a "Resolve Differences" comparing the CURRENT model
         /// (LEFT) against an older Mart version (RIGHT), then returns the
@@ -813,7 +889,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 IntPtr picker = WaitForNewDialog(dlgsBeforeOpen, "Open picker", 6000, log);
                 if (picker == IntPtr.Zero) { log?.Invoke("  [REVIEW] Open picker did not appear."); return null; }
                 if (!keepVisible) HideWindow(picker);
-                if (!SelectMartVersionInPicker(picker, rightVersion, catalogPath, log))
+                if (!SelectMartVersionInPicker(picker, rightVersion, catalogPath, out _, out _, log))
                 {
                     log?.Invoke($"  [REVIEW] picker select failed for v{rightVersion}.");
                     PostMessage(picker, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero);
@@ -2476,7 +2552,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                         catch (Exception ex) { log?.Invoke($"    dump err: {ex.Message}"); }
                         log?.Invoke("  === end Mart picker dump ===");
                     }
-                    if (!SelectMartVersionInPicker(martDlg, martVersion, catalogPath, log))
+                    if (!SelectMartVersionInPicker(martDlg, martVersion, catalogPath, out _, out _, log))
                     {
                         log?.Invoke("  [WARN] failed to select Mart version in picker; cancelling");
                         PostMessage(martDlg, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero);
@@ -2694,8 +2770,13 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         // ── UIA helpers ─────────────────────────────────────────────────────
 
-        private static bool SelectMartVersionInPicker(IntPtr martDlg, int version, string catalogPath, Action<string> log)
+        private static bool SelectMartVersionInPicker(IntPtr martDlg, int version, string catalogPath, out string error, out bool dataError, Action<string> log)
         {
+            error = null;
+            // dataError=true means the model/version genuinely is not in the Mart
+            // catalog (a bad MODEL_PATH/version in the job) - a PERMANENT failure the
+            // caller must NOT retry. Left false for transient UI/structure issues.
+            dataError = false;
             // PURE WIN32 (no UIA). The old UIA path (AutomationElement.FromHandle on
             // this picker dialog + its catalog tree / model grid / version combo /
             // Open button) created oleacc AccWrap IAccessible RCWs that, abandoned to
@@ -2755,7 +2836,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                     IntPtr probe = FindDescendantById(martDlg, 30270);
                     var gcls = new StringBuilder(64);
                     if (probe != IntPtr.Zero) GetClassName(probe, gcls, gcls.Capacity);
-                    log?.Invoke($"    [PICK] model grid id=30270 not a SysListView32 (hwnd=0x{probe.ToInt64():X} class='{gcls}') - cannot drive via Win32; ABORT (IDCANCEL).");
+                    error = "Mart Open picker model grid (id=30270) not accessible via Win32";
+                    log?.Invoke($"    [PICK] {error} (hwnd=0x{probe.ToInt64():X} class='{gcls}') - ABORT (IDCANCEL).");
                     PostMessage(martDlg, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero);
                     return false;
                 }
@@ -2779,7 +2861,9 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
                 if (modelRow < 0)
                 {
-                    log?.Invoke($"    [PICK] model '{wantModel}' not found in grid - ABORT (IDCANCEL, refusing to load a different model).");
+                    error = $"model '{wantModel}' not found in the Mart catalog for path '{catalogPath}' - check the job's MODEL_PATH (the model may have been renamed/removed).";
+                    dataError = true; // permanent: retrying will not make a missing model appear
+                    log?.Invoke($"    [PICK] {error} ABORT (IDCANCEL, refusing to load a different model).");
                     PostMessage(martDlg, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero);
                     return false;
                 }
@@ -2795,7 +2879,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                 if (combo != IntPtr.Zero) GetClassName(combo, ccls, ccls.Capacity);
                 if (combo == IntPtr.Zero || ccls.ToString().IndexOf("ComboBox", StringComparison.OrdinalIgnoreCase) < 0)
                 {
-                    log?.Invoke($"    [PICK] version combo id=2111 not a ComboBox (hwnd=0x{combo.ToInt64():X} class='{ccls}') - ABORT (IDCANCEL).");
+                    error = "Mart Open picker version combo (id=2111) not accessible via Win32";
+                    log?.Invoke($"    [PICK] {error} (hwnd=0x{combo.ToInt64():X} class='{ccls}') - ABORT (IDCANCEL).");
                     PostMessage(martDlg, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero);
                     return false;
                 }
@@ -2814,7 +2899,9 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
                 if (sel < 0)
                 {
-                    log?.Invoke($"    [PICK] no combo item matches version '{vs}' among {cnt} - ABORT (IDCANCEL, refusing wrong version).");
+                    error = $"version v{vs} not found for model '{wantModel}' (the picker listed {cnt} version(s)) - check the job's LEFT_VERSION/RIGHT_VERSION.";
+                    dataError = true; // permanent: retrying will not make a missing version appear
+                    log?.Invoke($"    [PICK] {error} ABORT (IDCANCEL, refusing wrong version).");
                     PostMessage(martDlg, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero);
                     return false;
                 }
@@ -2841,6 +2928,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
             catch (Exception ex)
             {
+                error = "picker automation threw: " + ex.Message;
                 log?.Invoke($"    [PICK] SelectMartVersionInPicker (Win32) threw: {ex.Message} - ABORT (IDCANCEL).");
                 try { PostMessage(martDlg, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero); } catch { /* dialog may be gone */ }
                 return false;
@@ -4334,6 +4422,52 @@ namespace EliteSoft.Erwin.AddIn.Services
             log?.Invoke(IsWindow(reChild)
                 ? "  [DB-CLOSE] RE'd model child still alive after close attempt - may need manual handling"
                 : "  [DB-CLOSE] RE'd model child closed (discarded, not saved).");
+        }
+
+        /// <summary>
+        /// Close the ACTIVE Mart MDI child WITHOUT saving, dismissing the dirty-model
+        /// "Save Models" + "Mart Offline" cascade via the same pure-Win32 sweep the
+        /// Review teardown uses. For the DDL queue worker's between-jobs cleanup: the
+        /// adopted model is dirty (connect-time UDP sync + the compare), so a plain
+        /// WM_CLOSE leaves a Save Models prompt stuck. Returns true once the child is
+        /// gone. MUST be called on a BACKGROUND thread (it blocks on Thread.Sleep +
+        /// dialog waits + cursor-based dismiss, and erwin needs its UI thread free to
+        /// raise + tear down the prompts). Reuses the existing close-cascade helpers.
+        /// </summary>
+        internal static bool CloseActiveMartModelDiscardingChanges(Action<string> log)
+        {
+            IntPtr main = FindErwinMain();
+            if (main == IntPtr.Zero) { log?.Invoke("  [WORKER-CLOSE] erwin main not found"); return false; }
+            IntPtr mdiClient = FindMdiClientOf(main);
+            if (mdiClient == IntPtr.Zero) { log?.Invoke("  [WORKER-CLOSE] MDIClient not found"); return false; }
+
+            IntPtr child = GetActiveMdiChild(mdiClient);
+            if (child == IntPtr.Zero) { log?.Invoke("  [WORKER-CLOSE] no active MDI child - nothing to close (already model-less)."); return true; }
+
+            log?.Invoke($"  [WORKER-CLOSE] WM_CLOSE active model child 0x{child.ToInt64():X} title='{GetTitle(child)}'");
+            ForceForeground(main);
+            PostMessage(child, WM_CLOSE_MSG, IntPtr.Zero, IntPtr.Zero);
+            Thread.Sleep(800);
+
+            // Dirty model -> "Save Models" (uncheck save + OK) then "Mart Offline".
+            // guardSingleRow inside the sweep aborts (leaves for manual) unless the
+            // dialog lists exactly one row, so a stray multi-row dialog is never touched.
+            if (!SweepVersionChildCloseDialogs(log, childKnownGone: false, quickRetry: false) && IsWindow(child))
+            {
+                log?.Invoke("  [WORKER-CLOSE] first sweep aborted safely - dialogs left for the user.");
+                return false;
+            }
+            if (IsWindow(child))
+            {
+                log?.Invoke("  [WORKER-CLOSE] child still alive after first sweep - second pass.");
+                SweepVersionChildCloseDialogs(log, childKnownGone: false, quickRetry: true);
+            }
+
+            bool gone = !IsWindow(child);
+            log?.Invoke(gone
+                ? "  [WORKER-CLOSE] active model closed (discarded, not saved)."
+                : "  [WORKER-CLOSE] active model still alive after close - may need manual handling.");
+            return gone;
         }
 
         /// <summary>Activate a SPECIFIC MDI child (used to flip Left back to the
