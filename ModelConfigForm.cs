@@ -1966,6 +1966,15 @@ namespace EliteSoft.Erwin.AddIn
                 {
                     if (IsDisposed) return;
                     _udpSyncDialogOpen = true;
+                    // Serialize popups (bug 2026-06-14): while the UDP sync dialog
+                    // is shown AND the diff is being applied, suspend validation so
+                    // the model-required-UDP prompt (CheckModelRequiredUdpsOnce) and
+                    // any naming/glossary popup cannot open hidden behind this modal.
+                    // The sync modal pumps the message loop, so the coordinator's
+                    // timer keeps ticking; without this a RequiredUdpForm opened in
+                    // behind the sync dialog and blocked the user. The model-required
+                    // check resumes on a later settle tick, after the synced UDPs exist.
+                    _validationCoordinatorService?.SuspendValidation();
                     try
                     {
                         // WARN_AND_APPLY: show the changes read-only (no per-row
@@ -2037,6 +2046,11 @@ namespace EliteSoft.Erwin.AddIn
                     finally
                     {
                         _udpSyncDialogOpen = false;
+                        // Resume validation so the deferred model-required-UDP
+                        // check + naming/glossary popups can surface on the next
+                        // settle tick, now that the sync modal is gone.
+                        try { _validationCoordinatorService?.ResumeValidation(); }
+                        catch (Exception ex) { Log($"UDP sync ResumeValidation failed: {ex.Message}"); }
                     }
                 }));
             }
