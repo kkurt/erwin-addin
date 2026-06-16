@@ -53,6 +53,21 @@ namespace EliteSoft.Erwin.AddIn.Services
         private bool _viewBaselineDone;
         private readonly Dictionary<string, Dictionary<string, string>> _viewUdpSnapshots =
             new Dictionary<string, Dictionary<string, string>>(StringComparer.Ordinal);
+
+        // View name-commit deferral (2026-06-14): mirror the entity
+        // _pendingNamedEntities machine so a freshly dropped view does NOT run
+        // its pipeline (UDP defaults + naming auto-apply + required UDP) on the
+        // placeholder name "V/<n>" before the user has typed a real name. A
+        // placeholder-named new view is HELD here until the inline-edit close
+        // edge (CommitPendingViews, fired by the coordinator) or a rename to a
+        // real name commits it. Keyed by RAW viewId (not the "V_"+id snapshot
+        // key) so the live name is re-resolved by ObjectId at commit time. The
+        // drag-create stale-pending guard reuses the entity StalePendingEntityMs
+        // window (single-sourced - no duplicate constant).
+        private readonly HashSet<string> _pendingViews = new HashSet<string>(StringComparer.Ordinal);
+        private readonly Dictionary<string, DateTime> _pendingViewAddedAt =
+            new Dictionary<string, DateTime>(StringComparer.Ordinal);
+
         private Dictionary<string, Dictionary<string, string>> _subjectAreaWatchedProperties;
 
         // UDP-deletion recovery buffer (2026-06-12, "Part A"): admin UDP values
@@ -857,6 +872,9 @@ namespace EliteSoft.Erwin.AddIn.Services
             // view as freshly created.
             _viewBaselineDone = false;
             _viewUdpSnapshots.Clear();
+            // Drop any held placeholder views so a model reload starts clean.
+            _pendingViews.Clear();
+            _pendingViewAddedAt.Clear();
             Log("TableTypeMonitorService: Snapshot dropped, deferred rebaseline scheduled (next cycle silent)");
         }
 
@@ -1328,25 +1346,91 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     RefreshViewUdpSnapshot(view, viewId);
 
                                     // Pre-existing views on the first walk are
-                                    // baseline, not user gestures; only fire the
-                                    // new-view pipeline once baselined.
+                                    // baseline, not user gestures; only act once
+                                    // baselined.
                                     if (_viewBaselineDone)
-                                        newViewsThisPass.Add((view, viewId, viewName));
+                                    {
+                                        // DEFER like tables: a view dropped with
+                                        // erwin's placeholder name ("V/<n>") is
+                                        // HELD until the user commits a real name
+                                        // (inline-edit close -> CommitPendingViews,
+                                        // or the rename branch below). Firing now
+                                        // would pop "Naming standard applied" on
+                                        // the placeholder before the user types.
+                                        // A view created already-named (paste /
+                                        // scripted create) is not a placeholder,
+                                        // so it fires immediately - table parity.
+                                        if (IsPlaceholderViewName(viewName))
+                                        {
+                                            _pendingViews.Add(viewId);
+                                            _pendingViewAddedAt[viewId] = DateTime.UtcNow;
+                                            Log($"[PENDING-VIEW] viewId={viewId} name='{viewName}' - placeholder, holding for inline-edit commit / rename");
+                                        }
+                                        else
+                                        {
+                                            newViewsThisPass.Add((view, viewId, viewName));
+                                        }
+                                    }
                                 }
                                 else if (nameChanged)
                                 {
-                                    ValidateNamingStandard("View", viewName, view);
-                                    _keyGroupSnapshots["V_" + viewId] = viewName;
-                                    if (!_viewWatchedProperties.TryGetValue(viewId, out var refreshBucket))
+                                    // A pending placeholder view whose name just
+                                    // changed = the user committed a real name via
+                                    // rename. Treat it as the creation gesture
+                                    // (full new-view pipeline, isNew) instead of
+                                    // the existing-view drift check - mirror the
+                                    // entity heartbeat rename branch (wasPending =>
+                                    // isNew). Route through newViewsThisPass so the
+                                    // modal / possible Cancel-delete fires AFTER
+                                    // the COM enumerator is released (never inside
+                                    // it - would wedge the live enumerator).
+                                    bool wasPendingView = _pendingViews.Remove(viewId);
+                                    _pendingViewAddedAt.Remove(viewId);
+                                    if (wasPendingView)
                                     {
-                                        refreshBucket = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                                        _viewWatchedProperties[viewId] = refreshBucket;
+                                        _keyGroupSnapshots["V_" + viewId] = viewName;
+                                        if (IsPlaceholderViewName(viewName))
+                                        {
+                                            // placeholder -> placeholder (e.g. user
+                                            // cleared the name back): keep deferred.
+                                            _pendingViews.Add(viewId);
+                                            _pendingViewAddedAt[viewId] = DateTime.UtcNow;
+                                        }
+                                        else
+                                        {
+                                            Log($"[PENDING-VIEW] viewId={viewId} committed via rename to '{viewName}' - firing new-view pipeline (isNew)");
+                                            newViewsThisPass.Add((view, viewId, viewName));
+                                        }
                                     }
-                                    ReadWatchedProperties(view, "View", refreshBucket);
-                                    CheckViewUdpChanges(view, viewId, viewName);
+                                    else
+                                    {
+                                        // Genuine drift rename of an already-
+                                        // committed view (Update context).
+                                        ValidateNamingStandard("View", viewName, view);
+                                        _keyGroupSnapshots["V_" + viewId] = viewName;
+                                        if (!_viewWatchedProperties.TryGetValue(viewId, out var refreshBucket))
+                                        {
+                                            refreshBucket = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                                            _viewWatchedProperties[viewId] = refreshBucket;
+                                        }
+                                        ReadWatchedProperties(view, "View", refreshBucket);
+                                        CheckViewUdpChanges(view, viewId, viewName);
+                                    }
                                 }
                                 else
                                 {
+                                    // A view still HELD pending a name commit runs
+                                    // NO validation - drift/UDP checks would fire the
+                                    // naming popup on the placeholder before the user
+                                    // has named it (the whole point of the deferral).
+                                    // Its checks run once CommitPendingViews fires the
+                                    // full pipeline. (No-op today since View rules are
+                                    // Name-only and Name routes through nameChanged,
+                                    // but this enforces the invariant if admin adds a
+                                    // rule on a non-Name View property.)
+                                    if (_pendingViews.Contains(viewId))
+                                        continue;
+
                                     // Drift detection (2026-05-17): a naming rule on
                                     // View.<some property> fires the Required popup
                                     // when the property is cleared on an existing view.
@@ -1555,6 +1639,166 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// True when a view still wears erwin's auto-assigned placeholder name
+        /// that the user has not yet replaced. The new-view pipeline is HELD
+        /// (see <see cref="_pendingViews"/>) until the placeholder is committed
+        /// via the inline-edit close edge or replaced by a real name, mirroring
+        /// the entity <c>IsPlaceholderEntityName</c> contract.
+        /// <para>
+        /// erwin's diagram auto-name for a new view is the View analogue of the
+        /// entity "E/&lt;digits&gt;" form. CRITICAL separator gotcha (live-verified
+        /// 2026-06-14): the raw <c>Properties("Name")</c> value is "V/&lt;n&gt;"
+        /// (forward slash - logged as liveValue='V/1'), but the <c>view.Name</c>
+        /// COM accessor that <see cref="CheckKeyGroupAndViewNaming"/> feeds in
+        /// here RENDERS the slash as an UNDERSCORE -> "V_&lt;n&gt;" (the title-bar
+        /// fold, same '/'->'_' transform documented for entities). The first live
+        /// test missed every placeholder because this matched only "V/" while the
+        /// caller passed "V_1". We therefore accept EITHER separator. Views have
+        /// NO Physical_Name on r10 SCAPI, so the caller passes view.Name.
+        /// </para>
+        /// </summary>
+        private static bool IsPlaceholderViewName(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return true;
+            if (name.Equals("<default>", StringComparison.OrdinalIgnoreCase)) return true;
+            if (name.StartsWith("<default>", StringComparison.OrdinalIgnoreCase)) return true;
+            // The auto-applied placeholder we write when an AUTO_APPLY naming
+            // rule fails (Phase-2H parity with the entity path).
+            if (name.StartsWith("PLEASE CHANGE IT", StringComparison.OrdinalIgnoreCase)) return true;
+            if (name.StartsWith("PLEASE_CHANGE_IT", StringComparison.OrdinalIgnoreCase)) return true;
+            // erwin diagram auto-name "V/<digits>" (raw) rendered as "V_<digits>"
+            // by view.Name. Accept BOTH separators; match conservatively (digits-
+            // only tail) so a user name like "V_Sales", "V/2_FOO" or "V_6_VVV"
+            // still counts as a real, committed name.
+            if (name.Length >= 3 && name[0] == 'V' && (name[1] == '/' || name[1] == '_'))
+            {
+                bool allDigits = true;
+                for (int i = 2; i < name.Length; i++)
+                {
+                    if (!char.IsDigit(name[i])) { allDigits = false; break; }
+                }
+                if (allDigits) return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Commit edge for deferred new views (2026-06-14): fire the full
+        /// new-view pipeline for every view held in <see cref="_pendingViews"/>.
+        /// The coordinator calls this from the inline-edit close edge (the same
+        /// open-&gt;closed signal that commits a pending table name) and from the
+        /// stale-pending drag-create guard. The view name is re-resolved LIVE by
+        /// ObjectId at commit time (an AUTO_APPLY naming rule could have renamed
+        /// it between hold and commit; views carry no Physical_Name so the read
+        /// is view.Name only). Each id is removed from the pending set BEFORE
+        /// <see cref="OnNewViewDetected"/> opens its modals, so a reentrant tick
+        /// during the modal pump never re-processes it. Fires are queued and run
+        /// AFTER the COM walk so a Required-UDP Cancel-delete cannot wedge the
+        /// live enumerator.
+        /// </summary>
+        public void CommitPendingViews()
+        {
+            if (!NamingStandardService.Instance.IsLoaded) return;
+            if (_pendingViews.Count == 0) return;
+
+            var toFire = new List<(dynamic View, string ViewId, string LiveName)>();
+            dynamic modelObjects = null;
+            dynamic root = null;
+            dynamic allViews = null;
+            bool walkComplete = false;
+            try
+            {
+                modelObjects = _session.ModelObjects;
+                root = modelObjects.Root;
+                allViews = modelObjects.Collect(root, "View");
+                if (allViews != null)
+                {
+                    foreach (dynamic view in allViews)
+                    {
+                        if (view == null) continue;
+                        string viewId;
+                        try { viewId = view.ObjectId?.ToString() ?? ""; }
+                        catch (Exception ex) { Log($"CommitPendingViews: ObjectId read failed: {ex.Message}"); continue; }
+                        if (string.IsNullOrEmpty(viewId) || !_pendingViews.Contains(viewId)) continue;
+
+                        // Live name (views have no Physical_Name - "Name" only).
+                        string liveName;
+                        try { liveName = view.Name ?? ""; }
+                        catch (Exception ex) { Log($"CommitPendingViews: name read failed for viewId={viewId}: {ex.Message}"); liveName = ""; }
+
+                        // Lift OUT of pending BEFORE firing (the modal pump can
+                        // re-enter this method; the early removal makes the
+                        // reentrant pass a no-op = no double popup).
+                        _pendingViews.Remove(viewId);
+                        _pendingViewAddedAt.Remove(viewId);
+
+                        // Advance the name snapshot to the committed live name so
+                        // the next MonitorTimer view scan sees nameChanged=false
+                        // and does NOT re-run naming validation a second time in
+                        // Update context (the view is no longer pending, so the
+                        // nameChanged branch would fall through to the drift path
+                        // with isNew=false). The entity machine gets this for free
+                        // by advancing _entityDisplayNameSnapshot every tick; the
+                        // view scan only advances on its own branches, so the
+                        // commit edge must do it here. OnNewViewDetected's own
+                        // final-name re-read still refines this if the pipeline
+                        // renames the view further (e.g. a suffix rule).
+                        if (!string.IsNullOrEmpty(viewId))
+                            _keyGroupSnapshots["V_" + viewId] = liveName;
+
+                        toFire.Add((view, viewId, liveName));
+                    }
+                }
+                walkComplete = true;
+            }
+            catch (Exception ex)
+            {
+                Log($"CommitPendingViews: view collect error: {ex.Message}");
+            }
+
+            // Any id still pending after a COMPLETE walk was not found in the
+            // live model = the user deleted/undid the placeholder before
+            // committing. Drop it so the stale guard does not re-walk forever.
+            // (Skip on an incomplete walk so a transient COM error does not lose
+            // a still-live pending view.)
+            if (walkComplete && _pendingViews.Count > 0)
+            {
+                foreach (var goneId in _pendingViews.ToList())
+                {
+                    _pendingViews.Remove(goneId);
+                    _pendingViewAddedAt.Remove(goneId);
+                    Log($"[PENDING-VIEW] viewId={goneId} vanished before commit - dropped");
+                }
+            }
+
+            foreach (var (view, viewId, liveName) in toFire)
+            {
+                Log($"[PENDING-VIEW] commit edge for viewId={viewId} liveName='{liveName}' - firing new-view pipeline (isNew)");
+                try { OnNewViewDetected(view, viewId, liveName); }
+                catch (Exception ex) { Log($"CommitPendingViews: OnNewViewDetected error for viewId={viewId} ('{liveName}'): {ex.Message}"); }
+            }
+        }
+
+        /// <summary>
+        /// True when any deferred view has been pending at least
+        /// <paramref name="staleMs"/> ms (or carries no timestamp). Backs the
+        /// coordinator's drag-create stale-pending guard for views without
+        /// exposing the pending maps. Mirrors the entity stale predicate.
+        /// </summary>
+        public bool HasStalePendingViews(int staleMs)
+        {
+            if (_pendingViews.Count == 0) return false;
+            var nowUtc = DateTime.UtcNow;
+            foreach (var id in _pendingViews)
+            {
+                if (!_pendingViewAddedAt.TryGetValue(id, out var addedAt)
+                    || (nowUtc - addedAt).TotalMilliseconds >= staleMs)
+                    return true;
+            }
+            return false;
+        }
+
+        /// <summary>
         /// View analogue of <see cref="PromptForMissingRequiredUdps"/>: prompts
         /// for View-scoped IS_REQUIRED UDPs that are still empty after defaults.
         /// Cancel discards the new view (mirrors the new-table contract). The
@@ -1643,6 +1887,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                 _keyGroupSnapshots.Remove("V_" + viewId);
                 _viewWatchedProperties.Remove(viewId);
                 _viewUdpSnapshots.Remove(viewId);
+                // A still-pending view discarded via Required-UDP Cancel must
+                // not linger in the pending set (would re-fire on the stale guard).
+                _pendingViews.Remove(viewId);
+                _pendingViewAddedAt.Remove(viewId);
 
                 Log($"TryDeleteNewView: removed '{viewName}' (objectId={viewId})");
                 return true;

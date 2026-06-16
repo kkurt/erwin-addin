@@ -3038,6 +3038,24 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // models the broad walk took several seconds.
                     try { ScanForLockedColumnRenames("inline-edit-close"); }
                     catch (Exception ex) { Log($"ScanForLockedColumnRenames (inline) err: {ex.Message}"); }
+
+                    // View name-commit (2026-06-14): the SAME inline-edit close
+                    // edge that commits a pending table name commits a pending
+                    // VIEW name (IsInlineEditActive is object-type-agnostic - the
+                    // diagram/tree inline editor is a plain Win32 'Edit' for both).
+                    // _scopedCheckInProgress MUST wrap the call (mirrors the
+                    // MonitorTimer view-scan site): CommitPendingViews opens the
+                    // naming / Required-UDP modals whose pump re-fires this timer,
+                    // and the early bail on _scopedCheckInProgress makes the
+                    // reentrant tick a no-op.
+                    if (_tableTypeMonitor != null)
+                    {
+                        bool acquired = !_scopedCheckInProgress;
+                        if (acquired) _scopedCheckInProgress = true;
+                        try { _tableTypeMonitor.CommitPendingViews(); }
+                        catch (Exception ex) { Log($"CommitPendingViews (inline) err: {ex.Message}"); }
+                        finally { if (acquired) _scopedCheckInProgress = false; }
+                    }
                 }
 
                 // Stale-pending fallback (2026-06-13): a drag-create (click +
@@ -3067,6 +3085,24 @@ namespace EliteSoft.Erwin.AddIn.Services
                         try { ValidateCommittedPendingAttrs(); }
                         catch (Exception ex) { Log($"ValidateCommittedPendingAttrs (stale) err: {ex.Message}"); }
                     }
+                }
+
+                // View analogue of the drag-create guard above: a view dropped
+                // fast enough that no inline 'Edit' was ever caught open would
+                // otherwise sit pending forever. With no editor open, force-commit
+                // any view pending past the same StalePendingEntityMs window. The
+                // '!inlineEditOpen' precondition is mandatory - never commit while
+                // the user is still typing a name. _scopedCheckInProgress wraps
+                // the modal-opening drain, same as the close edge above.
+                if (!inlineEditOpen && _tableTypeMonitor != null
+                    && _tableTypeMonitor.HasStalePendingViews(StalePendingEntityMs))
+                {
+                    Log("[PENDING-VIEW] stale pending view with no inline edit open - forcing commit validation (drag-create bypass guard).");
+                    bool acquired = !_scopedCheckInProgress;
+                    if (acquired) _scopedCheckInProgress = true;
+                    try { _tableTypeMonitor.CommitPendingViews(); }
+                    catch (Exception ex) { Log($"CommitPendingViews (stale) err: {ex.Message}"); }
+                    finally { if (acquired) _scopedCheckInProgress = false; }
                 }
 
                 _wasInlineEditOpen = inlineEditOpen;

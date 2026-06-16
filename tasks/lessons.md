@@ -4,6 +4,29 @@ A running log of corrections and non-obvious findings that future sessions
 should not have to rediscover. Each entry is a short rule, the reason, and
 how to apply it.
 
+## 2026-06-14: A placeholder/name classifier must test the EXACT variable the caller passes, not a name from a different log line
+
+**Rule:** when you write a name predicate (e.g. `IsPlaceholderViewName`), confirm
+the literal form of the string the call site actually feeds in - read the code
+path, not a convenient log line elsewhere. erwin's `view.Name` COM accessor
+renders a view's auto-name slash as an UNDERSCORE ("V/1" -> "V_1"), while
+`Properties("Name").Value` returns the raw slash ("V/1"). The view scan feeds
+`view.Name` ("V_1") into the placeholder test, but the `liveValue='V/1'` log
+line (from a DIFFERENT `Properties("Name")` read in ValidateNamingStandard
+Step-3b) shows the slash. I matched only "V/<digits>", so "V_1" was classified
+as a real name and the deferral never engaged - the popup still fired
+immediately on the first live test.
+
+**Why:** entities read `Physical_Name` (raw "E/284" slash) so `IsPlaceholderEntityName`
+matching "E/<digits>" works; views read `view.Name` (rendered "V_1" underscore),
+a different code path with a different separator. Assuming parity without
+checking the actual variable cost a full deploy+test cycle.
+
+**How to apply:** accept BOTH separators (`name[1]=='/' || name[1]=='_'`) for
+view auto-names; and in general, before shipping a string classifier, grep the
+call site and log the exact input once, rather than inferring its shape from an
+unrelated diagnostic line. See [[reference_view_defer_like_tables]].
+
 ## 2026-06-06: Any MODAL popup added to a per-change validation path MUST take a reentrancy guard, or it loops/stacks ad infinitum
 
 **Rule:** before you make `ValidateColumnNamingStandard` (or any method on the
