@@ -200,6 +200,27 @@ public static class WatcherWmPoster {
         return activeChild;
     }
 
+    public const uint WM_NULL = 0x0000;
+
+    // Block until erwin's UI thread is actually PUMPING messages (or the
+    // overall budget runs out). A WM_NULL no-op that comes back means the
+    // thread answered, i.e. it is NOT stuck in a long synchronous model
+    // parse; SMTO_ABORTIFHUNG returns fast if the thread is genuinely hung.
+    // Used to defer the Add-In Manager open until the thread can immediately
+    // hide+close it - otherwise a cross-thread ShowWindow(SW_HIDE) is queued
+    // unprocessed and the dialog sits VISIBLE over the loading model.
+    // Returns true if the thread became responsive, false on budget timeout.
+    public static bool WaitForResponsive(IntPtr hwnd, int overallTimeoutMs) {
+        if (hwnd == IntPtr.Zero) return false;
+        for (int waited = 0; waited < overallTimeoutMs; waited += 250) {
+            IntPtr res;
+            IntPtr ok = SendMessageTimeoutW(hwnd, WM_NULL, IntPtr.Zero, IntPtr.Zero, SMTO_ABORTIFHUNG, 300, out res);
+            if (ok != IntPtr.Zero) return true;
+            System.Threading.Thread.Sleep(250);
+        }
+        return false;
+    }
+
     // Find a top-level modal dialog (class #32770) owned by the given
     // process whose title contains the given substring. Returns IntPtr.Zero
     // when no match. Title match is OrdinalIgnoreCase. The class #32770
@@ -257,6 +278,23 @@ public static class WatcherWmPoster {
     }
 
     public static int TriggerLazyActivation(IntPtr mainFrame, uint erwinPid) {
+        // Wait until erwin's UI thread is actually PUMPING before opening the
+        // Add-In Manager. On a FILE-double-click cold launch the thread is
+        // BUSY parsing the model (incl. "Creating DV Components") for ~20+ s.
+        // If we post 1179 during that window the dialog opens VISIBLE but our
+        // cross-thread ShowWindow(SW_HIDE) is queued unprocessed, so the
+        // Add-In Manager sits in front of the loading model until the thread
+        // frees - the user ends up dismissing it by hand (reported 2026-06-15:
+        // "welcome closed but Add-In Manager stayed open; I closed it, not the
+        // watcher"). Deferring the open until the thread answers a WM_NULL
+        // means the subsequent SW_HIDE + WM_CLOSE are processed immediately, so
+        // the dialog opens+hides+closes in one tight window and never lingers
+        // visible - matching the warm open-then-load flow. The cmd-1181 binding
+        // still happens on dialog-open, just after the load settles. 60 s budget
+        // covers a big-model + DV-component cold load; if it never settles we
+        // fall through and try anyway (no worse than before).
+        WaitForResponsive(mainFrame, 60000);
+
         // 1179 = Manage Add-Ins dialog (from erwin string table +
         // EM_CMP.dll dispatch). Verified 2026-05-26 from the user's
         // wmcmd.log: opening Tools > Add-Ins... was what flipped cmd
@@ -305,12 +343,24 @@ public static class WatcherWmPoster {
         // by the time WM_INITDIALOG returned.
         System.Threading.Thread.Sleep(200);
 
-        // Close-and-verify loop: WM_CLOSE then poll IsWindow; if still
-        // alive, fall back to WM_COMMAND IDCANCEL (2). Up to ~2 s of
-        // attempts. Replaces the prior fire-and-forget single WM_CLOSE
-        // (and unconditional success log) that was intermittently lost
-        // when posted before the dialog's modal loop was ready.
-        for (int attempt = 0; attempt < 10; attempt++) {
+        // Close-and-verify loop: re-post WM_CLOSE (and IDCANCEL) and poll
+        // IsWindow; return the instant the dialog dies. The dialog stays
+        // HIDDEN throughout so the user never sees it.
+        //
+        // Budget raised 2 s -> 30 s (2026-06-15): on a FILE-double-click
+        // cold launch the erwin UI thread is BUSY parsing the model (the
+        // Welcome screen is still up, title shows "* "), so the Add-In
+        // Manager's message pump is starved and our posted closes just sit
+        // queued. The old ~2 s budget exhausted DURING the load, un-hid the
+        // dialog, and then stopped posting - so when the thread finally
+        // resumed there was no fresh WM_CLOSE to process and the dialog
+        // stranded over the Welcome screen, blocking it (user-reported). We
+        // now keep re-posting until the load finishes and one post lands on
+        // the now-pumping dialog. Returns early the moment the dialog dies,
+        // so a responsive (warm) thread still closes it in ~100 ms - the
+        // normal-launch path is unchanged.
+        const int closeBudgetMs = 30000;
+        for (int waited = 0; waited < closeBudgetMs; waited += 200) {
             PostMessageW(dlg, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
             System.Threading.Thread.Sleep(100);
             if (!IsWindow(dlg)) return 1;
@@ -324,8 +374,8 @@ public static class WatcherWmPoster {
             if (!IsWindow(dlg)) return 1;
         }
 
-        // Close attempts exhausted - un-hide so the user can dismiss
-        // it manually (better than stranding it hidden).
+        // Still alive after the full budget - truly stuck. Un-hide so the
+        // user can dismiss it manually (better than stranding it hidden).
         ShowWindow(dlg, SW_SHOW);
         return 2;
     }
