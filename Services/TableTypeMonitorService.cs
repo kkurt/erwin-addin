@@ -2787,7 +2787,26 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // Show the OBJECT NAME (the table) + a friendly property label,
                     // e.g. "VpDBMS_LIBRARY (Comment)" - the raw "Table.Definition"
                     // was meaningless to the user (2026-06-06).
-                    string fieldLabel = $"{physicalName} ({NamingValidationEngine.FriendlyPropertyLabel(rf.Rule.PropertyCode)})";
+                    //
+                    // Re-read the object's LIVE name each iteration instead of the
+                    // captured physicalName: an earlier popup in this same chain
+                    // (e.g. the user fixing a regex-violating Name) renames the
+                    // object, and every SUBSEQUENT required-property popup must
+                    // show the CORRECTED name, not the original invalid one
+                    // (user-reported 2026-06-15). Physical_Name for tables; views
+                    // have none, so fall back to the Name accessor.
+                    string liveObjName = physicalName;
+                    try
+                    {
+                        string pn = scapiObject?.Properties("Physical_Name")?.Value?.ToString() ?? "";
+                        if (!string.IsNullOrEmpty(pn) && !pn.StartsWith("%")) liveObjName = pn;
+                    }
+                    catch
+                    {
+                        try { string nm = scapiObject?.Name?.ToString() ?? ""; if (!string.IsNullOrEmpty(nm)) liveObjName = nm; }
+                        catch { /* keep captured physicalName */ }
+                    }
+                    string fieldLabel = $"{liveObjName} ({NamingValidationEngine.FriendlyPropertyLabel(rf.Rule.PropertyCode)})";
                     var cancelMode = isNew ? Forms.RequiredOperationMode.Create : Forms.RequiredOperationMode.Update;
 
                     // Pre-fill the dialog with the property's current value -
