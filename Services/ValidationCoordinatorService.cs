@@ -859,6 +859,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                 if (string.IsNullOrEmpty(modelName)) modelName = "Model";
 
                 _tableTypeMonitor.PromptForMissingRequiredModelUdps(root, modelName);
+
+                // Object-type-only Required rules ("an object of this type must
+                // exist", Property "(none)"): warn-only model-open check, same
+                // one-shot guard as the required-UDP prompt above. Runs after it
+                // so the required-UDP dialog (if any) is dealt with first.
+                _tableTypeMonitor.CheckRequiredObjectTypesExist(root);
             }
             catch (Exception ex)
             {

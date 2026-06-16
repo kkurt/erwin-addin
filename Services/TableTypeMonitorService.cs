@@ -450,6 +450,118 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// Map an admin OBJECT_TYPE name to the SCAPI Collect class for the
+        /// object-existence check. Returns null for types that have no
+        /// meaningful "at least one exists" semantic so the caller skips them:
+        /// MODEL is the root itself (always present) and any unmapped/unknown
+        /// type is logged-and-skipped rather than warned. Mirrors the owner-class
+        /// switch in <see cref="NamingValidationEngine"/> (table->Entity etc.).
+        /// </summary>
+        private static string ScapiCollectTypeForExistence(string objectType)
+        {
+            if (string.IsNullOrEmpty(objectType)) return null;
+            // Normalise admin's "SUBJECT AREA" / "SUBJECT_AREA" and casing.
+            switch (objectType.Trim().ToUpperInvariant().Replace(' ', '_'))
+            {
+                case "TABLE":        return "Entity";
+                case "VIEW":         return "View";
+                case "COLUMN":       return "Attribute";
+                case "INDEX":        return "Key_Group";
+                case "SUBJECT_AREA": return "Subject_Area";
+                default:             return null;   // MODEL (always exists) / unknown
+            }
+        }
+
+        /// <summary>
+        /// Model-open existence check (2026-06-15): an object-type-only Required
+        /// naming rule (Property "(none)") asserts "the model must contain at
+        /// least one object of this type". Loaded via
+        /// <see cref="NamingStandardService.GetObjectExistenceRules"/>. WARN-ONLY
+        /// (a missing object type cannot be auto-created); all violations are
+        /// consolidated into a single popup. ApplyOn and DEPENDS_ON conditions
+        /// are intentionally ignored - a model-level existence assertion has no
+        /// per-object to scope or condition against (admin disables the ApplyOn
+        /// combo for this rule form). Runs once per model open from
+        /// <c>ValidationCoordinatorService.CheckModelRequiredUdpsOnce</c>.
+        /// Best-effort: never throws into the caller.
+        /// </summary>
+        /// <param name="modelRoot">The SCAPI model Root object.</param>
+        public void CheckRequiredObjectTypesExist(dynamic modelRoot)
+        {
+            if (!NamingStandardService.Instance.IsLoaded) return;
+            var rules = NamingStandardService.Instance.GetObjectExistenceRules();
+            if (rules == null || rules.Count == 0) return;
+
+            dynamic modelObjects;
+            dynamic root;
+            try
+            {
+                modelObjects = _session.ModelObjects;
+                root = modelRoot ?? modelObjects.Root;
+            }
+            catch (Exception ex)
+            {
+                Log($"CheckRequiredObjectTypesExist: model access failed: {ex.Message}");
+                return;
+            }
+
+            // Cache the has-any result per SCAPI type so two rules on the same
+            // type only Collect once (rare, but cheap to guard).
+            var hasAnyByType = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            var violations = new List<string>();
+
+            foreach (var rule in rules)
+            {
+                string scapiType = ScapiCollectTypeForExistence(rule.ObjectType);
+                if (scapiType == null)
+                {
+                    Log($"CheckRequiredObjectTypesExist: rule#{rule.Id} object type '{rule.ObjectType}' has no existence semantic - skipped");
+                    continue;
+                }
+
+                if (!hasAnyByType.TryGetValue(scapiType, out bool hasAny))
+                {
+                    hasAny = false;
+                    try
+                    {
+                        dynamic coll = modelObjects.Collect(root, scapiType);
+                        if (coll != null)
+                        {
+                            // Existence only - stop at the first object.
+                            foreach (dynamic _ in coll) { hasAny = true; break; }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"CheckRequiredObjectTypesExist: Collect('{scapiType}') failed for rule#{rule.Id}: {ex.Message}");
+                        continue;
+                    }
+                    hasAnyByType[scapiType] = hasAny;
+                }
+
+                if (!hasAny)
+                {
+                    string msg = !string.IsNullOrEmpty(rule.ErrorMessage)
+                        ? rule.ErrorMessage
+                        : $"At least one {rule.ObjectType} must exist in the model.";
+                    Log($"CheckRequiredObjectTypesExist: rule#{rule.Id} VIOLATED - no '{scapiType}' object ({rule.ObjectType})");
+                    if (!violations.Contains(msg)) violations.Add(msg);
+                }
+                else
+                {
+                    Log($"CheckRequiredObjectTypesExist: rule#{rule.Id} OK - '{scapiType}' object present ({rule.ObjectType})");
+                }
+            }
+
+            if (violations.Count == 0) return;
+
+            string body = violations.Count == 1
+                ? violations[0]
+                : "The model is missing required object types:\n\n - " + string.Join("\n - ", violations);
+            AddinMessageDialog.Show(body, "Required object types", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+
+        /// <summary>
         /// True when a UDP whose admin "Apply On" is <paramref name="applyOn"/>
         /// should fire in the UPDATE context (model open == update). Mirrors
         /// <see cref="UdpValidationEngine"/>'s gate: Both always applies, else the

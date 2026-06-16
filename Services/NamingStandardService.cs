@@ -91,8 +91,11 @@ namespace EliteSoft.Erwin.AddIn.Services
     {
         public int Id { get; set; }
         public string ObjectType { get; set; }      // From MC_OBJECT_TYPE.NAME (e.g. "TABLE", "COLUMN")
-        public string PropertyCode { get; set; }    // From MC_PROPERTY_DEF.PROPERTY_CODE (e.g. "Physical_Name")
-        public int PropertyDefId { get; set; }
+        public string PropertyCode { get; set; }    // From MC_PROPERTY_DEF.PROPERTY_CODE (e.g. "Physical_Name"); "" for an object-type-only Required rule
+        // Null ONLY for an object-type-only Required rule (Property "(none)" =
+        // "an object of this type must exist"). Every other rule targets a
+        // property. Admin enforces this (only Required may omit PROPERTY_DEF_ID).
+        public int? PropertyDefId { get; set; }
         public NamingRuleKind RuleType { get; set; }
         /// <summary>
         /// IS_REQUIRED gate (orthogonal to <see cref="RuleType"/>). When true,
@@ -280,8 +283,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 {
                                     Id = Convert.ToInt32(reader["ID"]),
                                     ObjectType = reader["OBJECT_TYPE"]?.ToString()?.Trim() ?? "",
+                                    // PROPERTY_CODE is NULL for an object-type-only Required
+                                    // rule (LEFT JOIN, no property) - normalised to "".
                                     PropertyCode = reader["PROPERTY_CODE"]?.ToString()?.Trim() ?? "",
-                                    PropertyDefId = Convert.ToInt32(reader["PROPERTY_DEF_ID"]),
+                                    // Nullable: an object-type-only Required rule has no property.
+                                    PropertyDefId = reader["PROPERTY_DEF_ID"] == DBNull.Value
+                                        ? (int?)null
+                                        : Convert.ToInt32(reader["PROPERTY_DEF_ID"]),
                                     RuleType = ruleKind,
                                     IsRequired = reader["IS_REQUIRED"] != DBNull.Value && Convert.ToBoolean(reader["IS_REQUIRED"]),
                                     Prefix = reader["PREFIX"] == DBNull.Value ? "" : reader["PREFIX"]?.ToString()?.Trim() ?? "",
@@ -396,12 +404,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                             cond_pd.""PROPERTY_CODE"" AS ""COND_PROPERTY_CODE""
                             FROM ""MC_NAMING_STANDARD"" ns
                             JOIN ""MC_OBJECT_TYPE""  ot ON ot.""ID"" = ns.""OBJECT_TYPE_ID""
-                            JOIN ""MC_PROPERTY_DEF"" pd ON pd.""ID"" = ns.""PROPERTY_DEF_ID""
+                            LEFT JOIN ""MC_PROPERTY_DEF"" pd ON pd.""ID"" = ns.""PROPERTY_DEF_ID""
                             LEFT JOIN ""MC_UDP_DEFINITION"" udp ON udp.""ID"" = ns.""DEPENDS_ON_UDP_ID""
                             LEFT JOIN ""MC_PROPERTY_DEF"" cond_pd ON cond_pd.""ID"" = ns.""DEPENDS_ON_PROPERTY_DEF_ID""
                             WHERE ns.""IS_ACTIVE"" = true
                               AND ns.""CONFIG_ID"" = @cfgId
-                              AND pd.""DBMS_VERSION_ID"" IS NULL
+                              AND (ns.""PROPERTY_DEF_ID"" IS NULL OR pd.""DBMS_VERSION_ID"" IS NULL)
                             ORDER BY ot.""NAME"", pd.""PROPERTY_CODE"", ns.""SORT_ORDER""";
 
                 case "ORACLE":
@@ -415,12 +423,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                             cond_pd.PROPERTY_CODE AS COND_PROPERTY_CODE
                             FROM MC_NAMING_STANDARD ns
                             JOIN MC_OBJECT_TYPE  ot ON ot.ID = ns.OBJECT_TYPE_ID
-                            JOIN MC_PROPERTY_DEF pd ON pd.ID = ns.PROPERTY_DEF_ID
+                            LEFT JOIN MC_PROPERTY_DEF pd ON pd.ID = ns.PROPERTY_DEF_ID
                             LEFT JOIN MC_UDP_DEFINITION udp ON udp.ID = ns.DEPENDS_ON_UDP_ID
                             LEFT JOIN MC_PROPERTY_DEF cond_pd ON cond_pd.ID = ns.DEPENDS_ON_PROPERTY_DEF_ID
                             WHERE ns.IS_ACTIVE = 1
                               AND ns.CONFIG_ID = :cfgId
-                              AND pd.DBMS_VERSION_ID IS NULL
+                              AND (ns.PROPERTY_DEF_ID IS NULL OR pd.DBMS_VERSION_ID IS NULL)
                             ORDER BY ot.NAME, pd.PROPERTY_CODE, ns.SORT_ORDER";
 
                 case "MSSQL":
@@ -435,12 +443,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                             cond_pd.[PROPERTY_CODE] AS [COND_PROPERTY_CODE]
                             FROM [dbo].[MC_NAMING_STANDARD] ns
                             JOIN [dbo].[MC_OBJECT_TYPE]  ot ON ot.[ID] = ns.[OBJECT_TYPE_ID]
-                            JOIN [dbo].[MC_PROPERTY_DEF] pd ON pd.[ID] = ns.[PROPERTY_DEF_ID]
+                            LEFT JOIN [dbo].[MC_PROPERTY_DEF] pd ON pd.[ID] = ns.[PROPERTY_DEF_ID]
                             LEFT JOIN [dbo].[MC_UDP_DEFINITION] udp ON udp.[ID] = ns.[DEPENDS_ON_UDP_ID]
                             LEFT JOIN [dbo].[MC_PROPERTY_DEF] cond_pd ON cond_pd.[ID] = ns.[DEPENDS_ON_PROPERTY_DEF_ID]
                             WHERE ns.[IS_ACTIVE] = 1
                               AND ns.[CONFIG_ID] = @cfgId
-                              AND pd.[DBMS_VERSION_ID] IS NULL
+                              AND (ns.[PROPERTY_DEF_ID] IS NULL OR pd.[DBMS_VERSION_ID] IS NULL)
                             ORDER BY ot.[NAME], pd.[PROPERTY_CODE], ns.[SORT_ORDER]";
             }
         }
@@ -539,6 +547,25 @@ namespace EliteSoft.Erwin.AddIn.Services
                             && string.Equals(r.ObjectType, objectType, StringComparison.OrdinalIgnoreCase))
                 .Select(r => r.PropertyCode)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        /// <summary>
+        /// Active object-type-only Required rules (Property "(none)"): each
+        /// asserts "an object of this type must exist in the model". They carry
+        /// no property, so they never enter the per-property <c>_byKey</c>
+        /// buckets and are invisible to <see cref="GetByObjectTypeAndProperty"/>
+        /// / <see cref="GetRequiredPropertyCodes"/> (which filter out empty
+        /// PropertyCode); the model-open existence check retrieves them here.
+        /// 2026-06-15.
+        /// </summary>
+        public IReadOnlyList<NamingStandardRule> GetObjectExistenceRules()
+        {
+            return _allRules
+                .Where(r => r != null
+                            && r.IsActive
+                            && r.RuleType == NamingRuleKind.Required
+                            && string.IsNullOrEmpty(r.PropertyCode))
                 .ToList();
         }
 
