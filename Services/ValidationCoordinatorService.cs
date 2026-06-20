@@ -378,6 +378,12 @@ namespace EliteSoft.Erwin.AddIn.Services
             = new Dictionary<string, (string, DateTime)>(StringComparer.OrdinalIgnoreCase);
         private const double TermTypeDedupSeconds = 3.0;
 
+        // Same double-commit dedup for the allowed-datatype whitelist revert (kept
+        // separate from the term-type dict so the two machines never share/clobber
+        // each other's "last attempt" state). Reuses TermTypeDedupSeconds.
+        private readonly Dictionary<string, (string attempt, DateTime when)> _allowedDatatypeRecentAttempts
+            = new Dictionary<string, (string, DateTime)>(StringComparer.OrdinalIgnoreCase);
+
         // Snapshot of Key_Group (Index) names for naming standard checks
         private Dictionary<string, string> _keyGroupSnapshots;
 
@@ -3468,6 +3474,15 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                                     Log($"[PENDING-NAME] entity='{tableName}' attr id={aid} renamed to '{currentName}' during inline-edit - running rename validation");
                                     ProcessAttributeChanges(attr, previousState, snapshot, predefined);
+                                    // A brand-new column just got its real name. ProcessAttributeChanges
+                                    // only checks the datatype whitelist on a type CHANGE with no name
+                                    // change, so a new column left at erwin's default type (e.g. char(18))
+                                    // slips through here (name changed, type did not). Enforce the whitelist
+                                    // now against the committed type so a disallowed default is caught at
+                                    // creation. prev=null -> forces an allowed type when the default is
+                                    // disallowed. (New-column path only - existing columns are never
+                                    // retroactively re-typed; see feedback_rules_new_objects_only.)
+                                    EnforceAllowedDatatypeWhitelist(attr, null, snapshot);
                                     _attributeSnapshots[aid] = snapshot;
                                 }
                                 else
@@ -4544,6 +4559,15 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 currentState.PhysicalDataType = previousState.PhysicalDataType;
 
                             ProcessAttributeChanges(attr, previousState, currentState, predefinedColumnNames);
+
+                            // New column committed via the heartbeat rename branch (placeholder ->
+                            // real name): ProcessAttributeChanges skips the datatype whitelist on a
+                            // name change, so a new column left at erwin's default type slips
+                            // through. Enforce it now (dedup makes this a no-op if the inline-edit
+                            // close path already handled the same column). New-column only.
+                            if (IsPlaceholderColumnName(previousState.PhysicalName) && !IsPlaceholderColumnName(currentState.PhysicalName))
+                                EnforceAllowedDatatypeWhitelist(attr, null, currentState);
+
                             _attributeSnapshots[objectId] = currentState;
 
                             // Pending cleanup: was the attr's name a placeholder and is
@@ -5370,6 +5394,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // Required-popup Cancel branch deletes the new column
                 // (no pre-edit value to revert to).
                 ValidateColumnNamingStandard(attr, currentState, isNew: true);
+
+                // New column: enforce the datatype whitelist against its committed type so a
+                // disallowed erwin default (e.g. char(18)) is caught at creation, not only on a
+                // later type edit. EnforceAllowedDatatypeWhitelist self-skips the '<default>'
+                // placeholder, so the check effectively waits for the real name.
+                EnforceAllowedDatatypeWhitelist(attr, null, currentState);
             }
             finally
             {
@@ -5457,6 +5487,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                 {
                     Log($"Physical_Data_Type changed: {currentState.TableName}.{currentState.PhysicalName} '{previousState.PhysicalDataType}' -> '{currentState.PhysicalDataType}' (canonical='{currentState.TermTypeCanonical ?? "(none)"}')");
                     EnforceTermTypePolicy(attr, previousState, currentState);
+
+                    // Datatype whitelist (admin "Datatype Library" -> DATATYPE_LIBRARY, the model's
+                    // DBMS catalog). Runs AFTER the term-type policy so a glossary-authoritative
+                    // type is settled first, and BEFORE the naming re-run below so the engine sees
+                    // the final (possibly reverted) value. No-op when the model's DBMS has no
+                    // configured datatype list.
+                    EnforceAllowedDatatypeWhitelist(attr, previousState, currentState);
 
                     // C3 polymorphic-condition replay (2026-05-17): a naming rule can
                     // condition on the live Physical_Data_Type value (e.g. "DateTime
@@ -5621,6 +5658,157 @@ namespace EliteSoft.Erwin.AddIn.Services
                 try { _session.RollbackTransaction(trans); }
                 catch (Exception rbEx) { Log($"EnforceTermTypePolicy rollback error: {rbEx.Message}"); }
                 Log($"EnforceTermTypePolicy write failed for {curr.PhysicalName}: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Enforce the admin "Datatype Library" whitelist (DBMS-level DATATYPE_LIBRARY for the
+        /// model's DBMS) on a column's Physical_Data_Type. When the model's DBMS has a non-empty
+        /// list and the user picks a type not in it, write an allowed type and warn once (user
+        /// decision 2026-06-19: hard enforce, never leave a disallowed type). The written value is
+        /// the previous value when that is itself allowed (a normal revert), otherwise a forced
+        /// fallback allowed type (a brand-new column whose first pick is disallowed). No-op when
+        /// the list is empty (no restriction). Mirrors <see cref="EnforceTermTypePolicy"/>'s single-transaction
+        /// revert + snapshot-advance + double-commit dedup. See
+        /// reference_datatype_library_unimplemented.
+        /// </summary>
+        private void EnforceAllowedDatatypeWhitelist(dynamic attr, AttributeValidationSnapshot prev, AttributeValidationSnapshot curr)
+        {
+            // No whitelist configured for this config -> defer to DBMS-level policy.
+            if (!AllowedDatatypeService.Instance.HasRestriction) return;
+
+            // Defer while the column still carries erwin's transient '<default>' placeholder name:
+            // the popup would otherwise surface '<default>', and the name-commit path re-checks the
+            // final type once the user names the column. This is the single placeholder guard for
+            // every caller (change path, new-attribute path, name-commit paths).
+            if (IsPlaceholderColumnName(curr?.PhysicalName ?? string.Empty)) return;
+
+            // Validate the LIVE type, not the snapshot field. A prior SCAPI writer in this same
+            // gesture (e.g. ValidateDomain/ApplyDomainProperties applying a domain's datatype) can
+            // change Physical_Data_Type WITHOUT refreshing the snapshot, leaving curr.PhysicalDataType
+            // a stale pre-domain default (e.g. char(18)). Re-read so we never clobber a value a
+            // domain/glossary just applied or cite a type the user never set. Sync curr so the dedup
+            // key and the baseline reflect what is actually in the model.
+            string attempted = curr?.PhysicalDataType ?? string.Empty;
+            try
+            {
+                string liveNow = attr?.Properties("Physical_Data_Type").Value?.ToString();
+                if (!string.IsNullOrEmpty(liveNow)) attempted = liveNow;
+            }
+            catch (Exception preEx) { Log($"AllowedDatatype: live type pre-read failed for {curr?.PhysicalName}: {preEx.Message}"); }
+            if (curr != null) curr.PhysicalDataType = attempted;
+
+            if (AllowedDatatypeService.Instance.IsAllowed(attempted)) return; // permitted
+
+            // Target type to write. Prefer the previous value when it is ITSELF allowed (least
+            // surprising - the column goes back to what it was). Otherwise force an allowed type
+            // (user decision 2026-06-19 "izinli tipe zorla"): a brand-new column whose first pick
+            // is disallowed has no allowed previous value, and the model must never keep a
+            // disallowed type. GetFallbackDatatype gives a deterministic allowed token (the only
+            // one if a single type is allowed, e.g. int; else the first by name).
+            string restored = prev?.PhysicalDataType ?? string.Empty;
+            bool canRestore = !string.IsNullOrEmpty(restored)
+                              && AllowedDatatypeService.Instance.IsAllowed(restored);
+            string target = canRestore ? restored : AllowedDatatypeService.Instance.GetFallbackDatatype();
+
+            // Dedup erwin's double combo-commit: the Column Editor commits the user pick twice (the
+            // combo commit + a later sync that RE-APPLIES the disallowed value). Suppress the SECOND
+            // popup but STILL re-enforce on the duplicate - exactly like EnforceTermTypePolicy - so
+            // that second sync can never leave the disallowed type in the model. (Skipping the write
+            // on the duplicate would let it persist.) The pathological non-round-trip loop is broken
+            // separately, by advancing curr to the LIVE stored value after the write below, not by
+            // skipping the write.
+            bool suppressPopup = false;
+            string objId = curr?.ObjectId ?? string.Empty;
+            if (!string.IsNullOrEmpty(objId)
+                && _allowedDatatypeRecentAttempts.TryGetValue(objId, out var last)
+                && string.Equals(last.attempt, attempted, StringComparison.Ordinal)
+                && (DateTime.UtcNow - last.when).TotalSeconds < TermTypeDedupSeconds)
+            {
+                suppressPopup = true;
+            }
+            if (!string.IsNullOrEmpty(objId))
+                _allowedDatatypeRecentAttempts[objId] = (attempted, DateTime.UtcNow);
+
+            if (string.IsNullOrEmpty(target))
+            {
+                // HasRestriction guarantees a non-empty list, so GetFallbackDatatype returns a
+                // value; this is defensive only (e.g. a whitelist of only blank entries).
+                Log($"AllowedDatatype: {curr?.TableName}.{curr?.PhysicalName} attempted '{attempted}' not in whitelist and no allowed type to fall back on - warned only.");
+                if (!suppressPopup)
+                {
+                    AddinMessageDialog.Show(
+                        $"Column '{curr?.TableName}.{curr?.PhysicalName}': datatype '{attempted}' is not in the allowed datatype list for this configuration.\n\n" +
+                        $"Please pick an allowed datatype.",
+                        "Datatype not allowed",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                }
+                return;
+            }
+
+            int trans = _session.BeginNamedTransaction("EnforceAllowedDatatype");
+            try
+            {
+                attr.Properties("Physical_Data_Type").Value = target;
+                _session.CommitTransaction(trans);
+
+                // Advance the snapshot to the value erwin ACTUALLY stored (re-read), not the catalog
+                // token we wrote - they can differ if erwin canonicalizes the spelling. Using the
+                // real stored value as the next baseline stops the monitor re-firing on a phantom
+                // diff AND breaks the pathological loop: if the stored value does not round-trip it
+                // is still disallowed, but baseline==live so the change path never re-fires; the
+                // name-commit paths fire once per rename, so neither re-writes in a loop.
+                string liveAfterWrite = target;
+                try { liveAfterWrite = attr.Properties("Physical_Data_Type").Value?.ToString() ?? target; }
+                catch (Exception reEx) { Log($"AllowedDatatype: re-read after write failed for {curr?.PhysicalName}: {reEx.Message}"); }
+                curr.PhysicalDataType = liveAfterWrite;
+
+                bool storedDiffers = !string.Equals(liveAfterWrite, target, StringComparison.Ordinal);
+                bool roundTripped = AllowedDatatypeService.Instance.IsAllowed(liveAfterWrite);
+                Log($"AllowedDatatype: {curr?.TableName}.{curr?.PhysicalName} '{attempted}' not in whitelist - {(canRestore ? "reverted" : "forced")} to '{target}'" +
+                    $"{(storedDiffers ? $" (erwin stored '{liveAfterWrite}')" : "")}{(roundTripped ? "" : " - WARNING: stored value still not allowed")}{(suppressPopup ? " (popup suppressed, duplicate within " + TermTypeDedupSeconds + "s)" : "")}");
+
+                if (!suppressPopup)
+                {
+                    if (roundTripped)
+                    {
+                        string verb = canRestore ? "was reverted" : "was changed to an allowed type";
+                        string tail = canRestore ? $"Restored: {target}" : $"Set to: {target}";
+                        AddinMessageDialog.Show(
+                            $"Column '{curr?.TableName}.{curr?.PhysicalName}': datatype '{attempted}' is not in the allowed datatype list for this configuration and {verb}.\n\n" +
+                            tail,
+                            "Datatype not allowed",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Warning);
+                    }
+                    else
+                    {
+                        // The configured allowed type did not apply cleanly: erwin canonicalised it to
+                        // a value that is itself not in the list (a catalog/DBMS token mismatch). Do
+                        // not claim success or leave it buried in the log - tell the user so the
+                        // disallowed value the model now holds is visible, not silently swallowed.
+                        AddinMessageDialog.Show(
+                            $"Column '{curr?.TableName}.{curr?.PhysicalName}': datatype '{attempted}' is not allowed, and the configured allowed type '{target}' could not be applied (the model now holds '{liveAfterWrite}').\n\n" +
+                            $"Please pick an allowed datatype, and ask your administrator to check the Datatype Library entry for this DBMS.",
+                            "Datatype not allowed",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Warning);
+                    }
+
+                    // Re-stamp the dedup window AFTER the (blocking) modal closes so erwin's delayed
+                    // 2nd combo-commit - processed only once this modal returns (the _isProcessingChange
+                    // guard holds re-entrant ticks until then) - still lands inside the window even if
+                    // the user dwelled on the dialog longer than TermTypeDedupSeconds.
+                    if (!string.IsNullOrEmpty(objId))
+                        _allowedDatatypeRecentAttempts[objId] = (attempted, DateTime.UtcNow);
+                }
+            }
+            catch (Exception ex)
+            {
+                try { _session.RollbackTransaction(trans); }
+                catch (Exception rbEx) { Log($"EnforceAllowedDatatypeWhitelist rollback error: {rbEx.Message}"); }
+                Log($"EnforceAllowedDatatypeWhitelist write failed for {curr?.PhysicalName}: {ex.Message}");
             }
         }
 

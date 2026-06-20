@@ -1529,3 +1529,25 @@ in admin data.
 needs to be customer-facing Turkish, it belongs in the admin DB (message
 columns), not in code. Swept and converted all six existing occurrences
 (UDP Locked / UDP Required / recovery dialog) the same day.
+
+---
+
+## 2026-06-19 - Do not invent enforcement gates the user never asked for; verify admin data/query semantics live
+
+**Correction:** for the Datatype Library whitelist I added an `AND DBMS_VERSION.STATUS='ACTIVE'`
+gate AND a `DATATYPE_VERSION` per-version join on my own initiative. The user had
+defined the type at the DBMS level (DATATYPE_LIBRARY) with the version still DRAFT and
+no version link, so my query loaded an EMPTY set and the whole feature was silently
+off. The user's report was simply "test ettim olmadi".
+
+**Why (the trap):** I assumed a curation lifecycle (DRAFT = not enforced, ACTIVE =
+enforced) that sounded plausible but was never stated. The admin app's OWN query for
+"types of this version" (`DatatypeLibraryService.GetDatatypesForVersion`) does not
+filter STATUS - so my gate contradicted the source of truth and disabled the feature.
+
+**How to apply:** before enforcing against admin data, READ the admin code that writes
+it and/or query the live DB to confirm where/how the value is actually stored, and do
+NOT add filters (status gates, version links) the user did not specify. A hidden gate
+that yields an empty set looks identical to "feature works, nothing configured" - it
+fails silently. Match the admin's own read query. Relates to
+feedback_challenge_proposals + feedback_memory_verify_live.

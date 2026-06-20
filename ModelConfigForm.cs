@@ -3825,6 +3825,17 @@ namespace EliteSoft.Erwin.AddIn
                     Log($"NAMING_STANDARD not loaded: {service.LastError}");
                     AddConnectWarning($"NamingStandards: {service.LastError}");
                 }
+
+                // Datatype whitelist = admin "Datatype Library" catalog for the model's
+                // DBMS (DATATYPE_LIBRARY keyed by DBMS_ID, reached via the model's
+                // DBMS_VERSION_ID). Per-DBMS, not per-config; no STATUS gate. Empty catalog =
+                // no restriction. Enforced on a column's Physical_Data_Type change in
+                // ValidationCoordinatorService.
+                var dtSvc = AllowedDatatypeService.Instance;
+                if (dtSvc.Load())
+                    Log($"Datatype library loaded: {(dtSvc.HasRestriction ? dtSvc.Allowed.Count + " allowed type(s) - " + string.Join(", ", dtSvc.Allowed.Select(a => a.Datatype + (a.IsParameterized ? "(n)" : ""))) : "no restriction (DBMS catalog empty)")}");
+                else
+                    Log($"Datatype library not loaded: {dtSvc.LastError}");
             }
             catch (Exception ex)
             {
