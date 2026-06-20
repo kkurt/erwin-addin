@@ -1275,6 +1275,57 @@ namespace EliteSoft.Erwin.AddIn
                         return;
                     }
 
+                    // Single-active-PU model switch-BACK (2026-06-16): erwin's
+                    // in-process SCAPI surfaces only the ACTIVE model's PU, so
+                    // the PU count stays 1 across MDI tabs - switching tabs just
+                    // swaps the single PU's locator. The new-locator scan above
+                    // only reconnects for a NEVER-SEEN locator (NOT in
+                    // _knownLocators); switching BACK to a previously-open model
+                    // (its locator already in the set) was therefore missed and
+                    // the add-in stayed bound to the last-opened model, loading
+                    // config for the wrong tab (user-reported 2026-06-16). With a
+                    // single adoptable PU visible, that PU IS the active model:
+                    // if its locator no longer matches the one we are bound to,
+                    // the active model changed - reconnect so ConfigContext
+                    // re-resolves. No ping-pong risk (one visible PU has nothing
+                    // to oscillate with); the count>1 title detector below is
+                    // unaffected. activeLoc empty (an unsaved local PU) is left to
+                    // the title detector / PU-close paths - we only act on a
+                    // concrete locator change.
+                    if (effectiveCount == 1)
+                    {
+                        // Find the single adoptable PU and compare its locator to
+                        // the one we are bound to. Guards mirror the new-locator
+                        // scan above EXACTLY (skip empty/unsaved-local, erwin's
+                        // ;Duplicate Review copy, and DDL-pipeline-owned copies) -
+                        // we do NOT use FindFirstAdoptablePuIndex here because its
+                        // _pipelineOwnedLocators-empty shortcut returns PU[0]
+                        // without the ;Duplicate check, which could hand us a
+                        // Review copy that ConnectToModel then refuses every tick.
+                        for (int i = 0; i < count; i++)
+                        {
+                            string loc = Services.PuLocatorReader.Read(
+                                persistenceUnits.Item(i),
+                                allowWindowTitleFallback: false) ?? string.Empty;
+                            if (string.IsNullOrEmpty(loc)) continue;
+                            if (loc.IndexOf(";Duplicate=YES", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+                            if (_pipelineOwnedLocators.Contains(loc)) continue;
+
+                            if (!string.Equals(loc, _lastConnectedLocator, StringComparison.OrdinalIgnoreCase))
+                            {
+                                Log($"Active model switched to a previously-open PU: bound '{_lastConnectedLocator}' -> active '{loc}' (locator already in known set) - reconnecting so ConfigContext re-resolves.");
+                                _globalDataLoaded = false;
+                                _openModels.Clear();
+                                for (int j = 0; j < count; j++)
+                                    _openModels.Add(persistenceUnits.Item(j));
+                                ConnectToModel(i);
+                                return;
+                            }
+                            // The single real PU IS the bound model - no switch.
+                            break;
+                        }
+                    }
+
                     // MDI tab-switch detection: with multiple PUs open, the
                     // user can tab between them without any SCAPI-visible
                     // change (PU count and per-PU locators both stay
