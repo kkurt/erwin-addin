@@ -43,8 +43,10 @@ namespace EliteSoft.Erwin.AddIn.Forms
             (string title, string subtitle, string bodyHeading) = ActionCopy(action, columnName);
 
             Text = title;
-            Size = new Size(460, 240);
-            MinimumSize = Size;
+            // Final size is computed from the composed text at the end of the ctor (see below) so
+            // nothing clips: a PropertyChange popup can list up to FOUR "current -> standard"
+            // property lines (Datatype, Nullability, Default value, Primary Key) under a 2-line
+            // heading. A fixed height undercounted that and cut off the last line(s).
             StartPosition = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
@@ -93,7 +95,10 @@ namespace EliteSoft.Erwin.AddIn.Forms
             {
                 Dock = DockStyle.Fill,
                 BackColor = Color.White,
-                Padding = new Padding(20, 16, 20, 16)
+                Padding = new Padding(20, 16, 20, 16),
+                // Safety net: if the measured form height is off (e.g. an unusual DPI), overflow
+                // scrolls instead of silently clipping the lower detail lines.
+                AutoScroll = true
             };
             string entityLine = string.IsNullOrEmpty(entityName) ? "" : $"Entity: \"{entityName}\"\n";
             string detailLine = string.IsNullOrEmpty(detail) ? "" : $"\n{detail}";
@@ -103,8 +108,10 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 Font = new Font("Segoe UI", 10F),
                 ForeColor = ClrTextPrimary,
                 Location = new Point(20, 16),
-                Size = new Size(410, 120),
-                AutoSize = false
+                // Auto-size vertically, wrapping at 420px, so the label reports its TRUE height
+                // for any number of detail lines; the form is then sized to fit it (below).
+                MaximumSize = new Size(420, 0),
+                AutoSize = true
             };
             body.Controls.Add(lblMessage);
 
@@ -140,6 +147,16 @@ namespace EliteSoft.Erwin.AddIn.Forms
             Controls.Add(headerSep);
             Controls.Add(header);
             Controls.Add(accentStrip);
+
+            // Size the dialog to the composed text so no property line clips. body is Dock=Fill
+            // between the top stack (accent+header+sep) and the bottom stack (footer+sep); give it
+            // exactly the height the auto-sized label needs plus a bottom margin. A floor keeps the
+            // short cases (Rename/Delete) from looking cramped, and a generous width fits the label.
+            int chromeHeight = accentStrip.Height + header.Height + headerSep.Height
+                             + footerSep.Height + footer.Height;
+            int bodyContentHeight = lblMessage.Location.Y + lblMessage.PreferredSize.Height + 16;
+            ClientSize = new Size(460, chromeHeight + Math.Max(bodyContentHeight, 110));
+            MinimumSize = Size;
 
             AcceptButton = btnOk;
             CancelButton = btnOk;
@@ -178,7 +195,13 @@ namespace EliteSoft.Erwin.AddIn.Forms
                     return (
                         "Column Locked",
                         $"The column \"{columnName}\" is locked by the administrator.",
-                        "The property change was reverted - locked columns cannot be modified."
+                        // Shown both when the user edits a locked column AND when a locked column
+                        // already differs from the standard (the editor-close scan re-checks every
+                        // locked column, not only the one just edited). Worded so it is accurate in
+                        // both cases - it never claims the user made the change. The properties that
+                        // were brought back into line are listed below (the "current -> standard"
+                        // detail), per user request 2026-06-19 for a clearer, non-accusatory message.
+                        "This column is locked by the administrator and cannot be changed. Its properties are kept at the values defined by the standard:"
                     );
                 case LockedColumnAction.Delete:
                     return (

@@ -5091,8 +5091,16 @@ namespace EliteSoft.Erwin.AddIn.Services
                     if (!string.IsNullOrEmpty(ruleDataType)) snap.PhysicalDataType = ruleDataType;
                 }
 
+                // Nullability's rule value is stored as the integer write token (0/1) erwin
+                // accepts on Null_Option_Type; show it as NULL / NOT NULL so the popup reads
+                // clearly. Other properties already carry human-readable rule values.
                 string detail = string.Join("\n", driftedProps.Select(d =>
-                    $"{d.label}: \"{d.liveValue}\" -> \"{d.ruleValue}\""));
+                {
+                    string shownRule = string.Equals(d.accessor, "Null_Option_Type", StringComparison.Ordinal)
+                        ? (d.ruleValue == "1" ? "NOT NULL" : d.ruleValue == "0" ? "NULL" : d.ruleValue)
+                        : d.ruleValue;
+                    return $"{d.label}: \"{d.liveValue}\" -> \"{shownRule}\"";
+                }));
                 int ruleIdLocal = rule.Id;
                 dynamic capturedAttr = attr;
                 bool capturedRulePk = rule.IsPrimaryKey;
