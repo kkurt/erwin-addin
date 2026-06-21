@@ -1758,8 +1758,21 @@ namespace EliteSoft.Erwin.AddIn
             using (AddinLogger.BeginScope("Wait DB pre-warm"))
                 dbPrewarmTask.Wait(TimeSpan.FromSeconds(3));
 
-            using (AddinLogger.BeginScope("InitializePropertyApplicator"))
-                InitializePropertyApplicator();
+            // Gate config-driven setup on a model/config DBMS match. On mismatch
+            // CheckDbmsMismatch shows the modal; we then skip PropertyApplicator
+            // (no standards/questions loaded) and disable validation, so nothing
+            // config-driven runs against a model that does not match its config.
+            if (CheckDbmsMismatch())
+            {
+                btnValidateAll.Enabled = false;
+                lblPlatformStatus.Text = "DBMS mismatch - operations disabled. Contact the Data Architecture team.";
+                lblPlatformStatus.ForeColor = Color.OrangeRed;
+            }
+            else
+            {
+                using (AddinLogger.BeginScope("InitializePropertyApplicator"))
+                    InitializePropertyApplicator();
+            }
 
             // Load dependency sets BEFORE UdpRuntime (so List UDP options are available during creation)
             _dependencySetService = new DependencySetRuntimeService();
@@ -3739,6 +3752,55 @@ namespace EliteSoft.Erwin.AddIn
             }
         }
 
+        // Set when the open model's live DBMS does not match its bound config's
+        // DBMS (see CheckDbmsMismatch). While true the add-in blocks config-driven
+        // operations (property standards init) and DDL submission.
+        private bool _dbmsMismatch;
+        private string _dbmsMismatchMessage;
+
+        /// <summary>
+        /// Compares the OPEN MODEL's live DBMS (target-server label, e.g. "Oracle
+        /// 19c") against the bound CONFIG's DBMS label (ConfigContextService.DbmsLabel).
+        /// On a mismatch the add-in INFORMS the modeler via a modal and BLOCKS the
+        /// DBMS-driven operations: the model and its configuration must agree on the
+        /// DBMS, and CONFIG.DBMS_VERSION_ID is admin-owned, so the modeler cannot
+        /// silently reconcile it. Comparison is label-based (case/whitespace
+        /// normalized) - the model and config sides use different erwin code schemes,
+        /// so the composed "{DBMS} {Version}" label is the only shared key. Returns
+        /// true on mismatch. Only fires when BOTH labels are known (a missing side is
+        /// handled elsewhere and must not cause a false block).
+        /// </summary>
+        private bool CheckDbmsMismatch()
+        {
+            _dbmsMismatch = false;
+            _dbmsMismatchMessage = null;
+
+            string configLabel = Services.ConfigContextService.Instance?.DbmsLabel;
+            string modelLabel = ReadActivePuTargetServer();
+
+            if (string.IsNullOrWhiteSpace(configLabel) || string.IsNullOrWhiteSpace(modelLabel))
+                return false;
+
+            if (NormalizeDbmsLabel(modelLabel) == NormalizeDbmsLabel(configLabel))
+                return false;
+
+            _dbmsMismatch = true;
+            _dbmsMismatchMessage =
+                $"This model's configuration specifies DBMS \"{configLabel}\", " +
+                $"but the open model targets \"{modelLabel}\".\n\n" +
+                "DBMS-driven operations (property standards and DDL generation/approval) " +
+                "are disabled for this model. Please contact the Data Architecture team " +
+                "to align the configuration with the model.";
+
+            Log($"DBMS mismatch: config='{configLabel}' vs model='{modelLabel}' - config-driven operations blocked.");
+            ErwinAddIn.ShowTopMostMessage(_dbmsMismatchMessage, "Model / Configuration DBMS Mismatch", isError: true);
+            return true;
+        }
+
+        // Case-insensitive, whitespace-collapsed comparison key for DBMS labels.
+        private static string NormalizeDbmsLabel(string s)
+            => System.Text.RegularExpressions.Regex.Replace(s.Trim().ToLowerInvariant(), @"\s+", " ");
+
         /// <summary>
         /// Initialize PropertyApplicatorService: detect platform, load project standards from DB.
         /// Standards will be auto-applied to new tables when created.
@@ -5516,6 +5578,18 @@ namespace EliteSoft.Erwin.AddIn
         private void ShowDdlForApproval(string ddl, string sourceMode)
         {
             if (string.IsNullOrWhiteSpace(ddl)) return;
+
+            // Block DDL submission when the open model's DBMS diverges from its
+            // configuration (detected at connect). The model and config must agree
+            // before any governance-bound DDL leaves the add-in.
+            if (_dbmsMismatch)
+            {
+                ErwinAddIn.ShowTopMostMessage(
+                    _dbmsMismatchMessage ?? "The model's DBMS does not match its configuration. Please contact the Data Architecture team.",
+                    "Model / Configuration DBMS Mismatch",
+                    isError: true);
+                return;
+            }
 
             var ctx = Services.ConfigContextService.Instance;
             if (!ctx.IsInitialized || ctx.ActiveConfigId <= 0)

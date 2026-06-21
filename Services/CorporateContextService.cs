@@ -47,6 +47,12 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <summary>CONFIG.DBMS_VERSION_ID — used by PropertyApplicator to scope MC_PROPERTY_DEF / MC_QUESTION_DEF.</summary>
         public int? DbmsVersionId { get; private set; }
 
+        /// <summary>Composed "{DBMS} {Version}" label (e.g. "Oracle 19c") of the
+        /// config's DBMS version, resolved from DBMS_LIBRARY + DBMS_VERSION. The
+        /// add-in compares this against the open model's live target server to
+        /// detect a model/config DBMS mismatch. Null when it can't be resolved.</summary>
+        public string DbmsLabel { get; private set; }
+
         /// <summary>
         /// The MODEL_CONFIG_MAPPING key the active model resolved (or failed to
         /// resolve) against. For Mart models this is the mart path stem, e.g.
@@ -104,6 +110,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 CorporateId = null;
                 CorporateName = null;
                 DbmsVersionId = null;
+                DbmsLabel = null;
                 MartPath = null;
                 IsMartModel = false;
 
@@ -271,11 +278,14 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         private bool LoadConfigRow(string dbType, int configId)
         {
+            // Join DBMS_LIBRARY + DBMS_VERSION so the config's DBMS label
+            // ("{DBMS} {Version}", e.g. "Oracle 19c") is resolved in one round-trip
+            // for the model/config mismatch check.
             string cfgQuery = dbType?.ToUpper() switch
             {
-                "POSTGRESQL" => @"SELECT ""NAME"", ""CORPORATE_ID"", ""DBMS_VERSION_ID"" FROM ""CONFIG"" WHERE ""ID"" = @id",
-                "ORACLE"     => @"SELECT NAME, CORPORATE_ID, DBMS_VERSION_ID FROM CONFIG WHERE ID = :id",
-                _            => @"SELECT [NAME], [CORPORATE_ID], [DBMS_VERSION_ID] FROM [dbo].[CONFIG] WHERE [ID] = @id"
+                "POSTGRESQL" => @"SELECT c.""NAME"", c.""CORPORATE_ID"", c.""DBMS_VERSION_ID"", dl.""DISPLAY_NAME"" AS ""DBMS_NAME"", dv.""VERSION_CODE"" FROM ""CONFIG"" c LEFT JOIN ""DBMS_VERSION"" dv ON dv.""ID"" = c.""DBMS_VERSION_ID"" LEFT JOIN ""DBMS_LIBRARY"" dl ON dl.""ID"" = dv.""DBMS_ID"" WHERE c.""ID"" = @id",
+                "ORACLE"     => @"SELECT c.NAME, c.CORPORATE_ID, c.DBMS_VERSION_ID, dl.DISPLAY_NAME AS DBMS_NAME, dv.VERSION_CODE FROM CONFIG c LEFT JOIN DBMS_VERSION dv ON dv.ID = c.DBMS_VERSION_ID LEFT JOIN DBMS_LIBRARY dl ON dl.ID = dv.DBMS_ID WHERE c.ID = :id",
+                _            => @"SELECT c.[NAME], c.[CORPORATE_ID], c.[DBMS_VERSION_ID], dl.[DISPLAY_NAME] AS [DBMS_NAME], dv.[VERSION_CODE] FROM [dbo].[CONFIG] c LEFT JOIN [DBMS_VERSION] dv ON dv.[ID] = c.[DBMS_VERSION_ID] LEFT JOIN [DBMS_LIBRARY] dl ON dl.[ID] = dv.[DBMS_ID] WHERE c.[ID] = @id"
             };
 
             using (var conn = DatabaseService.Instance.CreateConnection())
@@ -293,6 +303,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                         ActiveConfigName = r["NAME"] == DBNull.Value ? "" : r["NAME"].ToString().Trim();
                         CorporateId = r["CORPORATE_ID"] == DBNull.Value ? (int?)null : Convert.ToInt32(r["CORPORATE_ID"]);
                         DbmsVersionId = r["DBMS_VERSION_ID"] == DBNull.Value ? (int?)null : Convert.ToInt32(r["DBMS_VERSION_ID"]);
+                        var dbmsName = r["DBMS_NAME"] == DBNull.Value ? "" : r["DBMS_NAME"].ToString().Trim();
+                        var verCode  = r["VERSION_CODE"] == DBNull.Value ? "" : r["VERSION_CODE"].ToString().Trim();
+                        DbmsLabel = (string.IsNullOrEmpty(dbmsName) && string.IsNullOrEmpty(verCode))
+                            ? null : $"{dbmsName} {verCode}".Trim();
                     }
                 }
             }
