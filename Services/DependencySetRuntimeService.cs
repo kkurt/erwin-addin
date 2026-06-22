@@ -801,7 +801,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 using (var cmd = DatabaseService.Instance.CreateCommand(query, conn))
                 {
                     var param = cmd.CreateParameter();
-                    param.ParameterName = repoDbType == "ORACLE" ? ":id" : "@id";
+                    param.ParameterName = SqlDialect.Param(repoDbType, "id");
                     param.Value = connectionDefId;
                     cmd.Parameters.Add(param);
 

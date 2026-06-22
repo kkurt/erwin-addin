@@ -281,55 +281,13 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// </summary>
         private string GetScapiOwnerClass(string objectType)
         {
-            switch (objectType?.ToLower())
-            {
-                case "table": return "Entity";
-                case "column": return "Attribute";
-                case "view": return "View";
-                case "procedure": return "Stored_Procedure";
-                case "model": return "Model";
-                case "subject area": return "Subject_Area";
-                default:
-                    Log($"UdpRuntime: Unknown object type '{objectType}' — skipping");
-                    return null;
-            }
-        }
-
-        /// <summary>
-        /// Map admin UDP_TYPE to erwin metamodel tag_Udp_Data_Type integer.
-        /// Per erwin API Reference 15 (page 169, tag_Udp_Data_Type table):
-        ///   1 = Integer, 2 = Text, 3 = Date, 4 = Command, 5 = Real, 6 = List.
-        /// Default is Text (2) - the same fallback erwin itself documents
-        /// ("Assumes the Text type if it is not specified.").
-        ///
-        /// Boolean has no native erwin datatype; the convention here is to
-        /// store it as Text so values like 'True'/'False' remain readable.
-        /// Admins who want a dropdown should pick List in MC_UDP_DEFINITION
-        /// and supply 'True,False' as the list options instead.
-        /// </summary>
-        private int MapUdpTypeToErwinDataTypeId(string udpType)
-        {
-            switch (udpType?.ToLower())
-            {
-                case "int":
-                case "integer":
-                    return 1;
-                case "text":
-                    return 2;
-                case "date":
-                case "datetime":
-                    return 3;
-                case "command":
-                    return 4;
-                case "real":
-                case "float":
-                case "decimal":
-                    return 5;
-                case "list":
-                    return 6;
-                default:
-                    return 2;
-            }
+            // Single source of the object-type -> erwin owner-class map lives in
+            // UdpSyncEngine (also used by the admin->model definition sync). It returns
+            // null for unknown types; we keep the runtime's skip-log on that path.
+            var owner = UdpSyncEngine.MapObjectTypeToOwnerClass(objectType);
+            if (owner == null)
+                Log($"UdpRuntime: Unknown object type '{objectType}' - skipping");
+            return owner;
         }
 
         /// <summary>

@@ -130,14 +130,14 @@ namespace EliteSoft.Erwin.AddIn.Services
                     using (var command = DatabaseService.Instance.CreateCommand(query, connection))
                     {
                         var pCfg = command.CreateParameter();
-                        pCfg.ParameterName = dbType == "ORACLE" ? ":cfgId" : "@cfgId";
+                        pCfg.ParameterName = SqlDialect.Param(dbType, "cfgId");
                         pCfg.Value = ctx.ActiveConfigId;
                         command.Parameters.Add(pCfg);
 
                         if (filterByType)
                         {
                             var param = command.CreateParameter();
-                            param.ParameterName = dbType == "ORACLE" ? ":objectType" : "@objectType";
+                            param.ParameterName = SqlDialect.Param(dbType, "objectType");
                             param.Value = objectType;
                             command.Parameters.Add(param);
                         }

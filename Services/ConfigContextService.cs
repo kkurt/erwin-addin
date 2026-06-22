@@ -266,7 +266,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 using (var cmd = DatabaseService.Instance.CreateCommand(query, conn))
                 {
                     var p = cmd.CreateParameter();
-                    p.ParameterName = dbType == "ORACLE" ? ":martPath" : "@martPath";
+                    p.ParameterName = SqlDialect.Param(dbType, "martPath");
                     p.Value = martPath;
                     cmd.Parameters.Add(p);
                     var v = cmd.ExecuteScalar();
@@ -294,7 +294,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 using (var cmd = DatabaseService.Instance.CreateCommand(cfgQuery, conn))
                 {
                     var p = cmd.CreateParameter();
-                    p.ParameterName = dbType == "ORACLE" ? ":id" : "@id";
+                    p.ParameterName = SqlDialect.Param(dbType, "id");
                     p.Value = configId;
                     cmd.Parameters.Add(p);
                     using (var r = cmd.ExecuteReader())
@@ -327,7 +327,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                         using (var cmd = DatabaseService.Instance.CreateCommand(nameQuery, conn))
                         {
                             var p = cmd.CreateParameter();
-                            p.ParameterName = dbType == "ORACLE" ? ":id" : "@id";
+                            p.ParameterName = SqlDialect.Param(dbType, "id");
                             p.Value = CorporateId.Value;
                             cmd.Parameters.Add(p);
                             var v = cmd.ExecuteScalar();

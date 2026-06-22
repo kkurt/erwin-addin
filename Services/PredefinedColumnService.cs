@@ -155,7 +155,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     using (var command = DatabaseService.Instance.CreateCommand(query, connection))
                     {
                         var pCfg = command.CreateParameter();
-                        pCfg.ParameterName = dbType == "ORACLE" ? ":cfgId" : "@cfgId";
+                        pCfg.ParameterName = SqlDialect.Param(dbType, "cfgId");
                         pCfg.Value = ctx.ActiveConfigId;
                         command.Parameters.Add(pCfg);
 
@@ -309,7 +309,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 using (var command = DatabaseService.Instance.CreateCommand(q, connection))
                 {
                     var pCfg = command.CreateParameter();
-                    pCfg.ParameterName = dbType == "ORACLE" ? ":cfgId" : "@cfgId";
+                    pCfg.ParameterName = SqlDialect.Param(dbType, "cfgId");
                     pCfg.Value = configId;
                     command.Parameters.Add(pCfg);
 

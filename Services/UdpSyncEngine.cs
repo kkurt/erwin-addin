@@ -212,8 +212,13 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         /// <summary>
         /// Map admin UDP_TYPE to erwin metamodel tag_Udp_Data_Type integer.
-        /// 1=Integer, 2=Text, 3=Date, 4=Command, 5=Real, 6=List. Mirrors
-        /// <c>UdpRuntimeService.MapUdpTypeToErwinDataTypeId</c>.
+        /// 1=Integer, 2=Text, 3=Date, 4=Command, 5=Real, 6=List. The single source
+        /// for this map (UdpRuntimeService delegates here).
+        /// <para>Default is Text (2) - the same fallback erwin itself documents
+        /// ("Assumes the Text type if it is not specified."). Boolean has no native
+        /// erwin datatype; the convention is to store it as Text so 'True'/'False'
+        /// stay readable. Admins who want a dropdown should use List in
+        /// MC_UDP_DEFINITION with 'True,False' list options instead.</para>
         /// </summary>
         public static int MapUdpTypeToErwinDataTypeId(string udpType)
         {
@@ -278,7 +283,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 using (var command = DatabaseService.Instance.CreateCommand(query, connection))
                 {
                     var pCfg = command.CreateParameter();
-                    pCfg.ParameterName = dbType?.ToUpperInvariant() == "ORACLE" ? ":cfgId" : "@cfgId";
+                    pCfg.ParameterName = SqlDialect.Param(dbType?.ToUpperInvariant(), "cfgId");
                     pCfg.Value = _configId;
                     command.Parameters.Add(pCfg);
 

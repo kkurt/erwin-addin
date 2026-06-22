@@ -122,7 +122,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     using (var command = DatabaseService.Instance.CreateCommand(query, connection))
                     {
                         var pVer = command.CreateParameter();
-                        pVer.ParameterName = dbType == "ORACLE" ? ":verId" : "@verId";
+                        pVer.ParameterName = SqlDialect.Param(dbType, "verId");
                         pVer.Value = ctx.DbmsVersionId.Value;
                         command.Parameters.Add(pVer);
 

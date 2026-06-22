@@ -172,7 +172,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                         using (var cmd = DatabaseService.Instance.CreateCommand(mappingQuery, conn))
                         {
                             var pCfg = cmd.CreateParameter();
-                            pCfg.ParameterName = repoDbType == "ORACLE" ? ":cfgId" : "@cfgId";
+                            pCfg.ParameterName = SqlDialect.Param(repoDbType, "cfgId");
                             pCfg.Value = cfgId;
                             cmd.Parameters.Add(pCfg);
 
@@ -215,7 +215,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                         using (var cmdDs = DatabaseService.Instance.CreateCommand(dsQuery, conn))
                         {
                             var pDs = cmdDs.CreateParameter();
-                            pDs.ParameterName = repoDbType == "ORACLE" ? ":dsId" : "@dsId";
+                            pDs.ParameterName = SqlDialect.Param(repoDbType, "dsId");
                             pDs.Value = dataSourceId.Value;
                             cmdDs.Parameters.Add(pDs);
 
@@ -269,7 +269,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     using (var cmd2 = DatabaseService.Instance.CreateCommand(colQuery, conn))
                     {
                         var param = cmd2.CreateParameter();
-                        param.ParameterName = repoDbType == "ORACLE" ? ":mappingId" : "@mappingId";
+                        param.ParameterName = SqlDialect.Param(repoDbType, "mappingId");
                         param.Value = mappingId.Value;
                         cmd2.Parameters.Add(param);
 
@@ -358,7 +358,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     using (var cmd3 = DatabaseService.Instance.CreateCommand(connQuery, conn))
                     {
                         var param = cmd3.CreateParameter();
-                        param.ParameterName = repoDbType == "ORACLE" ? ":connId" : "@connId";
+                        param.ParameterName = SqlDialect.Param(repoDbType, "connId");
                         param.Value = connectionDefId.Value;
                         cmd3.Parameters.Add(param);
 

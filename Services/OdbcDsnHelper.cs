@@ -39,6 +39,21 @@ namespace EliteSoft.Erwin.AddIn.Services
         private const string OdbcDriversPath = @"SOFTWARE\ODBC\ODBCINST.INI\ODBC Drivers";
 
         /// <summary>
+        /// SQL Server ODBC driver preference order. Order matters: erwin SCAPI is verified
+        /// to talk to the legacy "SQL Server" driver (SQLSRV32.dll); modern "ODBC Driver
+        /// 17/18" silently fail in RE on this install, so try legacy first and fall back to
+        /// modern only if missing. Single source for both the preflight check and the picker.
+        /// </summary>
+        private static readonly string[] PreferredSqlServerDrivers =
+        {
+            "SQL Server",
+            "SQL Server Native Client 11.0",
+            "SQL Server Native Client 10.0",
+            "ODBC Driver 18 for SQL Server",
+            "ODBC Driver 17 for SQL Server"
+        };
+
+        /// <summary>
         /// Preflight result describing whether a usable SQL Server ODBC driver exists.
         /// </summary>
         public class DriverCheck
@@ -74,16 +89,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 };
             }
 
-            // Order matters: erwin SCAPI is verified to talk to the legacy "SQL Server"
-            // ODBC driver (SQLSRV32.dll). Modern "ODBC Driver 17/18" silently fail in
-            // RE on this install. Try legacy first; fall back to modern only if missing.
-            string[] preferred = {
-                "SQL Server",
-                "SQL Server Native Client 11.0",
-                "SQL Server Native Client 10.0",
-                "ODBC Driver 18 for SQL Server",
-                "ODBC Driver 17 for SQL Server"
-            };
+            string[] preferred = PreferredSqlServerDrivers;
 
             var ordered = preferred.Where(installed.Contains)
                                    .Concat(installed.Except(preferred))
@@ -320,15 +326,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 return null;
             }
 
-            // Mirror CheckSqlServerDriver() ordering: legacy "SQL Server" first
-            // because that is what erwin SCAPI's RE accepts.
-            string[] preferred = {
-                "SQL Server",
-                "SQL Server Native Client 11.0",
-                "SQL Server Native Client 10.0",
-                "ODBC Driver 18 for SQL Server",
-                "ODBC Driver 17 for SQL Server"
-            };
+            string[] preferred = PreferredSqlServerDrivers;
             foreach (var p in preferred)
             {
                 var match = installed.FirstOrDefault(n => string.Equals(n, p, StringComparison.OrdinalIgnoreCase));
