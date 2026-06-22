@@ -132,6 +132,14 @@ namespace EliteSoft.Erwin.AddIn
         // still closing the leftover tab. Reset when a real PU is adopted.
         private bool _loggedPipelineOnlyPusOpen;
 
+        // One-shot latch for the stale-PU guard: in-process SCAPI can keep
+        // reporting a PersistenceUnit after its model window was closed (the
+        // mismatch force-close hits this; so does any GUI close). The adopt
+        // path skips such ghosts by trusting the live MDI hierarchy; this latch
+        // keeps that "no model window" note off the 500 ms spam loop. Reset
+        // when a real model window appears.
+        private bool _loggedNoModelWindow;
+
         // Two-tick debounce for the tab-switch detector's EMPTY title reads.
         // A single '' read can be transient (caption stolen by an appearing
         // dialog - 2026-06-10 crash chain) while a real switch to a local
@@ -1128,6 +1136,27 @@ namespace EliteSoft.Erwin.AddIn
                 // and UDP-sync into it (review finding, 2026-06-10).
                 if (!_isConnected)
                 {
+                    // Stale-PU guard (2026-06-22): in-process SCAPI can keep
+                    // reporting a PersistenceUnit after its model window was
+                    // closed (the DBMS-mismatch force-close, or any GUI close -
+                    // the DDL worker's "a model is open" check sees the same
+                    // ghost). Adopting that ghost would re-run ConnectToModel
+                    // against a dead model - and, on a force-closed mismatch
+                    // model, loop warn -> close -> warn. Trust the live MDI
+                    // hierarchy: with NO open model window there is nothing real
+                    // to adopt, so stay disconnected until a genuine model opens
+                    // (which yields a fresh MDI child and re-fires the check).
+                    if (!Services.MartMartAutomation.HasActiveModelWindow())
+                    {
+                        if (!_loggedNoModelWindow)
+                        {
+                            _loggedNoModelWindow = true;
+                            Log("Reconnect: SCAPI reports a PU but erwin has no open model window (stale PU) - staying disconnected until a real model opens.");
+                        }
+                        return;
+                    }
+                    _loggedNoModelWindow = false;
+
                     _openModels.Clear();
                     for (int i = 0; i < count; i++)
                         _openModels.Add(persistenceUnits.Item(i));
@@ -1549,7 +1578,7 @@ namespace EliteSoft.Erwin.AddIn
         /// Full initialization: corporate + global data + model-specific services.
         /// Called on first connect.
         /// </summary>
-        private void InitializeValidationService()
+        private void InitializeValidationService(bool closeConfigLessMartModel = true)
         {
             Log("Initializing validation service (full)...");
 
@@ -1596,41 +1625,77 @@ namespace EliteSoft.Erwin.AddIn
                 ok = ctx.Initialize(locator);
             if (!ok)
             {
-                // Degraded mode: keep the form alive without validation/glossary.
-                // Calling ForceClose() here disposed the form mid-Show(), which then
-                // surfaced as "Cannot access a disposed object" from Execute(). The
-                // user wants the add-in to load even when the active model is not
-                // mart-bound or has no CONFIG mapping, so they can still use the
-                // non-validation features (DDL compare/version tabs, debug log, etc).
+                // No CONFIG resolved for the active model. Two cases, handled
+                // differently (2026-06-22):
+                //   * Mart-bound model with NO CONFIG mapping -> same policy as a
+                //     DBMS mismatch: warn (with the copy-the-path modal so the user
+                //     can register it in Admin) and CLOSE it. A reopen re-runs this
+                //     check (the reconnect adopt path's HasActiveModelWindow guard
+                //     handles the lingering stale PU).
+                //   * Local-file (.erwin / non-Mart) model -> keep the existing
+                //     degraded mode (form stays open, action buttons disabled): the
+                //     user may have opened it on purpose for the non-validation
+                //     surfaces, and 'copy the path into Admin' is meaningless for it.
+                // Closing is deferred off this connect/Load message: a synchronous
+                // ForceClose here disposed the form mid-Show(), surfacing as "Cannot
+                // access a disposed object" from Execute().
                 string reason = ctx.LastError
                     ?? "No configuration is defined for the model you are trying to load. Add-in controls will be disabled.";
                 string contextPath = ctx.LastErrorPath ?? "";
-                Log($"Config not resolved: {reason} (path='{contextPath}') -- running in degraded mode (no validation/glossary).");
-                UpdateStatus("Connected (no config: add-in controls disabled).", Color.Red);
+                Log($"Config not resolved: {reason} (path='{contextPath}').");
+
+                // Action buttons would touch SCAPI on the active PU; disable them.
+                // (On a NON-Mart PU, dynamic-dispatch SCAPI methods NULL-deref deep
+                // in EM_GDM/mfc140 and crash the host - verified 2026-05-08 against a
+                // PowerDesigner-imported local .erwin. The model-close path below is
+                // pure Win32, so it is safe for the Mart case.)
                 btnValidateAll.Enabled = false;
-                // In degraded mode the active PU has no Mart locator. Calling
-                // dynamic dispatch SCAPI methods (PropertyBag().Value("Locator"),
-                // FEModel_DDL, ...) on a non-Mart PU triggers a NULL deref deep
-                // in EM_GDM/mfc140 whose IDispatchInvoke unwind crashes the host
-                // process (verified 2026-05-08 13:48 against a PowerDesigner-
-                // imported local .erwin file). Disable every action button that
-                // would touch SCAPI on the active PU, so the user can't trigger
-                // the AV from the UI. The form stays open for non-action surfaces
-                // (General tab, log file link, version compare for OTHER models).
                 btnAlterWizardProd.Enabled = false;
                 btnMartReview.Enabled = false;
+
+                // closeConfigLessMartModel is false on the manual "Reload Config"
+                // path: the user is already working in this open model, so a reload
+                // that lands on config-less must NOT yank it from under them
+                // (possible unsaved work). It stays in degraded mode instead - only
+                // a fresh CONNECT to a config-less Mart model closes it.
+                bool isMartBound = !string.IsNullOrEmpty(ConfigContextService.ParseMartPath(locator));
+                if (isMartBound && closeConfigLessMartModel)
+                {
+                    Log("Config not resolved for a Mart-bound model (no CONFIG mapping) - warning + closing.");
+                    UpdateStatus("No CONFIG mapping - closing model.", Color.Red);
+                    lblDDLStatus.Text = "No CONFIG mapping for this Mart model - closing.";
+                    lblDDLStatus.ForeColor = Color.Red;
+                    // We are closing, not running degraded - clear any stale degraded
+                    // markers (e.g. from a prior local-file model) so the reconnect
+                    // timer's adopt path, not its degraded-recovery path, handles the
+                    // reopen.
+                    _inDegradedMode = false;
+                    _lastDegradedLocator = null;
+                    // _isConnected is still true (set in ConnectToModel before this
+                    // method) and _lastConnectedLocator points at this model, so the
+                    // reconnect timer treats it as bound and will NOT re-adopt it
+                    // while the warning modal is up - no warn->close->warn loop. The
+                    // close continuation then forgets it so a reopen re-runs this
+                    // check.
+                    ShowConfigWarningAndCloseModel();
+                    StartReconnectTimer();
+                    return;
+                }
+
+                // Degraded mode (kept open): a local-file (non-Mart) model, OR a
+                // Mart-bound model reached via a manual Reload Config. Kept for the
+                // non-validation surfaces (General tab, log link, version compare
+                // for OTHER models) - and, on reload, so the user's open model is
+                // never yanked from under them.
+                Log($"Config not resolved - degraded mode (kept open). isMartBound={isMartBound}, fromReload={!closeConfigLessMartModel}.");
+                UpdateStatus("Connected (no config: add-in controls disabled).", Color.Red);
                 lblDDLStatus.Text = "Disabled until a Mart-bound model with CONFIG mapping is loaded.";
                 lblDDLStatus.ForeColor = Color.Red;
                 using (AddinLogger.BeginScope("UpdateGeneralTab(degraded)"))
                     UpdateGeneralTab();
-                // Defer the modal dialog so Form.Load can finish and Show()
-                // can return - calling ShowDialog directly here would nest a
-                // modal pump inside the parent form's Load handler, the
-                // ModelConfigForm window would never finish painting, and
-                // the addin would appear "not loaded" with no visible
-                // warning. BeginInvoke lands the call back on the UI thread
-                // after the current message completes, by which time the
-                // form is fully shown and can host the modal child.
+                // Defer the modal so Form.Load can finish + Show() can return: a
+                // direct ShowDialog nests a modal pump in the Load handler, the form
+                // never finishes painting, and the add-in looks "not loaded".
                 try
                 {
                     BeginInvoke(new Action(() =>
@@ -1641,13 +1706,9 @@ namespace EliteSoft.Erwin.AddIn
                 }
                 catch (Exception ex) { Log($"BeginInvoke for config warning failed: {ex.Message}"); }
 
-                // Track this degraded locator and re-arm the reconnect timer so
-                // we can detect when the user closes this unmapped model and
-                // opens a Mart-bound one with a valid CONFIG mapping. Without
-                // these two lines the form stays stuck in degraded mode UI
-                // forever after the user switches models, which was the bug
-                // reported on 2026-05-09 (local model -> Mart model still
-                // showed "no config" + Glossary "(not loaded)").
+                // Track the degraded locator + re-arm the reconnect timer so the
+                // form recovers when the user switches to a Mart-bound model with a
+                // valid CONFIG (2026-05-09 bug: stuck in degraded UI after switch).
                 _inDegradedMode = true;
                 _lastDegradedLocator = locator ?? "";
                 StartReconnectTimer();
@@ -1764,15 +1825,20 @@ namespace EliteSoft.Erwin.AddIn
             // config-driven runs against a model that does not match its config.
             if (CheckDbmsMismatch())
             {
+                // Model/config DBMS mismatch: the model does not belong to this
+                // config, so NONE of the config-driven setup may touch it
+                // (PropertyApplicator, UDP sync, runtime, monitors, validation).
+                // CheckDbmsMismatch has queued the themed warning + model close
+                // (deferred off the connect/Load thread), so we return now -
+                // nothing config-driven runs against the model before it closes.
                 btnValidateAll.Enabled = false;
                 lblPlatformStatus.Text = "DBMS mismatch - operations disabled. Contact the Data Architecture team.";
                 lblPlatformStatus.ForeColor = Color.OrangeRed;
+                return;
             }
-            else
-            {
-                using (AddinLogger.BeginScope("InitializePropertyApplicator"))
-                    InitializePropertyApplicator();
-            }
+
+            using (AddinLogger.BeginScope("InitializePropertyApplicator"))
+                InitializePropertyApplicator();
 
             // Load dependency sets BEFORE UdpRuntime (so List UDP options are available during creation)
             _dependencySetService = new DependencySetRuntimeService();
@@ -1891,6 +1957,18 @@ namespace EliteSoft.Erwin.AddIn
         private void RunUdpSyncIfNeeded(Action<UdpDiff> afterApply = null,
             string dialogTitle = null, string dialogSubtitle = null)
         {
+            // Never sync UDP definitions into a model whose live DBMS does not
+            // match its config (CheckDbmsMismatch): the model does not belong to
+            // this config - applying its UDPs would corrupt it - and it is being
+            // closed anyway. Defense in depth: the connect path already returns
+            // before reaching here on mismatch, but the UDP-editor deletion-
+            // recovery path also calls this.
+            if (_dbmsMismatch)
+            {
+                Log("UDP sync skipped: model/config DBMS mismatch.");
+                return;
+            }
+
             var ctx = ConfigContextService.Instance;
             if (!ctx.IsInitialized || ctx.ActiveConfigId <= 0)
             {
@@ -2775,6 +2853,97 @@ namespace EliteSoft.Erwin.AddIn
         }
 
         /// <summary>
+        /// Warn that the open Mart model has no CONFIG mapping and close it - the
+        /// same policy AND the same themed <see cref="Forms.AddinMessageDialog"/>
+        /// (red error accent) as <see cref="ShowDbmsMismatchWarningAndCloseModel"/>,
+        /// for one consistent add-in dialog language. The model is being closed, so
+        /// this is NOT the degraded-mode copy-the-path dialog
+        /// (<see cref="ShowConfigWarningDialog"/>, still used when the model stays
+        /// open): no Mart path, no Copy button - just the message and OK. Deferred
+        /// via <see cref="System.Windows.Forms.Control.BeginInvoke(Delegate)"/>
+        /// because this runs in the connect/Form.Load cycle where a synchronous
+        /// <c>ShowDialog</c> deadlocks the paint cycle. The model is freshly opened
+        /// and untouched (no config-driven setup ran), so the fast close discards
+        /// cleanly; the close continuation then forgets the model so a reopen
+        /// re-runs the config check.
+        /// </summary>
+        private void ShowConfigWarningAndCloseModel()
+        {
+            void ShowAndClose()
+            {
+                try
+                {
+                    AddinMessageDialog.Show(
+                        null,
+                        "No configuration is registered for this model.\n\n" +
+                        "Please contact the Data Architecture team to register one for it.",
+                        "No Configuration for Model",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error);
+                }
+                catch (Exception ex) { Log($"Config-less warning dialog failed: {ex.GetType().Name}: {ex.Message}"); }
+
+                // OK acknowledged - close the unmapped Mart model (discard via the
+                // fast cascade) on a background thread (it blocks on the dialog
+                // watch + dismiss and steals foreground, so it must run off the UI
+                // thread, and only AFTER the warning modal above has closed).
+                System.Threading.Tasks.Task.Run(() =>
+                {
+                    bool closed = false;
+                    try
+                    {
+                        closed = Services.MartMartAutomation.CloseActiveModelFast(Log);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"Config-less model-close failed: {ex.GetType().Name}: {ex.Message}");
+                    }
+
+                    // Forget the closed model so a reopen re-fires the connect (and
+                    // re-shows this warning + re-closes). Without this the reconnect
+                    // timer keeps _isConnected=true / _lastConnectedLocator=X and,
+                    // because a reopen has the identical locator, never re-detects
+                    // it. The adopt path's stale-PU guard (HasActiveModelWindow)
+                    // stops this reset from looping on the lingering ghost PU.
+                    if (closed && IsHandleCreated && !IsDisposed)
+                    {
+                        try
+                        {
+                            BeginInvoke((Action)(() =>
+                            {
+                                _isConnected = false;
+                                _lastConnectedLocator = null;
+                                _knownLocators.Clear();
+                                // See ShowDbmsMismatchWarningAndCloseModel: clearing
+                                // _globalDataLoaded forces the next ConnectToModel to
+                                // re-run ConfigContext.Initialize (full first-connect
+                                // path) instead of the fast model-switch path, so the
+                                // next model is checked against ITS OWN config, not
+                                // this closed model's stale one.
+                                _globalDataLoaded = false;
+                                Log("Config-less: forgot the closed model - a reopen will re-run the check.");
+                            }));
+                        }
+                        catch (Exception ex)
+                        {
+                            Log($"Config-less state reset failed: {ex.GetType().Name}: {ex.Message}");
+                        }
+                    }
+                });
+            }
+
+            if (IsHandleCreated && !IsDisposed)
+            {
+                try { BeginInvoke((Action)ShowAndClose); return; }
+                catch (Exception ex)
+                {
+                    Log($"Config-less BeginInvoke failed, running inline: {ex.GetType().Name}: {ex.Message}");
+                }
+            }
+            ShowAndClose();
+        }
+
+        /// <summary>
         /// Open Windows Explorer with the addin log file selected. Falls
         /// back to opening the temp folder if the file does not exist
         /// yet (first-run race).
@@ -3060,7 +3229,7 @@ namespace EliteSoft.Erwin.AddIn
                 // Force the full pipeline (not the fast model-switch path).
                 _globalDataLoaded = false;
                 using (AddinLogger.BeginScope("InitializeValidationService(reload)"))
-                    InitializeValidationService();
+                    InitializeValidationService(closeConfigLessMartModel: false);
 
                 if (Services.ConfigContextService.Instance.IsInitialized)
                     _globalDataLoaded = true;
@@ -3786,9 +3955,113 @@ namespace EliteSoft.Erwin.AddIn
                 "are disabled for this model. Please contact the Data Architecture team " +
                 "to align the configuration with the model.";
 
-            Log($"DBMS mismatch: config='{configLabel}' vs model='{modelLabel}' - config-driven operations blocked.");
-            ErwinAddIn.ShowTopMostMessage(_dbmsMismatchMessage, "Model / Configuration DBMS Mismatch", isError: true);
+            Log($"DBMS mismatch: config='{configLabel}' vs model='{modelLabel}' - config-driven operations blocked; closing model.");
+            ShowDbmsMismatchWarningAndCloseModel();
             return true;
+        }
+
+        /// <summary>
+        /// Show the themed model/config DBMS-mismatch warning and, once the user
+        /// acknowledges it, close the mismatched model. Deferred via
+        /// <see cref="System.Windows.Forms.Control.BeginInvoke(Delegate)"/>
+        /// because <see cref="CheckDbmsMismatch"/> runs inside the connect /
+        /// Form.Load cycle, where a synchronous managed <c>ShowDialog</c>
+        /// deadlocks the form's paint cycle (the same reason
+        /// <see cref="RunUdpSyncIfNeeded"/> posts its dialog). The legacy native
+        /// MessageBox sidestepped this by pumping its own modal message loop;
+        /// the themed <see cref="Forms.AddinMessageDialog"/> cannot, so it must
+        /// run after the connect cycle yields. Closing a Mart model always raises
+        /// erwin's "Mart Offline" dialog (and a "Save Models" dialog if the model
+        /// is dirty); <see cref="Services.MartMartAutomation.CloseActiveModelFast"/>
+        /// dismisses it (Save-to=Close + OK). The model is freshly opened and
+        /// untouched here (all config-driven setup is skipped on mismatch), so it
+        /// is clean and single - the fast path can skip the dirty-cascade's Save
+        /// Models / Close Model waits, keeping the modal on screen ~2-3s.
+        /// </summary>
+        private void ShowDbmsMismatchWarningAndCloseModel()
+        {
+            void ShowAndClose()
+            {
+                try
+                {
+                    AddinMessageDialog.Show(
+                        null,
+                        _dbmsMismatchMessage ?? "The model's DBMS does not match its configuration. Please contact the Data Architecture team.",
+                        "Model / Configuration DBMS Mismatch",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error);
+                }
+                catch (Exception ex)
+                {
+                    Log($"DBMS mismatch dialog failed: {ex.GetType().Name}: {ex.Message}");
+                }
+
+                // OK acknowledged - close the mismatched model so the user cannot
+                // keep working against a config that does not match it. Closing a
+                // Mart model raises erwin's "Mart Offline" dialog (per-row Save-to
+                // combo + OK); CloseActiveModelFast drives it to Save-to=Close + OK.
+                // It blocks on the dialog watch + dismiss and steals foreground, so
+                // it MUST run off the UI thread - and only AFTER the warning above
+                // has closed, so the foreground-steal never pushes a live modal
+                // behind erwin (see the teardown lesson).
+                System.Threading.Tasks.Task.Run(() =>
+                {
+                    bool closed = false;
+                    try
+                    {
+                        closed = Services.MartMartAutomation.CloseActiveModelFast(Log);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"DBMS mismatch model-close failed: {ex.GetType().Name}: {ex.Message}");
+                    }
+
+                    // Forget the closed model so REOPENING it re-fires the connect
+                    // (and re-shows this warning + re-closes). Without this the
+                    // reconnect timer keeps _isConnected=true / _lastConnectedLocator=X
+                    // and, because a reopen has the identical locator, never
+                    // re-detects it. The adopt path's stale-PU guard
+                    // (HasActiveModelWindow) stops this reset from looping on the
+                    // lingering ghost PU. Marshalled to the UI thread - these fields
+                    // belong to the reconnect timer.
+                    if (closed && IsHandleCreated && !IsDisposed)
+                    {
+                        try
+                        {
+                            BeginInvoke((Action)(() =>
+                            {
+                                _isConnected = false;
+                                _lastConnectedLocator = null;
+                                _knownLocators.Clear();
+                                // MUST also clear _globalDataLoaded: otherwise the
+                                // next ConnectToModel (reopen, or a DIFFERENT model)
+                                // takes the fast model-switch path which does NOT
+                                // re-run ConfigContext.Initialize, so the mismatch /
+                                // config check would reuse THIS closed model's stale
+                                // config against the next model (false mismatch on an
+                                // unmapped/different-config model). Forcing the full
+                                // first-connect path re-resolves config per model.
+                                _globalDataLoaded = false;
+                                Log("DBMS mismatch: forgot the closed model - a reopen will re-run the check.");
+                            }));
+                        }
+                        catch (Exception ex)
+                        {
+                            Log($"DBMS mismatch state reset failed: {ex.GetType().Name}: {ex.Message}");
+                        }
+                    }
+                });
+            }
+
+            if (IsHandleCreated && !IsDisposed)
+            {
+                try { BeginInvoke((Action)ShowAndClose); return; }
+                catch (Exception ex)
+                {
+                    Log($"DBMS mismatch BeginInvoke failed, running inline: {ex.GetType().Name}: {ex.Message}");
+                }
+            }
+            ShowAndClose();
         }
 
         // Case-insensitive, whitespace-collapsed comparison key for DBMS labels.
@@ -5793,12 +6066,16 @@ namespace EliteSoft.Erwin.AddIn
         /// erwin-admin's small-int mapping (50..200) produced wrong labels
         /// (Oracle 19c on a SQL Server model in the 2026-05-16 bug).
         ///
-        /// The major version comes from PropertyBag's <c>Target_Server_Version</c>.
-        /// Composed label is "{Brand} {Version}" - e.g. "Oracle 19",
-        /// "SQL Server 2019". erwin's own status bar uses a friendlier
-        /// label sometimes ("SQL Server 2016/2017" for a release-pair); we
-        /// try to scrape that first via <see cref="ReadDbmsFromErwinStatusBar"/>
-        /// and fall back to the composed label when the scrape misses.
+        /// The major version comes from PropertyBag's <c>Target_Server_Version</c>,
+        /// which is the INTERNAL engine major (SQL Server 15, Oracle 19), not
+        /// the marketing label. <see cref="Services.DbmsLabelComposer"/> maps it
+        /// to the label erwin itself shows - "Oracle 19c", "SQL Server 2019/2022"
+        /// (erwin groups the 2019+2022 engines into one release-pair target). We
+        /// still try to scrape erwin's status bar first via
+        /// <see cref="ReadDbmsFromErwinStatusBar"/> (it stays current with new
+        /// releases without code changes) and fall back to the composed label
+        /// when the scrape misses - which is the norm, because erwin's status
+        /// bar is an XTP custom-painted control GetWindowText cannot read.
         /// </summary>
         private string ReadActivePuTargetServer()
         {
@@ -5819,7 +6096,7 @@ namespace EliteSoft.Erwin.AddIn
 
                 if (brandId == 0) return null;
                 string brand = DbmsBrandNames.TryGetValue(brandId, out string b) ? b : $"DBMS Brand {brandId}";
-                return ComposeDbmsLabel(brand, version);
+                return Services.DbmsLabelComposer.Compose(brand, version);
             }
             catch (Exception ex) { Log($"ReadActivePuTargetServer: PropertyBag probe threw: {ex.GetType().Name}: {ex.Message}"); }
             return null;
@@ -5849,31 +6126,9 @@ namespace EliteSoft.Erwin.AddIn
             catch { return null; }
         }
 
-        /// <summary>
-        /// Composes the display label "brand version" with the Oracle suffix
-        /// convention applied (12+ -> "c", 10..11 -> "g", <=9 -> "i") so the
-        /// label matches what erwin's status bar shows (Oracle 19 -> Oracle
-        /// 19c, Oracle 11 -> Oracle 11g). For non-Oracle brands the version
-        /// is appended as-is because there is no comparable naming
-        /// convention (SQL Server / PostgreSQL / etc. ship as plain
-        /// numeric/year versions).
-        /// </summary>
-        private static string ComposeDbmsLabel(string brand, string version)
-        {
-            if (string.IsNullOrWhiteSpace(version)) return brand;
-            if (string.Equals(brand, "Oracle", StringComparison.OrdinalIgnoreCase)
-                && int.TryParse(version.Trim(), out int major))
-            {
-                string suffix = major switch
-                {
-                    <= 9  => "i",  // 8i, 9i
-                    <= 11 => "g",  // 10g, 11g
-                    _     => "c",  // 12c, 18c, 19c, 21c, 23c, ...
-                };
-                return $"Oracle {major}{suffix}";
-            }
-            return $"{brand} {version.Trim()}";
-        }
+        // DBMS label composition moved to Services.DbmsLabelComposer (pure +
+        // unit-tested) - the model/config mismatch label regressed twice on
+        // raw engine-version leaks, so it now lives behind a tested seam.
 
         /// <summary>
         /// erwin Property Bag "Target_Server" DBMS Brand ID -> name. Verbatim

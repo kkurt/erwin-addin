@@ -4,6 +4,41 @@ A running log of corrections and non-obvious findings that future sessions
 should not have to rediscover. Each entry is a short rule, the reason, and
 how to apply it.
 
+## 2026-06-22: A "forget the model / re-detect" reset MUST clear the COMPLETE disconnect state, not a convenient subset - and never trust an unverified invariant claim
+
+**Rule:** when you add a reset that pushes the form back to "disconnected" so a
+reopen re-runs the connect (the DBMS-mismatch / config-less close path:
+`_isConnected=false; _lastConnectedLocator=null; _knownLocators.Clear();`), you
+MUST also clear **`_globalDataLoaded`**. `ConnectToModel` forks on it:
+`if (_globalDataLoaded)` -> fast `ReinitializeForModelSwitch` (model-only) which
+SKIPS `ConfigContext.Initialize`; else -> full `InitializeValidationService`
+which re-resolves config. A config-resolved model sets `_globalDataLoaded=true`
+(ModelConfigForm.cs:672). My partial reset left it true, so after a close the
+next model took the switch path, never re-read its config, and the mismatch /
+config-less check ran against the PREVIOUS model's STALE config - a false
+"Oracle 21c mismatch" on a model that has no config row at all.
+
+**Why:** the connect state machine is a SET of fields
+(`_isConnected`, `_globalDataLoaded`, `_lastConnectedLocator`, `_knownLocators`,
+`_inDegradedMode`, `_lastDegradedLocator`). The existing disconnect paths
+(`HandleSessionLost`, the timer's count-drop/switch-detection at :1196/:1290/
+:1346/:1439) clear `_globalDataLoaded` too; the timer's **adopt** path
+(`!_isConnected`, ~:1137) does NOT. I reset a subset and assumed the adopt path
+would re-resolve config - it doesn't. Worse: the adversarial review I ran
+asserted "every tick path that adopts/switches first resets `_globalDataLoaded`"
+and cited :1196/:1290/:1346/:1439 - but those are the switch-DETECTION lines,
+NOT the adopt path the reset actually routes through. I accepted the claim
+without tracing the specific path, so the review "passed" a real bug.
+
+**How to apply:** (1) when mirroring/forcing a state transition, reset the WHOLE
+state set the canonical transition resets - diff your reset against
+`HandleSessionLost` / the existing disconnect path and match it field-for-field,
+don't hand-pick. (2) After any "forget the connection" reset, the next connect
+must do a FULL re-resolve: clear `_globalDataLoaded`. (3) When a review (sub-agent
+or your own) claims an invariant holds because "path X resets Y", open path X and
+confirm line Y is on THAT path, not a sibling path with the same effect elsewhere
+- an invariant proof is only as good as the exact lines it cites.
+
 ## 2026-06-14: A placeholder/name classifier must test the EXACT variable the caller passes, not a name from a different log line
 
 **Rule:** when you write a name predicate (e.g. `IsPlaceholderViewName`), confirm

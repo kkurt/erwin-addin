@@ -2160,7 +2160,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// fails it does NOT click OK (OK while a row is still Save-to=Offline spawns a
         /// Save As picker) and leaves the dialog for the user - never a spurious save.
         /// </summary>
-        private static void DismissMartOfflineDialogWin32(IntPtr martOffline, Action<string> log)
+        private static void DismissMartOfflineDialogWin32(IntPtr martOffline, Action<string> log, bool skipTrailingWait = false)
         {
             if (martOffline == IntPtr.Zero) return;
             try
@@ -2193,10 +2193,17 @@ namespace EliteSoft.Erwin.AddIn.Services
                     log?.Invoke($"  [MO-WIN32] OK posted (WM_COMMAND IDOK, lParam=okBtn 0x{okBtn.ToInt64():X}). NO UIA used.");
                 }
 
-                Thread.Sleep(500);
-                log?.Invoke(IsWindow(martOffline)
-                    ? "  [MO-WIN32] WARN Mart Offline still alive after Win32 OK - may need manual close."
-                    : "  [MO-WIN32] Mart Offline dismissed (pure Win32).");
+                // Trailing settle + verify-log is for callers that do no follow-up
+                // wait. The fast-close path verifies the close itself via
+                // WaitForWindowGone(child) and logs its own result, so it skips
+                // this to shave ~500ms off the on-screen modal time.
+                if (!skipTrailingWait)
+                {
+                    Thread.Sleep(500);
+                    log?.Invoke(IsWindow(martOffline)
+                        ? "  [MO-WIN32] WARN Mart Offline still alive after Win32 OK - may need manual close."
+                        : "  [MO-WIN32] Mart Offline dismissed (pure Win32).");
+                }
             }
             catch (Exception ex) { log?.Invoke($"  [MO-WIN32] threw: {ex.Message}"); }
         }
@@ -3800,15 +3807,16 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         /// <summary>True once the window handle is gone/destroyed within the
         /// timeout; false when it is still alive at the deadline.</summary>
-        private static bool WaitForWindowGone(IntPtr hwnd, int timeoutMs)
+        private static bool WaitForWindowGone(IntPtr hwnd, int timeoutMs, int pollMs = 250)
         {
             if (hwnd == IntPtr.Zero) return true;
+            if (pollMs < 1) pollMs = 1;
             int waited = 0;
             while (waited < timeoutMs)
             {
                 if (!IsWindow(hwnd)) return true;
-                Thread.Sleep(250);
-                waited += 250;
+                Thread.Sleep(pollMs);
+                waited += pollMs;
             }
             return !IsWindow(hwnd);
         }
@@ -3851,7 +3859,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// save - the caller then leaves the dialog for manual handling. Returns
         /// true if it unchecked + posted OK, false if it safely aborted.
         /// </summary>
-        private static bool CloseSaveModelsWin32(IntPtr dlg, Action<string> log, bool guardSingleRow = false)
+        private static bool CloseSaveModelsWin32(IntPtr dlg, Action<string> log, bool guardSingleRow = false, bool skipTrailingWait = false)
         {
             try
             {
@@ -3953,7 +3961,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                 Thread.Sleep(300);
                 PostMessage(dlg, WM_COMMAND, MakeWParam(IDOK, 0), okBtn);
                 log?.Invoke("  [SM-WIN32] OK posted (WM_COMMAND IDOK, lParam=okBtn) - save unchecked, model discarded. NO UIA used.");
-                Thread.Sleep(500);
+                // Trailing settle is for callers that do no follow-up wait; the
+                // fast-close path verifies the close (WaitForWindowGone) itself, so
+                // it skips this to shave ~500ms off the on-screen modal time.
+                if (!skipTrailingWait) Thread.Sleep(500);
                 return true;
             }
             catch (Exception ex) { log?.Invoke($"  [SM-WIN32] threw: {ex.Message} - ABORT (leave for manual)."); return false; }
@@ -4468,6 +4479,124 @@ namespace EliteSoft.Erwin.AddIn.Services
                 ? "  [WORKER-CLOSE] active model closed (discarded, not saved)."
                 : "  [WORKER-CLOSE] active model still alive after close - may need manual handling.");
             return gone;
+        }
+
+        /// <summary>
+        /// FAST attended close of the active Mart model for the DBMS-mismatch
+        /// path. Discards the model (it does not match its config): drives
+        /// whichever close-confirmation erwin raises - "Save Models" (uncheck save
+        /// + OK) for a dirty model, then "Mart Offline" (Save-to=Close + OK) - by
+        /// POLLING for each, instead of the dirty-cascade sweep's fixed Save
+        /// Models (3s) + Close Model (1.5s) timeouts and its eager "still alive"
+        /// second pass. Reacts the instant a dialog appears and stops the moment
+        /// the child window dies. With skipTrailingWait on each dismiss (we verify
+        /// via WaitForWindowGone ourselves) + a 50 ms poll, the on-screen time
+        /// drops from ~6-11s to ~0.6s clean / ~1.2s dirty (Save Models + Mart
+        /// Offline). Single-row guarded (CloseSaveModelsWin32) so it never mass-
+        /// discards when several dirty models are listed - that case is left for
+        /// the user. MUST run on a BACKGROUND thread (blocks on the dialog watch +
+        /// dismiss sleeps; erwin needs its UI thread free to raise/tear down the
+        /// prompts). The worker's between-jobs teardown keeps using
+        /// <see cref="CloseActiveMartModelDiscardingChanges"/>.
+        /// </summary>
+        internal static bool CloseActiveModelFast(Action<string> log)
+        {
+            IntPtr main = FindErwinMain();
+            if (main == IntPtr.Zero) { log?.Invoke("  [FAST-CLOSE] erwin main not found"); return false; }
+            IntPtr mdiClient = FindMdiClientOf(main);
+            if (mdiClient == IntPtr.Zero) { log?.Invoke("  [FAST-CLOSE] MDIClient not found"); return false; }
+            IntPtr child = GetActiveMdiChild(mdiClient);
+            if (child == IntPtr.Zero) { log?.Invoke("  [FAST-CLOSE] no active MDI child - already model-less."); return true; }
+
+            log?.Invoke($"  [FAST-CLOSE] WM_CLOSE active model child 0x{child.ToInt64():X} title='{GetTitle(child)}'");
+            ForceForeground(main);
+            PostMessage(child, WM_CLOSE_MSG, IntPtr.Zero, IntPtr.Zero);
+
+            // Poll-drive the close cascade until the CHILD window dies. A DIRTY
+            // model raises "Save Models" FIRST (discard = uncheck save + OK), then
+            // "Mart Offline" (Save-to=Close + OK) - both appear in sequence on one
+            // close. A clean model goes straight to "Mart Offline". Either dialog
+            // must DISCARD (the model does not match its config). We poll for
+            // whichever dialog is up, drive it, then wait on the CHILD - the real
+            // success signal - because a large model can take several seconds to
+            // finish closing after the final OK, during which the dialog lingers
+            // (that is normal, not a failure - the eager dialog-gone check here
+            // used to give up too early). Poll-based, so we react the instant a
+            // dialog appears instead of waiting out the dirty-cascade sweep's
+            // fixed Save Models 3s + Close Model 1.5s timeouts.
+            uint deadline = unchecked((uint)Environment.TickCount) + 15000;
+            bool sawSaveModels = false, sawMartOffline = false;
+            while (unchecked((int)((uint)Environment.TickCount - deadline)) < 0)
+            {
+                if (!IsWindow(child))
+                {
+                    log?.Invoke("  [FAST-CLOSE] model closed (discarded, not saved).");
+                    return true;
+                }
+
+                IntPtr sm = FindVisibleOwnTopLevel("Save Models");
+                if (sm == IntPtr.Zero) sm = FindVisibleOwnTopLevel("Save Model");
+                if (sm != IntPtr.Zero)
+                {
+                    if (!sawSaveModels) { sawSaveModels = true; log?.Invoke($"  [FAST-CLOSE] Save Models 0x{sm.ToInt64():X} - discarding (uncheck save + OK)."); }
+                    if (!CloseSaveModelsWin32(sm, log, guardSingleRow: true, skipTrailingWait: true))
+                    {
+                        log?.Invoke("  [FAST-CLOSE] Save Models discard aborted (guard/safety) - leaving dialog for the user.");
+                        return false;
+                    }
+                    // Save Models closes quickly after discard; the Mart Offline
+                    // dialog (or a direct child close) follows. Tight poll (50 ms)
+                    // so we move on the instant it closes.
+                    WaitForWindowGone(sm, 4000, pollMs: 50);
+                    continue;
+                }
+
+                IntPtr mo = FindVisibleOwnTopLevel("Mart Offline");
+                if (mo != IntPtr.Zero)
+                {
+                    if (!sawMartOffline) { sawMartOffline = true; log?.Invoke($"  [FAST-CLOSE] Mart Offline 0x{mo.ToInt64():X} - dismissing (Save-to=Close + OK)."); }
+                    DismissMartOfflineDialogWin32(mo, log, skipTrailingWait: true);
+                    // OK is in; the model is now closing. Wait on the CHILD, not the
+                    // dialog - a big model keeps the dialog up for several seconds
+                    // while it unwinds. Tight poll (50 ms) so we return the instant
+                    // the model is gone. If the child does not die, re-poll: the OK
+                    // may not have taken, or another dialog appeared.
+                    if (WaitForWindowGone(child, 8000, pollMs: 50))
+                    {
+                        log?.Invoke("  [FAST-CLOSE] model closed (discarded, not saved).");
+                        return true;
+                    }
+                    continue;
+                }
+
+                Thread.Sleep(50);
+            }
+
+            bool gone = !IsWindow(child);
+            log?.Invoke(gone
+                ? "  [FAST-CLOSE] model closed (discarded, not saved)."
+                : "  [FAST-CLOSE] model still alive after close (timed out) - may need manual close.");
+            return gone;
+        }
+
+        /// <summary>
+        /// True when erwin currently has an open model MDI child window. This is
+        /// the GUI ground truth (WM_MDIGETACTIVE on the MDIClient), used to tell
+        /// a REAL open model from a STALE in-process SCAPI PersistenceUnit - the
+        /// in-process collection can keep reporting a PU after its window was
+        /// closed (the DBMS-mismatch force-close hits this; the DDL worker's
+        /// "a model is open" check sees the same ghost). Callers that must not
+        /// act on a dead model (e.g. the reconnect-timer adopt path) gate on this
+        /// instead of <c>PersistenceUnits.Count</c>. Same-thread SendMessage, so
+        /// safe to call from the add-in UI thread.
+        /// </summary>
+        internal static bool HasActiveModelWindow()
+        {
+            IntPtr main = FindErwinMain();
+            if (main == IntPtr.Zero) return false;
+            IntPtr mdiClient = FindMdiClientOf(main);
+            if (mdiClient == IntPtr.Zero) return false;
+            return GetActiveMdiChild(mdiClient) != IntPtr.Zero;
         }
 
         /// <summary>Activate a SPECIFIC MDI child (used to flip Left back to the
