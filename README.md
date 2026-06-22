@@ -19,7 +19,6 @@ erwin-addin/
 ├── ModelConfigForm.cs               # Ana UI formu
 ├── ModelConfigForm.Designer.cs      # Form tasarımcı kodu
 ├── ErwinUtilities.cs                # Yardımcı fonksiyonlar
-├── DDLGenerator.cs                  # DDL oluşturma
 ├── ErwinAddIn.csproj                # Proje dosyası (net10.0-windows, EnableComHosting)
 ├── erwin-addin.sln                  # Solution dosyası
 ├── build-and-run.ps1                # Build + install + COM register (dev workflow)

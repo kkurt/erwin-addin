@@ -1842,12 +1842,6 @@ namespace EliteSoft.Erwin.AddIn
             using (AddinLogger.BeginScope("ValidationCoordinator.StartMonitoring"))
                 _validationCoordinatorService.StartMonitoring(_cachedPropertyTypeNames);
 
-            // DTProbe was a one-shot metamodel discovery spike (~5.7s on every connect).
-            // Output is deterministic per erwin install, not per model, so we no longer
-            // pay the cost on each load. The MetamodelDatatypeProbe class is preserved
-            // and can be invoked manually from a DEV button if the dropdown source
-            // question is revisited.
-
             using (AddinLogger.BeginScope("LoadTablesComboBox"))
                 LoadTablesComboBox();
             UpdateValidationStatus();
