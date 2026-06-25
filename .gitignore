@@ -15,6 +15,7 @@ ErwinAlterDdl/artifacts/
 dist/
 certs/*.pfx
 .swarm/
+.serena/
 
 # Native bridge build artifacts
 scripts/native-bridge/*.map

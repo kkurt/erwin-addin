@@ -1586,3 +1586,162 @@ NOT add filters (status gates, version links) the user did not specify. A hidden
 that yields an empty set looks identical to "feature works, nothing configured" - it
 fails silently. Match the admin's own read query. Relates to
 feedback_challenge_proposals + feedback_memory_verify_live.
+
+---
+
+## 2026-06-22 - A resolved CONFIG is NOT a proxy for "Mart model"; gate every Mart-driven feature on IsMartModel
+
+**Near-miss (caught by adversarial review, before the user saw it):** the new Integrate
+tab gated its visibility on `ctx.IsInitialized && ctx.ActiveConfigId > 0` only. Since
+2026-06-13 a LOCAL .erwin file can ALSO be config-initialized (ActiveConfigId set,
+MartPath = the local FILE path). `ParseParentFolder` splits on '\' too, so a local file
+like `C:\work\Dev\Sales.erwin` yields parent "Dev", which then falsely matched an
+ENVIRONMENT.NAME and rendered a confident "in environment Dev" promotion row with an
+active button - on a model that is not in the Mart at all.
+
+**Why (the trap):** I treated "has a config" as "is a Mart model." That stopped being
+true on 2026-06-13 when local files gained config resolution for validation features.
+Every OTHER Mart pipeline in ModelConfigForm already guards `if (!ctx.IsMartModel)`
+(BtnMartReview_Click, the Generate-DDL route, the local-model branch that disables the
+Mart buttons) precisely because the Mart engines AV on non-Mart PUs - the new feature
+was the one that forgot it.
+
+**How to apply:** when adding ANY Mart-driven feature (Review, Generate DDL, Merge,
+Integrate, ...), gate it on `ConfigContextService.Instance.IsMartModel`, not just on a
+resolved config. ActiveConfigId > 0 proves a config mapping exists, NOT that the model
+is Mart-hosted. Mirror the existing `if (!ctx.IsMartModel)` idiom already used by every
+other Mart pipeline in the form. Relates to reference_view_no_physical_name (local
+models are first-class config citizens now).
+
+---
+
+## 2026-06-23 - "isNew" (snapshot-absence) is NOT "new column" for Model Explorer adds; gate new-vs-existing on _pendingNamedAttrs
+
+**Bug (user-reported, log-confirmed):** adding a column via Model Explorer, the required-field
+rule fired ("Comment mandatory") but "Revert Change" did NOT remove the column. Log proved:
+the column arrives with placeholder name `<default>`, gets snapshotted + parked in
+`_pendingNamedAttrs` (naming deferred); when renamed to its real name it is validated with
+`isNew=False` (objectId already in `_attributeSnapshots`), so the Required dialog opened in
+UPDATE mode -> Cancel ran `TryRevertAttributeProperty` (blanked the Comment) instead of
+`TryDeleteNewAttribute` (discard). Column stayed. Diagram/Column-Editor adds set the real name
+immediately -> isNew=True -> CREATE mode -> "Discard New Column" -> deletes, which is why it
+"worked from other surfaces".
+
+**Why (the trap):** `isNew` is derived from snapshot ABSENCE. A Model-Explorer column passes
+through a placeholder->rename pending flow, so by the time its real name commits it is brand-new
+but `isNew=False`. Snapshot-absence and "is a new column the user is still creating" are NOT the
+same thing once the pending-name machine is involved.
+
+**How to apply:** for any new-vs-existing DECISION at name-commit time (here: discard vs revert),
+OR-in `_pendingNamedAttrs` membership, not just `isNew`. Fix used a SEPARATE
+`treatAsNewForRequired = isNew || IsAttributePendingNew(objectId)` ONLY for the required-field
+cancel branch - left `isNew` untouched for naming-rule application (it also drives
+ApplyNamingStandards new-vs-existing). `_pendingNamedAttrs` is ONLY ever populated on the
+`isNew && placeholder-name` path, so it can never contain a real existing column (no false-delete).
+SECONDARY structural lesson: when a deeply-nested validation method DELETES the COM object
+(TryDeleteNewAttribute), the deletion must propagate UP (return bool) so every caller skips its
+post-work (EnforceAllowedDatatypeWhitelist, snapshot re-add, locked-UDP enforcement) - otherwise
+they touch a dead COM object. Mirror the existing isNew=True mid-foreach delete (proven safe).
+Relates to reference_view_defer_like_tables (the pending-name machine) + feedback_rules_new_objects_only.
+
+---
+
+## 2026-06-23 - "DB unreachable" is NOT "no config mapping"; never take a destructive action on a config-resolution failure without distinguishing the two
+
+**Bug (user-reported, log-confirmed, MY regression):** on one user's machine, opening a Mart model
+gave NO validation popups. Log: `ConfigContext.Initialize error: Key not valid for use in specified
+state.` (a DPAPI CryptographicException decrypting the config DB password) -> `Config not resolved ...
+(path='')` -> `Config not resolved for a Mart-bound model (no CONFIG mapping) - warning + closing.`
+-> the model was force-closed, validation off for the session. Worked on Kursat's account because
+DPAPI decrypts there. The earlier DBMS-governance work's config-less-CLOSE logic
+(`InitializeValidationService`) fired on ANY `ConfigContext.Initialize` failure for a Mart model,
+conflating "DB reachable, mart path has no MODEL_CONFIG_MAPPING row" (genuinely config-less, close
+is intended) with "couldn't even reach/decrypt the config DB" (we do NOT know if a mapping exists).
+
+**Why (the trap):** a boolean "did config resolve?" hides WHY it failed. Closing the user's open
+model (possible unsaved work) is destructive and must only happen when we are SURE the model is
+config-less - which we are NOT when the DB was unreachable. DPAPI `CurrentUser` blobs are per-user
+and per-machine, so a password encrypted under one account/profile throws "Key not valid for use in
+specified state" on another (or transiently during an RDP/roaming-profile load) -> environment-specific
+breakage that the author can never reproduce.
+
+**How to apply:** before any destructive reaction to a config-resolution failure, distinguish DB-access
+failure from genuine no-mapping. The clean signal already existed: `ConfigContextService.Initialize`
+sets `LastErrorPath` to the resolved path ONLY on the no-mapping branch; every DB-access/crypto/
+unconfigured failure leaves it null (the catch never assigns it; `LookupConfigId` opens the connection,
+so a throw there precedes the path assignment). Fix: close only when
+`resolvedButUnmapped = !string.IsNullOrEmpty(LastErrorPath)`; on a DB-access error keep the model OPEN,
+degrade, surface a clear "configuration database unavailable" message (not "register this path"), and
+let the user reopen/Reload-Config. General rule: gate every destructive add-in action (close model,
+delete object, mass-rewrite) on a POSITIVE confirmation of the precondition, never on the mere absence
+of success. Relates to feedback_no_silent_fallback + project_corporate_flow.
+
+---
+
+## 2026-06-23 - Read a model's DBMS from the model's own properties, NEVER by scraping erwin's status bar / window captions
+
+**Bug (user-reported, log-confirmed, MY regression):** opening a Mart model whose mart folder is named
+"Sql Server Models" popped a false "Model / Configuration DBMS Mismatch" and CLOSED the model, even
+though the config said "SQL Server 2016/2017" and the model targets exactly that (the status bar showed
+it). Log: `ReadDbmsFromErwinStatusBar: matched ... text='Mart://Mart/FibaBenzerleri/Sql Server
+Models/FIBA-TEST : v1 : KKR'` then `DBMS mismatch: config='SQL Server 2016/2017' vs model='Mart://...
+/Sql Server Models/...'`. `ReadActivePuTargetServer` tried the status bar FIRST; `LooksLikeDbmsLabel`
+used `Contains("sql server")`, which matched the brand keyword sitting inside the FOLDER NAME of the MDI
+title, so the add-in compared the config DBMS against the LOCATOR.
+
+**Why (the trap):** erwin's status bar is an XTP custom-painted control that GetWindowText usually
+cannot read, so the code brute-force enumerated child windows looking for a "DBMS-looking" string - and
+a model's own MDI caption (a `Mart://.../<folder>/<model>` locator) is a child window whose text can
+contain a DBMS brand word by coincidence of folder naming. Screen-scraping UI for authoritative data is
+inherently fragile; the user's reaction ("pencere basligi neden?! model uzerinde zaten yaziyor,
+konfigde de yaziyor") was exactly right.
+
+**How to apply:** the model's DBMS is in the model's OWN data - SCAPI PropertyBag `Target_Server`
+(brand id) + `Target_Server_Version` (engine major) - and the config's DBMS is in the admin DB
+(ConfigContextService.DbmsLabel). Compare THOSE. Removed the status-bar path entirely
+(ReadDbmsFromErwinStatusBar + LooksLikeDbmsLabel deleted); ReadActivePuTargetServer is now
+PropertyBag-only, composed via the unit-tested DbmsLabelComposer. CheckDbmsMismatch already fail-safes
+(either label blank -> NO mismatch), so an unreadable model never closes. General rule: never derive a
+correctness-critical fact by scraping another app's window text/titles/status bars when the underlying
+structured data is available from its API. Relates to reference_uithread_getwindowtext_hang +
+the 2026-06-23 "positive confirmation before destructive action" lesson.
+
+## 2026-06-23: A shared MetaShared interface member that the admin added breaks the add-in build until AddInPropertyMetadataService implements it - and never trust an Explore agent's claimed enum/struct values; read the live code
+
+**Rule:** When the build fails with `CS0535 '<addin class>' does not implement interface member 'IPropertyMetadataService.<X>'`, do NOT assume your edit caused it. `IPropertyMetadataService` lives in the referenced `..\erwin-admin\MetaShared\MetaShared.csproj` (ProjectReference). The admin team adds members there (e.g. `List<ObjectRelation> GetRelations(int fromObjectTypeId)` for MC_OBJECT_RELATION); the add-in's `Services/AddInPropertyMetadataService.cs` then fails to compile until it implements them. Implement the member in the ADD-IN class (allowed - it is the add-in's impl), never edit MetaShared (admin-owned). Second rule: an Explore/agent summary can FABRICATE concrete values - one claimed `NamingRuleKind.Prefix = 45, Suffix = 47, ...`; the real enum has plain implicit values (0,1,2,...). Always open the live source before relying on an exact value/signature.
+
+**Why:** MetaShared is the shared contract assembly between erwin-admin and erwin-addin. The Template naming feature was added on BOTH sides: admin added the `ObjectRelation` EF entity + `GetRelations` interface method + DbSet, so the moment the add-in references the updated MetaShared, its `IPropertyMetadataService` implementation is incomplete. This looks like "I broke the build" but is really "the contract grew." The enum-value hallucination wasted no time only because I verified against the file; relying on it would have produced a wrong/confusing enum edit.
+
+**How to apply:** On an unexpected interface-not-implemented error, `grep -rn "interface I<Name>"` - if it is not in this repo, it is in MetaShared; read it, implement the missing member in the add-in impl class consistent with the sibling methods (EF via `CreateContext()` + `Include`/`OrderBy`). For runtime hot-path reads of an MC_* table, mirror `NamingStandardService` (cached raw-ADO via `DatabaseService` + `SqlDialect`, NOT EF) to avoid the EF cold-start; the EF interface method is the admin-parity/contract read. Reuse existing predicates by widening visibility (`NamingValidationEngine.IsRuleApplicable` made public) instead of reimplementing condition/ApplyOn logic.
+
+## 2026-06-23: "Template" naming rule type is a value GENERATOR, wired into the per-column lifecycle hook (not a model walk), no-fallback on token resolution
+
+**Rule:** The new `RULE_TYPE='Template'` is unlike Prefix/Suffix/Length/Regexp/Required: it does not validate a name, it RENDERS a target property's value from `VALUE_TEMPLATE` (tokens `{PropertyCode}` = same object, `{Alias.PropertyCode}` = related object via `MC_OBJECT_RELATION`) and writes it. It runs from `ValidationCoordinatorService.CheckEntityForChanges` per column (create moment = placeholder->real commit, or update), gated by the SAME `MatchesApplyOn` + `IsRuleApplicable` predicates, NEVER a full-model walk. `TEMPLATE_FILL_MODE` Always vs OnlyIfEmpty; AUTO_APPLY=true silent / false Yes-No confirm (mirrors naming). NO-FALLBACK: any unresolvable token (`NamingTemplateEngine.Render` throws `TemplateResolutionException`) skips the write and logs `ERROR_MESSAGE` - a half-rendered value never reaches the model. Idempotent: skip when rendered == current.
+
+**Why:** Template generation could be (mis)read from the admin spec's "iterate all objects of the type" as a bulk model pass; that would violate the project's no-full-walk + rules-apply-to-new/changed-only invariants and could overwrite the whole model. The lifecycle hook already has the owning entity in scope, so `{Table.Physical_Name}` resolves with no reverse lookup. v1 ships COLUMN.Definition (example 1); TABLE.PrimaryKey is deferred because identifying WHICH `Key_Group` is the PK needs a live SCAPI discriminator probe (writing `kg.Properties("Name")` is proven, selecting the PK among an entity's key groups is not).
+
+**How to apply:** Pure grammar/fill-mode logic is in `Services/NamingTemplateEngine.cs` (unit-tested, SCAPI-free); the global alias catalog is `Services/ObjectRelationCatalog.cs` (cached raw-ADO, reloaded next to naming standards only when a Template rule exists). To extend to TABLE.PrimaryKey or other object types, add a "target writer / relation navigator" adapter; the engine + catalog are generic. Do not route Template through the name-validation path - `EvaluateRule` has a deliberate `case Template: break;` no-op so it never emits a false violation.
+
+## 2026-06-24: Model-name naming rules never fired on a Model Explorer inline rename - the model validator existed but was wired ONLY to the Model Editor dialog-close edge
+
+**Rule:** When "validation works in the editor but not in Model Explorer" is reported for an object type, check WHICH lifecycle edge the validator is wired to. The model validator `ValidateModelOnEditorClose` (validates MODEL.Name regex/prefix/required + MODEL.Definition required, writes Required fields via RequiredFieldDialog with a regex re-prompt loop) was only triggered on the "Model 'X' Editor" DIALOG open->close transition. A Model Explorer inline label rename of the MODEL node never opens that dialog, so no model check fired - the exact model-level analog of the earlier column-add-via-Model-Explorer bug. Fix: a `ScanForModelRenameEventDriven` that runs on the SAME inline-edit-close edge (`_wasInlineEditOpen && !inlineEditOpen`) that already commits entity/column/view inline renames, comparing `root.Name` to an instance-field baseline `_modelNameSnapshot` and calling the existing validator on a change.
+
+**Why:** erwin's in-place inline editor is one object-type-agnostic Win32 "Edit" control (`Win32Helper.IsInlineEditActive`), so the inline-edit-close edge is the canonical commit point for ALL Model-Explorer-originated renames (table, column, view, AND the model node). It provably does NOT fire on an MDI tab switch (a tab switch focuses an MDI child, never an "Edit" control), so reusing that edge sidesteps the rename-vs-switch ambiguity that a window-title or heartbeat approach has (a model rename ALSO changes the window title, so `CheckForModelChanges` can't distinguish them). A fresh `ValidationCoordinatorService` is created on every connect (`ModelConfigForm.InitializeModelServices`), so the instance-field snapshot is always for the current model - no cross-model staleness, no ObjectId keying needed.
+
+**How to apply:** For a new top-level object's rename validation, hook the inline-edit-close edge alongside `ScanForRenamesEventDriven`/`CommitPendingViews`, baseline the name in `StartMonitoring` (before the timers start), guard with `_sessionLost || _disposed || _validationSuspended || _columnNamingCheckInProgress` (the modal pumps the loop and re-fires timers; the validator sets `_columnNamingCheckInProgress` before any dialog so both timers bail), and advance the baseline BEFORE validating then refresh it AFTER (the validator may write a corrected name). Evidence to confirm such a gap: the rule dump shows `[Regexp] MODEL.Name` etc. loaded, but `NamingValidate:` log lines appear only for Column/Table/View, never Model. Note (UX): the validator checks ALL model properties, so a name-only rename also surfaces a Required Definition dialog if Definition is empty (rare - Definition is validated at connect); consistent with the editor-close path.
+
+## 2026-06-24: A "Revert Change" cancel on a generic editor-close validator does nothing unless it is given the prior value to revert to
+
+**Rule:** `ValidateModelOnEditorClose` (and validators written for an "editor close" event) prompt for a Required/violating value but, on Cancel/"Revert Change", historically just logged "left as-is" and broke - they have NO concept of a prior value, so the rule-violating text the user typed stays. When such a validator is reused on a RENAME edge, the caller must pass the pre-rename value so the cancel branch can write it back. Fix: `ValidateModelOnEditorClose(string nameRevertValue, bool nameOnly)` - on `isNameCode && nameRevertValue != null` cancel, write `nameRevertValue` back in a `BeginNamedTransaction` (mirror the forward-write: `try root.Properties(writeAccessor).Value = x; catch root.Name = x;`); `ScanForModelRenameEventDriven` passes `oldName = _modelNameSnapshot` (captured BEFORE advancing the snapshot) and `nameOnly: true`. The no-arg editor-close caller keeps the old "left as-is" behavior via the `null` default.
+
+**Why:** This is the SAME bug class as the column "Revert Change doesn't undo the add" (2026-06-23): a revert/cancel path that does not actually restore prior state. The user hit it on the model the moment the rename validator started firing. `nameOnly` also resolves the earlier reviewer NIT-4 (a name-only rename should not drag in a Required Definition prompt). Snapshot bookkeeping is advance-before-validate / refresh-after so neither a revert nor a successful re-prompt fill re-fires the scan (root.Name == snapshot next tick).
+
+**How to apply:** When wiring an existing validate-on-close routine onto a rename/edit edge, audit its Cancel branch first - "revert" almost always needs the old value threaded in. Reverting to a still-invalid prior value settles (does not loop) because the cancel branch breaks without re-validating and the snapshot is refreshed to the reverted name. NOTE: the Model-Editor-DIALOG-close path still leaves an invalid name as-is on cancel (no prior value tracked there) - extend it only if a user hits that path.
+
+## 2026-06-24: "Revert" on a Required violation = uniform rule across ALL object types - and a current request can contradict the user's own prior rule (surface it, do not silently override)
+
+**Rule:** The behaviour of clicking "Revert Change" on a Required naming-rule dialog must be identical for MODEL / TABLE / VIEW / COLUMN: (a) revert restores the value; (b) reverting STOPS the cross-property dialog chain (a valid revert does not then pop the next property's dialog); (c) on an EXISTING object, if the reverted value is STILL invalid (e.g. empty Required baseline) the SAME dialog re-opens until valid - the user cannot escape a Required violation by reverting (the 2026-05-24 rule); (d) a NEW object escapes via Discard (delete). TABLE/VIEW already had (c) via `RevalidatePropertyAfterRevert` + a re-prompt loop; MODEL and COLUMN only had (a)+(b) and let the user escape. Applied (c) to MODEL (`ValidateModelOnEditorClose`: cancel -> revert -> re-validate -> `currentFail=fresh; continue` if invalid, else `return`) and COLUMN (`ValidateColumnNamingStandardCore`: wrapped the first dialog in a `while`, SITE 1; and made the OK-path re-prompt `while` SITE 2 re-validate-then-reprompt). Mirror the reference's safeguards: re-validation in a try/catch that treats a fault as valid (no infinite trap), and record the session dismissal on the revert-to-VALID path (parity - missing it on one site was a real divergence caught in review).
+
+**Why:** The user asked to "apply this logic to all rules", and when I surfaced the two consistent directions (force-valid everywhere vs allow-escape everywhere), I discovered their CURRENT lean (revert -> stop+leave) directly contradicted their OWN documented 2026-05-24 rule (force valid, no escape via invalid-baseline revert; the comment at TableTypeMonitorService.cs ~2822-2832). Per "challenge proposals / question what the user says", I did NOT silently override the prior rule - I quoted it back and asked which way to unify. The user chose KEEP-2026-05-24-everywhere. Silently applying the first lean would have reversed a deliberate enforcement they wanted.
+
+**How to apply:** When a "make it consistent everywhere" request touches a behaviour that already exists asymmetrically, find WHY the asymmetry exists (often a prior explicit rule documented in a comment) before unifying - the consistent answer might be the opposite of the user's first instinct. COLUMN's required-field loop has TWO cancel sites (first dialog + OK-path re-prompt while); both need the force-fix and must stay mutually exclusive (gated by the OK-vs-cancel `rc` check). New objects must keep escaping via Discard - only existing objects are trapped until valid. Note (intended UX, consistent with TABLE): an existing column's empty Required Schema_Ref/Owner is non-dismissable-by-revert - it loops to the Owner picker.
