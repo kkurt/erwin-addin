@@ -327,7 +327,11 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// is matched case-insensitively (single-value CSV = back-compat
         /// path; empty CSV with a source set = "any non-empty value matches").
         /// </summary>
-        private static bool IsRuleApplicable(NamingStandardRule rule, string objectType, dynamic scapiObject)
+        // Public so the Template runtime applier
+        // (ValidationCoordinatorService.ApplyColumnTemplateRules) reuses the
+        // exact same DEPENDS_ON condition evaluation as the validate-only path,
+        // rather than reimplementing it.
+        public static bool IsRuleApplicable(NamingStandardRule rule, string objectType, dynamic scapiObject)
         {
             bool hasUdpSource = rule.DependsOnUdpId.HasValue && !string.IsNullOrEmpty(rule.DependsOnUdpName);
             bool hasPropSource = rule.DependsOnPropertyDefId.HasValue && !string.IsNullOrEmpty(rule.DependsOnPropertyCode);
@@ -580,6 +584,17 @@ namespace EliteSoft.Erwin.AddIn.Services
                         System.Diagnostics.Debug.WriteLine(
                             $"NamingValidation: Invalid regex rule#{rule.Id} '{rule.RegexpPattern}': {ex.Message}");
                     }
+                    break;
+
+                case NamingRuleKind.Template:
+                    // Template is a GENERATOR, not a validator: it produces a
+                    // target property value and writes it via its own runtime
+                    // applier (ValidationCoordinatorService.ApplyColumnTemplateRules).
+                    // It must never emit a name/value violation here, so the
+                    // validate-only path treats it as a no-op. This case exists
+                    // so a Template rule that lands here (e.g. via the Step 3b
+                    // per-property sweep) is silently ignored instead of hitting
+                    // the unknown-kind warning below.
                     break;
 
                 default:

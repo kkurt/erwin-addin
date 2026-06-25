@@ -39,6 +39,7 @@ namespace EliteSoft.Erwin.AddIn
             this.tabValidation = new System.Windows.Forms.TabPage();
             this.tabTableProcesses = new System.Windows.Forms.TabPage();
             this.tabDdlGeneration = new System.Windows.Forms.TabPage();
+            this.tabIntegrate = new System.Windows.Forms.TabPage();
 
             // Model tab
             this.grpModel = new System.Windows.Forms.GroupBox();
@@ -660,6 +661,18 @@ namespace EliteSoft.Erwin.AddIn
             this.Text = "Elite Soft Erwin Model Configurator";
             this.Load += new System.EventHandler(this.ModelConfigForm_Load);
 
+            // ================================================================
+            // TAB: INTEGRATE (environment promotion)
+            // Shell only - deliberately NOT added to tabControl here. The tab is
+            // shown at runtime solely for configs with INTEGRATE_ENABLED (via
+            // SetIntegrateTabVisible) and its body is built by RebuildIntegrateTab,
+            // so it never flashes for models that do not have it enabled.
+            // ================================================================
+            this.tabIntegrate.Name = "tabIntegrate";
+            this.tabIntegrate.Text = "Integrate";
+            this.tabIntegrate.Padding = new System.Windows.Forms.Padding(12);
+            this.tabIntegrate.UseVisualStyleBackColor = true;
+
             this.tabControl.ResumeLayout(false);
             this.tabGeneral.ResumeLayout(false);
             this.tabValidation.ResumeLayout(false);
@@ -678,6 +691,7 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.TabPage tabGeneral;
         private System.Windows.Forms.TabPage tabValidation;
         private System.Windows.Forms.TabPage tabDdlGeneration;
+        private System.Windows.Forms.TabPage tabIntegrate;
         private System.Windows.Forms.Label lblOpenedModel;
         private System.Windows.Forms.Button btnMartReview;
         private System.Windows.Forms.Button btnAlterWizardProd;

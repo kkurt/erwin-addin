@@ -494,6 +494,13 @@ namespace EliteSoft.Erwin.AddIn
                 // a stale value that confuses the reconnect timer's diff.
                 _lastConnectedLocator = null;
                 UpdateConnectionStatus(StatusConnecting, Color.Gray);
+
+                // Every connect starts with the Integrate tab hidden; only the
+                // config-driven success path re-shows it (when the resolved
+                // config has INTEGRATE_ENABLED). This single reset covers the
+                // mismatch / config-less / not-enabled exits uniformly.
+                SetIntegrateTabVisible(false);
+
                 Application.DoEvents();
 
                 _currentModel = _openModels[modelIndex];
@@ -1659,7 +1666,19 @@ namespace EliteSoft.Erwin.AddIn
                 // (possible unsaved work). It stays in degraded mode instead - only
                 // a fresh CONNECT to a config-less Mart model closes it.
                 bool isMartBound = !string.IsNullOrEmpty(ConfigContextService.ParseMartPath(locator));
-                if (isMartBound && closeConfigLessMartModel)
+                // Only a model whose mart path RESOLVED against a reachable DB but has
+                // no MODEL_CONFIG_MAPPING row is genuinely config-less: ConfigContext
+                // sets LastErrorPath to that path on that branch only. A DB-ACCESS
+                // failure - the config DB password could not be decrypted on this
+                // account/profile (DPAPI "Key not valid for use in specified state"),
+                // or the DB was unreachable - leaves LastErrorPath empty: we do NOT
+                // know whether a mapping exists, so closing the user's model would be
+                // wrong. (Regression 2026-06-23: a transient crypto blip closed a
+                // perfectly mapped model and killed validation for the whole session,
+                // while the same model worked on accounts where DPAPI decrypted.)
+                bool resolvedButUnmapped = !string.IsNullOrEmpty(contextPath);
+                bool dbAccessError = isMartBound && !resolvedButUnmapped;
+                if (isMartBound && resolvedButUnmapped && closeConfigLessMartModel)
                 {
                     Log("Config not resolved for a Mart-bound model (no CONFIG mapping) - warning + closing.");
                     UpdateStatus("No CONFIG mapping - closing model.", Color.Red);
@@ -1687,9 +1706,17 @@ namespace EliteSoft.Erwin.AddIn
                 // non-validation surfaces (General tab, log link, version compare
                 // for OTHER models) - and, on reload, so the user's open model is
                 // never yanked from under them.
-                Log($"Config not resolved - degraded mode (kept open). isMartBound={isMartBound}, fromReload={!closeConfigLessMartModel}.");
-                UpdateStatus("Connected (no config: add-in controls disabled).", Color.Red);
-                lblDDLStatus.Text = "Disabled until a Mart-bound model with CONFIG mapping is loaded.";
+                Log($"Config not resolved - degraded mode (kept open). isMartBound={isMartBound}, fromReload={!closeConfigLessMartModel}, dbAccessError={dbAccessError}.");
+                if (dbAccessError)
+                {
+                    UpdateStatus("Connected (configuration database unreachable - validation disabled).", Color.Red);
+                    lblDDLStatus.Text = "Cannot reach the configuration database - reopen the model or contact your administrator.";
+                }
+                else
+                {
+                    UpdateStatus("Connected (no config: add-in controls disabled).", Color.Red);
+                    lblDDLStatus.Text = "Disabled until a Mart-bound model with CONFIG mapping is loaded.";
+                }
                 lblDDLStatus.ForeColor = Color.Red;
                 using (AddinLogger.BeginScope("UpdateGeneralTab(degraded)"))
                     UpdateGeneralTab();
@@ -1700,8 +1727,20 @@ namespace EliteSoft.Erwin.AddIn
                 {
                     BeginInvoke(new Action(() =>
                     {
-                        try { ShowConfigWarningDialog(reason, contextPath); }
-                        catch (Exception ex) { Log($"ShowConfigWarningDialog (deferred) failed: {ex.Message}"); }
+                        try
+                        {
+                            if (dbAccessError)
+                                AddinMessageDialog.Show(
+                                    this,
+                                    "The add-in could not read its configuration database, so model validation is disabled for this session.\n\n" +
+                                    "This is usually a transient connection or credentials problem on this machine or account. Please reopen the model; if it keeps happening, contact your administrator.\n\n" +
+                                    $"Details: {reason}",
+                                    "Configuration database unavailable",
+                                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                            else
+                                ShowConfigWarningDialog(reason, contextPath);
+                        }
+                        catch (Exception ex) { Log($"Config warning (deferred) failed: {ex.Message}"); }
                     }));
                 }
                 catch (Exception ex) { Log($"BeginInvoke for config warning failed: {ex.Message}"); }
@@ -1916,6 +1955,12 @@ namespace EliteSoft.Erwin.AddIn
                 UpdateGeneralTab();
             using (AddinLogger.BeginScope("PopulateVersionCombos"))
                 PopulateVersionCombos();
+
+            // Config-driven success path: this is reached only with a resolved,
+            // DBMS-matched config, so it is the one place the Integrate tab may
+            // appear (gated again on INTEGRATE_ENABLED inside RefreshIntegrateTab).
+            using (AddinLogger.BeginScope("RefreshIntegrateTab"))
+                RefreshIntegrateTab();
 
             // Save baseline DDL at connect time (FEModel_DDL does NOT corrupt PU)
             // Baseline DDL removed - DdlHelper fetches any version from Mart on demand
@@ -4194,10 +4239,30 @@ namespace EliteSoft.Erwin.AddIn
                             NamingRuleKind.Length => $"len {(string.IsNullOrEmpty(rule.LengthOperator) ? "?" : rule.LengthOperator)} {rule.LengthValue?.ToString() ?? "?"}",
                             NamingRuleKind.Regexp => $"regex(len={(rule.RegexpPattern ?? "").Length})='{rule.RegexpPattern ?? ""}'",
                             NamingRuleKind.Required => "empty-check",
+                            NamingRuleKind.Template => $"template fill={rule.TemplateFillMode} auto={rule.AutoApply} value='{(rule.ValueTemplate ?? "").Replace("\r", " ").Replace("\n", " ")}'",
                             _ => "(unknown)",
                         };
                         Log($"  rule#{rule.Id} [{rule.RuleType}] {rule.ObjectType}.{rule.PropertyCode} " +
                             $"req={rule.IsRequired} apply={rule.ApplyOn} {typeParam} cond={udpCond} msg='{msg}'");
+                    }
+
+                    // Template rules navigate related objects via the global
+                    // MC_OBJECT_RELATION alias catalog. Refresh it alongside the
+                    // rules (only when a Template rule exists, to avoid a needless
+                    // query) so a corporate/DB switch picks up the right catalog.
+                    // Non-fatal: ObjectRelationCatalog lazy-loads on first use and
+                    // an unreadable catalog surfaces per-rule at apply time.
+                    if (service.AllRules.Any(r => r.RuleType == NamingRuleKind.Template))
+                    {
+                        try
+                        {
+                            ObjectRelationCatalog.Instance.Reload();
+                            Log("MC_OBJECT_RELATION catalog loaded for Template rules");
+                        }
+                        catch (Exception relEx)
+                        {
+                            Log($"MC_OBJECT_RELATION catalog not loaded: {relEx.Message}");
+                        }
                     }
                 }
                 else
@@ -6070,23 +6135,25 @@ namespace EliteSoft.Erwin.AddIn
         /// which is the INTERNAL engine major (SQL Server 15, Oracle 19), not
         /// the marketing label. <see cref="Services.DbmsLabelComposer"/> maps it
         /// to the label erwin itself shows - "Oracle 19c", "SQL Server 2019/2022"
-        /// (erwin groups the 2019+2022 engines into one release-pair target). We
-        /// still try to scrape erwin's status bar first via
-        /// <see cref="ReadDbmsFromErwinStatusBar"/> (it stays current with new
-        /// releases without code changes) and fall back to the composed label
-        /// when the scrape misses - which is the norm, because erwin's status
-        /// bar is an XTP custom-painted control GetWindowText cannot read.
+        /// (erwin groups the 2019+2022 engines into one release-pair target).
+        ///
+        /// This reads the model's OWN PropertyBag only. It deliberately does NOT
+        /// scrape erwin's status bar / window captions: that XTP custom-painted
+        /// text is usually unreadable, and on the one occasion a caption DID match
+        /// it grabbed the MDI title - a locator like
+        /// "Mart://.../Sql Server Models/FIBA-TEST" whose FOLDER NAME contains a
+        /// brand keyword - so the mismatch check compared the config DBMS against
+        /// the locator and wrongly closed a correctly-configured model
+        /// (2026-06-23). The model's brand ID + engine version is the reliable,
+        /// unambiguous source; the config side is the admin DB. We never compare
+        /// against window text.
         /// </summary>
         private string ReadActivePuTargetServer()
         {
-            // 1) Prefer erwin's own status bar text - it's the friendliest
-            //    label, matches what the user sees on screen, and stays
-            //    current with new DBMS releases without code changes.
-            string statusBar = ReadDbmsFromErwinStatusBar();
-            if (!string.IsNullOrWhiteSpace(statusBar)) return statusBar;
-
-            // 2) Fallback: read PropertyBag Target_Server brand ID + version
-            //    and compose a label from the documented brand-ID table.
+            // Read the model's DBMS from the model's OWN properties (PropertyBag
+            // Target_Server brand ID + Target_Server_Version engine major) and
+            // compose the label from the documented brand-ID table. No status-bar /
+            // window-caption scraping (see the remarks above for why it was removed).
             if (_currentModel == null) return null;
             try
             {
@@ -6177,89 +6244,6 @@ namespace EliteSoft.Erwin.AddIn
                 { 1075918979L, "Amazon Redshift" },
                 { 1075918980L, "AlloyDB for PostgreSQL" },
             };
-
-        /// <summary>
-        /// Scrapes erwin's bottom status bar for the part that looks like a
-        /// DBMS label ("Oracle 19c", "SQL Server 2019", ...). erwin's status
-        /// bar is an XTP custom control that does NOT necessarily expose the
-        /// standard <c>msctls_statusbar32</c> class - SB_GETTEXT against
-        /// other classes silently returns empty, which is why the previous
-        /// class-specific scrape missed the label entirely. We brute-force
-        /// enumerate every child window, log each candidate, and return the
-        /// first window text that matches a known DBMS family name. This is
-        /// the same string the user sees on screen and the safest fallback
-        /// when the SCAPI Target_Server enum maps to an id we have not yet
-        /// catalogued.
-        /// </summary>
-        private string ReadDbmsFromErwinStatusBar()
-        {
-            try
-            {
-                IntPtr erwin = Services.Win32Helper.GetErwinMainWindow();
-                if (erwin == IntPtr.Zero) { Log("ReadDbmsFromErwinStatusBar: no erwin main window"); return null; }
-
-                int probed = 0;
-                int matched = 0;
-                string hit = null;
-                var children = Services.Win32Helper.EnumAllChildWindows(erwin);
-                foreach (var c in children)
-                {
-                    probed++;
-                    if (string.IsNullOrWhiteSpace(c.Text)) continue;
-                    if (!LooksLikeDbmsLabel(c.Text)) continue;
-                    matched++;
-                    if (hit == null)
-                    {
-                        hit = c.Text.Trim();
-                        Log($"ReadDbmsFromErwinStatusBar: matched hWnd={c.Handle} class='{c.ClassName}' text='{hit}'");
-                    }
-                    else
-                    {
-                        // Multiple matches: log them too so we can audit later
-                        // if the wrong one wins (e.g. a transient dialog).
-                        Log($"ReadDbmsFromErwinStatusBar: additional candidate hWnd={c.Handle} class='{c.ClassName}' text='{c.Text.Trim()}' (ignored, first match kept)");
-                    }
-                }
-
-                if (hit == null)
-                {
-                    // Best-effort attempt against the legacy standard class as
-                    // a last resort; harmless if the class is not present.
-                    var bars = Services.Win32Helper.FindChildWindowsByClass(erwin, "msctls_statusbar32");
-                    foreach (var bar in bars)
-                    {
-                        for (int i = 0; i < 16; i++)
-                        {
-                            string text = Services.Win32Helper.GetStatusBarText(bar, i);
-                            if (!LooksLikeDbmsLabel(text)) continue;
-                            hit = text.Trim();
-                            Log($"ReadDbmsFromErwinStatusBar: msctls fallback matched part[{i}]='{hit}'");
-                            break;
-                        }
-                        if (hit != null) break;
-                    }
-                    if (hit == null)
-                        Log($"ReadDbmsFromErwinStatusBar: no match (probed={probed} children, matched={matched})");
-                }
-                return hit;
-            }
-            catch (Exception ex) { Log($"ReadDbmsFromErwinStatusBar threw: {ex.GetType().Name}: {ex.Message}"); }
-            return null;
-        }
-
-        private static bool LooksLikeDbmsLabel(string s)
-        {
-            if (string.IsNullOrWhiteSpace(s)) return false;
-            string lower = s.ToLowerInvariant();
-            return lower.Contains("oracle")
-                || lower.Contains("sql server")
-                || lower.Contains("postgres")
-                || lower.Contains("mysql")
-                || lower.Contains("db2")
-                || lower.Contains("teradata")
-                || lower.Contains("snowflake")
-                || lower.Contains("azure");
-        }
 
         private string ParseCompleteCompareHtml(string html)
         {
@@ -8020,6 +8004,269 @@ namespace EliteSoft.Erwin.AddIn
         /// <see cref="AddinLogger.LogDebug"/>'s Conditional attribute.
         /// </summary>
         private void LogDebug(string message) => AddinLogger.LogDebug(message);
+
+        #region Integrate tab (environment promotion)
+
+        // Current body of the Integrate tab; replaced wholesale on every rebuild
+        // (model switch / reconnect) so stale environment data never lingers.
+        private Panel _integrateContentPanel;
+
+        // Theme tokens mirrored from the General tab so the Integrate tab matches
+        // the rest of the add-in (accent blue, neutral text, error red).
+        private static readonly Color IntegrateAccent = Color.FromArgb(0, 102, 204);
+        private static readonly Color IntegrateTextSecondary = Color.FromArgb(120, 120, 120);
+        private static readonly Color IntegrateError = Color.FromArgb(204, 0, 0);
+
+        /// <summary>
+        /// True when the active model's config has the Integrate feature switched
+        /// on, resolved exactly like the admin side (CONFIG_PROPERTY -&gt;
+        /// CORPORATE_PROPERTY -&gt; false). Requires a resolved config on a
+        /// MART-HOSTED model: config-less / mismatch / local-file models never
+        /// qualify. The IsMartModel guard matters because a local .erwin can be
+        /// config-initialized (2026-06-13) with MartPath set to its file path,
+        /// whose parent folder could coincidentally match an environment name;
+        /// every other Mart-driven feature in this form guards the same way.
+        /// </summary>
+        private bool IsIntegrateEnabled()
+        {
+            var ctx = ConfigContextService.Instance;
+            if (!ctx.IsInitialized || !ctx.IsMartModel || ctx.ActiveConfigId <= 0) return false;
+            return ctx.GetEffectiveBool("INTEGRATE_ENABLED", false);
+        }
+
+        /// <summary>
+        /// Shows or hides the Integrate tab. WinForms TabPage has no usable
+        /// Visible, so a conditional tab is toggled by membership in
+        /// tabControl.TabPages. Appended last to preserve tab order; idempotent.
+        /// </summary>
+        private void SetIntegrateTabVisible(bool show)
+        {
+            if (tabControl == null || tabIntegrate == null) return;
+            bool present = tabControl.TabPages.Contains(tabIntegrate);
+            if (show && !present) tabControl.TabPages.Add(tabIntegrate);
+            else if (!show && present) tabControl.TabPages.Remove(tabIntegrate);
+        }
+
+        /// <summary>
+        /// Connect-time entry point: shows and (re)builds the Integrate tab only
+        /// for configs with INTEGRATE_ENABLED; otherwise leaves it hidden. A
+        /// failure to read the enabled flag is surfaced to the log and the tab
+        /// stays hidden rather than breaking the model connect.
+        /// </summary>
+        private void RefreshIntegrateTab()
+        {
+            bool enabled;
+            try
+            {
+                enabled = IsIntegrateEnabled();
+            }
+            catch (Exception ex)
+            {
+                Log($"Integrate: enabled-flag read failed, tab hidden: {ex.Message}");
+                SetIntegrateTabVisible(false);
+                return;
+            }
+
+            if (!enabled)
+            {
+                SetIntegrateTabVisible(false);
+                return;
+            }
+
+            SetIntegrateTabVisible(true);
+            RebuildIntegrateTab();
+        }
+
+        /// <summary>
+        /// Builds the Integrate tab body from the admin ENVIRONMENT /
+        /// ENVIRONMENT_RELATION contract for the active config and the model's
+        /// current environment (its Mart parent folder). States: not in a managed
+        /// environment / no promotions / a single static target / a target combo,
+        /// each with a per-target Integrate button or an approval notice. A
+        /// MetaRepo read failure is rendered in the tab, never swallowed.
+        /// </summary>
+        private void RebuildIntegrateTab()
+        {
+            // Replace any previous body (a model switch / reconnect rebuilds this).
+            if (_integrateContentPanel != null)
+            {
+                tabIntegrate.Controls.Remove(_integrateContentPanel);
+                _integrateContentPanel.Dispose();
+                _integrateContentPanel = null;
+            }
+
+            var content = new Panel { Dock = DockStyle.Fill, BackColor = Color.White };
+            _integrateContentPanel = content;
+            tabIntegrate.Controls.Add(content);
+
+            var lblTitle = new Label
+            {
+                Text = "Integrate",
+                Font = new Font("Segoe UI", 16f, FontStyle.Bold),
+                ForeColor = IntegrateAccent,
+                AutoSize = true,
+                Location = new Point(12, 12)
+            };
+            content.Controls.Add(lblTitle);
+
+            var lblSubtitle = new Label
+            {
+                Text = "Promote this model between deployment environments.",
+                Font = new Font("Segoe UI", 9f),
+                ForeColor = IntegrateTextSecondary,
+                AutoSize = true,
+                Location = new Point(14, 44)
+            };
+            content.Controls.Add(lblSubtitle);
+
+            content.Controls.Add(new Panel
+            {
+                Location = new Point(14, 66),
+                Size = new Size(60, 3),
+                BackColor = IntegrateAccent
+            });
+
+            const int bodyTop = 96;
+
+            IReadOnlyList<IntegrationEnvironment> environments;
+            IntegrationEnvironment current;
+            try
+            {
+                var ctx = ConfigContextService.Instance;
+                environments = IntegrationEnvironmentService.GetEnvironments(ctx.ActiveConfigId);
+                current = IntegrationPlanner.ResolveCurrentEnvironment(ctx.MartPath, environments);
+            }
+            catch (Exception ex)
+            {
+                Log($"Integrate: failed to read environments: {ex.Message}");
+                content.Controls.Add(BuildIntegrateMessage(
+                    $"Could not read deployment environments from the repository:\n{ex.Message}",
+                    IntegrateError, bodyTop));
+                return;
+            }
+
+            if (current == null)
+            {
+                content.Controls.Add(BuildIntegrateMessage(
+                    "This model is not in a managed environment.", IntegrateTextSecondary, bodyTop));
+                return;
+            }
+
+            // Surface an admin data anomaly rather than resolving it silently:
+            // duplicate environment names within a config collapse to the same
+            // Mart folder and cannot be told apart from the path, so the lowest
+            // SORT_ORDER won the match above.
+            int sameNameCount = 0;
+            foreach (var e in environments)
+                if (string.Equals(e.Name, current.Name, StringComparison.OrdinalIgnoreCase)) sameNameCount++;
+            if (sameNameCount > 1)
+                Log($"Integrate: {sameNameCount} environments share the name '{current.Name}' in config " +
+                    $"{ConfigContextService.Instance.ActiveConfigId}; resolved to the lowest SORT_ORDER. " +
+                    $"Environment names should be unique per config.");
+
+            IReadOnlyList<IntegrationRelation> relations;
+            IReadOnlyList<PromotionTarget> targets;
+            try
+            {
+                var ctx = ConfigContextService.Instance;
+                relations = IntegrationEnvironmentService.GetRelations(ctx.ActiveConfigId);
+                targets = IntegrationPlanner.BuildTargets(current.Id, relations, environments);
+            }
+            catch (Exception ex)
+            {
+                Log($"Integrate: failed to read promotion transitions: {ex.Message}");
+                content.Controls.Add(BuildIntegrateMessage(
+                    $"Could not read promotion transitions from the repository:\n{ex.Message}",
+                    IntegrateError, bodyTop));
+                return;
+            }
+
+            // Full topology diagram (mirrors the admin Integrate screen): every
+            // environment + transition, the current environment highlighted, a
+            // promote button on each allowed (non-approval) transition out of it.
+            // Hosted on an auto-scroll surface so wide / deep pipelines stay reachable.
+            content.AutoScroll = true;
+            var diagram = new EnvironmentPipelineDiagram { Location = new Point(14, bodyTop) };
+            diagram.IntegrateRequested += target => OnIntegrateClicked(current, target);
+            diagram.SetData(environments, relations, current.Id);
+            content.Controls.Add(diagram);
+
+            int legendTop = bodyTop + diagram.Height + 12;
+            var legend = new Label
+            {
+                Text = "▶  Promote        ⚠  Requires approval",
+                Font = new Font("Segoe UI", 8.5f),
+                ForeColor = IntegrateTextSecondary,
+                AutoSize = true,
+                Location = new Point(16, legendTop)
+            };
+            content.Controls.Add(legend);
+
+            int actionable = 0;
+            foreach (var t in targets) if (!t.RequiresApproval) actionable++;
+
+            string hintText = "";
+            if (targets.Count == 0) hintText = $"No promotions available from {current.Name}.";
+            else if (actionable == 0) hintText = $"All promotions from {current.Name} require approval.";
+
+            Label hint = null;
+            if (hintText.Length > 0)
+            {
+                hint = new Label
+                {
+                    Text = hintText,
+                    Font = new Font("Segoe UI", 9.5f),
+                    ForeColor = IntegrateTextSecondary,
+                    AutoSize = true,
+                    Location = new Point(16, legendTop + 22)
+                };
+                content.Controls.Add(hint);
+            }
+
+            // Center the diagram horizontally and keep the legend/hint aligned to
+            // its left edge, re-centering when the tab is resized. Falls back to
+            // left when the diagram is wider than the visible area so horizontal
+            // scrolling starts at the first environment.
+            void CenterIntegrateDiagram()
+            {
+                int avail = content.ClientSize.Width;
+                int x = diagram.Width < avail ? Math.Max(14, (avail - diagram.Width) / 2) : 14;
+                diagram.Left = x;
+                legend.Left = x + 2;
+                if (hint != null) hint.Left = x + 2;
+            }
+            CenterIntegrateDiagram();
+            content.SizeChanged += (s, e) => CenterIntegrateDiagram();
+        }
+
+        /// <summary>Builds a single-line informational/empty-state label for the tab body.</summary>
+        private Label BuildIntegrateMessage(string text, Color color, int top) => new Label
+        {
+            Text = text,
+            Font = new Font("Segoe UI", 10f),
+            ForeColor = color,
+            AutoSize = true,
+            MaximumSize = new Size(820, 0),
+            Location = new Point(14, top)
+        };
+
+        /// <summary>
+        /// Integrate button handler. SEAM: this iteration does NOT run the merge.
+        /// It reserves the call site (<see cref="Services.MartMartAutomation.PromoteViaMartMerge"/>),
+        /// logs, and tells the user the execution steps are pending. No destructive action.
+        /// </summary>
+        private void OnIntegrateClicked(IntegrationEnvironment current, IntegrationEnvironment target)
+        {
+            Services.MartMartAutomation.PromoteViaMartMerge(current.Name, target.Name, Log);
+            AddinMessageDialog.Show(
+                this,
+                $"Promotion of this model from {current.Name} to {target.Name} via Mart Merge will run here.\n\nThe execution steps are not implemented yet.",
+                "Integrate (steps pending)",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+        }
+
+        #endregion
 
         /// <summary>
         /// Parses the right-side Mart version number from the cmbRightModel

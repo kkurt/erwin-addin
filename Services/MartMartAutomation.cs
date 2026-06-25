@@ -355,6 +355,27 @@ namespace EliteSoft.Erwin.AddIn.Services
             return true;
         }
 
+        /// <summary>
+        /// Seam for the Integrate-tab promotion: this is where erwin's Mart &gt;
+        /// Merge will be driven to move the current-environment model onto the
+        /// selected target environment, reusing the same WM_COMMAND dispatch as
+        /// <see cref="PostMartReviewCommand"/>. The native Merge command-id
+        /// discovery and dialog automation are a later step; this iteration only
+        /// reserves the call site and logs, performing NO destructive action.
+        /// Returns false to signal the merge has not been executed yet.
+        /// </summary>
+        /// <param name="sourceEnvironment">Name of the environment the model is currently in.</param>
+        /// <param name="targetEnvironment">Name of the environment the model is being promoted to.</param>
+        /// <param name="log">Diagnostic sink.</param>
+        internal static bool PromoteViaMartMerge(string sourceEnvironment, string targetEnvironment, Action<string> log)
+        {
+            log?.Invoke(
+                $"Integrate: Merge will run here (steps pending). " +
+                $"Source environment '{sourceEnvironment}' -> target environment '{targetEnvironment}'. " +
+                $"No action taken this iteration.");
+            return false;
+        }
+
         // RD's toolbars are standard Win32 ToolbarWindow32 controls
         // (verified by RAS-DUMP). Existing TB_BUTTONCOUNT/TB_GETBUTTON +
         // TBBUTTON struct + SendMessageTbButton are defined further below in

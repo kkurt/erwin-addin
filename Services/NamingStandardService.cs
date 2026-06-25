@@ -61,6 +61,18 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <see cref="NamingRuleKind.Length"/> and run alongside.
         /// </summary>
         Required,
+
+        /// <summary>
+        /// GENERATOR (not a validator): renders a target property's value from
+        /// a template string and writes it via SCAPI. The template
+        /// (<see cref="NamingStandardRule.ValueTemplate"/>) reads properties of
+        /// the same object (<c>{PropertyCode}</c>) or a related object
+        /// (<c>{Alias.PropertyCode}</c> via <c>MC_OBJECT_RELATION</c>);
+        /// <see cref="NamingStandardRule.TemplateFillMode"/> decides Always vs
+        /// OnlyIfEmpty. Unlike the other kinds it does not flag a name
+        /// violation - it produces a value. Admin 2026-06-23.
+        /// </summary>
+        Template,
     }
 
     /// <summary>
@@ -115,6 +127,22 @@ namespace EliteSoft.Erwin.AddIn.Services
         public bool IsActive { get; set; }
         public int SortOrder { get; set; }
         public int ConfigId { get; set; }
+
+        /// <summary>
+        /// VALUE_TEMPLATE: the template string for a
+        /// <see cref="NamingRuleKind.Template"/> rule. Tokens are
+        /// <c>{PropertyCode}</c> (same object) and <c>{Alias.PropertyCode}</c>
+        /// (related object via <c>MC_OBJECT_RELATION</c>); text outside tokens
+        /// is kept verbatim. Empty for non-Template rules.
+        /// </summary>
+        public string ValueTemplate { get; set; }
+
+        /// <summary>
+        /// TEMPLATE_FILL_MODE for a <see cref="NamingRuleKind.Template"/> rule:
+        /// "Always" (overwrite) or "OnlyIfEmpty" (write only when the target is
+        /// empty, never clobber a human value). Empty for non-Template rules.
+        /// </summary>
+        public string TemplateFillMode { get; set; }
 
         /// <summary>
         /// Context gate (2026-05-25 admin schema): "Create" fires only when
@@ -304,10 +332,14 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     // the regex compiler sees the pattern.
                                     RegexpPattern = reader["REGEXP_PATTERN"] == DBNull.Value ? "" : (reader["REGEXP_PATTERN"]?.ToString() ?? "").Trim(),
                                     ErrorMessage = reader["ERROR_MESSAGE"] == DBNull.Value ? "" : reader["ERROR_MESSAGE"]?.ToString() ?? "",
-                                    // AUTO_APPLY is only meaningful for Prefix/Suffix; admin
-                                    // stores 0 on other kinds, but defend against legacy or
-                                    // hand-edited rows by forcing it to false here too.
-                                    AutoApply = autoApplyRaw && (ruleKind == NamingRuleKind.Prefix || ruleKind == NamingRuleKind.Suffix),
+                                    // AUTO_APPLY is meaningful for Prefix/Suffix (silent
+                                    // name decoration) and for Template (silent value
+                                    // generation). Admin stores 0 on the validate-only
+                                    // kinds (Length/Regexp/Required); force false there too
+                                    // to defend against legacy or hand-edited rows.
+                                    AutoApply = autoApplyRaw && (ruleKind == NamingRuleKind.Prefix
+                                        || ruleKind == NamingRuleKind.Suffix
+                                        || ruleKind == NamingRuleKind.Template),
                                     IsActive = Convert.ToBoolean(reader["IS_ACTIVE"]),
                                     SortOrder = reader["SORT_ORDER"] == DBNull.Value ? 0 : Convert.ToInt32(reader["SORT_ORDER"]),
                                     ConfigId = Convert.ToInt32(reader["CONFIG_ID"]),
@@ -317,6 +349,11 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     DependsOnUdpName = reader["UDP_NAME"] == DBNull.Value ? "" : reader["UDP_NAME"]?.ToString()?.Trim() ?? "",
                                     DependsOnPropertyCode = reader["COND_PROPERTY_CODE"] == DBNull.Value ? "" : reader["COND_PROPERTY_CODE"]?.ToString()?.Trim() ?? "",
                                     ApplyOn = ParseApplyOn(reader["APPLY_ON"]),
+                                    // Template-only columns; empty for the other kinds.
+                                    // Not trimmed: a template may legitimately rely on
+                                    // leading/trailing spaces in the literal text.
+                                    ValueTemplate = reader["VALUE_TEMPLATE"] == DBNull.Value ? "" : reader["VALUE_TEMPLATE"]?.ToString() ?? "",
+                                    TemplateFillMode = reader["TEMPLATE_FILL_MODE"] == DBNull.Value ? "" : reader["TEMPLATE_FILL_MODE"]?.ToString()?.Trim() ?? "",
                                 };
 
                                 if (!rule.IsActive) continue;
@@ -400,6 +437,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                             ns.""REGEXP_PATTERN"", ns.""ERROR_MESSAGE"", ns.""AUTO_APPLY"", ns.""IS_ACTIVE"", ns.""SORT_ORDER"",
                             ns.""CONFIG_ID"", ns.""DEPENDS_ON_UDP_ID"", ns.""DEPENDS_ON_PROPERTY_DEF_ID"",
                             ns.""DEPENDS_ON_PROPERTY_VALUES"", ns.""APPLY_ON"",
+                            ns.""VALUE_TEMPLATE"", ns.""TEMPLATE_FILL_MODE"",
                             udp.""NAME"" AS ""UDP_NAME"",
                             cond_pd.""PROPERTY_CODE"" AS ""COND_PROPERTY_CODE""
                             FROM ""MC_NAMING_STANDARD"" ns
@@ -419,6 +457,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                             ns.REGEXP_PATTERN, ns.ERROR_MESSAGE, ns.AUTO_APPLY, ns.IS_ACTIVE, ns.SORT_ORDER,
                             ns.CONFIG_ID, ns.DEPENDS_ON_UDP_ID, ns.DEPENDS_ON_PROPERTY_DEF_ID,
                             ns.DEPENDS_ON_PROPERTY_VALUES, ns.APPLY_ON,
+                            ns.VALUE_TEMPLATE, ns.TEMPLATE_FILL_MODE,
                             udp.NAME AS UDP_NAME,
                             cond_pd.PROPERTY_CODE AS COND_PROPERTY_CODE
                             FROM MC_NAMING_STANDARD ns
@@ -439,6 +478,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                             ns.[REGEXP_PATTERN], ns.[ERROR_MESSAGE], ns.[AUTO_APPLY], ns.[IS_ACTIVE], ns.[SORT_ORDER],
                             ns.[CONFIG_ID], ns.[DEPENDS_ON_UDP_ID], ns.[DEPENDS_ON_PROPERTY_DEF_ID],
                             ns.[DEPENDS_ON_PROPERTY_VALUES], ns.[APPLY_ON],
+                            ns.[VALUE_TEMPLATE], ns.[TEMPLATE_FILL_MODE],
                             udp.[NAME] AS [UDP_NAME],
                             cond_pd.[PROPERTY_CODE] AS [COND_PROPERTY_CODE]
                             FROM [dbo].[MC_NAMING_STANDARD] ns
@@ -566,6 +606,29 @@ namespace EliteSoft.Erwin.AddIn.Services
                             && r.IsActive
                             && r.RuleType == NamingRuleKind.Required
                             && string.IsNullOrEmpty(r.PropertyCode))
+                .ToList();
+        }
+
+        /// <summary>
+        /// Active <see cref="NamingRuleKind.Template"/> rules for the given
+        /// object type (e.g. "Column"), ordered by SortOrder. A Template rule
+        /// must target a property (PropertyCode) and carry a non-empty
+        /// ValueTemplate; malformed rows missing either are skipped here so the
+        /// runtime applier never renders against nothing. The runtime applier
+        /// uses this instead of the per-property <c>_byKey</c> buckets because
+        /// it iterates Template rules by object type, not by target property.
+        /// </summary>
+        public IReadOnlyList<NamingStandardRule> GetTemplateRules(string objectType)
+        {
+            if (string.IsNullOrEmpty(objectType)) return new List<NamingStandardRule>();
+            return _allRules
+                .Where(r => r != null
+                            && r.IsActive
+                            && r.RuleType == NamingRuleKind.Template
+                            && string.Equals(r.ObjectType, objectType, StringComparison.OrdinalIgnoreCase)
+                            && !string.IsNullOrEmpty(r.PropertyCode)
+                            && !string.IsNullOrEmpty(r.ValueTemplate))
+                .OrderBy(r => r.SortOrder)
                 .ToList();
         }
 

@@ -54,6 +54,10 @@ namespace EliteSoft.Erwin.AddIn.Services
         // Nothing validated model-level rules on close before, so an empty
         // required model description was never flagged (2026-06-05).
         private bool _modelEditorWasOpen;
+        // Model name captured when the Model Editor dialog OPENED, used as the
+        // "Revert Change" target if the user renames the model to a rule-violating
+        // value inside the editor and reverts on close (2026-06-24).
+        private string _modelEditorOpenName;
         // _entityEditorUdpSnapshot field removed 2026-05-22 along with the
         // Table-UDP delta enforcement that was its only consumer.
         // Reentrancy guard. MessageBox.Show pumps the message loop while
@@ -403,6 +407,12 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         // Model change detection
         private string _lastKnownModelName;
+        // SCAPI model-object Name baseline, distinct from _lastKnownModelName
+        // (which tracks the window-title name for tab-switch detection). Used by
+        // ScanForModelRenameEventDriven to detect a Model Explorer inline rename
+        // of the MODEL node. A fresh ValidationCoordinatorService is created per
+        // connect, so this is always the current model (null until baselined).
+        private string _modelNameSnapshot;
         private int _modelCheckCounter;
         private const int ModelCheckEveryNTicks = 4; // Check every 2 seconds (4 * 500ms)
 
@@ -574,6 +584,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                 if (string.IsNullOrEmpty(_lastKnownModelName))
                     _lastKnownModelName = _session.ModelObjects.Root?.Name ?? "";
                 _modelCheckCounter = 0;
+                // Baseline the SCAPI model-object Name (raw, not the window-title
+                // form) for the inline-edit-close rename scan. A null here is fine:
+                // ScanForModelRenameEventDriven lazily baselines on first sight.
+                _modelNameSnapshot = _session.ModelObjects.Root?.Name ?? "";
             }
             catch { }
 
@@ -2973,28 +2987,48 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
 
                 // --- Model Editor ("Model 'X' Editor") close detection (2026-06-05).
-                // Model-level naming rules (e.g. rule#1028 MODEL.Definition req=True,
-                // rule#1027 MODEL.Name regex) had NO event-driven trigger - the only
+                // Model-level naming rules (e.g. MODEL.Definition req=True,
+                // MODEL.Name regex/prefix) had NO event-driven trigger - the only
                 // model validation was the on-demand Validation tab, and even that
                 // checked the name only. So closing the Model Editor with an empty
                 // required description never warned. Mirror the Column/Entity Editor
-                // close edge: on the open->closed transition run a READ-ONLY model
-                // validation and surface a warning popup. We deliberately do NOT
-                // write back to the model object (a model rename/definition write
-                // from the watchdog is riskier than column/table writes, and the
-                // Definition is a free-text paragraph better fixed in the editor),
-                // so this is warn-only.
+                // close edge: on the open->closed transition run model validation
+                // (ValidateModelOnEditorClose) - Required violations open a
+                // RequiredFieldDialog that WRITES the typed value back (with a regex
+                // re-prompt loop); other violations are warn-only popups. (The same
+                // validator is now also reached from ScanForModelRenameEventDriven
+                // on a Model Explorer inline rename.)
                 bool modelEditorIsOpen = IsModelEditorOpen();
                 if (_modelEditorWasOpen && !modelEditorIsOpen)
                 {
                     // Re-entrancy: flip state BEFORE the popup pumps the loop (same
                     // hazard documented on the Entity Editor branch above).
                     _modelEditorWasOpen = false;
-                    try { ValidateModelOnEditorClose(); }
+                    // Revert target = the model name captured when the editor opened
+                    // (its pre-edit value). A "Revert Change" on a rule-violating
+                    // rename done IN the editor now restores it, same as the inline
+                    // path. nameOnly stays false: the editor can also change
+                    // Definition etc., so all model properties are still validated;
+                    // only the NAME gets the revert.
+                    string editorOldName = _modelEditorOpenName;
+                    try { ValidateModelOnEditorClose(nameRevertValue: editorOldName, nameOnly: false); }
                     catch (Exception ex) { Log($"ValidateModelOnEditorClose err: {ex.Message}"); }
+                    // Keep the inline-rename baseline in sync with whatever the editor
+                    // (and the validation) left, so the inline scan does not then
+                    // see a phantom rename.
+                    try { _modelNameSnapshot = _session.ModelObjects.Root?.Name ?? _modelNameSnapshot; }
+                    catch { /* keep prior baseline */ }
+                    _modelEditorOpenName = null;
                 }
                 else
                 {
+                    // Editor OPEN transition: capture the current (pre-edit) model
+                    // name as the revert target for when it closes.
+                    if (!_modelEditorWasOpen && modelEditorIsOpen)
+                    {
+                        try { _modelEditorOpenName = _session.ModelObjects.Root?.Name ?? ""; }
+                        catch { _modelEditorOpenName = null; }
+                    }
                     _modelEditorWasOpen = modelEditorIsOpen;
                 }
 
@@ -3050,6 +3084,18 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // models the broad walk took several seconds.
                     try { ScanForLockedColumnRenames("inline-edit-close"); }
                     catch (Exception ex) { Log($"ScanForLockedColumnRenames (inline) err: {ex.Message}"); }
+
+                    // Model rename (2026-06-24): renaming the MODEL node in Model
+                    // Explorer commits on this same inline-edit close edge but never
+                    // opens the Model Editor dialog, so MODEL.Name / MODEL.Definition
+                    // rules were never enforced. Mirror the entity rename scan. The
+                    // Model Editor DIALOG does not trigger this inline edge (its
+                    // textbox is not the tree's in-place Edit) - it is handled by the
+                    // editor open/close block above; and even if it ever did, that
+                    // block already validated the model and refreshed _modelNameSnapshot
+                    // this same tick, so this scan finds no diff and self-suppresses.
+                    try { ScanForModelRenameEventDriven("inline-edit-close"); }
+                    catch (Exception ex) { Log($"ScanForModelRenameEventDriven (inline) err: {ex.Message}"); }
 
                     // View name-commit (2026-06-14): the SAME inline-edit close
                     // edge that commits a pending table name commits a pending
@@ -3157,6 +3203,60 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// Event-driven MODEL rename detection (2026-06-24). The model's naming
+        /// rules (MODEL.Name regex/prefix/required, MODEL.Definition required) were
+        /// only enforced when the "Model 'X' Editor" dialog closed
+        /// (<see cref="ValidateModelOnEditorClose"/>). Renaming the model via the
+        /// Model Explorer inline label edit never opens that dialog, so no model
+        /// naming check fired - the exact analog of the column-add-via-Model-Explorer
+        /// bug. This runs on the SAME inline-edit-close edge that commits entity /
+        /// column / view renames (so it does NOT fire on a tab switch): if the root
+        /// model object's Name changed since the baseline, run the model naming
+        /// validation and re-baseline.
+        /// </summary>
+        private void ScanForModelRenameEventDriven(string source)
+        {
+            // Same entry guards as the sibling ScanForRenamesEventDriven.
+            if (_sessionLost || _disposed || _validationSuspended) return;
+            // ValidateModelOnEditorClose opens modal dialogs; skip if a naming
+            // check (column or model) is already mid-flight to avoid re-entry.
+            if (_columnNamingCheckInProgress) return;
+            if (!IsModelStillOpen()) return;
+
+            dynamic root;
+            try { root = _session.ModelObjects?.Root; }
+            catch (Exception ex) { Log($"ScanForModelRenameEventDriven: cannot read model root: {ex.Message}"); return; }
+            if (root == null) return;
+
+            string currentName;
+            try { currentName = root.Name?.ToString() ?? ""; }
+            catch (Exception ex) { Log($"ScanForModelRenameEventDriven: cannot read model name: {ex.Message}"); return; }
+
+            // Lazy baseline backstop (StartMonitoring normally sets it at connect).
+            if (_modelNameSnapshot == null)
+            {
+                _modelNameSnapshot = currentName;
+                return;
+            }
+            if (string.Equals(currentName, _modelNameSnapshot, StringComparison.Ordinal))
+                return;
+
+            string oldName = _modelNameSnapshot;
+            Log($"[ModelName] Model renamed ({source}): '{oldName}' -> '{currentName}' - running model naming validation");
+            // Advance the baseline BEFORE validating so a reentrant tick during the
+            // modal does not re-fire; refresh it AFTER to whatever the validator
+            // left (a Required-field fill / regex re-prompt / "Revert Change" can
+            // change the name). nameOnly: only the name changed, so do not also
+            // nag about other model properties. nameRevertValue: on "Revert Change"
+            // restore the pre-rename name instead of keeping the invalid one.
+            _modelNameSnapshot = currentName;
+            try { ValidateModelOnEditorClose(nameRevertValue: oldName, nameOnly: true); }
+            catch (Exception ex) { Log($"ScanForModelRenameEventDriven: validation error: {ex.Message}"); }
+            try { _modelNameSnapshot = root.Name?.ToString() ?? currentName; }
+            catch { /* keep the tentative baseline */ }
+        }
+
+        /// <summary>
         /// Model-level naming ENFORCEMENT, fired when the Model Editor closes.
         /// Reads the model root object's rule-targeted properties (Name,
         /// Definition, ...) and, for every REQUIRED rule that is violated, opens
@@ -3170,7 +3270,16 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// Config FibaEmre_SQL MODEL rules (verified 2026-06-06): rule#1027 Name
         /// Regexp ^[A-Z_]+$ (req), rule#1028 Definition Required (req).
         /// </summary>
-        private void ValidateModelOnEditorClose()
+        /// <param name="nameRevertValue">When non-null and the user cancels
+        /// ("Revert Change") a violation on the model NAME, the name is written
+        /// back to this value. Both triggers supply it: the inline-rename scan
+        /// passes the pre-rename name; the Model-Editor-close path passes the name
+        /// captured when the editor opened. Pass null to keep the legacy "leave
+        /// as-is" on cancel.</param>
+        /// <param name="nameOnly">When true, only the model Name is validated
+        /// (used by the inline-rename scan: only the name changed, so other model
+        /// properties like a Required Definition are not dragged in).</param>
+        private void ValidateModelOnEditorClose(string nameRevertValue = null, bool nameOnly = false)
         {
             if (_validationSuspended || !NamingStandardService.Instance.IsLoaded) return;
             if (_columnNamingCheckInProgress) return; // a naming required-popup is already up
@@ -3210,6 +3319,12 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                 foreach (var code in NamingStandardService.Instance.GetPropertyCodes("Model"))
                 {
+                    bool isNameCode = string.Equals(code, "Name", StringComparison.OrdinalIgnoreCase)
+                                      || string.Equals(code, "Physical_Name", StringComparison.OrdinalIgnoreCase);
+                    // nameOnly (inline-rename scan): only the model name changed, so
+                    // do not drag in other model properties (e.g. a Required Definition).
+                    if (nameOnly && !isNameCode) continue;
+
                     string value = ReadVal(code);
                     var res = NamingValidationEngine.ValidateObjectName("Model", value, rootBoxed, code, isNew: false);
                     var fail = res?.FirstOrDefault(r => !r.IsValid);
@@ -3232,8 +3347,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // e.g. "Fiba_SQLEmred (Comment)" instead of raw "Model.Definition".
                     string fieldLabel = $"{modelName} ({NamingValidationEngine.FriendlyPropertyLabel(code)})";
                     string writeAccessor = NamingValidationEngine.WriteAccessorFor(code);
-                    bool isNameCode = string.Equals(code, "Name", StringComparison.OrdinalIgnoreCase)
-                                      || string.Equals(code, "Physical_Name", StringComparison.OrdinalIgnoreCase);
 
                     var currentFail = fail;
                     while (currentFail != null)
@@ -3251,8 +3364,52 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                         if (rc != DialogResult.OK || string.IsNullOrEmpty(typed))
                         {
-                            Log($"Model required field cancelled: {fieldLabel} (left as-is)");
-                            break;
+                            // "Revert Change" (Update mode) on the model NAME: restore
+                            // the pre-rename name instead of leaving the rule-violating
+                            // name the user just typed. Both triggers supply a revert
+                            // value (inline scan = pre-rename name; editor-close = the
+                            // name captured when the editor opened).
+                            if (isNameCode && !string.IsNullOrEmpty(nameRevertValue))
+                            {
+                                int rTx = _session.BeginNamedTransaction("RevertModelName");
+                                try
+                                {
+                                    try { root.Properties(writeAccessor).Value = nameRevertValue; }
+                                    catch { root.Name = nameRevertValue; }
+                                    _session.CommitTransaction(rTx);
+                                    Log($"Model name reverted: {fieldLabel} -> '{nameRevertValue}'");
+                                }
+                                catch (Exception ex)
+                                {
+                                    try { _session.RollbackTransaction(rTx); } catch (Exception rbEx) { Log($"RevertModelName rollback err: {rbEx.Message}"); }
+                                    Log($"Model name revert failed for {fieldLabel}: {ex.Message}");
+                                }
+                            }
+                            else
+                            {
+                                Log($"Model required field cancelled: {fieldLabel} (left as-is)");
+                            }
+                            // 2026-05-24 rule (force valid Required values, now applied
+                            // to MODEL too): if the reverted / left-as-is value STILL
+                            // violates, re-prompt the SAME property - the user cannot
+                            // escape a Required violation by clicking Revert. Only when
+                            // the value is now valid do we STOP the whole chain (so a
+                            // valid Name revert does not then pop the Definition dialog).
+                            string afterRevert = ReadVal(code);
+                            List<NamingValidationResult> revertRes;
+                            // Safeguard (mirror of RevalidatePropertyAfterRevert): a
+                            // re-validation fault treats the value as valid so it can
+                            // never trap the user in the re-prompt loop.
+                            try { revertRes = NamingValidationEngine.ValidateObjectName("Model", afterRevert, rootBoxed, code, isNew: false); }
+                            catch (Exception rvEx) { Log($"Model post-revert re-validation error for {fieldLabel}, treating as valid: {rvEx.Message}"); revertRes = null; }
+                            var revertStillFail = revertRes?.FirstOrDefault(r => !r.IsValid);
+                            if (revertStillFail != null)
+                            {
+                                Log($"Model required re-prompt after Cancel (post-revert still invalid): {fieldLabel}");
+                                currentFail = revertStillFail;
+                                continue;
+                            }
+                            return;
                         }
 
                         int transId = _session.BeginNamedTransaction("RequiredModelField");
@@ -3473,17 +3630,28 @@ namespace EliteSoft.Erwin.AddIn.Services
                                         snapshot.PhysicalDataType = previousState.PhysicalDataType;
 
                                     Log($"[PENDING-NAME] entity='{tableName}' attr id={aid} renamed to '{currentName}' during inline-edit - running rename validation");
-                                    ProcessAttributeChanges(attr, previousState, snapshot, predefined);
-                                    // A brand-new column just got its real name. ProcessAttributeChanges
-                                    // only checks the datatype whitelist on a type CHANGE with no name
-                                    // change, so a new column left at erwin's default type (e.g. char(18))
-                                    // slips through here (name changed, type did not). Enforce the whitelist
-                                    // now against the committed type so a disallowed default is caught at
-                                    // creation. prev=null -> forces an allowed type when the default is
-                                    // disallowed. (New-column path only - existing columns are never
-                                    // retroactively re-typed; see feedback_rules_new_objects_only.)
-                                    EnforceAllowedDatatypeWhitelist(attr, null, snapshot);
-                                    _attributeSnapshots[aid] = snapshot;
+                                    bool attrDiscarded = ProcessAttributeChanges(attr, previousState, snapshot, predefined);
+                                    if (!attrDiscarded)
+                                    {
+                                        // A brand-new column just got its real name. ProcessAttributeChanges
+                                        // only checks the datatype whitelist on a type CHANGE with no name
+                                        // change, so a new column left at erwin's default type (e.g. char(18))
+                                        // slips through here (name changed, type did not). Enforce the whitelist
+                                        // now against the committed type so a disallowed default is caught at
+                                        // creation. prev=null -> forces an allowed type when the default is
+                                        // disallowed. (New-column path only - existing columns are never
+                                        // retroactively re-typed; see feedback_rules_new_objects_only.)
+                                        EnforceAllowedDatatypeWhitelist(attr, null, snapshot);
+                                        _attributeSnapshots[aid] = snapshot;
+                                    }
+                                    else
+                                    {
+                                        // User discarded the pending-new column's mandatory field: the
+                                        // column was deleted inside ProcessAttributeChanges. Drop the stale
+                                        // snapshot it left and skip the whitelist on the dead COM object.
+                                        _attributeSnapshots.Remove(aid);
+                                        Log($"[REQUIRED-DISCARD] entity='{tableName}' attr id={aid} discarded via Required-field Cancel - removed");
+                                    }
                                 }
                                 else
                                 {
@@ -4509,6 +4677,16 @@ namespace EliteSoft.Erwin.AddIn.Services
                         var currentState = CreateSnapshot(attr, tableName, modelObjects);
                         bool isNew = !_attributeSnapshots.ContainsKey(objectId);
 
+                        // Template value-generation rules fire on the column's
+                        // "create moment" (a new column committed with a real
+                        // name, directly or via placeholder -> real rename) and
+                        // on update, gated per rule by APPLY_ON. Capture the
+                        // intent inside the branches below, then apply once after
+                        // the if/else (placeholder columns never fire - they wait
+                        // for their real name).
+                        bool fireTemplate = false;
+                        bool templateTreatAsNew = false;
+
                         if (isNew)
                         {
                             _attributeSnapshots[objectId] = currentState;
@@ -4518,6 +4696,16 @@ namespace EliteSoft.Erwin.AddIn.Services
                             // true, the attribute genuinely DID NOT exist at baseline time -
                             // it's user-added during the active edit session. Validate it.
                             ProcessNewAttribute(attr, currentState, predefinedColumnNames);
+
+                            // A brand-new column that already carries a real name
+                            // is a create moment for Template rules (no placeholder
+                            // phase). Placeholder columns fire later, on their
+                            // rename commit in the else branch.
+                            if (!IsPlaceholderColumnName(currentState.PhysicalName))
+                            {
+                                fireTemplate = true;
+                                templateTreatAsNew = true;
+                            }
 
                             // Phase-2E pending-name tracking. Model Explorer's "New Column"
                             // creates the attribute with name '<default>' as a distinct edit
@@ -4558,7 +4746,27 @@ namespace EliteSoft.Erwin.AddIn.Services
                             if (string.IsNullOrEmpty(currentState.PhysicalDataType))
                                 currentState.PhysicalDataType = previousState.PhysicalDataType;
 
-                            ProcessAttributeChanges(attr, previousState, currentState, predefinedColumnNames);
+                            bool attrDiscarded = ProcessAttributeChanges(attr, previousState, currentState, predefinedColumnNames);
+                            if (attrDiscarded)
+                            {
+                                // The user discarded a pending-new column's mandatory field
+                                // (Model Explorer add -> placeholder -> real name -> Required
+                                // Cancel): the column was deleted inside ProcessAttributeChanges
+                                // and no longer exists. Drop our tracking and skip every
+                                // remaining per-attribute step, all of which touch the dead COM
+                                // object.
+                                _attributeSnapshots.Remove(objectId);
+                                string discardOwnerId = null;
+                                try { discardOwnerId = entity.ObjectId?.ToString(); } catch { /* best effort */ }
+                                if (!string.IsNullOrEmpty(discardOwnerId) && _pendingNamedAttrs.TryGetValue(discardOwnerId, out var discardPend))
+                                {
+                                    if (discardPend.Remove(objectId) && discardPend.Count == 0)
+                                        _pendingNamedAttrs.Remove(discardOwnerId);
+                                }
+                                _pendingAttrAddedAt.Remove(objectId);
+                                Log($"[REQUIRED-DISCARD] entity='{tableName}' attr id={objectId} discarded via Required-field Cancel - removed, skipping post-work");
+                                continue;
+                            }
 
                             // New column committed via the heartbeat rename branch (placeholder ->
                             // real name): ProcessAttributeChanges skips the datatype whitelist on a
@@ -4569,6 +4777,16 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 EnforceAllowedDatatypeWhitelist(attr, null, currentState);
 
                             _attributeSnapshots[objectId] = currentState;
+
+                            // Template create/update moment: fire for any column
+                            // that now has a real name. treatAsNew is true only
+                            // when this tick committed the name (placeholder ->
+                            // real); otherwise it is an update.
+                            if (!IsPlaceholderColumnName(currentState.PhysicalName))
+                            {
+                                fireTemplate = true;
+                                templateTreatAsNew = IsPlaceholderColumnName(previousState.PhysicalName);
+                            }
 
                             // Pending cleanup: was the attr's name a placeholder and is
                             // it now resolved? Drop it from the watch list so we stop
@@ -4602,6 +4820,13 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                         // Check column-level UDP changes for dependency cascade
                         CheckAttributeUdpDependencies(attr, objectId, currentState.PhysicalName);
+
+                        // Template value-generation (writes a target property such
+                        // as Definition, NOT the column name). Runs last so the
+                        // column's name and type are settled. Gated per rule by
+                        // APPLY_ON + DEPENDS_ON; no-fallback render inside.
+                        if (fireTemplate)
+                            ApplyColumnTemplateRules(entity, attr, objectId, currentState.PhysicalName, templateTreatAsNew);
                     }
                 }
                 finally { ReleaseCom(entityAttrs); }
@@ -4613,6 +4838,172 @@ namespace EliteSoft.Erwin.AddIn.Services
             {
                 System.Diagnostics.Debug.WriteLine($"CheckEntityForChanges error: {ex.Message}");
             }
+        }
+
+        /// <summary>
+        /// Applies active Template naming rules for a column: renders the target
+        /// property value from the rule's template and writes it via SCAPI.
+        /// Gated per rule by APPLY_ON (<paramref name="treatAsNew"/>) and
+        /// DEPENDS_ON, reusing the exact predicates from the validate-only path.
+        /// NO-FALLBACK: any token that cannot resolve aborts that rule's write
+        /// and is logged with the rule's ERROR_MESSAGE - a half-rendered value
+        /// never reaches the model. Each rule writes in its own named
+        /// transaction; a write failure is logged and rolled back, not swallowed.
+        /// </summary>
+        /// <param name="entity">Owning Entity (parent table), in scope so a
+        /// <c>{Table.*}</c> token resolves without a reverse lookup.</param>
+        /// <param name="attr">The column (Attribute) SCAPI object.</param>
+        /// <param name="objectId">The column's stable ObjectId (diagnostics).</param>
+        /// <param name="columnName">The column's physical name (log/prompt).</param>
+        /// <param name="treatAsNew">True at the create moment, false on update;
+        /// fed to APPLY_ON gating.</param>
+        private void ApplyColumnTemplateRules(dynamic entity, dynamic attr, string objectId, string columnName, bool treatAsNew)
+        {
+            IReadOnlyList<NamingStandardRule> rules;
+            try
+            {
+                rules = NamingStandardService.Instance.GetTemplateRules("Column");
+            }
+            catch (Exception ex)
+            {
+                Log($"[TEMPLATE-ERROR] column='{columnName}': loading Template rules failed: {ex.Message}");
+                return;
+            }
+            if (rules == null || rules.Count == 0) return;
+
+            foreach (var rule in rules)
+            {
+                try
+                {
+                    // Same APPLY_ON (Create/Update/Both) and DEPENDS_ON gating as
+                    // the validate-only path.
+                    if (!NamingValidationEngine.MatchesApplyOn(rule, treatAsNew)) continue;
+                    if (!NamingValidationEngine.IsRuleApplicable(rule, "Column", attr)) continue;
+
+                    string targetCode = rule.PropertyCode;
+
+                    string rendered;
+                    try
+                    {
+                        rendered = NamingTemplateEngine.Render(
+                            rule.ValueTemplate,
+                            ownCode => ReadScapiProperty(attr, ownCode),
+                            (alias, code) => ResolveColumnRelatedProperty(entity, alias, code));
+                    }
+                    catch (TemplateResolutionException tex)
+                    {
+                        // No-fallback: token unresolved (own/related property
+                        // absent or empty, unknown alias, unsupported navigation).
+                        // Surface the rule's ERROR_MESSAGE (or a default) and skip
+                        // without writing.
+                        string msg = !string.IsNullOrWhiteSpace(rule.ErrorMessage)
+                            ? rule.ErrorMessage
+                            : $"could not resolve token '{{{tex.Token}}}'";
+                        Log($"[TEMPLATE-SKIP] column='{columnName}' rule#{rule.Id} target='{targetCode}': {msg}");
+                        continue;
+                    }
+
+                    // FILL_MODE: Always overwrites; OnlyIfEmpty keeps a human value.
+                    string currentVal = ReadScapiProperty(attr, targetCode);
+                    bool shouldWrite = NamingTemplateEngine.ShouldWrite(rule.TemplateFillMode, currentVal, out bool unknownMode);
+                    if (unknownMode)
+                    {
+                        Log($"[TEMPLATE-SKIP] column='{columnName}' rule#{rule.Id}: unknown TEMPLATE_FILL_MODE '{rule.TemplateFillMode}'");
+                        continue;
+                    }
+                    if (!shouldWrite) continue;
+
+                    // Idempotent: never dirty the model with a no-op write.
+                    if (string.Equals(currentVal, rendered, StringComparison.Ordinal)) continue;
+
+                    // AUTO_APPLY=false -> confirm (mirrors the naming Yes/No
+                    // prompt); =true -> silent. UI text is English; the admin
+                    // ERROR_MESSAGE (which may be Turkish) goes only to the log.
+                    if (!rule.AutoApply)
+                    {
+                        var answer = AddinMessageDialog.Show(
+                            $"Apply naming template to column '{columnName}'?\n\nSet {targetCode} to:\n{rendered}",
+                            "Apply Naming Template",
+                            MessageBoxButtons.YesNo,
+                            MessageBoxIcon.Question);
+                        if (answer != DialogResult.Yes) continue;
+                    }
+
+                    int transId = _session.BeginNamedTransaction("ApplyColumnTemplate");
+                    try
+                    {
+                        attr.Properties(targetCode).Value = rendered;
+                        _session.CommitTransaction(transId);
+                        Log($"[TEMPLATE-APPLY] column='{columnName}' rule#{rule.Id} {targetCode}='{rendered}'");
+                    }
+                    catch (Exception wex)
+                    {
+                        try { _session.RollbackTransaction(transId); }
+                        catch (Exception rex) { Log($"[TEMPLATE-ERROR] column='{columnName}' rule#{rule.Id}: rollback failed: {rex.Message}"); }
+                        Log($"[TEMPLATE-ERROR] column='{columnName}' rule#{rule.Id}: writing '{targetCode}' failed: {wex.Message}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Unknown-alias / DB / unexpected errors from rendering or
+                    // condition evaluation. Surface, never swallow; move on.
+                    Log($"[TEMPLATE-ERROR] column='{columnName}' rule#{rule.Id}: {ex.GetType().Name}: {ex.Message}");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Reads a built-in property value off a SCAPI object by PROPERTY_CODE.
+        /// Returns "" when the property is unset (erwin throws on sparse storage)
+        /// or absent; the Template renderer treats "" as an unresolved token
+        /// (no-fallback) and the FILL_MODE check treats "" as empty.
+        /// </summary>
+        private static string ReadScapiProperty(dynamic obj, string propertyCode)
+        {
+            if (obj == null || string.IsNullOrEmpty(propertyCode)) return "";
+            try
+            {
+                return obj.Properties(propertyCode)?.Value?.ToString() ?? "";
+            }
+            catch (Exception ex)
+            {
+                // Unset/absent property is normal (sparse storage); record at
+                // debug level only so OnlyIfEmpty reads do not spam the log.
+                System.Diagnostics.Debug.WriteLine($"ReadScapiProperty('{propertyCode}'): {ex.GetType().Name}: {ex.Message}");
+                return "";
+            }
+        }
+
+        /// <summary>
+        /// Resolves a <c>{Alias.PropertyCode}</c> token for a COLUMN: maps the
+        /// alias through the global <c>MC_OBJECT_RELATION</c> catalog, then
+        /// navigates to the related object and reads the property. v1 supports
+        /// COLUMN -> TABLE (the alias's TO type is "TABLE"), where the related
+        /// object is the parent entity already in scope. An unknown alias or an
+        /// unsupported navigation is a hard error (no write), never a silent skip.
+        /// </summary>
+        private string ResolveColumnRelatedProperty(dynamic entity, string alias, string propertyCode)
+        {
+            // ResolveAlias may load the catalog; a DB error propagates and is
+            // surfaced as a DB error by the caller's per-rule catch (not masked
+            // as "unknown alias").
+            string toType = ObjectRelationCatalog.Instance.ResolveAlias("Column", alias);
+            if (string.IsNullOrEmpty(toType))
+            {
+                throw new TemplateResolutionException(
+                    $"{alias}.{propertyCode}",
+                    $"alias '{alias}' is not defined in MC_OBJECT_RELATION for object type 'Column'");
+            }
+
+            if (string.Equals(toType, "TABLE", StringComparison.OrdinalIgnoreCase))
+            {
+                // Parent table is the owning entity, already in scope - no reverse walk.
+                return ReadScapiProperty(entity, propertyCode);
+            }
+
+            throw new TemplateResolutionException(
+                $"{alias}.{propertyCode}",
+                $"alias '{alias}' navigates Column -> {toType}, which has no runtime navigation in this version");
         }
 
         /// <summary>
@@ -5415,9 +5806,12 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
         }
 
-        private void ProcessAttributeChanges(dynamic attr, AttributeValidationSnapshot previousState, AttributeValidationSnapshot currentState, HashSet<string> predefinedColumnNames)
+        /// <returns>True when the attribute was DISCARDED (deleted) by a Required-field
+        /// Cancel on a pending-new column, so the caller must skip all post-work that
+        /// would touch the now-dead COM object.</returns>
+        private bool ProcessAttributeChanges(dynamic attr, AttributeValidationSnapshot previousState, AttributeValidationSnapshot currentState, HashSet<string> predefinedColumnNames)
         {
-            if (_validationSuspended) return;
+            if (_validationSuspended) return false;
             bool physicalNameChanged = previousState.PhysicalName != currentState.PhysicalName;
             bool domainChanged = previousState.DomainParentValue != currentState.DomainParentValue;
             bool hasValidDomain = IsValidDomain(currentState.DomainParentValue);
@@ -5431,7 +5825,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                                                   StringComparison.Ordinal);
 
             // No changes relevant to validation
-            if (!physicalNameChanged && !domainChanged && !dataTypeChanged) return;
+            if (!physicalNameChanged && !domainChanged && !dataTypeChanged) return false;
 
             // Locked predefined-column enforcement (2026-05-24).
             //
@@ -5449,11 +5843,11 @@ namespace EliteSoft.Erwin.AddIn.Services
             // is needed against the typed-but-rejected value.
             if (physicalNameChanged && EnforceLockedColumnRename(attr, previousState, currentState))
             {
-                return;
+                return false;
             }
             if (!physicalNameChanged && EnforceLockedColumnPropertyChange(attr, previousState, currentState))
             {
-                return;
+                return false;
             }
 
             _isProcessingChange = true;
@@ -5477,8 +5871,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // Re-apply Column UDP defaults with new column name (Glossary mapping resolves by name)
                     ApplyColumnUdpDefaults(attr, currentState.PhysicalName);
 
-                    // Validate Column naming standards
-                    ValidateColumnNamingStandard(attr, currentState);
+                    // Validate Column naming standards. If the user discards a pending-new
+                    // column's mandatory field, the column is deleted in here; stop
+                    // processing it so nothing downstream touches the now-dead COM object.
+                    if (ValidateColumnNamingStandard(attr, currentState)) return true;
                 }
 
                 // Domain changed (and new domain is valid) - need domain validation
@@ -5548,6 +5944,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                         }
                     }
                 }
+
+                return false;
             }
             finally
             {
@@ -5954,10 +6352,12 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// from <c>_attributeSnapshots</c> at method entry.
         /// </para>
         /// </summary>
-        private void ValidateColumnNamingStandard(dynamic attr, AttributeValidationSnapshot state, bool isNew = false)
+        /// <returns>True when the attribute was DISCARDED (deleted) by a Required-field
+        /// Cancel, so the caller must stop touching the now-dead COM object.</returns>
+        private bool ValidateColumnNamingStandard(dynamic attr, AttributeValidationSnapshot state, bool isNew = false)
         {
-            if (_validationSuspended) return;
-            if (!NamingStandardService.Instance.IsLoaded) return;
+            if (_validationSuspended) return false;
+            if (!NamingStandardService.Instance.IsLoaded) return false;
             // Reentrancy guard (2026-06-06): the Required-field popup in the core
             // method is MODAL and pumps the message loop, re-firing the monitor
             // timers. A reentrant tick that re-validates the same column before the
@@ -5966,19 +6366,20 @@ namespace EliteSoft.Erwin.AddIn.Services
             // guards on the Table path. (Exposed by the COLUMN.Definition Step-3b,
             // which made this path raise modals where Physical_Name validation
             // rarely did, so the latent loop became visible spam.)
-            if (_columnNamingCheckInProgress) return;
+            if (_columnNamingCheckInProgress) return false;
             _columnNamingCheckInProgress = true;
-            try { ValidateColumnNamingStandardCore(attr, state, isNew); }
+            try { return ValidateColumnNamingStandardCore(attr, state, isNew); }
             finally { _columnNamingCheckInProgress = false; }
         }
 
-        private void ValidateColumnNamingStandardCore(dynamic attr, AttributeValidationSnapshot state, bool isNew = false)
+        /// <returns>True when the attribute was DISCARDED (deleted) by a Required-field Cancel.</returns>
+        private bool ValidateColumnNamingStandardCore(dynamic attr, AttributeValidationSnapshot state, bool isNew = false)
         {
             if (string.IsNullOrEmpty(state.PhysicalName) ||
                 state.PhysicalName.Equals("<default>", StringComparison.OrdinalIgnoreCase) ||
                 state.PhysicalName.StartsWith("<default>", StringComparison.OrdinalIgnoreCase))
             {
-                return;
+                return false;
             }
 
             // Locked predefined columns are admin-controlled: their exact name is
@@ -5993,7 +6394,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             if (PredefinedColumnService.Instance.IsLockedColumnName(state.PhysicalName))
             {
                 Log($"Column naming skipped: '{state.TableName}.{state.PhysicalName}' is a locked predefined column (admin-owned name).");
-                return;
+                return false;
             }
 
             // attr MUST be passed so UDP-conditional rules (DEPENDS_ON_UDP_ID) can read
@@ -6028,10 +6429,26 @@ namespace EliteSoft.Erwin.AddIn.Services
                 catch (Exception ex) { Log($"ValidateColumnNamingStandard: baseline capture failed for '{state.TableName}.{state.PhysicalName}': {ex.Message}"); }
             }
 
+            // A column added via Model Explorer is first seen with a placeholder name
+            // and parked in _pendingNamedAttrs, so by the time its real name commits it
+            // is no longer "new" by snapshot identity (isNew=false) even though it is a
+            // brand-new column. It must count as new for ALL new-vs-existing decisions
+            // here: (1) the Required-field Cancel should DISCARD it, not revert; and
+            // (2) - the reason a Model-Explorer column got NO validation while the same
+            // column warns in the Column Editor and new TABLES warn fine - apply=Create
+            // naming rules (forbidden-word, name regex, required Definition/Datatype)
+            // must be evaluated. They are gated on isNew, so at isNew=false every Create
+            // rule was silently skipped. New tables keep isNew=true through their own
+            // pending-entity path; columns did not, which is this whole bug. (apply=Both
+            // rules fire either way, so configs using Both are unaffected.)
+            bool treatAsNew = isNew
+                || (!string.IsNullOrEmpty(snapshotId) && IsAttributePendingNew(snapshotId));
+            bool attributeDeleted = false;
+
             // Step 1: silently apply AUTO_APPLY=true rules
             if (attrBoxed != null)
             {
-                string afterAuto = NamingValidationEngine.ApplyNamingStandards("Column", state.PhysicalName, attrBoxed, autoOnly: true, isNew: isNew);
+                string afterAuto = NamingValidationEngine.ApplyNamingStandards("Column", state.PhysicalName, attrBoxed, autoOnly: true, isNew: treatAsNew);
                 if (!string.Equals(afterAuto, state.PhysicalName, StringComparison.Ordinal))
                 {
                     int transId = _session.BeginNamedTransaction("ApplyAutoColumnNaming");
@@ -6064,7 +6481,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             // Step 2: prompt for AUTO_APPLY=false rules that would change the name
             if (attrBoxed != null)
             {
-                string afterAll = NamingValidationEngine.ApplyNamingStandards("Column", state.PhysicalName, attrBoxed, autoOnly: false, isNew: isNew);
+                string afterAll = NamingValidationEngine.ApplyNamingStandards("Column", state.PhysicalName, attrBoxed, autoOnly: false, isNew: treatAsNew);
                 if (!string.Equals(afterAll, state.PhysicalName, StringComparison.Ordinal))
                 {
                     var answer = AddinMessageDialog.Show(
@@ -6084,7 +6501,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                             _session.CommitTransaction(transId);
                             Log($"Column naming applied (user confirmed): '{state.TableName}.{state.PhysicalName}' -> '{afterAll}'");
                             state.PhysicalName = afterAll;
-                            return;
+                            return false;
                         }
                         catch (Exception ex)
                         {
@@ -6096,7 +6513,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
 
             // Step 3: Validate remaining issues (warning popup for un-fixable rules)
-            var results = NamingValidationEngine.ValidateObjectName("Column", state.PhysicalName, attrBoxed, isNew: isNew);
+            var results = NamingValidationEngine.ValidateObjectName("Column", state.PhysicalName, attrBoxed, isNew: treatAsNew);
             var failures = results.Where(r => !r.IsValid).ToList();
 
             // Step 3b (2026-06-05): the admin can author Column rules on any
@@ -6133,9 +6550,9 @@ namespace EliteSoft.Erwin.AddIn.Services
                         Log($"Naming standard: SCAPI did not surface 'Column.{propertyCode}' on this column (treating as empty): {ex.Message}");
                     }
 
-                    Log($"NamingValidate: 'Column.{propertyCode}' on '{state.TableName}.{state.PhysicalName}' liveValue='{propValue}' isNew={isNew}");
+                    Log($"NamingValidate: 'Column.{propertyCode}' on '{state.TableName}.{state.PhysicalName}' liveValue='{propValue}' isNew={treatAsNew}");
                     var extraResults = NamingValidationEngine.ValidateObjectName(
-                        "Column", propValue, attrBoxed, propertyCode, isNew: isNew);
+                        "Column", propValue, attrBoxed, propertyCode, isNew: treatAsNew);
                     failures.AddRange(extraResults.Where(r => !r.IsValid));
                 }
             }
@@ -6190,7 +6607,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // e.g. "VpE_LOG.ID (Comment)" - the raw "Column.Definition" was
                     // meaningless to the user (2026-06-06).
                     string fieldLabel = $"{state.TableName}.{state.PhysicalName} ({NamingValidationEngine.FriendlyPropertyLabel(rf.Rule.PropertyCode)})";
-                    var cancelMode = isNew ? Forms.RequiredOperationMode.Create : Forms.RequiredOperationMode.Update;
+                    var cancelMode = treatAsNew ? Forms.RequiredOperationMode.Create : Forms.RequiredOperationMode.Update;
 
                     // Pre-fill the dialog with the column's current value
                     // (same rationale as the Table path).
@@ -6198,51 +6615,87 @@ namespace EliteSoft.Erwin.AddIn.Services
                     try { seedValue = attr?.Properties(rf.Rule.PropertyCode)?.Value?.ToString() ?? ""; }
                     catch { seedValue = ""; }
 
-                    var rc = EliteSoft.Erwin.AddIn.Forms.RequiredFieldDialog.Show(
-                        title: "Required field",
-                        message: rf.ErrorMessage,
-                        fieldLabel: fieldLabel,
-                        out string typed,
-                        owner: null,
-                        initialValue: seedValue,
-                        mode: cancelMode,
-                        objectKind: "Column");
+                    // Dialog + cancel-revert re-prompt loop. On an EXISTING column
+                    // the user cannot escape a Required violation by clicking Revert
+                    // when the baseline is itself invalid: the reverted value is
+                    // re-validated and the dialog re-opens until it satisfies every
+                    // rule (the 2026-05-24 Table-path rule, now applied to columns).
+                    // New columns still escape via Discard.
+                    string promptMessage = rf.ErrorMessage;
+                    string promptSeed = seedValue;
+                    DialogResult rc = DialogResult.Cancel;
+                    string typed = "";
+                    while (true)
+                    {
+                        rc = EliteSoft.Erwin.AddIn.Forms.RequiredFieldDialog.Show(
+                            title: "Required field",
+                            message: promptMessage,
+                            fieldLabel: fieldLabel,
+                            out typed,
+                            owner: null,
+                            initialValue: promptSeed,
+                            mode: cancelMode,
+                            objectKind: "Column");
+
+                        if (rc == DialogResult.OK && !string.IsNullOrEmpty(typed))
+                            break; // user typed a value - fall through to the write logic
+
+                        Log($"Required field dialog cancelled: {state.TableName}.{state.PhysicalName} field={fieldLabel} (mode={cancelMode})");
+                        if (treatAsNew)
+                        {
+                            requiredCancelHandled = TryDeleteNewAttribute(attr, state.TableName, state.PhysicalName);
+                            attributeDeleted = requiredCancelHandled;
+                            break; // new column discarded (or delete failed) - exit loop
+                        }
+
+                        string baseline = string.Equals(rf.Rule.PropertyCode, "Physical_Name", StringComparison.OrdinalIgnoreCase)
+                            ? baselinePhysicalName
+                            : (baselineWatched.TryGetValue(rf.Rule.PropertyCode, out var bv) ? bv : "");
+                        requiredCancelHandled = TryRevertAttributeProperty(attr, snapshotId, state.TableName, state.PhysicalName, rf.Rule.PropertyCode, baseline);
+                        if (!requiredCancelHandled)
+                            break; // revert failed - drop through so other Required failures still get a chance
+
+                        // Keep the in-flight currentState aligned with the revert so
+                        // code that runs after this method does not capture the
+                        // rolled-back invalid value.
+                        if (string.Equals(rf.Rule.PropertyCode, "Physical_Name", StringComparison.OrdinalIgnoreCase))
+                            state.PhysicalName = baseline ?? "";
+                        state.WatchedProperties[rf.Rule.PropertyCode] = baseline ?? "";
+
+                        // 2026-05-24 rule: re-validate the reverted value. If it still
+                        // violates, re-open the dialog (NO session dismissal, so the
+                        // user must supply a valid value). Only when the reverted
+                        // value is valid do we dismiss + stop the chain.
+                        string afterRevert;
+                        try { afterRevert = attr?.Properties(rf.Rule.PropertyCode)?.Value?.ToString() ?? ""; }
+                        catch { afterRevert = baseline ?? ""; }
+                        List<NamingValidationResult> revertFresh;
+                        // Mirror RevalidatePropertyAfterRevert's safeguard: on an
+                        // internal error treat the value as valid (revertFresh=null)
+                        // so a re-validation fault can never trap the user in the loop.
+                        try { revertFresh = NamingValidationEngine.ValidateObjectName("Column", afterRevert, attrBoxed, rf.Rule.PropertyCode, isNew: treatAsNew); }
+                        catch (Exception rvEx) { Log($"Post-revert re-validation error for {fieldLabel}, treating as valid: {rvEx.Message}"); revertFresh = null; }
+                        var revertStillFail = revertFresh?.FirstOrDefault(r => !r.IsValid);
+                        if (revertStillFail != null)
+                        {
+                            Log($"Required field re-prompt after Cancel (post-revert still invalid): {fieldLabel}");
+                            promptMessage = revertStillFail.ErrorMessage;
+                            promptSeed = afterRevert;
+                            continue;
+                        }
+
+                        // Reverted value passes every rule - dismiss for the session
+                        // and stop. (Same dismissal the next drift tick checks against.)
+                        if (!string.IsNullOrEmpty(snapshotId))
+                        {
+                            _dismissedRequiredColumnKeys.Add($"{snapshotId}|{rf.Rule.PropertyCode}");
+                            Log($"Required field dismissed for session: {snapshotId}|{rf.Rule.PropertyCode}");
+                        }
+                        break;
+                    }
 
                     if (rc != DialogResult.OK || string.IsNullOrEmpty(typed))
                     {
-                        Log($"Required field dialog cancelled: {state.TableName}.{state.PhysicalName} field={fieldLabel} (mode={cancelMode})");
-                        if (isNew)
-                        {
-                            requiredCancelHandled = TryDeleteNewAttribute(attr, state.TableName, state.PhysicalName);
-                        }
-                        else
-                        {
-                            string baseline = string.Equals(rf.Rule.PropertyCode, "Physical_Name", StringComparison.OrdinalIgnoreCase)
-                                ? baselinePhysicalName
-                                : (baselineWatched.TryGetValue(rf.Rule.PropertyCode, out var bv) ? bv : "");
-                            requiredCancelHandled = TryRevertAttributeProperty(attr, snapshotId, state.TableName, state.PhysicalName, rf.Rule.PropertyCode, baseline);
-                            // Keep the in-flight currentState aligned with the
-                            // revert so any code that runs after this method
-                            // (snapshot replace in ProcessAttributeChanges)
-                            // does not capture the rolled-back invalid value.
-                            if (requiredCancelHandled)
-                            {
-                                if (string.Equals(rf.Rule.PropertyCode, "Physical_Name", StringComparison.OrdinalIgnoreCase))
-                                    state.PhysicalName = baseline ?? "";
-                                state.WatchedProperties[rf.Rule.PropertyCode] = baseline ?? "";
-                            }
-
-                            // Record session dismissal even when the revert
-                            // wrote nothing (baseline equal to current). The
-                            // next tick's drift detector would otherwise
-                            // re-fire the same popup against the still-empty
-                            // value.
-                            if (!string.IsNullOrEmpty(snapshotId))
-                            {
-                                _dismissedRequiredColumnKeys.Add($"{snapshotId}|{rf.Rule.PropertyCode}");
-                                Log($"Required field dismissed for session: {snapshotId}|{rf.Rule.PropertyCode}");
-                            }
-                        }
                         if (requiredCancelHandled) break;
                         // Delete/revert failed - drop through so other Required
                         // failures still get a chance and the consolidated
@@ -6303,7 +6756,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                             catch { liveValue = currentTyped; }
 
                             var freshResults = NamingValidationEngine.ValidateObjectName(
-                                "Column", liveValue, attrBoxed, rf.Rule.PropertyCode, isNew: isNew);
+                                "Column", liveValue, attrBoxed, rf.Rule.PropertyCode, isNew: treatAsNew);
                             var freshFailure = freshResults?.FirstOrDefault(r => !r.IsValid);
                             if (freshFailure == null)
                             {
@@ -6326,16 +6779,48 @@ namespace EliteSoft.Erwin.AddIn.Services
                             if (rc2 != DialogResult.OK || string.IsNullOrEmpty(typed2))
                             {
                                 Log($"Required field re-prompt cancelled for {fieldLabel} (mode={cancelMode})");
-                                if (isNew)
+                                if (treatAsNew)
                                 {
                                     requiredCancelHandled = TryDeleteNewAttribute(attr, state.TableName, state.PhysicalName);
+                                    attributeDeleted = requiredCancelHandled;
+                                    failures.RemoveAll(f => f.Rule != null
+                                        && string.Equals(f.Rule.PropertyCode, rf.Rule.PropertyCode, StringComparison.OrdinalIgnoreCase));
+                                    break; // new column discarded - escape
                                 }
-                                else
+
+                                string baseline = baselineWatched.TryGetValue(rf.Rule.PropertyCode, out var bv) ? bv : "";
+                                requiredCancelHandled = TryRevertAttributeProperty(attr, snapshotId, state.TableName, state.PhysicalName, rf.Rule.PropertyCode, baseline);
+                                if (!requiredCancelHandled)
                                 {
-                                    string baseline = baselineWatched.TryGetValue(rf.Rule.PropertyCode, out var bv) ? bv : "";
-                                    requiredCancelHandled = TryRevertAttributeProperty(attr, snapshotId, state.TableName, state.PhysicalName, rf.Rule.PropertyCode, baseline);
-                                    if (!string.IsNullOrEmpty(snapshotId))
-                                        _dismissedRequiredColumnKeys.Add($"{snapshotId}|{rf.Rule.PropertyCode}");
+                                    failures.RemoveAll(f => f.Rule != null
+                                        && string.Equals(f.Rule.PropertyCode, rf.Rule.PropertyCode, StringComparison.OrdinalIgnoreCase));
+                                    break; // revert failed - give up this property
+                                }
+
+                                if (string.Equals(rf.Rule.PropertyCode, "Physical_Name", StringComparison.OrdinalIgnoreCase))
+                                    state.PhysicalName = baseline ?? "";
+                                state.WatchedProperties[rf.Rule.PropertyCode] = baseline ?? "";
+                                currentTyped = baseline ?? "";
+
+                                // 2026-05-24 rule (mirror of SITE 1): re-validate the
+                                // reverted value. Still invalid -> re-prompt via the loop
+                                // top (no dismissal). Valid -> record the session
+                                // dismissal (parity with SITE 1 / the Table path) + drop
+                                // the failure + stop. On a re-validation fault treat as
+                                // valid so a fault cannot trap the user.
+                                string afterRevert2;
+                                try { afterRevert2 = attr?.Properties(rf.Rule.PropertyCode)?.Value?.ToString() ?? ""; }
+                                catch { afterRevert2 = baseline ?? ""; }
+                                List<NamingValidationResult> revertFresh2;
+                                try { revertFresh2 = NamingValidationEngine.ValidateObjectName("Column", afterRevert2, attrBoxed, rf.Rule.PropertyCode, isNew: treatAsNew); }
+                                catch (Exception rvEx2) { Log($"Post-revert re-validation error for {fieldLabel}, treating as valid: {rvEx2.Message}"); revertFresh2 = null; }
+                                if (revertFresh2?.Any(r => !r.IsValid) == true)
+                                    continue; // still invalid -> loop top re-prompts
+
+                                if (!string.IsNullOrEmpty(snapshotId))
+                                {
+                                    _dismissedRequiredColumnKeys.Add($"{snapshotId}|{rf.Rule.PropertyCode}");
+                                    Log($"Required field dismissed for session: {snapshotId}|{rf.Rule.PropertyCode}");
                                 }
                                 failures.RemoveAll(f => f.Rule != null
                                     && string.Equals(f.Rule.PropertyCode, rf.Rule.PropertyCode, StringComparison.OrdinalIgnoreCase));
@@ -6395,7 +6880,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             if (requiredCancelHandled)
             {
                 Log($"ValidateColumnNamingStandard: Cancel-handled, suppressing remaining warnings for '{state.TableName}.{state.PhysicalName}'");
-                return;
+                return attributeDeleted;
             }
 
             foreach (var r in failures)
@@ -6409,6 +6894,25 @@ namespace EliteSoft.Erwin.AddIn.Services
                     Message = r.ErrorMessage
                 });
             }
+
+            return false;
+        }
+
+        /// <summary>
+        /// True when the column is a brand-new one parked in <see cref="_pendingNamedAttrs"/>
+        /// - added via Model Explorer with a placeholder name, awaiting its real name.
+        /// By snapshot identity such a column is no longer "new" once its name commits
+        /// (it was recorded in _attributeSnapshots during the placeholder phase), but for
+        /// the Required-field Cancel it must still count as new: Cancel should DISCARD the
+        /// just-created column, not revert a property on a column the user never meant to
+        /// keep. This is exactly the "Revert Change vs Discard New Column" split.
+        /// </summary>
+        private bool IsAttributePendingNew(string objectId)
+        {
+            if (string.IsNullOrEmpty(objectId)) return false;
+            foreach (var pendSet in _pendingNamedAttrs.Values)
+                if (pendSet.Contains(objectId)) return true;
+            return false;
         }
 
         /// <summary>

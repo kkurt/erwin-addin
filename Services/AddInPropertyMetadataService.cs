@@ -64,6 +64,26 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
         }
 
+        public List<ObjectRelation> GetRelations(int fromObjectTypeId)
+        {
+            // Global navigable relations FROM the given object type (e.g. COLUMN
+            // -> TABLE under alias "Table"), ordered by SortOrder then Alias.
+            // This is the EF/admin-parity read of the contract; the add-in's
+            // runtime Template applier uses the cached raw-ADO ObjectRelationCatalog
+            // on the heartbeat path (mirrors NamingStandardService, which reads
+            // MC_NAMING_STANDARD via raw ADO to avoid the EF cold-start there).
+            using (var context = CreateContext())
+            {
+                return context.ObjectRelations
+                    .Include(r => r.FromObjectType)
+                    .Include(r => r.ToObjectType)
+                    .Where(r => r.FromObjectTypeId == fromObjectTypeId)
+                    .OrderBy(r => r.SortOrder)
+                    .ThenBy(r => r.Alias)
+                    .ToList();
+            }
+        }
+
         public List<PropertyDef> GetPropertyDefs(int dbmsVersionId, int objectTypeId, bool erwinMode = false)
         {
             // After the schema rename: MC_PROPERTY_DEF lost CONFIG_ID and uses
