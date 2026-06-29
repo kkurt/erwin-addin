@@ -630,9 +630,19 @@ namespace EliteSoft.Erwin.AddIn.Services
             _domainCache.Clear();
             _tablesBaselined.Clear();
 
+            // Capture the DIAGRAM-HEARTBEAT baseline (entity ids + per-entity attr
+            // ids/counts + totals) synchronously NOW, at connect, while the model
+            // is loaded. This is the change-DETECTION baseline only - the per-table
+            // validation baseline (_attributeSnapshots) stays Phase-2D lazy. Without
+            // it the heartbeat's first tick (which only fires after the connect
+            // settle + model-UDP one-shot, ~10 s later) silently absorbs any table
+            // the user adds in that window into the baseline, so it is never
+            // validated - the user-reported model-switch-back bug (2026-06-29).
+            BaselineDiagramHeartbeat();
+
             _monitorTimer.Start();
             _windowMonitorTimer.Start();
-            Log("ValidationCoordinatorService: Monitoring started (Phase-2D: per-table lazy baseline, no startup populate)");
+            Log("ValidationCoordinatorService: Monitoring started (Phase-2D: per-table lazy validation baseline; heartbeat baselined at connect)");
         }
 
         public void StopMonitoring()
@@ -1288,6 +1298,124 @@ namespace EliteSoft.Erwin.AddIn.Services
             finally
             {
                 _isCheckingForChanges = false;
+            }
+        }
+
+        /// <summary>
+        /// Captures the diagram-heartbeat baseline (entity ids, per-entity attribute
+        /// id sets + counts, and the total Attribute/Entity counters) for the model
+        /// active RIGHT NOW. Called synchronously from StartMonitoring at connect so
+        /// the heartbeat's first tick treats only objects added AFTER connect as new.
+        /// Without it the first tick - delayed by the connect settle + model-UDP
+        /// one-shot (~10 s) - silently baselines whatever the model contains then,
+        /// absorbing any table the user adds in that window so it is never validated
+        /// (user-reported model-switch-back bug, 2026-06-29). Pure snapshot, no
+        /// validation. On any failure the snapshots are cleared and the counters
+        /// reset to -1, so the original first-tick baseline path still runs (safe
+        /// fallback that only widens the absorb window back to the old behaviour).
+        /// </summary>
+        private void BaselineDiagramHeartbeat()
+        {
+            dynamic entityCollection = null;
+            dynamic attrCollection = null;
+            try
+            {
+                dynamic modelObjects = _session.ModelObjects;
+                dynamic root = modelObjects?.Root;
+                if (root == null) { _lastTotalAttributeCount = -1; _lastTotalEntityCount = -1; return; }
+
+                _entityIdSnapshot.Clear();
+                _entityAttrIdSnapshot.Clear();
+                _entityAttrCountSnapshot.Clear();
+                _entityDisplayNameSnapshot.Clear();
+
+                entityCollection = modelObjects.Collect(root, "Entity");
+                attrCollection = modelObjects.Collect(root, "Attribute");
+                if (entityCollection == null) { _lastTotalAttributeCount = -1; _lastTotalEntityCount = -1; return; }
+
+                // Partial-read guard (mirrors ModelConfigForm's incomplete-metamodel
+                // read guard, 2026-06-08): a transient reconnect while erwin is still
+                // reloading the model (e.g. Mart Save-As + Cancel) hands us an empty
+                // entity collection. Do NOT trust a connect-time baseline then - reset
+                // to -1 so the deferred first-tick baseline runs after the ~10 s settle
+                // (by when the reload has finished). A genuinely empty model is harmless
+                // either way (first tick simply baselines 0).
+                if ((long)entityCollection.Count == 0)
+                {
+                    _lastTotalAttributeCount = -1;
+                    _lastTotalEntityCount = -1;
+                    Log("DiagramHeartbeat: connect-time baseline saw 0 entities (empty model or mid-reload) - deferring to first-tick baseline");
+                    return;
+                }
+
+                foreach (dynamic entity in entityCollection)
+                {
+                    if (entity == null) continue;
+                    string entityId;
+                    try { entityId = entity.ObjectId?.ToString(); }
+                    catch { continue; }
+                    if (string.IsNullOrEmpty(entityId)) continue;
+                    _entityIdSnapshot.Add(entityId);
+
+                    var attrIds = new HashSet<string>(StringComparer.Ordinal);
+                    dynamic entityAttrs = null;
+                    try
+                    {
+                        entityAttrs = modelObjects.Collect(entity, "Attribute");
+                        if (entityAttrs != null)
+                        {
+                            foreach (dynamic a in entityAttrs)
+                            {
+                                string aid;
+                                try { aid = a.ObjectId?.ToString(); }
+                                catch { continue; }
+                                if (!string.IsNullOrEmpty(aid)) attrIds.Add(aid);
+                            }
+                        }
+                    }
+                    catch (Exception ex) { Log($"BaselineDiagramHeartbeat attr-walk err on '{entityId}': {ex.Message}"); }
+                    finally { ReleaseCom(entityAttrs); }
+
+                    _entityAttrIdSnapshot[entityId] = attrIds;
+                    _entityAttrCountSnapshot[entityId] = attrIds.Count;
+
+                    // Display name baseline (same derivation the heartbeat uses) so a
+                    // rename of a pre-existing entity between connect and the first
+                    // tick is still diffable rather than silently absorbed.
+                    string displayName;
+                    try
+                    {
+                        // Identical derivation to DiagramHeartbeatTick (Physical_Name
+                        // via Properties(...).Value) so the first tick does not see a
+                        // phantom rename from a different read path.
+                        string p = entity.Properties("Physical_Name").Value?.ToString() ?? "";
+                        displayName = (!string.IsNullOrEmpty(p) && !p.StartsWith("%")) ? p : (entity.Name ?? entityId);
+                    }
+                    catch { try { displayName = entity.Name ?? entityId; } catch { displayName = entityId; } }
+                    _entityDisplayNameSnapshot[entityId] = displayName;
+                }
+
+                // Totals are read the SAME way the heartbeat reads them (Collect.Count)
+                // so an unchanged model yields delta==0 on the first tick (no spurious
+                // validation).
+                _lastTotalEntityCount = (long)entityCollection.Count;
+                _lastTotalAttributeCount = attrCollection != null ? (long)attrCollection.Count : 0;
+                Log($"DiagramHeartbeat: connect-time baseline captured ({_lastTotalEntityCount} entities, {_lastTotalAttributeCount} attrs); post-connect additions will be detected");
+            }
+            catch (Exception ex)
+            {
+                _entityIdSnapshot.Clear();
+                _entityAttrIdSnapshot.Clear();
+                _entityAttrCountSnapshot.Clear();
+                _entityDisplayNameSnapshot.Clear();
+                _lastTotalAttributeCount = -1;
+                _lastTotalEntityCount = -1;
+                Log($"DiagramHeartbeat: connect-time baseline failed ({ex.Message}); deferring to first-tick baseline");
+            }
+            finally
+            {
+                ReleaseCom(entityCollection);
+                ReleaseCom(attrCollection);
             }
         }
 
