@@ -327,11 +327,49 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// is matched case-insensitively (single-value CSV = back-compat
         /// path; empty CSV with a source set = "any non-empty value matches").
         /// </summary>
+        // Condition property codes that mean "is this column a member of the
+        // primary key". erwin does NOT surface PK membership as a readable
+        // Attribute property (it lives in the Key_Group / Key_Group_Member graph,
+        // reached via IsAttributeInPrimaryKey), so a DEPENDS_ON targeting one of
+        // these reads empty from a property accessor. The caller resolves PK
+        // membership from the Key_Group graph and passes it as the pkMembership
+        // argument of the IsRuleApplicable overload below.
+        private static readonly HashSet<string> PkMembershipConditionCodes =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            { "IsPrimaryKey", "Is_PK", "Primary_Key", "PrimaryKey", "Is_Primary_Key" };
+
+        /// <summary>
+        /// True when this rule's DEPENDS_ON condition asks whether the object is a
+        /// primary-key member (property code in <see cref="PkMembershipConditionCodes"/>,
+        /// and not a UDP source). Such a condition cannot be answered by a property
+        /// read on the Attribute; the caller must resolve PK membership from the
+        /// Key_Group graph and pass it to the <c>pkMembership</c> overload of
+        /// <see cref="IsRuleApplicable"/>.
+        /// </summary>
+        public static bool IsPkMembershipCondition(NamingStandardRule rule)
+        {
+            if (rule == null) return false;
+            bool hasUdpSource = rule.DependsOnUdpId.HasValue && !string.IsNullOrEmpty(rule.DependsOnUdpName);
+            bool hasPropSource = rule.DependsOnPropertyDefId.HasValue && !string.IsNullOrEmpty(rule.DependsOnPropertyCode);
+            return hasPropSource && !hasUdpSource && PkMembershipConditionCodes.Contains(rule.DependsOnPropertyCode);
+        }
+
         // Public so the Template runtime applier
         // (ValidationCoordinatorService.ApplyColumnTemplateRules) reuses the
         // exact same DEPENDS_ON condition evaluation as the validate-only path,
         // rather than reimplementing it.
         public static bool IsRuleApplicable(NamingStandardRule rule, string objectType, dynamic scapiObject)
+            => IsRuleApplicable(rule, objectType, scapiObject, null);
+
+        /// <summary>
+        /// As <see cref="IsRuleApplicable(NamingStandardRule, string, object)"/>, but
+        /// when the rule's condition is a PK-membership check (see
+        /// <see cref="IsPkMembershipCondition"/>) and <paramref name="pkMembership"/>
+        /// has a value, the condition is evaluated against that caller-resolved
+        /// boolean (from the Key_Group_Member walk) instead of a property read.
+        /// Passing <c>null</c> reproduces the property-read behaviour exactly.
+        /// </summary>
+        public static bool IsRuleApplicable(NamingStandardRule rule, string objectType, dynamic scapiObject, bool? pkMembership)
         {
             bool hasUdpSource = rule.DependsOnUdpId.HasValue && !string.IsNullOrEmpty(rule.DependsOnUdpName);
             bool hasPropSource = rule.DependsOnPropertyDefId.HasValue && !string.IsNullOrEmpty(rule.DependsOnPropertyCode);
@@ -339,6 +377,11 @@ namespace EliteSoft.Erwin.AddIn.Services
             // Unconditional rule.
             if (!hasUdpSource && !hasPropSource)
                 return true;
+
+            // PK-membership condition resolved by the caller via the Key_Group
+            // graph (erwin exposes no Attribute property for it).
+            if (pkMembership.HasValue && IsPkMembershipCondition(rule))
+                return MatchesCsv(pkMembership.Value ? "True" : "False", rule.DependsOnPropertyValues);
 
             // Has condition but no SCAPI object to evaluate against → skip
             // (the caller is invoking us out of band, e.g. a static name
@@ -352,6 +395,43 @@ namespace EliteSoft.Erwin.AddIn.Services
                 : ReadBuiltinPropertyValue(scapiObject, rule.DependsOnPropertyCode);
 
             return MatchesCsv(sourceValue, rule.DependsOnPropertyValues);
+        }
+
+        /// <summary>
+        /// Diagnostic companion to <see cref="IsRuleApplicable"/>: returns a short
+        /// human-readable description of the DEPENDS_ON condition evaluation -
+        /// the source kind/name, the LIVE value read from SCAPI, and the allowed
+        /// CSV - so callers can log WHY a conditional rule did not apply instead
+        /// of skipping silently. A read that returns empty usually means the
+        /// property/UDP name is wrong (not surfaced on this object class); a
+        /// concrete value that is not in the allowed list means the live object
+        /// simply does not meet the condition. No SCAPI writes.
+        /// </summary>
+        public static string DescribeApplicability(NamingStandardRule rule, string objectType, dynamic scapiObject, bool? pkMembership = null)
+        {
+            bool hasUdpSource = rule.DependsOnUdpId.HasValue && !string.IsNullOrEmpty(rule.DependsOnUdpName);
+            bool hasPropSource = rule.DependsOnPropertyDefId.HasValue && !string.IsNullOrEmpty(rule.DependsOnPropertyCode);
+
+            if (!hasUdpSource && !hasPropSource) return "unconditional";
+            if (pkMembership.HasValue && IsPkMembershipCondition(rule))
+                return $"pk-membership={pkMembership.Value} (via Key_Group_Member walk) not in allowed [{rule.DependsOnPropertyValues}]";
+            if (scapiObject == null) return "no live object to evaluate condition";
+
+            string kind = hasUdpSource ? "udp" : "prop";
+            string name = hasUdpSource ? rule.DependsOnUdpName : rule.DependsOnPropertyCode;
+            string val;
+            try
+            {
+                val = hasUdpSource
+                    ? ReadUdpValue(scapiObject, objectType, rule.DependsOnUdpName)
+                    : ReadBuiltinPropertyValue(scapiObject, rule.DependsOnPropertyCode);
+            }
+            catch (Exception ex) { val = "<read-error: " + ex.Message + ">"; }
+
+            string hint = string.IsNullOrEmpty(val)
+                ? " (empty - likely a wrong/unsurfaced property or UDP name)"
+                : "";
+            return $"cond {kind}[{name}]='{val}' not in allowed [{rule.DependsOnPropertyValues}]{hint}";
         }
 
         /// <summary>
@@ -392,6 +472,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 "column" => "Attribute",
                 "view" => "View",
                 "index" => "Key_Group",
+                "primary key" => "Key_Group",
                 _ => "Entity"
             };
             string path = $"{ownerClass}.Physical.{udpName}";

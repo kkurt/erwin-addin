@@ -467,6 +467,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                 case "VIEW":         return "View";
                 case "COLUMN":       return "Attribute";
                 case "INDEX":        return "Key_Group";
+                // PRIMARY KEY is the Key_Group class filtered to Key_Group_Type=="PK".
+                // The caller MUST apply that filter (see CheckRequiredObjectTypesExist);
+                // returning "Key_Group" here only names the SCAPI collect class.
+                case "PRIMARY_KEY":  return "Key_Group";
                 case "SUBJECT_AREA": return "Subject_Area";
                 default:             return null;   // MODEL (always exists) / unknown
             }
@@ -519,7 +523,15 @@ namespace EliteSoft.Erwin.AddIn.Services
                     continue;
                 }
 
-                if (!hasAnyByType.TryGetValue(scapiType, out bool hasAny))
+                // PRIMARY KEY shares the Key_Group SCAPI class with INDEX/AK, so its
+                // existence must additionally filter Key_Group_Type == "PK" - and cache
+                // under a distinct key so it does not share INDEX's any-Key_Group result.
+                bool pkOnly = string.Equals(
+                    rule.ObjectType?.Trim().ToUpperInvariant().Replace(' ', '_'),
+                    "PRIMARY_KEY", StringComparison.Ordinal);
+                string cacheKey = pkOnly ? scapiType + ":PK" : scapiType;
+
+                if (!hasAnyByType.TryGetValue(cacheKey, out bool hasAny))
                 {
                     hasAny = false;
                     try
@@ -527,16 +539,26 @@ namespace EliteSoft.Erwin.AddIn.Services
                         dynamic coll = modelObjects.Collect(root, scapiType);
                         if (coll != null)
                         {
-                            // Existence only - stop at the first object.
-                            foreach (dynamic _ in coll) { hasAny = true; break; }
+                            // Existence only - stop at the first matching object.
+                            foreach (dynamic o in coll)
+                            {
+                                if (pkOnly)
+                                {
+                                    string kgType;
+                                    try { kgType = o.Properties("Key_Group_Type").Value?.ToString(); }
+                                    catch { continue; }
+                                    if (!string.Equals(kgType, "PK", StringComparison.OrdinalIgnoreCase)) continue;
+                                }
+                                hasAny = true; break;
+                            }
                         }
                     }
                     catch (Exception ex)
                     {
-                        Log($"CheckRequiredObjectTypesExist: Collect('{scapiType}') failed for rule#{rule.Id}: {ex.Message}");
+                        Log($"CheckRequiredObjectTypesExist: Collect('{scapiType}'{(pkOnly ? " PK-filtered" : "")}) failed for rule#{rule.Id}: {ex.Message}");
                         continue;
                     }
-                    hasAnyByType[scapiType] = hasAny;
+                    hasAnyByType[cacheKey] = hasAny;
                 }
 
                 if (!hasAny)

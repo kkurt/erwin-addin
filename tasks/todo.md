@@ -216,3 +216,23 @@ the column-add-via-Model-Explorer bug.
 - Fix (ValidationCoordinatorService.cs): MODEL cancel branch re-validates -> re-prompt (continue) if invalid, return if valid. COLUMN: wrapped the first dialog in a `while` (SITE 1) + made the OK-path re-prompt `while` (SITE 2) re-validate-then-reprompt. Both: existing-object revert-to-invalid loops; new-object discards; valid revert dismisses + stops chain. Added try/catch (fault -> treat valid, no trap) + session dismissal parity.
 - Adversarial review: 1 real bug (SITE 2 missing dismissal on revert-to-valid) FIXED; 1 NIT (exception guard) FIXED; 1 NIT (Schema_Ref non-dismissable-by-revert) = intended, consistent with TABLE.
 - Build 0/0; tests 385/385. NOT committed.
+
+## PRIMARY KEY object type runtime support (2026-06-26)
+- Admin added "PRIMARY KEY" governance type = Key_Group (Key_Group_Type="PK"); admin can author naming rules (target usually the PK constraint name) incl. Template (PK_{Table.Name}).
+- Done: `ApplyPrimaryKeyRules` (Template applier, parallel to ApplyColumnTemplateRules) + `ResolvePrimaryKeyRelatedProperty` ("Table" alias) + call site after CheckEntityKeyGroups + `_pkTemplateSeen`/`_pkTemplateWriteFailed` (cleared in all 3 rebaseline paths) + ReadUdpValue "primary key"=>"Key_Group".
+- Adversarial review: 2 bugs FIXED - (1) PK sets not cleared on rebaseline; (2) write-failure log-spam guard. PK-detection/string-consistency/idempotency/exception-safety CONFIRMED-OK.
+- Build 0/0; tests 385/385. NOT committed.
+- OPEN (CHALLENGE - needs live verify): codebase evidence says a Key_Group has NO `Physical_Name` (all existing writes use `Name`; KeyGroupCandidates omits it; Views-have-no-Physical_Name precedent). Applier is generic (writes rule.PropertyCode); if the admin PK rule targets Physical_Name and it throws, the log shows `[PK-TEMPLATE-ERROR] writing 'Physical_Name' failed` and the write is suppressed. Live-verify the correct PK constraint-name property (likely `Name`).
+- DEFERRED: non-template PK rules (Prefix/Suffix/Length/Regexp/Required validate+prompt) and PRIMARY KEY object-existence rule mapping (needs Type=="PK" filter).
+
+## Update 2026-06-26: PRIMARY KEY deferred items done (non-template + filtered existence)
+- (1) Non-template PK rules: `ApplyPrimaryKeyRules` now also runs a non-template pass mirroring the Index flow (CheckEntityKeyGroups): baseline-on-first-sight then auto-apply prefix/suffix + validate-warn on a value change, snapshot-gated via `_pkPropertySnapshots` (cleared in all 3 rebaseline paths), warn-only (no required-field force-fill). Generic over PropertyCode. Early-out now fires only when there are NO PK rules at all (template OR non-template).
+- (2) Filtered existence: `ScapiCollectTypeForExistence` maps PRIMARY_KEY -> Key_Group; `CheckRequiredObjectTypesExist` filters members by Key_Group_Type=="PK" and caches under a distinct "Key_Group:PK" key so a PRIMARY KEY existence rule never shares INDEX's any-Key_Group result.
+- Adversarial review: NO real bugs (2 cosmetic NITs left). Snapshot gating = exactly-once-per-change (no _pendingResults spam); template/non-template don't oscillate; missing Physical_Name degrades to inert; existence cacheKey isolates PK from INDEX; exception-safe. no-full-walk preserved (PK pass is scoped to the processed entity).
+- Build 0/0; tests 385/385. NOT committed. Physical_Name-on-Key_Group still pending live verify (generic code handles either way).
+
+## Update 2026-06-29: PRIMARY KEY Template LIVE-VERIFIED + Physical_Name uncertainty RESOLVED
+- Live log proof: template 'PK_{Table.Physical_Name}' -> [PK-TEMPLATE-APPLY] table='TEST' Physical_Name='PK_TEST' (once, no error, no runaway). User confirmed this is the intended behavior ("PK name'i bu olmalı"), feature stays.
+- RESOLVED: Key_Group.Physical_Name IS writable via SCAPI (the PK constraint name) - unlike Views which have no Physical_Name. The earlier ship-blocker uncertainty is cleared.
+- Self-referential guard LIVE-VERIFIED: with the old 'PK_{Physical_Name}' it logged [PK-TEMPLATE-SKIP] once, 0 APPLY, flicker gone.
+- Status: all PK work + self-ref guard done. Build 0/0, tests 395/395. Generic over PropertyCode (admin can target Name instead of Physical_Name if a visible-name rename is ever wanted - no code change). NOT committed.

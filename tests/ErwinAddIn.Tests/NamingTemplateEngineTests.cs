@@ -220,4 +220,56 @@ public class NamingTemplateEngineTests
         write.Should().BeFalse();
         unknown.Should().BeTrue();
     }
+
+    // ---- ReferencesOwnProperty (self-referential / runaway guard) ----------
+
+    [Fact]
+    public void ReferencesOwnProperty_own_token_equal_to_target_is_self_referential()
+    {
+        // 'PK_{Physical_Name}' targeting Physical_Name = the runaway that grew
+        // PK_PK_PK_... every heartbeat.
+        NamingTemplateEngine.ReferencesOwnProperty("PK_{Physical_Name}", "Physical_Name")
+            .Should().BeTrue();
+    }
+
+    [Fact]
+    public void ReferencesOwnProperty_is_case_insensitive_on_the_token()
+    {
+        NamingTemplateEngine.ReferencesOwnProperty("PK_{physical_name}", "Physical_Name")
+            .Should().BeTrue();
+    }
+
+    [Fact]
+    public void ReferencesOwnProperty_related_token_to_same_name_is_not_self_referential()
+    {
+        // {Table.Physical_Name} reads the PARENT, not the target - the correct form.
+        NamingTemplateEngine.ReferencesOwnProperty("PK_{Table.Physical_Name}", "Physical_Name")
+            .Should().BeFalse();
+    }
+
+    [Fact]
+    public void ReferencesOwnProperty_own_token_to_other_property_is_not_self_referential()
+    {
+        NamingTemplateEngine.ReferencesOwnProperty("{Name}_PK", "Physical_Name")
+            .Should().BeFalse();
+    }
+
+    [Fact]
+    public void ReferencesOwnProperty_detects_self_reference_among_multiple_tokens()
+    {
+        NamingTemplateEngine.ReferencesOwnProperty("{Table.Name}_{Physical_Name}", "Physical_Name")
+            .Should().BeTrue();
+    }
+
+    [Theory]
+    [InlineData("", "Physical_Name")]
+    [InlineData(null, "Physical_Name")]
+    [InlineData("literal only, no tokens", "Physical_Name")]
+    [InlineData("{Physical_Name}", "")]
+    [InlineData("{Physical_Name}", null)]
+    public void ReferencesOwnProperty_safe_on_empty_inputs(string? template, string? propertyCode)
+    {
+        NamingTemplateEngine.ReferencesOwnProperty(template, propertyCode)
+            .Should().BeFalse();
+    }
 }

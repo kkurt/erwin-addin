@@ -26,6 +26,14 @@
     <DefineConstants>$(DefineConstants);PACKAGED</DefineConstants>
   </PropertyGroup>
 
+  <!-- Dev-only verbose diagnostics: per-column-change traces ([PK-WALK],
+       [TEMPLATE-COND]) are gated behind [Conditional("DEV_DIAGNOSTICS")] so the
+       compiler omits the calls (and their string interpolation) from packaged
+       production builds. Defined for every NON-packaged (developer) build. -->
+  <PropertyGroup Condition="'$(PackagedBuild)' != 'true'">
+    <DefineConstants>$(DefineConstants);DEV_DIAGNOSTICS</DefineConstants>
+  </PropertyGroup>
+
   <ItemGroup>
     <!-- ADO.NET providers for multi-database support -->
     <PackageReference Include="ExcelDataReader" Version="3.7.0" />

@@ -148,5 +148,33 @@ namespace EliteSoft.Erwin.AddIn.Services
             unknownMode = true;
             return false;
         }
+
+        /// <summary>
+        /// True when <paramref name="template"/> contains an OWN token (a
+        /// <c>{PropertyCode}</c> with no <c>Alias.</c> prefix) equal to
+        /// <paramref name="propertyCode"/> - i.e. the template reads the very
+        /// property it is going to write. Such a rule is self-referential: under
+        /// <c>FILL_MODE=Always</c> each render feeds its own previous output back
+        /// in, so the value grows without bound and a transaction is written every
+        /// heartbeat. The caller MUST refuse such a rule (a related token like
+        /// <c>{Table.Physical_Name}</c> is the correct way to seed a name). Related
+        /// tokens (<c>{Alias.PropertyCode}</c>) are never self-referential and are
+        /// ignored here.
+        /// </summary>
+        public static bool ReferencesOwnProperty(string? template, string? propertyCode)
+        {
+            if (string.IsNullOrEmpty(template) || string.IsNullOrWhiteSpace(propertyCode))
+                return false;
+
+            string target = propertyCode!.Trim();
+            foreach (Match m in TokenPattern.Matches(template!))
+            {
+                string token = m.Groups[1].Value.Trim();
+                if (token.IndexOf('.') >= 0) continue; // related token, not own
+                if (string.Equals(token, target, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
+        }
     }
 }

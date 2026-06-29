@@ -391,6 +391,23 @@ namespace EliteSoft.Erwin.AddIn.Services
         // Snapshot of Key_Group (Index) names for naming standard checks
         private Dictionary<string, string> _keyGroupSnapshots;
 
+        // PK Key_Group ObjectIds already seen by ApplyPrimaryKeyRules this session.
+        // First sight == the Create moment for APPLY_ON gating of PRIMARY KEY
+        // Template rules. Cleared on every rebaseline (ObjectIds are model-scoped,
+        // not globally unique) so a model switch cannot mis-gate APPLY_ON.
+        private readonly HashSet<string> _pkTemplateSeen = new HashSet<string>(StringComparer.Ordinal);
+
+        // "pkId|ruleId" of PK Template writes that already FAILED this session
+        // (e.g. the rule's target PropertyCode is not writable on a Key_Group).
+        // Skipped on later ticks so a misconfigured rule does not re-attempt the
+        // throwing write - and spam the log - every heartbeat. Cleared on rebaseline.
+        private readonly HashSet<string> _pkTemplateWriteFailed = new HashSet<string>(StringComparer.Ordinal);
+
+        // "pkId|propertyCode" -> last seen value, for the non-template PK naming pass
+        // (Prefix/Suffix/Length/Regexp/Required). Mirrors _keyGroupSnapshots: baseline
+        // on first sight, validate/auto-apply only on a value change. Cleared on rebaseline.
+        private readonly Dictionary<string, string> _pkPropertySnapshots = new Dictionary<string, string>(StringComparer.Ordinal);
+
         // Cache of Domain ObjectId -> Domain Name
         private Dictionary<string, string> _domainCache;
 
@@ -607,6 +624,9 @@ namespace EliteSoft.Erwin.AddIn.Services
             // the startup tax.
             _attributeSnapshots.Clear();
             _keyGroupSnapshots.Clear();
+            _pkTemplateSeen.Clear();
+            _pkTemplateWriteFailed.Clear();
+            _pkPropertySnapshots.Clear();
             _domainCache.Clear();
             _tablesBaselined.Clear();
 
@@ -661,6 +681,9 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             _attributeSnapshots.Clear();
             _keyGroupSnapshots.Clear();
+            _pkTemplateSeen.Clear();
+            _pkTemplateWriteFailed.Clear();
+            _pkPropertySnapshots.Clear();
             _tablesBaselined.Clear();
             _pendingResults.Clear();
             // Phase-3B (2026-05-07): keep _domainCache populated across rebaselines.
@@ -677,6 +700,9 @@ namespace EliteSoft.Erwin.AddIn.Services
             {
                 _attributeSnapshots.Clear();
                 _keyGroupSnapshots.Clear();
+                _pkTemplateSeen.Clear();
+                _pkTemplateWriteFailed.Clear();
+                _pkPropertySnapshots.Clear();
                 _domainCache.Clear();
 
                 dynamic modelObjects = _session.ModelObjects;
@@ -4833,6 +4859,12 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                 // Check Key_Group (Index) naming for this entity's indexes
                 CheckEntityKeyGroups(entity, modelObjects, tableName);
+
+                // PRIMARY KEY governance object type (2026-06-26): apply Template
+                // naming rules to this entity's PK constraint (the Key_Group with
+                // Key_Group_Type == "PK"). Cheap early-out inside when no PK
+                // Template rules exist.
+                ApplyPrimaryKeyRules(entity, modelObjects, tableName);
             }
             catch (Exception ex)
             {
@@ -4871,6 +4903,12 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
             if (rules == null || rules.Count == 0) return;
 
+            // PK membership is not a readable Attribute property (erwin keeps it in
+            // the Key_Group graph), so a rule conditioned on "column is PK" is
+            // resolved here via the Key_Group_Member walk. Computed lazily and once
+            // per column - only when a rule actually asks for it.
+            bool? pkMembership = null;
+
             foreach (var rule in rules)
             {
                 try
@@ -4878,9 +4916,30 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // Same APPLY_ON (Create/Update/Both) and DEPENDS_ON gating as
                     // the validate-only path.
                     if (!NamingValidationEngine.MatchesApplyOn(rule, treatAsNew)) continue;
-                    if (!NamingValidationEngine.IsRuleApplicable(rule, "Column", attr)) continue;
+
+                    if (pkMembership == null && NamingValidationEngine.IsPkMembershipCondition(rule))
+                        pkMembership = IsAttributePrimaryKeyMember(entity, objectId);
+
+                    if (!NamingValidationEngine.IsRuleApplicable(rule, "Column", attr, pkMembership))
+                    {
+                        // Don't skip silently: a conditional Template that never fires
+                        // is the #1 "why didn't my rule apply?" question. Log the live
+                        // condition value (runs per column-change, so it is bounded).
+                        LogDebug($"[TEMPLATE-COND] column='{columnName}' rule#{rule.Id} not applied: {NamingValidationEngine.DescribeApplicability(rule, "Column", attr, pkMembership)}");
+                        continue;
+                    }
 
                     string targetCode = rule.PropertyCode;
+
+                    // Self-referential template guard (see ApplyPrimaryKeyRules): a
+                    // template that reads its own target property would grow without
+                    // bound under FILL_MODE=Always. Refuse it - a related token like
+                    // {Table.Physical_Name} is the correct way to seed the value.
+                    if (NamingTemplateEngine.ReferencesOwnProperty(rule.ValueTemplate, targetCode))
+                    {
+                        Log($"[TEMPLATE-SKIP] column='{columnName}' rule#{rule.Id}: template '{rule.ValueTemplate}' references its own target property '{targetCode}' (self-referential - would loop); skipping. Use a related token like {{Table.Physical_Name}} instead.");
+                        continue;
+                    }
 
                     string rendered;
                     try
@@ -4953,6 +5012,64 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// True when the attribute (by ObjectId) is a member of its entity's
+        /// primary key. erwin exposes NO readable PK-membership property on the
+        /// Attribute, so this walks the entity's Key_Group of type "PK" and its
+        /// Key_Group_Member rows, matching <c>Attribute_Ref</c> (mirrors
+        /// <see cref="TableTypeMonitorService.IsAttributeInPrimaryKey"/>). Used to
+        /// resolve a "column is PK" DEPENDS_ON condition for naming Template rules.
+        /// </summary>
+        private bool IsAttributePrimaryKeyMember(dynamic entity, string attrObjectId)
+        {
+            if (entity == null || string.IsNullOrEmpty(attrObjectId)) return false;
+            bool pkKgFound = false;
+            bool matched = false;
+            var memberRefs = new List<string>();
+            var kgTypesSeen = new List<string>();
+            try
+            {
+                dynamic modelObjects = _session.ModelObjects;
+                dynamic groups = modelObjects.Collect(entity, "Key_Group");
+                if (groups != null)
+                {
+                    foreach (dynamic kg in groups)
+                    {
+                        if (kg == null) continue;
+                        string kgType;
+                        try { kgType = kg.Properties("Key_Group_Type").Value?.ToString(); }
+                        catch { continue; }
+                        kgTypesSeen.Add(kgType ?? "<null>");
+                        if (!string.Equals(kgType, "PK", StringComparison.OrdinalIgnoreCase)) continue;
+
+                        pkKgFound = true;
+                        dynamic members = modelObjects.Collect(kg, "Key_Group_Member");
+                        if (members != null)
+                        {
+                            foreach (dynamic m in members)
+                            {
+                                string memberRef;
+                                try { memberRef = m.Properties("Attribute_Ref").Value?.ToString(); }
+                                catch { continue; }
+                                memberRefs.Add(memberRef ?? "<null>");
+                                if (string.Equals(memberRef, attrObjectId, StringComparison.OrdinalIgnoreCase))
+                                    matched = true;
+                            }
+                        }
+                        break; // exactly one PK Key_Group per entity
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"IsAttributePrimaryKeyMember err for '{attrObjectId}': {ex.Message}");
+            }
+            // Diagnostic (per column-change, bounded): shows WHY membership is false -
+            // no PK key-group, empty members, or Attribute_Ref vs ObjectId mismatch.
+            LogDebug($"[PK-WALK] attr='{attrObjectId}' pkKgFound={pkKgFound} matched={matched} kgTypes=[{string.Join(",", kgTypesSeen)}] pkMembers=[{string.Join(",", memberRefs)}]");
+            return matched;
+        }
+
+        /// <summary>
         /// Reads a built-in property value off a SCAPI object by PROPERTY_CODE.
         /// Returns "" when the property is unset (erwin throws on sparse storage)
         /// or absent; the Template renderer treats "" as an unresolved token
@@ -5004,6 +5121,284 @@ namespace EliteSoft.Erwin.AddIn.Services
             throw new TemplateResolutionException(
                 $"{alias}.{propertyCode}",
                 $"alias '{alias}' navigates Column -> {toType}, which has no runtime navigation in this version");
+        }
+
+        /// <summary>
+        /// Applies active Template naming rules for the "PRIMARY KEY" governance
+        /// object type to an entity's primary-key constraint. PRIMARY KEY maps to
+        /// erwin's <c>Key_Group</c> class filtered to <c>Key_Group_Type == "PK"</c>
+        /// (INDEX/AK key groups share the class, so the type filter is mandatory -
+        /// there is exactly one PK Key_Group per entity). Renders and writes the
+        /// rule's configured target property (<c>rule.PropertyCode</c>, set by the
+        /// admin - e.g. <c>PK_{Table.Name}</c>) via SCAPI. The applier is generic
+        /// about the property code; whether a given code (e.g. <c>Physical_Name</c>
+        /// vs <c>Name</c>) is writable on a Key_Group is an erwin-metamodel fact the
+        /// admin rule must get right - a non-writable code throws and is suppressed
+        /// (logged once per session). Same APPLY_ON / DEPENDS_ON gating, FILL_MODE,
+        /// idempotency and NO-FALLBACK contract as <see cref="ApplyColumnTemplateRules"/>.
+        /// </summary>
+        /// <param name="entity">Owning Entity (the parent table) - in scope so a
+        /// <c>{Table.*}</c> token resolves without a reverse lookup.</param>
+        /// <param name="modelObjects">SCAPI ModelObjects for the Key_Group collect.</param>
+        /// <param name="tableName">The entity's name (log/prompt).</param>
+        private void ApplyPrimaryKeyRules(dynamic entity, dynamic modelObjects, string tableName)
+        {
+            IReadOnlyList<NamingStandardRule> templateRules;
+            IReadOnlyList<string> pkPropertyCodes;
+            try
+            {
+                templateRules = NamingStandardService.Instance.GetTemplateRules("PRIMARY KEY");
+                pkPropertyCodes = NamingStandardService.Instance.GetPropertyCodes("PRIMARY KEY");
+            }
+            catch (Exception ex)
+            {
+                Log($"[PK-TEMPLATE-ERROR] table='{tableName}': loading PRIMARY KEY rules failed: {ex.Message}");
+                return;
+            }
+            bool hasTemplate = templateRules != null && templateRules.Count > 0;
+            bool hasNonTemplate = pkPropertyCodes != null && pkPropertyCodes.Count > 0;
+            // Pre-filter (no full walk): no PK naming rules at all -> no Key_Group collect.
+            if (!hasTemplate && !hasNonTemplate) return;
+
+            // Find THE primary-key Key_Group: Key_Group_Type == "PK". INDEX/AK key
+            // groups are the same SCAPI class, so this filter is mandatory.
+            dynamic pkKg = null;
+            try
+            {
+                dynamic keyGroups = modelObjects.Collect(entity, "Key_Group");
+                if (keyGroups != null)
+                {
+                    foreach (dynamic kg in keyGroups)
+                    {
+                        if (kg == null) continue;
+                        string kgType;
+                        try { kgType = kg.Properties("Key_Group_Type").Value?.ToString(); }
+                        catch { continue; }
+                        if (string.Equals(kgType, "PK", StringComparison.OrdinalIgnoreCase)) { pkKg = kg; break; }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"[PK-TEMPLATE] table='{tableName}': Key_Group collect failed: {ex.Message}");
+                return;
+            }
+            if (pkKg == null) return; // table has no primary key
+
+            string pkId;
+            try { pkId = pkKg.ObjectId?.ToString() ?? ""; } catch { pkId = ""; }
+            // First sight of this PK == the Create moment for APPLY_ON gating.
+            bool treatAsNew = !string.IsNullOrEmpty(pkId) && _pkTemplateSeen.Add(pkId);
+
+            foreach (var rule in templateRules)
+            {
+                try
+                {
+                    // A write that already failed this session (e.g. the rule's
+                    // target PropertyCode is not writable on a Key_Group) is not
+                    // retried every tick - that would only spam the log.
+                    string failKey = pkId + "|" + rule.Id;
+                    if (_pkTemplateWriteFailed.Contains(failKey)) continue;
+
+                    if (!NamingValidationEngine.MatchesApplyOn(rule, treatAsNew)) continue;
+                    if (!NamingValidationEngine.IsRuleApplicable(rule, "PRIMARY KEY", pkKg))
+                    {
+                        // Log the condition reason once per PK (first sight only) so a
+                        // never-firing conditional rule is diagnosable without spamming
+                        // the per-heartbeat scoped path.
+                        if (treatAsNew)
+                            LogDebug($"[PK-TEMPLATE-COND] table='{tableName}' rule#{rule.Id} not applied: {NamingValidationEngine.DescribeApplicability(rule, "PRIMARY KEY", pkKg)}");
+                        continue;
+                    }
+
+                    string targetCode = rule.PropertyCode;
+
+                    // Self-referential template guard: a template that reads its own
+                    // target property (e.g. value 'PK_{Physical_Name}' targeting
+                    // Physical_Name) feeds its previous output back in every render,
+                    // so under FILL_MODE=Always it grows without bound and writes a
+                    // transaction every heartbeat (cursor flicker). Refuse it once,
+                    // suppress further attempts, and tell the admin the fix.
+                    if (NamingTemplateEngine.ReferencesOwnProperty(rule.ValueTemplate, targetCode))
+                    {
+                        _pkTemplateWriteFailed.Add(failKey);
+                        Log($"[PK-TEMPLATE-SKIP] table='{tableName}' rule#{rule.Id}: template '{rule.ValueTemplate}' references its own target property '{targetCode}' (self-referential - would loop); suppressing. Use a related token like {{Table.Physical_Name}} instead.");
+                        continue;
+                    }
+
+                    string rendered;
+                    try
+                    {
+                        rendered = NamingTemplateEngine.Render(
+                            rule.ValueTemplate,
+                            ownCode => ReadScapiProperty(pkKg, ownCode),
+                            (alias, code) => ResolvePrimaryKeyRelatedProperty(entity, alias, code));
+                    }
+                    catch (TemplateResolutionException tex)
+                    {
+                        string msg = !string.IsNullOrWhiteSpace(rule.ErrorMessage)
+                            ? rule.ErrorMessage
+                            : $"could not resolve token '{{{tex.Token}}}'";
+                        Log($"[PK-TEMPLATE-SKIP] table='{tableName}' rule#{rule.Id} target='{targetCode}': {msg}");
+                        continue;
+                    }
+
+                    string currentVal = ReadScapiProperty(pkKg, targetCode);
+                    bool shouldWrite = NamingTemplateEngine.ShouldWrite(rule.TemplateFillMode, currentVal, out bool unknownMode);
+                    if (unknownMode)
+                    {
+                        Log($"[PK-TEMPLATE-SKIP] table='{tableName}' rule#{rule.Id}: unknown TEMPLATE_FILL_MODE '{rule.TemplateFillMode}'");
+                        continue;
+                    }
+                    if (!shouldWrite) continue;
+                    if (string.Equals(currentVal, rendered, StringComparison.Ordinal)) continue; // idempotent
+
+                    if (!rule.AutoApply)
+                    {
+                        var answer = AddinMessageDialog.Show(
+                            $"Apply naming template to the primary key of '{tableName}'?\n\nSet {targetCode} to:\n{rendered}",
+                            "Apply Naming Template",
+                            MessageBoxButtons.YesNo,
+                            MessageBoxIcon.Question);
+                        if (answer != DialogResult.Yes) continue;
+                    }
+
+                    int transId = _session.BeginNamedTransaction("ApplyPrimaryKeyTemplate");
+                    try
+                    {
+                        pkKg.Properties(targetCode).Value = rendered;
+                        _session.CommitTransaction(transId);
+                        Log($"[PK-TEMPLATE-APPLY] table='{tableName}' rule#{rule.Id} {targetCode}='{rendered}'");
+                    }
+                    catch (Exception wex)
+                    {
+                        try { _session.RollbackTransaction(transId); }
+                        catch (Exception rex) { Log($"[PK-TEMPLATE-ERROR] table='{tableName}' rule#{rule.Id}: rollback failed: {rex.Message}"); }
+                        // Likely a persistent config error (PropertyCode not writable
+                        // on a Key_Group). Record it so we do not retry + spam the log;
+                        // cleared on the next rebaseline / reconnect.
+                        _pkTemplateWriteFailed.Add(failKey);
+                        Log($"[PK-TEMPLATE-ERROR] table='{tableName}' rule#{rule.Id}: writing '{targetCode}' failed (suppressing further attempts this session): {wex.Message}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log($"[PK-TEMPLATE-ERROR] table='{tableName}' rule#{rule.Id}: {ex.GetType().Name}: {ex.Message}");
+                }
+            }
+
+            // Non-template naming rules (Prefix/Suffix/Length/Regexp/Required) on the
+            // PK's rule-targeted properties. Mirrors the Index flow
+            // (CheckEntityKeyGroups): baseline on first sight, then auto-apply
+            // prefix/suffix + validate-warn on a value change (snapshot-gated; no
+            // required-field force-fill - warn-only, like the Index path). Generic
+            // over PropertyCode (the admin sets the target, usually Physical_Name).
+            if (hasNonTemplate)
+            {
+                foreach (var propertyCode in pkPropertyCodes)
+                {
+                    try
+                    {
+                        string curVal = ReadScapiProperty(pkKg, propertyCode);
+                        string snapKey = pkId + "|" + propertyCode;
+                        bool propIsNew = !_pkPropertySnapshots.ContainsKey(snapKey);
+                        bool propChanged = !propIsNew && !string.Equals(_pkPropertySnapshots[snapKey], curVal, StringComparison.Ordinal);
+
+                        if (propIsNew)
+                        {
+                            // First sight: baseline only. Do not validate a pre-existing
+                            // value the user has not touched (same as the Index flow).
+                            _pkPropertySnapshots[snapKey] = curVal;
+                            continue;
+                        }
+                        if (!propChanged) continue;
+
+                        // Auto-apply prefix/suffix (AutoApply rules) on the changed value.
+                        if (NamingValidationEngine.HasAutoApplyChanges("PRIMARY KEY", curVal, (object)pkKg, propertyCode: propertyCode))
+                        {
+                            string newVal = NamingValidationEngine.ApplyNamingStandards("PRIMARY KEY", curVal, (object)pkKg, propertyCode: propertyCode);
+                            if (!string.Equals(newVal, curVal, StringComparison.Ordinal))
+                            {
+                                var answer = AddinMessageDialog.Show(
+                                    $"Naming standard requires a change for the primary key of '{tableName}':\n\n{propertyCode}: '{curVal}' -> '{newVal}'\n\nApply automatically?",
+                                    "Naming Standard - Auto Apply",
+                                    MessageBoxButtons.YesNo,
+                                    MessageBoxIcon.Question);
+                                if (answer == DialogResult.Yes)
+                                {
+                                    int tx = _session.BeginNamedTransaction("ApplyPrimaryKeyNaming");
+                                    try
+                                    {
+                                        pkKg.Properties(propertyCode).Value = newVal;
+                                        _session.CommitTransaction(tx);
+                                        Log($"[PK-NAMING-APPLY] table='{tableName}' {propertyCode} '{curVal}' -> '{newVal}'");
+                                        curVal = newVal;
+                                    }
+                                    catch (Exception wex)
+                                    {
+                                        try { _session.RollbackTransaction(tx); }
+                                        catch (Exception rex) { Log($"[PK-NAMING-ERROR] table='{tableName}': rollback failed: {rex.Message}"); }
+                                        Log($"[PK-NAMING-ERROR] table='{tableName}': writing '{propertyCode}' failed: {wex.Message}");
+                                    }
+                                }
+                            }
+                        }
+
+                        // Validate the (possibly auto-applied) value. Violations go to the
+                        // consolidated warning popup - warn-only, no force-fill.
+                        var results = NamingValidationEngine.ValidateObjectName("PRIMARY KEY", curVal, (object)pkKg, propertyCode);
+                        if (results != null)
+                        {
+                            foreach (var r in results)
+                            {
+                                if (r.IsValid) continue;
+                                Log($"[PK-NAMING] violation ({r.RuleName}): {tableName}.{curVal} - {r.ErrorMessage}");
+                                _pendingResults.Add(new CollectedValidationResult
+                                {
+                                    ValidationType = CollectedValidationResultType.NamingStandard,
+                                    TableName = tableName,
+                                    ColumnName = curVal,
+                                    Message = $"[Primary Key] {r.ErrorMessage}"
+                                });
+                            }
+                        }
+
+                        _pkPropertySnapshots[snapKey] = curVal;
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"[PK-NAMING-ERROR] table='{tableName}' property='{propertyCode}': {ex.GetType().Name}: {ex.Message}");
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Resolves a <c>{Alias.PropertyCode}</c> token for a PRIMARY KEY: maps the
+        /// alias via the global <c>MC_OBJECT_RELATION</c> catalog then reads the
+        /// related object's property. v1 supports PRIMARY KEY -> TABLE (the owning
+        /// entity, already in scope). Unknown alias / unsupported navigation is a
+        /// hard error (no-fallback), never a silent skip.
+        /// </summary>
+        private string ResolvePrimaryKeyRelatedProperty(dynamic entity, string alias, string propertyCode)
+        {
+            string toType = ObjectRelationCatalog.Instance.ResolveAlias("PRIMARY KEY", alias);
+            if (string.IsNullOrEmpty(toType))
+            {
+                throw new TemplateResolutionException(
+                    $"{alias}.{propertyCode}",
+                    $"alias '{alias}' is not defined in MC_OBJECT_RELATION for object type 'PRIMARY KEY'");
+            }
+
+            if (string.Equals(toType, "TABLE", StringComparison.OrdinalIgnoreCase))
+            {
+                // Parent table is the owning entity, already in scope - no reverse walk.
+                return ReadScapiProperty(entity, propertyCode);
+            }
+
+            throw new TemplateResolutionException(
+                $"{alias}.{propertyCode}",
+                $"alias '{alias}' navigates PRIMARY KEY -> {toType}, which has no runtime navigation in this version");
         }
 
         /// <summary>
@@ -7972,6 +8367,14 @@ namespace EliteSoft.Erwin.AddIn.Services
             try { OnLog?.Invoke(message); } catch { }
             System.Diagnostics.Debug.WriteLine(message);
         }
+
+        // Verbose, per-column-change diagnostic logging ([PK-WALK], [TEMPLATE-COND]).
+        // The [Conditional] attribute makes the C# compiler omit every call to this
+        // method - and the evaluation of its interpolated arguments - from builds
+        // where DEV_DIAGNOSTICS is undefined, i.e. packaged (production) builds. So
+        // these traces aid development without ever reaching the shipped log file.
+        [System.Diagnostics.Conditional("DEV_DIAGNOSTICS")]
+        private void LogDebug(string message) => Log(message);
 
         #endregion
 

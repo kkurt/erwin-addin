@@ -706,4 +706,78 @@ public class NamingStandardEngineTests
         }
         finally { NamingStandardService.Instance.SeedForTesting(System.Array.Empty<NamingStandardRule>()); }
     }
+
+    // ---- PK-membership condition (column-is-PK, resolved via Key_Group walk) ----
+    // Pure: these exercise the static condition logic only (no singleton, no SCAPI).
+
+    private static NamingStandardRule PkConditionRule(string propCode)
+        => new()
+        {
+            Id = 1,
+            ObjectType = "Column",
+            PropertyCode = "Physical_Name",
+            RuleType = NamingRuleKind.Template,
+            ValueTemplate = "PK_{Table.Physical_Name}",
+            TemplateFillMode = "Always",
+            AutoApply = true,
+            ApplyOn = RuleApplyOn.Both,
+            IsActive = true,
+            DependsOnPropertyDefId = 99,
+            DependsOnPropertyCode = propCode,
+            DependsOnPropertyValues = "True",
+        };
+
+    [Theory]
+    [InlineData("IsPrimaryKey")]
+    [InlineData("Is_PK")]
+    [InlineData("Primary_Key")]
+    [InlineData("primary_key")] // case-insensitive
+    public void IsPkMembershipCondition_true_for_pk_property_codes(string code)
+        => NamingValidationEngine.IsPkMembershipCondition(PkConditionRule(code)).Should().BeTrue();
+
+    [Fact]
+    public void IsPkMembershipCondition_false_for_ordinary_property()
+        => NamingValidationEngine.IsPkMembershipCondition(PkConditionRule("Physical_Data_Type")).Should().BeFalse();
+
+    [Fact]
+    public void IsPkMembershipCondition_false_when_source_is_a_udp()
+    {
+        var rule = PkConditionRule("Is_PK");
+        rule.DependsOnPropertyDefId = null;     // not a built-in property source
+        rule.DependsOnUdpId = 5;                // a UDP source instead
+        rule.DependsOnUdpName = "Is_PK";
+        NamingValidationEngine.IsPkMembershipCondition(rule).Should().BeFalse();
+    }
+
+    [Fact]
+    public void IsRuleApplicable_pk_condition_uses_caller_resolved_membership()
+    {
+        var rule = PkConditionRule("IsPrimaryKey"); // cond: IsPrimaryKey in [True]
+        // No SCAPI object needed: the PK answer comes from the caller, not a read.
+        NamingValidationEngine.IsRuleApplicable(rule, "Column", scapiObject: null, pkMembership: true).Should().BeTrue();
+        NamingValidationEngine.IsRuleApplicable(rule, "Column", scapiObject: null, pkMembership: false).Should().BeFalse();
+    }
+
+    [Fact]
+    public void IsRuleApplicable_pk_condition_without_membership_falls_back_and_is_not_applicable()
+    {
+        // null override + null object → the old property-read path → "" → not applicable.
+        var rule = PkConditionRule("IsPrimaryKey");
+        NamingValidationEngine.IsRuleApplicable(rule, "Column", scapiObject: null, pkMembership: null).Should().BeFalse();
+    }
+
+    [Fact]
+    public void IsRuleApplicable_unconditional_rule_applies_regardless_of_membership()
+    {
+        var rule = new NamingStandardRule
+        {
+            Id = 2,
+            ObjectType = "Column",
+            PropertyCode = "Physical_Name",
+            RuleType = NamingRuleKind.Template,
+            IsActive = true,
+            ApplyOn = RuleApplyOn.Both,
+        };
+        NamingValidationEngine.IsRuleApplicable(rule, "Column", scapiObject: null, pkMembership: null).Should().BeTrue();
+    }
 }
