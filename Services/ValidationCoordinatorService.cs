@@ -318,6 +318,28 @@ namespace EliteSoft.Erwin.AddIn.Services
             new HashSet<string>(StringComparer.Ordinal);
 
         /// <summary>
+        /// Creation-cascade continuation (2026-07-02). A Create-context scoped check can
+        /// RENAME the entity (auto/confirmed Prefix/Suffix apply). That rename re-fires
+        /// the scoped check via ScanForRenamesEventDriven on a LATER tick - after
+        /// ValidateCommittedPendingAttrs' finally has already cleared
+        /// <see cref="_creationGestureEntityIds"/> - so the follow-up check used to run
+        /// as isNew=false and silently dropped every remaining ApplyOn=Create rule
+        /// (e.g. Create-only Prefix applied, then the Create-only Suffix never fired).
+        /// User semantic: ALL checks in the chain triggered by one creation gesture must
+        /// see the object's INITIAL state (Create), regardless of how many add-in
+        /// renames the chain contains.
+        /// Armed in RunScopedTableNamingCheckCore when a Create-context check renamed
+        /// the entity; disarmed at the first Create-context check that no longer renames
+        /// (fixed point - the cascade is over) or when the entity disappears. Read by
+        /// <see cref="IsEntityInCreationGesture"/> and the rename-scan isNew bridge, so
+        /// every follow-up trigger (rename scan, editor close, heartbeat) upgrades to
+        /// isNew=true while the cascade is live. Keyed by entity ObjectId, which is
+        /// stable across renames.
+        /// </summary>
+        private readonly HashSet<string> _creationCascadeEntityIds =
+            new HashSet<string>(StringComparer.Ordinal);
+
+        /// <summary>
         /// True when the column's Physical_Name is still in erwin's
         /// placeholder state (just created, no user-typed name yet).
         /// Mirrors the early-return guard in ValidateGlossary so the
@@ -386,6 +408,13 @@ namespace EliteSoft.Erwin.AddIn.Services
         // separate from the term-type dict so the two machines never share/clobber
         // each other's "last attempt" state). Reuses TermTypeDedupSeconds.
         private readonly Dictionary<string, (string attempt, DateTime when)> _allowedDatatypeRecentAttempts
+            = new Dictionary<string, (string, DateTime)>(StringComparer.OrdinalIgnoreCase);
+
+        // The datatype the USER picked in the AllowedDatatypePickerForm for this
+        // attribute, remembered so erwin's delayed SECOND combo-commit (the dedup
+        // duplicate, popup suppressed) re-enforces the USER's choice - not the
+        // automatic fallback, which would silently clobber what they just picked.
+        private readonly Dictionary<string, (string pick, DateTime when)> _allowedDatatypeUserPicks
             = new Dictionary<string, (string, DateTime)>(StringComparer.OrdinalIgnoreCase);
 
         // Snapshot of Key_Group (Index) names for naming standard checks
@@ -537,7 +566,10 @@ namespace EliteSoft.Erwin.AddIn.Services
         internal bool IsEntityInCreationGesture(string tableName)
         {
             if (string.IsNullOrEmpty(tableName)) return false;
-            if (_creationGestureEntityIds.Count == 0) return false;
+            // Live while EITHER the placeholder-commit gesture OR the
+            // rename-continuation cascade holds the entity (see
+            // _creationCascadeEntityIds doc).
+            if (_creationGestureEntityIds.Count == 0 && _creationCascadeEntityIds.Count == 0) return false;
             if (_session == null || _sessionLost) return false;
 
             dynamic mmObj = null, mmRoot = null, mmEntities = null;
@@ -556,7 +588,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                     if (!EntityNameMatchesTitle(nm, tableName)) continue;
                     string eid = null;
                     try { eid = e.ObjectId?.ToString(); } catch { break; }
-                    return !string.IsNullOrEmpty(eid) && _creationGestureEntityIds.Contains(eid);
+                    return !string.IsNullOrEmpty(eid)
+                        && (_creationGestureEntityIds.Contains(eid) || _creationCascadeEntityIds.Contains(eid));
                 }
                 return false;
             }
@@ -587,6 +620,15 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             if (_isMonitoring) return;
             _isMonitoring = true;
+
+            // Let the (static) naming engine resolve MODEL-scoped condition UDPs
+            // against THIS model's root. A naming-rule condition can depend on a UDP
+            // that lives on the model rather than the rule's target object (e.g. an
+            // "Application" model UDP gating a TABLE prefix model-wide); the engine
+            // falls back to this root only when the entity/column read reports the
+            // property is not on that class. Refreshed every connect so it always
+            // points at the active model.
+            NamingValidationEngine.ModelRootProvider = () => _session?.ModelObjects?.Root;
 
             // Re-arm the one-shot MODEL required-UDP check for this connect, so a
             // model switch / reconnect re-validates the new model. (Harmless if the
@@ -1733,7 +1775,15 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 // isNew=false → "Revert Change".
                                 bool wasPending = _pendingNamedEntities.Remove(entityId);
                                 _pendingEntityAddedAt.Remove(entityId);
-                                bool entityIsNew = wasPending;
+                                // Placeholder-origin (prev name "E/17"/"<default>"/"") is a
+                                // creation commit even if the pending set was already
+                                // drained - keeps Create-only rules alive whose condition
+                                // (Owner/Schema) is filled during Required-UDP after the
+                                // first check (see the inline-edit-close scan bridge).
+                                bool entityIsNew = wasPending
+                                    || _creationGestureEntityIds.Contains(entityId)
+                                    || _creationCascadeEntityIds.Contains(entityId)
+                                    || IsPlaceholderEntityName(prevDisplayName);
 
                                 entitiesToNamingCheck.Add((displayName, entityIsNew));
                                 Log($"[NAMING] entity renamed '{prevDisplayName}' -> '{displayName}' - queuing naming check (isNew={entityIsNew})");
@@ -1782,6 +1832,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                         _entityDisplayNameSnapshot.Remove(id);
                         _pendingNamedEntities.Remove(id);
                         _pendingEntityAddedAt.Remove(id);
+                        // A deleted entity can never be disarmed by a scoped check
+                        // (nothing resolves to it by name any more) - GC its gesture/
+                        // cascade ids here so a leaked id cannot keep the
+                        // IsEntityInCreationGesture fast path (Count==0) defeated and
+                        // force a full entity walk on every later naming check.
+                        _creationGestureEntityIds.Remove(id);
+                        _creationCascadeEntityIds.Remove(id);
                         // Drop pending attr timestamps belonging to the
                         // disappearing entity so the dictionary doesn't grow
                         // unbounded across long sessions.
@@ -2428,10 +2485,20 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // ONE consolidated modal (Vp prefix is Create / Both
                     // so it lands together with whatever Create-side
                     // Suffix the active TableClass dictates, if any).
-                    bool inCreationGesture = _creationGestureEntityIds.Contains(id);
-                    bool entityIsNew = wasPending || inCreationGesture;
+                    bool inCreationGesture = _creationGestureEntityIds.Contains(id)
+                        || _creationCascadeEntityIds.Contains(id);
+                    // A rename whose OLD name is an erwin placeholder ("E/17", "<default>",
+                    // "") is unambiguously the first real naming of a new entity - the
+                    // creation commit - even if the pending/gesture sets were already
+                    // drained. Required-UDP flow (which can set the very properties a
+                    // Create-only rule conditions on, e.g. Owner/Schema) runs BETWEEN the
+                    // commit-edge check and this inline-edit-close scan, so without this
+                    // the settle check ran isNew=false and Create rules whose condition
+                    // only just became true (SCHEMA.Name=DM) never fired (Furkan rule#1175).
+                    bool fromPlaceholder = IsPlaceholderEntityName(oldName);
+                    bool entityIsNew = wasPending || inCreationGesture || fromPlaceholder;
                     if (entityIsNew)
-                        Log($"  rename '{oldName}' -> '{newName}' is placeholder commit (wasPending={wasPending}, inCreationGesture={inCreationGesture}) - treating as new-entity creation flow (isNew=true)");
+                        Log($"  rename '{oldName}' -> '{newName}' is placeholder commit (wasPending={wasPending}, inCreationGesture={inCreationGesture}, fromPlaceholder={fromPlaceholder}) - treating as new-entity creation flow (isNew=true)");
 
                     try { RunScopedTableNamingCheck(newName, isNew: entityIsNew); }
                     catch (Exception ex) { Log($"ScanForRenamesEventDriven scoped check err for '{newName}': {ex.Message}"); }
@@ -4353,8 +4420,74 @@ namespace EliteSoft.Erwin.AddIn.Services
                     if (!EntityNameMatchesTitle(nameForMatch, tableName))
                         continue;
 
+                    // Read the id BEFORE ValidateNamingStandard, while the entity is
+                    // guaranteed alive: a Required-popup Cancel inside the call can
+                    // DELETE the entity, and a dead COM proxy may throw on ObjectId -
+                    // which would skip the disarm below and leak an armed cascade id
+                    // for the rest of the connect (adversarial review 2026-07-02).
+                    string cascadeId = null;
+                    try { cascadeId = entity.ObjectId?.ToString(); } catch { /* keep null */ }
+
+                    // Authoritative Create-context upgrade by OBJECT ID: the name-based
+                    // wrapper probe is first-match-wins and can hit a same-named sibling;
+                    // this id-based check binds the cascade to the exact entity we are
+                    // about to validate.
+                    if (!isNew && !string.IsNullOrEmpty(cascadeId)
+                        && (_creationGestureEntityIds.Contains(cascadeId) || _creationCascadeEntityIds.Contains(cascadeId)))
+                    {
+                        Log($"Scoped naming check: '{nameForMatch}' is in the creation gesture/cascade (id match) - upgrading isNew to True");
+                        isNew = true;
+                    }
+
                     Log($"Scoped naming check on '{nameForMatch}' (isNew={isNew})");
                     _tableTypeMonitor.ValidateNamingStandard("Table", nameForMatch, entity, baselineOverride: baselineOverride, isNew: isNew);
+
+                    // Creation-cascade continuation: if THIS Create-context check just
+                    // renamed the entity (a Prefix/Suffix rule fired), the rename will
+                    // re-trigger the scoped check on a later tick - and that follow-up
+                    // must STILL see Create (see _creationCascadeEntityIds doc). Arm the
+                    // cascade on rename; disarm at the first stable (no-rename) check -
+                    // the fixed point where the chain is over and later edits are
+                    // genuine updates. A deleted entity (GetTableName empty/throw) also
+                    // disarms, so a cancelled new table cannot leak an armed id.
+                    // Live name AFTER validation, read once for the cascade decision
+                    // AND the discard gate below. Empty = the entity no longer exists
+                    // (a live entity always carries at least a placeholder name).
+                    string liveAfter = null;
+                    try { liveAfter = GetTableName(entity); }
+                    catch { /* deleted during the check (required-cancel) */ }
+
+                    if (isNew && !string.IsNullOrEmpty(cascadeId))
+                    {
+                        bool renamedDuringCheck = !string.IsNullOrEmpty(liveAfter)
+                            && !string.Equals(liveAfter, nameForMatch, StringComparison.Ordinal);
+                        if (renamedDuringCheck)
+                        {
+                            if (_creationCascadeEntityIds.Add(cascadeId))
+                                Log($"Creation cascade armed: '{nameForMatch}' -> '{liveAfter}' renamed during Create-context check; follow-up checks stay isNew=true");
+                        }
+                        else if (_creationCascadeEntityIds.Remove(cascadeId))
+                        {
+                            Log($"Creation cascade complete for '{nameForMatch}' - name stable, later checks run as Update");
+                        }
+                    }
+
+                    // Discard gate: a Required prompt inside ValidateNamingStandard can
+                    // DELETE the entity (user clicked Discard). Every pending warning
+                    // for it must be cancelled - a dead proxy's Key_Group collect can
+                    // return EMPTY instead of throwing, which would surface a bogus
+                    // "PK required" popup for a table that no longer exists.
+                    if (string.IsNullOrEmpty(liveAfter))
+                    {
+                        Log($"Scoped naming check: '{nameForMatch}' no longer exists after validation (discarded) - skipping remaining checks");
+                        return;
+                    }
+
+                    // PRIMARY KEY existence is per-table (not the model-wide
+                    // CheckRequiredObjectTypesExist): warn if THIS table owns no PK.
+                    // Same scoped trigger + isNew as the name check, so it honours
+                    // APPLY_ON and fires on editor-close / Model-Explorer name-commit.
+                    _tableTypeMonitor.CheckTablePrimaryKeyRequired(entity, modelObjects, nameForMatch, isNew);
                     return;
                 }
             }
@@ -6601,6 +6734,16 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// revert + snapshot-advance + double-commit dedup. See
         /// reference_datatype_library_unimplemented.
         /// </summary>
+        /// <summary>Base token to preselect in the datatype picker: the value now in
+        /// the model (fallback: the intended target), stripped of any parameter -
+        /// "char(18)" -> "char" - so the combo lands on the matching whitelist entry.</summary>
+        private static string AllowedDatatypePickerFormPreselect(string live, string target)
+        {
+            string src = !string.IsNullOrEmpty(live) ? live : (target ?? "");
+            int p = src.IndexOf('(');
+            return (p > 0 ? src.Substring(0, p) : src).Trim();
+        }
+
         private void EnforceAllowedDatatypeWhitelist(dynamic attr, AttributeValidationSnapshot prev, AttributeValidationSnapshot curr)
         {
             // No whitelist configured for this config -> defer to DBMS-level policy.
@@ -6659,6 +6802,19 @@ namespace EliteSoft.Erwin.AddIn.Services
             if (!string.IsNullOrEmpty(objId))
                 _allowedDatatypeRecentAttempts[objId] = (attempted, DateTime.UtcNow);
 
+            // erwin's delayed second combo-commit re-applies the DISALLOWED value with
+            // the popup suppressed. Re-enforce with what the user just PICKED in the
+            // picker dialog (if any), not the automatic fallback - otherwise the
+            // duplicate would silently replace their choice.
+            if (suppressPopup
+                && !string.IsNullOrEmpty(objId)
+                && _allowedDatatypeUserPicks.TryGetValue(objId, out var remembered)
+                && (DateTime.UtcNow - remembered.when).TotalSeconds < TermTypeDedupSeconds * 4
+                && AllowedDatatypeService.Instance.IsAllowed(remembered.pick))
+            {
+                target = remembered.pick;
+            }
+
             if (string.IsNullOrEmpty(target))
             {
                 // HasRestriction guarantees a non-empty list, so GetFallbackDatatype returns a
@@ -6700,30 +6856,67 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                 if (!suppressPopup)
                 {
-                    if (roundTripped)
+                    // Let the user pick the allowed replacement (2026-07-02 request):
+                    // combo of the whitelist, parameter input for parameterized types.
+                    // The safe automatic value is ALREADY in the model (written above),
+                    // so the invariant "never hold a disallowed type" holds while the
+                    // modal is up; Cancel simply keeps it.
+                    string pickMessage = roundTripped
+                        ? $"Column '{curr?.TableName}.{curr?.PhysicalName}': datatype '{attempted}' is not in the allowed datatype list for this configuration.\n\n" +
+                          $"Choose the allowed datatype to use (Cancel keeps '{liveAfterWrite}')."
+                        : $"Column '{curr?.TableName}.{curr?.PhysicalName}': datatype '{attempted}' is not allowed, and the configured allowed type '{target}' could not be applied (the model now holds '{liveAfterWrite}').\n\n" +
+                          $"Choose an allowed datatype, and ask your administrator to check the Datatype Library entry for this DBMS.";
+
+                    string pickPreselect = AllowedDatatypePickerFormPreselect(liveAfterWrite, target);
+                    var pickRc = Forms.AllowedDatatypePickerForm.Show(
+                        "Datatype not allowed",
+                        pickMessage,
+                        AllowedDatatypeService.Instance.Allowed,
+                        pickPreselect,
+                        Forms.AllowedDatatypePickerForm.ExtractParameter(attempted),
+                        out string userPick);
+
+                    if (pickRc == DialogResult.OK
+                        && !string.IsNullOrEmpty(userPick)
+                        && !string.Equals(userPick, liveAfterWrite, StringComparison.Ordinal))
                     {
-                        string verb = canRestore ? "was reverted" : "was changed to an allowed type";
-                        string tail = canRestore ? $"Restored: {target}" : $"Set to: {target}";
-                        AddinMessageDialog.Show(
-                            $"Column '{curr?.TableName}.{curr?.PhysicalName}': datatype '{attempted}' is not in the allowed datatype list for this configuration and {verb}.\n\n" +
-                            tail,
-                            "Datatype not allowed",
-                            MessageBoxButtons.OK,
-                            MessageBoxIcon.Warning);
+                        int pickTrans = _session.BeginNamedTransaction("EnforceAllowedDatatypeUserPick");
+                        try
+                        {
+                            attr.Properties("Physical_Data_Type").Value = userPick;
+                            _session.CommitTransaction(pickTrans);
+
+                            string liveAfterPick = userPick;
+                            try { liveAfterPick = attr.Properties("Physical_Data_Type").Value?.ToString() ?? userPick; }
+                            catch (Exception reEx) { Log($"AllowedDatatype: re-read after user pick failed for {curr?.PhysicalName}: {reEx.Message}"); }
+                            curr.PhysicalDataType = liveAfterPick;
+                            liveAfterWrite = liveAfterPick;
+
+                            bool pickRoundTripped = AllowedDatatypeService.Instance.IsAllowed(liveAfterPick);
+                            Log($"AllowedDatatype: {curr?.TableName}.{curr?.PhysicalName} user picked '{userPick}'" +
+                                $"{(string.Equals(liveAfterPick, userPick, StringComparison.Ordinal) ? "" : $" (erwin stored '{liveAfterPick}')")}" +
+                                $"{(pickRoundTripped ? "" : " - WARNING: stored value still not allowed")}");
+                            if (!pickRoundTripped)
+                            {
+                                AddinMessageDialog.Show(
+                                    $"Column '{curr?.TableName}.{curr?.PhysicalName}': the picked datatype '{userPick}' could not be applied cleanly (the model now holds '{liveAfterPick}').\n\n" +
+                                    $"Ask your administrator to check the Datatype Library entry for this DBMS.",
+                                    "Datatype not allowed",
+                                    MessageBoxButtons.OK,
+                                    MessageBoxIcon.Warning);
+                            }
+                        }
+                        catch (Exception pickEx)
+                        {
+                            try { _session.RollbackTransaction(pickTrans); } catch { /* already closed */ }
+                            Log($"AllowedDatatype: user-pick write failed for {curr?.TableName}.{curr?.PhysicalName}: {pickEx.Message} - automatic value '{liveAfterWrite}' kept");
+                        }
                     }
-                    else
-                    {
-                        // The configured allowed type did not apply cleanly: erwin canonicalised it to
-                        // a value that is itself not in the list (a catalog/DBMS token mismatch). Do
-                        // not claim success or leave it buried in the log - tell the user so the
-                        // disallowed value the model now holds is visible, not silently swallowed.
-                        AddinMessageDialog.Show(
-                            $"Column '{curr?.TableName}.{curr?.PhysicalName}': datatype '{attempted}' is not allowed, and the configured allowed type '{target}' could not be applied (the model now holds '{liveAfterWrite}').\n\n" +
-                            $"Please pick an allowed datatype, and ask your administrator to check the Datatype Library entry for this DBMS.",
-                            "Datatype not allowed",
-                            MessageBoxButtons.OK,
-                            MessageBoxIcon.Warning);
-                    }
+
+                    // Remember the value now in force (user pick or the automatic one the
+                    // user accepted via Cancel) so the dedup duplicate re-enforces IT.
+                    if (!string.IsNullOrEmpty(objId))
+                        _allowedDatatypeUserPicks[objId] = (liveAfterWrite, DateTime.UtcNow);
 
                     // Re-stamp the dedup window AFTER the (blocking) modal closes so erwin's delayed
                     // 2nd combo-commit - processed only once this modal returns (the _isProcessingChange

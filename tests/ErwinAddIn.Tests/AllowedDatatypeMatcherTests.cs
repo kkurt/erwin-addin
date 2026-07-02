@@ -2,6 +2,8 @@ using System.Collections.Generic;
 
 using EliteSoft.Erwin.AddIn.Services;
 
+using Forms = EliteSoft.Erwin.AddIn.Forms;
+
 using FluentAssertions;
 
 using Xunit;
@@ -175,5 +177,55 @@ public class AllowedDatatypeMatcherTests
         // Empty seed -> no restriction.
         AllowedDatatypeService.Instance.HasRestriction.Should().BeFalse();
         AllowedDatatypeService.Instance.IsAllowed("anything").Should().BeTrue();
+    }
+}
+
+/// <summary>
+/// Pure-composition coverage for the AllowedDatatypePickerForm statics: the picker
+/// composes <c>base(param)</c> from the user's combo pick + parameter text, validates
+/// the parameter shape (n or n,m), and prefills from the attempted type's parameter.
+/// The WinForms chrome is not under test - only the value logic the enforcement
+/// writes into Physical_Data_Type.
+/// </summary>
+public class AllowedDatatypePickerLogicTests
+{
+    [Theory]
+    [InlineData("nvarchar", "50", "nvarchar(50)")]
+    [InlineData("NUMBER", "10,2", "NUMBER(10,2)")]
+    [InlineData("NUMBER", " 10 , 2 ", "NUMBER(10,2)")]   // spaces stripped inside param
+    [InlineData("int", "", "int")]                        // empty param -> bare base
+    [InlineData("int", null, "int")]
+    [InlineData(" date ", "", "date")]                    // base trimmed
+    [InlineData("", "50", "")]                            // no base -> nothing
+    public void Compose_builds_physical_datatype(string baseToken, string param, string expected)
+    {
+        Forms.AllowedDatatypePickerForm.Compose(baseToken, param).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("", true)]          // optional
+    [InlineData(null, true)]
+    [InlineData("18", true)]
+    [InlineData("10,2", true)]
+    [InlineData(" 10 , 2 ", true)]
+    [InlineData("abc", false)]
+    [InlineData("10,", false)]
+    [InlineData(",2", false)]
+    [InlineData("10,2,3", false)]
+    [InlineData("(18)", false)]
+    public void IsValidParameter_accepts_n_or_n_comma_m(string param, bool expected)
+    {
+        Forms.AllowedDatatypePickerForm.IsValidParameter(param).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("char(18)", "18")]
+    [InlineData("NUMBER(10,2)", "10,2")]
+    [InlineData("date", "")]
+    [InlineData("", "")]
+    [InlineData(null, "")]
+    public void ExtractParameter_pulls_parenthesized_part(string datatype, string expected)
+    {
+        Forms.AllowedDatatypePickerForm.ExtractParameter(datatype).Should().Be(expected);
     }
 }

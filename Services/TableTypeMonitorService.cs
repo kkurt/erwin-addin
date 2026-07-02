@@ -127,6 +127,14 @@ namespace EliteSoft.Erwin.AddIn.Services
         // on next model open.
         private readonly Dictionary<string, string> _dismissedRequiredKeys = new Dictionary<string, string>(StringComparer.Ordinal);
 
+        // Session-dismissal for the Step-2 manual (AUTO_APPLY=false) name-suggestion
+        // Yes/No. The creation cascade re-runs the scoped check after every add-in
+        // rename, and each re-run would re-ask the IDENTICAL declined suggestion.
+        // Keyed by ObjectId; value = the suggested name the user declined. A DIFFERENT
+        // suggestion (rules/name changed) naturally mismatches and asks again; an
+        // accepted suggestion clears the entry. Per-session, resets on model open.
+        private readonly Dictionary<string, string> _declinedNameSuggestions = new Dictionary<string, string>(StringComparer.Ordinal);
+
         // Property applicator for applying project standards to new tables
         private PropertyApplicatorService _propertyApplicator;
 
@@ -523,6 +531,15 @@ namespace EliteSoft.Erwin.AddIn.Services
                     continue;
                 }
 
+                if (IsPrimaryKeyObjectType(rule.ObjectType))
+                {
+                    // PRIMARY KEY existence is enforced PER-TABLE in
+                    // CheckTablePrimaryKeyRequired ("every table must own a PK"), NOT
+                    // model-wide - a model-wide "some PK exists somewhere" check is
+                    // meaningless for a table-owned object. Skip it here.
+                    continue;
+                }
+
                 // PRIMARY KEY shares the Key_Group SCAPI class with INDEX/AK, so its
                 // existence must additionally filter Key_Group_Type == "PK" - and cache
                 // under a distinct key so it does not share INDEX's any-Key_Group result.
@@ -581,6 +598,141 @@ namespace EliteSoft.Erwin.AddIn.Services
                 ? violations[0]
                 : "The model is missing required object types:\n\n - " + string.Join("\n - ", violations);
             AddinMessageDialog.Show(body, "Required object types", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+
+        /// <summary>True when a rule's object type denotes the table-owned PRIMARY KEY
+        /// (normalised, space/underscore-insensitive, e.g. "PRIMARY KEY").</summary>
+        private static bool IsPrimaryKeyObjectType(string objectType)
+            => string.Equals(
+                objectType?.Trim().ToUpperInvariant().Replace(' ', '_'),
+                "PRIMARY_KEY", StringComparison.Ordinal);
+
+        // Warn ONCE per entity while it lacks a PK. One "add a table" gesture re-fires
+        // the scoped check many times over several seconds - the commit check, then a
+        // fresh check after EACH naming auto-rename (Abc -> VpAbcLog -> PF_VpAbcLog as
+        // prefix rules become applicable) - and every one would pop the same PK warning.
+        // A fixed time debounce could not cover the whole (modal-stretched) chain, so we
+        // suppress by entity ObjectId for the lifetime of the PK-less state. Cleared for
+        // an entity as soon as it gains a PK, so removing the PK later warns again.
+        private readonly HashSet<string> _pkWarnedEntityIds =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Per-table PRIMARY KEY existence enforcement. A "Required PRIMARY KEY" rule
+        /// means EVERY table must own a primary key (a Key_Group with
+        /// Key_Group_Type == "PK"), not merely that the model contains one somewhere -
+        /// so this runs per entity on the scoped table check (Entity Editor close,
+        /// Model Explorer name-commit, diagram add-commit) rather than model-wide.
+        /// APPLY_ON is honoured via <paramref name="isNew"/> (Create = new tables only,
+        /// Update = existing/changed, Both = always). Warn-only: no auto-fix, mirroring
+        /// the model-wide object-existence rule.
+        /// </summary>
+        public void CheckTablePrimaryKeyRequired(dynamic entity, dynamic modelObjects, string tableName, bool isNew)
+        {
+            if (entity == null || modelObjects == null) return;
+            if (!NamingStandardService.Instance.IsLoaded) return;
+
+            var rules = NamingStandardService.Instance.GetObjectExistenceRules();
+            if (rules == null || rules.Count == 0) return;
+
+            // Quick gate (no SCAPI walk) - any PRIMARY KEY existence rule for this
+            // APPLY_ON? If not, nothing to enforce on this table.
+            bool anyPkRule = rules.Any(r => IsPrimaryKeyObjectType(r.ObjectType)
+                                            && NamingValidationEngine.MatchesApplyOn(r, isNew));
+            if (!anyPkRule) return;
+
+            // Does THIS table own a USABLE primary key? Key_Group_Type == "PK"
+            // (INDEX/AK share the Key_Group SCAPI class so the filter is mandatory) AND
+            // it must have >= 1 key member: erwin auto-creates an EMPTY XPK group with
+            // no Key_Group_Member rows until the user assigns PK columns, and an empty
+            // PK is not a real primary key. Mirrors the IsAttributePrimaryKeyMember walk.
+            bool hasPk = false;
+            int pkMemberCount = 0;
+            try
+            {
+                dynamic keyGroups = modelObjects.Collect(entity, "Key_Group");
+                if (keyGroups != null)
+                {
+                    foreach (dynamic kg in keyGroups)
+                    {
+                        if (kg == null) continue;
+                        string kgType;
+                        try { kgType = kg.Properties("Key_Group_Type").Value?.ToString(); }
+                        catch { continue; }
+                        if (!string.Equals(kgType, "PK", StringComparison.OrdinalIgnoreCase)) continue;
+
+                        try
+                        {
+                            dynamic members = modelObjects.Collect(kg, "Key_Group_Member");
+                            if (members != null)
+                                foreach (dynamic m in members) { if (m != null) pkMemberCount++; }
+                        }
+                        catch { /* member collect failed - treat as empty PK */ }
+                        hasPk = pkMemberCount > 0;
+                        break; // exactly one PK Key_Group per entity
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                // Entity may have just been deleted (e.g. Required-UDP Cancel on a new
+                // table dropped it) - the Collect then throws; treat as nothing to warn.
+                Log($"CheckTablePrimaryKeyRequired: Key_Group collect failed for '{tableName}': {ex.Message}");
+                return;
+            }
+
+            string entId = null;
+            try { entId = entity.ObjectId?.ToString(); } catch { /* best effort */ }
+
+            string body = ComputePkRequirementWarning(rules, isNew, hasPk, tableName);
+            if (body == null)
+            {
+                // Has a PK now (or no applicable rule) -> clear any prior warning so a
+                // later PK removal on this entity warns again.
+                if (!string.IsNullOrEmpty(entId)) _pkWarnedEntityIds.Remove(entId);
+                Log($"CheckTablePrimaryKeyRequired: '{tableName}' OK - PRIMARY KEY present (members={pkMemberCount})");
+                return;
+            }
+
+            // Warn once per entity while it lacks a PK - the naming auto-rename chain
+            // re-fires this check repeatedly for one add gesture; the same warning must
+            // not repeat back-to-back.
+            if (!string.IsNullOrEmpty(entId) && !_pkWarnedEntityIds.Add(entId))
+            {
+                Log($"CheckTablePrimaryKeyRequired: '{tableName}' - duplicate warning suppressed (already warned this entity; still no PK)");
+                return;
+            }
+
+            Log($"CheckTablePrimaryKeyRequired: '{tableName}' VIOLATED - no usable PRIMARY KEY (members={pkMemberCount}, isNew={isNew})");
+            // Body is the admin rule message (localised there); title is fixed English.
+            AddinMessageDialog.Show(body, "Primary key required", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+
+        /// <summary>
+        /// Pure decision for the per-table PRIMARY KEY requirement: returns the warning
+        /// body (admin message, or a default), or null when nothing should warn. Warns
+        /// only when at least one PRIMARY KEY existence rule matches <paramref name="isNew"/>
+        /// (APPLY_ON) AND the table has no PK (<paramref name="hasPk"/> false). Separated
+        /// from the SCAPI/dialog plumbing so the APPLY_ON + message logic is unit-tested.
+        /// </summary>
+        public static string ComputePkRequirementWarning(
+            IReadOnlyList<NamingStandardRule> existenceRules, bool isNew, bool hasPk, string tableName)
+        {
+            if (existenceRules == null) return null;
+            var pkRules = existenceRules
+                .Where(r => IsPrimaryKeyObjectType(r?.ObjectType)
+                            && NamingValidationEngine.MatchesApplyOn(r, isNew))
+                .ToList();
+            if (pkRules.Count == 0) return null;
+            if (hasPk) return null;
+
+            var msgs = pkRules
+                .Select(r => !string.IsNullOrEmpty(r.ErrorMessage)
+                    ? r.ErrorMessage
+                    : $"Table '{tableName}' must have a primary key.")
+                .Distinct()
+                .ToList();
+            return msgs.Count == 1 ? msgs[0] : string.Join("\n\n - ", msgs);
         }
 
         /// <summary>
@@ -2614,16 +2766,41 @@ namespace EliteSoft.Erwin.AddIn.Services
                 string afterAll = NamingValidationEngine.ApplyNamingStandards(objectType, physicalName, scapiBoxed, autoOnly: false, isNew: isNew);
                 if (!string.Equals(afterAll, physicalName, StringComparison.Ordinal))
                 {
-                    var answer = AddinMessageDialog.Show(
-                        $"Naming standard suggests changes for '{physicalName}':\n\n" +
-                        $"'{physicalName}' -> '{afterAll}'\n\n" +
-                        $"Apply?",
-                        "Naming Standard",
-                        System.Windows.Forms.MessageBoxButtons.YesNo,
-                        System.Windows.Forms.MessageBoxIcon.Question);
+                    // Don't re-ask the IDENTICAL suggestion the user already declined
+                    // this session - the creation cascade re-runs this check after
+                    // every add-in rename and would otherwise nag with the same Yes/No.
+                    string suggestKey = null;
+                    try { suggestKey = scapiObject?.ObjectId?.ToString(); } catch { /* keep null */ }
+                    bool alreadyDeclined = !string.IsNullOrEmpty(suggestKey)
+                        && _declinedNameSuggestions.TryGetValue(suggestKey, out var declined)
+                        && string.Equals(declined, afterAll, StringComparison.Ordinal);
+
+                    var answer = System.Windows.Forms.DialogResult.No;
+                    if (alreadyDeclined)
+                    {
+                        Log($"Naming standard suggestion '{physicalName}' -> '{afterAll}' already declined this session - not re-asking");
+                    }
+                    else
+                    {
+                        answer = AddinMessageDialog.Show(
+                            $"Naming standard suggests changes for '{physicalName}':\n\n" +
+                            $"'{physicalName}' -> '{afterAll}'\n\n" +
+                            $"Apply?",
+                            "Naming Standard",
+                            System.Windows.Forms.MessageBoxButtons.YesNo,
+                            System.Windows.Forms.MessageBoxIcon.Question);
+
+                        if (answer != System.Windows.Forms.DialogResult.Yes
+                            && !string.IsNullOrEmpty(suggestKey))
+                        {
+                            _declinedNameSuggestions[suggestKey] = afterAll;
+                        }
+                    }
 
                     if (answer == System.Windows.Forms.DialogResult.Yes)
                     {
+                        if (!string.IsNullOrEmpty(suggestKey))
+                            _declinedNameSuggestions.Remove(suggestKey);
                         int transId = _session.BeginNamedTransaction("ApplyManualNamingStandard");
                         try
                         {
