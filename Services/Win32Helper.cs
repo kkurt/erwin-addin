@@ -264,6 +264,40 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// Returns the HWND of erwin's ACTIVE MDI child (the model tab the user is
+        /// currently looking at), or <see cref="IntPtr.Zero"/> when erwin is not using
+        /// a standard MFC/XTP MDI frame or no child is active. The active MDI child is
+        /// the ground truth for which model is in front: a modal dialog is not an MDI
+        /// child, so (unlike the main-frame title) it cannot mask the real active
+        /// model. Timeout-bounded (SMTO_ABORTIFHUNG) so a hung erwin frame returns Zero
+        /// instead of blocking the caller, matching <see cref="GetWindowTextNoHang"/>.
+        /// </summary>
+        public static IntPtr GetActiveMdiChild(IntPtr erwinMain, int timeoutMs = 200)
+        {
+            if (erwinMain == IntPtr.Zero) return IntPtr.Zero;
+
+            // erwin hosts its model windows in a standard "MDIClient" child of the
+            // main frame (same lookup MartMartAutomation uses to drive the MDI).
+            IntPtr mdiClient = IntPtr.Zero;
+            EnumChildWindows(erwinMain, (h, _) =>
+            {
+                var cls = new StringBuilder(64);
+                GetClassName(h, cls, cls.Capacity);
+                if (cls.ToString() == "MDIClient") { mdiClient = h; return false; }
+                return true;
+            }, IntPtr.Zero);
+            if (mdiClient == IntPtr.Zero) return IntPtr.Zero;
+
+            // WM_MDIGETACTIVE returns the active child HWND as the message result.
+            const uint WM_MDIGETACTIVE = 0x0229;
+            const uint SMTO_ABORTIFHUNG = 0x0002;
+            if (SendMessageTimeout(mdiClient, WM_MDIGETACTIVE, IntPtr.Zero, IntPtr.Zero,
+                    SMTO_ABORTIFHUNG, (uint)timeoutMs, out IntPtr active) == IntPtr.Zero)
+                return IntPtr.Zero; // timed out / hung frame
+            return active;
+        }
+
+        /// <summary>
         /// Enumerate ALL visible top-level windows belonging to the erwin process.
         /// Useful for debugging which windows exist.
         /// </summary>

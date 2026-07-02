@@ -110,18 +110,68 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // as the 2026-06-03 monitor-heartbeat dump). SMTO_ABORTIFHUNG
                 // returns "" instead of blocking.
                 var title = Win32Helper.GetWindowTextNoHang(hWnd);
-                var m = Regex.Match(title,
-                    @"\[(?<base>(?:[Mm]art://)[^\s\]]+)(?:\s*:\s*v(?<v>\d+))?",
-                    RegexOptions.IgnoreCase);
-                if (!m.Success) return string.Empty;
-                var basePart = m.Groups["base"].Value;
-                var ver = m.Groups["v"].Value;
-                return string.IsNullOrEmpty(ver) ? basePart : $"{basePart}?VNO={ver}";
+                return ParseLocatorFromCaption(title);
             }
-            catch
+            catch (Exception ex)
             {
+                AddinLogger.Log($"PuLocatorReader.ReadFromWindowTitle error: {ex.Message}");
                 return string.Empty;
             }
+        }
+
+        /// <summary>
+        /// Reads the locator of erwin's ACTIVE MDI child - the model tab the user is
+        /// actually looking at. This is the ground truth for tab-switch detection:
+        /// unlike the main-frame title, a modal dialog or compare wizard cannot
+        /// overwrite an MDI child's caption, so the active model reads correctly even
+        /// while a dialog is up. Returns the full locator plus the active child HWND in
+        /// <paramref name="childHwnd"/>, or <see cref="string.Empty"/> / Zero when erwin
+        /// is not using a standard MDI frame or no Mart model is active - in which case
+        /// the caller falls back to <see cref="ReadFromWindowTitle"/>.
+        /// </summary>
+        public static string ReadFromActiveMdiChild(out IntPtr childHwnd)
+        {
+            childHwnd = IntPtr.Zero;
+            try
+            {
+                var main = Win32Helper.GetErwinMainWindow();
+                if (main == IntPtr.Zero) return string.Empty;
+                IntPtr child = Win32Helper.GetActiveMdiChild(main);
+                if (child == IntPtr.Zero) return string.Empty;
+                string caption = Win32Helper.GetWindowTextNoHang(child);
+                string loc = ParseLocatorFromCaption(caption);
+                if (string.IsNullOrEmpty(loc)) return string.Empty;
+                childHwnd = child;
+                return loc;
+            }
+            catch (Exception ex)
+            {
+                AddinLogger.Log($"PuLocatorReader.ReadFromActiveMdiChild error: {ex.Message}");
+                return string.Empty;
+            }
+        }
+
+        /// <summary>
+        /// Extracts the full Mart locator from an erwin window / MDI-child caption of
+        /// the form <c>[Mart://&lt;path with spaces&gt; :  vN  : &lt;diagram&gt;]</c>.
+        /// The locator PATH itself contains spaces ("Core Banking/CORE BANKING ..."),
+        /// so the match runs from "Mart://" lazily up to the <c> : vN</c> version marker
+        /// - the only <c> : v&lt;digits&gt;</c> in a Mart caption. A leading <c>[</c> is
+        /// optional so this works on both the bracketed main-frame title and a bare MDI
+        /// child caption. Returns <c>&lt;locator&gt;?VNO=N</c>, or <see cref="string.Empty"/>
+        /// on no match (e.g. a non-Mart / file-only model is active - not an error).
+        /// Public so the parse can be unit-tested against real captions without COM.
+        /// </summary>
+        public static string ParseLocatorFromCaption(string caption)
+        {
+            if (string.IsNullOrEmpty(caption)) return string.Empty;
+            var m = Regex.Match(caption,
+                @"(?<base>[Mm]art://.+?)\s*:\s*v(?<v>\d+)",
+                RegexOptions.IgnoreCase);
+            if (!m.Success) return string.Empty;
+            var basePart = m.Groups["base"].Value.TrimEnd();
+            var ver = m.Groups["v"].Value;
+            return string.IsNullOrEmpty(ver) ? basePart : $"{basePart}?VNO={ver}";
         }
     }
 }
