@@ -17,6 +17,11 @@ namespace EliteSoft.Erwin.AddIn.Tests;
 /// (TableTypeMonitorService.ScapiCollectTypeForExistence, private static -
 /// exercised via reflection, same pattern as the view placeholder test).
 /// </summary>
+// Both this class and NamingStandardEngineTests seed the NamingStandardService.Instance
+// SINGLETON via SeedForTesting. xUnit runs different classes in parallel, so without a
+// shared collection one class's seed/clear races the other's reads (tests pass isolated,
+// flake in the full run). Same collection = serialized.
+[Collection("NamingStandardSingleton")]
 public class ExistenceRuleTests
 {
     private static NamingStandardRule ExistenceRule(string objectType, string error = "must exist") =>

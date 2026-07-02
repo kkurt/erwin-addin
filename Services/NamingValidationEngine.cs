@@ -79,6 +79,28 @@ namespace EliteSoft.Erwin.AddIn.Services
                 EvaluateRule(rule, objectName, results);
             }
 
+            // Canonical-form acceptance for affix rules (2026-07-02). With TWO prefix
+            // rules on one property the composed name carries both ('VpPF_X'), but the
+            // per-rule Prefix check is StartsWith - the inner prefix can NEVER be at
+            // position 0, so its violation is unsatisfiable and the Required re-prompt
+            // loops forever (user stuck typing the same name). A name that the full
+            // canonical apply would leave UNCHANGED already carries every applicable
+            // affix in its canonical slot - drop the false affix violations then.
+            // Genuinely missing affixes still flag (the apply WOULD change the name).
+            if (results.Any(r => !r.IsValid
+                    && (r.Rule?.RuleType == NamingRuleKind.Prefix || r.Rule?.RuleType == NamingRuleKind.Suffix)))
+            {
+                string canonical = ApplyNamingStandards(objectType, objectName, scapiObject,
+                    autoOnly: false, propertyCode: propertyCode, isNew: isNew);
+                if (string.Equals(canonical, objectName, StringComparison.Ordinal))
+                {
+                    int dropped = results.RemoveAll(r => !r.IsValid
+                        && (r.Rule?.RuleType == NamingRuleKind.Prefix || r.Rule?.RuleType == NamingRuleKind.Suffix));
+                    if (dropped > 0)
+                        AddinLogger.Log($"NamingValidate: '{objectName}' is already in canonical affix form - dropped {dropped} positional Prefix/Suffix violation(s)");
+                }
+            }
+
             return results;
         }
 
@@ -171,73 +193,88 @@ namespace EliteSoft.Erwin.AddIn.Services
                             && MatchesApplyOn(r, isNew))
                 .ToList();
 
-            string result = objectName;
-
-            // Two-pass design (2026-05-24): a single pass that interleaved
-            // reverse-strip with forward-apply ordered the operations by
-            // SORT_ORDER, so a now-applicable rule (TableClass switched to
-            // Log -> rule#20 adds '_LOG') ran BEFORE a now-stale rule
-            // (rule#21 _HISTORY strip), leaving the entity with both
-            // suffixes ("VpE_281_HISTORY_LOG" - verified 2026-05-24). Pass
-            // 1 strips every stale conditional decoration first, pass 2
-            // adds the currently-applicable ones to the clean baseline.
-            // Per-pass evaluations of IsRuleApplicable are independent (same
-            // SCAPI state for both), so the two-pass scan does not flip a
-            // decision mid-iteration.
-
-            // Pass 1: reverse-strip for non-applicable conditional rules.
+            // Evaluate applicability ONCE per rule (SCAPI condition reads are not
+            // free) and reuse it across the strip + re-apply passes below.
+            var applicable = new Dictionary<NamingStandardRule, bool>();
             foreach (var rule in rules)
             {
-                bool isConditional = rule.DependsOnUdpId.HasValue && !string.IsNullOrEmpty(rule.DependsOnUdpName);
-                if (!isConditional) continue;
+                bool a = IsRuleApplicable(rule, objectType, scapiObject);
+                applicable[rule] = a;
+                if (rule.Conditions != null && rule.Conditions.Count > 0)
+                    AddinLogger.Log(
+                        $"NamingApply: rule#{rule.Id} [{rule.RuleType}] {rule.ObjectType}.{rule.PropertyCode} " +
+                        $"cond=[{rule.Conditions.Count} term(s)] -> applicable={a}");
+            }
 
-                bool applicable = IsRuleApplicable(rule, objectType, scapiObject);
-                AddinLogger.Log(
-                    $"NamingApply: rule#{rule.Id} [{rule.RuleType}] {rule.ObjectType}.{rule.PropertyCode} " +
-                    $"cond=udp[{rule.DependsOnUdpName}] in [{rule.DependsOnPropertyValues ?? ""}] -> applicable={applicable}");
+            string result = objectName;
 
-                if (applicable) continue; // forward-apply pass handles it below
+            // Order-independent, idempotent affix apply (2026-07-01). The old design
+            // added each applicable prefix behind a single StartsWith check, so with TWO
+            // prefix rules on one property each pushed the other off the front and BOTH
+            // re-added on every re-check (a rename by one rule re-fires the scoped check),
+            // stacking without bound ('VpPFXC_VpPFXC_Abc...'). Instead: strip every
+            // managed prefix/suffix that is either now-stale (rule no longer applies) OR
+            // will be re-applied, down to the clean core, then re-apply the currently-
+            // applicable affixes exactly once in SORT_ORDER. This supersedes the earlier
+            // two-pass strip-then-apply (which fixed the double-SUFFIX case the same way,
+            // but only stripped NON-applicable affixes so two front-prefixes still stacked).
+            // Applicable-but-deferred (AUTO_APPLY=false in the auto pass) affixes are left
+            // untouched - the forward pass will not re-add them, so stripping would drop one.
+            bool WillApply(NamingStandardRule r) => applicable[r] && !(autoOnly && !r.AutoApply);
 
-                if (rule.RuleType == NamingRuleKind.Prefix
-                    && !string.IsNullOrEmpty(rule.Prefix)
-                    && result.StartsWith(rule.Prefix, StringComparison.OrdinalIgnoreCase))
+            bool changed = true;
+            while (changed)
+            {
+                changed = false;
+                foreach (var rule in rules)
                 {
-                    AddinLogger.Log($"NamingApply: rule#{rule.Id} stale Prefix='{rule.Prefix}' stripped from '{result}'");
-                    result = result.Substring(rule.Prefix.Length);
-                }
-                else if (rule.RuleType == NamingRuleKind.Suffix
-                         && !string.IsNullOrEmpty(rule.Suffix)
-                         && result.EndsWith(rule.Suffix, StringComparison.OrdinalIgnoreCase))
-                {
-                    AddinLogger.Log($"NamingApply: rule#{rule.Id} stale Suffix='{rule.Suffix}' stripped from '{result}'");
-                    result = result.Substring(0, result.Length - rule.Suffix.Length);
+                    // Leave applicable-but-deferred affixes in place (see above).
+                    if (applicable[rule] && !WillApply(rule)) continue;
+
+                    if (rule.RuleType == NamingRuleKind.Prefix
+                        && !string.IsNullOrEmpty(rule.Prefix)
+                        && result.StartsWith(rule.Prefix, StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (!applicable[rule])
+                            AddinLogger.Log($"NamingApply: rule#{rule.Id} stale Prefix='{rule.Prefix}' stripped from '{result}'");
+                        result = result.Substring(rule.Prefix.Length);
+                        changed = true;
+                    }
+                    else if (rule.RuleType == NamingRuleKind.Suffix
+                             && !string.IsNullOrEmpty(rule.Suffix)
+                             && result.EndsWith(rule.Suffix, StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (!applicable[rule])
+                            AddinLogger.Log($"NamingApply: rule#{rule.Id} stale Suffix='{rule.Suffix}' stripped from '{result}'");
+                        result = result.Substring(0, result.Length - rule.Suffix.Length);
+                        changed = true;
+                    }
                 }
             }
 
-            // Pass 2: forward-apply for applicable rules (conditional and
-            // unconditional). Honour autoOnly here so AUTO_APPLY=false rules
-            // are deferred to the ask-user path.
+            // Re-apply currently-applicable affixes once, in rule (SORT_ORDER) order:
+            // prefixes prepend so the later rule ends up outermost (preserves the prior
+            // stacking order); suffixes append.
             foreach (var rule in rules)
             {
-                bool applicable = IsRuleApplicable(rule, objectType, scapiObject);
-                if (!applicable) continue;
-                if (autoOnly && !rule.AutoApply) continue;
+                if (!WillApply(rule)) continue;
 
                 if (rule.RuleType == NamingRuleKind.Prefix
                     && !string.IsNullOrEmpty(rule.Prefix)
                     && !result.StartsWith(rule.Prefix, StringComparison.OrdinalIgnoreCase))
                 {
-                    AddinLogger.Log($"NamingApply: rule#{rule.Id} Prefix='{rule.Prefix}' applied to '{result}'");
                     result = rule.Prefix + result;
                 }
                 else if (rule.RuleType == NamingRuleKind.Suffix
                          && !string.IsNullOrEmpty(rule.Suffix)
                          && !result.EndsWith(rule.Suffix, StringComparison.OrdinalIgnoreCase))
                 {
-                    AddinLogger.Log($"NamingApply: rule#{rule.Id} Suffix='{rule.Suffix}' applied to '{result}'");
                     result = result + rule.Suffix;
                 }
             }
+
+            if (!string.Equals(result, objectName, StringComparison.Ordinal))
+                AddinLogger.Log($"NamingApply: affixes '{objectName}' -> '{result}'");
 
             return result;
         }
@@ -339,19 +376,31 @@ namespace EliteSoft.Erwin.AddIn.Services
             { "IsPrimaryKey", "Is_PK", "Primary_Key", "PrimaryKey", "Is_Primary_Key" };
 
         /// <summary>
-        /// True when this rule's DEPENDS_ON condition asks whether the object is a
-        /// primary-key member (property code in <see cref="PkMembershipConditionCodes"/>,
-        /// and not a UDP source). Such a condition cannot be answered by a property
-        /// read on the Attribute; the caller must resolve PK membership from the
-        /// Key_Group graph and pass it to the <c>pkMembership</c> overload of
-        /// <see cref="IsRuleApplicable"/>.
+        /// True when a single condition TERM asks whether the object is a primary-key
+        /// member (a property-source term whose code is in
+        /// <see cref="PkMembershipConditionCodes"/>). erwin exposes no Attribute
+        /// property for it, so such a term is evaluated against a caller-resolved
+        /// boolean (the Key_Group_Member walk) rather than a property read.
+        /// </summary>
+        public static bool IsPkMembershipCondition(NamingRuleCondition c)
+        {
+            if (c == null) return false;
+            bool hasUdpSource = c.DependsOnUdpId.HasValue && !string.IsNullOrEmpty(c.DependsOnUdpName);
+            bool hasPropSource = c.DependsOnPropertyDefId.HasValue && !string.IsNullOrEmpty(c.DependsOnPropertyCode);
+            return hasPropSource && !hasUdpSource && PkMembershipConditionCodes.Contains(c.DependsOnPropertyCode);
+        }
+
+        /// <summary>
+        /// True when ANY of the rule's condition terms is a PK-membership check, so the
+        /// caller knows it must resolve PK membership and pass it to
+        /// <see cref="IsRuleApplicable(NamingStandardRule, string, object, bool?)"/>.
         /// </summary>
         public static bool IsPkMembershipCondition(NamingStandardRule rule)
         {
-            if (rule == null) return false;
-            bool hasUdpSource = rule.DependsOnUdpId.HasValue && !string.IsNullOrEmpty(rule.DependsOnUdpName);
-            bool hasPropSource = rule.DependsOnPropertyDefId.HasValue && !string.IsNullOrEmpty(rule.DependsOnPropertyCode);
-            return hasPropSource && !hasUdpSource && PkMembershipConditionCodes.Contains(rule.DependsOnPropertyCode);
+            if (rule?.Conditions == null) return false;
+            foreach (var c in rule.Conditions)
+                if (IsPkMembershipCondition(c)) return true;
+            return false;
         }
 
         // Public so the Template runtime applier
@@ -362,76 +411,178 @@ namespace EliteSoft.Erwin.AddIn.Services
             => IsRuleApplicable(rule, objectType, scapiObject, null);
 
         /// <summary>
-        /// As <see cref="IsRuleApplicable(NamingStandardRule, string, object)"/>, but
-        /// when the rule's condition is a PK-membership check (see
-        /// <see cref="IsPkMembershipCondition"/>) and <paramref name="pkMembership"/>
-        /// has a value, the condition is evaluated against that caller-resolved
-        /// boolean (from the Key_Group_Member walk) instead of a property read.
-        /// Passing <c>null</c> reproduces the property-read behaviour exactly.
+        /// Evaluates the rule's ordered DEPENDS_ON condition list
+        /// (<c>MC_NAMING_RULE_CONDITION</c>), folded strictly LEFT-TO-RIGHT with no
+        /// precedence and no parentheses: <c>result = term0; result = result AND/OR
+        /// termN</c> per each later term's CONNECTOR. An EMPTY list means the rule is
+        /// unconditional (always applies). Each term matches exactly as the legacy
+        /// single condition did (a UDP or erwin built-in property value IN the CSV,
+        /// case-insensitive). When a term is a PK-membership check and
+        /// <paramref name="pkMembership"/> has a value, that term uses the caller-
+        /// resolved boolean (Key_Group_Member walk) instead of a property read.
         /// </summary>
         public static bool IsRuleApplicable(NamingStandardRule rule, string objectType, dynamic scapiObject, bool? pkMembership)
         {
-            bool hasUdpSource = rule.DependsOnUdpId.HasValue && !string.IsNullOrEmpty(rule.DependsOnUdpName);
-            bool hasPropSource = rule.DependsOnPropertyDefId.HasValue && !string.IsNullOrEmpty(rule.DependsOnPropertyCode);
+            var conditions = rule?.Conditions;
+            if (conditions == null || conditions.Count == 0)
+                return true; // unconditional
 
-            // Unconditional rule.
+            bool result = MatchSingleCondition(conditions[0], objectType, scapiObject, pkMembership);
+            for (int i = 1; i < conditions.Count; i++)
+            {
+                var c = conditions[i];
+                bool isOr = string.Equals(c.Connector, "OR", StringComparison.OrdinalIgnoreCase);
+                // Short-circuit: an OR over an already-true result, or an AND over an
+                // already-false result, cannot change it - skip the (COM-touching) match.
+                if (isOr == result) continue;
+                result = MatchSingleCondition(c, objectType, scapiObject, pkMembership);
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// Evaluates one DEPENDS_ON term: PK-membership via the caller-resolved boolean
+        /// when applicable, else the UDP / erwin built-in property value IN the CSV
+        /// (case-insensitive). A term with no live object to read is treated as not
+        /// matching (out-of-band callers, e.g. a static unit-test name check).
+        /// </summary>
+        private static bool MatchSingleCondition(NamingRuleCondition c, string objectType, dynamic scapiObject, bool? pkMembership)
+        {
+            bool hasUdpSource = c.DependsOnUdpId.HasValue && !string.IsNullOrEmpty(c.DependsOnUdpName);
+            bool hasPropSource = c.DependsOnPropertyDefId.HasValue && !string.IsNullOrEmpty(c.DependsOnPropertyCode);
+
+            // The loader skips source-less terms (NamingStandardService.LoadRuleConditions),
+            // so this path is unreachable in practice. If one still arrives, treat it as
+            // vacuously satisfied (true): the neutral element for AND. (An OR'd vacuous
+            // term would force the result true, but that cannot happen given the loader filter.)
             if (!hasUdpSource && !hasPropSource)
                 return true;
 
-            // PK-membership condition resolved by the caller via the Key_Group
-            // graph (erwin exposes no Attribute property for it).
-            if (pkMembership.HasValue && IsPkMembershipCondition(rule))
-                return MatchesCsv(pkMembership.Value ? "True" : "False", rule.DependsOnPropertyValues);
+            if (pkMembership.HasValue && IsPkMembershipCondition(c))
+                return MatchesCsv(pkMembership.Value ? "True" : "False", c.DependsOnPropertyValues);
 
-            // Has condition but no SCAPI object to evaluate against → skip
-            // (the caller is invoking us out of band, e.g. a static name
-            // check from a unit test or a Glossary-bound path that does
-            // not carry a live entity ref).
             if (scapiObject == null)
                 return false;
 
             string sourceValue = hasUdpSource
-                ? ReadUdpValue(scapiObject, objectType, rule.DependsOnUdpName)
-                : ReadBuiltinPropertyValue(scapiObject, rule.DependsOnPropertyCode);
+                ? ReadUdpValue(scapiObject, objectType, c.DependsOnUdpName)
+                : ReadConditionPropertyValue(scapiObject, objectType, c);
 
-            return MatchesCsv(sourceValue, rule.DependsOnPropertyValues);
+            return MatchesCsv(sourceValue, c.DependsOnPropertyValues);
         }
 
         /// <summary>
-        /// Diagnostic companion to <see cref="IsRuleApplicable"/>: returns a short
-        /// human-readable description of the DEPENDS_ON condition evaluation -
-        /// the source kind/name, the LIVE value read from SCAPI, and the allowed
-        /// CSV - so callers can log WHY a conditional rule did not apply instead
-        /// of skipping silently. A read that returns empty usually means the
-        /// property/UDP name is wrong (not surfaced on this object class); a
-        /// concrete value that is not in the allowed list means the live object
-        /// simply does not meet the condition. No SCAPI writes.
+        /// Read a built-in-property condition value, honouring the condition property's
+        /// OWNING object type. When it matches the rule's target object (the usual case)
+        /// the property is read directly. When it names a RELATED object type it is
+        /// resolved from the target: erwin surfaces a table/view's owning SCHEMA name on
+        /// the object itself as <c>Name_Qualifier</c> (the derived projection of
+        /// Schema_Ref), so a SCHEMA.Name condition reads the target's Name_Qualifier.
+        /// Any other related-object condition is not yet supported and reads empty (the
+        /// term simply will not match) - logged once so it is diagnosable.
+        /// </summary>
+        private static string ReadConditionPropertyValue(dynamic scapiObject, string ruleObjectType, NamingRuleCondition c)
+        {
+            string condOt = c.DependsOnPropertyObjectType;
+
+            // No owner type, or the property is on the rule's own target object -> direct.
+            if (string.IsNullOrEmpty(condOt) || IsSameObjectType(condOt, ruleObjectType))
+                return ReadBuiltinPropertyValue(scapiObject, c.DependsOnPropertyCode);
+
+            // Related object type: SCHEMA (the table's owner). Its Name is projected onto
+            // the table/view as Name_Qualifier.
+            if (string.Equals(condOt.Trim(), "SCHEMA", StringComparison.OrdinalIgnoreCase)
+                && string.Equals(c.DependsOnPropertyCode, "Name", StringComparison.OrdinalIgnoreCase))
+                return ReadBuiltinPropertyValue(scapiObject, "Name_Qualifier");
+
+            AddinLogger.Log($"NamingApply: condition on related object '{condOt}'.{c.DependsOnPropertyCode} not supported for target '{ruleObjectType}' - treated as empty");
+            return "";
+        }
+
+        /// <summary>True when a condition property's owning object-type name (e.g. "TABLE"
+        /// from MC_OBJECT_TYPE) denotes the same object as the rule's runtime target
+        /// string (e.g. "Table"). Case- and space/underscore-insensitive.</summary>
+        private static bool IsSameObjectType(string objectTypeName, string ruleObjectType)
+        {
+            string a = objectTypeName?.Trim().ToUpperInvariant().Replace(' ', '_');
+            string b = ruleObjectType?.Trim().ToUpperInvariant().Replace(' ', '_');
+            return !string.IsNullOrEmpty(a) && a == b;
+        }
+
+        /// <summary>
+        /// Diagnostic companion to <see cref="IsRuleApplicable"/>: a short human-readable
+        /// trace of the multi-term DEPENDS_ON evaluation (each term's live value vs its
+        /// allowed CSV, the AND/OR connectors, and the folded result), so a never-firing
+        /// conditional rule is debuggable instead of silently skipped. No SCAPI writes.
         /// </summary>
         public static string DescribeApplicability(NamingStandardRule rule, string objectType, dynamic scapiObject, bool? pkMembership = null)
         {
-            bool hasUdpSource = rule.DependsOnUdpId.HasValue && !string.IsNullOrEmpty(rule.DependsOnUdpName);
-            bool hasPropSource = rule.DependsOnPropertyDefId.HasValue && !string.IsNullOrEmpty(rule.DependsOnPropertyCode);
+            var conditions = rule?.Conditions;
+            if (conditions == null || conditions.Count == 0) return "unconditional";
 
-            if (!hasUdpSource && !hasPropSource) return "unconditional";
-            if (pkMembership.HasValue && IsPkMembershipCondition(rule))
-                return $"pk-membership={pkMembership.Value} (via Key_Group_Member walk) not in allowed [{rule.DependsOnPropertyValues}]";
-            if (scapiObject == null) return "no live object to evaluate condition";
-
-            string kind = hasUdpSource ? "udp" : "prop";
-            string name = hasUdpSource ? rule.DependsOnUdpName : rule.DependsOnPropertyCode;
-            string val;
+            // Diagnostic only - never let a describe failure escape into the caller's log.
             try
             {
-                val = hasUdpSource
-                    ? ReadUdpValue(scapiObject, objectType, rule.DependsOnUdpName)
-                    : ReadBuiltinPropertyValue(scapiObject, rule.DependsOnPropertyCode);
+                var sb = new System.Text.StringBuilder();
+                bool result = false;
+                for (int i = 0; i < conditions.Count; i++)
+                {
+                    var c = conditions[i];
+                    bool m = MatchSingleCondition(c, objectType, scapiObject, pkMembership);
+                    if (i == 0)
+                    {
+                        result = m;
+                    }
+                    else
+                    {
+                        bool isOr = string.Equals(c.Connector, "OR", StringComparison.OrdinalIgnoreCase);
+                        result = isOr ? (result || m) : (result && m);
+                        sb.Append(isOr ? " OR " : " AND ");
+                    }
+                    sb.Append(DescribeTerm(c, objectType, scapiObject, pkMembership, m));
+                }
+                sb.Append(" => ").Append(result ? "applies" : "skip");
+                return sb.ToString();
             }
-            catch (Exception ex) { val = "<read-error: " + ex.Message + ">"; }
+            catch (Exception ex)
+            {
+                return $"<describe-error: {ex.Message}>";
+            }
+        }
 
-            string hint = string.IsNullOrEmpty(val)
-                ? " (empty - likely a wrong/unsurfaced property or UDP name)"
-                : "";
-            return $"cond {kind}[{name}]='{val}' not in allowed [{rule.DependsOnPropertyValues}]{hint}";
+        private static string DescribeTerm(NamingRuleCondition c, string objectType, dynamic scapiObject, bool? pkMembership, bool matched)
+        {
+            bool hasUdpSource = c.DependsOnUdpId.HasValue && !string.IsNullOrEmpty(c.DependsOnUdpName);
+            bool hasPropSource = c.DependsOnPropertyDefId.HasValue && !string.IsNullOrEmpty(c.DependsOnPropertyCode);
+            if (!hasUdpSource && !hasPropSource) return $"[empty-term]={matched}";
+
+            if (pkMembership.HasValue && IsPkMembershipCondition(c))
+                return $"pk-membership={pkMembership.Value}={matched}";
+
+            string kind = hasUdpSource ? "udp" : "prop";
+            // Qualify a related-object property in the trace, e.g. prop[SCHEMA.Name].
+            string name = hasUdpSource
+                ? c.DependsOnUdpName
+                : (!string.IsNullOrEmpty(c.DependsOnPropertyObjectType) && !IsSameObjectType(c.DependsOnPropertyObjectType, objectType)
+                    ? $"{c.DependsOnPropertyObjectType}.{c.DependsOnPropertyCode}"
+                    : c.DependsOnPropertyCode);
+            string val;
+            if (scapiObject == null)
+            {
+                val = "<no-object>";
+            }
+            else
+            {
+                try
+                {
+                    val = hasUdpSource
+                        ? ReadUdpValue(scapiObject, objectType, c.DependsOnUdpName)
+                        : ReadConditionPropertyValue(scapiObject, objectType, c);
+                }
+                catch (Exception ex) { val = "<read-error: " + ex.Message + ">"; }
+            }
+            string hint = string.IsNullOrEmpty(val) ? "(empty?)" : "";
+            return $"{kind}[{name}]='{val}'in[{c.DependsOnPropertyValues}]{hint}={matched}";
         }
 
         /// <summary>
@@ -459,10 +610,28 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// Optional accessor to the active model's SCAPI root object, set by the
+        /// monitoring layer (<c>ValidationCoordinatorService</c>) at connect. Used to
+        /// resolve a condition UDP that is MODEL-scoped rather than owned by the rule's
+        /// target object type - e.g. an "Application" model UDP gating a TABLE rule
+        /// model-wide. Null when no model is being monitored; model-scoped UDP
+        /// conditions then read as empty (the same not-applicable outcome as before).
+        /// </summary>
+        public static Func<dynamic> ModelRootProvider { get; set; }
+
+        /// <summary>
         /// Read a UDP value from an erwin SCAPI object. UDP path on r10 is
         /// <c>&lt;OwnerClass&gt;.Physical.&lt;UdpName&gt;</c>; SCAPI throws on
         /// unknown owner class so the switch hard-codes the small set the
         /// addin actually validates today.
+        /// <para>If the UDP is not owned by the rule's target object type - SCAPI
+        /// reports "not a valid class id or class name for object or property" - the
+        /// UDP may be MODEL-scoped (it lives on the model, not the entity/column).
+        /// The same UDP name can be a table UDP in one model and a model UDP in
+        /// another, so we resolve against the LIVE model: on that specific error we
+        /// re-read from the model root (<c>Model.Physical.&lt;UdpName&gt;</c>). This
+        /// lets a model-level condition (e.g. the model's Application) gate a table
+        /// rule model-wide.</para>
         /// </summary>
         private static string ReadUdpValue(dynamic scapiObject, string objectType, string udpName)
         {
@@ -487,9 +656,49 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
             catch (Exception ex)
             {
+                // The UDP is not on the rule's target object class -> it may be a
+                // MODEL-scoped UDP. Resolve from the model root (returns null only
+                // when we could not even attempt it; "" when attempted-but-absent).
+                if (IsNotOnThisClass(ex))
+                {
+                    string fromModel = TryReadModelUdp(udpName);
+                    if (fromModel != null) return fromModel;
+                }
                 // Keep the error path - sparse-storage / typo / missing UDP
                 // diagnostics are valuable.
                 AddinLogger.Log($"NamingApply.ReadUdpValue: '{path}' threw {ex.GetType().Name}: {ex.Message}");
+                return "";
+            }
+        }
+
+        /// <summary>True when a SCAPI property read failed because the property is not
+        /// defined on the object's class (vs. a transient/other COM error). This is the
+        /// signal that the UDP belongs to a different object type (e.g. the model).</summary>
+        private static bool IsNotOnThisClass(Exception ex)
+            => ex?.Message != null
+               && ex.Message.IndexOf("not valid class", StringComparison.OrdinalIgnoreCase) >= 0;
+
+        /// <summary>
+        /// Re-read a UDP from the MODEL root via <see cref="ModelRootProvider"/>.
+        /// Returns null when no model root is available (caller logs the original
+        /// entity-class error); "" when the model was read but does not carry the UDP
+        /// either (genuine typo / absent), so the IN-match short-circuits to not-applicable.
+        /// </summary>
+        private static string TryReadModelUdp(string udpName)
+        {
+            var provider = ModelRootProvider;
+            if (provider == null) return null;
+            dynamic root;
+            try { root = provider(); }
+            catch { return null; }
+            if (root == null) return null;
+            try
+            {
+                return root.Properties($"Model.Physical.{udpName}")?.Value?.ToString() ?? "";
+            }
+            catch (Exception ex)
+            {
+                AddinLogger.Log($"NamingApply.ReadUdpValue: model-scope 'Model.Physical.{udpName}' threw {ex.GetType().Name}: {ex.Message}");
                 return "";
             }
         }

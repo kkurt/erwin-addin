@@ -20,6 +20,7 @@ namespace EliteSoft.Erwin.AddIn.Tests;
 /// without running the pattern check.
 /// </para>
 /// </summary>
+[Collection("NamingStandardSingleton")]
 public class NamingStandardEngineTests
 {
     private static NamingStandardRule Rule(
@@ -508,6 +509,99 @@ public class NamingStandardEngineTests
     }
 
     [Fact]
+    public void ApplyNamingStandards_two_prefix_rules_apply_once_and_do_not_stack_on_recheck()
+    {
+        // Two prefix rules on one property (rule#1167 PFXC_ + rule#17 Vp). A rename by
+        // one rule re-fires the scoped check; the old single-StartsWith apply re-added
+        // BOTH every pass ('VpPFXC_VpPFXC_Abc...'). Must apply each once and be stable.
+        NamingStandardService.Instance.SeedForTesting(new[]
+        {
+            Rule(NamingRuleKind.Prefix, prefix: "PFXC_", autoApply: true, applyOn: RuleApplyOn.Both),
+            Rule(NamingRuleKind.Prefix, prefix: "Vp", autoApply: true, applyOn: RuleApplyOn.Both),
+        });
+        try
+        {
+            var once = NamingValidationEngine.ApplyNamingStandards(
+                "Table", "Abc", scapiObject: null, autoOnly: true, propertyCode: "Physical_Name", isNew: true);
+            once.Should().Contain("PFXC_").And.Contain("Vp").And.EndWith("Abc");
+            System.Text.RegularExpressions.Regex.Matches(once, "PFXC_").Count.Should().Be(1);
+            System.Text.RegularExpressions.Regex.Matches(once, "Vp").Count.Should().Be(1);
+
+            // Feeding the result back (the rename re-check) must be a no-op.
+            var twice = NamingValidationEngine.ApplyNamingStandards(
+                "Table", once, scapiObject: null, autoOnly: true, propertyCode: "Physical_Name", isNew: true);
+            twice.Should().Be(once);
+        }
+        finally { NamingStandardService.Instance.SeedForTesting(System.Array.Empty<NamingStandardRule>()); }
+    }
+
+    [Fact]
+    public void ValidateObjectName_accepts_canonical_two_prefix_form()
+    {
+        // Two prefix rules compose 'VpPF_X' - the inner prefix can never be at
+        // position 0, so per-rule StartsWith flagged it forever and the Required
+        // re-prompt looped (user typed the same name endlessly, 2026-07-02 log).
+        // A name the canonical apply leaves unchanged must validate CLEAN.
+        NamingStandardService.Instance.SeedForTesting(new[]
+        {
+            Rule(NamingRuleKind.Prefix, prefix: "PF_", autoApply: true, applyOn: RuleApplyOn.Both),
+            Rule(NamingRuleKind.Prefix, prefix: "Vp", autoApply: true, applyOn: RuleApplyOn.Both),
+            Rule(NamingRuleKind.Suffix, suffix: "Log", autoApply: true, applyOn: RuleApplyOn.Both),
+        });
+        try
+        {
+            string canonical = NamingValidationEngine.ApplyNamingStandards(
+                "Table", "Abc", scapiObject: null, autoOnly: false, propertyCode: "Physical_Name", isNew: true);
+
+            var results = NamingValidationEngine.ValidateObjectName(
+                "Table", canonical, scapiObject: null, propertyCode: "Physical_Name", isNew: true);
+
+            results.Where(r => !r.IsValid).Should().BeEmpty(
+                "the canonical affix form carries every applicable prefix/suffix in its slot");
+        }
+        finally { NamingStandardService.Instance.SeedForTesting(System.Array.Empty<NamingStandardRule>()); }
+    }
+
+    [Fact]
+    public void ValidateObjectName_still_flags_a_name_genuinely_missing_an_affix()
+    {
+        NamingStandardService.Instance.SeedForTesting(new[]
+        {
+            Rule(NamingRuleKind.Prefix, prefix: "PF_", autoApply: true, applyOn: RuleApplyOn.Both),
+            Rule(NamingRuleKind.Prefix, prefix: "Vp", autoApply: true, applyOn: RuleApplyOn.Both),
+        });
+        try
+        {
+            var results = NamingValidationEngine.ValidateObjectName(
+                "Table", "Abc", scapiObject: null, propertyCode: "Physical_Name", isNew: true);
+
+            results.Where(r => !r.IsValid).Should().NotBeEmpty(
+                "a bare name is not canonical - the apply would change it, so the violations are real");
+        }
+        finally { NamingStandardService.Instance.SeedForTesting(System.Array.Empty<NamingStandardRule>()); }
+    }
+
+    [Fact]
+    public void ApplyNamingStandards_prefix_plus_suffix_stable_on_recheck()
+    {
+        NamingStandardService.Instance.SeedForTesting(new[]
+        {
+            Rule(NamingRuleKind.Prefix, prefix: "Vp", autoApply: true, applyOn: RuleApplyOn.Both),
+            Rule(NamingRuleKind.Suffix, suffix: "Log", autoApply: true, applyOn: RuleApplyOn.Both),
+        });
+        try
+        {
+            var once = NamingValidationEngine.ApplyNamingStandards(
+                "Table", "Abc", scapiObject: null, autoOnly: true, propertyCode: "Physical_Name", isNew: true);
+            once.Should().Be("VpAbcLog");
+            var twice = NamingValidationEngine.ApplyNamingStandards(
+                "Table", once, scapiObject: null, autoOnly: true, propertyCode: "Physical_Name", isNew: true);
+            twice.Should().Be("VpAbcLog");
+        }
+        finally { NamingStandardService.Instance.SeedForTesting(System.Array.Empty<NamingStandardRule>()); }
+    }
+
+    [Fact]
     public void ApplyNamingStandards_unconditional_Prefix_Create_AutoApply_true_isNew_false_does_NOT_apply()
     {
         // Spec: ApplyOn=Create filtered out when isNew=false. The
@@ -711,7 +805,8 @@ public class NamingStandardEngineTests
     // Pure: these exercise the static condition logic only (no singleton, no SCAPI).
 
     private static NamingStandardRule PkConditionRule(string propCode)
-        => new()
+    {
+        var rule = new NamingStandardRule
         {
             Id = 1,
             ObjectType = "Column",
@@ -722,10 +817,16 @@ public class NamingStandardEngineTests
             AutoApply = true,
             ApplyOn = RuleApplyOn.Both,
             IsActive = true,
+        };
+        rule.Conditions.Add(new NamingRuleCondition
+        {
+            OrderIndex = 0,
             DependsOnPropertyDefId = 99,
             DependsOnPropertyCode = propCode,
             DependsOnPropertyValues = "True",
-        };
+        });
+        return rule;
+    }
 
     [Theory]
     [InlineData("IsPrimaryKey")]
@@ -743,9 +844,9 @@ public class NamingStandardEngineTests
     public void IsPkMembershipCondition_false_when_source_is_a_udp()
     {
         var rule = PkConditionRule("Is_PK");
-        rule.DependsOnPropertyDefId = null;     // not a built-in property source
-        rule.DependsOnUdpId = 5;                // a UDP source instead
-        rule.DependsOnUdpName = "Is_PK";
+        rule.Conditions[0].DependsOnPropertyDefId = null;  // not a built-in property source
+        rule.Conditions[0].DependsOnUdpId = 5;             // a UDP source instead
+        rule.Conditions[0].DependsOnUdpName = "Is_PK";
         NamingValidationEngine.IsPkMembershipCondition(rule).Should().BeFalse();
     }
 
@@ -779,5 +880,156 @@ public class NamingStandardEngineTests
             ApplyOn = RuleApplyOn.Both,
         };
         NamingValidationEngine.IsRuleApplicable(rule, "Column", scapiObject: null, pkMembership: null).Should().BeTrue();
+    }
+
+    // ---- Multi-term DEPENDS_ON fold (left-to-right AND/OR, no precedence) ----
+    // A tiny SCAPI stand-in lets each term read a controlled built-in property value
+    // so the fold's true/false combinations can be exercised without a live model.
+
+    [Fact]
+    public void Condition_on_SCHEMA_Name_resolves_via_target_Name_Qualifier()
+    {
+        // rule#1169 C2: a "Name" property OWNED BY the SCHEMA object type. On a table the
+        // owning schema name is surfaced as Name_Qualifier, so SCHEMA.Name IN (DM) must
+        // read Name_Qualifier - NOT the table's own Name.
+        var entity = new FakeScapi(new System.Collections.Generic.Dictionary<string, object>
+        {
+            ["Name"] = "Abc",           // the table's own name - must be IGNORED
+            ["Name_Qualifier"] = "DM",  // the owning schema name
+        });
+        var rule = MultiRule(new NamingRuleCondition
+        {
+            OrderIndex = 0,
+            DependsOnPropertyDefId = 58,
+            DependsOnPropertyCode = "Name",
+            DependsOnPropertyObjectType = "SCHEMA",
+            DependsOnPropertyValues = "DM",
+        });
+
+        NamingValidationEngine.IsRuleApplicable(rule, "Table", entity).Should().BeTrue();
+    }
+
+    [Fact]
+    public void Condition_on_SCHEMA_Name_ignores_the_targets_own_name()
+    {
+        // The old bug read the table's own Name; a table literally named 'DM' must NOT
+        // satisfy a SCHEMA.Name IN (DM) condition when its real schema differs.
+        var entity = new FakeScapi(new System.Collections.Generic.Dictionary<string, object>
+        {
+            ["Name"] = "DM",             // table happens to be named DM - must NOT count
+            ["Name_Qualifier"] = "OTHER" // real owning schema differs
+        });
+        var rule = MultiRule(new NamingRuleCondition
+        {
+            OrderIndex = 0,
+            DependsOnPropertyDefId = 58,
+            DependsOnPropertyCode = "Name",
+            DependsOnPropertyObjectType = "SCHEMA",
+            DependsOnPropertyValues = "DM",
+        });
+
+        NamingValidationEngine.IsRuleApplicable(rule, "Table", entity).Should().BeFalse();
+    }
+
+    [Fact]
+    public void Condition_on_TABLE_property_still_reads_the_target_directly()
+    {
+        // Same-object-type property (TABLE.Physical_Data_Type) is unaffected: read direct.
+        var attr = new FakeScapi(new System.Collections.Generic.Dictionary<string, object>
+        {
+            ["Physical_Data_Type"] = "DateTime",
+        });
+        var rule = MultiRule(new NamingRuleCondition
+        {
+            OrderIndex = 0,
+            DependsOnPropertyDefId = 53,
+            DependsOnPropertyCode = "Physical_Data_Type",
+            DependsOnPropertyObjectType = "TABLE",
+            DependsOnPropertyValues = "DateTime",
+        });
+
+        NamingValidationEngine.IsRuleApplicable(rule, "Table", attr).Should().BeTrue();
+    }
+
+    // Public so the cross-assembly dynamic binder in NamingValidationEngine can read
+    // them (ReadBuiltinPropertyValue does scapiObject.Properties(code).Value via dynamic;
+    // a private/internal stand-in would bind-fail and be swallowed as an empty read).
+    public sealed class FakeProp
+    {
+        public FakeProp(object value) { Value = value; }
+        public object Value { get; }
+    }
+
+    public sealed class FakeScapi
+    {
+        private readonly System.Collections.Generic.Dictionary<string, object> _p;
+        public FakeScapi(System.Collections.Generic.Dictionary<string, object> p) { _p = p; }
+        public FakeProp Properties(string code) => _p.TryGetValue(code, out var v) ? new FakeProp(v) : null;
+    }
+
+    private static NamingRuleCondition PropTerm(int order, string connector, string propCode, string values)
+        => new()
+        {
+            OrderIndex = order,
+            Connector = connector,
+            DependsOnPropertyDefId = 200 + order,
+            DependsOnPropertyCode = propCode,
+            DependsOnPropertyValues = values,
+        };
+
+    private static NamingStandardRule MultiRule(params NamingRuleCondition[] terms)
+    {
+        var rule = new NamingStandardRule
+        {
+            Id = 7,
+            ObjectType = "Column",
+            PropertyCode = "Physical_Name",
+            RuleType = NamingRuleKind.Prefix,
+            IsActive = true,
+            ApplyOn = RuleApplyOn.Both,
+        };
+        foreach (var t in terms) rule.Conditions.Add(t);
+        return rule;
+    }
+
+    [Theory]
+    // rule = (A in [X]) <conn> (B in [Y]); model supplies A=aVal, B=bVal.
+    [InlineData("X", "Y", "AND", true)]
+    [InlineData("X", "Z", "AND", false)]
+    [InlineData("Z", "Y", "AND", false)]
+    [InlineData("X", "Y", "OR", true)]
+    [InlineData("X", "Z", "OR", true)]   // short-circuit: A true, OR stays true
+    [InlineData("Z", "Y", "OR", true)]
+    [InlineData("Z", "Z", "OR", false)]
+    public void IsRuleApplicable_two_term_fold(string aVal, string bVal, string connector, bool expected)
+    {
+        var rule = MultiRule(PropTerm(0, null, "A", "X"), PropTerm(1, connector, "B", "Y"));
+        dynamic scapi = new FakeScapi(new System.Collections.Generic.Dictionary<string, object> { ["A"] = aVal, ["B"] = bVal });
+        ((bool)NamingValidationEngine.IsRuleApplicable(rule, "Column", scapi)).Should().Be(expected);
+    }
+
+    [Fact]
+    public void IsRuleApplicable_three_term_folds_strictly_left_to_right()
+    {
+        // ((A AND B) OR C). A=X(T), B=Z(F): (T AND F)=F; OR C.
+        var rule = MultiRule(
+            PropTerm(0, null, "A", "X"),
+            PropTerm(1, "AND", "B", "Y"),
+            PropTerm(2, "OR", "C", "W"));
+
+        dynamic hitC = new FakeScapi(new System.Collections.Generic.Dictionary<string, object> { ["A"] = "X", ["B"] = "Z", ["C"] = "W" });
+        ((bool)NamingValidationEngine.IsRuleApplicable(rule, "Column", hitC)).Should().BeTrue();   // F OR T = T
+
+        dynamic missC = new FakeScapi(new System.Collections.Generic.Dictionary<string, object> { ["A"] = "X", ["B"] = "Z", ["C"] = "nope" });
+        ((bool)NamingValidationEngine.IsRuleApplicable(rule, "Column", missC)).Should().BeFalse(); // F OR F = F
+    }
+
+    [Fact]
+    public void IsRuleApplicable_unknown_connector_defaults_to_and()
+    {
+        // Term 1 connector "XOR" is unknown -> treated as AND. A=X(T) AND B=Z(F) => F.
+        var rule = MultiRule(PropTerm(0, null, "A", "X"), PropTerm(1, "XOR", "B", "Y"));
+        dynamic scapi = new FakeScapi(new System.Collections.Generic.Dictionary<string, object> { ["A"] = "X", ["B"] = "Z" });
+        ((bool)NamingValidationEngine.IsRuleApplicable(rule, "Column", scapi)).Should().BeFalse();
     }
 }

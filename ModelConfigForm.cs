@@ -112,6 +112,15 @@ namespace EliteSoft.Erwin.AddIn
         // mode because no PU set element changed.
         private string _lastObservedTitleLocator = string.Empty;
 
+        // HWND of the active MDI child (the model tab in front) captured at the
+        // last connect. The active MDI child is the ground truth for which model
+        // the user is looking at: a modal dialog cannot become the active child,
+        // so it cannot mask a real tab switch the way it can steal the main-frame
+        // title. A change here is a parse-free switch signal that complements the
+        // locator-string compare (regex-independent). Zero when erwin is not on a
+        // standard MDI frame (then we fall back to the main-frame title compare).
+        private IntPtr _lastActiveMdiChildHwnd = IntPtr.Zero;
+
         // Locators of Mart-version PUs the DDL pipeline opened ITSELF (the
         // older version loaded as the compare RIGHT side, e.g. v1 in a
         // v4-vs-v1 run). The reconnect tick must treat these as pipeline
@@ -618,7 +627,13 @@ namespace EliteSoft.Erwin.AddIn
                 // PUs without a PU set change. Reading the title here (not in
                 // the tick body alone) ensures the baseline matches the PU we
                 // just bound to.
-                _lastObservedTitleLocator = Services.PuLocatorReader.ReadFromWindowTitle() ?? string.Empty;
+                // Prefer the ACTIVE MDI child caption (ground truth, immune to
+                // dialog title theft); fall back to the main-frame title only when
+                // erwin is not on a standard MDI frame. Capture the child HWND so
+                // the tick can detect a switch parse-free.
+                _lastObservedTitleLocator = Services.PuLocatorReader.ReadFromActiveMdiChild(out _lastActiveMdiChildHwnd);
+                if (_lastActiveMdiChildHwnd == IntPtr.Zero)
+                    _lastObservedTitleLocator = Services.PuLocatorReader.ReadFromWindowTitle() ?? string.Empty;
 
                 // Keep the reconnect timer alive even after a successful
                 // connect so it can act as a model-state monitor: the tick
@@ -1380,30 +1395,39 @@ namespace EliteSoft.Erwin.AddIn
                     // wrongly (e.g. onto the leftover's title).
                     if (effectiveCount > 1)
                     {
-                        string currentTitleLoc = Services.PuLocatorReader.ReadFromWindowTitle() ?? string.Empty;
+                        // Ground truth: the ACTIVE MDI child (the model tab in
+                        // front). Its caption cannot be stolen by a modal dialog
+                        // the way the main-frame title can, and it carries the
+                        // FULL locator (spaces and all). Only when erwin is not on
+                        // a standard MDI frame do we fall back to the main-frame
+                        // title parse.
+                        IntPtr activeChild;
+                        string currentTitleLoc = Services.PuLocatorReader.ReadFromActiveMdiChild(out activeChild);
+                        if (activeChild == IntPtr.Zero)
+                            currentTitleLoc = Services.PuLocatorReader.ReadFromWindowTitle() ?? string.Empty;
 
-                        // Diagnostic heartbeat: log the title locator every
-                        // ~10 s (20 ticks at 500 ms) so we can see WHAT
-                        // ReadFromWindowTitle is returning when the user
-                        // claims a tab switch went unnoticed. Without this,
-                        // a silent log makes both "user did not switch tabs"
-                        // and "we read the wrong title locator" look identical.
+                        // Diagnostic heartbeat: log the active locator + child hwnd
+                        // every ~10 s so a "tab switch went unnoticed" report is
+                        // one-line diagnosable (did the child / locator actually
+                        // change, or did we read the wrong one?).
                         _tabPollDebugTickCounter++;
                         if (_tabPollDebugTickCounter >= 20)
                         {
                             _tabPollDebugTickCounter = 0;
-                            // One-line summary on idle. Full ground-truth dump
-                            // (raw title + per-PU name/locator) is reserved
-                            // for actual tab-switch firings - cheap there
-                            // because it runs at most a few times per minute.
-                            // The previous per-heartbeat dump produced 4
-                            // log lines every 10 s for the lifetime of the
-                            // process; trimmed 2026-05-14 once the locator
-                            // matcher proved stable in production logs.
-                            Log($"[TabPoll] count={count} titleLoc='{currentTitleLoc}' boundName='{_connectedModelName}'");
+                            Log($"[TabPoll] count={count} titleLoc='{currentTitleLoc}' child=0x{activeChild.ToInt64():X} boundName='{_connectedModelName}'");
                         }
 
-                        if (!string.Equals(currentTitleLoc, _lastObservedTitleLocator, StringComparison.OrdinalIgnoreCase))
+                        // Two complementary switch signals: the active MDI child
+                        // HWND changed (parse-free, regex-independent) OR the parsed
+                        // locator changed. The HWND signal catches a switch even if
+                        // a caption fails to parse; the locator signal catches the
+                        // fallback (non-MDI) path. Either fires the reconnect.
+                        bool hwndSwitched = activeChild != IntPtr.Zero
+                            && _lastActiveMdiChildHwnd != IntPtr.Zero
+                            && activeChild != _lastActiveMdiChildHwnd;
+
+                        if (hwndSwitched
+                            || !string.Equals(currentTitleLoc, _lastObservedTitleLocator, StringComparison.OrdinalIgnoreCase))
                         {
                             // Transient-empty debounce (2026-06-10 crash chain):
                             // ReadFromWindowTitle returned '' for a single read
@@ -1438,6 +1462,9 @@ namespace EliteSoft.Erwin.AddIn
                             {
                                 Log($"Tab switch onto pipeline-owned version copy ('{currentTitleLoc}') - NOT reconnecting. Close that tab without saving to clean up.");
                                 _lastObservedTitleLocator = currentTitleLoc;
+                                // Arm BOTH detectors so we log once, not every tick,
+                                // and so tabbing BACK to the real model fires normally.
+                                _lastActiveMdiChildHwnd = activeChild;
                                 return;
                             }
 
@@ -1536,6 +1563,13 @@ namespace EliteSoft.Erwin.AddIn
                         // empty-title debounce so a later real transition gets
                         // a fresh two-tick window.
                         _emptyTitleDebouncePending = false;
+
+                        // Keep the HWND detector armed/current. Normally a no-op
+                        // (same bound child); it heals a connect snapshot taken
+                        // while a dialog hid the active child (HWND was Zero) so a
+                        // later switch is caught parse-free too.
+                        if (activeChild != IntPtr.Zero)
+                            _lastActiveMdiChildHwnd = activeChild;
                     }
 
                     // All open PUs are already in the known set; idle tick.
@@ -4217,18 +4251,36 @@ namespace EliteSoft.Erwin.AddIn
                     // Length rule missing operator/value) trivially visible.
                     foreach (var rule in service.AllRules)
                     {
-                        // Polymorphic condition: at most one of (UDP, built-in
-                        // property) is set per the C3 admin contract. Diagnostic
-                        // surfaces whichever source the rule chose plus the CSV
-                        // values list so an admin reading the log can confirm
-                        // exactly what state the rule is gating on.
+                        // Ordered AND/OR condition list (MC_NAMING_RULE_CONDITION).
+                        // Render every term left-to-right with its connector so an
+                        // admin reading the log can confirm exactly what the rule is
+                        // gating on, e.g. "udp[TABLE_TYPE] in [LOG] AND prop[Is_PK] in [True]".
                         string udpCond;
-                        if (!string.IsNullOrEmpty(rule.DependsOnUdpName))
-                            udpCond = $"udp[{rule.DependsOnUdpName}] in [{rule.DependsOnPropertyValues ?? "(any)"}]";
-                        else if (!string.IsNullOrEmpty(rule.DependsOnPropertyCode))
-                            udpCond = $"prop[{rule.DependsOnPropertyCode}] in [{rule.DependsOnPropertyValues ?? "(any)"}]";
-                        else
+                        if (rule.Conditions.Count == 0)
+                        {
                             udpCond = "(none)";
+                        }
+                        else
+                        {
+                            var condParts = new List<string>();
+                            foreach (var c in rule.Conditions)
+                            {
+                                // Qualify a related-object property (e.g. prop[SCHEMA.Name])
+                                // so the dump shows WHERE the value is read from.
+                                string propName = !string.IsNullOrEmpty(c.DependsOnPropertyObjectType)
+                                        && !string.Equals(c.DependsOnPropertyObjectType?.Trim(), rule.ObjectType?.Trim(), StringComparison.OrdinalIgnoreCase)
+                                    ? $"{c.DependsOnPropertyObjectType}.{c.DependsOnPropertyCode}"
+                                    : c.DependsOnPropertyCode;
+                                string src = !string.IsNullOrEmpty(c.DependsOnUdpName)
+                                    ? $"udp[{c.DependsOnUdpName}]"
+                                    : (!string.IsNullOrEmpty(c.DependsOnPropertyCode) ? $"prop[{propName}]" : "?[]");
+                                string term = $"{src} in [{(string.IsNullOrEmpty(c.DependsOnPropertyValues) ? "(any)" : c.DependsOnPropertyValues)}]";
+                                condParts.Add(c.OrderIndex == 0
+                                    ? term
+                                    : $"{(string.IsNullOrEmpty(c.Connector) ? "AND" : c.Connector.ToUpperInvariant())} {term}");
+                            }
+                            udpCond = string.Join(" ", condParts);
+                        }
                         string msg = rule.ErrorMessage ?? "";
                         if (msg.Length > 80) msg = msg.Substring(0, 77) + "...";
 

@@ -155,32 +155,60 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// </summary>
         public RuleApplyOn ApplyOn { get; set; } = RuleApplyOn.Both;
 
-        // --- Polymorphic condition (mutually exclusive sources) ---
+        // --- Ordered AND/OR condition list (MC_NAMING_RULE_CONDITION) ---
 
-        /// <summary>FK to <c>MC_UDP_DEFINITION</c>. When set, the rule fires only
-        /// when the entity's UDP value is in <see cref="DependsOnPropertyValues"/>.</summary>
+        /// <summary>
+        /// The rule's DEPENDS_ON conditions in ORDER_INDEX order, folded strictly
+        /// left-to-right (no precedence/parentheses) by <c>NamingValidationEngine</c>.
+        /// Empty == the rule is unconditional (always applies). This sub-table is the
+        /// SOLE authority; the former flat <c>DEPENDS_ON_*</c> columns on
+        /// MC_NAMING_STANDARD were a migration bridge and have been dropped, so there
+        /// is no fallback to them.
+        /// </summary>
+        public List<NamingRuleCondition> Conditions { get; } = new List<NamingRuleCondition>();
+    }
+
+    /// <summary>
+    /// One term of a naming rule's DEPENDS_ON condition list (a row of
+    /// <c>MC_NAMING_RULE_CONDITION</c>). Each term has the SAME shape as the legacy
+    /// single condition: a source that is EITHER a UDP (<see cref="DependsOnUdpId"/>)
+    /// XOR an erwin built-in property (<see cref="DependsOnPropertyDefId"/>), plus a
+    /// CSV of allowed values matched case-insensitively (IN). Terms are joined by
+    /// <see cref="Connector"/> ('AND'/'OR'); the first term (ORDER_INDEX 0) has a
+    /// NULL connector that is ignored.
+    /// </summary>
+    public class NamingRuleCondition
+    {
+        /// <summary>0-based position; term 0 is the left-most, connector ignored.</summary>
+        public int OrderIndex { get; set; }
+
+        /// <summary>"AND" / "OR" joining this term to the running result; NULL/"" on
+        /// term 0. Unknown/empty values past term 0 default to AND (never loosen).</summary>
+        public string Connector { get; set; }
+
+        /// <summary>FK to <c>MC_UDP_DEFINITION</c> (XOR with <see cref="DependsOnPropertyDefId"/>).</summary>
         public int? DependsOnUdpId { get; set; }
 
-        /// <summary>FK to <c>MC_PROPERTY_DEF</c>. When set, the rule fires only
-        /// when the entity's erwin built-in property value (read via SCAPI
-        /// using <see cref="DependsOnPropertyCode"/>) is in
-        /// <see cref="DependsOnPropertyValues"/>.</summary>
-        public int? DependsOnPropertyDefId { get; set; }
-
-        /// <summary>CSV of values the source property must match (case-insensitive).
-        /// Empty + a source set → "any non-empty value matches". Both FKs null
-        /// → rule is unconditional regardless of this field's contents.</summary>
-        public string DependsOnPropertyValues { get; set; }
-
-        /// <summary>Resolved UDP name when <see cref="DependsOnUdpId"/> is set
-        /// (JOIN result). The UDP value is read via the
+        /// <summary>Resolved UDP name (JOIN). Read via the
         /// <c>"&lt;OwnerClass&gt;.Physical.&lt;UdpName&gt;"</c> SCAPI accessor.</summary>
         public string DependsOnUdpName { get; set; }
 
-        /// <summary>Resolved <c>PROPERTY_CODE</c> when
-        /// <see cref="DependsOnPropertyDefId"/> is set (JOIN result). Read as
-        /// a direct SCAPI accessor (e.g. <c>"Physical_Data_Type"</c>).</summary>
+        /// <summary>FK to <c>MC_PROPERTY_DEF</c> (XOR with <see cref="DependsOnUdpId"/>).</summary>
+        public int? DependsOnPropertyDefId { get; set; }
+
+        /// <summary>Resolved <c>PROPERTY_CODE</c> (JOIN), e.g. "Physical_Data_Type".</summary>
         public string DependsOnPropertyCode { get; set; }
+
+        /// <summary>Object type that OWNS the condition property (JOIN
+        /// <c>MC_PROPERTY_DEF.OBJECT_TYPE_ID -&gt; MC_OBJECT_TYPE.NAME</c>), e.g. "TABLE"
+        /// or "SCHEMA". When it differs from the rule's target object type the property
+        /// lives on a RELATED object (a table's owning schema), so the evaluator resolves
+        /// it accordingly (SCHEMA.Name = the target's Name_Qualifier). Null for UDP terms.</summary>
+        public string DependsOnPropertyObjectType { get; set; }
+
+        /// <summary>CSV the source value must be IN (case-insensitive, trimmed).
+        /// Empty + a source set => "any non-empty value matches".</summary>
+        public string DependsOnPropertyValues { get; set; }
     }
 
     /// <summary>
@@ -343,11 +371,9 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     IsActive = Convert.ToBoolean(reader["IS_ACTIVE"]),
                                     SortOrder = reader["SORT_ORDER"] == DBNull.Value ? 0 : Convert.ToInt32(reader["SORT_ORDER"]),
                                     ConfigId = Convert.ToInt32(reader["CONFIG_ID"]),
-                                    DependsOnUdpId = reader["DEPENDS_ON_UDP_ID"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["DEPENDS_ON_UDP_ID"]),
-                                    DependsOnPropertyDefId = reader["DEPENDS_ON_PROPERTY_DEF_ID"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["DEPENDS_ON_PROPERTY_DEF_ID"]),
-                                    DependsOnPropertyValues = reader["DEPENDS_ON_PROPERTY_VALUES"] == DBNull.Value ? "" : reader["DEPENDS_ON_PROPERTY_VALUES"]?.ToString()?.Trim() ?? "",
-                                    DependsOnUdpName = reader["UDP_NAME"] == DBNull.Value ? "" : reader["UDP_NAME"]?.ToString()?.Trim() ?? "",
-                                    DependsOnPropertyCode = reader["COND_PROPERTY_CODE"] == DBNull.Value ? "" : reader["COND_PROPERTY_CODE"]?.ToString()?.Trim() ?? "",
+                                    // DEPENDS_ON conditions are loaded separately from
+                                    // MC_NAMING_RULE_CONDITION (see LoadRuleConditions);
+                                    // the flat DEPENDS_ON_* columns have been dropped.
                                     ApplyOn = ParseApplyOn(reader["APPLY_ON"]),
                                     // Template-only columns; empty for the other kinds.
                                     // Not trimmed: a template may legitimately rely on
@@ -357,16 +383,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 };
 
                                 if (!rule.IsActive) continue;
-
-                                // Defence-in-depth mirror of admin's CK_MC_NAMING_COND_XOR: a
-                                // hand-edited row that points at both sources would otherwise
-                                // produce confusing dual-read behaviour. Skip and log.
-                                if (rule.DependsOnUdpId.HasValue && rule.DependsOnPropertyDefId.HasValue)
-                                {
-                                    System.Diagnostics.Debug.WriteLine(
-                                        $"NamingStandardService: skipping rule ID={rule.Id} - both DEPENDS_ON_UDP_ID and DEPENDS_ON_PROPERTY_DEF_ID set");
-                                    continue;
-                                }
 
                                 _allRules.Add(rule);
 
@@ -380,6 +396,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                             }
                         }
                     }
+
+                    // Load each rule's ordered AND/OR condition list from
+                    // MC_NAMING_RULE_CONDITION onto the rules just loaded (reusing the
+                    // open connection). Inside this try so a condition-load failure
+                    // fails the whole load instead of silently treating conditional
+                    // rules as unconditional.
+                    LoadRuleConditions(connection, dbType, ctx.ActiveConfigId);
                 }
 
                 _isLoaded = true;
@@ -426,6 +449,119 @@ namespace EliteSoft.Erwin.AddIn.Services
             return RuleApplyOn.Both;
         }
 
+        /// <summary>
+        /// Loads MC_NAMING_RULE_CONDITION for the active config and attaches each row
+        /// (ORDER_INDEX order) to its owning rule's <see cref="NamingStandardRule.Conditions"/>,
+        /// reusing the already-open <paramref name="connection"/>. A row that names
+        /// neither source or both is skipped + logged (mirrors the admin XOR CHECK).
+        /// Lets a query failure propagate so the caller fails the whole load rather
+        /// than silently treating conditional rules as unconditional.
+        /// </summary>
+        private void LoadRuleConditions(DbConnection connection, string dbType, int configId)
+        {
+            var byId = new Dictionary<int, NamingStandardRule>();
+            foreach (var r in _allRules)
+                byId[r.Id] = r;
+            if (byId.Count == 0) return;
+
+            string query = GetConditionsQuery(dbType);
+            using (var command = DatabaseService.Instance.CreateCommand(query, connection))
+            {
+                var pCfg = command.CreateParameter();
+                pCfg.ParameterName = SqlDialect.Param(dbType, "cfgId");
+                pCfg.Value = configId;
+                command.Parameters.Add(pCfg);
+
+                int loaded = 0, skipped = 0;
+                using (var reader = command.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        int nsId = Convert.ToInt32(reader["NAMING_STANDARD_ID"]);
+                        if (!byId.TryGetValue(nsId, out var rule)) continue; // condition for a rule we did not load (inactive/other config)
+
+                        int? udpId = reader["DEPENDS_ON_UDP_ID"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["DEPENDS_ON_UDP_ID"]);
+                        int? propDefId = reader["DEPENDS_ON_PROPERTY_DEF_ID"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["DEPENDS_ON_PROPERTY_DEF_ID"]);
+
+                        // Mirror admin's CK XOR: each term must name EXACTLY one source.
+                        if (udpId.HasValue == propDefId.HasValue)
+                        {
+                            AddinLogger.Log(
+                                $"NAMING_RULE_CONDITION SKIP: rule {nsId} order {reader["ORDER_INDEX"]} names {(udpId.HasValue ? "BOTH" : "NO")} source(s) - term dropped");
+                            skipped++;
+                            continue;
+                        }
+
+                        rule.Conditions.Add(new NamingRuleCondition
+                        {
+                            OrderIndex = Convert.ToInt32(reader["ORDER_INDEX"]),
+                            Connector = reader["CONNECTOR"] == DBNull.Value ? null : reader["CONNECTOR"]?.ToString()?.Trim(),
+                            DependsOnUdpId = udpId,
+                            DependsOnUdpName = reader["UDP_NAME"] == DBNull.Value ? "" : reader["UDP_NAME"]?.ToString()?.Trim() ?? "",
+                            DependsOnPropertyDefId = propDefId,
+                            DependsOnPropertyCode = reader["COND_PROPERTY_CODE"] == DBNull.Value ? "" : reader["COND_PROPERTY_CODE"]?.ToString()?.Trim() ?? "",
+                            DependsOnPropertyObjectType = reader["COND_PROPERTY_OBJECT_TYPE"] == DBNull.Value ? "" : reader["COND_PROPERTY_OBJECT_TYPE"]?.ToString()?.Trim() ?? "",
+                            DependsOnPropertyValues = reader["DEPENDS_ON_PROPERTY_VALUES"] == DBNull.Value ? "" : reader["DEPENDS_ON_PROPERTY_VALUES"]?.ToString()?.Trim() ?? "",
+                        });
+                        loaded++;
+                    }
+                }
+
+                // Defensive: the fold relies on ORDER_INDEX order. The query already
+                // sorts, but a per-rule sort guarantees it regardless of provider quirks.
+                foreach (var rule in byId.Values)
+                    rule.Conditions.Sort((a, b) => a.OrderIndex.CompareTo(b.OrderIndex));
+
+                AddinLogger.Log($"NAMING_RULE_CONDITION loaded: {loaded} condition(s) across {byId.Count} rule(s) ({skipped} skipped). Per-rule counts: {string.Join(", ", _allRules.Where(r => r.Conditions.Count > 0).Select(r => $"#{r.Id}={r.Conditions.Count}"))}");
+            }
+        }
+
+        private static string GetConditionsQuery(string dbType)
+        {
+            switch (dbType?.ToUpper())
+            {
+                case "POSTGRESQL":
+                    return @"SELECT rc.""NAMING_STANDARD_ID"", rc.""ORDER_INDEX"", rc.""CONNECTOR"",
+                            rc.""DEPENDS_ON_UDP_ID"", rc.""DEPENDS_ON_PROPERTY_DEF_ID"", rc.""DEPENDS_ON_PROPERTY_VALUES"",
+                            udp.""NAME"" AS ""UDP_NAME"",
+                            cond_pd.""PROPERTY_CODE"" AS ""COND_PROPERTY_CODE"",
+                            cond_ot.""NAME"" AS ""COND_PROPERTY_OBJECT_TYPE""
+                            FROM ""MC_NAMING_RULE_CONDITION"" rc
+                            JOIN ""MC_NAMING_STANDARD"" ns ON ns.""ID"" = rc.""NAMING_STANDARD_ID""
+                            LEFT JOIN ""MC_UDP_DEFINITION"" udp ON udp.""ID"" = rc.""DEPENDS_ON_UDP_ID""
+                            LEFT JOIN ""MC_PROPERTY_DEF"" cond_pd ON cond_pd.""ID"" = rc.""DEPENDS_ON_PROPERTY_DEF_ID""
+                            LEFT JOIN ""MC_OBJECT_TYPE"" cond_ot ON cond_ot.""ID"" = cond_pd.""OBJECT_TYPE_ID""
+                            WHERE ns.""CONFIG_ID"" = @cfgId
+                            ORDER BY rc.""NAMING_STANDARD_ID"", rc.""ORDER_INDEX""";
+                case "ORACLE":
+                    return @"SELECT rc.NAMING_STANDARD_ID, rc.ORDER_INDEX, rc.CONNECTOR,
+                            rc.DEPENDS_ON_UDP_ID, rc.DEPENDS_ON_PROPERTY_DEF_ID, rc.DEPENDS_ON_PROPERTY_VALUES,
+                            udp.NAME AS UDP_NAME,
+                            cond_pd.PROPERTY_CODE AS COND_PROPERTY_CODE,
+                            cond_ot.NAME AS COND_PROPERTY_OBJECT_TYPE
+                            FROM MC_NAMING_RULE_CONDITION rc
+                            JOIN MC_NAMING_STANDARD ns ON ns.ID = rc.NAMING_STANDARD_ID
+                            LEFT JOIN MC_UDP_DEFINITION udp ON udp.ID = rc.DEPENDS_ON_UDP_ID
+                            LEFT JOIN MC_PROPERTY_DEF cond_pd ON cond_pd.ID = rc.DEPENDS_ON_PROPERTY_DEF_ID
+                            LEFT JOIN MC_OBJECT_TYPE cond_ot ON cond_ot.ID = cond_pd.OBJECT_TYPE_ID
+                            WHERE ns.CONFIG_ID = :cfgId
+                            ORDER BY rc.NAMING_STANDARD_ID, rc.ORDER_INDEX";
+                default: // SQL Server
+                    return @"SELECT rc.[NAMING_STANDARD_ID], rc.[ORDER_INDEX], rc.[CONNECTOR],
+                            rc.[DEPENDS_ON_UDP_ID], rc.[DEPENDS_ON_PROPERTY_DEF_ID], rc.[DEPENDS_ON_PROPERTY_VALUES],
+                            udp.[NAME] AS [UDP_NAME],
+                            cond_pd.[PROPERTY_CODE] AS [COND_PROPERTY_CODE],
+                            cond_ot.[NAME] AS [COND_PROPERTY_OBJECT_TYPE]
+                            FROM [dbo].[MC_NAMING_RULE_CONDITION] rc
+                            JOIN [dbo].[MC_NAMING_STANDARD] ns ON ns.[ID] = rc.[NAMING_STANDARD_ID]
+                            LEFT JOIN [dbo].[MC_UDP_DEFINITION] udp ON udp.[ID] = rc.[DEPENDS_ON_UDP_ID]
+                            LEFT JOIN [dbo].[MC_PROPERTY_DEF] cond_pd ON cond_pd.[ID] = rc.[DEPENDS_ON_PROPERTY_DEF_ID]
+                            LEFT JOIN [dbo].[MC_OBJECT_TYPE] cond_ot ON cond_ot.[ID] = cond_pd.[OBJECT_TYPE_ID]
+                            WHERE ns.[CONFIG_ID] = @cfgId
+                            ORDER BY rc.[NAMING_STANDARD_ID], rc.[ORDER_INDEX]";
+            }
+        }
+
         private static string GetQuery(string dbType)
         {
             switch (dbType?.ToUpper())
@@ -435,16 +571,11 @@ namespace EliteSoft.Erwin.AddIn.Services
                             ns.""PROPERTY_DEF_ID"", ns.""RULE_TYPE"", ns.""IS_REQUIRED"",
                             ns.""PREFIX"", ns.""SUFFIX"", ns.""LENGTH_OPERATOR"", ns.""LENGTH_VALUE"",
                             ns.""REGEXP_PATTERN"", ns.""ERROR_MESSAGE"", ns.""AUTO_APPLY"", ns.""IS_ACTIVE"", ns.""SORT_ORDER"",
-                            ns.""CONFIG_ID"", ns.""DEPENDS_ON_UDP_ID"", ns.""DEPENDS_ON_PROPERTY_DEF_ID"",
-                            ns.""DEPENDS_ON_PROPERTY_VALUES"", ns.""APPLY_ON"",
-                            ns.""VALUE_TEMPLATE"", ns.""TEMPLATE_FILL_MODE"",
-                            udp.""NAME"" AS ""UDP_NAME"",
-                            cond_pd.""PROPERTY_CODE"" AS ""COND_PROPERTY_CODE""
+                            ns.""CONFIG_ID"", ns.""APPLY_ON"",
+                            ns.""VALUE_TEMPLATE"", ns.""TEMPLATE_FILL_MODE""
                             FROM ""MC_NAMING_STANDARD"" ns
                             JOIN ""MC_OBJECT_TYPE""  ot ON ot.""ID"" = ns.""OBJECT_TYPE_ID""
                             LEFT JOIN ""MC_PROPERTY_DEF"" pd ON pd.""ID"" = ns.""PROPERTY_DEF_ID""
-                            LEFT JOIN ""MC_UDP_DEFINITION"" udp ON udp.""ID"" = ns.""DEPENDS_ON_UDP_ID""
-                            LEFT JOIN ""MC_PROPERTY_DEF"" cond_pd ON cond_pd.""ID"" = ns.""DEPENDS_ON_PROPERTY_DEF_ID""
                             WHERE ns.""IS_ACTIVE"" = true
                               AND ns.""CONFIG_ID"" = @cfgId
                               AND (ns.""PROPERTY_DEF_ID"" IS NULL OR pd.""DBMS_VERSION_ID"" IS NULL)
@@ -455,16 +586,11 @@ namespace EliteSoft.Erwin.AddIn.Services
                             ns.PROPERTY_DEF_ID, ns.RULE_TYPE, ns.IS_REQUIRED,
                             ns.PREFIX, ns.SUFFIX, ns.LENGTH_OPERATOR, ns.LENGTH_VALUE,
                             ns.REGEXP_PATTERN, ns.ERROR_MESSAGE, ns.AUTO_APPLY, ns.IS_ACTIVE, ns.SORT_ORDER,
-                            ns.CONFIG_ID, ns.DEPENDS_ON_UDP_ID, ns.DEPENDS_ON_PROPERTY_DEF_ID,
-                            ns.DEPENDS_ON_PROPERTY_VALUES, ns.APPLY_ON,
-                            ns.VALUE_TEMPLATE, ns.TEMPLATE_FILL_MODE,
-                            udp.NAME AS UDP_NAME,
-                            cond_pd.PROPERTY_CODE AS COND_PROPERTY_CODE
+                            ns.CONFIG_ID, ns.APPLY_ON,
+                            ns.VALUE_TEMPLATE, ns.TEMPLATE_FILL_MODE
                             FROM MC_NAMING_STANDARD ns
                             JOIN MC_OBJECT_TYPE  ot ON ot.ID = ns.OBJECT_TYPE_ID
                             LEFT JOIN MC_PROPERTY_DEF pd ON pd.ID = ns.PROPERTY_DEF_ID
-                            LEFT JOIN MC_UDP_DEFINITION udp ON udp.ID = ns.DEPENDS_ON_UDP_ID
-                            LEFT JOIN MC_PROPERTY_DEF cond_pd ON cond_pd.ID = ns.DEPENDS_ON_PROPERTY_DEF_ID
                             WHERE ns.IS_ACTIVE = 1
                               AND ns.CONFIG_ID = :cfgId
                               AND (ns.PROPERTY_DEF_ID IS NULL OR pd.DBMS_VERSION_ID IS NULL)
@@ -476,16 +602,11 @@ namespace EliteSoft.Erwin.AddIn.Services
                             ns.[PROPERTY_DEF_ID], ns.[RULE_TYPE], ns.[IS_REQUIRED],
                             ns.[PREFIX], ns.[SUFFIX], ns.[LENGTH_OPERATOR], ns.[LENGTH_VALUE],
                             ns.[REGEXP_PATTERN], ns.[ERROR_MESSAGE], ns.[AUTO_APPLY], ns.[IS_ACTIVE], ns.[SORT_ORDER],
-                            ns.[CONFIG_ID], ns.[DEPENDS_ON_UDP_ID], ns.[DEPENDS_ON_PROPERTY_DEF_ID],
-                            ns.[DEPENDS_ON_PROPERTY_VALUES], ns.[APPLY_ON],
-                            ns.[VALUE_TEMPLATE], ns.[TEMPLATE_FILL_MODE],
-                            udp.[NAME] AS [UDP_NAME],
-                            cond_pd.[PROPERTY_CODE] AS [COND_PROPERTY_CODE]
+                            ns.[CONFIG_ID], ns.[APPLY_ON],
+                            ns.[VALUE_TEMPLATE], ns.[TEMPLATE_FILL_MODE]
                             FROM [dbo].[MC_NAMING_STANDARD] ns
                             JOIN [dbo].[MC_OBJECT_TYPE]  ot ON ot.[ID] = ns.[OBJECT_TYPE_ID]
                             LEFT JOIN [dbo].[MC_PROPERTY_DEF] pd ON pd.[ID] = ns.[PROPERTY_DEF_ID]
-                            LEFT JOIN [dbo].[MC_UDP_DEFINITION] udp ON udp.[ID] = ns.[DEPENDS_ON_UDP_ID]
-                            LEFT JOIN [dbo].[MC_PROPERTY_DEF] cond_pd ON cond_pd.[ID] = ns.[DEPENDS_ON_PROPERTY_DEF_ID]
                             WHERE ns.[IS_ACTIVE] = 1
                               AND ns.[CONFIG_ID] = @cfgId
                               AND (ns.[PROPERTY_DEF_ID] IS NULL OR pd.[DBMS_VERSION_ID] IS NULL)
@@ -642,8 +763,9 @@ namespace EliteSoft.Erwin.AddIn.Services
         public IReadOnlyList<string> GetRelevantUdpNames()
         {
             return _allRules
-                .Where(r => !string.IsNullOrEmpty(r.DependsOnUdpName))
-                .Select(r => r.DependsOnUdpName)
+                .SelectMany(r => r.Conditions)
+                .Where(c => !string.IsNullOrEmpty(c.DependsOnUdpName))
+                .Select(c => c.DependsOnUdpName)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToList();
         }
