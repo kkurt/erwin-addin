@@ -644,16 +644,18 @@ namespace EliteSoft.Erwin.AddIn
             // the General tab without pushing the footer (Close erwin / copyright)
             // past the visible tab area. The tabControl is Bottom-anchored so it
             // absorbs the extra height automatically.
-            this.ClientSize = new System.Drawing.Size(980, 720);
+            this.ClientSize = new System.Drawing.Size(980, 600);
             this.Controls.Add(this.tabControl);
             this.Controls.Add(this.pnlStatusSep);
             this.Controls.Add(this.pnlStatusBar);
             this.Font = fontBody;
             this.BackColor = System.Drawing.Color.White;
             this.FormBorderStyle = System.Windows.Forms.FormBorderStyle.Sizable;
-            // Floor raised 500 -> 700 (2026-06-08) so the General tab's General
-            // cards + Close-erwin footer stay reachable after the new System card.
-            this.MinimumSize = new System.Drawing.Size(800, 700);
+            // Floor lowered 700 -> 560 (2026-07-07): the "System" card was removed
+            // (the active DB now shows in the Repository Config row), so the General
+            // tab is one card shorter again - the height that was added for that card
+            // is no longer needed and left empty space below the footer.
+            this.MinimumSize = new System.Drawing.Size(800, 560);
             this.MaximizeBox = true;
             this.MinimizeBox = true;
             this.Name = "ModelConfigForm";

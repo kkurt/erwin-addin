@@ -10,9 +10,8 @@ namespace EliteSoft.Erwin.AddIn.Services
 {
     /// <summary>
     /// Database service for multi-provider support (MSSQL, PostgreSQL, Oracle).
-    /// Reads bootstrap config via <see cref="HklmFirstBootstrapReader"/>: probes
-    /// HKLM first (LocalMachine DPAPI), then HKCU (CurrentUser DPAPI). See
-    /// docs/INSTALL.md for the load decision tree.
+    /// Reads bootstrap config via <see cref="HkcuBootstrapReader"/>: HKCU only
+    /// (CurrentUser DPAPI). See docs/INSTALL.md for the load decision tree.
     /// </summary>
     public class DatabaseService
     {
@@ -45,15 +44,15 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         private DatabaseService()
         {
-            // HklmFirstBootstrapReader probes HKLM first (LocalMachine DPAPI),
-            // then HKCU (CurrentUser DPAPI). See docs/INSTALL.md for the full
-            // decision tree and DPAPI scope rules. We no longer fall back to
-            // bootstrap.json - the installer is the single source of truth and
-            // it always writes the registry, never a JSON file. (The legacy
+            // HkcuBootstrapReader reads HKCU only (CurrentUser DPAPI). HKLM
+            // support was removed 2026-07-02 (user decision) - see the reader's
+            // docstring for the rationale. We also no longer fall back to
+            // bootstrap.json: the installer is the single source of truth and it
+            // always writes the registry, never a JSON file. (The legacy
             // BootstrapService JSON path migrated to registry years ago via
             // RegistryBootstrapService.MigrateFromJsonIfNeeded; that migration
             // still runs in erwin-admin if a stale bootstrap.json lingers.)
-            _bootstrapService = new HklmFirstBootstrapReader();
+            _bootstrapService = new HkcuBootstrapReader();
         }
 
         /// <summary>

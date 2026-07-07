@@ -103,8 +103,7 @@ value via `scapiObject.Properties(PROPERTY_CODE).Value`; the code must
 match an actual erwin SCAPI property accessor exactly or SCAPI throws
 "is not valid class id or class name for object or property".
 
-Verified empirically 2026-05-16 with [MetamodelPropertyProbeService](../Services/MetamodelPropertyProbeService.cs)
-across four DBMS families:
+Verified empirically 2026-05-16 across four DBMS families:
 
 | Concept | SCAPI accessor (PROPERTY_CODE) | Verified on |
 |---------|-------------------------------|-------------|
@@ -149,9 +148,9 @@ SCAPI accessor.
 
 1. Insert (or use admin UI to add) a row in `MC_PROPERTY_DEF` whose
    `PROPERTY_CODE` matches the SCAPI accessor for the property you
-   want to constrain. Use the table above for common ones; run the
-   dev-only Probe Properties button to discover new accessors on
-   exotic DBMS.
+   want to constrain. Use the table above for common ones; for an
+   unlisted accessor, inspect the SCAPI object's Properties collection
+   (e.g. from a REScript or the debugger).
 2. Insert one or more rows in `MC_NAMING_STANDARD` pointing at the new
    `PROPERTY_DEF_ID`. **Each row is exactly one rule kind** (see
    `RULE_TYPE` contract below); to express "must start with `DM_` AND

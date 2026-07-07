@@ -4940,6 +4940,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     // the slow path below. Run the lock check here before
                                     // continuing so locked UDPs are still reverted.
                                     EnforceLockedAttributeUdps(attr, objectId, existingSnap.PhysicalName);
+                                    EnforceLockedGlossaryFields(attr, objectId, existingSnap.PhysicalName);
 
                                     // Same blind-spot for cascade-source UDPs (e.g.
                                     // DATA_CATEGORY -> KVKK / INTEGRITY / CONFIDENTIALITY
@@ -5104,6 +5105,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                         // through the lock and revert them, breaking the
                         // user-only intent.
                         EnforceLockedAttributeUdps(attr, objectId, currentState.PhysicalName);
+                        EnforceLockedGlossaryFields(attr, objectId, currentState.PhysicalName);
 
                         // Check column-level UDP changes for dependency cascade
                         CheckAttributeUdpDependencies(attr, objectId, currentState.PhysicalName);
@@ -5819,6 +5821,119 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // Snapshot stays at prevVal so the next tick sees the
                 // re-applied revert value and treats it as "no change".
             }
+        }
+
+        /// <summary>
+        /// Lock enforcement for glossary-mapped fields flagged IS_LOCKED=1 in
+        /// DG_TABLE_MAPPING_COLUMN (MAPPING_CODE='GLOSSARY'). A locked field is
+        /// glossary-owned: the authoritative value is the glossary value for the
+        /// column's matched term, so any user edit that drifts off it is reverted.
+        ///
+        /// erwin SCAPI has NO per-attribute read-only (a property's read-only flag
+        /// can be queried but not set), so this is reconciliation: the applicator
+        /// (<see cref="ApplyGlossaryUdpValues"/>) seeds the value, and this pass
+        /// reverts a user edit back to the glossary value + notifies. Runs on the
+        /// same tick as <see cref="EnforceLockedAttributeUdps"/>, BEFORE the
+        /// dependency cascade, for the same user-only-intent reason.
+        ///
+        /// Enforceable target types: UDP and ERWIN_PROPERTY. DB_PROPERTY apply is
+        /// a no-op today (nothing is written), so a locked DB_PROPERTY is logged
+        /// and skipped - there is no applied value to revert.
+        ///
+        /// Additive: when nothing is locked (IS_LOCKED=0 everywhere) this returns
+        /// immediately, so unlocked fields keep exactly today's behaviour.
+        /// </summary>
+        private void EnforceLockedGlossaryFields(dynamic attr, string objectId, string columnName)
+        {
+            if (attr == null) return;
+            var glossary = GlossaryService.Instance;
+            if (!glossary.IsLoaded) return;
+
+            var lockedMappings = glossary.GetLockedMappings();
+            if (lockedMappings.Count == 0) return;              // IS_LOCKED=0 everywhere -> no-op
+
+            var glossaryValues = glossary.GetUdpValues(columnName);
+            if (glossaryValues == null) return;                 // column has no glossary match
+
+            foreach (var (targetField, targetType) in lockedMappings)
+            {
+                glossaryValues.TryGetValue(targetField, out string glossaryVal);
+                glossaryVal = glossaryVal ?? "";
+
+                if (string.IsNullOrEmpty(glossaryVal))
+                {
+                    // Locked field with no glossary value for this term (miss): do
+                    // not fabricate, do not enforce an empty (the miss is flagged at
+                    // apply time). Nothing to revert to.
+                    continue;
+                }
+
+                string upperType = targetType?.ToUpperInvariant() ?? "";
+                if (upperType == "DB_PROPERTY")
+                {
+                    Log($"Glossary lock: '{targetField}' is DB_PROPERTY (apply is a no-op) - not enforceable, skipped.");
+                    continue;
+                }
+
+                string currentVal = ReadGlossaryFieldValue(attr, targetField, upperType);
+                if (currentVal == null) continue;               // unreadable - already logged
+                if (string.Equals(currentVal, glossaryVal, StringComparison.Ordinal)) continue;
+
+                // User drifted a locked field off its glossary value - revert it.
+                try
+                {
+                    WriteGlossaryFieldValue(attr, targetField, upperType, glossaryVal);
+                    Log($"Glossary lock: '{targetField}' on '{columnName}' reverted '{currentVal}' -> '{glossaryVal}'");
+                    Forms.LockedUdpDialog.Show(targetField, currentVal, glossaryVal);
+                }
+                catch (Exception ex)
+                {
+                    Log($"Glossary lock revert failed for '{targetField}' on '{columnName}': {ex.Message}");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Reads a glossary target field's current value by target type so the lock
+        /// check can compare it to the glossary value. UDP (and the prefix-less
+        /// default) read the canonical Column-UDP path (the same one
+        /// <see cref="EnforceLockedAttributeUdps"/> uses); ERWIN_PROPERTY reads the
+        /// mapped erwin property. Returns null on a read error (logged) so the
+        /// caller skips this field this tick rather than mis-reverting.
+        /// </summary>
+        private string ReadGlossaryFieldValue(dynamic attr, string targetField, string upperType)
+        {
+            try
+            {
+                if (upperType == "ERWIN_PROPERTY")
+                {
+                    string erwinName = MapPropertyCodeToErwin(targetField);
+                    return attr.Properties(erwinName)?.Value?.ToString() ?? "";
+                }
+                // UDP + prefix-less default: canonical Column-UDP property path.
+                return attr.Properties($"Attribute.Physical.{targetField}")?.Value?.ToString() ?? "";
+            }
+            catch (Exception ex)
+            {
+                Log($"Glossary lock: read '{targetField}' failed: {ex.Message}");
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Writes the glossary value back (the revert), reusing the applicator's
+        /// setters so the write path stays identical to a normal glossary apply:
+        /// <see cref="TrySetProperty"/> for ERWIN_PROPERTY, <see cref="TrySetUdp"/>
+        /// for UDP (and the prefix-less default).
+        /// </summary>
+        private void WriteGlossaryFieldValue(dynamic attr, string targetField, string upperType, string value)
+        {
+            if (upperType == "ERWIN_PROPERTY")
+            {
+                TrySetProperty(attr, MapPropertyCodeToErwin(targetField), value);
+                return;
+            }
+            TrySetUdp(attr, targetField, value);
         }
 
         /// <summary>
@@ -6548,10 +6663,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                     Log($"Physical_Data_Type changed: {currentState.TableName}.{currentState.PhysicalName} '{previousState.PhysicalDataType}' -> '{currentState.PhysicalDataType}' (canonical='{currentState.TermTypeCanonical ?? "(none)"}')");
                     EnforceTermTypePolicy(attr, previousState, currentState);
 
-                    // Datatype whitelist (admin "Datatype Library" -> DATATYPE_LIBRARY, the model's
-                    // DBMS catalog). Runs AFTER the term-type policy so a glossary-authoritative
+                    // Datatype whitelist (admin "Datatype Library" -> DATATYPE_LIBRARY for the
+                    // active config). Runs AFTER the term-type policy so a glossary-authoritative
                     // type is settled first, and BEFORE the naming re-run below so the engine sees
-                    // the final (possibly reverted) value. No-op when the model's DBMS has no
+                    // the final (possibly reverted) value. No-op when the config has no
                     // configured datatype list.
                     EnforceAllowedDatatypeWhitelist(attr, previousState, currentState);
 
@@ -6724,8 +6839,8 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// Enforce the admin "Datatype Library" whitelist (DBMS-level DATATYPE_LIBRARY for the
-        /// model's DBMS) on a column's Physical_Data_Type. When the model's DBMS has a non-empty
+        /// Enforce the admin "Datatype Library" whitelist (config-scoped DATATYPE_LIBRARY for the
+        /// active config) on a column's Physical_Data_Type. When the config has a non-empty
         /// list and the user picks a type not in it, write an allowed type and warn once (user
         /// decision 2026-06-19: hard enforce, never leave a disallowed type). The written value is
         /// the previous value when that is itself allowed (a normal revert), otherwise a forced
@@ -6746,7 +6861,7 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         private void EnforceAllowedDatatypeWhitelist(dynamic attr, AttributeValidationSnapshot prev, AttributeValidationSnapshot curr)
         {
-            // No whitelist configured for this config -> defer to DBMS-level policy.
+            // No whitelist configured for this config -> nothing to enforce.
             if (!AllowedDatatypeService.Instance.HasRestriction) return;
 
             // Defer while the column still carries erwin's transient '<default>' placeholder name:
@@ -7900,7 +8015,15 @@ namespace EliteSoft.Erwin.AddIn.Services
                     var glossary = GlossaryService.Instance;
                     foreach (var kvp in udpValues)
                     {
-                        if (string.IsNullOrEmpty(kvp.Value)) continue;
+                        if (string.IsNullOrEmpty(kvp.Value))
+                        {
+                            // Locked field with no glossary value for this term (miss): do not
+                            // fabricate an empty value and do not fail the apply - just flag it
+                            // (never swallow silently).
+                            if (glossary.GetIsLocked(kvp.Key))
+                                Log($"Glossary: locked field '{kvp.Key}' has no value for '{columnName}' - left unset (not fabricated).");
+                            continue;
+                        }
 
                         string targetField = kvp.Key;
                         string targetType = glossary.GetTargetType(targetField);

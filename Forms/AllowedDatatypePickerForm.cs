@@ -312,6 +312,11 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 var entry = SelectedEntry();
                 bool on = entry != null && entry.IsParameterized;
                 _txtParam.Enabled = on;
+                // A parameterized base MUST carry a length, so the label says "required" while the
+                // field is active; a non-parameterized base disables the field entirely.
+                _lblParam.Text = on
+                    ? "Parameter (length or precision,scale) - required"
+                    : "Parameter - not applicable for this type";
                 _lblParam.ForeColor = on ? ClrTextSecondary : ClrBorder;
                 paramFrame.BackColor = on ? ClrFieldBorder : ClrBorder;
                 if (!on) { _txtParam.Text = ""; _lblError.Visible = false; }
@@ -427,9 +432,14 @@ namespace EliteSoft.Erwin.AddIn.Forms
             var entry = SelectedEntry();
             if (entry == null) { DialogResult = DialogResult.Cancel; Close(); return; }
 
-            string param = entry.IsParameterized ? _txtParam.Text : "";
-            if (entry.IsParameterized && !IsValidParameter(param))
+            string param = entry.IsParameterized ? _txtParam.Text.Trim() : "";
+            if (entry.IsParameterized && (string.IsNullOrWhiteSpace(param) || !IsValidParameter(param)))
             {
+                // A parameterized base REQUIRES a length: submitting a bare 'varchar2' would just
+                // be rejected by the whitelist, so block it here and keep the user in the dialog.
+                _lblError.Text = string.IsNullOrWhiteSpace(param)
+                    ? "This type needs a length or precision,scale (e.g. 18 or 10,2)."
+                    : "Enter digits, optionally as precision,scale (e.g. 18 or 10,2).";
                 _lblError.Visible = true;
                 _txtParam.Focus();
                 _txtParam.SelectAll();

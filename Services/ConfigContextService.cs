@@ -116,13 +116,11 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                 if (!DatabaseService.Instance.IsConfigured)
                 {
-                    // The HklmFirstBootstrapReader probes both hives in order
-                    // (HKLM then HKCU). Neither yielded a populated config, so
-                    // surface both candidate paths so the user/admin can decide
-                    // which one to seed. install.bat (calling install-impl.ps1)
-                    // owns the HKCU write path; corporate IT typically seeds
-                    // HKLM with its own tooling.
-                    LastError = "No configuration found in HKLM\\Software\\EliteSoft\\MetaRepo\\Bootstrap or HKCU\\Software\\EliteSoft\\MetaRepo\\Bootstrap. Please run install.bat to configure the add-in.";
+                    // HkcuBootstrapReader reads HKCU only (HKLM support removed
+                    // 2026-07-02). No populated HKCU Bootstrap seed was found, so
+                    // point the user/admin at the single path to seed. install.bat
+                    // (calling install-impl.ps1) owns the HKCU write path.
+                    LastError = "No configuration found in HKCU\\Software\\EliteSoft\\MetaRepo\\Bootstrap. Please run install.bat to configure the add-in.";
                     Log($"ConfigContext: {LastError}");
                     return false;
                 }

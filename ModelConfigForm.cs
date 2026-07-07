@@ -1730,6 +1730,16 @@ namespace EliteSoft.Erwin.AddIn
                     // while the warning modal is up - no warn->close->warn loop. The
                     // close continuation then forgets it so a reopen re-runs this
                     // check.
+                    // Refresh the General tab so the Config row shows "(no config)"
+                    // instead of the previous model's config name - otherwise it
+                    // contradicts the red "No CONFIG mapping" status the user sees
+                    // (reported 2026-07-07: Config row kept the last-loaded config
+                    // while the status bar said no config).
+                    using (AddinLogger.BeginScope("UpdateGeneralTab(config-less-close)"))
+                        UpdateGeneralTab();
+                    // The model is being closed - drop the stale "Model" + glossary
+                    // rows so they don't keep showing the just-closed model.
+                    ResetActiveModelDisplay();
                     ShowConfigWarningAndCloseModel();
                     StartReconnectTimer();
                     return;
@@ -1862,8 +1872,7 @@ namespace EliteSoft.Erwin.AddIn
             {
                 try
                 {
-                    var bs = new RegistryBootstrapService();
-                    new AddInPropertyMetadataService(bs).GetObjectTypes();
+                    new AddInPropertyMetadataService(DatabaseService.Instance.BootstrapService).GetObjectTypes();
                 }
                 catch (Exception ex)
                 {
@@ -2447,8 +2456,6 @@ namespace EliteSoft.Erwin.AddIn
 
         // Labels to update after corporate initialization
         private Label _lblCorporateValue;
-        private Label _lblDbValue;
-        private Label _lblRegistryValue;
         private Label _lblWarningsValue;
         private Label _lblLogPathValue;
 
@@ -2632,30 +2639,18 @@ namespace EliteSoft.Erwin.AddIn
             _lblLogPathValue.Click += (s, ev) => OpenLogFolder();
             tabGeneral.Controls.Add(card);
 
-            // --- System Card: bootstrap source (which registry hive + which DB) ---
-            // Surfaces WHERE the add-in resolved its connection from. This is the
-            // info that exposes a stale machine-wide (HKLM) seed shadowing the
-            // user's per-user (HKCU) config: Registry = the winning hive
-            // (User (HKCU) / Machine (HKLM)), Database = the bootstrap DB the
-            // add-in actually connected to. Both labels are populated in
-            // UpdateGeneralTab from DatabaseService's own bootstrap reader.
-            // 2 rows fit in 80px (2 * 26 + 28 padding).
-            const int sysY = repoY + repoH + 30 + 16;  // +30 card chrome, +16 spacing
-            const int sysH = 80;
-            var sysCard = CreateSectionCard("System", cardX, sysY, cardW, sysH, clrCardBg, clrCardHeader);
-            AddCardRow(sysCard, "Registry:", "(not loaded)", fontBold, font, 0, out _, out _lblRegistryValue);
-            AddCardRow(sysCard, "Database:", "(not loaded)", fontBold, font, 1, out _, out _lblDbValue);
-            tabGeneral.Controls.Add(sysCard);
-
-            // --- Middle Card: Active Model ---
+            // --- Middle Card: Model ---
+            // The standalone "System / Database" card was removed 2026-07-07: the
+            // active database is now shown in the Repository card's Config row
+            // (as a "DB:<name>  |  ..." prefix), so a separate card was redundant.
             // The legacy grpModel GroupBox sat here with an etched-border that
             // jarred against the modern card chrome above and below. We unhost
             // its child labels and re-place them inside a section card body so
             // the visual rhythm stays consistent. grpModel itself is no longer
             // added to the tab.
-            const int modelY = sysY + sysH + 30 + 16;  // below the System card; +30 chrome, +16 spacing
+            const int modelY = repoY + repoH + 30 + 16;  // directly below the Repository card
             const int modelH = 44;  // single "Model:" row now that the DBMS line is gone
-            var modelCard = CreateSectionCard("Active Model", cardX, modelY, cardW, modelH, clrCardBg, clrCardHeader);
+            var modelCard = CreateSectionCard("Model", cardX, modelY, cardW, modelH, clrCardBg, clrCardHeader);
             var modelBody = modelCard.Tag as Panel;
 
             grpModel.Controls.Remove(lblModelName);
@@ -3164,41 +3159,22 @@ namespace EliteSoft.Erwin.AddIn
 
 #if !PACKAGED
         /// <summary>
-        /// Dev-only "Reload Config" + "Probe Properties" buttons anchored
-        /// to the right of the Repository card's first row. Reload Config
-        /// re-runs the full validation pipeline (CONFIG row from DB + all
-        /// config-scoped services) so a config edit in the admin tool is
-        /// picked up without restarting erwin. Probe Properties dumps the
-        /// SCAPI Properties collection for one instance of each interesting
-        /// object class (Entity, Attribute, View, ...) so admins can find
-        /// the right PROPERTY_CODE for new naming-standard rules - see
-        /// <see cref="MetamodelPropertyProbeService"/>.
+        /// Dev-only "Reload Config" button anchored to the right of the
+        /// Repository card's first row. Re-runs the full validation pipeline
+        /// (CONFIG row from DB + all config-scoped services) so a config edit
+        /// in the admin tool is picked up without restarting erwin.
         /// </summary>
         private int AddRepositoryReloadButton(Panel card, int cardW)
         {
             var host = card.Tag as Panel ?? card;
             const int btnW = 110;
-            const int probeW = 130;
             const int btnH = 22;
-            const int gap = 6;
             // Row 0's label sits at y=14; align the button's vertical center
             // with the row by inset of 2px above (matches typical Button vs
             // AutoSize Label baseline on Segoe UI 9pt).
             int reloadX = (cardW - 2) - btnW - 12;
-            int probeX = reloadX - probeW - gap;
             int btnY = 12;
-
-            var probeBtn = new Button
-            {
-                Text = "Probe Properties",
-                Location = new Point(probeX, btnY),
-                Size = new Size(probeW, btnH),
-                FlatStyle = FlatStyle.System,
-                UseVisualStyleBackColor = true,
-                TabStop = false,
-            };
-            probeBtn.Click += BtnProbeProperties_Click;
-            host.Controls.Add(probeBtn);
+            int leftMostX = reloadX;
 
             var reloadBtn = new Button
             {
@@ -3211,127 +3187,104 @@ namespace EliteSoft.Erwin.AddIn
             };
             reloadBtn.Click += BtnReloadConfig_Click;
             host.Controls.Add(reloadBtn);
-            // Return the LEFT-most button's X so the label MaximumSize math
-            // shrinks past both buttons.
-            return probeX;
-        }
 
-        private void BtnProbeProperties_Click(object sender, EventArgs e)
-        {
-            var btn = sender as Button;
-            if (btn != null) btn.Enabled = false;
-            Form overlay = null;
-            try
+#if DEV
+            // Dev-only "Change DB": re-run the startup MetaRepo* picker to switch the
+            // active database in-memory, then reload the config. Sits to the left of
+            // Reload Config. Only compiled when DEV is defined (never in a package).
+            const int changeW = 100;
+            const int changeGap = 6;
+            int changeX = reloadX - changeW - changeGap;
+            var changeDbBtn = new Button
             {
-                if (_session == null || _scapi == null || _currentModel == null)
-                {
-                    AddinMessageDialog.Show(this,
-                        "Probe Properties needs an active model session - connect to a model first.",
-                        "Probe Properties",
-                        MessageBoxButtons.OK,
-                        MessageBoxIcon.Warning);
-                    return;
-                }
+                Text = "Change DB",
+                Location = new Point(changeX, btnY),
+                Size = new Size(changeW, btnH),
+                FlatStyle = FlatStyle.System,
+                UseVisualStyleBackColor = true,
+                TabStop = false,
+            };
+            changeDbBtn.Click += BtnChangeDb_Click;
+            host.Controls.Add(changeDbBtn);
+            leftMostX = changeX;
+#endif
 
-                Log("Probe Properties: starting metamodel property dump.");
-                overlay = ShowBusyOverlay("Probing SCAPI properties, please wait...");
-                Application.DoEvents();
-
-                var probe = new MetamodelPropertyProbeService(_session, _scapi, _currentModel);
-                probe.OnLog += Log;
-                string outPath = probe.RunProbe();
-
-                Log($"Probe Properties: dump written to {outPath}");
-
-                // Best-effort open the file in the default text editor so
-                // the user can scan it immediately without hunting in temp.
-                try
-                {
-                    System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(outPath)
-                    {
-                        UseShellExecute = true,
-                    });
-                }
-                catch (Exception openEx)
-                {
-                    Log($"Probe Properties: could not auto-open '{outPath}': {openEx.Message}");
-                }
-
-                AddinMessageDialog.Show(this,
-                    $"Property dump written to:\n{outPath}\n\nThe file should open in your default text editor.",
-                    "Probe Properties",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Information);
-            }
-            catch (Exception ex)
-            {
-                Log($"Probe Properties failed: {ex}");
-                AddinMessageDialog.Show(this,
-                    $"Probe Properties failed:\r\n{ex.Message}",
-                    "Probe Properties",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Error);
-            }
-            finally
-            {
-                if (overlay != null && !overlay.IsDisposed)
-                {
-                    overlay.Close();
-                    overlay.Dispose();
-                }
-                if (btn != null && !btn.IsDisposed) btn.Enabled = true;
-            }
+            // Return the LEFT-most button's X so the label MaximumSize math shrinks past them.
+            return leftMostX;
         }
 
         private void BtnReloadConfig_Click(object sender, EventArgs e)
+#if DEV
+            // DEV: preserve any "Change DB" override - do NOT clear the bootstrap cache
+            // (that would snap back to the registry DB). Config-less stays kept-open
+            // (the dev is working in this model against the currently-selected DB).
+            => RunConfigReload(sender as Button, clearBootstrapCache: false, closeConfigLessModel: false,
+                overlayMessage: "Reloading config from database, please wait...",
+                logPrefix: "Reload Config");
+#else
+            => RunConfigReload(sender as Button, clearBootstrapCache: true, closeConfigLessModel: false,
+                overlayMessage: "Reloading config from database, please wait...",
+                logPrefix: "Reload Config");
+#endif
+
+        /// <summary>
+        /// Shared reload used by "Reload Config" and (dev) "Change DB". Re-runs the
+        /// full validation pipeline (CONFIG row from DB + all config-scoped services)
+        /// and refreshes the General tab + session-tracking settings.
+        /// <para>
+        /// <paramref name="clearBootstrapCache"/> true drops both bootstrap caches so
+        /// the next GetConfig() re-reads the registry (Reload Config's purpose: pick up
+        /// an install.bat edit without restarting erwin). Change DB passes FALSE:
+        /// DevDatabaseSelector has already installed an in-memory bootstrap override,
+        /// and clearing the cache would discard it and snap back to the registry DB.
+        /// </para>
+        /// </summary>
+        private void RunConfigReload(Button btn, bool clearBootstrapCache, bool closeConfigLessModel, string overlayMessage, string logPrefix)
         {
-            var btn = sender as Button;
-            // Re-entrancy guard: full reload is ~4-5s; disabling the button
-            // prevents the user from queuing a second pass that would interleave
-            // with the first DisposeServices/LoadGlossary cycle.
+            // Re-entrancy guard: full reload is ~4-5s; disabling the button prevents a
+            // second pass interleaving with the first DisposeServices/LoadGlossary cycle.
             if (btn != null) btn.Enabled = false;
             Form overlay = null;
             try
             {
-                Log("Reload Config: user triggered full validation re-init.");
-                overlay = ShowBusyOverlay("Reloading config from database, please wait...");
+                Log($"{logPrefix}: user triggered full validation re-init.");
+                overlay = ShowBusyOverlay(overlayMessage);
                 Application.DoEvents();
 
-                // Drop both bootstrap caches (DatabaseService + HklmFirstBootstrapReader)
-                // so the next GetConfig() re-reads HKLM/HKCU. Without this the button
-                // re-runs every DB query but keeps the connection string captured at
-                // process start - users editing registry via install.bat see no effect
-                // until they restart erwin.
-                Services.DatabaseService.Instance.ClearCache();
-                Log("Reload Config: bootstrap cache cleared - registry will be re-read.");
+                if (clearBootstrapCache)
+                {
+                    // Drop both bootstrap caches so the next GetConfig() re-reads the
+                    // registry. Without this the reload re-runs every DB query but keeps
+                    // the connection captured at process start.
+                    Services.DatabaseService.Instance.ClearCache();
+                    Log($"{logPrefix}: bootstrap cache cleared - registry will be re-read.");
+                }
 
                 // Force the full pipeline (not the fast model-switch path).
                 _globalDataLoaded = false;
-                using (AddinLogger.BeginScope("InitializeValidationService(reload)"))
-                    InitializeValidationService(closeConfigLessMartModel: false);
+                using (AddinLogger.BeginScope($"InitializeValidationService({logPrefix})"))
+                    InitializeValidationService(closeConfigLessMartModel: closeConfigLessModel);
 
                 if (Services.ConfigContextService.Instance.IsInitialized)
                     _globalDataLoaded = true;
 
-                using (AddinLogger.BeginScope("UpdateGeneralTab(reload)"))
+                using (AddinLogger.BeginScope($"UpdateGeneralTab({logPrefix})"))
                     UpdateGeneralTab();
 
                 // Re-apply user-session tracking settings (USER_TRACKING_ENABLED /
-                // USER_TRACKING_INTERVAL_MINUTES). The interval is otherwise read
-                // once at startup, so a mid-session change (e.g. 5 -> 1 min) would
-                // be ignored until erwin restarts. Non-blocking + best-effort.
+                // USER_TRACKING_INTERVAL_MINUTES) so a mid-session change takes effect
+                // without restarting erwin. Non-blocking + best-effort.
                 Services.SessionTrackingService.Instance.ReloadSettings();
 
-                Log("Reload Config: complete.");
+                Log($"{logPrefix}: complete.");
             }
             catch (Exception ex)
             {
-                // Surface the failure rather than swallowing - reload is a
-                // dev-only diagnostic, the stack trace is what we need.
-                Log($"Reload Config failed: {ex}");
+                // Surface the failure rather than swallowing - the stack trace is what we need.
+                Log($"{logPrefix} failed: {ex}");
                 AddinMessageDialog.Show(this,
-                    $"Reload Config failed:\r\n{ex.Message}",
-                    "Reload Config",
+                    $"{logPrefix} failed:\r\n{ex.Message}",
+                    logPrefix,
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error);
             }
@@ -3345,7 +3298,70 @@ namespace EliteSoft.Erwin.AddIn
                 if (btn != null && !btn.IsDisposed) btn.Enabled = true;
             }
         }
+
+#if DEV
+        // Dev-only: re-run the startup MetaRepo* database picker mid-session, then
+        // reload the config against the newly chosen database. Cancel / no selection
+        // keeps the current database (unlike startup, we never abort - a model is
+        // already open). Only compiled when DEV is defined (never in a package).
+        private void BtnChangeDb_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                Log("Change DB: re-running dev database picker...");
+                if (!Services.DevDatabaseSelector.TrySelectAndOverride(Log))
+                {
+                    Log("Change DB: cancelled / no selection - keeping current database.");
+                    return;
+                }
+                // TrySelectAndOverride already installed the in-memory override; reload
+                // WITHOUT clearing the bootstrap cache (that would discard the override).
+                // Switching the whole DB: if the current model has no config in the new
+                // DB it does not belong there, so close it (like a fresh connect).
+                RunConfigReload(sender as Button, clearBootstrapCache: false, closeConfigLessModel: true,
+                    overlayMessage: "Switching database and reloading config, please wait...",
+                    logPrefix: "Change DB");
+            }
+            catch (Exception ex)
+            {
+                Log($"Change DB failed: {ex}");
+                AddinMessageDialog.Show(this,
+                    $"Change DB failed:\r\n{ex.Message}",
+                    "Change DB",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+        }
 #endif
+#endif
+
+        /// <summary>
+        /// Clears the "Model" + connection + glossary rows to their no-model state.
+        /// Used by the config-less / DBMS-mismatch CLOSE paths: they shut the model
+        /// but deliberately keep _isConnected=true for the reconnect timer's adopt
+        /// path, so the display would otherwise keep showing the just-closed model
+        /// (user-reported 2026-07-07: "Model" showed the old name after the close).
+        /// Display-only - does NOT touch _isConnected / _lastConnectedLocator.
+        /// </summary>
+        private void ResetActiveModelDisplay()
+        {
+            if (lblActiveModel != null) lblActiveModel.Text = "(no model open)";
+            if (lblConnectionStatus != null)
+            {
+                lblConnectionStatus.Text = "Not connected";
+                lblConnectionStatus.ForeColor = Color.FromArgb(120, 120, 120);
+            }
+            if (lblGlossaryStatus != null)
+            {
+                lblGlossaryStatus.Text = "(not loaded)";
+                lblGlossaryStatus.ForeColor = Color.FromArgb(120, 120, 120);
+            }
+            if (lblLastRefreshValue != null)
+            {
+                lblLastRefreshValue.Text = "(not yet)";
+                lblLastRefreshValue.ForeColor = Color.FromArgb(120, 120, 120);
+            }
+        }
 
         /// <summary>
         /// Update General tab with corporate and connection info after initialization.
@@ -3386,41 +3402,21 @@ namespace EliteSoft.Erwin.AddIn
                     // state more strongly than the previous amber (user feedback
                     // 2026-05-14: amber read as a warning, but this is the actual
                     // reason every action button is disabled).
-                    _lblCorporateValue.Text = string.IsNullOrEmpty(ctx.LastError)
-                        ? "(no config for this model)"
-                        : $"(no config: {ctx.LastError})";
+                    // Not initialized: short, readable "No Config". The full reason is
+                    // in the log + the degraded status bar; a long error string here
+                    // was unreadable (user feedback 2026-07-07). The DB prefix below
+                    // still shows which database this is.
+                    _lblCorporateValue.Text = "No Config";
                     _lblCorporateValue.ForeColor = Color.Red;
                 }
 
+                // Prefix the Config row with the active database so it is always visible
+                // which repository DB the add-in connected to - the standalone "System /
+                // Database" card was removed 2026-07-07 as redundant. Refreshes with the
+                // row, so a dev "Change DB" updates it too.
                 var config = DatabaseService.Instance.GetConfig();
-                if (config != null && config.IsConfigured)
-                {
-                    _lblDbValue.Text = $"{config.Host}/{config.Database} ({DatabaseService.Instance.GetDbType()})";
-                    _lblDbValue.ForeColor = Color.FromArgb(40, 40, 40); // primary
-                }
-                else
-                {
-                    // CLEAR stale value. Without this branch, a previous
-                    // successful load would leave the OLD host/database string
-                    // visible (visually overlapping the red "(no config: ...)"
-                    // warning on the Config row above), making the user think
-                    // the addin was still wired to the old registry data even
-                    // after a successful HKLM change + reload (user reported
-                    // 2026-05-30, screenshot showed garbled overlap).
-                    _lblDbValue.Text = "(not configured)";
-                    _lblDbValue.ForeColor = Color.FromArgb(120, 120, 120); // secondary/gray
-                }
-
-                // Use the ACTUAL bootstrap reader DatabaseService resolved the
-                // config with (HKCU-first HklmFirstBootstrapReader), NOT a throwaway
-                // RegistryBootstrapService. The old code probed a different path and
-                // mislabelled the source - it showed "User" while the config had
-                // actually come from the HKLM seed, which is exactly what hid the
-                // KKBDemo-vs-MetaRepoTmp confusion. GetConfigFilePath reflects the
-                // hive the cached config was read from.
-                string hivePath = DatabaseService.Instance.BootstrapService.GetConfigFilePath() ?? "";
-                _lblRegistryValue.Text =
-                    hivePath.StartsWith("HKLM", StringComparison.OrdinalIgnoreCase) ? "Machine (HKLM)" : "User (HKCU)";
+                if (config != null && !string.IsNullOrEmpty(config.Database))
+                    _lblCorporateValue.Text = $"DB:{config.Database}  |  {_lblCorporateValue.Text}";
 
                 if (_lblWarningsValue != null)
                 {
@@ -4083,6 +4079,9 @@ namespace EliteSoft.Erwin.AddIn
                 // it MUST run off the UI thread - and only AFTER the warning above
                 // has closed, so the foreground-steal never pushes a live modal
                 // behind erwin (see the teardown lesson).
+                // Drop the stale "Model" + glossary rows now (still on the UI thread)
+                // so they don't keep showing the model being closed below.
+                ResetActiveModelDisplay();
                 System.Threading.Tasks.Task.Run(() =>
                 {
                     bool closed = false;
@@ -4158,15 +4157,14 @@ namespace EliteSoft.Erwin.AddIn
                 _propertyApplicatorService?.Dispose();
                 _propertyApplicatorService = null;
 
-                var bootstrapService = new RegistryBootstrapService();
-                var config = bootstrapService.GetConfig();
+                var config = DatabaseService.Instance.GetConfig();
                 if (config == null || !config.IsConfigured)
                 {
                     Log("PropertyApplicator: DB not configured, skipping");
                     return;
                 }
 
-                var metadataService = new AddInPropertyMetadataService(bootstrapService);
+                var metadataService = new AddInPropertyMetadataService(DatabaseService.Instance.BootstrapService);
                 _propertyApplicatorService = new PropertyApplicatorService(_session, metadataService);
                 _propertyApplicatorService.OnLog += Log;
 
@@ -4323,9 +4321,9 @@ namespace EliteSoft.Erwin.AddIn
                     AddConnectWarning($"NamingStandards: {service.LastError}");
                 }
 
-                // Datatype whitelist = admin "Datatype Library" catalog for the model's
-                // DBMS (DATATYPE_LIBRARY keyed by DBMS_ID, reached via the model's
-                // DBMS_VERSION_ID). Per-DBMS, not per-config; no STATUS gate. Empty catalog =
+                // Datatype whitelist = admin "Datatype Library" for the active config
+                // (DATATYPE_LIBRARY rows WHERE CONFIG_ID = ActiveConfigId; config-scoped
+                // since the 2026-07-02 admin migration). No STATUS gate. Empty set =
                 // no restriction. Enforced on a column's Physical_Data_Type change in
                 // ValidationCoordinatorService.
                 var dtSvc = AllowedDatatypeService.Instance;
@@ -9122,8 +9120,6 @@ namespace EliteSoft.Erwin.AddIn
                 // until the next successful connect repaints it.
                 _lblCorporateValue.Text = "-";
                 _lblCorporateValue.ForeColor = Color.FromArgb(120, 120, 120);
-                _lblDbValue.Text = "-";
-                _lblRegistryValue.Text = "-";
 
                 // Reset UI to disconnected state
                 UpdateConnectionStatus(StatusDisconnected, Color.Red);

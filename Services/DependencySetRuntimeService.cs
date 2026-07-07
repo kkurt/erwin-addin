@@ -60,8 +60,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     return false;
                 }
 
-                var bootstrapService = new RegistryBootstrapService();
-                var config = bootstrapService.GetConfig();
+                var config = DatabaseService.Instance.GetConfig();
                 if (config == null || !config.IsConfigured) return false;
 
                 // Single config scope (one mart path -> one config row)
@@ -333,7 +332,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             try
             {
                 _tableDataCache.Clear();
-                var config = new RegistryBootstrapService().GetConfig();
+                var config = DatabaseService.Instance.GetConfig();
                 if (config != null) PreFetchTableData(config);
             }
             catch (Exception ex)
@@ -816,19 +815,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                         string encUser = reader["USERNAME"]?.ToString()?.Trim() ?? "";
                         string encPass = reader["PASSWORD"]?.ToString()?.Trim() ?? "";
 
-                        string username = PasswordEncryptionService.Decrypt(encUser);
-                        string password = PasswordEncryptionService.Decrypt(encPass);
-
-                        // Fallback to bootstrap credentials if DPAPI fails
-                        if (string.IsNullOrEmpty(username) || (username.Length > 50 && username == encUser))
-                        {
-                            var bootstrapConfig = DatabaseService.Instance.GetConfig();
-                            if (bootstrapConfig != null)
-                            {
-                                username = bootstrapConfig.Username;
-                                password = bootstrapConfig.Password;
-                            }
-                        }
+                        // Shared per-deployment key: decrypt succeeds, or throws (no silent fallback
+                        // to the repo bootstrap creds, which would be wrong for an external connection).
+                        string username = EliteSoft.MetaAdmin.Services.PasswordEncryptionService.DecryptConnectionSecret(encUser);
+                        string password = EliteSoft.MetaAdmin.Services.PasswordEncryptionService.DecryptConnectionSecret(encPass);
 
                         string connStr = BuildConnectionString(dbType, host, port, schema, username, password);
                         return (connStr, dbType, host, schema);

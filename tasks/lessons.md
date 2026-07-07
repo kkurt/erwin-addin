@@ -870,10 +870,10 @@ calls actually return `null` on most DBMS - misread as "Schema_Name
 works" but it never did.
 
 **How to apply:** before adding a Platform Property row to
-`MC_PROPERTY_DEF`, run the dev-only "Probe Properties" button on a
-model bound to the target DBMS. The probe enumerates a curated
-candidate list and prints which accessor names SCAPI accepts. Confirmed
-universal accessors as of 2026-05-16:
+`MC_PROPERTY_DEF`, verify the accessor name is one SCAPI accepts on the
+target DBMS by reading the object's `Properties` collection (via a
+REScript or the debugger). Confirmed universal accessors as of
+2026-05-16:
 
 - Entity / Table: `Physical_Name`, `Name`, `Definition`, `Comment`, `Name_Qualifier`
 - Attribute / Column: `Physical_Name`, `Name`, `Physical_Data_Type`, `Null_Option_Type`, `Hide_In_Physical`, `Definition`, `Comment`

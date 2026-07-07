@@ -1,3 +1,2 @@
 .\package.ps1 -Zip `
-    -License "F990AA11B34638DFDD87D041467B6A91C2BAFCE0D0FD0F174180B4CDFFDA5E20" `
     -PackageName "MetaAddinForDev"

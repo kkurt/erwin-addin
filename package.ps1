@@ -3,7 +3,6 @@
 # Usage:
 #   .\package.ps1                                                Publish to default folder (no compression)
 #   .\package.ps1 -Zip                                           Create ZIP at <scriptDir>\dist
-#   .\package.ps1 -Zip -License HWID                             Embed hardware license
 #   .\package.ps1 -PackageName ErwinAddIn-TTKOM                  Folder output to C:\EliteSoft\ErwinAddIn-TTKOM
 #   .\package.ps1 -PackageName ErwinAddIn-TTKOM -Zip             ZIP at C:\EliteSoft\ErwinAddIn-TTKOM\ErwinAddIn-TTKOM.zip
 #   .\package.ps1 -DBHost srv -DBName MetaRepo \                 Bake DB bootstrap into the package
@@ -20,13 +19,8 @@
     Justification='Plaintext seed required because DPAPI keys are bound to the install host, not the build host. install-impl.ps1 encrypts before writing to the registry and deletes the seed file.')]
 param(
     [switch]$Zip,
-    [string]$License,
-    # License expiration date, forwarded to KeyGen as --expires. Any string
-    # DateTime.TryParse can read is accepted (yyyy-MM-dd recommended for
-    # culture-independence). When omitted, the license is perpetual. Only
-    # meaningful with -License; specifying -Expires without -License is a
-    # hard error.
-    [string]$Expires,
+    # Licensing is no longer embedded in the package (2026-07): the add-in reads its product license
+    # from the repository DB (applied by the admin web's apply-license step). No -License/-Expires.
     # MetaRepo bootstrap seed. Param names (-DBHost, -DBPort, -DBName, -DBUserName,
     # -DBPassword, -DBType) match the registry value names under
     # SOFTWARE\EliteSoft\MetaRepo\Bootstrap. PowerShell parameter binding is
@@ -63,9 +57,6 @@ if ($Help) {
     Write-Host "Usage:" -ForegroundColor Yellow
     Write-Host "  .\package.ps1                                    Publish to default folder (no compression)"
     Write-Host "  .\package.ps1 -Zip                               Create ZIP at <scriptDir>\dist"
-    Write-Host "  .\package.ps1 -Zip -License HWID                 Embed perpetual hardware license"
-    Write-Host "  .\package.ps1 -Zip -License HWID -Expires 2027-01-01"
-    Write-Host "                                                   Embed license that expires on 2027-01-01"
     Write-Host "  .\package.ps1 -PackageName MyDevPkg              Folder output to C:\EliteSoft\MyDevPkg"
     Write-Host "  .\package.ps1 -PackageName MyDevPkg -Zip         ZIP at C:\EliteSoft\MyDevPkg\MyDevPkg.zip"
     Write-Host "  .\package.ps1 -DBHost srv -DBName MR \           Bake bootstrap config (DB connection) into"
@@ -101,8 +92,6 @@ if (-not $isAdmin) {
     Write-Host "Requesting Administrator privileges..." -ForegroundColor Yellow
     $elevateArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`""
     if ($Zip)                                  { $elevateArgs += " -Zip" }
-    if ($License)                              { $elevateArgs += " -License `"$License`"" }
-    if ($Expires)                              { $elevateArgs += " -Expires `"$Expires`"" }
     if ($DBHost)                               { $elevateArgs += " -DBHost `"$DBHost`"" }
     if ($DBPort)                               { $elevateArgs += " -DBPort `"$DBPort`"" }
     if ($DBName)                               { $elevateArgs += " -DBName `"$DBName`"" }
@@ -112,27 +101,6 @@ if (-not $isAdmin) {
     if ($PackageName)                          { $elevateArgs += " -PackageName `"$PackageName`"" }
     Start-Process powershell.exe -ArgumentList $elevateArgs -Verb RunAs
     exit
-}
-
-# Validate -Expires up front so we fail before the 30+ second publish step
-# rather than 30+ seconds in when KeyGen would reject it. Empty string =
-# perpetual (default KeyGen behaviour); any non-empty value MUST parse as a
-# DateTime and MUST be paired with -License (otherwise the user wired the
-# flag to a no-op build).
-$expiresDate = $null
-if ($Expires) {
-    if (-not $License) {
-        Write-Host "ERROR: -Expires requires -License (expires only applies when a license is being embedded)." -ForegroundColor Red
-        exit 1
-    }
-    $parsed = [datetime]::MinValue
-    if (-not [datetime]::TryParse($Expires, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)) {
-        Write-Host "ERROR: -Expires value '$Expires' is not a valid date. Use YYYY-MM-DD (e.g. 2027-01-01)." -ForegroundColor Red
-        exit 1
-    }
-    # Normalize to ISO date for the KeyGen CLI call so culture / time-zone
-    # surprises can't change the embedded date.
-    $expiresDate = $parsed.ToUniversalTime()
 }
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -246,59 +214,8 @@ if (Test-Path $packagedComHost) {
     }
 }
 
-# STEP 2: Embed license (optional)
-if ($License) {
-    Write-Host "`n[2] Generating license..." -ForegroundColor Yellow
-
-    $keyGenProject = Join-Path $scriptDir "..\x-hw-licensing\KeyGen\KeyGen.csproj"
-    $privateKeySource = Join-Path $scriptDir "..\x-hw-licensing\rsa_private_key.xml"
-
-    if (-not (Test-Path $keyGenProject)) {
-        Write-Host "  KeyGen not found: $keyGenProject" -ForegroundColor Red
-        Write-Host "`nPress any key to exit..." -ForegroundColor Gray
-$null = $(if (-not [Console]::IsOutputRedirected) { (Get-Host).UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') })
-        exit 1
-    }
-    if (-not (Test-Path $privateKeySource)) {
-        Write-Host "  Private key not found: $privateKeySource" -ForegroundColor Red
-        Write-Host "`nPress any key to exit..." -ForegroundColor Gray
-$null = $(if (-not [Console]::IsOutputRedirected) { (Get-Host).UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') })
-        exit 1
-    }
-
-    $keyGenDir = Split-Path $keyGenProject -Parent
-    $privateKeyTarget = Join-Path $keyGenDir "rsa_private_key.xml"
-    $licenseOutput = Join-Path $publishDir "license.lic"
-
-    Copy-Item $privateKeySource $privateKeyTarget -Force
-    Push-Location $keyGenDir
-    # Build the KeyGen argument list as an array so the splat preserves
-    # quoting semantics even when --expires is omitted. KeyGen treats a
-    # missing --expires as perpetual (DateTime.MaxValue).
-    $keyGenArgs = @(
-        'genlicense'
-        '--hwid',     $License
-        '--licensee', 'ErwinAddIn'
-        '--features', 'ErwinAddIn'
-        '-o',         $licenseOutput
-    )
-    if ($expiresDate) {
-        $keyGenArgs += @('--expires', $expiresDate.ToString('yyyy-MM-dd'))
-    }
-    dotnet run --project $keyGenProject -c Debug -- @keyGenArgs
-    $exitCode = $LASTEXITCODE
-    Pop-Location
-    Remove-Item $privateKeyTarget -Force -ErrorAction SilentlyContinue
-
-    if ($exitCode -ne 0) {
-        Write-Host "  License generation failed!" -ForegroundColor Red
-        Write-Host "`nPress any key to exit..." -ForegroundColor Gray
-$null = $(if (-not [Console]::IsOutputRedirected) { (Get-Host).UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') })
-        exit 1
-    }
-    $expiresLabel = if ($expiresDate) { $expiresDate.ToString('yyyy-MM-dd') } else { 'Perpetual' }
-    Write-Host "  License embedded (expires: $expiresLabel)" -ForegroundColor Green
-}
+# STEP 2 (hardware license embedding - REMOVED 2026-07): the add-in now reads its product license
+# from the repository DB (applied by the admin web's apply-license step); packages ship no license.lic.
 
 # STEP 3 (legacy injection components - REMOVED 2026-05-26):
 # ErwinInjector.exe + TriggerDll.dll were superseded by the PostMessage

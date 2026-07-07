@@ -715,7 +715,7 @@ WScript.Quit 0
             {
                 if (!DatabaseService.Instance.IsConfigured) return null;
 
-                var config = new RegistryBootstrapService().GetConfig();
+                var config = DatabaseService.Instance.GetConfig();
                 if (config == null) return null;
 
                 using (var conn = DatabaseService.Instance.CreateConnection())
@@ -758,14 +758,8 @@ WScript.Quit 0
                             string encUser = reader["USERNAME"]?.ToString()?.Trim() ?? "";
                             string encPass = reader["PASSWORD"]?.ToString()?.Trim() ?? "";
 
-                            string user = PasswordEncryptionService.Decrypt(encUser);
-                            string pass = PasswordEncryptionService.Decrypt(encPass);
-
-                            if (string.IsNullOrEmpty(user) || (user.Length > 50 && user == encUser))
-                            {
-                                user = config.Username;
-                                pass = config.Password;
-                            }
+                            string user = EliteSoft.MetaAdmin.Services.PasswordEncryptionService.DecryptConnectionSecret(encUser);
+                            string pass = EliteSoft.MetaAdmin.Services.PasswordEncryptionService.DecryptConnectionSecret(encPass);
 
                             return (host, port, user, pass);
                         }

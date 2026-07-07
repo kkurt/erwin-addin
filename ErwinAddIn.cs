@@ -1,10 +1,12 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Forms;
-using xLicense;
+using EliteSoft.MetaAdmin.Shared.Data;
+using Microsoft.EntityFrameworkCore;
 using xLicense.Core;
 
 namespace EliteSoft.Erwin.AddIn
@@ -26,6 +28,8 @@ namespace EliteSoft.Erwin.AddIn
     {
         private static ModelConfigForm _activeForm = null;
         private static bool _exceptionHandlerInstalled = false;
+        private static bool _secretProtectorInstalled = false;
+        private static bool _licenseValidatedThisSession = false;
 
         /// <summary>
         /// Public read-only accessor for the currently displayed addin form.
@@ -88,6 +92,25 @@ namespace EliteSoft.Erwin.AddIn
                 Application.ThreadException += Application_ThreadException;
             }
             catch { }
+        }
+
+        /// <summary>
+        /// Installs the connection-secret protector so the add-in can decrypt CONNECTION_DEF
+        /// credentials (glossary / data-source / Mart) that the web-admin wrote. Both sides use the
+        /// SAME fixed key from <see cref="EliteSoft.MetaAdmin.Shared.Security.ConnectionSecretKey"/>
+        /// (owner decision 2026-07 for corporate on-prem installs - replaces the earlier per-deployment
+        /// HKCU DataKey provisioning). One-time guard, mirrors <see cref="EnsureExceptionHandler"/>.
+        /// The fixed key cannot fail construction, so there is no soft-skip path.
+        /// </summary>
+        private static void EnsureConnectionSecretProtector()
+        {
+            if (_secretProtectorInstalled) return;
+            _secretProtectorInstalled = true;
+
+            EliteSoft.MetaAdmin.Services.PasswordEncryptionService.UseConnectionSecretProtector(
+                new EliteSoft.MetaAdmin.Shared.Security.SharedKeySecretProtector(
+                    EliteSoft.MetaAdmin.Shared.Security.ConnectionSecretKey.GetKey()));
+            Services.AddinLogger.Log("Connection-secret protector installed (fixed shared key).");
         }
 
         private static void Application_ThreadException(object sender, ThreadExceptionEventArgs e)
@@ -239,11 +262,34 @@ namespace EliteSoft.Erwin.AddIn
                 using (Services.AddinLogger.BeginScope("EnsureExceptionHandler"))
                     EnsureExceptionHandler();
 
+                // Install the shared-key connection-secret protector BEFORE any feature reads a
+                // CONNECTION_DEF secret, so web-written glossary/data-source/Mart credentials
+                // decrypt with the per-deployment key provisioned to this box's HKCU.
+                using (Services.AddinLogger.BeginScope("EnsureConnectionSecretProtector"))
+                    EnsureConnectionSecretProtector();
+
                 // Phase A spike: install native SyncModelCallback hook.
                 // Safe no-op if the bridge DLL is missing or EM_ECX can't be found.
                 using (Services.AddinLogger.BeginScope("NativeBridgeService.Install"))
                     Services.NativeBridgeService.Install(msg =>
                         System.Diagnostics.Debug.WriteLine(msg));
+
+#if DEV
+                // DEV-ONLY: before ANY DB connection (license read, config resolution),
+                // let the developer pick which local MetaRepo* database to run against.
+                // Overrides the registry bootstrap IN-MEMORY for this session (registry
+                // is NOT modified); cancel / no DB found aborts the load. Never compiled
+                // into a packaged build (guarded by the DEV symbol).
+                using (Services.AddinLogger.BeginScope("DevDatabaseSelector"))
+                {
+                    if (!Services.DevDatabaseSelector.TrySelectAndOverride(Services.AddinLogger.Log))
+                    {
+                        Services.AddinLogger.Log("Dev database not selected - aborting load.");
+                        DisposeEarlySplash(ref earlySplash);
+                        return;
+                    }
+                }
+#endif
 
                 ModelConfigForm.UpdateLoadingMessage(earlySplash, "Verifying license...");
 
@@ -375,19 +421,12 @@ namespace EliteSoft.Erwin.AddIn
         private static bool _licenseFailurePopupShown;
 
         /// <summary>
-        /// Validates hardware license. Returns true if valid, false otherwise.
-        /// Wraps the UI-free check + shows the MessageBox on failure. Used by the
-        /// startup path; the failure message is displayed on the calling thread,
-        /// so this must be invoked from the UI thread (which Execute() is on).
+        /// Validates the product license. Returns true if valid, false otherwise. Wraps the check +
+        /// shows the MessageBox on failure; the message is rendered on the calling thread, so this
+        /// must run on the UI thread (which Execute() is on).
         ///
-        /// Retry policy: on LicenseStatus.ValidationTransient, silently retry once
-        /// after a 1.5 s pause. xLicense returns ValidationTransient when its
-        /// timing window check (AntiTamper.CheckGroup2_Timing) trips without a
-        /// real debugger present — caused by AV first-scan, .NET tiered JIT,
-        /// COM/SCAPI cold-init contention, or GC compaction. xLicense's
-        /// HwidGenerator caches WMI results for the AppDomain, so the retry
-        /// validates in &lt; 1 s. TamperingDetected (real debugger via
-        /// CheckGroup1/CheckGroup3) gets no retry; the popup is correct there.
+        /// The license now comes from the repository DB (a standard signed license), so there is no
+        /// anti-tamper timing window and no retry - the check is a DB read + RSA signature verify.
         /// </summary>
         private bool CheckLicense()
         {
@@ -399,34 +438,8 @@ namespace EliteSoft.Erwin.AddIn
 
             Services.AddinLogger.Log($"License check failed: status={status}, elapsed={sw.ElapsedMilliseconds}ms");
 
-            // ValidationTransient = xLicense timing-window check fired but no real
-            // debugger was detected (AntiTamper.CheckGroup2_Timing). Caused by AV
-            // first-scan, GC compaction, COM/SCAPI cold-init contention. With the
-            // HwidGenerator WMI cache the second Validate hits zero WMI calls, so
-            // retry resolves in well under a second. TamperingDetected (real debugger
-            // detection from CheckGroup1/CheckGroup3) gets no retry — the popup is
-            // the correct outcome there.
-            if (status == LicenseStatus.ValidationTransient)
-            {
-                Services.AddinLogger.Log("ValidationTransient - retrying once after 1500 ms");
-                Thread.Sleep(1500);
-
-                var retrySw = Stopwatch.StartNew();
-                var (retryStatus, retryMessage) = CheckLicenseStatus();
-                retrySw.Stop();
-
-                Services.AddinLogger.Log($"License retry: status={retryStatus}, elapsed={retrySw.ElapsedMilliseconds}ms");
-
-                if (retryStatus == LicenseStatus.Valid) return true;
-
-                // Retry produced a different failure (or persistent transient).
-                // Prefer the retry's message; it reflects the steady-state cause.
-                failureMessage = retryMessage;
-            }
-
-            // De-dupe the popup but always run the underlying check. A
-            // mid-session license fix + manual re-click should be able to
-            // re-validate; latching CheckLicenseStatus itself would block
+            // De-dupe the popup but always run the underlying check. A mid-session license fix + manual
+            // re-click should be able to re-validate; latching CheckLicenseStatus itself would block
             // that recovery path.
             if (_licenseFailurePopupShown)
             {
@@ -439,60 +452,84 @@ namespace EliteSoft.Erwin.AddIn
         }
 
         /// <summary>
-        /// Phase-3C parallel-friendly variant: pure managed work (file read + decrypt),
-        /// no UI calls. Runs safely on a thread-pool worker so it can overlap with the
-        /// SCAPI activation + form constructor (~250 ms total) on the startup critical
-        /// path. Returns (LicenseStatus.Valid, null) on success or (status, userFacingMessage)
-        /// on failure; the caller renders the message on the UI thread.
+        /// Reads the product license from the repository DB (PRODUCT_LICENSE, single row) and validates
+        /// it with xLicense's standard (non-hardware) validator: signature + expiry + the MetaAddIn
+        /// feature. No UI here; the caller renders the message on the UI thread. Success is cached for
+        /// the session; failures are never cached, so a fixed license + re-open re-validates.
+        /// This is the FIRST repository-DB touch in ExecuteBody (the HKCU bootstrap config it needs is
+        /// already available). No fallback: a missing table / row / bad signature fails loudly.
         /// </summary>
         private static (LicenseStatus status, string failureMessage) CheckLicenseStatus()
         {
-            if (LicensingService.IsValid)
+            if (_licenseValidatedThisSession)
                 return (LicenseStatus.Valid, null);
 
-            var assemblyLocation = typeof(ErwinAddIn).Assembly.Location;
-            if (string.IsNullOrEmpty(assemblyLocation))
-                assemblyLocation = AppContext.BaseDirectory;
-            var assemblyDir = Path.GetDirectoryName(assemblyLocation) ?? AppContext.BaseDirectory;
-            var licensePath = Path.Combine(assemblyDir, "license.lic");
+            var config = Services.DatabaseService.Instance.GetConfig();
+            if (config == null || !Services.DatabaseService.Instance.IsConfigured)
+                return (LicenseStatus.NotPresent,
+                    "The repository database connection is not configured.\n\n" +
+                    "Run the add-in installer to set the connection, then try again.");
 
-            var status = LicensingService.Initialize(licensePath);
-
-            if (status == LicenseStatus.Valid)
-                return (LicenseStatus.Valid, null);
-
-            string message = status switch
+            string licenseText;
+            try
             {
-                LicenseStatus.FileNotFound =>
-                    "License file not found.\n\n" +
-                    "Please contact Elite Soft to obtain a license file for this machine.\n\n" +
-                    $"Machine ID: {LicensingService.GetCurrentHwid()}",
-                LicenseStatus.Expired =>
-                    "Your license has expired.\n\n" +
-                    "Please contact Elite Soft to renew your license.",
-                LicenseStatus.HwidMismatch =>
-                    "This license is not valid for this machine.\n\n" +
-                    "Please contact Elite Soft with your Machine ID to obtain a new license.\n\n" +
-                    $"Machine ID: {LicensingService.GetCurrentHwid()}",
-                LicenseStatus.DecryptionFailed =>
-                    "License file is corrupted or not valid for this machine.\n\n" +
-                    "Please contact Elite Soft to obtain a new license file.\n\n" +
-                    $"Machine ID: {LicensingService.GetCurrentHwid()}",
-                LicenseStatus.SignatureInvalid =>
-                    "License file has been tampered with.\n\n" +
-                    "Please contact Elite Soft to obtain a valid license file.",
-                LicenseStatus.TamperingDetected =>
-                    "License validation failed due to security check.\n\n" +
-                    "Please close any debugging tools and try again.",
-                LicenseStatus.ValidationTransient =>
-                    "License validation could not complete due to system load.\n\n" +
-                    "Please close other heavy applications and try opening the add-in again.",
-                _ =>
-                    "License validation failed.\n\n" +
-                    "Please contact Elite Soft for assistance."
-            };
+                using var ctx = new RepoDbContext(config);
+                licenseText = ctx.ProductLicenses.AsNoTracking()
+                    .Where(l => l.Id == 1)
+                    .Select(l => l.LicenseText)
+                    .SingleOrDefault();
+            }
+            catch (Exception ex)
+            {
+                Services.AddinLogger.Log($"License read from DB failed: {ex}");
+                return (LicenseStatus.NotPresent,
+                    "The license could not be read from the repository database.\n\n" +
+                    $"{ex.GetType().Name}: {ex.Message}\n\n" +
+                    "If the error mentions PRODUCT_LICENSE, the admin deployment is older than this add-in: " +
+                    "have the administrator apply the license (admin apply-license step), then try again.");
+            }
 
-            return (status, message);
+            if (string.IsNullOrWhiteSpace(licenseText))
+                return (LicenseStatus.NotPresent,
+                    "No product license was found in the repository database.\n\n" +
+                    "Have the administrator apply a license (admin apply-license step), then try again.");
+
+            var result = StandardLicenseValidator.Validate(licenseText);
+
+            if (result.Status != LicenseStatus.Valid)
+            {
+                string message = result.Status switch
+                {
+                    LicenseStatus.Expired =>
+                        $"Your license expired on {result.License?.ExpiresAt:yyyy-MM-dd}.\n\n" +
+                        "Please contact Elite Soft to renew your license.",
+                    LicenseStatus.SignatureInvalid =>
+                        "The license stored in the repository database failed the signature check.\n\n" +
+                        "Please contact Elite Soft.",
+                    LicenseStatus.Malformed =>
+                        "The license stored in the repository database is corrupted.\n\n" +
+                        "Please contact Elite Soft.",
+                    LicenseStatus.WrongLicenseKind =>
+                        "The stored license is machine-bound and cannot be used here.\n\n" +
+                        "Please contact Elite Soft for a standard license.",
+                    _ =>
+                        "License validation failed.\n\n" +
+                        "Please contact Elite Soft for assistance."
+                };
+                return (result.Status, message);
+            }
+
+            // Valid signature and not expired; ensure THIS product is licensed.
+            // Feature key is "MetaAddIn" (renamed from "ErwinAddIn" 2026-07-07);
+            // licenses must now enable the MetaAddIn feature.
+            if (result.License == null ||
+                !result.License.EnabledFeatures.Contains("MetaAddIn", StringComparer.OrdinalIgnoreCase))
+                return (LicenseStatus.NotPresent,
+                    "The installed license does not include the required 'MetaAddIn' feature.\n\n" +
+                    "Please contact Elite Soft.");
+
+            _licenseValidatedThisSession = true;
+            return (LicenseStatus.Valid, null);
         }
 
         /// <summary>

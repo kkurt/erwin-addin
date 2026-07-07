@@ -19,15 +19,12 @@
 # because erwin DM r10 only discovers Add-Ins from HKCU (HKLM Add-Ins are
 # invisible in the Tools menu - empirically verified).
 #
-# Bootstrap (MetaRepo DB connection) decision tree, in priority order:
-#   1. HKLM\Software\EliteSoft\MetaRepo\Bootstrap populated -> skip Step 4
-#      entirely. The add-in will read from HKLM at runtime (DPAPI scope
-#      LocalMachine). HKLM is corporate IT territory; this script never writes
-#      it.
-#   2. bootstrap.seed.json next to install-impl.ps1 contains DBHost+DBName -> write
+# Bootstrap (MetaRepo DB connection) decision tree, in priority order. HKCU-only
+# (HKLM support removed 2026-07-02 - the add-in reads HKCU only):
+#   1. bootstrap.seed.json next to install-impl.ps1 contains DBHost+DBName -> write
 #      HKCU silently, DPAPI CurrentUser, delete the seed file.
-#   3. HKCU already has Bootstrap -> "Overwrite existing? [y/N]" prompt.
-#   4. Otherwise -> interactive Read-Host prompts, write HKCU.
+#   2. HKCU already has Bootstrap -> "Overwrite existing? [y/N]" prompt.
+#   3. Otherwise -> interactive Read-Host prompts, write HKCU.
 #
 # See docs/INSTALL.md for the complete reference.
 #
@@ -95,8 +92,10 @@ if ($Help) {
     Write-Host "    scheduled task per-user. No UAC at any step." -ForegroundColor Gray
     Write-Host "  - Add-In Manager entry is always HKCU\SOFTWARE\erwin\Data Modeler\10.10 (erwin r10" -ForegroundColor Gray
     Write-Host "    reads HKCU only)." -ForegroundColor Gray
-    Write-Host "  - Bootstrap (DB connection) loads HKLM-first at runtime: HKLM if corporate IT seeded" -ForegroundColor Gray
-    Write-Host "    it, otherwise HKCU. The installer writes HKCU only; HKLM is read-only." -ForegroundColor Gray
+    Write-Host "  - Bootstrap (DB connection) is read from HKCU only at runtime; the installer" -ForegroundColor Gray
+    Write-Host "    writes HKCU only (DPAPI CurrentUser). HKLM is no longer read." -ForegroundColor Gray
+    Write-Host "  - Connection-secret encryption uses a FIXED key baked into the binaries (no -DataKey,"  -ForegroundColor Gray
+    Write-Host "    no provisioning). The add-in reads its product license from the repository database." -ForegroundColor Gray
     Write-Host "  - A pre-existing Machine-scope install (Program Files + HKLM COM) aborts the script;" -ForegroundColor Gray
     Write-Host "    run the old uninstaller as Admin first, then re-run this." -ForegroundColor Gray
     Write-Host ""
@@ -714,24 +713,19 @@ try {
     Write-Host "  Addin may still appear if you restart erwin manually after install." -ForegroundColor Yellow
 }
 
-# Step 4: MetaRepo bootstrap (DB connection seed). Decision tree:
-#   1. HKLM\Software\EliteSoft\MetaRepo\Bootstrap is populated (DBHost AND
-#      DBName non-empty) -> SKIP entirely. The add-in will read from HKLM at
-#      runtime; we deliberately do not write HKCU because HKLM wins on read
-#      and a partial HKCU could confuse troubleshooting later. Corporate IT
-#      owns HKLM; this script never writes it.
-#   2. bootstrap.seed.json next to install-impl.ps1 has DBHost AND DBName -> write
+# Step 4: MetaRepo bootstrap (DB connection seed). HKCU-only (HKLM support
+# removed 2026-07-02: the add-in reads HKCU only, so seeding or reading HKLM
+# would just shadow the user's HKCU config). Decision tree, in priority order:
+#   1. bootstrap.seed.json next to install-impl.ps1 has DBHost AND DBName -> write
 #      HKCU silently (DPAPI CurrentUser), delete the seed file.
-#   3. HKCU already has a populated Bootstrap key -> show current vs new and
+#   2. HKCU already has a populated Bootstrap key -> show current vs new and
 #      ask "Overwrite? [y/N]". Default N preserves the prior config.
-#   4. None of the above -> interactive Read-Host prompts, then write HKCU.
+#   3. None of the above -> interactive Read-Host prompts, then write HKCU.
 #
-# DPAPI scope at write time is always CurrentUser. install-impl.ps1 never
-# writes HKLM, so the LocalMachine scope is irrelevant here (it lives in
-# the read-side HklmFirstBootstrapReader, where the source hive picks scope).
+# DPAPI scope at write time is always CurrentUser (install-impl.ps1 only ever
+# writes HKCU).
 Write-Host "`n[4/4] Configuring MetaRepo bootstrap..." -ForegroundColor Yellow
 
-$hklmBootstrap = "HKLM:\Software\EliteSoft\MetaRepo\Bootstrap"
 $hkcuBootstrap = "HKCU:\Software\EliteSoft\MetaRepo\Bootstrap"
 
 # Same configured-test the add-in uses: key exists AND DBHost non-empty AND
@@ -745,197 +739,185 @@ function Test-BootstrapConfigured([string]$registryPath) {
     return -not [string]::IsNullOrEmpty($hostVal) -and -not [string]::IsNullOrEmpty($nameVal)
 }
 
-# Branch 1: HKLM already seeded by corporate IT. Skip everything else.
-if (Test-BootstrapConfigured $hklmBootstrap) {
+# HKCU-only: resolve CLI args + seed file + (later) interactive prompts, then write HKCU.
+$seedPath = Join-Path $sourceDir "bootstrap.seed.json"
+$seedFromFile = $null
+if (Test-Path -LiteralPath $seedPath) {
     try {
-        $hklm = Get-ItemProperty -LiteralPath $hklmBootstrap -ErrorAction Stop
-        Write-Host "  HKLM bootstrap detected; skipping HKCU bootstrap write." -ForegroundColor Green
-        $hklmType = if ($hklm.PSObject.Properties['DBType']) { $hklm.DBType } else { '(missing)' }
-        $hklmPort = if ($hklm.PSObject.Properties['DBPort']) { $hklm.DBPort } else { '(missing)' }
-        Write-Host "    DBType=$hklmType DBHost=$($hklm.DBHost) DBPort=$hklmPort DBName=$($hklm.DBName)" -ForegroundColor Gray
-        Write-Host "    Add-in will read this config from HKLM at runtime (DPAPI LocalMachine)." -ForegroundColor Gray
+        $seedFromFile = Get-Content -LiteralPath $seedPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        Write-Host "  Found bootstrap.seed.json (packaged seed)" -ForegroundColor Gray
     } catch {
-        Write-Host "  HKLM bootstrap detected; skipping HKCU bootstrap write." -ForegroundColor Green
-        Write-Host "  (Could not enumerate HKLM values: $($_.Exception.Message))" -ForegroundColor DarkGray
+        Write-Host "  WARNING: bootstrap.seed.json present but unreadable: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host "           Delete it manually if it is corrupt; CLI args still work." -ForegroundColor Gray
     }
-} else {
-    # No HKLM seed. Resolve CLI args + seed file + (later) interactive prompts.
-    $seedPath = Join-Path $sourceDir "bootstrap.seed.json"
-    $seedFromFile = $null
-    if (Test-Path -LiteralPath $seedPath) {
+}
+
+function Resolve-Field([string]$cliValue, [string]$seedKey, [string]$default) {
+    if (-not [string]::IsNullOrEmpty($cliValue)) { return $cliValue }
+    if ($null -ne $seedFromFile -and $null -ne $seedFromFile.$seedKey -and -not [string]::IsNullOrEmpty([string]$seedFromFile.$seedKey)) {
+        return [string]$seedFromFile.$seedKey
+    }
+    return $default
+}
+
+# Read a password without echo. Read-Host -AsSecureString works on PS5 and
+# PS7; the BSTR round-trip is needed because PS5 lacks
+# ConvertFrom-SecureString -AsPlainText. Empty Enter returns "".
+function Read-PlainPassword([string]$prompt) {
+    $sec = Read-Host -Prompt $prompt -AsSecureString
+    if ($null -eq $sec -or $sec.Length -eq 0) { return "" }
+    $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
+    try {
+        return [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+    } finally {
+        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    }
+}
+
+function Read-WithDefault([string]$prompt, [string]$default) {
+    $shown = if ([string]::IsNullOrEmpty($default)) { "" } else { " [$default]" }
+    $val = Read-Host -Prompt "$prompt$shown"
+    if ([string]::IsNullOrEmpty($val)) { return $default }
+    return $val
+}
+
+$bsDBHost     = Resolve-Field $DBHost     "DBHost"     ""
+$bsDBName     = Resolve-Field $DBName     "DBName"     ""
+$bsDBUserName = Resolve-Field $DBUserName "DBUserName" ""
+$bsDBPassword = Resolve-Field $DBPassword "DBPassword" ""
+$bsDBType     = Resolve-Field $DBType     "DBType"     "MSSQL"
+$bsDBPort     = Resolve-Field $DBPort     "DBPort"     "1433"
+
+$haveHostAndName = -not [string]::IsNullOrEmpty($bsDBHost) -and -not [string]::IsNullOrEmpty($bsDBName)
+
+if (-not $haveHostAndName) {
+    # No CLI args, no seed file. Before prompting, honour the
+    # decision tree at the top of Step 4: if HKCU already has a populated
+    # Bootstrap from a prior install, keep it as-is. The add-in will read
+    # from HKCU at runtime, and re-prompting the user every time they
+    # re-run install.bat would be a regression (pre-2026-05-14 the
+    # prompt fired even when HKCU was complete, see user report on
+    # 2026-05-14: "dev re-install asked for credentials even though HKCU
+    # was already populated").
+    if (Test-BootstrapConfigured $hkcuBootstrap) {
         try {
-            $seedFromFile = Get-Content -LiteralPath $seedPath -Raw -Encoding UTF8 | ConvertFrom-Json
-            Write-Host "  Found bootstrap.seed.json (packaged seed)" -ForegroundColor Gray
+            $hkcu = Get-ItemProperty -LiteralPath $hkcuBootstrap -ErrorAction Stop
+            $hkcuType = if ($hkcu.PSObject.Properties['DBType']) { $hkcu.DBType } else { '(missing)' }
+            $hkcuPort = if ($hkcu.PSObject.Properties['DBPort']) { $hkcu.DBPort } else { '(missing)' }
+            Write-Host "  HKCU bootstrap already populated; keeping existing config." -ForegroundColor Green
+            Write-Host "    DBType=$hkcuType DBHost=$($hkcu.DBHost) DBPort=$hkcuPort DBName=$($hkcu.DBName)" -ForegroundColor Gray
+            Write-Host "    (Pass -DBHost/-DBName on the command line or drop a bootstrap.seed.json next to install.bat to overwrite.)" -ForegroundColor Gray
         } catch {
-            Write-Host "  WARNING: bootstrap.seed.json present but unreadable: $($_.Exception.Message)" -ForegroundColor Yellow
-            Write-Host "           Delete it manually if it is corrupt; CLI args still work." -ForegroundColor Gray
+            Write-Host "  HKCU bootstrap detected; keeping existing config (could not enumerate: $($_.Exception.Message))." -ForegroundColor Green
         }
-    }
+        $bsDBHost = ""  # sentinel: write block below sees empty Host/Name and skips
+        $bsDBName = ""
+    } else {
+        # Branch 4: nothing anywhere. Ask the user.
+        Write-Host "  No HKCU config; no CLI/seed values supplied." -ForegroundColor Cyan
+        Write-Host "  Please enter DB connection info now (will be written to HKCU):" -ForegroundColor Cyan
+        Write-Host ""
+        $bsDBType     = Read-WithDefault "  DB Type (MSSQL/ORACLE/POSTGRESQL)" $bsDBType
+        $bsDBHost     = Read-WithDefault "  DB Host" $bsDBHost
+        $bsDBPort     = Read-WithDefault "  DB Port" $bsDBPort
+        $bsDBName     = Read-WithDefault "  DB Name (catalog)" $bsDBName
+        $bsDBUserName = Read-WithDefault "  DB UserName" $bsDBUserName
+        $bsDBPassword = Read-PlainPassword "  DB Password"
+        Write-Host ""
 
-    function Resolve-Field([string]$cliValue, [string]$seedKey, [string]$default) {
-        if (-not [string]::IsNullOrEmpty($cliValue)) { return $cliValue }
-        if ($null -ne $seedFromFile -and $null -ne $seedFromFile.$seedKey -and -not [string]::IsNullOrEmpty([string]$seedFromFile.$seedKey)) {
-            return [string]$seedFromFile.$seedKey
-        }
-        return $default
-    }
-
-    # Read a password without echo. Read-Host -AsSecureString works on PS5 and
-    # PS7; the BSTR round-trip is needed because PS5 lacks
-    # ConvertFrom-SecureString -AsPlainText. Empty Enter returns "".
-    function Read-PlainPassword([string]$prompt) {
-        $sec = Read-Host -Prompt $prompt -AsSecureString
-        if ($null -eq $sec -or $sec.Length -eq 0) { return "" }
-        $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
-        try {
-            return [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
-        } finally {
-            [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
-        }
-    }
-
-    function Read-WithDefault([string]$prompt, [string]$default) {
-        $shown = if ([string]::IsNullOrEmpty($default)) { "" } else { " [$default]" }
-        $val = Read-Host -Prompt "$prompt$shown"
-        if ([string]::IsNullOrEmpty($val)) { return $default }
-        return $val
-    }
-
-    $bsDBHost     = Resolve-Field $DBHost     "DBHost"     ""
-    $bsDBName     = Resolve-Field $DBName     "DBName"     ""
-    $bsDBUserName = Resolve-Field $DBUserName "DBUserName" ""
-    $bsDBPassword = Resolve-Field $DBPassword "DBPassword" ""
-    $bsDBType     = Resolve-Field $DBType     "DBType"     "MSSQL"
-    $bsDBPort     = Resolve-Field $DBPort     "DBPort"     "1433"
-
-    $haveHostAndName = -not [string]::IsNullOrEmpty($bsDBHost) -and -not [string]::IsNullOrEmpty($bsDBName)
-
-    if (-not $haveHostAndName) {
-        # No CLI args, no seed file. Before prompting, honour Branch 3 of the
-        # decision tree at the top of Step 4: if HKCU already has a populated
-        # Bootstrap from a prior install, keep it as-is. The add-in will read
-        # from HKCU at runtime, and re-prompting the user every time they
-        # re-run install.bat would be a regression (pre-2026-05-14 the
-        # prompt fired even when HKCU was complete, see user report on
-        # 2026-05-14: "dev re-install asked for credentials even though HKCU
-        # was already populated").
-        if (Test-BootstrapConfigured $hkcuBootstrap) {
-            try {
-                $hkcu = Get-ItemProperty -LiteralPath $hkcuBootstrap -ErrorAction Stop
-                $hkcuType = if ($hkcu.PSObject.Properties['DBType']) { $hkcu.DBType } else { '(missing)' }
-                $hkcuPort = if ($hkcu.PSObject.Properties['DBPort']) { $hkcu.DBPort } else { '(missing)' }
-                Write-Host "  HKCU bootstrap already populated; keeping existing config." -ForegroundColor Green
-                Write-Host "    DBType=$hkcuType DBHost=$($hkcu.DBHost) DBPort=$hkcuPort DBName=$($hkcu.DBName)" -ForegroundColor Gray
-                Write-Host "    (Pass -DBHost/-DBName on the command line or drop a bootstrap.seed.json next to install.bat to overwrite.)" -ForegroundColor Gray
-            } catch {
-                Write-Host "  HKCU bootstrap detected; keeping existing config (could not enumerate: $($_.Exception.Message))." -ForegroundColor Green
-            }
-            $bsDBHost = ""  # sentinel: write block below sees empty Host/Name and skips
+        if ([string]::IsNullOrEmpty($bsDBHost) -or [string]::IsNullOrEmpty($bsDBName)) {
+            Write-Host "  Skipped bootstrap (DBHost or DBName left empty)." -ForegroundColor Yellow
+            Write-Host "  The add-in will surface 'No configuration found' on first load." -ForegroundColor Gray
+            Write-Host "  Re-run install.bat with the missing values to seed HKCU." -ForegroundColor Gray
+            $bsDBHost = ""
             $bsDBName = ""
-        } else {
-            # Branch 4: nothing anywhere. Ask the user.
-            Write-Host "  No HKLM seed; no HKCU config; no CLI/seed values supplied." -ForegroundColor Cyan
-            Write-Host "  Please enter DB connection info now (will be written to HKCU):" -ForegroundColor Cyan
-            Write-Host ""
-            $bsDBType     = Read-WithDefault "  DB Type (MSSQL/ORACLE/POSTGRESQL)" $bsDBType
-            $bsDBHost     = Read-WithDefault "  DB Host" $bsDBHost
-            $bsDBPort     = Read-WithDefault "  DB Port" $bsDBPort
-            $bsDBName     = Read-WithDefault "  DB Name (catalog)" $bsDBName
-            $bsDBUserName = Read-WithDefault "  DB UserName" $bsDBUserName
-            $bsDBPassword = Read-PlainPassword "  DB Password"
-            Write-Host ""
+        }
+    }
+}
 
-            if ([string]::IsNullOrEmpty($bsDBHost) -or [string]::IsNullOrEmpty($bsDBName)) {
-                Write-Host "  Skipped bootstrap (DBHost or DBName left empty)." -ForegroundColor Yellow
-                Write-Host "  The add-in will surface 'No configuration found' on first load." -ForegroundColor Gray
-                Write-Host "  Re-run install.bat with the missing values to seed HKCU." -ForegroundColor Gray
-                $bsDBHost = ""
-                $bsDBName = ""
+if (-not [string]::IsNullOrEmpty($bsDBHost) -and -not [string]::IsNullOrEmpty($bsDBName)) {
+    # Windows PowerShell 5.1 (.NET Framework) does NOT auto-load
+    # System.Security.dll, which is where DataProtectionScope and
+    # ProtectedData live. Without this Add-Type the next line fails with
+    # "Unable to find type [System.Security.Cryptography.DataProtectionScope]".
+    # PS 7 / .NET Core resolves it implicitly, so the bug only surfaces on
+    # production user machines running the in-box PS 5.1.
+    Add-Type -AssemblyName System.Security
+
+    # install-impl.ps1 only ever writes HKCU, so DPAPI scope is always
+    # CurrentUser.
+    $dpapiScope = [System.Security.Cryptography.DataProtectionScope]::CurrentUser
+
+    function Protect-WithDpapi([string]$plaintext, [System.Security.Cryptography.DataProtectionScope]$scope) {
+        if ([string]::IsNullOrEmpty($plaintext)) { return "" }
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($plaintext)
+        $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null, $scope)
+        return [System.Convert]::ToBase64String($protected)
+    }
+
+    # Existing HKCU config: summary + overwrite prompt. Default N
+    # preserves the prior config exactly as-is.
+    $writeBootstrap = $true
+    if (Test-Path -LiteralPath $hkcuBootstrap) {
+        Write-Host ""
+        Write-Host "  An existing Bootstrap config was found in HKCU\Software\EliteSoft\MetaRepo\Bootstrap:" -ForegroundColor Yellow
+        try {
+            $existing = Get-ItemProperty -LiteralPath $hkcuBootstrap -ErrorAction Stop
+            $oldType = if ($existing.PSObject.Properties['DBType']) { $existing.DBType } else { '(missing)' }
+            $oldHost = if ($existing.PSObject.Properties['DBHost']) { $existing.DBHost } else { '(missing)' }
+            $oldPort = if ($existing.PSObject.Properties['DBPort']) { $existing.DBPort } else { '(missing)' }
+            $oldName = if ($existing.PSObject.Properties['DBName']) { $existing.DBName } else { '(missing)' }
+            Write-Host "    Current: DBType=$oldType DBHost=$oldHost DBPort=$oldPort DBName=$oldName" -ForegroundColor Gray
+        } catch {
+            Write-Host "    Current: (could not read - $($_.Exception.Message))" -ForegroundColor DarkGray
+        }
+        Write-Host "    New:     DBType=$bsDBType DBHost=$bsDBHost DBPort=$bsDBPort DBName=$bsDBName" -ForegroundColor Gray
+        Write-Host ""
+        $resp = Read-Host "  Clear existing Bootstrap key and write new values? [y/N]"
+        if ($resp -notmatch '^[yY]') {
+            Write-Host "  Bootstrap write SKIPPED. Existing config preserved." -ForegroundColor Yellow
+            $writeBootstrap = $false
+        } else {
+            # Wipe the whole key so legacy value names (Host/Database/...)
+            # get cleared rather than masked by the new DB* names.
+            try {
+                Remove-Item -LiteralPath $hkcuBootstrap -Recurse -Force -ErrorAction Stop
+                Write-Host "  Cleared existing HKCU\Software\EliteSoft\MetaRepo\Bootstrap" -ForegroundColor Gray
+            } catch {
+                Write-Host "  WARNING: Could not clear existing HKCU Bootstrap key: $($_.Exception.Message)" -ForegroundColor Yellow
+                Write-Host "           Proceeding to overwrite individual values; legacy names may remain." -ForegroundColor Yellow
             }
         }
     }
 
-    if (-not [string]::IsNullOrEmpty($bsDBHost) -and -not [string]::IsNullOrEmpty($bsDBName)) {
-        # Windows PowerShell 5.1 (.NET Framework) does NOT auto-load
-        # System.Security.dll, which is where DataProtectionScope and
-        # ProtectedData live. Without this Add-Type the next line fails with
-        # "Unable to find type [System.Security.Cryptography.DataProtectionScope]".
-        # PS 7 / .NET Core resolves it implicitly, so the bug only surfaces on
-        # production user machines running the in-box PS 5.1.
-        Add-Type -AssemblyName System.Security
-
-        # We always write HKCU (HKLM was handled in Branch 1 above), so DPAPI
-        # scope is always CurrentUser.
-        $dpapiScope = [System.Security.Cryptography.DataProtectionScope]::CurrentUser
-
-        function Protect-WithDpapi([string]$plaintext, [System.Security.Cryptography.DataProtectionScope]$scope) {
-            if ([string]::IsNullOrEmpty($plaintext)) { return "" }
-            $bytes = [System.Text.Encoding]::UTF8.GetBytes($plaintext)
-            $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null, $scope)
-            return [System.Convert]::ToBase64String($protected)
+    if ($writeBootstrap) {
+        if (-not (Test-Path -LiteralPath $hkcuBootstrap)) {
+            New-Item -Path $hkcuBootstrap -Force | Out-Null
         }
 
-        # Branch 3 (existing HKCU): summary + overwrite prompt. Default N
-        # preserves the prior config exactly as-is.
-        $writeBootstrap = $true
-        if (Test-Path -LiteralPath $hkcuBootstrap) {
-            Write-Host ""
-            Write-Host "  An existing Bootstrap config was found in HKCU\Software\EliteSoft\MetaRepo\Bootstrap:" -ForegroundColor Yellow
+        Set-ItemProperty $hkcuBootstrap -Name "DBType"     -Value $bsDBType     -Type String
+        Set-ItemProperty $hkcuBootstrap -Name "DBHost"     -Value $bsDBHost     -Type String
+        Set-ItemProperty $hkcuBootstrap -Name "DBPort"     -Value $bsDBPort     -Type String
+        Set-ItemProperty $hkcuBootstrap -Name "DBName"     -Value $bsDBName     -Type String
+        Set-ItemProperty $hkcuBootstrap -Name "DBUserName" -Value (Protect-WithDpapi $bsDBUserName $dpapiScope) -Type String
+        Set-ItemProperty $hkcuBootstrap -Name "DBPassword" -Value (Protect-WithDpapi $bsDBPassword $dpapiScope) -Type String
+        # The connection-secret key is now a FIXED key baked into the binaries (owner decision 2026-07);
+        # nothing is written to HKCU for it. Best-effort remove any stale DataKey left by an older installer.
+        Remove-ItemProperty $hkcuBootstrap -Name "DataKey" -ErrorAction SilentlyContinue
+        Write-Host "  Bootstrap written to HKCU\Software\EliteSoft\MetaRepo\Bootstrap" -ForegroundColor Green
+        Write-Host "    DBType=$bsDBType DBHost=$bsDBHost DBPort=$bsDBPort DBName=$bsDBName" -ForegroundColor Gray
+        Write-Host "    DBUserName/DBPassword DPAPI-encrypted (CurrentUser)" -ForegroundColor Gray
+
+        # Best-effort delete of the plaintext seed file. Failure is
+        # non-fatal (a locked file just stays on disk; admin can remove
+        # it manually).
+        if (Test-Path -LiteralPath $seedPath) {
             try {
-                $existing = Get-ItemProperty -LiteralPath $hkcuBootstrap -ErrorAction Stop
-                $oldType = if ($existing.PSObject.Properties['DBType']) { $existing.DBType } else { '(missing)' }
-                $oldHost = if ($existing.PSObject.Properties['DBHost']) { $existing.DBHost } else { '(missing)' }
-                $oldPort = if ($existing.PSObject.Properties['DBPort']) { $existing.DBPort } else { '(missing)' }
-                $oldName = if ($existing.PSObject.Properties['DBName']) { $existing.DBName } else { '(missing)' }
-                Write-Host "    Current: DBType=$oldType DBHost=$oldHost DBPort=$oldPort DBName=$oldName" -ForegroundColor Gray
+                Remove-Item -LiteralPath $seedPath -Force -ErrorAction Stop
+                Write-Host "  Removed plaintext bootstrap.seed.json after successful registry write" -ForegroundColor Gray
             } catch {
-                Write-Host "    Current: (could not read - $($_.Exception.Message))" -ForegroundColor DarkGray
-            }
-            Write-Host "    New:     DBType=$bsDBType DBHost=$bsDBHost DBPort=$bsDBPort DBName=$bsDBName" -ForegroundColor Gray
-            Write-Host ""
-            $resp = Read-Host "  Clear existing Bootstrap key and write new values? [y/N]"
-            if ($resp -notmatch '^[yY]') {
-                Write-Host "  Bootstrap write SKIPPED. Existing config preserved." -ForegroundColor Yellow
-                $writeBootstrap = $false
-            } else {
-                # Wipe the whole key so legacy value names (Host/Database/...)
-                # get cleared rather than masked by the new DB* names.
-                try {
-                    Remove-Item -LiteralPath $hkcuBootstrap -Recurse -Force -ErrorAction Stop
-                    Write-Host "  Cleared existing HKCU\Software\EliteSoft\MetaRepo\Bootstrap" -ForegroundColor Gray
-                } catch {
-                    Write-Host "  WARNING: Could not clear existing HKCU Bootstrap key: $($_.Exception.Message)" -ForegroundColor Yellow
-                    Write-Host "           Proceeding to overwrite individual values; legacy names may remain." -ForegroundColor Yellow
-                }
-            }
-        }
-
-        if ($writeBootstrap) {
-            if (-not (Test-Path -LiteralPath $hkcuBootstrap)) {
-                New-Item -Path $hkcuBootstrap -Force | Out-Null
-            }
-
-            Set-ItemProperty $hkcuBootstrap -Name "DBType"     -Value $bsDBType     -Type String
-            Set-ItemProperty $hkcuBootstrap -Name "DBHost"     -Value $bsDBHost     -Type String
-            Set-ItemProperty $hkcuBootstrap -Name "DBPort"     -Value $bsDBPort     -Type String
-            Set-ItemProperty $hkcuBootstrap -Name "DBName"     -Value $bsDBName     -Type String
-            Set-ItemProperty $hkcuBootstrap -Name "DBUserName" -Value (Protect-WithDpapi $bsDBUserName $dpapiScope) -Type String
-            Set-ItemProperty $hkcuBootstrap -Name "DBPassword" -Value (Protect-WithDpapi $bsDBPassword $dpapiScope) -Type String
-            Write-Host "  Bootstrap written to HKCU\Software\EliteSoft\MetaRepo\Bootstrap" -ForegroundColor Green
-            Write-Host "    DBType=$bsDBType DBHost=$bsDBHost DBPort=$bsDBPort DBName=$bsDBName" -ForegroundColor Gray
-            Write-Host "    DBUserName/DBPassword DPAPI-encrypted (CurrentUser)" -ForegroundColor Gray
-
-            # Best-effort delete of the plaintext seed file. Failure is
-            # non-fatal (a locked file just stays on disk; admin can remove
-            # it manually).
-            if (Test-Path -LiteralPath $seedPath) {
-                try {
-                    Remove-Item -LiteralPath $seedPath -Force -ErrorAction Stop
-                    Write-Host "  Removed plaintext bootstrap.seed.json after successful registry write" -ForegroundColor Gray
-                } catch {
-                    Write-Host "  WARNING: Could not remove $seedPath after successful seed: $($_.Exception.Message)" -ForegroundColor Yellow
-                    Write-Host "           Delete it manually - it contains plaintext DB credentials." -ForegroundColor Yellow
-                }
+                Write-Host "  WARNING: Could not remove $seedPath after successful seed: $($_.Exception.Message)" -ForegroundColor Yellow
+                Write-Host "           Delete it manually - it contains plaintext DB credentials." -ForegroundColor Yellow
             }
         }
     }

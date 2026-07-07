@@ -26,12 +26,16 @@
     <DefineConstants>$(DefineConstants);PACKAGED</DefineConstants>
   </PropertyGroup>
 
-  <!-- Dev-only verbose diagnostics: per-column-change traces ([PK-WALK],
-       [TEMPLATE-COND]) are gated behind [Conditional("DEV_DIAGNOSTICS")] so the
-       compiler omits the calls (and their string interpolation) from packaged
-       production builds. Defined for every NON-packaged (developer) build. -->
+  <!-- Dev-only symbols, defined for every NON-packaged (developer) build and
+       omitted from packaged production builds:
+         DEV_DIAGNOSTICS - per-column-change traces ([PK-WALK], [TEMPLATE-COND])
+                           gated behind [Conditional("DEV_DIAGNOSTICS")].
+         DEV             - developer-only features that must NEVER ship, e.g. the
+                           startup "pick a local MetaRepo* database" override
+                           (DevDatabaseSelector / DevDatabasePickerForm). Gate such
+                           code with #if DEV so it is not compiled into a package. -->
   <PropertyGroup Condition="'$(PackagedBuild)' != 'true'">
-    <DefineConstants>$(DefineConstants);DEV_DIAGNOSTICS</DefineConstants>
+    <DefineConstants>$(DefineConstants);DEV_DIAGNOSTICS;DEV</DefineConstants>
   </PropertyGroup>
 
   <ItemGroup>

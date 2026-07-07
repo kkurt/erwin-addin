@@ -5,9 +5,9 @@ using System.Linq;
 namespace EliteSoft.Erwin.AddIn.Services
 {
     /// <summary>
-    /// One allowed datatype for the model's DBMS: the base type token plus whether it
+    /// One allowed datatype for the active config: the base type token plus whether it
     /// takes a length/precision parameter. Sourced from DATATYPE_LIBRARY (the admin
-    /// "Datatype Library" catalog rows for that DBMS).
+    /// "Datatype Library" whitelist rows for that config).
     /// </summary>
     public sealed class AllowedDatatypeEntry
     {
@@ -23,23 +23,20 @@ namespace EliteSoft.Erwin.AddIn.Services
     }
 
     /// <summary>
-    /// Loads the datatypes the admin "Datatype Library" allows for the active model's DBMS and
-    /// answers whether a column's Physical_Data_Type is permitted. The allowed set is the DBMS
-    /// catalog the admin curated: DATATYPE_LIBRARY rows for the DBMS the model targets, reached
-    /// from the config's DBMS_VERSION_ID via DBMS_VERSION.DBMS_ID. This is PER-DBMS (the admin's
-    /// own "types for this DBMS" list, user decision 2026-06-19: "DBMS bazinda belirleniyor, config
-    /// bazinda degil"), NOT per config (the never-populated ALLOWED_DATATYPE table).
+    /// Loads the datatypes the admin "Datatype Library" allows for the active CONFIG and answers
+    /// whether a column's Physical_Data_Type is permitted. The allowed set is the config's own
+    /// whitelist: DATATYPE_LIBRARY rows WHERE CONFIG_ID = the active config's ID
+    /// (ConfigContextService.ActiveConfigId). A config's row set IS its datatype whitelist.
     /// <para>
-    /// An empty/absent list is "no restriction" - so a DBMS the admin has not curated yet does
-    /// not suddenly reject every type. There is NO DBMS_VERSION.STATUS gate: the admin's own
-    /// catalog query does not filter on status, every version is DRAFT in practice, and a hidden
-    /// ACTIVE gate silently disabled the whole feature. We enforce whatever the admin defined.
+    /// An empty/absent set is "no restriction" - a config the admin has not curated yet does not
+    /// suddenly reject every type. There is NO status gate: enforcement is purely "is this base
+    /// token in the config's set".
     /// </para>
-    /// <para>2026-06-19: corrected twice. First from ALLOWED_DATATYPE (config-level, unpopulated,
-    /// no UI) to DATATYPE_VERSION (per-version link); then to DBMS-level DATATYPE_LIBRARY after a
-    /// live trace showed the admin defines types at the DBMS level (DATATYPE_VERSION empty, all
-    /// versions DRAFT) and the per-version + ACTIVE query loaded an empty set. The add-in is the
-    /// only side changed - the admin project is untouched.</para>
+    /// <para>2026-07-02: DATATYPE_LIBRARY became config-scoped (admin migration applied to the
+    /// live MetaRepo DBs). Columns are now ID, CONFIG_ID, DATATYPE, IS_PARAMETERIZED; the old
+    /// DBMS_ID column, the DATATYPE_VERSION and ALLOWED_DATATYPE tables, and the DBMS_VERSION join
+    /// are all gone. The add-in filters by CONFIG_ID; DBMS_VERSION / DBMS_LIBRARY remain only for
+    /// CONFIG.DBMS_VERSION_ID + the DBMS-mismatch check, not for this whitelist.</para>
     /// </summary>
     public class AllowedDatatypeService
     {
@@ -75,11 +72,10 @@ namespace EliteSoft.Erwin.AddIn.Services
         public string LastError => _lastError;
 
         /// <summary>
-        /// Load the active model's allowed datatypes = the catalog the admin curated for its DBMS
-        /// (DATATYPE_LIBRARY joined to DBMS_VERSION on DBMS_ID), reached from the model's
-        /// DBMS_VERSION_ID (ConfigContextService.DbmsVersionId). Returns true on a clean read
-        /// (including the legitimate empty result = no restriction); false on a hard error.
-        /// No DBMS version on the config yields an empty set = no restriction.
+        /// Load the active config's allowed datatypes = DATATYPE_LIBRARY rows WHERE CONFIG_ID =
+        /// ConfigContextService.ActiveConfigId. Returns true on a clean read (including the
+        /// legitimate empty result = no restriction); false on a hard error. A config with no
+        /// DATATYPE_LIBRARY rows yields an empty set = no restriction.
         /// </summary>
         public bool Load()
         {
@@ -105,14 +101,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                     return false;
                 }
 
-                // No DBMS version mapped -> nothing to restrict against.
-                if (ctx.DbmsVersionId == null)
-                {
-                    _isLoaded = true;
-                    System.Diagnostics.Debug.WriteLine("AllowedDatatypeService: config has no DBMS_VERSION_ID - no restriction.");
-                    return true;
-                }
-
                 string dbType = DatabaseService.Instance.GetDbType();
                 string query = GetQuery(dbType);
 
@@ -121,10 +109,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                     connection.Open();
                     using (var command = DatabaseService.Instance.CreateCommand(query, connection))
                     {
-                        var pVer = command.CreateParameter();
-                        pVer.ParameterName = SqlDialect.Param(dbType, "verId");
-                        pVer.Value = ctx.DbmsVersionId.Value;
-                        command.Parameters.Add(pVer);
+                        var pCfg = command.CreateParameter();
+                        pCfg.ParameterName = SqlDialect.Param(dbType, "configId");
+                        pCfg.Value = ctx.ActiveConfigId;
+                        command.Parameters.Add(pCfg);
 
                         using (var reader = command.ExecuteReader())
                         {
@@ -142,8 +130,8 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                 _isLoaded = true;
                 System.Diagnostics.Debug.WriteLine(
-                    $"AllowedDatatypeService: loaded {_allowed.Count} allowed datatype(s) for DBMS version {ctx.DbmsVersionId} " +
-                    $"({(_allowed.Count == 0 ? "no restriction (DBMS catalog empty)" : string.Join(", ", _allowed.Select(a => a.Datatype + (a.IsParameterized ? "(n)" : ""))))})");
+                    $"AllowedDatatypeService: loaded {_allowed.Count} allowed datatype(s) for config {ctx.ActiveConfigId} " +
+                    $"({(_allowed.Count == 0 ? "no restriction (config whitelist empty)" : string.Join(", ", _allowed.Select(a => a.Datatype + (a.IsParameterized ? "(n)" : ""))))})");
                 return true;
             }
             catch (Exception ex)
@@ -155,39 +143,32 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
         }
 
-        // The admin "Datatype Library" catalog for the model's DBMS: DATATYPE_LIBRARY (DATATYPE,
-        // IS_PARAMETERIZED) keyed by DBMS_ID, reached from the model's DBMS_VERSION_ID through
-        // DBMS_VERSION.DBMS_ID. NO DATATYPE_VERSION link and NO DBMS_VERSION.STATUS filter: the
-        // admin defines types at the DBMS level and the per-version link / ACTIVE status are not
-        // required for enforcement (verified live 2026-06-19: DATATYPE_VERSION empty, every
-        // version DRAFT, yet 'int' defined for the DBMS must be enforced). NO MC_ prefix on these
-        // tables (unlike MC_NAMING_STANDARD). Bound to ConfigContextService.DbmsVersionId, NOT a
-        // CONFIG/ALLOWED_DATATYPE row.
+        // The active config's "Datatype Library" whitelist: DATATYPE_LIBRARY (DATATYPE,
+        // IS_PARAMETERIZED) filtered by CONFIG_ID. Config-scoped since the 2026-07-02 admin
+        // migration (the old DBMS_ID column + DBMS_VERSION join are gone). No status gate. No MC_
+        // prefix (unlike MC_NAMING_STANDARD). Bound to ConfigContextService.ActiveConfigId.
         private static string GetQuery(string dbType)
         {
             switch (dbType?.ToUpper())
             {
                 case "POSTGRESQL":
-                    return @"SELECT dl.""DATATYPE"", dl.""IS_PARAMETERIZED""
-                            FROM ""DATATYPE_LIBRARY"" dl
-                            JOIN ""DBMS_VERSION"" dv ON dv.""DBMS_ID"" = dl.""DBMS_ID""
-                            WHERE dv.""ID"" = @verId
-                            ORDER BY dl.""DATATYPE""";
+                    return @"SELECT ""DATATYPE"", ""IS_PARAMETERIZED""
+                            FROM ""DATATYPE_LIBRARY""
+                            WHERE ""CONFIG_ID"" = @configId
+                            ORDER BY ""DATATYPE""";
 
                 case "ORACLE":
-                    return @"SELECT dl.DATATYPE, dl.IS_PARAMETERIZED
-                            FROM DATATYPE_LIBRARY dl
-                            JOIN DBMS_VERSION dv ON dv.DBMS_ID = dl.DBMS_ID
-                            WHERE dv.ID = :verId
-                            ORDER BY dl.DATATYPE";
+                    return @"SELECT DATATYPE, IS_PARAMETERIZED
+                            FROM DATATYPE_LIBRARY
+                            WHERE CONFIG_ID = :configId
+                            ORDER BY DATATYPE";
 
                 case "MSSQL":
                 default:
-                    return @"SELECT dl.[DATATYPE], dl.[IS_PARAMETERIZED]
-                            FROM [dbo].[DATATYPE_LIBRARY] dl
-                            JOIN [dbo].[DBMS_VERSION] dv ON dv.[DBMS_ID] = dl.[DBMS_ID]
-                            WHERE dv.[ID] = @verId
-                            ORDER BY dl.[DATATYPE]";
+                    return @"SELECT [DATATYPE], [IS_PARAMETERIZED]
+                            FROM [dbo].[DATATYPE_LIBRARY]
+                            WHERE [CONFIG_ID] = @configId
+                            ORDER BY [DATATYPE]";
             }
         }
 
@@ -223,9 +204,10 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <summary>
         /// Pure matcher (no DB / no SCAPI) so it is unit-testable. A type is allowed when:
         /// the whitelist is empty (no restriction); OR the parsed base token matches an entry
-        /// case-insensitively AND, for a non-parameterized entry, the value carries NO length
-        /// (a parameterized entry accepts any length, including none). An empty/unparseable
-        /// value is treated as allowed (cannot classify - do not block).
+        /// case-insensitively AND the length rule holds: a parameterized entry REQUIRES a length
+        /// (bare 'varchar2' is rejected when 'varchar2' is parameterized), a non-parameterized
+        /// entry requires NO length. An empty/unparseable value is treated as allowed (cannot
+        /// classify - do not block).
         /// </summary>
         public static bool IsDatatypeAllowed(string physicalDataType, IReadOnlyCollection<AllowedDatatypeEntry> allowed)
         {
@@ -238,8 +220,12 @@ namespace EliteSoft.Erwin.AddIn.Services
             {
                 if (a == null || string.IsNullOrEmpty(a.Datatype)) continue;
                 if (!string.Equals(a.Datatype, parts.Base, StringComparison.OrdinalIgnoreCase)) continue;
-                if (a.IsParameterized) return true;   // base matches, any length (incl. none)
-                if (!parts.HasLength) return true;    // bare type: base + no length
+                // A parameterized entry REQUIRES a length: 'varchar2' defined as parameterized
+                // means the model must carry 'varchar2(n)', never a bare 'varchar2' (user
+                // decision 2026-07-05). A non-parameterized entry requires NO length. Base is
+                // unique per config, so the non-matching branch just falls through to false.
+                if (a.IsParameterized) { if (parts.HasLength) return true; }
+                else if (!parts.HasLength) return true;
             }
             return false;
         }

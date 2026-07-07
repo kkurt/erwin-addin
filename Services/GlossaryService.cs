@@ -38,7 +38,7 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         // Mapping metadata (for logging/debugging)
         private string _matchSourceColumn;
-        private List<(string sourceCol, string targetType, string targetField)> _valueMappings;
+        private List<(string sourceCol, string targetType, string targetField, bool isLocked)> _valueMappings;
         private string _tableName;
 
         // Term-type metadata (Step 3 in Admin):
@@ -81,7 +81,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         private GlossaryService()
         {
             _glossaryCache = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
-            _valueMappings = new List<(string, string, string)>();
+            _valueMappings = new List<(string, string, string, bool)>();
             _termTypeMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             _termTypeByMatch = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         }
@@ -264,8 +264,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                         return false;
                     }
 
-                    // Step 2: Read DG_TABLE_MAPPING_COLUMN
-                    string colQuery = GetMappingColumnQuery(repoDbType);
+                    // Step 2: Read DG_TABLE_MAPPING_COLUMN. IS_LOCKED (glossary field
+                    // lock) is OPTIONAL: repos that predate the 2026-07 migration do not
+                    // have the column, so probe the catalog before selecting it -
+                    // otherwise the whole load fails with "Invalid column name 'IS_LOCKED'".
+                    bool hasIsLocked = HasIsLockedColumn(conn, repoDbType);
+                    string colQuery = GetMappingColumnQuery(repoDbType, hasIsLocked);
                     using (var cmd2 = DatabaseService.Instance.CreateCommand(colQuery, conn))
                     {
                         var param = cmd2.CreateParameter();
@@ -282,6 +286,18 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 string targetType = "";
                                 try { targetType = reader["TARGET_TYPE"]?.ToString()?.Trim() ?? ""; }
                                 catch { targetType = ""; } // Column may not exist in older schemas
+
+                                // IS_LOCKED (glossary field lock, admin migration 2026-07). A locked
+                                // field is glossary-owned: its value is applied AND the user cannot
+                                // keep an edit. Read only when the column exists (hasIsLocked probe
+                                // above); a pre-migration repo leaves isLocked=false -> today's
+                                // behaviour, and the SELECT never references the missing column.
+                                bool isLocked = false;
+                                if (hasIsLocked)
+                                {
+                                    try { isLocked = reader["IS_LOCKED"] != DBNull.Value && Convert.ToInt32(reader["IS_LOCKED"]) != 0; }
+                                    catch { isLocked = false; }
+                                }
 
                                 if (string.IsNullOrEmpty(sourceCol)) continue;
 
@@ -305,7 +321,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 }
                                 else if (!string.IsNullOrEmpty(targetField))
                                 {
-                                    _valueMappings.Add((sourceCol, targetType, targetField));
+                                    _valueMappings.Add((sourceCol, targetType, targetField, isLocked));
                                 }
                             }
                         }
@@ -336,7 +352,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                         }
                     }
 
-                    AddinLogger.LogDebug($"GlossaryService: Match column='{_matchSourceColumn}', {_valueMappings.Count} value mapping(s): [{string.Join(", ", _valueMappings.Select(m => $"{m.sourceCol}→{m.targetType}:{m.targetField}"))}]");
+                    AddinLogger.LogDebug($"GlossaryService: Match column='{_matchSourceColumn}', {_valueMappings.Count} value mapping(s): [{string.Join(", ", _valueMappings.Select(m => $"{m.sourceCol}→{m.targetType}:{m.targetField}{(m.isLocked ? " [LOCKED]" : "")}"))}]");
                     if (!string.IsNullOrEmpty(_termTypeColumn))
                     {
                         AddinLogger.LogDebug($"GlossaryService: TermType column='{_termTypeColumn}', {_termTypeMap.Count} concept mapping(s): [{string.Join(", ", _termTypeMap.Select(kv => $"{kv.Key}->{kv.Value}"))}]");
@@ -373,21 +389,30 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 string encUser = reader["USERNAME"]?.ToString()?.Trim() ?? "";
                                 string encPass = reader["PASSWORD"]?.ToString()?.Trim() ?? "";
 
-                                string username = PasswordEncryptionService.Decrypt(encUser);
-                                string password = PasswordEncryptionService.Decrypt(encPass);
+                                string username = EliteSoft.MetaAdmin.Services.PasswordEncryptionService.DecryptConnectionSecret(encUser);
+                                string password = EliteSoft.MetaAdmin.Services.PasswordEncryptionService.DecryptConnectionSecret(encPass);
 
-                                // If DPAPI decrypt failed (credentials encrypted by different user),
-                                // fall back to Bootstrap credentials (encrypted by install script for this user)
+                                // DPAPI is per Windows user (CurrentUser scope). If the CONNECTION_DEF
+                                // credentials were encrypted by a DIFFERENT account than the one erwin
+                                // runs under (classic prod symptom: seeded on another machine/login),
+                                // Decrypt yields empty or returns the ciphertext unchanged.
+                                //
+                                // We deliberately do NOT fall back to the Bootstrap (repo) credentials
+                                // here (removed 2026-07-06). That used to connect to the external
+                                // glossary DB as the WRONG user: connect succeeds but the glossary query
+                                // then fails with a misleading "table/view does not exist" (ORA-00942)
+                                // instead of the real cause. Surface the true error and stop so the
+                                // admin re-enters the credentials on the correct account (no silent
+                                // fallback).
                                 bool decryptFailed = string.IsNullOrEmpty(username) || (username.Length > 50 && username == encUser);
                                 if (decryptFailed)
                                 {
-                                    Log("GlossaryService: CONNECTION_DEF credentials not decryptable, using Bootstrap credentials");
-                                    var bootstrapConfig = DatabaseService.Instance.GetConfig();
-                                    if (bootstrapConfig != null)
-                                    {
-                                        username = bootstrapConfig.Username;
-                                        password = bootstrapConfig.Password;
-                                    }
+                                    _lastError = "Glossary CONNECTION_DEF credentials could not be decrypted for the current "
+                                               + "Windows user (DPAPI is per-user). Re-enter the glossary connection credentials "
+                                               + "in the admin tool while logged in as the account erwin runs under.";
+                                    _isLoaded = false;
+                                    Log($"GlossaryService: {_lastError}");
+                                    return false;
                                 }
 
                                 glossaryConnStr = BuildConnectionString(glossaryDbType, host, port, dbSchema, username, password);
@@ -470,7 +495,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                             if (string.IsNullOrEmpty(matchValue)) continue;
 
                             var udpValues = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                            foreach (var (sourceCol, targetType, targetField) in _valueMappings)
+                            foreach (var (sourceCol, targetType, targetField, isLocked) in _valueMappings)
                             {
                                 try
                                 {
@@ -542,6 +567,34 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             var mapping = _valueMappings.FirstOrDefault(m => m.targetField.Equals(targetField, StringComparison.OrdinalIgnoreCase));
             return mapping.targetType ?? "";
+        }
+
+        /// <summary>
+        /// Whether the mapped target field is admin-locked
+        /// (DG_TABLE_MAPPING_COLUMN.IS_LOCKED, MAPPING_CODE='GLOSSARY' only). A
+        /// locked field's value is glossary-owned: it is applied and the user
+        /// cannot keep an edit (enforced by reverting to the glossary value).
+        /// Unknown field or unlocked -> false (today's behaviour).
+        /// </summary>
+        public bool GetIsLocked(string targetField)
+        {
+            if (string.IsNullOrEmpty(targetField)) return false;
+            var mapping = _valueMappings.FirstOrDefault(m => m.targetField.Equals(targetField, StringComparison.OrdinalIgnoreCase));
+            return mapping.isLocked;
+        }
+
+        /// <summary>
+        /// The (targetField, targetType) pairs flagged IS_LOCKED=1, for the
+        /// runtime lock-enforcement pass. Empty when nothing is locked
+        /// (IS_LOCKED=0 everywhere) so enforcement is a no-op and behaviour
+        /// stays identical to before the feature.
+        /// </summary>
+        public IReadOnlyList<(string targetField, string targetType)> GetLockedMappings()
+        {
+            return _valueMappings
+                .Where(m => m.isLocked && !string.IsNullOrEmpty(m.targetField))
+                .Select(m => (m.targetField, m.targetType))
+                .ToList();
         }
 
         /// <summary>
@@ -621,20 +674,66 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
         }
 
-        private string GetMappingColumnQuery(string dbType)
+        // IS_LOCKED is appended only when the column exists (hasIsLocked). Older
+        // repos without the glossary field-lock migration select the original 3
+        // columns and behave exactly as before.
+        private string GetMappingColumnQuery(string dbType, bool hasIsLocked)
         {
             switch (dbType?.ToUpper())
             {
                 case "POSTGRESQL":
-                    return @"SELECT ""SOURCE_COLUMN"", ""TARGET_TYPE"", ""TARGET_FIELD"" FROM ""DG_TABLE_MAPPING_COLUMN""
+                    return $@"SELECT ""SOURCE_COLUMN"", ""TARGET_TYPE"", ""TARGET_FIELD""{(hasIsLocked ? @", ""IS_LOCKED""" : "")} FROM ""DG_TABLE_MAPPING_COLUMN""
                             WHERE ""TABLE_MAPPING_ID"" = @mappingId ORDER BY ""SORT_ORDER""";
                 case "ORACLE":
-                    return @"SELECT SOURCE_COLUMN, TARGET_TYPE, TARGET_FIELD FROM DG_TABLE_MAPPING_COLUMN
+                    return $@"SELECT SOURCE_COLUMN, TARGET_TYPE, TARGET_FIELD{(hasIsLocked ? ", IS_LOCKED" : "")} FROM DG_TABLE_MAPPING_COLUMN
                             WHERE TABLE_MAPPING_ID = :mappingId ORDER BY SORT_ORDER";
                 case "MSSQL":
                 default:
-                    return @"SELECT [SOURCE_COLUMN], [TARGET_TYPE], [TARGET_FIELD] FROM [dbo].[DG_TABLE_MAPPING_COLUMN]
+                    return $@"SELECT [SOURCE_COLUMN], [TARGET_TYPE], [TARGET_FIELD]{(hasIsLocked ? ", [IS_LOCKED]" : "")} FROM [dbo].[DG_TABLE_MAPPING_COLUMN]
                             WHERE [TABLE_MAPPING_ID] = @mappingId ORDER BY [SORT_ORDER]";
+            }
+        }
+
+        /// <summary>
+        /// Whether DG_TABLE_MAPPING_COLUMN carries the optional IS_LOCKED column.
+        /// The glossary field-lock migration (2026-07) adds it; repos that predate
+        /// it must still load (feature simply off), so we probe the catalog before
+        /// putting IS_LOCKED in the SELECT - otherwise the whole glossary load fails
+        /// with "Invalid column name 'IS_LOCKED'". A probe error -> treat as absent
+        /// (logged, not swallowed) so the glossary still loads.
+        /// </summary>
+        private bool HasIsLockedColumn(System.Data.Common.DbConnection conn, string dbType)
+        {
+            string probe;
+            switch (dbType?.ToUpper())
+            {
+                case "ORACLE":
+                    probe = "SELECT COUNT(*) FROM USER_TAB_COLUMNS WHERE TABLE_NAME = 'DG_TABLE_MAPPING_COLUMN' AND COLUMN_NAME = 'IS_LOCKED'";
+                    break;
+                case "POSTGRESQL":
+                    probe = "SELECT COUNT(*) FROM information_schema.columns WHERE lower(table_name) = 'dg_table_mapping_column' AND lower(column_name) = 'is_locked'";
+                    break;
+                case "MSSQL":
+                default:
+                    probe = "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = 'DG_TABLE_MAPPING_COLUMN' AND COLUMN_NAME = 'IS_LOCKED'";
+                    break;
+            }
+
+            try
+            {
+                using (var cmd = DatabaseService.Instance.CreateCommand(probe, conn))
+                {
+                    var v = cmd.ExecuteScalar();
+                    bool present = v != null && v != DBNull.Value && Convert.ToInt32(v) > 0;
+                    if (!present)
+                        Log("GlossaryService: DG_TABLE_MAPPING_COLUMN.IS_LOCKED absent - glossary field-lock disabled (pre-migration repo).");
+                    return present;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"GlossaryService: IS_LOCKED column probe failed ({ex.Message}) - treating as absent.");
+                return false;
             }
         }
 
