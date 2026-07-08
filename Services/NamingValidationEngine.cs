@@ -222,6 +222,22 @@ namespace EliteSoft.Erwin.AddIn.Services
             // untouched - the forward pass will not re-add them, so stripping would drop one.
             bool WillApply(NamingStandardRule r) => applicable[r] && !(autoOnly && !r.AutoApply);
 
+            // Affix matching is CASE-SENSITIVE (Ordinal). The affix 'Date' must match the TOKEN
+            // 'Date', not the letters 'date' inside an ordinary word. Under the old case-
+            // INsensitive matching, 'UpdateDate' with an applicable Suffix='Date' rule was
+            // corrupted to 'UpDate': strip 'Date' -> 'Update', but 'Update' still "ends with
+            // date" (ignore-case) so it was stripped AGAIN -> 'Up', and the re-apply appended
+            // 'Date' -> 'UpDate'. With Ordinal, 'Update' does not end with 'Date', so a name that
+            // already correctly ends in the affix round-trips and a plain word is never eaten.
+            // (The affix tokens in real rules - 'Vp', 'PF', 'DM_', 'Date', '_LOG' - are authored
+            // in a fixed case, so exact matching is also the truer test of "already applied".)
+            //
+            // Strip each rule's affix AT MOST ONCE as belt-and-suspenders: the while-loop only
+            // exists to let a rule strip AFTER another rule's strip exposed it (two stacked
+            // prefixes 'PFVpAbc' -> 'Abc'); a rule must never re-strip its OWN affix from what
+            // remains.
+            var stripped = new HashSet<NamingStandardRule>();
+
             bool changed = true;
             while (changed)
             {
@@ -241,22 +257,28 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // Leave applicable-but-deferred affixes in place (see above).
                     if (applicable[rule] && !WillApply(rule)) continue;
 
+                    // Already stripped this rule's affix once - do not re-strip its own affix
+                    // from a coincidental match in the remaining core text.
+                    if (stripped.Contains(rule)) continue;
+
                     if (rule.RuleType == NamingRuleKind.Prefix
                         && !string.IsNullOrEmpty(rule.Prefix)
-                        && result.StartsWith(rule.Prefix, StringComparison.OrdinalIgnoreCase))
+                        && result.StartsWith(rule.Prefix, StringComparison.Ordinal))
                     {
                         if (!applicable[rule])
                             AddinLogger.Log($"NamingApply: rule#{rule.Id} stale Prefix='{rule.Prefix}' stripped from '{result}'");
                         result = result.Substring(rule.Prefix.Length);
+                        stripped.Add(rule);
                         changed = true;
                     }
                     else if (rule.RuleType == NamingRuleKind.Suffix
                              && !string.IsNullOrEmpty(rule.Suffix)
-                             && result.EndsWith(rule.Suffix, StringComparison.OrdinalIgnoreCase))
+                             && result.EndsWith(rule.Suffix, StringComparison.Ordinal))
                     {
                         if (!applicable[rule])
                             AddinLogger.Log($"NamingApply: rule#{rule.Id} stale Suffix='{rule.Suffix}' stripped from '{result}'");
                         result = result.Substring(0, result.Length - rule.Suffix.Length);
+                        stripped.Add(rule);
                         changed = true;
                     }
                 }
@@ -271,13 +293,13 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                 if (rule.RuleType == NamingRuleKind.Prefix
                     && !string.IsNullOrEmpty(rule.Prefix)
-                    && !result.StartsWith(rule.Prefix, StringComparison.OrdinalIgnoreCase))
+                    && !result.StartsWith(rule.Prefix, StringComparison.Ordinal))
                 {
                     result = rule.Prefix + result;
                 }
                 else if (rule.RuleType == NamingRuleKind.Suffix
                          && !string.IsNullOrEmpty(rule.Suffix)
-                         && !result.EndsWith(rule.Suffix, StringComparison.OrdinalIgnoreCase))
+                         && !result.EndsWith(rule.Suffix, StringComparison.Ordinal))
                 {
                     result = result + rule.Suffix;
                 }

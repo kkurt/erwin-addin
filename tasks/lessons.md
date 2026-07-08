@@ -1942,3 +1942,18 @@ the 2026-06-23 "positive confirmation before destructive action" lesson.
 - **"Works in the editor" can be an accident of a close-edge rescue, not design.** The editor-close final pass masked the missing replay for months; Model Explorer exposed it because no close edge exists there. When a behavior only manifests at a session boundary, ask what SHOULD have fired earlier.
 - **Same-day fixes can supersede each other - reconcile, don't stack.** The morning's warning-only safety net + this replay would both fire on the same value; replaced rather than stacked.
 - Condition-UDP values are watched NOWHERE (only rule targets are). If an admin ever conditions COLUMN naming on a UDP set AFTER creation, that change is invisible to every pipeline (fast path diffs name+type only; heartbeat is count-based). WON'T-DO (user decided 2026-07-07 they have no UDP-conditioned column naming rules): the bounded candidate-set watch was NOT built. Only re-open if such a rule is added.
+
+## 2026-07-08: applicable Suffix rule corrupted "UpdateDate" -> "UpDate" (case-insensitive affix match ate the word's own letters)
+
+**Symptom (Kursat):** new column "UpdateDate", set datatype Date -> renamed to "UpDate". rule#1032 = Suffix='Date', which became applicable once datatype=Date (via the picker + the new post-Enforce replay).
+
+**Log:** `rule#1032 [Suffix] ... applicable=True` then `affixes 'UpdateDate' -> 'UpDate'`.
+
+**Root cause:** `ApplyNamingStandards`' strip/reapply used case-INsensitive (OrdinalIgnoreCase) affix matching, so the letters "date" INSIDE the word "Update" were treated as the rule's "Date" affix. The strip `while(changed)` loop stripped "Date" from "UpdateDate" -> "Update", then matched again ("Update" ends with "date" ignore-case) -> "Up", and the re-apply appended "Date" -> "UpDate". A first fix attempt (strip-each-rule-at-most-once) was INSUFFICIENT: it stopped the double-strip but the case-insensitive re-apply guard still saw "Update" as already ending in the affix, so "UpdateDate" -> "Update" (real "Date" lost). Unit tests caught this - the fix was wrong until the real cause (case-insensitivity) was addressed.
+
+**Fix:** make affix boundary matching CASE-SENSITIVE (Ordinal) in all four checks (strip prefix/suffix + reapply prefix/suffix). The affix "Date" now matches only the token "Date", never the "date" inside "Update". "UpdateDate" (already ends with exact "Date") round-trips unchanged; "Update" (ends with lowercase "date") gets "Date" appended. Real affix tokens (Vp, PF, DM_, Date, _LOG) are authored in fixed case, so exact matching is also the truer "already applied" test. Kept strip-once as belt-and-suspenders. Tests: AffixStaleStripTests + "does_not_double_strip" (UpdateDate, isNew true/false) + "appended_when_missing" (Update -> UpdateDate).
+
+**Lessons:**
+- **A first fix that a unit test rejects is a gift - it means the root cause is elsewhere.** strip-once was a plausible fix for the double-strip symptom but the test proved the real cause was case-insensitivity. Write the test to the DESIRED OUTPUT ("UpdateDate" -> "UpdateDate"), not to the mechanism you're changing, so a wrong fix fails loudly.
+- **Case-insensitive substring/affix matching silently eats real words.** "date" is inside "Update", "log" inside "catalog", "id" inside "video". An affix token should match exact-case; the letters happening to appear inside an ordinary word are not the affix. Prefer Ordinal for affix add/strip.
+- **Trace the whole strip->reapply round-trip, not just the strip.** The bug needed BOTH the greedy strip AND the case-insensitive reapply guard to produce "UpDate"; fixing only one leaves it broken ("Update").
