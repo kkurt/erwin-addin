@@ -1,4 +1,7 @@
-# Build artifacts (the final DLL is checked in for now; regenerate via build.ps1)
+# Build artifacts - all outputs are regenerated via build.ps1 and are NOT tracked
+# (the DLL was removed from source control 2026-07-08; rebuild with build.ps1,
+# or package.ps1 rebuilds it during packaging).
+*.dll
 *.obj
 *.exp
 *.lib
