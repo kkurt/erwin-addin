@@ -36,6 +36,20 @@ namespace EliteSoft.Erwin.AddIn.Services
         private bool _isLoaded;
         private string _lastError;
 
+        // Credential-failure latch (2026-07-07). When the glossary's CONNECTION_DEF
+        // credentials cannot be decrypted (DPAPI is per-Windows-user, or the ciphertext
+        // is corrupt/legacy base64), LoadGlossary is called from EVERY validation gesture
+        // via the uniform "if (!IsLoaded) LoadGlossary()" pattern - each retry re-opens the
+        // repo DB and re-hits the same failure, spamming the log. Once we KNOW the creds are
+        // undecryptable for a config we latch it (keyed on ActiveConfigId) and short-circuit
+        // subsequent loads: no DB hit, no retry. The latch auto-clears when the config
+        // changes (different ActiveConfigId) or via ResetCredentialFailureLatch (explicit
+        // reload / DB switch). _pendingCredentialWarning carries the one-time user warning,
+        // drained on the STA by TryConsumeCredentialWarning.
+        private int? _credentialFailureConfigId;
+        private string _credentialFailureMessage;
+        private string _pendingCredentialWarning;
+
         // Mapping metadata (for logging/debugging)
         private string _matchSourceColumn;
         private List<(string sourceCol, string targetType, string targetField, bool isLocked)> _valueMappings;
@@ -90,6 +104,57 @@ namespace EliteSoft.Erwin.AddIn.Services
         public int Count => _glossaryCache.Count;
         public string LastError => _lastError;
 
+        /// <summary>True while the credential-failure latch is set (glossary credentials
+        /// undecryptable for the active config); LoadGlossary short-circuits until it clears.</summary>
+        public bool HasCredentialFailure => _credentialFailureConfigId.HasValue;
+
+        /// <summary>
+        /// Drain the one-time credential-failure warning: returns <c>true</c> and the message
+        /// exactly once after a decrypt failure is latched, then clears it. Call from a UI/STA
+        /// context (e.g. the validation path) so the user is told ONCE why the glossary will not
+        /// load, without a modal on every column.
+        /// </summary>
+        public bool TryConsumeCredentialWarning(out string message)
+        {
+            message = _pendingCredentialWarning;
+            if (string.IsNullOrEmpty(message)) return false;
+            _pendingCredentialWarning = null;
+            return true;
+        }
+
+        /// <summary>
+        /// Clear the credential-failure latch so the next load attempts a fresh read (the admin
+        /// may have re-entered the credentials). Used by the explicit DB-switch / config-reload
+        /// path. Does not itself load - the next "if (!IsLoaded) LoadGlossary()" caller does.
+        /// </summary>
+        public void ResetCredentialFailureLatch()
+        {
+            _credentialFailureConfigId = null;
+            _credentialFailureMessage = null;
+            _pendingCredentialWarning = null;
+        }
+
+        /// <summary>
+        /// Record an undecryptable-credentials failure for <paramref name="configId"/>: set the
+        /// user message on <see cref="LastError"/>, latch the config so LoadGlossary stops retrying,
+        /// and queue the one-time user warning (drained by <see cref="TryConsumeCredentialWarning"/>).
+        /// Always returns <c>false</c> (LoadGlossary's "not loaded" result).
+        /// </summary>
+        private bool LatchCredentialFailure(int configId)
+        {
+            _credentialFailureMessage =
+                "Glossary connection credentials could not be decrypted for the current Windows user. "
+                + "DPAPI encryption is per Windows account, so credentials seeded on a different machine "
+                + "or login cannot be read here. Re-enter the glossary connection credentials in the admin "
+                + "tool while logged in as the account erwin runs under.";
+            _lastError = _credentialFailureMessage;
+            _pendingCredentialWarning = _credentialFailureMessage;
+            _credentialFailureConfigId = configId;
+            _isLoaded = false;
+            Log($"GlossaryService: {_lastError} (latched for config {configId}; further loads skipped until config/DB change or reload)");
+            return false;
+        }
+
         /// <summary>USE_EXTERNAL_GLOSSARY effective gate (set at LoadGlossary). When false the glossary is not loaded.</summary>
         public bool IsExternalGlossaryEnabled => _useExternalGlossary;
         /// <summary>GLOSSARY_REQUIRED_OPTION effective mode for unmatched elements (default OPTIONAL_SILENT).</summary>
@@ -136,6 +201,25 @@ namespace EliteSoft.Erwin.AddIn.Services
                 _requiredOption = ConfigContextService.Instance.GetEffectiveEnum(
                     "GLOSSARY_REQUIRED_OPTION", GlossaryRequiredOption.OPTIONAL_SILENT);
                 Log($"GlossaryService: USE_EXTERNAL_GLOSSARY=true, GLOSSARY_REQUIRED_OPTION={_requiredOption}");
+
+                // Credential-failure latch: if a prior load already found this config's glossary
+                // credentials undecryptable, do NOT re-open the repo DB and re-hit the same failure
+                // on every validation gesture. Skip cheaply (no DB, no log spam), keeping the
+                // original message in LastError. Auto re-arm when the config changed since.
+                int currentCfgId = ConfigContextService.Instance.IsInitialized
+                    ? ConfigContextService.Instance.ActiveConfigId
+                    : -1;
+                if (_credentialFailureConfigId.HasValue)
+                {
+                    if (_credentialFailureConfigId.Value == currentCfgId)
+                    {
+                        _isLoaded = false;
+                        _lastError = _credentialFailureMessage;
+                        return false;
+                    }
+                    // Config changed since the failure - re-arm and attempt a fresh load.
+                    _credentialFailureConfigId = null;
+                }
 
                 string repoDbType = DatabaseService.Instance.GetDbType();
 
@@ -389,8 +473,24 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 string encUser = reader["USERNAME"]?.ToString()?.Trim() ?? "";
                                 string encPass = reader["PASSWORD"]?.ToString()?.Trim() ?? "";
 
-                                string username = EliteSoft.MetaAdmin.Services.PasswordEncryptionService.DecryptConnectionSecret(encUser);
-                                string password = EliteSoft.MetaAdmin.Services.PasswordEncryptionService.DecryptConnectionSecret(encPass);
+                                string username;
+                                string password;
+                                try
+                                {
+                                    username = EliteSoft.MetaAdmin.Services.PasswordEncryptionService.DecryptConnectionSecret(encUser);
+                                    password = EliteSoft.MetaAdmin.Services.PasswordEncryptionService.DecryptConnectionSecret(encPass);
+                                }
+                                catch (Exception decEx)
+                                {
+                                    // The stored ciphertext is not even decodable (corrupt / legacy /
+                                    // non-base64 value) - DecryptConnectionSecret throws (the classic
+                                    // "input is not a valid Base-64 string"). Same user-visible cause as
+                                    // the DPAPI-different-user case below, so handle it identically:
+                                    // latch the config, warn once, stop retrying. (Previously this
+                                    // exception bubbled to the outer catch and re-fired on every gesture.)
+                                    Log($"GlossaryService: glossary credential decrypt failed: {decEx.Message}");
+                                    return LatchCredentialFailure(currentCfgId);
+                                }
 
                                 // DPAPI is per Windows user (CurrentUser scope). If the CONNECTION_DEF
                                 // credentials were encrypted by a DIFFERENT account than the one erwin
@@ -407,12 +507,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 bool decryptFailed = string.IsNullOrEmpty(username) || (username.Length > 50 && username == encUser);
                                 if (decryptFailed)
                                 {
-                                    _lastError = "Glossary CONNECTION_DEF credentials could not be decrypted for the current "
-                                               + "Windows user (DPAPI is per-user). Re-enter the glossary connection credentials "
-                                               + "in the admin tool while logged in as the account erwin runs under.";
-                                    _isLoaded = false;
-                                    Log($"GlossaryService: {_lastError}");
-                                    return false;
+                                    return LatchCredentialFailure(currentCfgId);
                                 }
 
                                 glossaryConnStr = BuildConnectionString(glossaryDbType, host, port, dbSchema, username, password);

@@ -3260,6 +3260,11 @@ namespace EliteSoft.Erwin.AddIn
                     Log($"{logPrefix}: bootstrap cache cleared - registry will be re-read.");
                 }
 
+                // Explicit reload / DB switch: clear the glossary credential-failure latch so a
+                // load that gave up earlier (undecryptable creds) is retried once now - the admin
+                // may have re-entered the credentials. Passive gestures still respect the latch.
+                Services.GlossaryService.Instance.ResetCredentialFailureLatch();
+
                 // Force the full pipeline (not the fast model-switch path).
                 _globalDataLoaded = false;
                 using (AddinLogger.BeginScope($"InitializeValidationService({logPrefix})"))

@@ -21,6 +21,14 @@ namespace EliteSoft.Erwin.AddIn.Services
         private readonly IBootstrapService _bootstrapService;
         private BootstrapConfig _cachedConfig;
 
+        // True while an in-memory override is in force (the DEV startup DB picker points the
+        // add-in at a chosen MetaRepo* DB instead of the registry one). Tracked HERE - not just
+        // on the reader - so callers can decide NOT to ClearCache when an override is active: a
+        // blind ClearCache (e.g. the fresh-invocation registry re-read in ErwinAddIn.Execute)
+        // would otherwise WIPE the override and silently snap back to the registry DB. Cleared
+        // by ClearCache, set by OverrideConfig. See reference_dev_flag_and_db_picker.
+        private bool _isOverridden;
+
         /// <summary>
         /// Singleton instance
         /// </summary>
@@ -158,13 +166,33 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// Clears the cached configuration (forces reload)
+        /// Clears the cached configuration (forces reload from the registry). Also drops any
+        /// in-memory override, so callers that must PRESERVE an override (dev DB picker) should
+        /// check <see cref="IsOverridden"/> and skip this when it is set.
         /// </summary>
         public void ClearCache()
         {
             _cachedConfig = null;
             _bootstrapService.ClearCache();
+            _isOverridden = false;
         }
+
+        /// <summary>
+        /// Point the add-in at a caller-supplied bootstrap config in memory, WITHOUT touching
+        /// the registry, and mark the override as active so a later blind <see cref="ClearCache"/>
+        /// (the fresh-invocation registry re-read) knows to leave it alone. Used by the DEV
+        /// startup DB picker. Caches on both this service and the reader so the very next
+        /// GetConfig returns the override.
+        /// </summary>
+        public void OverrideConfig(BootstrapConfig config)
+        {
+            _cachedConfig = config;
+            _bootstrapService.OverrideConfig(config);
+            _isOverridden = true;
+        }
+
+        /// <summary>True while an in-memory bootstrap override is in force (dev DB picker).</summary>
+        public bool IsOverridden => _isOverridden;
 
         /// <summary>
         /// Gets the bootstrap service for direct access if needed

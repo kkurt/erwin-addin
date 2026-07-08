@@ -69,6 +69,14 @@ namespace EliteSoft.Erwin.AddIn.Forms
         private readonly Label _lblParam;
         private readonly Label _lblError;
 
+        // Optional rule validator (2026-07-07): the composed datatype token is passed
+        // here on Accept; a non-empty return is a violation message that keeps the
+        // dialog open. Lets the caller enforce the admin naming/regex rules (e.g. a
+        // "length must be <= 4000" Column.Physical_Data_Type rule) BEFORE the pick is
+        // committed - closing the gap where a picked value bypassed rule validation.
+        // Contract: returns null/empty when the value is acceptable; never throws.
+        private readonly Func<string, string?>? _validate;
+
         /// <summary>Composed datatype (<c>base</c> or <c>base(param)</c>) the user
         /// confirmed with OK. Empty when cancelled.</summary>
         public string SelectedDatatype { get; private set; } = "";
@@ -105,9 +113,10 @@ namespace EliteSoft.Erwin.AddIn.Forms
 
         private AllowedDatatypePickerForm(
             string title, string message, IReadOnlyList<AllowedDatatypeEntry> entries,
-            string preselectBase, string prefillParam)
+            string preselectBase, string prefillParam, Func<string, string?>? validate)
         {
             _entries = entries.Where(e => e != null && !string.IsNullOrEmpty(e.Datatype)).ToList();
+            _validate = validate;
 
             Text = title;
             FormBorderStyle = FormBorderStyle.None;
@@ -295,23 +304,37 @@ namespace EliteSoft.Erwin.AddIn.Forms
             paramFrame.Controls.Add(_txtParam);
             yCursor += FieldHeight + 8;
 
+            // AutoSize=false + fixed width so a long rule message (e.g. an admin
+            // "NVARCHAR length must be <= 4000" message surfaced by the validator)
+            // WRAPS inside the dialog instead of overrunning its width. Height is
+            // measured for the default one-line text; ShowInlineError grows the form
+            // when a taller message must be shown so the footer never overlaps it.
             _lblError = new Label
             {
                 Text = "Enter digits, optionally as precision,scale (e.g. 18 or 10,2).",
                 Font = new Font("Segoe UI", 8.75F),
                 ForeColor = ClrError,
-                AutoSize = true,
+                AutoSize = false,
+                Width = contentWidth,
                 Location = new Point(BodyHorizontalPadding, yCursor),
                 Visible = false,
                 UseMnemonic = false,
             };
-            yCursor += _lblError.PreferredHeight + 10;
+            using (var g = CreateGraphics())
+            {
+                _lblError.Height = TextRenderer.MeasureText(g, _lblError.Text, _lblError.Font,
+                    new Size(contentWidth, int.MaxValue), TextFormatFlags.WordBreak).Height + 2;
+            }
+            yCursor += _lblError.Height + 10;
 
             void SyncParamEnabled()
             {
                 var entry = SelectedEntry();
                 bool on = entry != null && entry.IsParameterized;
                 _txtParam.Enabled = on;
+                // Clear any stale violation message when the chosen type changes so a rule
+                // error from the previous selection does not linger over the new one.
+                _lblError.Visible = false;
                 // A parameterized base MUST carry a length, so the label says "required" while the
                 // field is active; a non-parameterized base disables the field entirely.
                 _lblParam.Text = on
@@ -427,28 +450,97 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 ? _entries[_cmbType.SelectedIndex]
                 : null;
 
+        /// <summary>
+        /// Pure accept/reject decision for <see cref="AcceptIfValid"/>: given the selected
+        /// entry, the raw parameter text, and an optional rule validator, return the inline
+        /// error message to show, or <c>null</c> when the composition is acceptable and the
+        /// dialog may close. Enforces, in order: (1) a parameterized base REQUIRES a length,
+        /// (2) the length must be <c>n</c> / <c>n,m</c>, (3) the admin naming/regex rules for
+        /// the COMPOSED datatype (via <paramref name="ruleValidate"/>) - e.g. a "length &lt;=
+        /// 4000" rule. Public + pure (no UI) so the branching is unit-tested; the validator is
+        /// assumed not to throw (its contract), and <see cref="AcceptIfValid"/> guards that.
+        /// </summary>
+        public static string? ValidateComposition(
+            AllowedDatatypeEntry entry, string paramText, Func<string, string?>? ruleValidate)
+        {
+            if (entry == null) return null; // no selectable type -> caller cancels, not an error
+
+            string param = entry.IsParameterized ? (paramText ?? "").Trim() : "";
+            if (entry.IsParameterized && (string.IsNullOrWhiteSpace(param) || !IsValidParameter(param)))
+            {
+                // A parameterized base REQUIRES a length: submitting a bare 'varchar2' would just
+                // be rejected by the whitelist, so block it and keep the user in the dialog.
+                return string.IsNullOrWhiteSpace(param)
+                    ? "This type needs a length or precision,scale (e.g. 18 or 10,2)."
+                    : "Enter digits, optionally as precision,scale (e.g. 18 or 10,2).";
+            }
+
+            // Rule gate (2026-07-07): run the admin naming/regex rules for Physical_Data_Type
+            // against the composed value BEFORE committing. A violation (e.g. length > 4000)
+            // keeps the user in the dialog with the admin's own message, so a rule-breaking
+            // datatype can never leave this picker - the exact gap that let nvarchar(4200)
+            // through in the Model Explorer path.
+            if (ruleValidate != null)
+            {
+                string? ruleError = ruleValidate(Compose(entry.Datatype, param));
+                if (!string.IsNullOrEmpty(ruleError)) return ruleError;
+            }
+
+            return null;
+        }
+
         private void AcceptIfValid()
         {
             var entry = SelectedEntry();
             if (entry == null) { DialogResult = DialogResult.Cancel; Close(); return; }
 
-            string param = entry.IsParameterized ? _txtParam.Text.Trim() : "";
-            if (entry.IsParameterized && (string.IsNullOrWhiteSpace(param) || !IsValidParameter(param)))
+            string? error;
+            try
             {
-                // A parameterized base REQUIRES a length: submitting a bare 'varchar2' would just
-                // be rejected by the whitelist, so block it here and keep the user in the dialog.
-                _lblError.Text = string.IsNullOrWhiteSpace(param)
-                    ? "This type needs a length or precision,scale (e.g. 18 or 10,2)."
-                    : "Enter digits, optionally as precision,scale (e.g. 18 or 10,2).";
-                _lblError.Visible = true;
-                _txtParam.Focus();
-                _txtParam.SelectAll();
+                error = ValidateComposition(entry, _txtParam.Text, _validate);
+            }
+            catch (Exception ex)
+            {
+                // The validator owns its own error handling and must not throw; if it somehow
+                // does, fail OPEN (accept the pick) rather than trap the user, but log so the
+                // swallow is never silent.
+                AddinLogger.Log($"AllowedDatatypePicker: composition/rule validation threw: {ex.Message}");
+                error = null;
+            }
+
+            if (!string.IsNullOrEmpty(error))
+            {
+                ShowInlineError(error);
+                if (entry.IsParameterized) { _txtParam.Focus(); _txtParam.SelectAll(); }
                 return;
             }
 
+            string param = entry.IsParameterized ? _txtParam.Text.Trim() : "";
             SelectedDatatype = Compose(entry.Datatype, param);
             DialogResult = DialogResult.OK;
             Close();
+        }
+
+        /// <summary>Show an inline error under the parameter field, wrapping and growing
+        /// the dialog when the message needs more than the reserved single line (long
+        /// admin rule messages) so it never overlaps the footer.</summary>
+        private void ShowInlineError(string message)
+        {
+            _lblError.Text = message ?? "";
+            int contentWidth = DialogWidth - BodyHorizontalPadding * 2;
+            int needed;
+            using (var g = CreateGraphics())
+            {
+                needed = TextRenderer.MeasureText(g, _lblError.Text, _lblError.Font,
+                    new Size(contentWidth, int.MaxValue), TextFormatFlags.WordBreak).Height + 2;
+            }
+            int delta = needed - _lblError.Height;
+            if (delta > 0)
+            {
+                _lblError.Height = needed;
+                Height += delta; // grow the form so the footer stays clear of the taller message
+            }
+            _lblError.Visible = true;
         }
 
         /// <summary>
@@ -466,9 +558,10 @@ namespace EliteSoft.Erwin.AddIn.Forms
             string preselectBase,
             string prefillParam,
             out string selectedDatatype,
-            IWin32Window? owner = null)
+            IWin32Window? owner = null,
+            Func<string, string?>? validate = null)
         {
-            using var dlg = new AllowedDatatypePickerForm(title, message, entries, preselectBase, prefillParam);
+            using var dlg = new AllowedDatatypePickerForm(title, message, entries, preselectBase, prefillParam, validate);
             dlg.PositionOnActiveScreen(owner);
             var rc = dlg.ShowDialog(owner);
             selectedDatatype = rc == DialogResult.OK ? dlg.SelectedDatatype : "";

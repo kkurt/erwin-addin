@@ -3862,7 +3862,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                                         // creation. prev=null -> forces an allowed type when the default is
                                         // disallowed. (New-column path only - existing columns are never
                                         // retroactively re-typed; see feedback_rules_new_objects_only.)
-                                        EnforceAllowedDatatypeWhitelist(attr, null, snapshot);
+                                        EnforceAllowedDatatypeWhitelist(attr, null, snapshot, isNew: true);
                                         _attributeSnapshots[aid] = snapshot;
                                     }
                                     else
@@ -5062,7 +5062,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                             // through. Enforce it now (dedup makes this a no-op if the inline-edit
                             // close path already handled the same column). New-column only.
                             if (IsPlaceholderColumnName(previousState.PhysicalName) && !IsPlaceholderColumnName(currentState.PhysicalName))
-                                EnforceAllowedDatatypeWhitelist(attr, null, currentState);
+                                EnforceAllowedDatatypeWhitelist(attr, null, currentState, isNew: true);
 
                             _attributeSnapshots[objectId] = currentState;
 
@@ -6569,7 +6569,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // disallowed erwin default (e.g. char(18)) is caught at creation, not only on a
                 // later type edit. EnforceAllowedDatatypeWhitelist self-skips the '<default>'
                 // placeholder, so the check effectively waits for the real name.
-                EnforceAllowedDatatypeWhitelist(attr, null, currentState);
+                EnforceAllowedDatatypeWhitelist(attr, null, currentState, isNew: true);
             }
             finally
             {
@@ -6667,8 +6667,11 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // active config). Runs AFTER the term-type policy so a glossary-authoritative
                     // type is settled first, and BEFORE the naming re-run below so the engine sees
                     // the final (possibly reverted) value. No-op when the config has no
-                    // configured datatype list.
-                    EnforceAllowedDatatypeWhitelist(attr, previousState, currentState);
+                    // configured datatype list. isNew:false - this branch is a type change on an
+                    // EXISTING column (rename path handled separately); ValidateColumnNamingStandard
+                    // just below re-checks the picked value too, so the picker gate + that re-run
+                    // both cover this site.
+                    EnforceAllowedDatatypeWhitelist(attr, previousState, currentState, isNew: false);
 
                     // C3 polymorphic-condition replay (2026-05-17): a naming rule can
                     // condition on the live Physical_Data_Type value (e.g. "DateTime
@@ -6859,7 +6862,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             return (p > 0 ? src.Substring(0, p) : src).Trim();
         }
 
-        private void EnforceAllowedDatatypeWhitelist(dynamic attr, AttributeValidationSnapshot prev, AttributeValidationSnapshot curr)
+        private void EnforceAllowedDatatypeWhitelist(dynamic attr, AttributeValidationSnapshot prev, AttributeValidationSnapshot curr, bool isNew = false)
         {
             // No whitelist configured for this config -> nothing to enforce.
             if (!AllowedDatatypeService.Instance.HasRestriction) return;
@@ -6983,13 +6986,25 @@ namespace EliteSoft.Erwin.AddIn.Services
                           $"Choose an allowed datatype, and ask your administrator to check the Datatype Library entry for this DBMS.";
 
                     string pickPreselect = AllowedDatatypePickerFormPreselect(liveAfterWrite, target);
+
+                    // treatAsNew mirrors ValidateColumnNamingStandardCore (isNew || pending-new) so
+                    // the picker's inline rule validator - and the post-enforcement re-check below -
+                    // evaluate exactly the Create/Update/Both rules the editor-close naming pass would.
+                    bool treatAsNew = isNew || (!string.IsNullOrEmpty(objId) && IsAttributePendingNew(objId));
+
+                    // validate: run the admin Physical_Data_Type rules against the COMPOSED pick
+                    // before the picker commits it. A violation (e.g. length > 4000) keeps the user
+                    // in the dialog with the admin's own message, so a rule-breaking datatype can
+                    // never leave the picker - this is what closes the Model Explorer gap where the
+                    // picked value was never regex-validated (no editor-close pass to catch it).
                     var pickRc = Forms.AllowedDatatypePickerForm.Show(
                         "Datatype not allowed",
                         pickMessage,
                         AllowedDatatypeService.Instance.Allowed,
                         pickPreselect,
                         Forms.AllowedDatatypePickerForm.ExtractParameter(attempted),
-                        out string userPick);
+                        out string userPick,
+                        validate: candidate => ValidateDatatypeCandidate(attr, candidate, treatAsNew));
 
                     if (pickRc == DialogResult.OK
                         && !string.IsNullOrEmpty(userPick)
@@ -7039,6 +7054,32 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // the user dwelled on the dialog longer than TermTypeDedupSeconds.
                     if (!string.IsNullOrEmpty(objId))
                         _allowedDatatypeRecentAttempts[objId] = (attempted, DateTime.UtcNow);
+
+                    // Post-enforcement naming replay (2026-07-07): the type-change branch of
+                    // ProcessAttributeChanges already re-runs the column naming validator right
+                    // after enforcement (the C3 polymorphic replay) so rules CONDITIONED on the
+                    // datatype - e.g. "Date-typed columns get suffix 'Date'" (rule#1032) - react
+                    // to the FINAL type. The three new-column call sites had NOTHING after
+                    // Enforce, so a type settled here (picker pick, or the forced fallback the
+                    // user kept via Cancel) never re-evaluated those rules: in the Column Editor
+                    // the suffix only appeared on the editor-CLOSE pass (late), and via Model
+                    // Explorer never (no close edge exists). Re-run the full column pass against
+                    // the final type NOW - the suffix/prefix applies while the editor is still
+                    // open, and the Model Explorer path no longer needs a close edge. Step 3b of
+                    // the pass also re-checks Physical_Data_Type rules, so this subsumes a
+                    // datatype-only warning (an earlier warning-only safety net was replaced by
+                    // this replay to avoid double dialogs). Gated on isNew: the type-change site
+                    // (isNew:false) already replays itself right after Enforce returns. No naming
+                    // frame is active on the new-column sites (their ValidateColumnNamingStandard
+                    // ran and returned BEFORE Enforce), so the reentrancy guard will not no-op us.
+                    if (isNew)
+                    {
+                        bool discardedAfterType = ValidateColumnNamingStandard(attr, curr, isNew: true);
+                        if (!discardedAfterType && _pendingResults.Count > 0)
+                        {
+                            ShowConsolidatedPopup();
+                        }
+                    }
                 }
             }
             catch (Exception ex)
@@ -7046,6 +7087,34 @@ namespace EliteSoft.Erwin.AddIn.Services
                 try { _session.RollbackTransaction(trans); }
                 catch (Exception rbEx) { Log($"EnforceAllowedDatatypeWhitelist rollback error: {rbEx.Message}"); }
                 Log($"EnforceAllowedDatatypeWhitelist write failed for {curr?.PhysicalName}: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// UI-less evaluation of the admin naming/regex rules for a column's
+        /// <c>Physical_Data_Type</c> against a CANDIDATE value that is NOT (yet) written to
+        /// the model. Returns the first violation's message, or <c>null</c> when the candidate
+        /// passes (or no rules are loaded). Pure/read-only:
+        /// <see cref="NamingValidationEngine.ValidateObjectName"/> only reads rules + the column's
+        /// UDPs, so this is safe to call as the datatype picker's inline validator with no
+        /// transaction. Never throws - fails OPEN (returns null) and logs, so an internal
+        /// validation error can never trap the user inside the picker.
+        /// </summary>
+        private string ValidateDatatypeCandidate(dynamic attr, string candidate, bool treatAsNew)
+        {
+            if (!NamingStandardService.Instance.IsLoaded) return null;
+            try
+            {
+                object attrBoxed = attr;
+                var results = NamingValidationEngine.ValidateObjectName(
+                    "Column", candidate ?? string.Empty, attrBoxed, "Physical_Data_Type", isNew: treatAsNew);
+                var failure = results.FirstOrDefault(r => r != null && !r.IsValid);
+                return failure?.ErrorMessage;
+            }
+            catch (Exception ex)
+            {
+                Log($"ValidateDatatypeCandidate error for '{candidate}': {ex.Message}");
+                return null;
             }
         }
 
@@ -7106,6 +7175,21 @@ namespace EliteSoft.Erwin.AddIn.Services
             if (!glossary.IsLoaded)
             {
                 glossary.LoadGlossary();
+            }
+
+            // If the glossary could not load because its stored connection credentials are
+            // undecryptable (DPAPI is per-Windows-user, or the ciphertext is corrupt/legacy),
+            // warn the user ONCE. GlossaryService latches the failure so the LoadGlossary above
+            // stops hammering the DB on every column; here - on the erwin STA thread, a safe
+            // place for a modal - we surface the reason a single time (TryConsumeCredentialWarning
+            // clears the pending message) instead of silently skipping validation forever.
+            if (glossary.TryConsumeCredentialWarning(out string glossaryCredWarning))
+            {
+                AddinMessageDialog.Show(
+                    glossaryCredWarning,
+                    "Glossary not loaded",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
             }
 
             if (!glossary.IsLoaded)

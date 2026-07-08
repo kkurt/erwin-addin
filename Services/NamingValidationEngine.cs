@@ -228,6 +228,16 @@ namespace EliteSoft.Erwin.AddIn.Services
                 changed = false;
                 foreach (var rule in rules)
                 {
+                    // A brand-new object has no naming history: no rule has ever applied to
+                    // it, so a name that merely ends/starts with a NON-applicable rule's affix
+                    // is user-typed text, not a stale rule decoration - never strip it. This was
+                    // the 'AbcDate' -> 'Abc' false positive: a conditional Suffix='Date' rule
+                    // that does not apply to this column stripped the user's meaningful 'Date'.
+                    // The legitimate stale-strip (a conditioning UDP flipped, leaving an obsolete
+                    // affix) only makes sense on an EXISTING object, where isNew is false, so it
+                    // is preserved. Applicable rules still strip-then-reapply for idempotency.
+                    if (!applicable[rule] && isNew) continue;
+
                     // Leave applicable-but-deferred affixes in place (see above).
                     if (applicable[rule] && !WillApply(rule)) continue;
 

@@ -349,10 +349,24 @@ namespace EliteSoft.Erwin.AddIn
                 // only Reload Config button (user-reported 2026-05-30). The
                 // ClearCache is cheap (~ms registry stat) and only runs on
                 // fresh form creation, not on bring-to-front re-clicks.
+                // BUT: when a DEV override is active (the startup DB picker above already ran
+                // ClearCache + OverrideConfig to point the add-in at the chosen MetaRepo* DB),
+                // a blind ClearCache here would WIPE that override and snap back to the registry
+                // DB - so config resolution would read the WRONG database (root cause of the
+                // "config DBMS 2019/2022 vs model 2016/2017" false mismatch: config #1012 in the
+                // registry DB differs from the picked DB). Skip the clear while overridden; the
+                // picker already established a fresh, authoritative bootstrap this invocation.
                 try
                 {
-                    Services.DatabaseService.Instance.ClearCache();
-                    Services.AddinLogger.Log("Execute: bootstrap cache cleared - registry will be re-read on form init.");
+                    if (Services.DatabaseService.Instance.IsOverridden)
+                    {
+                        Services.AddinLogger.Log("Execute: bootstrap override active (dev DB picker) - keeping the selected DB, skipping cache clear.");
+                    }
+                    else
+                    {
+                        Services.DatabaseService.Instance.ClearCache();
+                        Services.AddinLogger.Log("Execute: bootstrap cache cleared - registry will be re-read on form init.");
+                    }
                 }
                 catch (Exception ex)
                 {

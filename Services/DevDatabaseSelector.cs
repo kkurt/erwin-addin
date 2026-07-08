@@ -128,8 +128,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                 Username = reg.Username,
                 Password = reg.Password,
             };
+            // ClearCache() first (drops both caches AND any prior override flag), then
+            // OverrideConfig installs the picked config and RE-arms the override flag, so a
+            // later blind ClearCache (ErwinAddIn.Execute's fresh-invocation registry re-read)
+            // skips itself and the picked DB survives to config init. Route through
+            // DatabaseService.OverrideConfig (not the raw reader) so IsOverridden is set.
             DatabaseService.Instance.ClearCache();
-            DatabaseService.Instance.BootstrapService.OverrideConfig(overrideCfg);
+            DatabaseService.Instance.OverrideConfig(overrideCfg);
             log?.Invoke($"DevDatabaseSelector: DEV override -> {reg.Host}/{picked} (registry DB '{reg.Database}' ignored for this session; registry NOT modified).");
             return true;
         }

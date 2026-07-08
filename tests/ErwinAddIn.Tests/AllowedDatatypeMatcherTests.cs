@@ -230,4 +230,95 @@ public class AllowedDatatypePickerLogicTests
     {
         Forms.AllowedDatatypePickerForm.ExtractParameter(datatype).Should().Be(expected);
     }
+
+    // ---------- ValidateComposition: the picker's accept/reject decision ----------
+    // 2026-07-07: the picker now runs the admin naming/regex rules against the COMPOSED
+    // datatype before committing, so a rule-violating value (e.g. nvarchar(4200) when a
+    // length <= 4000 rule exists) can never leave the dialog - the gap that let the Model
+    // Explorer path bypass rule validation entirely.
+
+    private static AllowedDatatypeEntry Entry(string name, bool param = false) =>
+        new() { Datatype = name, IsParameterized = param };
+
+    [Fact]
+    public void ValidateComposition_accepts_non_parameterized_without_validator()
+    {
+        Forms.AllowedDatatypePickerForm
+            .ValidateComposition(Entry("int"), "", null)
+            .Should().BeNull();
+    }
+
+    [Fact]
+    public void ValidateComposition_requires_length_for_parameterized()
+    {
+        Forms.AllowedDatatypePickerForm
+            .ValidateComposition(Entry("varchar2", param: true), "", null)
+            .Should().NotBeNullOrEmpty();
+    }
+
+    [Fact]
+    public void ValidateComposition_rejects_bad_length_syntax()
+    {
+        Forms.AllowedDatatypePickerForm
+            .ValidateComposition(Entry("varchar2", param: true), "abc", null)
+            .Should().NotBeNullOrEmpty();
+    }
+
+    [Fact]
+    public void ValidateComposition_accepts_valid_length_without_validator()
+    {
+        Forms.AllowedDatatypePickerForm
+            .ValidateComposition(Entry("varchar2", param: true), "4000", null)
+            .Should().BeNull();
+    }
+
+    [Fact]
+    public void ValidateComposition_surfaces_rule_violation_on_composed_value()
+    {
+        // Emulates an admin "NVARCHAR length must be <= 4000" rule: the validator sees the
+        // COMPOSED token and rejects 4200 - the exact value the user reported slipping through.
+        string? Validator(string composed) =>
+            composed == "nvarchar(4200)" ? "NVARCHAR length must be <= 4000." : null;
+
+        Forms.AllowedDatatypePickerForm
+            .ValidateComposition(Entry("nvarchar", param: true), "4200", Validator)
+            .Should().Be("NVARCHAR length must be <= 4000.");
+    }
+
+    [Fact]
+    public void ValidateComposition_accepts_rule_valid_composed_value()
+    {
+        string? Validator(string composed) =>
+            composed == "nvarchar(4200)" ? "too long" : null;
+
+        Forms.AllowedDatatypePickerForm
+            .ValidateComposition(Entry("nvarchar", param: true), "4000", Validator)
+            .Should().BeNull();
+    }
+
+    [Fact]
+    public void ValidateComposition_skips_rule_validator_when_length_syntax_fails()
+    {
+        // Param-syntax gate runs FIRST: an invalid/empty length short-circuits before the rule
+        // validator is consulted, so a malformed token is never rule-validated.
+        bool validatorCalled = false;
+        string? Validator(string composed) { validatorCalled = true; return null; }
+
+        Forms.AllowedDatatypePickerForm
+            .ValidateComposition(Entry("nvarchar", param: true), "", Validator)
+            .Should().NotBeNullOrEmpty();
+        validatorCalled.Should().BeFalse();
+    }
+
+    [Fact]
+    public void ValidateComposition_applies_rule_validator_to_non_parameterized_type()
+    {
+        // The rule gate is not limited to parameterized types: a bare base can also violate
+        // an admin datatype rule.
+        string? Validator(string composed) => composed == "text" ? "TEXT is not permitted." : null;
+
+        Forms.AllowedDatatypePickerForm
+            .ValidateComposition(Entry("text"), "", Validator)
+            .Should().Be("TEXT is not permitted.");
+    }
 }
