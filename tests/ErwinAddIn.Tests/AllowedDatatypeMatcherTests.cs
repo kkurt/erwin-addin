@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 
 using EliteSoft.Erwin.AddIn.Services;
@@ -12,16 +13,34 @@ namespace EliteSoft.Erwin.AddIn.Tests;
 
 /// <summary>
 /// Pure-matcher coverage for the admin "Datatype Library" whitelist
-/// (<see cref="AllowedDatatypeService.IsDatatypeAllowed"/>). Rules: empty whitelist =
-/// no restriction; base token matched case-insensitively; a non-parameterized entry
-/// permits the base ONLY without a length; a parameterized entry REQUIRES a length
-/// (bare 'varchar2' rejected when 'varchar2' is parameterized - user decision
-/// 2026-07-05).
+/// (<see cref="AllowedDatatypeService.ValidateDatatype"/> / <see cref="AllowedDatatypeService.IsDatatypeAllowed"/>).
+/// 2026-07-08 model: each entry has PARAMETRIZATION_TYPE (None/Standard/Regex) + ALLOW_NON_PARAMETRIZED
+/// (+ REGEX_PATTERN / REGEX_ERROR for Regex). Rules: empty whitelist = no restriction; base matched
+/// case-insensitively; None = bare-only (a parameter is invalid); Standard/Regex require a parameter
+/// unless the bare form is allowed; Regex validates the parameter against REGEX_PATTERN (REGEX_ERROR on
+/// failure). Back-compat migration: old IS_PARAMETERIZED=1 -> Standard + allowBare=off (param required);
+/// =0 -> None (bare-only) - so the factories below reproduce today's behaviour.
 /// </summary>
 public class AllowedDatatypeMatcherTests
 {
-    private static AllowedDatatypeEntry T(string name, bool param = false) =>
-        new() { Datatype = name, IsParameterized = param };
+    // Bare-only type (migrated from IS_PARAMETERIZED=0).
+    private static AllowedDatatypeEntry None(string name) =>
+        new() { Datatype = name, ParametrizationType = DatatypeParametrization.None };
+
+    // Standard length/precision type; allowBare=false reproduces the old IS_PARAMETERIZED=1 "param required".
+    private static AllowedDatatypeEntry Std(string name, bool allowBare = false) =>
+        new() { Datatype = name, ParametrizationType = DatatypeParametrization.Standard, AllowNonParametrized = allowBare };
+
+    // Regex-validated parameter type.
+    private static AllowedDatatypeEntry Rgx(string name, string pattern, string error = null, bool allowBare = false) =>
+        new()
+        {
+            Datatype = name,
+            ParametrizationType = DatatypeParametrization.Regex,
+            AllowNonParametrized = allowBare,
+            RegexPattern = pattern,
+            RegexError = error,
+        };
 
     private static List<AllowedDatatypeEntry> Set(params AllowedDatatypeEntry[] e) => new(e);
 
@@ -39,64 +58,43 @@ public class AllowedDatatypeMatcherTests
         AllowedDatatypeService.IsDatatypeAllowed(value, null).Should().BeTrue();
     }
 
-    // ---------- non-parameterized entry (e.g. "int") ----------
+    // ---------- None (bare-only, e.g. "int") ----------
 
     [Theory]
     [InlineData("int", true)]
     [InlineData("INT", true)]          // case-insensitive base
     [InlineData("  int  ", true)]      // parser trims
-    [InlineData("int(5)", false)]      // non-param must NOT carry a length
-    [InlineData("bigint", false)]      // different base
+    [InlineData("int(5)", false)]      // None must NOT carry a parameter
+    [InlineData("bigint", false)]      // different base (not whitelisted)
     [InlineData("varchar(50)", false)]
-    public void NonParameterized_int_only(string value, bool expected)
+    public void None_int_only(string value, bool expected)
     {
-        var allowed = Set(T("int"));
-        AllowedDatatypeService.IsDatatypeAllowed(value, allowed).Should().Be(expected);
+        AllowedDatatypeService.IsDatatypeAllowed(value, Set(None("int"))).Should().Be(expected);
     }
 
-    // ---------- parameterized entry (e.g. "nvarchar") ----------
+    // ---------- Standard, param required (migrated IS_PARAMETERIZED=1) ----------
 
     [Theory]
     [InlineData("nvarchar(50)", true)]
     [InlineData("nvarchar(4000)", true)]
     [InlineData("NVARCHAR(200)", true)]   // case-insensitive
-    [InlineData("nvarchar", false)]       // param base REQUIRES a length - bare rejected (2026-07-05)
+    [InlineData("nvarchar", false)]       // Standard+allowBare=off REQUIRES a parameter
     [InlineData("int", false)]            // different base
     [InlineData("varchar(50)", false)]    // different base (varchar != nvarchar)
-    public void Parameterized_nvarchar(string value, bool expected)
+    public void Standard_required_nvarchar(string value, bool expected)
     {
-        var allowed = Set(T("nvarchar", param: true));
-        AllowedDatatypeService.IsDatatypeAllowed(value, allowed).Should().Be(expected);
+        AllowedDatatypeService.IsDatatypeAllowed(value, Set(Std("nvarchar"))).Should().Be(expected);
     }
+
+    // ---------- Standard, bare allowed (ALLOW_NON_PARAMETRIZED=1) ----------
 
     [Theory]
-    [InlineData("Numeric(10,2)", true)]   // multi-arg length under a parameterized entry
-    [InlineData("Numeric(18)", true)]
-    [InlineData("numeric", false)]        // param base REQUIRES a length - bare rejected (2026-07-05)
-    [InlineData("Number(10,2)", false)]   // Oracle 'Number' != 'Numeric'
-    public void Parameterized_numeric_with_precision(string value, bool expected)
+    [InlineData("decimal", true)]         // bare accepted
+    [InlineData("decimal(10,2)", true)]   // param accepted
+    [InlineData("DECIMAL", true)]
+    public void Standard_bare_allowed_decimal(string value, bool expected)
     {
-        AllowedDatatypeService.IsDatatypeAllowed(value, Set(T("Numeric", param: true))).Should().Be(expected);
-    }
-
-    // ---------- mixed whitelist (the user's likely real config) ----------
-
-    [Fact]
-    public void Mixed_whitelist_int_and_nvarchar()
-    {
-        var allowed = Set(T("int"), T("nvarchar", param: true), T("bit"), T("DateTime"));
-
-        AllowedDatatypeService.IsDatatypeAllowed("int", allowed).Should().BeTrue();
-        AllowedDatatypeService.IsDatatypeAllowed("nvarchar(255)", allowed).Should().BeTrue();
-        AllowedDatatypeService.IsDatatypeAllowed("bit", allowed).Should().BeTrue();
-        AllowedDatatypeService.IsDatatypeAllowed("datetime", allowed).Should().BeTrue();
-
-        AllowedDatatypeService.IsDatatypeAllowed("varchar(50)", allowed).Should().BeFalse();
-        AllowedDatatypeService.IsDatatypeAllowed("float", allowed).Should().BeFalse();
-        AllowedDatatypeService.IsDatatypeAllowed("char(18)", allowed).Should().BeFalse();
-        AllowedDatatypeService.IsDatatypeAllowed("binary()", allowed).Should().BeFalse();
-        AllowedDatatypeService.IsDatatypeAllowed("int(5)", allowed).Should().BeFalse(); // int is non-param
-        AllowedDatatypeService.IsDatatypeAllowed("nvarchar", allowed).Should().BeFalse(); // param base needs a length
+        AllowedDatatypeService.IsDatatypeAllowed(value, Set(Std("decimal", allowBare: true))).Should().Be(expected);
     }
 
     // ---------- unclassifiable input is not blocked ----------
@@ -109,72 +107,127 @@ public class AllowedDatatypeMatcherTests
     {
         // A non-empty whitelist must not block an empty/blank type (cannot classify) -
         // erwin transiently surfaces "" mid-edit; blocking it would fight the editor.
-        AllowedDatatypeService.IsDatatypeAllowed(value, Set(T("int"))).Should().BeTrue();
+        AllowedDatatypeService.IsDatatypeAllowed(value, Set(None("int"))).Should().BeTrue();
     }
 
-    // ---------- SeedForTesting reaches the instance matcher ----------
+    // ---------- mixed config: the full acceptance matrix the task asks for ----------
+
+    [Fact]
+    public void Mixed_config_covers_all_parametrization_rules()
+    {
+        // int  = None (bare-only); nvarchar = Standard required; decimal = Standard bare-allowed;
+        // varchar2 = Regex (param must be 1-3 digits) with a custom REGEX_ERROR.
+        var allowed = Set(
+            None("int"),
+            Std("nvarchar"),
+            Std("decimal", allowBare: true),
+            Rgx("varchar2", @"^\d{1,3}$", error: "varchar2 length must be 1-999."));
+
+        // whitelist-out -> rejected
+        AllowedDatatypeService.ValidateDatatype("float", allowed).IsValid.Should().BeFalse();
+        AllowedDatatypeService.ValidateDatatype("varchar(50)", allowed).IsValid.Should().BeFalse();
+
+        // None: bare ok, param rejected with a message
+        AllowedDatatypeService.ValidateDatatype("int", allowed).IsValid.Should().BeTrue();
+        var noneParam = AllowedDatatypeService.ValidateDatatype("int(5)", allowed);
+        noneParam.IsValid.Should().BeFalse();
+        noneParam.Message.Should().Contain("does not take a parameter");
+
+        // Standard required: bare rejected, param accepted
+        AllowedDatatypeService.ValidateDatatype("nvarchar", allowed).IsValid.Should().BeFalse();
+        AllowedDatatypeService.ValidateDatatype("nvarchar(255)", allowed).IsValid.Should().BeTrue();
+
+        // Standard bare-allowed: both accepted
+        AllowedDatatypeService.ValidateDatatype("decimal", allowed).IsValid.Should().BeTrue();
+        AllowedDatatypeService.ValidateDatatype("decimal(10,2)", allowed).IsValid.Should().BeTrue();
+
+        // Regex: matching param accepted; non-matching rejected WITH the custom REGEX_ERROR
+        AllowedDatatypeService.ValidateDatatype("varchar2(50)", allowed).IsValid.Should().BeTrue();
+        var rgxBad = AllowedDatatypeService.ValidateDatatype("varchar2(5000)", allowed); // 4 digits -> fails ^\d{1,3}$
+        rgxBad.IsValid.Should().BeFalse();
+        rgxBad.Message.Should().Be("varchar2 length must be 1-999.");
+        // Regex + allowBare=off: bare rejected (requires a parameter)
+        AllowedDatatypeService.ValidateDatatype("varchar2", allowed).IsValid.Should().BeFalse();
+    }
+
+    [Fact]
+    public void Regex_generic_message_when_regex_error_blank()
+    {
+        var allowed = Set(Rgx("varchar2", @"^\d{1,3}$", error: null));
+        var r = AllowedDatatypeService.ValidateDatatype("varchar2(5000)", allowed);
+        r.IsValid.Should().BeFalse();
+        r.Message.Should().NotBeNullOrEmpty();
+        r.Message.Should().Contain("varchar2");
+    }
+
+    [Fact]
+    public void Regex_bare_allowed_accepts_bare()
+    {
+        var allowed = Set(Rgx("varchar2", @"^\d{1,3}$", error: "bad", allowBare: true));
+        AllowedDatatypeService.ValidateDatatype("varchar2", allowed).IsValid.Should().BeTrue();      // bare ok
+        AllowedDatatypeService.ValidateDatatype("varchar2(50)", allowed).IsValid.Should().BeTrue();  // param ok
+        AllowedDatatypeService.ValidateDatatype("varchar2(5000)", allowed).IsValid.Should().BeFalse(); // param fails regex
+    }
 
     // ---------- GetFallbackDatatype: the type a disallowed value is forced to ----------
 
     [Fact]
-    public void GetFallbackDatatype_prefers_first_complete_nonparameterized()
+    public void GetFallbackDatatype_prefers_a_bare_usable_type()
     {
-        // A parameterized entry first, then a complete non-param one: the non-param wins
-        // because its base token is a valid standalone Physical_Data_Type ("int").
-        AllowedDatatypeService.Instance.SeedForTesting(new[] { T("nvarchar", param: true), T("int") });
+        // A param-required Standard entry first, then a bare-usable None ("int"): the bare-usable
+        // wins because its base token is a valid standalone Physical_Data_Type.
+        AllowedDatatypeService.Instance.SeedForTesting(new[] { Std("nvarchar"), None("int") });
         try
         {
             AllowedDatatypeService.Instance.GetFallbackDatatype().Should().Be("int");
         }
-        finally { AllowedDatatypeService.Instance.SeedForTesting(System.Array.Empty<AllowedDatatypeEntry>()); }
+        finally { AllowedDatatypeService.Instance.SeedForTesting(Array.Empty<AllowedDatatypeEntry>()); }
     }
 
     [Fact]
-    public void GetFallbackDatatype_single_allowed_type_is_used()
+    public void GetFallbackDatatype_standard_bare_allowed_is_bare_usable()
     {
-        AllowedDatatypeService.Instance.SeedForTesting(new[] { T("int") });
+        AllowedDatatypeService.Instance.SeedForTesting(new[] { Std("nvarchar"), Std("decimal", allowBare: true) });
         try
         {
-            AllowedDatatypeService.Instance.GetFallbackDatatype().Should().Be("int");
+            AllowedDatatypeService.Instance.GetFallbackDatatype().Should().Be("decimal");
         }
-        finally { AllowedDatatypeService.Instance.SeedForTesting(System.Array.Empty<AllowedDatatypeEntry>()); }
+        finally { AllowedDatatypeService.Instance.SeedForTesting(Array.Empty<AllowedDatatypeEntry>()); }
     }
 
     [Fact]
-    public void GetFallbackDatatype_all_parameterized_synthesizes_minimal_length()
+    public void GetFallbackDatatype_all_param_required_synthesizes_minimal_length()
     {
-        // No non-parameterized type to fall back on: a bare "nvarchar" may be rejected by erwin, so
-        // the fallback synthesizes a minimal valid length. Which base wins depends on the load
-        // query's ORDER BY dl.DATATYPE (not SeedForTesting's insertion order), so assert either -
-        // and assert the synthesized token round-trips through the matcher (no revert loop).
-        AllowedDatatypeService.Instance.SeedForTesting(new[] { T("nvarchar", param: true), T("Numeric", param: true) });
+        // No bare-usable type: a bare "nvarchar" may be rejected by erwin, so the fallback
+        // synthesizes a minimal length and it must round-trip through the matcher (no revert loop).
+        AllowedDatatypeService.Instance.SeedForTesting(new[] { Std("nvarchar"), Std("Numeric") });
         try
         {
             var fb = AllowedDatatypeService.Instance.GetFallbackDatatype();
             fb.Should().BeOneOf("nvarchar(1)", "Numeric(1)");
             AllowedDatatypeService.Instance.IsAllowed(fb).Should().BeTrue();
         }
-        finally { AllowedDatatypeService.Instance.SeedForTesting(System.Array.Empty<AllowedDatatypeEntry>()); }
+        finally { AllowedDatatypeService.Instance.SeedForTesting(Array.Empty<AllowedDatatypeEntry>()); }
     }
 
     [Fact]
     public void GetFallbackDatatype_null_when_no_restriction()
     {
-        AllowedDatatypeService.Instance.SeedForTesting(System.Array.Empty<AllowedDatatypeEntry>());
+        AllowedDatatypeService.Instance.SeedForTesting(Array.Empty<AllowedDatatypeEntry>());
         AllowedDatatypeService.Instance.GetFallbackDatatype().Should().BeNull();
     }
 
     [Fact]
     public void SeedForTesting_drives_instance_IsAllowed()
     {
-        AllowedDatatypeService.Instance.SeedForTesting(new[] { T("int") });
+        AllowedDatatypeService.Instance.SeedForTesting(new[] { None("int") });
         try
         {
             AllowedDatatypeService.Instance.HasRestriction.Should().BeTrue();
             AllowedDatatypeService.Instance.IsAllowed("int").Should().BeTrue();
             AllowedDatatypeService.Instance.IsAllowed("varchar(10)").Should().BeFalse();
         }
-        finally { AllowedDatatypeService.Instance.SeedForTesting(System.Array.Empty<AllowedDatatypeEntry>()); }
+        finally { AllowedDatatypeService.Instance.SeedForTesting(Array.Empty<AllowedDatatypeEntry>()); }
 
         // Empty seed -> no restriction.
         AllowedDatatypeService.Instance.HasRestriction.Should().BeFalse();
@@ -183,11 +236,10 @@ public class AllowedDatatypeMatcherTests
 }
 
 /// <summary>
-/// Pure-composition coverage for the AllowedDatatypePickerForm statics: the picker
-/// composes <c>base(param)</c> from the user's combo pick + parameter text, validates
-/// the parameter shape (n or n,m), and prefills from the attempted type's parameter.
-/// The WinForms chrome is not under test - only the value logic the enforcement
-/// writes into Physical_Data_Type.
+/// Pure-composition coverage for the AllowedDatatypePickerForm statics: the picker composes
+/// <c>base(param)</c> from the user's combo pick + parameter text, and (2026-07-08) validates the
+/// composition against the selected entry's parametrization rule (None/Standard/Regex) plus any
+/// admin naming rule. The WinForms chrome is not under test - only the value logic.
 /// </summary>
 public class AllowedDatatypePickerLogicTests
 {
@@ -232,93 +284,92 @@ public class AllowedDatatypePickerLogicTests
     }
 
     // ---------- ValidateComposition: the picker's accept/reject decision ----------
-    // 2026-07-07: the picker now runs the admin naming/regex rules against the COMPOSED
-    // datatype before committing, so a rule-violating value (e.g. nvarchar(4200) when a
-    // length <= 4000 rule exists) can never leave the dialog - the gap that let the Model
-    // Explorer path bypass rule validation entirely.
+    // Applies the selected entry's parametrization rule (via AllowedDatatypeService.ValidateAgainstEntry)
+    // then the optional admin naming-rule validator.
 
-    private static AllowedDatatypeEntry Entry(string name, bool param = false) =>
-        new() { Datatype = name, IsParameterized = param };
+    private static AllowedDatatypeEntry None(string name) =>
+        new() { Datatype = name, ParametrizationType = DatatypeParametrization.None };
+    private static AllowedDatatypeEntry Std(string name, bool allowBare = false) =>
+        new() { Datatype = name, ParametrizationType = DatatypeParametrization.Standard, AllowNonParametrized = allowBare };
+    private static AllowedDatatypeEntry Rgx(string name, string pattern, string error = null, bool allowBare = false) =>
+        new() { Datatype = name, ParametrizationType = DatatypeParametrization.Regex, AllowNonParametrized = allowBare, RegexPattern = pattern, RegexError = error };
 
     [Fact]
-    public void ValidateComposition_accepts_non_parameterized_without_validator()
+    public void ValidateComposition_accepts_none_without_param()
     {
-        Forms.AllowedDatatypePickerForm
-            .ValidateComposition(Entry("int"), "", null)
-            .Should().BeNull();
+        Forms.AllowedDatatypePickerForm.ValidateComposition(None("int"), "", null).Should().BeNull();
     }
 
     [Fact]
-    public void ValidateComposition_requires_length_for_parameterized()
+    public void ValidateComposition_none_rejects_param()
     {
         Forms.AllowedDatatypePickerForm
-            .ValidateComposition(Entry("varchar2", param: true), "", null)
-            .Should().NotBeNullOrEmpty();
+            .ValidateComposition(None("int"), "5", null)
+            .Should().Contain("does not take a parameter");
     }
 
     [Fact]
-    public void ValidateComposition_rejects_bad_length_syntax()
+    public void ValidateComposition_standard_required_rejects_bare()
     {
         Forms.AllowedDatatypePickerForm
-            .ValidateComposition(Entry("varchar2", param: true), "abc", null)
-            .Should().NotBeNullOrEmpty();
+            .ValidateComposition(Std("varchar2"), "", null)
+            .Should().Contain("requires a parameter");
     }
 
     [Fact]
-    public void ValidateComposition_accepts_valid_length_without_validator()
+    public void ValidateComposition_standard_accepts_any_param_format()
     {
-        Forms.AllowedDatatypePickerForm
-            .ValidateComposition(Entry("varchar2", param: true), "4000", null)
-            .Should().BeNull();
+        // Per spec, STANDARD does NOT format-check the parameter (DB/erwin owns the format).
+        Forms.AllowedDatatypePickerForm.ValidateComposition(Std("varchar2"), "4000", null).Should().BeNull();
+        Forms.AllowedDatatypePickerForm.ValidateComposition(Std("varchar2"), "anything", null).Should().BeNull();
     }
 
     [Fact]
-    public void ValidateComposition_surfaces_rule_violation_on_composed_value()
+    public void ValidateComposition_standard_bare_allowed_accepts_bare()
     {
-        // Emulates an admin "NVARCHAR length must be <= 4000" rule: the validator sees the
-        // COMPOSED token and rejects 4200 - the exact value the user reported slipping through.
+        Forms.AllowedDatatypePickerForm.ValidateComposition(Std("decimal", allowBare: true), "", null).Should().BeNull();
+    }
+
+    [Fact]
+    public void ValidateComposition_regex_surfaces_regex_error_on_mismatch()
+    {
+        var entry = Rgx("varchar2", @"^\d{1,3}$", error: "varchar2 length must be 1-999.");
+        Forms.AllowedDatatypePickerForm
+            .ValidateComposition(entry, "5000", null)
+            .Should().Be("varchar2 length must be 1-999.");
+    }
+
+    [Fact]
+    public void ValidateComposition_regex_accepts_matching_param()
+    {
+        var entry = Rgx("varchar2", @"^\d{1,3}$", error: "bad");
+        Forms.AllowedDatatypePickerForm.ValidateComposition(entry, "50", null).Should().BeNull();
+    }
+
+    [Fact]
+    public void ValidateComposition_surfaces_naming_rule_violation_on_composed_value()
+    {
+        // The whitelist rule passes (Standard + param), then the admin naming-rule validator sees
+        // the COMPOSED token and rejects it - the Model Explorer gap closer.
         string? Validator(string composed) =>
             composed == "nvarchar(4200)" ? "NVARCHAR length must be <= 4000." : null;
 
         Forms.AllowedDatatypePickerForm
-            .ValidateComposition(Entry("nvarchar", param: true), "4200", Validator)
+            .ValidateComposition(Std("nvarchar"), "4200", Validator)
             .Should().Be("NVARCHAR length must be <= 4000.");
     }
 
     [Fact]
-    public void ValidateComposition_accepts_rule_valid_composed_value()
+    public void ValidateComposition_skips_naming_validator_when_whitelist_rule_fails()
     {
-        string? Validator(string composed) =>
-            composed == "nvarchar(4200)" ? "too long" : null;
-
-        Forms.AllowedDatatypePickerForm
-            .ValidateComposition(Entry("nvarchar", param: true), "4000", Validator)
-            .Should().BeNull();
-    }
-
-    [Fact]
-    public void ValidateComposition_skips_rule_validator_when_length_syntax_fails()
-    {
-        // Param-syntax gate runs FIRST: an invalid/empty length short-circuits before the rule
-        // validator is consulted, so a malformed token is never rule-validated.
+        // Whitelist rule runs FIRST: a Standard-required type with no param short-circuits before
+        // the naming validator is consulted.
         bool validatorCalled = false;
         string? Validator(string composed) { validatorCalled = true; return null; }
 
         Forms.AllowedDatatypePickerForm
-            .ValidateComposition(Entry("nvarchar", param: true), "", Validator)
-            .Should().NotBeNullOrEmpty();
+            .ValidateComposition(Std("nvarchar"), "", Validator)
+            .Should().Contain("requires a parameter");
         validatorCalled.Should().BeFalse();
-    }
-
-    [Fact]
-    public void ValidateComposition_applies_rule_validator_to_non_parameterized_type()
-    {
-        // The rule gate is not limited to parameterized types: a bare base can also violate
-        // an admin datatype rule.
-        string? Validator(string composed) => composed == "text" ? "TEXT is not permitted." : null;
-
-        Forms.AllowedDatatypePickerForm
-            .ValidateComposition(Entry("text"), "", Validator)
-            .Should().Be("TEXT is not permitted.");
     }
 }

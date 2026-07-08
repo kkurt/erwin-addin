@@ -15,8 +15,8 @@ namespace EliteSoft.Erwin.AddIn.Forms
     /// Modal picker shown when a column's datatype is not in the configuration's
     /// Datatype Library whitelist. Instead of silently forcing the first allowed
     /// type, the user chooses the allowed base type from a locked ComboBox and,
-    /// when the chosen type is parameterized (IS_PARAMETERIZED), enters the
-    /// length/precision parameter(s) - composed as <c>base(param)</c>.
+    /// when the chosen type takes a parameter (PARAMETRIZATION_TYPE Standard/Regex),
+    /// enters the length/precision parameter(s) - composed as <c>base(param)</c>.
     /// <para>
     /// Cancel / [X] / Esc returns <see cref="DialogResult.Cancel"/>; the caller
     /// keeps its automatic fallback value (the model must never hold a
@@ -260,7 +260,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 FlatStyle = FlatStyle.Flat,
             };
             foreach (var entry in _entries)
-                _cmbType.Items.Add(entry.IsParameterized ? $"{entry.Datatype} (n)" : entry.Datatype);
+                _cmbType.Items.Add(TakesParameter(entry) ? $"{entry.Datatype} (n)" : entry.Datatype);
             int matchIdx = -1;
             if (!string.IsNullOrEmpty(preselectBase))
             {
@@ -330,16 +330,19 @@ namespace EliteSoft.Erwin.AddIn.Forms
             void SyncParamEnabled()
             {
                 var entry = SelectedEntry();
-                bool on = entry != null && entry.IsParameterized;
+                bool on = TakesParameter(entry);                              // Standard or Regex takes a parameter
+                bool optional = on && entry != null && entry.AllowNonParametrized; // ...and may also be used bare
                 _txtParam.Enabled = on;
                 // Clear any stale violation message when the chosen type changes so a rule
                 // error from the previous selection does not linger over the new one.
                 _lblError.Visible = false;
-                // A parameterized base MUST carry a length, so the label says "required" while the
-                // field is active; a non-parameterized base disables the field entirely.
-                _lblParam.Text = on
-                    ? "Parameter (length or precision,scale) - required"
-                    : "Parameter - not applicable for this type";
+                // The label reflects the entry's parametrization rule: required when the type must
+                // carry a parameter, optional when the bare form is also allowed, N/A for NONE.
+                _lblParam.Text = !on
+                    ? "Parameter - not applicable for this type"
+                    : optional
+                        ? "Parameter (length or precision,scale) - optional"
+                        : "Parameter (length or precision,scale) - required";
                 _lblParam.ForeColor = on ? ClrTextSecondary : ClrBorder;
                 paramFrame.BackColor = on ? ClrFieldBorder : ClrBorder;
                 if (!on) { _txtParam.Text = ""; _lblError.Visible = false; }
@@ -450,39 +453,43 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 ? _entries[_cmbType.SelectedIndex]
                 : null;
 
+        /// <summary>A type takes a parameter when its parametrization is Standard or Regex
+        /// (None is bare-only). Drives the parameter field enable + the accept logic.</summary>
+        private static bool TakesParameter(AllowedDatatypeEntry? entry) =>
+            entry != null && entry.ParametrizationType != DatatypeParametrization.None;
+
         /// <summary>
-        /// Pure accept/reject decision for <see cref="AcceptIfValid"/>: given the selected
-        /// entry, the raw parameter text, and an optional rule validator, return the inline
-        /// error message to show, or <c>null</c> when the composition is acceptable and the
-        /// dialog may close. Enforces, in order: (1) a parameterized base REQUIRES a length,
-        /// (2) the length must be <c>n</c> / <c>n,m</c>, (3) the admin naming/regex rules for
-        /// the COMPOSED datatype (via <paramref name="ruleValidate"/>) - e.g. a "length &lt;=
-        /// 4000" rule. Public + pure (no UI) so the branching is unit-tested; the validator is
-        /// assumed not to throw (its contract), and <see cref="AcceptIfValid"/> guards that.
+        /// Pure accept/reject decision for <see cref="AcceptIfValid"/>: given the selected entry,
+        /// the raw parameter text, and an optional rule validator, return the inline error message
+        /// to show, or <c>null</c> when the composition is acceptable and the dialog may close.
+        /// Applies, in order: (1) the whitelist entry's own parametrization rule via the shared
+        /// <see cref="AllowedDatatypeService.ValidateAgainstEntry"/> - NONE rejects a parameter,
+        /// STANDARD/REGEX require one unless the bare form is allowed, and REGEX validates the
+        /// parameter against REGEX_PATTERN (surfacing REGEX_ERROR on failure); (2) the admin
+        /// naming/regex rules for the COMPOSED datatype (via <paramref name="ruleValidate"/>).
+        /// Public + pure (no UI) so the branching is unit-tested.
         /// </summary>
         public static string? ValidateComposition(
             AllowedDatatypeEntry entry, string paramText, Func<string, string?>? ruleValidate)
         {
             if (entry == null) return null; // no selectable type -> caller cancels, not an error
 
-            string param = entry.IsParameterized ? (paramText ?? "").Trim() : "";
-            if (entry.IsParameterized && (string.IsNullOrWhiteSpace(param) || !IsValidParameter(param)))
-            {
-                // A parameterized base REQUIRES a length: submitting a bare 'varchar2' would just
-                // be rejected by the whitelist, so block it and keep the user in the dialog.
-                return string.IsNullOrWhiteSpace(param)
-                    ? "This type needs a length or precision,scale (e.g. 18 or 10,2)."
-                    : "Enter digits, optionally as precision,scale (e.g. 18 or 10,2).";
-            }
+            string param = (paramText ?? "").Trim();
+            bool hasParam = param.Length > 0;
 
-            // Rule gate (2026-07-07): run the admin naming/regex rules for Physical_Data_Type
-            // against the composed value BEFORE committing. A violation (e.g. length > 4000)
-            // keeps the user in the dialog with the admin's own message, so a rule-breaking
-            // datatype can never leave this picker - the exact gap that let nvarchar(4200)
-            // through in the Model Explorer path.
+            // (1) Whitelist entry rule - the single source of the NONE/STANDARD/REGEX semantics,
+            // shared with model validation. This surfaces the admin Datatype Library rule inline
+            // (e.g. REGEX_ERROR for a parameter that fails REGEX_PATTERN) so a non-conforming
+            // datatype can never leave the picker.
+            var wl = AllowedDatatypeService.ValidateAgainstEntry(entry, hasParam, param);
+            if (!wl.IsValid) return wl.Message;
+
+            // (2) Additional admin naming/regex rules for Physical_Data_Type (separate table from
+            // the whitelist) run against the composed value BEFORE committing - closes the Model
+            // Explorer gap where a picked value was never naming-validated.
             if (ruleValidate != null)
             {
-                string? ruleError = ruleValidate(Compose(entry.Datatype, param));
+                string? ruleError = ruleValidate(Compose(entry.Datatype, hasParam ? param : ""));
                 if (!string.IsNullOrEmpty(ruleError)) return ruleError;
             }
 
@@ -511,11 +518,11 @@ namespace EliteSoft.Erwin.AddIn.Forms
             if (!string.IsNullOrEmpty(error))
             {
                 ShowInlineError(error);
-                if (entry.IsParameterized) { _txtParam.Focus(); _txtParam.SelectAll(); }
+                if (TakesParameter(entry)) { _txtParam.Focus(); _txtParam.SelectAll(); }
                 return;
             }
 
-            string param = entry.IsParameterized ? _txtParam.Text.Trim() : "";
+            string param = TakesParameter(entry) ? _txtParam.Text.Trim() : "";
             SelectedDatatype = Compose(entry.Datatype, param);
             DialogResult = DialogResult.OK;
             Close();
