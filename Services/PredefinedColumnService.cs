@@ -475,6 +475,69 @@ namespace EliteSoft.Erwin.AddIn.Services
             return null;
         }
 
+        /// <summary>
+        /// Names of the predefined columns that currently APPLY to the given entity: every
+        /// unconditional row, plus each conditional row whose gating UDP
+        /// (<c>Entity.Physical.{DependsOnUdpName}</c>) equals <c>DependsOnUdpValue</c>. This is the
+        /// SAME applicability that ApplyPredefined uses to auto-add columns, so the set treated as
+        /// "predefined" (e.g. exempt from glossary loading) exactly matches the set that was
+        /// actually added. Entity-scoped by design: a column gated on <c>TableClass='Parametre'</c>
+        /// must NOT count as predefined on a <c>TableClass='Log'</c> table - otherwise a user
+        /// column that happens to share a name (e.g. "OID") is wrongly skipped from the glossary.
+        /// </summary>
+        public HashSet<string> GetApplicableNames(dynamic entity)
+        {
+            if (!_isLoaded) return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            return GetApplicableNames(_columns, udpName => ReadEntityUdp(entity, udpName));
+        }
+
+        /// <summary>
+        /// Pure applicability core (no SCAPI) so it is unit-testable. <paramref name="readUdp"/>
+        /// resolves a UDP name to the entity's live value (called at most once per distinct UDP,
+        /// results cached). A conditional row applies when that value equals its DependsOnUdpValue
+        /// (case-insensitive); unconditional rows always apply.
+        /// </summary>
+        public static HashSet<string> GetApplicableNames(IEnumerable<PredefinedColumn> columns, Func<string, string> readUdp)
+        {
+            var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (columns == null) return names;
+
+            var udpCache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var col in columns)
+            {
+                if (col == null || string.IsNullOrEmpty(col.ColumnName)) continue;
+                if (col.IsUnconditional) { names.Add(col.ColumnName); continue; }
+                if (string.IsNullOrEmpty(col.DependsOnUdpName)) continue;
+
+                if (!udpCache.TryGetValue(col.DependsOnUdpName, out var live))
+                {
+                    live = readUdp?.Invoke(col.DependsOnUdpName) ?? "";
+                    udpCache[col.DependsOnUdpName] = live;
+                }
+                if (string.Equals(live, col.DependsOnUdpValue, StringComparison.OrdinalIgnoreCase))
+                    names.Add(col.ColumnName);
+            }
+            return names;
+        }
+
+        /// <summary>Read <c>Entity.Physical.{udpName}</c> off a live entity; returns "" when the
+        /// UDP is not assigned (r10.10 sparse storage throws on an unassigned UDP - the expected
+        /// "condition cannot hold" case, mirroring <see cref="FindApplicableLockedRule"/>).</summary>
+        private static string ReadEntityUdp(dynamic entity, string udpName)
+        {
+            if (entity == null || string.IsNullOrEmpty(udpName)) return "";
+            try
+            {
+                return entity.Properties($"Entity.Physical.{udpName}")?.Value?.ToString() ?? "";
+            }
+            catch
+            {
+                // SCAPI "Entity class does not use a property of ... type": the entity has never
+                // been assigned this UDP, so the gating condition cannot be met - treat as "".
+                return "";
+            }
+        }
+
         public void Reload(string platformDbType = null)
         {
             LoadPredefinedColumns(platformDbType);

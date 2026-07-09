@@ -77,6 +77,13 @@ namespace EliteSoft.Erwin.AddIn.Forms
         // Contract: returns null/empty when the value is acceptable; never throws.
         private readonly Func<string, string?>? _validate;
 
+        // Term-type length lock (2026-07-09): when the column's glossary term type fixes the
+        // length/precision (BUSINESS_TERM never reaches the picker; AMORPH_DATA_TYPE does),
+        // the parameter field stays visible but DISABLED, pinned to the authoritative value
+        // supplied via prefillParam. The base-type lock is applied directly to the combo in
+        // the ctor (no field needed - the combo never re-enables).
+        private readonly bool _lockParam;
+
         /// <summary>Composed datatype (<c>base</c> or <c>base(param)</c>) the user
         /// confirmed with OK. Empty when cancelled.</summary>
         public string SelectedDatatype { get; private set; } = "";
@@ -113,10 +120,12 @@ namespace EliteSoft.Erwin.AddIn.Forms
 
         private AllowedDatatypePickerForm(
             string title, string message, IReadOnlyList<AllowedDatatypeEntry> entries,
-            string preselectBase, string prefillParam, Func<string, string?>? validate)
+            string preselectBase, string prefillParam, Func<string, string?>? validate,
+            bool lockType, bool lockParam)
         {
             _entries = entries.Where(e => e != null && !string.IsNullOrEmpty(e.Datatype)).ToList();
             _validate = validate;
+            _lockParam = lockParam;
 
             Text = title;
             FormBorderStyle = FormBorderStyle.None;
@@ -271,6 +280,13 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 }
             }
             _cmbType.SelectedIndex = matchIdx >= 0 ? matchIdx : (_cmbType.Items.Count > 0 ? 0 : -1);
+            // Term-type base lock: the column's glossary term type says the BASE type may not
+            // change - pin the combo to the (caller-guaranteed whitelisted) authoritative base
+            // and disable it. Only when the preselect matched: locking to an arbitrary first
+            // entry would pin the WRONG base, so an unmatched preselect leaves the combo free
+            // (the caller routes non-representable locked bases to a warn-only dialog instead).
+            if (lockType && matchIdx >= 0)
+                _cmbType.Enabled = false;
             typeFrame.Controls.Add(_cmbType);
             yCursor += FieldHeight + 12;
 
@@ -332,19 +348,24 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 var entry = SelectedEntry();
                 bool on = TakesParameter(entry);                              // Standard or Regex takes a parameter
                 bool optional = on && entry != null && entry.AllowNonParametrized; // ...and may also be used bare
-                _txtParam.Enabled = on;
+                // Term-type length lock: the field stays visible (the user must SEE the pinned
+                // authoritative value that will be composed) but cannot be edited.
+                _txtParam.Enabled = on && !_lockParam;
                 // Clear any stale violation message when the chosen type changes so a rule
                 // error from the previous selection does not linger over the new one.
                 _lblError.Visible = false;
                 // The label reflects the entry's parametrization rule: required when the type must
-                // carry a parameter, optional when the bare form is also allowed, N/A for NONE.
+                // carry a parameter, optional when the bare form is also allowed, N/A for NONE;
+                // the term lock overrides all of those wordings.
                 _lblParam.Text = !on
                     ? "Parameter - not applicable for this type"
-                    : optional
-                        ? "Parameter (length or precision,scale) - optional"
-                        : "Parameter (length or precision,scale) - required";
-                _lblParam.ForeColor = on ? ClrTextSecondary : ClrBorder;
-                paramFrame.BackColor = on ? ClrFieldBorder : ClrBorder;
+                    : _lockParam
+                        ? "Parameter - fixed by the glossary term mapping"
+                        : optional
+                            ? "Parameter (length or precision,scale) - optional"
+                            : "Parameter (length or precision,scale) - required";
+                _lblParam.ForeColor = on && !_lockParam ? ClrTextSecondary : ClrBorder;
+                paramFrame.BackColor = on && !_lockParam ? ClrFieldBorder : ClrBorder;
                 if (!on) { _txtParam.Text = ""; _lblError.Visible = false; }
             }
             _cmbType.SelectedIndexChanged += (_, _) => SyncParamEnabled();
@@ -566,9 +587,11 @@ namespace EliteSoft.Erwin.AddIn.Forms
             string prefillParam,
             out string selectedDatatype,
             IWin32Window? owner = null,
-            Func<string, string?>? validate = null)
+            Func<string, string?>? validate = null,
+            bool lockType = false,
+            bool lockParam = false)
         {
-            using var dlg = new AllowedDatatypePickerForm(title, message, entries, preselectBase, prefillParam, validate);
+            using var dlg = new AllowedDatatypePickerForm(title, message, entries, preselectBase, prefillParam, validate, lockType, lockParam);
             dlg.PositionOnActiveScreen(owner);
             var rc = dlg.ShowDialog(owner);
             selectedDatatype = rc == DialogResult.OK ? dlg.SelectedDatatype : "";

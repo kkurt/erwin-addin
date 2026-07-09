@@ -22,6 +22,21 @@ namespace EliteSoft.Erwin.AddIn.Services
     }
 
     /// <summary>
+    /// How a model element name is compared to the glossary match-column values when looking
+    /// for an equal record. Backed by the two-level config key GLOSSARY_COMPARISON_TYPE
+    /// (2026-07-09); default CASE_INSENSITIVE. Member names match the stored VALUE strings
+    /// verbatim so <c>GetEffectiveEnum</c> parses them directly.
+    /// </summary>
+    public enum GlossaryComparisonType
+    {
+        /// <summary>Ordinal, case-SENSITIVE equality (only an exact case+content match).</summary>
+        EXACT,
+        /// <summary>INVARIANT case-insensitive equality (StringComparer.OrdinalIgnoreCase) - ASCII
+        /// case-fold only, NOT tr-TR, so Turkish dotted/dotless I ('İ'/'ı') are not folded.</summary>
+        CASE_INSENSITIVE
+    }
+
+    /// <summary>
     /// Glossary service with dynamic mapping support.
     /// Reads glossary config from DG_TABLE_MAPPING (MAPPING_CODE='GLOSSARY') + DG_TABLE_MAPPING_COLUMN.
     /// Cache: Dictionary&lt;matchValue, Dictionary&lt;targetUdp, value&gt;&gt;
@@ -35,6 +50,14 @@ namespace EliteSoft.Erwin.AddIn.Services
         private Dictionary<string, Dictionary<string, string>> _glossaryCache;
         private bool _isLoaded;
         private string _lastError;
+
+        // Config-scoped load-state (2026-07-09). The ActiveConfigId the current load reflects (or -1
+        // when ConfigContext was not initialized at load time). IsLoaded is scoped to it so a glossary
+        // loaded under model A does NOT keep validating model B after an MDI model switch: the gate
+        // (USE_EXTERNAL_GLOSSARY), DG_TABLE_MAPPING, required-option and comparison-type are all
+        // config-scoped, so reusing model A's cache for model B was a correctness bug - external
+        // glossary validation fired on a model whose USE_EXTERNAL_GLOSSARY=false. See IsLoadedForConfig.
+        private int _loadedConfigId = -1;
 
         // Credential-failure latch (2026-07-07). When the glossary's CONNECTION_DEF
         // credentials cannot be decrypted (DPAPI is per-Windows-user, or the ciphertext
@@ -74,6 +97,19 @@ namespace EliteSoft.Erwin.AddIn.Services
         private bool _useExternalGlossary;
         private GlossaryRequiredOption _requiredOption = GlossaryRequiredOption.OPTIONAL_SILENT;
 
+        // Comparison mode for model-name <-> glossary match-value lookups (GLOSSARY_COMPARISON_TYPE).
+        // Resolved once per LoadGlossary; the match dictionaries (_glossaryCache, _termTypeByMatch)
+        // are (re)built with the matching StringComparer so every ContainsKey/TryGetValue on the
+        // model column name uses it. Default matches the historical behaviour (OrdinalIgnoreCase).
+        private GlossaryComparisonType _comparisonType = GlossaryComparisonType.CASE_INSENSITIVE;
+        private StringComparer _matchComparer = StringComparer.OrdinalIgnoreCase;
+
+        /// <summary>The StringComparer for a comparison mode: EXACT -> Ordinal (case-sensitive);
+        /// CASE_INSENSITIVE -> OrdinalIgnoreCase (INVARIANT ASCII fold, never tr-TR). Pure/static
+        /// so it is unit-testable.</summary>
+        public static StringComparer ResolveMatchComparer(GlossaryComparisonType type) =>
+            type == GlossaryComparisonType.EXACT ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase;
+
         public event Action<string> OnLog;
 
         public static GlossaryService Instance
@@ -100,7 +136,29 @@ namespace EliteSoft.Erwin.AddIn.Services
             _termTypeByMatch = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         }
 
-        public bool IsLoaded => _isLoaded;
+        /// <summary>
+        /// True only when a successful load exists AND it was captured under the config that is
+        /// active NOW. A load captured under a different config (an MDI model switch flips
+        /// <see cref="ConfigContextService.ActiveConfigId"/>) is reported as not-loaded, so the
+        /// uniform "if (!IsLoaded) LoadGlossary()" callers re-read the glossary under the new config
+        /// instead of validating the new model against the previous model's glossary.
+        /// </summary>
+        public bool IsLoaded => IsLoadedForConfig(_isLoaded, _loadedConfigId, CurrentConfigId());
+
+        /// <summary>ActiveConfigId at "now", using the SAME formula the load path stamps
+        /// <see cref="_loadedConfigId"/> with (mirrors the credential-latch id in LoadGlossary);
+        /// ConfigContext not initialized -> -1. Two field reads: no DB, cheap to call per column.</summary>
+        private static int CurrentConfigId() =>
+            ConfigContextService.Instance.IsInitialized ? ConfigContextService.Instance.ActiveConfigId : -1;
+
+        /// <summary>
+        /// Pure decision (DB-free, unit-testable): is a glossary load-state usable for the active
+        /// config? Only when a load succeeded (<paramref name="loaded"/>) AND it was captured under
+        /// the same config now active. Loaded under a different config -> reload required (return false).
+        /// </summary>
+        public static bool IsLoadedForConfig(bool loaded, int loadedUnderConfigId, int currentConfigId) =>
+            loaded && loadedUnderConfigId == currentConfigId;
+
         public int Count => _glossaryCache.Count;
         public string LastError => _lastError;
 
@@ -133,6 +191,18 @@ namespace EliteSoft.Erwin.AddIn.Services
             _credentialFailureMessage = null;
             _pendingCredentialWarning = null;
         }
+
+        /// <summary>
+        /// Force the next "if (!IsLoaded) LoadGlossary()" caller to re-read the glossary, regardless
+        /// of config id. Used by the explicit "Reload Config" / "Change DB" path: CONFIG.ID is an
+        /// identity scoped PER repository DB, so switching to a different repo whose active model
+        /// happens to reuse the same integer id would make the config-scoped <see cref="IsLoaded"/>
+        /// wrongly report the previous repo's glossary as still valid. Flipping <c>_isLoaded</c> here
+        /// defeats that cross-repo id collision. Does not itself load - the next gated caller does.
+        /// (Do NOT call <see cref="Reload"/> on that path: it would run before ConfigContext is
+        /// re-initialized and load under the OLD ActiveConfigId.)
+        /// </summary>
+        public void Invalidate() => _isLoaded = false;
 
         /// <summary>
         /// Record an undecryptable-credentials failure for <paramref name="configId"/>: set the
@@ -191,6 +261,11 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // (they all early-return on !glossary.IsLoaded). A real DB read error
                 // propagates to the outer catch (LastError surfaced), never a silent off.
                 _useExternalGlossary = ConfigContextService.Instance.GetEffectiveBool("USE_EXTERNAL_GLOSSARY", false);
+                // Stamp the config this load-state reflects BEFORE any return below (gate-off,
+                // credential-latch, error, or success), so IsLoaded is scoped to it. ActiveConfigId
+                // cannot change during this synchronous STA method, so this equals the currentCfgId
+                // computed further down for the credential latch.
+                _loadedConfigId = CurrentConfigId();
                 if (!_useExternalGlossary)
                 {
                     _isLoaded = false;
@@ -200,7 +275,19 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // Enforcement mode for columns with no glossary match (default OPTIONAL_SILENT).
                 _requiredOption = ConfigContextService.Instance.GetEffectiveEnum(
                     "GLOSSARY_REQUIRED_OPTION", GlossaryRequiredOption.OPTIONAL_SILENT);
-                Log($"GlossaryService: USE_EXTERNAL_GLOSSARY=true, GLOSSARY_REQUIRED_OPTION={_requiredOption}");
+
+                // Resolve the model-name <-> glossary-value comparison mode ONCE, then (re)build the
+                // two match dictionaries with the corresponding comparer so every lookup uses it.
+                // The dicts were Clear()ed above (early-return safety); a matching config change
+                // (Reload Config / Change DB) re-runs LoadGlossary so this always reflects the
+                // current effective value. _termTypeMap (external-label -> canonical) is NOT a
+                // model-name match, so it stays OrdinalIgnoreCase.
+                _comparisonType = ConfigContextService.Instance.GetEffectiveEnum(
+                    "GLOSSARY_COMPARISON_TYPE", GlossaryComparisonType.CASE_INSENSITIVE);
+                _matchComparer = ResolveMatchComparer(_comparisonType);
+                _glossaryCache = new Dictionary<string, Dictionary<string, string>>(_matchComparer);
+                _termTypeByMatch = new Dictionary<string, string>(_matchComparer);
+                Log($"GlossaryService: USE_EXTERNAL_GLOSSARY=true, GLOSSARY_REQUIRED_OPTION={_requiredOption}, GLOSSARY_COMPARISON_TYPE={_comparisonType}");
 
                 // Credential-failure latch: if a prior load already found this config's glossary
                 // credentials undecryptable, do NOT re-open the repo DB and re-hit the same failure

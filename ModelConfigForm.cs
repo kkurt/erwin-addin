@@ -3265,6 +3265,13 @@ namespace EliteSoft.Erwin.AddIn
                 // may have re-entered the credentials. Passive gestures still respect the latch.
                 Services.GlossaryService.Instance.ResetCredentialFailureLatch();
 
+                // Also drop the loaded glossary itself. IsLoaded is config-scoped (keyed on
+                // ActiveConfigId), but CONFIG.ID is repo-local, so a Change-DB to a DIFFERENT repo
+                // whose active model reuses the same id would otherwise keep serving the previous
+                // repo's glossary. Invalidate forces the post-Initialize LoadGlossary below to
+                // re-read under the new repo/config.
+                Services.GlossaryService.Instance.Invalidate();
+
                 // Force the full pipeline (not the fast model-switch path).
                 _globalDataLoaded = false;
                 using (AddinLogger.BeginScope($"InitializeValidationService({logPrefix})"))

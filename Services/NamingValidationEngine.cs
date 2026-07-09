@@ -141,6 +141,52 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// True when <paramref name="newName"/> is erwin's auto-uniquify of
+        /// <paramref name="prevName"/>: erwin appends "__NNNN" (double underscore + digits) when a
+        /// name it is asked to set collides with an existing object of the same type (e.g. adding a
+        /// second column the add-in named "Pre_Abc" yields "Pre_Abc__1069").
+        /// <para>
+        /// The add-in did NOT choose this name - erwin did, AFTER the add-in's own naming ran - so
+        /// the resulting name may violate the naming standard (digits + "__" defeat a PascalCase
+        /// regex). Callers re-validate such a rename as a fresh CREATE (isNew=true) so apply=Create
+        /// rules re-fire on the erwin-assigned name. Object-type agnostic: the same "__NNNN"
+        /// signature is used for columns, tables and views. Ordinal match - the base is identical,
+        /// only an appended "__&lt;digits&gt;" differs.
+        /// </para>
+        /// </summary>
+        public static bool IsAutoUniquifyRename(string prevName, string newName)
+        {
+            if (string.IsNullOrEmpty(prevName) || string.IsNullOrEmpty(newName)) return false;
+            const string sep = "__";
+            if (newName.Length <= prevName.Length + sep.Length) return false;
+            if (!newName.StartsWith(prevName, StringComparison.Ordinal)) return false;
+            string tail = newName.Substring(prevName.Length);
+            if (!tail.StartsWith(sep, StringComparison.Ordinal)) return false;
+            string digits = tail.Substring(sep.Length);
+            return digits.Length > 0 && digits.All(char.IsDigit);
+        }
+
+        /// <summary>
+        /// True when a rename should re-run apply=Create naming rules on the new name: the
+        /// baseline is a real (non-empty, non-placeholder) prior name that differs (Ordinal) from
+        /// the current one. The user's contract (2026-07-10) is that ANY real rename re-validates
+        /// the new name against the same rules a fresh name must pass (rule#1127 no-digits etc.),
+        /// so a manual Model Explorer / Properties-pane / Column Editor rename is caught, not just
+        /// erwin's auto-uniquify (which <see cref="IsAutoUniquifyRename"/> already handles as a
+        /// special case). This drives ONLY validation scope; the caller keeps a separate identity
+        /// flag so a Required-popup Cancel reverts the name rather than deleting a pre-existing
+        /// object. Not retroactive: false when the name is unchanged, so an untouched (even
+        /// already-nonconforming) name is never re-flagged. <paramref name="isPlaceholder"/> lets
+        /// the caller inject its object-kind placeholder test (column vs entity defaults differ).
+        /// </summary>
+        public static bool RenameRequiresRevalidation(string baselineName, string currentName, Func<string, bool> isPlaceholder)
+        {
+            if (string.IsNullOrEmpty(baselineName)) return false;
+            if (isPlaceholder != null && isPlaceholder(baselineName)) return false;
+            return !string.Equals(baselineName, currentName ?? string.Empty, StringComparison.Ordinal);
+        }
+
+        /// <summary>
         /// Evaluate a single rule against an object name and append violations.
         /// Public so unit tests can exercise per-RuleType dispatch without
         /// having to load <see cref="NamingStandardService"/> from a real

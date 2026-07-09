@@ -102,7 +102,7 @@ namespace EliteSoft.Erwin.AddIn
             this.tabControl.Location = new System.Drawing.Point(16, 16);
             this.tabControl.Name = "tabControl";
             this.tabControl.SelectedIndex = 0;
-            this.tabControl.Size = new System.Drawing.Size(948, 640);
+            this.tabControl.Size = new System.Drawing.Size(948, 530);
             this.tabControl.TabIndex = 0;
             this.tabControl.Font = fontBody;
             this.tabControl.SelectedIndexChanged += new System.EventHandler(this.tabControl_SelectedIndexChanged);
@@ -113,13 +113,16 @@ namespace EliteSoft.Erwin.AddIn
             this.tabGeneral.Location = new System.Drawing.Point(4, 26);
             this.tabGeneral.Name = "tabGeneral";
             this.tabGeneral.Padding = new System.Windows.Forms.Padding(20);
-            // MUST track tabControl.Size (948x640 -> page 940x610, -8/-30 chrome).
+            // MUST track tabControl.Size (948x530 -> page 940x500, -8/-30 chrome).
             // BuildGeneralTab places the Bottom-anchored footer (copyright +
-            // Close erwin) by absolute Y while THIS serialized size is current;
-            // a stale smaller value makes the anchor capture a negative
-            // bottom-distance and layout then pushes the footer off the page
-            // (invisible footer bug, 2026-06-10).
-            this.tabGeneral.Size = new System.Drawing.Size(940, 610);
+            // Close erwin) by absolute Y (footer bottom ~460) while THIS serialized
+            // size is current; a value INCONSISTENT with the form ClientSize makes the
+            // anchor capture the wrong bottom-distance and layout pushes the footer /
+            // the bottom status-bar 'Close' off the visible area (invisible footer bug
+            // 2026-06-10; the 2026-07-09 recurrence was tabControl 640 left stale after
+            // ClientSize was shrunk 720 -> 600, so the tab overflowed and covered the
+            // status bar - resized to 530/500 to fit ClientSize 600 with a positive margin).
+            this.tabGeneral.Size = new System.Drawing.Size(940, 500);
             this.tabGeneral.TabIndex = 10;
             this.tabGeneral.Text = "General";
             this.tabGeneral.UseVisualStyleBackColor = true;
@@ -640,10 +643,13 @@ namespace EliteSoft.Erwin.AddIn
             // ================================================================
             this.AutoScaleDimensions = new System.Drawing.SizeF(7F, 17F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
-            // Height raised 660 -> 720 (2026-06-08) to fit the new "System" card on
-            // the General tab without pushing the footer (Close erwin / copyright)
-            // past the visible tab area. The tabControl is Bottom-anchored so it
-            // absorbs the extra height automatically.
+            // Client height 600 with a CONSISTENT tabControl (530) + status bar (45):
+            // 16 (top) + 530 (tab) + 45 (status+sep) leaves a 9px gap, so the tab never
+            // overflows and the bottom status-bar 'Close' stays visible. (Regression fixed
+            // 2026-07-09: ClientSize had been shrunk 720 -> 600 but tabControl was left at
+            // 640, so the tab overflowed the client and covered the status-bar Close.)
+            // If ClientSize height changes, tabControl.Size (and tabGeneral = -8/-30) MUST
+            // change with it - see the tabGeneral comment above.
             this.ClientSize = new System.Drawing.Size(980, 600);
             this.Controls.Add(this.tabControl);
             this.Controls.Add(this.pnlStatusSep);
@@ -651,11 +657,12 @@ namespace EliteSoft.Erwin.AddIn
             this.Font = fontBody;
             this.BackColor = System.Drawing.Color.White;
             this.FormBorderStyle = System.Windows.Forms.FormBorderStyle.Sizable;
-            // Floor lowered 700 -> 560 (2026-07-07): the "System" card was removed
-            // (the active DB now shows in the Repository Config row), so the General
-            // tab is one card shorter again - the height that was added for that card
-            // is no longer needed and left empty space below the footer.
-            this.MinimumSize = new System.Drawing.Size(800, 560);
+            // Floor 620 (2026-07-09): the General-tab footer (Close erwin / copyright,
+            // bottom ~460 in tab-page coords) plus the bottom status-bar 'Close' must never
+            // crop. At MinimumSize the anchored tab shrinks; 620 keeps the runtime tab page
+            // >= the footer bottom with margin. (Was 560 - too short, the footer/status
+            // 'Close' cropped when the window hit the floor.)
+            this.MinimumSize = new System.Drawing.Size(800, 620);
             this.MaximizeBox = true;
             this.MinimizeBox = true;
             this.Name = "ModelConfigForm";

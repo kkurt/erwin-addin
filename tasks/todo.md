@@ -1,3 +1,94 @@
+# Manual-rename revalidation + Properties-pane dropdown coverage (2026-07-10) - DONE
+
+## From live test of the A-F fixes
+- test 1 (picker idle -> uniquify -> rule fires): OK
+- test 2 (dialogs show live name): OK
+- test 3 (Model Explorer rename existing column to a digit -> rule should fire): FAILED -> fixed
+- limitation 1a (Properties-pane dropdown datatype edit unobserved): user chose selection-scoped
+  fingerprint -> implemented
+
+## Fixes
+- [x] Bug-3 (columns): SPLIT `treatAsNew` into `revalidateAsNew` (validation scope: apply=Create
+      rules fire on ANY real rename) vs `treatAsNew` (identity: Cancel deletes-vs-reverts). Manual
+      rename now fires rule#1127 but Cancel REVERTS (does not delete the pre-existing column).
+      Trigger = NamingValidationEngine.RenameRequiresRevalidation (pure, tested).
+- [x] Table + View: same split in the shared TableTypeMonitorService.ValidateNamingStandard
+      (revalidateAsNew param + internal RenameRequiresRevalidation detection); threaded a revalidate
+      bool through the table heartbeat; view rename site passes it directly. Cancel still reverts,
+      never deletes the table/view. (User earlier: "diger objelerde de (Tablo,View) vardir".)
+- [x] Task (a): SelectionScopedAttributeCheck - Overview-pane selected entity fingerprinted each
+      heartbeat (editor-closed), handle-cached + backoff so no per-second full child enum. Catches
+      Properties-pane dropdown datatype/name edits on existing columns.
+- [x] Task (a) HARDENING (user: "bazen kaciyor" - edit not caught first time, caught on re-select):
+      Overview tracks DIAGRAM selection but a Model-Explorer TREE column selection does not sync, so
+      the edited entity was never fingerprinted until re-selected. Fix = fingerprint selected entity
+      PLUS a bounded round-robin slice (RollingRescanPerHeartbeat=3) of the baselined working set, so
+      the edited table is re-checked within a few seconds regardless of the Overview, no re-select
+      needed. Bounded (touched entities only), no spurious popup (stable entity short-circuits).
+- [x] Tests: RenameRevalidationTests, OverviewSelectionParseTests. DEV 0/0, packaged 0/0, 571 green.
+
+## Verification (user live)
+- [ ] test 3 re-run: rename existing column to a digit name -> rule#1127 fires with LIVE name; Cancel reverts (does NOT delete the column)
+- [ ] table/view manual rename to a digit -> naming rule fires; Cancel reverts (does NOT delete)
+- [ ] Properties-pane datatype dropdown change on existing column -> caught in ~1-2s ([SEL-SCOPE] + rule)
+- [ ] confirm the manual-rename prefix/suffix RE-APPLY side effect is acceptable (else narrow revalidateAsNew to validation-only)
+
+## Still open (declined / caveat)
+- Definition/Comment-only Properties-pane edits: no observer (user declined).
+- [SEL-SCOPE] relies on Overview reflecting the selection; verify with the log line.
+
+---
+
+# Model Explorer / modal-race validation gaps (2026-07-09) - DONE (A-F approved + implemented)
+
+## Bugs (user report + log/code verified)
+- bug-1: erwin auto-uniquify rename (Pre_Abc -> Pre_Abc__1070/__1073) committed WHILE a modal
+  was pumping is never validated: rule#1127 (Regexp) bypass. Log never contains the new name.
+- bug-2: dialogs print stale names: picker said 'TEST.Pre_Abc' while live was Pre_Abc__1070;
+  "Naming standard applied" said 'Abc' -> 'Pre_Abc' while live was Pre_Abc__1073.
+- structural: right-dock Properties pane edits on EXISTING objects have no watcher at all.
+
+## Root causes
+1. `_datatypePickerShowing` gates BOTH timers for the whole picker modal (57 s in the repro);
+   the uniquify commit lands mid-modal, no detector sees it.
+2. Post-modal only Physical_Data_Type is live re-read (VCS ~:7134); curr.PhysicalName stays
+   stale; the isNew replay validates the STALE name; IsAutoUniquifyRename compares stale-vs-stale
+   (baseline snapshot and state are the SAME object/value) so it can never fire here.
+3. After the gesture (pending-new consumed), no detector ever rescans that attribute:
+   heartbeat is count-only (rename = no delta), ScanForRenamesEventDriven walks ENTITIES only.
+   The snapshot-vs-live diff sits unread forever.
+4. Dialog texts are built from pre-captured state: picker msg (~:7070), "Naming standard
+   applied" (~:7528), required-field fieldLabel built once outside the re-prompt loop (~:7671).
+
+## Fix plan
+- [x] A. Helper ReadLivePhysicalName(attr, fallback) + RefreshNameAfterModal(attr, state, ctx):
+      live re-read + sync (placeholder-safe), mirroring the live datatype re-read discipline.
+- [x] B. Post-modal rename catch in EnforceAllowedDatatypeWhitelist: entry refresh + refresh after
+      picker/warn-only/term dialogs; replay condition isNew || renameCaught (Core's
+      IsAutoUniquifyRename baseline bridge decides Create-vs-Update for !isNew).
+- [x] C. _attrRecheckQueue + ScheduleAttributeRecheck + DrainAttributeRecheckQueue (MonitorTimer):
+      targeted live-vs-snapshot re-diff per attr ObjectId, routed through ProcessAttributeChanges.
+      Scheduled at Enforce exits, Core Step1/2 name writes, snapshot-advance sites, inline-edit close.
+- [x] D. Dialogs resolve LIVE name: picker path via entry refresh; "Naming standard applied"
+      re-reads before AND after the modal (Steps 2/3 continue with the live '__NNNN' name);
+      required-field label rebuilt per pass; Naming/Domain queue entries carry Attribute/ObjectId,
+      ShowConsolidatedPopup prints LiveColumnNameFor.
+- [x] E. Gate consistency: _datatypePickerShowing -> _validationModalShowing (+ShowValidationModal
+      wrapping warn-only + term dialogs); WindowMonitorTimer bails on _isProcessingChange/_isCheckingForChanges.
+- [x] F. Properties-pane / Model Explorer F2 coverage: Win32Helper.GetFocusedInlineEditText reads
+      the in-place editor's initial text on the OPEN edge; SelectInlineEditCandidates (pure, cap 8,
+      names before types, overflow logged) matches snapshots; close edge schedules rechecks.
+      KNOWN GAP: pane datatype edits via dropdown-only and Definition/Comment-only pane edits.
+
+## Verification
+- [x] Unit tests: InlineEditCandidateTests (5) - 549/549 total green
+- [x] Builds: DEV 0/0, PackagedBuild 0/0
+- [ ] Live repro (user): idle >30 s in picker until uniquify lands, confirm rule#1127 fires post-pick
+- [ ] Live repro (user): dialog texts show the live (uniquified) name
+- [ ] Live repro (user): Properties pane rename of existing column with digits triggers rules
+
+---
+
 # "Integrate" tab - environment promotion front-end (2026-06-22)
 
 Read-only runtime consumer of the admin-side Integrate feature. The user, with a

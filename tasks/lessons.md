@@ -4,6 +4,68 @@ A running log of corrections and non-obvious findings that future sessions
 should not have to rediscover. Each entry is a short rule, the reason, and
 how to apply it.
 
+## 2026-07-10: One flag must not drive both "which rules fire" and "does Cancel delete" - split them
+
+**Rule:** the `isNew`/`treatAsNew` flag was overloaded: it decided BOTH whether apply=Create
+naming rules fire AND whether a Required-popup Cancel DELETES the object (Create) or REVERTS the
+property (Update). The user's contract is that ANY real rename (manual Model Explorer F2 /
+Properties pane / Column Editor, not just erwin auto-uniquify) re-runs the naming chain on the new
+name. Naively setting the one flag true for renames would make Cancel DELETE a pre-existing
+column/table/view. So SPLIT into `revalidateAsNew` (validation scope) and `isNew`/`treatAsNew`
+(identity). Manual rename => revalidateAsNew=true (rule#1127 fires) but identity=false (Cancel
+reverts). The trigger is `NamingValidationEngine.RenameRequiresRevalidation(baseline, current,
+placeholderProbe)` - true only for a real, non-placeholder rename (not retroactive on an unchanged
+name).
+
+**Why:** columns go through `ValidateColumnNamingStandardCore`; tables AND views share
+`TableTypeMonitorService.ValidateNamingStandard` (one method, so split there once + thread a
+`revalidateAsNew` bool from the table heartbeat and view rename site). Before splitting, TRACE
+every use of the flag and classify each as validation-scope vs cancel/identity - a mis-classified
+site either deletes a user's object on Cancel or silently skips a rule.
+
+**How to apply:** never widen an identity/isNew flag to make a rule fire; add a separate
+validation-scope flag. Keep discard/Cancel gated on the identity flag. When one method serves
+several object kinds, split inside it and inject the per-kind placeholder probe.
+
+## 2026-07-10: A "coverage" claim needs an observer enumeration - name the input signal for EVERY edit path
+
+**Rule:** the inline-edit candidate mechanism (F) covers renames/retype via a Win32 "Edit"
+control, but a Properties-pane datatype change via DROPDOWN leaves no "Edit" focus, so it had NO
+observer. Closing that needed a selection-scoped fingerprint: read erwin's Overview-pane Static for
+the selected entity and fingerprint just that one entity each heartbeat. Cache the Static handle
+(one WM_GETTEXT/tick) and BACK OFF when it is not found, or a full child-window enumeration runs
+every second on the UI thread (the GetWindowText-hang class).
+
+**How to apply:** for each distinct edit gesture (typed edit, dropdown pick, drag, paste) ask
+"what signal fires?" If none, it is unobserved - do not claim coverage. Bound every new detector to
+a candidate set (one selected entity), never a model-wide walk.
+
+## 2026-07-09: State captured before a modal is STALE after it - re-read live, and pair every sync with a re-validation
+
+**Rule:** any modal in the validation pipeline pumps the message loop, and erwin's
+delayed commits (auto-uniquify '__NNNN' above all) can land during that pump while
+both timers are gated. Therefore: (1) never display or validate a snapshot name
+after a modal without a live re-read (`ReadLivePhysicalName`); (2) whenever you
+sync a snapshot to the live value you MUST also guarantee a validation runs on the
+refreshed value in the same flow - sync-without-validate silently absorbs the
+change forever (the 'Pre_Abc__1070' rule#1127 bypass), validate-without-sync
+re-fires forever.
+
+**Why:** the detection machinery is diff-based (snapshot vs live) with NO event
+source. Gating timers during modals is necessary for sequencing but creates a
+blind window; the only safe pattern is re-observe-at-the-boundary plus a deferred
+targeted recheck (`_attrRecheckQueue`) for commits that land even later. Also
+learned: a "coverage" claim needs an observer ENUMERATION - the heartbeat was
+count-only and the rename scan walked entities only, so existing-column edits from
+Model Explorer F2 / Properties pane had literally zero observers until the
+inline-edit-candidate mechanism was added.
+
+**How to apply:** new enforcement dialog? Wrap it in `ShowValidationModal`, call
+`RefreshNameAfterModal` after it, and make sure a naming replay covers the
+renameCaught case. New write of Physical_Name? `ScheduleAttributeRecheck` after
+the commit. Never add a detection path that walks the whole model - match against
+in-memory snapshots instead (SelectInlineEditCandidates pattern).
+
 ## 2026-06-22: A "forget the model / re-detect" reset MUST clear the COMPLETE disconnect state, not a convenient subset - and never trust an unverified invariant claim
 
 **Rule:** when you add a reset that pushes the form back to "disconnected" so a
@@ -1957,3 +2019,62 @@ the 2026-06-23 "positive confirmation before destructive action" lesson.
 - **A first fix that a unit test rejects is a gift - it means the root cause is elsewhere.** strip-once was a plausible fix for the double-strip symptom but the test proved the real cause was case-insensitivity. Write the test to the DESIRED OUTPUT ("UpdateDate" -> "UpdateDate"), not to the mechanism you're changing, so a wrong fix fails loudly.
 - **Case-insensitive substring/affix matching silently eats real words.** "date" is inside "Update", "log" inside "catalog", "id" inside "video". An affix token should match exact-case; the letters happening to appear inside an ordinary word are not the affix. Prefer Ordinal for affix add/strip.
 - **Trace the whole strip->reapply round-trip, not just the strip.** The bug needed BOTH the greedy strip AND the case-insensitive reapply guard to produce "UpDate"; fixing only one leaves it broken ("Update").
+
+## 2026-07-08 (2): erwin auto-uniquify rename ('Pre_Abc' -> 'Pre_Abc__1069') re-validated isNew=false, skipping Create rules
+
+**Symptom (Kursat, config #1012):** add a 2nd column "Abc" (a "Pre_Abc" already exists from the 1st). Prefix rule#1171 makes it "Pre_Abc"; erwin then UNIQUIFIES to "Pre_Abc__1069" (collision). The add-in DID re-validate the erwin-assigned name, but with isNew=FALSE, so the Create-scoped PascalCase rule#1127 was skipped and the digit/"__" name passed. User: "erwin ismi değiştirince, o zincirde kural kontrolleri baştan yapılmalı" + "not only columns - tables/views too".
+
+**Root cause:** the ONLY per-column brand-new signal (_pendingNamedAttrs / IsAttributePendingNew) is CONSUMED at the placeholder->real-name commit that happens moments earlier. When erwin then appends "__NNNN", ProcessAttributeChanges' physicalNameChanged branch calls ValidateColumnNamingStandard with default isNew=false, treatAsNew = false || IsAttributePendingNew(id)=false. Step 3 Physical_Name validation DOES run (silently - no log) but NamingValidationEngine.ValidateObjectName gates every rule via MatchesApplyOn(rule,isNew): apply=Create + isNew=false -> `continue` -> rule#1127 skipped. (apply=Both rule#1171 fires but is a no-op since 'Pre_Abc__1069' already starts with 'Pre_'.) NamingValidate log lines are Step 3b only; Physical_Name (Step 3) is silent, so its absence at 14:58:12 did NOT mean it was skipped - it ran, gated out.
+
+**Fix (general, all object types):** new pure `NamingValidationEngine.IsAutoUniquifyRename(prevName, newName)` = `newName == prevName + "__" + <digits>` (Ordinal). OR it into the isNew of every rename->validate site: column `ValidateColumnNamingStandardCore` treatAsNew (baselinePhysicalName vs state.PhysicalName - one place, covers all column paths); entity bridges (DiagramHeartbeatTick entityIsNew + ScanForRenamesEventDriven entityIsNew); view drift-rename branch (TableTypeMonitorService, prev = _keyGroupSnapshots["V_"+id]). So an erwin-assigned uniquify name re-validates as create and apply=Create rules re-fire. Tests: AutoUniquifyRenameTests (16 cases). 501 tests green.
+
+**Why isNew=true is safe here (not over-enforcement):** the uniquified name is derived from an ALREADY-prefixed/affixed name ('Pre_Abc' -> 'Pre_Abc__1069'), so Step-1 auto-apply Create affix rules are no-ops (the affix is already present) - only the VALIDATE Create rules (regex/length) newly fire, which is exactly the goal (catch the invalid '__NNNN' name). The '__<digits>' signature is specific enough that a deliberate user rename won't match; if one did, the name is invalid anyway so flagging is correct.
+
+**Lessons:**
+- **When erwin re-assigns a name AFTER our naming ran, re-validate it as a fresh create.** erwin's collision uniquify ('__NNNN') produces a name the user never chose; it must go through the same Create-rule gate a fresh name would. A signature check (name + '__' + digits) is the object-type-agnostic discriminator.
+- **A consumed "brand-new" flag leaves later same-gesture events mis-scoped.** _pendingNamedAttrs is drained at first name commit; any FURTHER auto-rename in the same gesture (erwin uniquify) then reads isNew=false. Don't rely solely on a one-shot pending flag for new-ness across a multi-step creation gesture - add an independent signal (here: the uniquify signature).
+- **Silent validation steps make logs misleading.** Physical_Name (Step 3) logs nothing; only Step 3b logs 'NamingValidate:'. The absence of a Physical_Name log line is NOT evidence the rule was skipped - confirm via the isNew gate, not the log.
+
+## 2026-07-08 (3): "OID" on a Log table skipped from glossary - predefined-column set was global, not entity-scoped
+
+**Symptom (Kursat, MetaRepoZeynep):** create a table, set TableClass UDP='Log', add column "OID" (NOT predefined for a Log table; it IS in the glossary). The add-in did NOT load glossary values for it. Log: `Physical name changed: LOG_LOG.<default> -> OID` then `Glossary validation skipped (predefined column): LOG_LOG.OID`. But OID is predefined only for TableClass='Parametre' (`ApplyPredefined(UDP 'TableClass'='Parametre'): added 'OID'`).
+
+**Root cause:** `GetPredefinedColumnNames(dynamic entity)` IGNORED its entity arg and returned `PredefinedColumnService.GetAll()` - EVERY predefined column across ALL table classes. So "OID" (gated on TableClass='Parametre') was in the set for a 'Log' table too, and `ValidateGlossary`'s skip `predefinedColumnNames.Contains(state.PhysicalName)` (the ONLY consumer) skipped it. The set that is treated as predefined did not match the set ApplyPredefined actually adds (which IS entity-scoped by the DEPENDS_ON_UDP condition).
+
+**Fix:** new `PredefinedColumnService.GetApplicableNames(entity)` = unconditional rows + conditional rows whose `Entity.Physical.{DependsOnUdpName}` == `DependsOnUdpValue` (same applicability as ApplyPredefined / FindApplicableLockedRule). Extracted a pure static core `GetApplicableNames(columns, readUdp)` (unit-tested, UDP read once per distinct name) + a `ReadEntityUdp` COM helper. `GetPredefinedColumnNames` now calls it. So OID counts as predefined only on a Parametre table; on a Log table it is a normal column and gets glossary. Tests: PredefinedColumnApplicabilityTests (6). 507 tests green.
+
+**Lessons:**
+- **A "predefined/auto-added column" set MUST be scoped by the same condition that adds it.** ApplyPredefined adds columns per TableClass (DEPENDS_ON_UDP); any set derived from "predefined" (glossary-skip, naming-exempt) must apply the SAME per-entity condition, never a global GetAll(). A name colliding across table classes ("OID") exposes the leak.
+- **A method that takes `entity` but ignores it is a red flag.** GetPredefinedColumnNames(entity) never touched entity - the scoping was silently global. When a per-object method doesn't read the object, suspect a missing scope.
+
+## 2026-07-08 (4): datatype picker + naming Required dialog overlapped (WindowMonitorTimer_Tick missed the _isProcessingChange gate)
+
+**Symptom (Kursat):** after the uniquify-rename fix [2026-07-08(2)] correctly made rule#1127 fire on 'Pre_Abc__1069', the "Datatype not allowed" picker and the naming "Required field" dialog appeared STACKED (should be sequential). Log: `AllowedDatatype ... forced to 'varchar(1)'` (picker shown) then, while it was up, `renamed to 'Pre_Abc__1069' during inline-edit` -> `NamingValidate isNew=True` -> 2nd modal on top.
+
+**Root cause:** EnforceAllowedDatatypeWhitelist shows its picker while `_isProcessingChange` is set (by ProcessNewAttribute/ProcessAttributeChanges), and the modal pumps the message loop. `MonitorTimer_Tick` gates on `_isProcessingChange` (bails), but `WindowMonitorTimer_Tick` (the 100ms timer that runs the inline-edit-close -> ValidateCommittedPendingAttrs -> naming path) gated on `_lockedDialogShowing`/`_columnNamingCheckInProgress`/`_scopedCheckInProgress` but NOT `_isProcessingChange`. So while the picker pumped, WindowMonitorTimer re-entered, detected erwin's uniquify inline-edit edge, and stacked the naming Required popup on top. The datatype picker sets none of the naming guards - only `_isProcessingChange` covers it. (My uniquify fix surfaced this: before it, the isNew=false re-validate showed no naming modal, so nothing stacked.)
+
+**Fix (v1 insufficient -> v2 dedicated flag):** v1 added `if (_isProcessingChange) return;` to WindowMonitorTimer_Tick - STILL overlapped in the field. Reason: the picker is ALSO shown from ValidateCommittedPendingAttrs -> Enforce (3865) AFTER ProcessAttributeChanges already reset _isProcessingChange to false, so that flag is not reliably set while the picker is up. v2 = a DEDICATED `_datatypePickerShowing` flag set for the ENTIRE `AllowedDatatypePickerForm.Show` (try/finally so an exception can't wedge it), checked in BOTH timer entry gates (MonitorTimer + WindowMonitorTimer). Placed before any window-edge state is read so the inline-edit-close edge survives and the naming dialog fires SEQUENTIALLY on the next tick after the picker closes. (The naming Comment/Required dialog was already covered by `_columnNamingCheckInProgress`; only the datatype picker lacked a guard.)
+
+**Lessons:**
+- **A shared in-flight flag is NOT a reliable modal guard - use a dedicated flag scoped to the modal's Show.** `_isProcessingChange` looked like it covered the picker, but the picker outlives / is shown outside that flag's frame on one call path (Enforce from the pending-commit path, after ProcessAttributeChanges reset it). Guard a modal with a flag set exactly around its Show (try/finally), not with a coarse "am I processing" flag.
+- **Every modal-showing path needs its OWN re-entrancy guard checked by ALL timers.** Naming modals set `_columnNamingCheckInProgress`/`_scopedCheckInProgress`; the datatype picker set nothing of its own. When adding a modal, give it a dedicated flag and verify EVERY timer bails on it.
+- **Enabling a previously-skipped modal can expose a latent stacking bug.** The uniquify fix didn't create the gap; it made a second modal actually appear, revealing the picker never had a guard. Re-check re-entrancy whenever you make a dialog fire in a new situation.
+- **Bail BEFORE mutating edge state** so a deferred tick re-detects the edge; a level-triggered `_wasXOpen` compared to the live state survives the bail and fires next tick.
+
+## 2026-07-09: Datatype Library picker was term-type-blind - it let the user override a BUSINESS_TERM lock
+
+**Symptom (Kursat):** column mapped to a glossary Business term (type fully fixed). User changes its type -> term policy correctly REVERTS + warns -> but then the whitelist picker opens and lets the user pick ANY allowed type ('user picked NUMBER(45)' on a VARCHAR2(250 CHAR) Business column) - silently defeating the term lock. User spec: the picker's type combo must be enabled/disabled per the term type's base-changeability, the parameter field per the length-changeability.
+
+**Mechanism (log+code proven):** (1) EnforceTermTypePolicy reverts and shows a MODAL; while the modal pumps, erwin's delayed 2nd combo-commit re-writes the disallowed value. (2) EnforceAllowedDatatypeWhitelist runs next, deliberately live-reads (sees the re-committed value), and shows the picker - it never read curr.TermTypeCanonical. (3) The pick is written unconditionally and curr.PhysicalDataType advanced, so baseline==live and the term policy never re-fires. Lock semantics (from EnforceTermTypePolicy): BUSINESS_TERM = base+length locked; AMORPH_DATA_TYPE = base free/length locked; AMORPH_DATA_LENGTH = base locked/length free; AMORPH/null/unknown = free.
+
+**Fix:**
+- New pure `TermTypeLocks` (single source): `Get(canonical) -> (lockBase, lockLength)` + `Honors(candidate, authoritative, lockBase, lockLength)` (base OrdinalIgnoreCase, length Ordinal - mirrors the policy). Unit-tested (25 cases incl. the live NUMBER(45) override).
+- Enforce now derives locks from `curr.TermTypeCanonical` (already on the snapshot; no DB read). Authoritative value = prev.PhysicalDataType, else glossary cache (`GetGlossaryAuthoritativeDatatype` -> GetUdpValues PHYSICAL_DATA_TYPE) for the prev==null new-column sites.
+- Term lock overrides the automatic target: a locked column snaps back to the term-authoritative value EVEN if that value is not whitelist-allowed (glossary/whitelist disagreement = admin-data conflict; the add-in must not "fix" it by mutating a locked type - warn instead).
+- BUSINESS_TERM (or locked base not representable in the whitelist combo): NO picker at all - nothing is choosable; one warn-only dialog explains the type is fixed (+ admin note on conflict). Authoritative value remembered in _allowedDatatypeUserPicks so the delayed duplicate commit re-enforces it silently.
+- Partial locks: picker opens with the locked half pinned+disabled - `lockType` disables the combo (pinned to the authoritative base via preselect), `lockParam` disables the parameter field (pinned via prefill); message notes what is fixed. Remembered-pick re-enforcement now vetted by `TermTypeLocks.Honors` so a stale pre-fix pick cannot resurrect an override.
+
+**Lessons:**
+- **Two enforcement machines over the same property MUST share the constraint model.** Term policy and whitelist enforcement each "owned" Physical_Data_Type; the second one's UI (picker) could undo the first one's decision because it did not know the constraint existed. Any corrective UI must be gated by ALL constraints on the value, not just its own.
+- **A corrective modal that lets the user choose is itself a write path.** Auditing writes for policy compliance must include values coming back from dialogs (the pick write was unconditional).
+- **"Reverted + snapshot advanced" hides later overrides.** Advancing the baseline to the picker's value made the term policy permanently blind to the override. When one machine advances a shared baseline, ask which OTHER machine loses its trigger.

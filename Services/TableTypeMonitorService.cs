@@ -1690,9 +1690,19 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     }
                                     else
                                     {
-                                        // Genuine drift rename of an already-
-                                        // committed view (Update context).
-                                        ValidateNamingStandard("View", viewName, view);
+                                        // Genuine drift rename of an already-committed view (Update
+                                        // context) - UNLESS it is an erwin AUTO-UNIQUIFY ('Foo' ->
+                                        // 'Foo__1' on a name collision), an erwin-assigned name that
+                                        // must be re-validated as create so apply=Create rules re-fire
+                                        // on the '__NNNN' name (same fix as columns/tables). The
+                                        // snapshot still holds the previous name (updated just below).
+                                        string prevViewName = _keyGroupSnapshots.TryGetValue("V_" + viewId, out var pvn) ? pvn : "";
+                                        bool viewFromUniquify = NamingValidationEngine.IsAutoUniquifyRename(prevViewName, viewName);
+                                        // 2026-07-10: a MANUAL view rename must re-run apply=Create rules on the new
+                                        // name (identity stays isNew=false so Cancel reverts, not deletes the view).
+                                        bool viewRevalidate = viewFromUniquify
+                                            || NamingValidationEngine.RenameRequiresRevalidation(prevViewName, viewName, IsPlaceholderViewName);
+                                        ValidateNamingStandard("View", viewName, view, isNew: viewFromUniquify, revalidateAsNew: viewRevalidate);
                                         _keyGroupSnapshots["V_" + viewId] = viewName;
                                         if (!_viewWatchedProperties.TryGetValue(viewId, out var refreshBucket))
                                         {
@@ -1967,6 +1977,42 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
             return false;
         }
+
+        /// <summary>
+        /// Entity/table placeholder-name test, mirrors ValidationCoordinatorService's own
+        /// IsPlaceholderEntityName (kept in sync deliberately): erwin's "E/&lt;digits&gt;" diagram
+        /// auto-name, "&lt;default&gt;", and our "PLEASE CHANGE IT" auto-apply placeholder are NOT
+        /// real user names, so a rename FROM one of them is a creation commit (handled by the
+        /// identity flag), not a rename that <see cref="NamingValidationEngine.RenameRequiresRevalidation"/>
+        /// should treat as a re-validate trigger.
+        /// </summary>
+        private static bool IsPlaceholderEntityName(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return true;
+            if (name.Equals("<default>", StringComparison.OrdinalIgnoreCase)) return true;
+            if (name.StartsWith("<default>", StringComparison.OrdinalIgnoreCase)) return true;
+            if (name.StartsWith("PLEASE CHANGE IT", StringComparison.OrdinalIgnoreCase)) return true;
+            if (name.StartsWith("PLEASE_CHANGE_IT", StringComparison.OrdinalIgnoreCase)) return true;
+            if (name.Length >= 3 && name[0] == 'E' && name[1] == '/')
+            {
+                bool allDigits = true;
+                for (int i = 2; i < name.Length; i++)
+                {
+                    if (!char.IsDigit(name[i])) { allDigits = false; break; }
+                }
+                if (allDigits) return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Placeholder test dispatched by object type: views use the "V/&lt;digits&gt;" pattern,
+        /// tables/entities the "E/&lt;digits&gt;" pattern. Used by the rename-revalidation gate.
+        /// </summary>
+        private static bool IsPlaceholderNameForObjectType(string objectType, string name)
+            => string.Equals(objectType, "View", StringComparison.OrdinalIgnoreCase)
+                ? IsPlaceholderViewName(name)
+                : IsPlaceholderEntityName(name);
 
         /// <summary>
         /// Commit edge for deferred new views (2026-06-14): fire the full
@@ -2683,7 +2729,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// Column-Editor-open transition for the parent entity (Glossary-style
         /// scoped check on the table currently in focus).
         /// </summary>
-        internal void ValidateNamingStandard(string objectType, string physicalName, dynamic scapiObject = null, bool isNew = false, IDictionary<string, string> baselineOverride = null)
+        internal void ValidateNamingStandard(string objectType, string physicalName, dynamic scapiObject = null, bool isNew = false, IDictionary<string, string> baselineOverride = null, bool revalidateAsNew = false)
         {
             if (!NamingStandardService.Instance.IsLoaded) return;
 
@@ -2754,16 +2800,34 @@ namespace EliteSoft.Erwin.AddIn.Services
             // breaks the LINQ lambdas inside the engine — see CheckEntityKeyGroups for prior art).
             object scapiBoxed = scapiObject;
 
+            // 2026-07-10: split isNew into IDENTITY (Cancel deletes vs reverts) and VALIDATION
+            // SCOPE (should apply=Create rules fire). The user's contract is that ANY real rename
+            // re-validates the new name against apply=Create rules (rule#1127 no-digits etc.), not
+            // just erwin's auto-uniquify. `revalidateAsNew` drives every ApplyNamingStandards /
+            // ValidateObjectName / AutoApplyNamingForProperty below; the original `isNew` keeps
+            // driving cancelMode + Discard-vs-Revert, so a Required-popup Cancel on a MANUAL rename
+            // of a pre-existing table/view REVERTS the name instead of deleting the object (the
+            // trap the two flags being one would spring). Callers that detect a rename but have no
+            // snapshot baseline (the table heartbeat) pass revalidateAsNew=true explicitly; we ALSO
+            // detect it here whenever a real baseline is available (editor-open baselineOverride /
+            // _entitySnapshots), so entity/view-editor renames are covered for free. Not
+            // retroactive: false when the name is unchanged.
+            revalidateAsNew = revalidateAsNew || isNew
+                || NamingValidationEngine.RenameRequiresRevalidation(
+                       baselinePhysicalName, physicalName, n => IsPlaceholderNameForObjectType(objectType, n));
+            if (revalidateAsNew && !isNew)
+                Log($"ValidateNamingStandard: '{objectType}' rename '{baselinePhysicalName}' -> '{physicalName}' - re-running apply=Create rules (Cancel still reverts, not deletes)");
+
             // Step 1: silently apply AUTO_APPLY=true rules to the object's
             // primary name (Physical_Name). Property codes other than
             // Physical_Name (e.g. View.Name, which has no Physical_Name
             // accessor) are auto-applied per-property in the Step 3b loop.
-            physicalName = AutoApplyNamingForProperty(objectType, "Physical_Name", physicalName, scapiObject, isNew);
+            physicalName = AutoApplyNamingForProperty(objectType, "Physical_Name", physicalName, scapiObject, revalidateAsNew);
 
             // Step 2: ask user about AUTO_APPLY=false rules that would still change the name
             if (scapiBoxed != null)
             {
-                string afterAll = NamingValidationEngine.ApplyNamingStandards(objectType, physicalName, scapiBoxed, autoOnly: false, isNew: isNew);
+                string afterAll = NamingValidationEngine.ApplyNamingStandards(objectType, physicalName, scapiBoxed, autoOnly: false, isNew: revalidateAsNew);
                 if (!string.Equals(afterAll, physicalName, StringComparison.Ordinal))
                 {
                     // Don't re-ask the IDENTICAL suggestion the user already declined
@@ -2837,7 +2901,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 catch { }
             }
 
-            var results = NamingValidationEngine.ValidateObjectName(objectType, nameToValidate, scapiBoxed, isNew: isNew);
+            var results = NamingValidationEngine.ValidateObjectName(objectType, nameToValidate, scapiBoxed, isNew: revalidateAsNew);
             var failures = results.Where(r => !r.IsValid).ToList();
 
             // Step 3b (2026-05-16): the admin can author rules on any
@@ -2891,12 +2955,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // suffix is never added and the un-suffixed name escalates
                     // to the Required-input popup because Name also carries a
                     // required regexp rule (user-reported 2026-06-13).
-                    string autoApplied = AutoApplyNamingForProperty(objectType, propertyCode, propValue, scapiObject, isNew);
+                    string autoApplied = AutoApplyNamingForProperty(objectType, propertyCode, propValue, scapiObject, revalidateAsNew);
                     if (!string.Equals(autoApplied, propValue, StringComparison.Ordinal))
                         propValue = autoApplied;
 
                     var extraResults = NamingValidationEngine.ValidateObjectName(
-                        objectType, propValue, scapiBoxed, propertyCode, isNew: isNew);
+                        objectType, propValue, scapiBoxed, propertyCode, isNew: revalidateAsNew);
                     failures.AddRange(extraResults.Where(r => !r.IsValid));
                 }
             }
@@ -3201,7 +3265,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                             catch { liveValue = currentTyped; }
 
                             var freshResults = NamingValidationEngine.ValidateObjectName(
-                                objectType, liveValue, scapiBoxed, rf.Rule.PropertyCode, isNew: isNew);
+                                objectType, liveValue, scapiBoxed, rf.Rule.PropertyCode, isNew: revalidateAsNew);
                             var freshFailure = freshResults?.FirstOrDefault(r => !r.IsValid);
                             if (freshFailure == null)
                             {

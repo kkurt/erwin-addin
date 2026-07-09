@@ -180,6 +180,33 @@ namespace EliteSoft.Erwin.AddIn.Services
             return string.Equals(sb.ToString(), "Edit", StringComparison.Ordinal);
         }
 
+        /// <summary>
+        /// Text of the in-place Win32 "Edit" control erwin's UI thread currently has focus on,
+        /// or null when no inline edit is active. Same focus probe as
+        /// <see cref="IsInlineEditActive"/>; XTPPropertyGrid's in-place cell editor is also a
+        /// plain "Edit", so this covers Properties-pane edits too. Read at the inline-edit OPEN
+        /// edge the text is the OLD value being edited, which is what the validation coordinator
+        /// matches against its snapshots to identify the edited attribute (2026-07-09). Uses the
+        /// non-hanging text read (SendMessageTimeout) - a blocking GetWindowText on a same-process
+        /// cross-thread window can deadlock the UI thread.
+        /// </summary>
+        public static string GetFocusedInlineEditText(IntPtr erwinHwnd)
+        {
+            if (erwinHwnd == IntPtr.Zero) return null;
+            uint erwinThreadId = GetWindowThreadProcessId(erwinHwnd, out _);
+            if (erwinThreadId == 0) return null;
+
+            var gti = new GUITHREADINFO { cbSize = Marshal.SizeOf<GUITHREADINFO>() };
+            if (!GetGUIThreadInfo(erwinThreadId, ref gti)) return null;
+            if (gti.hwndFocus == IntPtr.Zero) return null;
+
+            var sb = new StringBuilder(64);
+            int len = GetClassName(gti.hwndFocus, sb, sb.Capacity);
+            if (len <= 0 || !string.Equals(sb.ToString(), "Edit", StringComparison.Ordinal)) return null;
+
+            return GetWindowTextNoHang(gti.hwndFocus);
+        }
+
         [DllImport("user32.dll")]
         private static extern bool IsWindowEnabled(IntPtr hWnd);
 
@@ -1045,6 +1072,56 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
 
             return result;
+        }
+
+        [DllImport("user32.dll")]
+        private static extern bool IsWindow(IntPtr hWnd);
+
+        /// <summary>True when the handle still refers to a live window (cheap, no message sent).</summary>
+        public static bool IsWindowValid(IntPtr hWnd) => hWnd != IntPtr.Zero && IsWindow(hWnd);
+
+        /// <summary>
+        /// Finds and returns the handle of the Overview-pane Static window that shows the
+        /// "MODELNAME (ENTITY_NAME)" selection text (or just "MODELNAME" when nothing is
+        /// selected). The handle is STABLE while the Overview pane lives, so callers cache it and
+        /// re-read its text each tick via <see cref="GetWindowTextNoHang"/> - one WM_GETTEXT
+        /// instead of a full child-window enumeration every poll (2026-07-10). Returns Zero if
+        /// not found. Text reads are timeout-bounded, so a hung child cannot freeze the UI thread.
+        /// </summary>
+        public static IntPtr FindDiagramSelectionStatic(IntPtr erwinHwnd, string modelName)
+        {
+            if (erwinHwnd == IntPtr.Zero || string.IsNullOrEmpty(modelName)) return IntPtr.Zero;
+            string modelUpper = modelName.ToUpperInvariant();
+            foreach (var cw in EnumAllChildWindows(erwinHwnd))
+            {
+                if (cw.ClassName != "Static" || string.IsNullOrEmpty(cw.Text)) continue;
+                if (cw.Text.Trim().StartsWith(modelUpper, StringComparison.OrdinalIgnoreCase))
+                    return cw.Handle;
+            }
+            return IntPtr.Zero;
+        }
+
+        /// <summary>
+        /// Parses the Overview-pane selection text ("MODELNAME (ENTITY_NAME)") into the single
+        /// selected entity name. Returns null when nothing is selected (no parentheses), when the
+        /// text is a multi-select count ("N objects"), or when several names are listed - i.e.
+        /// only a single, unambiguous entity selection yields a name.
+        /// </summary>
+        public static string ParseSelectedEntityFromOverviewText(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return null;
+            text = text.Trim();
+            int parenStart = text.IndexOf('(');
+            int parenEnd = text.LastIndexOf(')');
+            if (parenStart <= 0 || parenEnd <= parenStart) return null;
+            string inside = text.Substring(parenStart + 1, parenEnd - parenStart - 1).Trim();
+            if (string.IsNullOrEmpty(inside)) return null;
+            if (inside.EndsWith("objects", StringComparison.OrdinalIgnoreCase)
+                || inside.EndsWith("object", StringComparison.OrdinalIgnoreCase)) return null;
+            var parts = inside.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length != 1) return null;
+            string single = parts[0].Trim();
+            return string.IsNullOrEmpty(single) ? null : single;
         }
 
         #endregion

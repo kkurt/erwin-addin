@@ -144,6 +144,41 @@ namespace EliteSoft.Erwin.AddIn.Services
         // per-process, not persisted.
         private volatile bool _lockedDialogShowing;
 
+        // True for the entire lifetime of ANY enforcement modal in the datatype/term-type
+        // pipeline (the "Datatype not allowed" picker plus its warn-only siblings and the
+        // "Term Type Constraint" dialog). Those modals pump the message loop, so both timers
+        // must bail while one is up or a re-entrant tick stacks a naming Required popup ON TOP
+        // of it (2026-07-08, generalized 2026-07-09). Unlike the naming guards, these dialogs
+        // set NONE of _columnNamingCheckInProgress/_scopedCheckInProgress, and they can be shown
+        // from a path where _isProcessingChange is already false (ValidateCommittedPendingAttrs
+        // -> Enforce, after ProcessAttributeChanges reset it), so a DEDICATED flag is the only
+        // reliable guard. Set via ShowValidationModal / try-finally around the picker Show.
+        private volatile bool _validationModalShowing;
+
+        // Post-gesture attribute recheck queue (2026-07-09). erwin commits some writes on a
+        // DELAYED transaction - most notably the auto-uniquify rename ('Pre_Abc' ->
+        // 'Pre_Abc__1070') that follows a name collision - and that commit can land while one
+        // of our modals pumps (both timers gated) or AFTER the gesture drained the pending-new
+        // signal. At that point NOTHING re-observes the attribute: the heartbeat is count-only
+        // (a rename has no count delta) and ScanForRenamesEventDriven walks entities only, so
+        // the snapshot-vs-live drift sat unread forever and Name rules (e.g. a no-digits
+        // Regexp) never ran on the '__NNNN' name (user bug 2026-07-09, 'Pre_Abc__1070').
+        // Every site that writes/validates a name schedules the attribute here; MonitorTimer
+        // drains due entries and routes any drift through the NORMAL ProcessAttributeChanges
+        // machinery. Key = attribute ObjectId (dedup), value = owning table + due time.
+        private readonly Dictionary<string, (string TableName, DateTime DueUtc)> _attrRecheckQueue =
+            new Dictionary<string, (string, DateTime)>(StringComparer.Ordinal);
+
+        // Inline-edit recheck candidates (2026-07-09): attributes whose snapshot matched the
+        // TEXT the user started editing in-place (Model Explorer F2 / Properties-pane grid -
+        // both use a plain Win32 'Edit', see Win32Helper.IsInlineEditActive). Captured on the
+        // inline-edit OPEN edge from in-memory snapshots only (no SCAPI walk), scheduled into
+        // _attrRecheckQueue on the CLOSE edge. This is what makes an EXISTING column's rename /
+        // retype from the Properties pane or Model Explorer visible at all - neither has any
+        // other observer (no editor open, no count delta).
+        private readonly List<(string ObjectId, string TableName)> _inlineEditRecheckCandidates =
+            new List<(string, string)>();
+
         // De-duplication for locked-column dialogs (2026-05-25). Multiple
         // detection paths (close-edge re-evaluate, heartbeat attrsShrunk
         // restore, scan rename) can race for the same column-action pair
@@ -243,14 +278,17 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// (via the comparer) keeps the set deduplicated across multiple
         /// ticks that observed the same pending entity.
         /// </summary>
-        private readonly HashSet<(string Name, bool IsNew)> _pendingTableNamingChecks =
-            new HashSet<(string, bool)>(new PendingNamingCheckComparer());
+        // Tuple carries IsNew (identity: Cancel deletes vs reverts) AND Revalidate (2026-07-10:
+        // should apply=Create rules re-fire, true for any real rename). The comparer dedupes by
+        // Name only, so the first-queued flags win for a given entity within a flush window.
+        private readonly HashSet<(string Name, bool IsNew, bool Revalidate)> _pendingTableNamingChecks =
+            new HashSet<(string, bool, bool)>(new PendingNamingCheckComparer());
 
-        private sealed class PendingNamingCheckComparer : IEqualityComparer<(string Name, bool IsNew)>
+        private sealed class PendingNamingCheckComparer : IEqualityComparer<(string Name, bool IsNew, bool Revalidate)>
         {
-            public bool Equals((string Name, bool IsNew) x, (string Name, bool IsNew) y) =>
+            public bool Equals((string Name, bool IsNew, bool Revalidate) x, (string Name, bool IsNew, bool Revalidate) y) =>
                 string.Equals(x.Name, y.Name, StringComparison.OrdinalIgnoreCase);
-            public int GetHashCode((string Name, bool IsNew) obj) =>
+            public int GetHashCode((string Name, bool IsNew, bool Revalidate) obj) =>
                 obj.Name == null ? 0 : StringComparer.OrdinalIgnoreCase.GetHashCode(obj.Name);
         }
 
@@ -1178,7 +1216,7 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         private void MonitorTimer_Tick(object sender, EventArgs e)
         {
-            if (_sessionLost || !_isMonitoring || _disposed || _isProcessingChange || _validationSuspended || _isCheckingForChanges || _columnNamingCheckInProgress || _scopedCheckInProgress) return;
+            if (_sessionLost || !_isMonitoring || _disposed || _isProcessingChange || _validationSuspended || _isCheckingForChanges || _columnNamingCheckInProgress || _scopedCheckInProgress || _validationModalShowing) return;
             // 2026-05-25: while a locked-column dialog is up, skip the
             // entire heartbeat. SCAPI walks during the dialog's nested
             // message pump otherwise hog the UI thread and block OK
@@ -1254,6 +1292,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                     return; // resume normal scanning on the next tick
                 }
 
+                // Post-gesture recheck drain (2026-07-09): targeted live-vs-snapshot re-diff of
+                // attributes whose gesture may have raced one of erwin's DELAYED commits (auto-
+                // uniquify rename during/after a modal). Runs in BOTH modes (editor open or not);
+                // when the Column Editor is open the scoped scan below covers the same entity, so
+                // a drained entry simply no-ops on the already-advanced snapshot.
+                DrainAttributeRecheckQueue(modelObjects, root);
+
                 // Phase-2D (2026-05-06): scoped per-table path is the ONLY path.
                 // When a Column Editor is open, scan that one entity. The first time
                 // the table is touched in this session, do a silent populate of just
@@ -1323,6 +1368,16 @@ namespace EliteSoft.Erwin.AddIn.Services
                 {
                     _heartbeatTickCounter = 0;
                     DiagramHeartbeatTick(modelObjects, root);
+
+                    // Selection-scoped fingerprint (2026-07-10): the count-only heartbeat above
+                    // cannot see a Physical_Data_Type change on an EXISTING column that the user
+                    // makes purely via the Properties-pane dropdown (no "Edit" control focus, so
+                    // the inline-edit candidate mechanism never captures it - the one gap left
+                    // after the F fix). erwin's Overview pane exposes the currently-selected
+                    // entity; fingerprint just that ONE entity's columns each heartbeat so a
+                    // pane/combo datatype or name edit is caught within ~1 s. Bounded to the
+                    // single selected entity - never a model-wide walk.
+                    SelectionScopedAttributeCheck(modelObjects, root);
                 }
             }
             catch (COMException) { HandleSessionLost(); }
@@ -1584,7 +1639,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // Required-property prompts that fire from
                 // OnNewEntityDetected already get Create mode; threading
                 // the same flag here keeps the popup family consistent.
-                var entitiesToNamingCheck = new List<(string name, bool isNew)>();
+                var entitiesToNamingCheck = new List<(string name, bool isNew, bool revalidate)>();
 
                 foreach (dynamic entity in entityCollection)
                 {
@@ -1746,7 +1801,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                             }
                             else
                             {
-                                entitiesToNamingCheck.Add((displayName, isNew: true));
+                                entitiesToNamingCheck.Add((displayName, isNew: true, revalidate: true));
                                 Log($"[NAMING] newly seen entity '{displayName}' - queuing naming check (isNew)");
                                 FireNewEntityPipeline(entity, displayName);
                             }
@@ -1780,13 +1835,24 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 // drained - keeps Create-only rules alive whose condition
                                 // (Owner/Schema) is filled during Required-UDP after the
                                 // first check (see the inline-edit-close scan bridge).
+                                // erwin auto-uniquify ('Foo' -> 'Foo__1' on a name collision) is an
+                                // erwin-assigned name, not a user rename: re-validate as create so
+                                // apply=Create rules re-fire on the '__NNNN' name (same fix as columns).
                                 bool entityIsNew = wasPending
                                     || _creationGestureEntityIds.Contains(entityId)
                                     || _creationCascadeEntityIds.Contains(entityId)
-                                    || IsPlaceholderEntityName(prevDisplayName);
+                                    || IsPlaceholderEntityName(prevDisplayName)
+                                    || NamingValidationEngine.IsAutoUniquifyRename(prevDisplayName, displayName);
 
-                                entitiesToNamingCheck.Add((displayName, entityIsNew));
-                                Log($"[NAMING] entity renamed '{prevDisplayName}' -> '{displayName}' - queuing naming check (isNew={entityIsNew})");
+                                // 2026-07-10: a MANUAL table rename (real prev name, not an
+                                // erwin/placeholder auto-name) must re-run apply=Create naming rules
+                                // on the new name - but identity stays isNew=false so a Required-popup
+                                // Cancel REVERTS the name, it does NOT delete the pre-existing table.
+                                bool entityRevalidate = entityIsNew
+                                    || NamingValidationEngine.RenameRequiresRevalidation(prevDisplayName, displayName, IsPlaceholderEntityName);
+
+                                entitiesToNamingCheck.Add((displayName, entityIsNew, entityRevalidate));
+                                Log($"[NAMING] entity renamed '{prevDisplayName}' -> '{displayName}' - queuing naming check (isNew={entityIsNew}, revalidate={entityRevalidate})");
 
                                 if (wasPending)
                                 {
@@ -1954,18 +2020,18 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // _pendingTableNamingChecks; the editor-close transition
                 // handler in WindowMonitorTimer_Tick drains them.
                 bool editorOpen = IsColumnEditorOpen() || IsEntityEditorOpen(out _);
-                foreach (var (entityName, entityIsNew) in entitiesToNamingCheck)
+                foreach (var (entityName, entityIsNew, entityRevalidate) in entitiesToNamingCheck)
                 {
                     if (editorOpen)
                     {
-                        // Keep the isNew flag on the deferred entry so the
-                        // editor-close flush can still pick "Discard New
-                        // Table" over "Revert Change".
-                        if (_pendingTableNamingChecks.Add((entityName, entityIsNew)))
-                            Log($"DiagramHeartbeat: deferring naming check on '{entityName}' (editor open, isNew={entityIsNew})");
+                        // Keep the isNew AND revalidate flags on the deferred entry so the
+                        // editor-close flush can still pick "Discard New Table" over "Revert
+                        // Change" (isNew) and re-run apply=Create rules on a rename (revalidate).
+                        if (_pendingTableNamingChecks.Add((entityName, entityIsNew, entityRevalidate)))
+                            Log($"DiagramHeartbeat: deferring naming check on '{entityName}' (editor open, isNew={entityIsNew}, revalidate={entityRevalidate})");
                         continue;
                     }
-                    try { RunScopedTableNamingCheck(entityName, isNew: entityIsNew); }
+                    try { RunScopedTableNamingCheck(entityName, isNew: entityIsNew, revalidateAsNew: entityRevalidate); }
                     catch (Exception ex) { Log($"DiagramHeartbeat: naming check err for '{entityName}': {ex.Message}"); }
                 }
             }
@@ -2496,9 +2562,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // the settle check ran isNew=false and Create rules whose condition
                     // only just became true (SCHEMA.Name=DM) never fired (Furkan rule#1175).
                     bool fromPlaceholder = IsPlaceholderEntityName(oldName);
-                    bool entityIsNew = wasPending || inCreationGesture || fromPlaceholder;
+                    // erwin auto-uniquify ('Foo' -> 'Foo__1') is an erwin-assigned name: re-validate
+                    // as create so apply=Create rules re-fire on the '__NNNN' name (same fix as columns).
+                    bool fromUniquify = NamingValidationEngine.IsAutoUniquifyRename(oldName, newName);
+                    bool entityIsNew = wasPending || inCreationGesture || fromPlaceholder || fromUniquify;
                     if (entityIsNew)
-                        Log($"  rename '{oldName}' -> '{newName}' is placeholder commit (wasPending={wasPending}, inCreationGesture={inCreationGesture}, fromPlaceholder={fromPlaceholder}) - treating as new-entity creation flow (isNew=true)");
+                        Log($"  rename '{oldName}' -> '{newName}' is placeholder commit (wasPending={wasPending}, inCreationGesture={inCreationGesture}, fromPlaceholder={fromPlaceholder}, fromUniquify={fromUniquify}) - treating as new-entity creation flow (isNew=true)");
 
                     try { RunScopedTableNamingCheck(newName, isNew: entityIsNew); }
                     catch (Exception ex) { Log($"ScanForRenamesEventDriven scoped check err for '{newName}': {ex.Message}"); }
@@ -2851,10 +2920,10 @@ namespace EliteSoft.Erwin.AddIn.Services
             if (_pendingTableNamingChecks.Count == 0) return;
             var queued = _pendingTableNamingChecks.ToArray();
             _pendingTableNamingChecks.Clear();
-            Log($"Editor close: flushing {queued.Length} deferred naming check(s): {string.Join(", ", queued.Select(q => $"{q.Name}(isNew={q.IsNew})"))}");
-            foreach (var (entityName, isNew) in queued)
+            Log($"Editor close: flushing {queued.Length} deferred naming check(s): {string.Join(", ", queued.Select(q => $"{q.Name}(isNew={q.IsNew},revalidate={q.Revalidate})"))}");
+            foreach (var (entityName, isNew, revalidate) in queued)
             {
-                try { RunScopedTableNamingCheck(entityName, isNew: isNew); }
+                try { RunScopedTableNamingCheck(entityName, isNew: isNew, revalidateAsNew: revalidate); }
                 catch (Exception ex) { Log($"FlushPendingTableNamingChecks: err for '{entityName}': {ex.Message}"); }
             }
         }
@@ -2877,6 +2946,26 @@ namespace EliteSoft.Erwin.AddIn.Services
             // re-enters, validates the just-added columns, and stacks a column
             // Required-field popup ON TOP of the table modal (before its OK).
             if (_scopedCheckInProgress) return;
+
+            // 2026-07-08: same hazard for the DATATYPE picker. EnforceAllowedDatatypeWhitelist's
+            // "Datatype not allowed" modal pumps the loop but sets NONE of the naming guards above,
+            // so without this the tick re-enters, detects erwin's auto-uniquify rename inline-edit
+            // edge, and stacks a column naming Required-field popup ON TOP of the picker (they must
+            // come sequentially, not overlap). Bailing here (before any window-edge state is read)
+            // leaves the inline-edit-close edge intact, so the naming check fires on the next tick
+            // AFTER the picker closes. (The naming Comment/Required dialog is already covered by
+            // _columnNamingCheckInProgress; only the datatype picker needed its own flag.)
+            // 2026-07-09: the flag now also covers the warn-only whitelist dialogs and the
+            // Term Type Constraint dialog (ShowValidationModal).
+            if (_validationModalShowing) return;
+
+            // 2026-07-09: also bail while the change pipeline itself runs (MonitorTimer's
+            // CheckEntityForChanges / ProcessAttributeChanges). Their dialogs pump this timer,
+            // and the close-edge work below (ValidateCommittedPendingAttrs,
+            // FinalValidateClosedTable) would re-enter the same attribute mid-flight and stack a
+            // second modal. MonitorTimer_Tick already honors these flags; this timer must too.
+            // The bail consumes no edge STATE, so edges fire on the first tick afterwards.
+            if (_isProcessingChange || _isCheckingForChanges) return;
 
             // Safety: check if model is still open BEFORE touching the session.
             if (!IsModelStillOpen()) { HandleSessionLost(); return; }
@@ -3277,6 +3366,19 @@ namespace EliteSoft.Erwin.AddIn.Services
                 try { erwinHwnd = System.Diagnostics.Process.GetCurrentProcess().MainWindowHandle; }
                 catch { /* leave zero - IsInlineEditActive bails on zero */ }
                 bool inlineEditOpen = Win32Helper.IsInlineEditActive(erwinHwnd);
+
+                // Inline-edit OPEN edge (2026-07-09): remember WHAT the user started editing.
+                // The in-place Edit's initial text is the OLD value; matching it against the
+                // in-memory snapshots identifies the attribute(s) an EXISTING column's rename /
+                // retype could belong to - the Properties-pane grid and the Model Explorer F2
+                // editor are both plain Win32 'Edit' controls, and neither has any other
+                // observer (no editor window, no attr-count delta).
+                if (!_wasInlineEditOpen && inlineEditOpen)
+                {
+                    try { CaptureInlineEditCandidates(erwinHwnd); }
+                    catch (Exception ex) { Log($"[INLINE-EDIT] open-edge capture err: {ex.Message}"); }
+                }
+
                 if (_wasInlineEditOpen && !inlineEditOpen)
                 {
                     try { ValidateCommittedPendingAttrs(); }
@@ -3335,6 +3437,14 @@ namespace EliteSoft.Erwin.AddIn.Services
                         catch (Exception ex) { Log($"CommitPendingViews (inline) err: {ex.Message}"); }
                         finally { if (acquired) _scopedCheckInProgress = false; }
                     }
+
+                    // Existing-COLUMN rename/retype coverage (2026-07-09): the scans above
+                    // handle entities, models, views and locked columns, but a plain existing
+                    // column edited via Model Explorer F2 or the Properties-pane grid had NO
+                    // observer. Schedule the candidates captured on the open edge for a
+                    // targeted live-vs-snapshot recheck (drained by MonitorTimer).
+                    try { FlushInlineEditCandidates(); }
+                    catch (Exception ex) { Log($"[INLINE-EDIT] close-edge flush err: {ex.Message}"); }
                 }
 
                 // Stale-pending fallback (2026-06-13): a drag-create (click +
@@ -3864,6 +3974,11 @@ namespace EliteSoft.Erwin.AddIn.Services
                                         // retroactively re-typed; see feedback_rules_new_objects_only.)
                                         EnforceAllowedDatatypeWhitelist(attr, null, snapshot, isNew: true);
                                         _attributeSnapshots[aid] = snapshot;
+                                        // erwin's auto-uniquify may rename this just-committed
+                                        // column on a DELAYED transaction after the drain, with
+                                        // nothing else watching - schedule the targeted recheck
+                                        // (2026-07-09, 'Pre_Abc__1070').
+                                        ScheduleAttributeRecheck(snapshot);
                                     }
                                     else
                                     {
@@ -3882,6 +3997,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     Log($"[PENDING-NAME] entity='{tableName}' attr id={aid} renamed to '{currentName}' (no prior snapshot) - running new-attr validation");
                                     _attributeSnapshots[aid] = snapshot;
                                     ProcessNewAttribute(attr, snapshot, predefined);
+                                    ScheduleAttributeRecheck(snapshot); // late auto-uniquify safety net (2026-07-09)
                                 }
 
                                 pendSet.Remove(aid);
@@ -4343,7 +4459,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// (DEPENDS_ON_UDP_ID) read live UDP values off the entity and apply
         /// only when the condition matches.
         /// </summary>
-        private void RunScopedTableNamingCheck(string tableName, IDictionary<string, string> baselineOverride = null, bool isNew = false)
+        private void RunScopedTableNamingCheck(string tableName, IDictionary<string, string> baselineOverride = null, bool isNew = false, bool revalidateAsNew = false)
         {
             if (string.IsNullOrEmpty(tableName)) return;
             if (_validationSuspended) return;
@@ -4377,16 +4493,16 @@ namespace EliteSoft.Erwin.AddIn.Services
             // branch, so a defer collision there is impossible in practice.
             if (_scopedCheckInProgress)
             {
-                if (_pendingTableNamingChecks.Add((tableName, isNew)))
-                    Log($"RunScopedTableNamingCheck: deferring '{tableName}' (isNew={isNew}) - check already in progress");
+                if (_pendingTableNamingChecks.Add((tableName, isNew, revalidateAsNew)))
+                    Log($"RunScopedTableNamingCheck: deferring '{tableName}' (isNew={isNew}, revalidate={revalidateAsNew}) - check already in progress");
                 return;
             }
             _scopedCheckInProgress = true;
-            try { RunScopedTableNamingCheckCore(tableName, baselineOverride, isNew); }
+            try { RunScopedTableNamingCheckCore(tableName, baselineOverride, isNew, revalidateAsNew); }
             finally { _scopedCheckInProgress = false; }
         }
 
-        private void RunScopedTableNamingCheckCore(string tableName, IDictionary<string, string> baselineOverride = null, bool isNew = false)
+        private void RunScopedTableNamingCheckCore(string tableName, IDictionary<string, string> baselineOverride = null, bool isNew = false, bool revalidateAsNew = false)
         {
 
             dynamic modelObjects = null;
@@ -4439,8 +4555,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                         isNew = true;
                     }
 
-                    Log($"Scoped naming check on '{nameForMatch}' (isNew={isNew})");
-                    _tableTypeMonitor.ValidateNamingStandard("Table", nameForMatch, entity, baselineOverride: baselineOverride, isNew: isNew);
+                    Log($"Scoped naming check on '{nameForMatch}' (isNew={isNew}, revalidate={revalidateAsNew})");
+                    _tableTypeMonitor.ValidateNamingStandard("Table", nameForMatch, entity, baselineOverride: baselineOverride, isNew: isNew, revalidateAsNew: revalidateAsNew);
 
                     // Creation-cascade continuation: if THIS Create-context check just
                     // renamed the entity (a Prefix/Suffix rule fired), the rename will
@@ -4797,6 +4913,150 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
         }
 
+        // Last entity name checked by the selection-scoped fingerprint, so a stable selection
+        // does not log on every heartbeat (the fingerprint itself is idempotent).
+        private string _lastSelectionScopedEntity;
+        // Cached handle of the Overview-pane selection Static, so each heartbeat re-reads ONE
+        // window instead of enumerating every child (re-found only when the cached read fails).
+        private IntPtr _overviewSelectionStatic = IntPtr.Zero;
+        // Backoff so that when the Static cannot be found (e.g. the Overview pane is closed) we do
+        // NOT run a full child-window enumeration on every heartbeat. Counts heartbeats to skip.
+        private int _selectionStaticRetryTicks;
+        private const int SelectionStaticRetryHeartbeats = 10; // ~10 s between re-find attempts
+
+        // Round-robin cursor over the baselined working set (see SelectionScopedAttributeCheck).
+        private int _rollingRescanCursor;
+        // Baselined entities re-fingerprinted per heartbeat IN ADDITION to the selected one. Bounds
+        // the cost while guaranteeing full working-set coverage every ceil(workingSet/N) heartbeats.
+        private const int RollingRescanPerHeartbeat = 3;
+
+        /// <summary>
+        /// Pane-edit fingerprint (2026-07-10, hardened after a live "sometimes escapes" report).
+        /// An EXISTING column's Physical_Data_Type or name change made purely via the Properties-pane
+        /// dropdown leaves no Win32 "Edit" focus, so the inline-edit candidate path never sees it.
+        /// This catches it by re-running the fingerprint diff (<see cref="CheckEntityForChanges"/>) on
+        /// a BOUNDED target set each heartbeat: the currently-selected entity (Overview pane, fast
+        /// path for the common case, ~1 s) PLUS a small round-robin slice of the already-baselined
+        /// working set. The round-robin is the safety net: the Overview does not reliably reflect a
+        /// Model-Explorer column selection (verified from the log - it showed a different entity than
+        /// the one being edited), so relying on selection alone missed edits; rotating through the
+        /// touched entities re-checks every one within a few seconds regardless. NOT a full model
+        /// walk - the candidate set is only entities we have already snapshotted (hard rule). A
+        /// stable entity short-circuits in the fingerprint fast path, so a rescan of an untouched
+        /// entity produces NO popup - only genuine unobserved drift fires. Runs only when the Column
+        /// Editor is closed (the open case is covered by the 250 ms scoped path).
+        /// </summary>
+        private void SelectionScopedAttributeCheck(dynamic modelObjects, dynamic root)
+        {
+            if (!string.IsNullOrEmpty(_activeColumnEditorTable)) return; // covered by the scoped path
+
+            // Build the bounded target set: selected entity (if resolvable) + round-robin slice.
+            var targets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            string selectedName = TryReadSelectedEntityName(root);
+            if (!string.IsNullOrEmpty(selectedName)) targets.Add(selectedName);
+
+            if (_tablesBaselined.Count > 0)
+            {
+                var working = new List<string>(_tablesBaselined);
+                int take = Math.Min(RollingRescanPerHeartbeat, working.Count);
+                for (int i = 0; i < take; i++)
+                    targets.Add(working[(_rollingRescanCursor + i) % working.Count]);
+                _rollingRescanCursor = (_rollingRescanCursor + take) % working.Count;
+            }
+
+            if (targets.Count == 0) return;
+
+            dynamic entities = null;
+            try
+            {
+                entities = modelObjects.Collect(root, "Entity");
+                if (entities == null) return;
+                foreach (dynamic entity in entities)
+                {
+                    if (targets.Count == 0) break;
+                    if (entity == null) continue;
+                    string nameForMatch;
+                    try
+                    {
+                        string p = entity.Properties("Physical_Name").Value?.ToString() ?? "";
+                        nameForMatch = (!string.IsNullOrEmpty(p) && !p.StartsWith("%")) ? p : (entity.Name ?? "");
+                    }
+                    catch { try { nameForMatch = entity.Name ?? ""; } catch { continue; } }
+
+                    // Match a target either by exact working-set name or by the selection title.
+                    bool isTarget = targets.Remove(nameForMatch);
+                    if (!isTarget && !string.IsNullOrEmpty(selectedName)
+                        && EntityNameMatchesTitle(nameForMatch, selectedName))
+                    {
+                        isTarget = true;
+                        targets.Remove(selectedName);
+                    }
+                    if (!isTarget) continue;
+
+                    if (!_tablesBaselined.Contains(nameForMatch))
+                    {
+                        SilentPopulateEntity(entity, modelObjects, nameForMatch);
+                        _tablesBaselined.Add(nameForMatch);
+                        if (!string.Equals(_lastSelectionScopedEntity, nameForMatch, StringComparison.Ordinal))
+                        {
+                            _lastSelectionScopedEntity = nameForMatch;
+                            Log($"[SEL-SCOPE] baselined entity '{nameForMatch}' (count={_attributeSnapshots.Count})");
+                        }
+                        continue;
+                    }
+
+                    _pendingResults.Clear();
+                    CheckEntityForChanges(entity, modelObjects);
+                    if (_pendingResults.Count > 0) ShowConsolidatedPopup();
+                }
+            }
+            catch (Exception ex) { Log($"[SEL-SCOPE] rescan failed: {ex.Message}"); }
+            finally { ReleaseCom(entities); }
+        }
+
+        /// <summary>
+        /// Reads the single selected entity name from erwin's Overview pane (cached Static handle +
+        /// backoff so a closed Overview never triggers a per-heartbeat child-window enumeration).
+        /// Returns null when nothing / a multi-select / an unresolvable selection is shown.
+        /// </summary>
+        private string TryReadSelectedEntityName(dynamic root)
+        {
+            string modelName;
+            try { modelName = root?.Name?.ToString() ?? _lastKnownModelName; }
+            catch { modelName = _lastKnownModelName; }
+            if (string.IsNullOrEmpty(modelName)) return null;
+
+            try
+            {
+                IntPtr hwnd = Win32Helper.GetErwinMainWindow();
+                if (hwnd == IntPtr.Zero) return null;
+
+                // Re-read the cached Overview Static (one cheap WM_GETTEXT). When nothing is
+                // selected the Static still shows just "MODELNAME" (model-prefixed, no parens), so
+                // the common cases - stable selection AND nothing selected - never re-enumerate.
+                string selText = Win32Helper.IsWindowValid(_overviewSelectionStatic)
+                    ? Win32Helper.GetWindowTextNoHang(_overviewSelectionStatic)
+                    : null;
+                bool cachedUsable = !string.IsNullOrEmpty(selText)
+                    && selText.TrimStart().StartsWith(modelName, StringComparison.OrdinalIgnoreCase);
+
+                if (!cachedUsable)
+                {
+                    if (_selectionStaticRetryTicks > 0) { _selectionStaticRetryTicks--; return null; }
+                    _overviewSelectionStatic = Win32Helper.FindDiagramSelectionStatic(hwnd, modelName);
+                    if (!Win32Helper.IsWindowValid(_overviewSelectionStatic))
+                    {
+                        _selectionStaticRetryTicks = SelectionStaticRetryHeartbeats;
+                        return null;
+                    }
+                    selText = Win32Helper.GetWindowTextNoHang(_overviewSelectionStatic);
+                }
+                return Win32Helper.ParseSelectedEntityFromOverviewText(selText);
+            }
+            catch (Exception ex) { Log($"[SEL-SCOPE] selection read failed: {ex.Message}"); return null; }
+        }
+
         /// <summary>
         /// Phase-2D (2026-05-06): silently snapshot every attribute of a single entity
         /// without firing ProcessNewAttribute / ProcessAttributeChanges. Used by the
@@ -5065,6 +5325,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 EnforceAllowedDatatypeWhitelist(attr, null, currentState, isNew: true);
 
                             _attributeSnapshots[objectId] = currentState;
+                            ScheduleAttributeRecheck(currentState); // late auto-uniquify safety net (2026-07-09)
 
                             // Template create/update moment: fire for any column
                             // that now has a real name. treatAsNew is true only
@@ -6824,13 +7085,24 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                 if (!suppressPopup)
                 {
-                    AddinMessageDialog.Show(
+                    // ShowValidationModal (2026-07-09): both timers bail while this pumps, same
+                    // protection as the datatype picker - without it a WindowMonitor tick could
+                    // stack a naming popup on top of this dialog.
+                    ShowValidationModal(
                         $"Column '{curr.TableName}.{curr.PhysicalName}' is tagged '{canonical}' in the glossary.\n\n" +
                         $"{disallowed} cannot be changed and was reverted.\n\n" +
                         $"Restored: {corrected}",
                         "Term Type Constraint",
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Warning);
+
+                    // A rename (erwin auto-uniquify) can land while the modal pumps. Sync it so
+                    // the caller's dialogs/validators cite the live name - ProcessAttributeChanges
+                    // re-runs the column naming pass right after enforcement, so the refreshed
+                    // name IS re-validated (Core's IsAutoUniquifyRename baseline bridge decides
+                    // Create-vs-Update). The scheduled recheck covers a commit landing even later.
+                    RefreshNameAfterModal(attr, curr, "Term Type Constraint");
+                    ScheduleAttributeRecheck(curr);
                 }
             }
             catch (Exception ex)
@@ -6839,6 +7111,265 @@ namespace EliteSoft.Erwin.AddIn.Services
                 catch (Exception rbEx) { Log($"EnforceTermTypePolicy rollback error: {rbEx.Message}"); }
                 Log($"EnforceTermTypePolicy write failed for {curr.PhysicalName}: {ex.Message}");
             }
+        }
+
+        /// <summary>
+        /// Re-reads the LIVE Physical_Name of a column. erwin commits renames on a DELAYED
+        /// transaction - most notably the auto-uniquify '__NNNN' suffix after a name collision -
+        /// so any name captured into a snapshot before a modal pumped can be stale by the time
+        /// it is displayed or validated. Mirrors CreateSnapshot's placeholder handling: a '%...'
+        /// macro placeholder falls back to the logical Name. Returns <paramref name="fallback"/>
+        /// when the live read fails (e.g. the attribute was deleted).
+        /// </summary>
+        private string ReadLivePhysicalName(dynamic attr, string fallback)
+        {
+            try
+            {
+                string live = attr?.Properties("Physical_Name").Value?.ToString();
+                if (!string.IsNullOrEmpty(live))
+                {
+                    if (!live.StartsWith("%", StringComparison.Ordinal)) return live;
+                    string logical = attr?.Name?.ToString();
+                    if (!string.IsNullOrEmpty(logical)) return logical;
+                }
+            }
+            catch (Exception ex) { Log($"Live Physical_Name re-read failed (using '{fallback}'): {ex.Message}"); }
+            return fallback ?? string.Empty;
+        }
+
+        /// <summary>
+        /// Detects a rename that landed while a modal pumped: re-reads the live Physical_Name and,
+        /// when it differs from the snapshot, syncs the snapshot and returns true so the caller
+        /// re-validates with the live name. Callers MUST guarantee a naming validation runs on the
+        /// refreshed name afterwards - syncing without validating would silently absorb the rename,
+        /// which is exactly the 'Pre_Abc__1070' bug this exists to fix.
+        /// </summary>
+        private bool RefreshNameAfterModal(dynamic attr, AttributeValidationSnapshot state, string modalContext)
+        {
+            if (state == null) return false;
+            string live = ReadLivePhysicalName(attr, state.PhysicalName);
+            if (string.Equals(live, state.PhysicalName ?? string.Empty, StringComparison.Ordinal)) return false;
+            Log($"Live name drift caught ({modalContext}): '{state.TableName}.{state.PhysicalName}' -> '{live}' - re-validating with the live name");
+            state.PhysicalName = live;
+            return true;
+        }
+
+        /// <summary>
+        /// Shows an enforcement warning under <see cref="_validationModalShowing"/> so BOTH timers
+        /// bail while the modal pumps (same protection the datatype picker gets). Without the flag
+        /// a WindowMonitor tick during the pump can run editor-close/inline-edit-close work that
+        /// re-enters the same attribute mid-flight and stacks a second modal (2026-07-08 overlap).
+        /// </summary>
+        private DialogResult ShowValidationModal(string message, string title, MessageBoxButtons buttons, MessageBoxIcon icon)
+        {
+            _validationModalShowing = true;
+            try { return AddinMessageDialog.Show(message, title, buttons, icon); }
+            finally { _validationModalShowing = false; }
+        }
+
+        /// <summary>
+        /// Schedules a targeted live-vs-snapshot recheck of ONE attribute (see
+        /// <see cref="_attrRecheckQueue"/>). Idempotent per attribute: rescheduling pushes the due
+        /// time out, which is what we want - the LAST write of a gesture restarts the settle window
+        /// erwin's delayed commits need.
+        /// </summary>
+        private void ScheduleAttributeRecheck(string objectId, string tableName, int delayMs = 1500)
+        {
+            if (string.IsNullOrEmpty(objectId) || string.IsNullOrEmpty(tableName)) return;
+            _attrRecheckQueue[objectId] = (tableName, DateTime.UtcNow.AddMilliseconds(delayMs));
+        }
+
+        private void ScheduleAttributeRecheck(AttributeValidationSnapshot state, int delayMs = 1500)
+            => ScheduleAttributeRecheck(state?.ObjectId, state?.TableName, delayMs);
+
+        /// <summary>
+        /// Drains due entries of <see cref="_attrRecheckQueue"/>: for each, re-reads the live
+        /// attribute and routes any name/type drift through the NORMAL ProcessAttributeChanges
+        /// machinery (rename branch -> glossary + naming with the auto-uniquify isNew bridge).
+        /// Targeted by ObjectId - never a model-wide walk (hard rule: no full walks in change
+        /// detection). Runs inside MonitorTimer_Tick, so all its guards already held.
+        /// </summary>
+        private void DrainAttributeRecheckQueue(dynamic modelObjects, dynamic root)
+        {
+            if (_attrRecheckQueue.Count == 0) return;
+            var now = DateTime.UtcNow;
+            List<string> dueIds = null;
+            foreach (var kv in _attrRecheckQueue)
+            {
+                if (kv.Value.DueUtc <= now) (dueIds ??= new List<string>()).Add(kv.Key);
+            }
+            if (dueIds == null) return;
+
+            foreach (var objectId in dueIds)
+            {
+                string tableName = _attrRecheckQueue[objectId].TableName;
+                _attrRecheckQueue.Remove(objectId);
+
+                // A pending-new placeholder is still owned by the [PENDING-NAME] machinery;
+                // its own commit path validates the final name.
+                if (IsAttributePendingNew(objectId)) continue;
+                if (!_attributeSnapshots.TryGetValue(objectId, out var previousState) || previousState == null) continue;
+
+                try { RecheckAttributeAgainstSnapshot(modelObjects, root, objectId, tableName, previousState); }
+                catch (Exception ex) { Log($"[RECHECK] failed for '{tableName}' attr {objectId}: {ex.Message}"); }
+            }
+        }
+
+        /// <summary>
+        /// Live-vs-snapshot compare for one attribute, resolved by owning-entity name + ObjectId
+        /// (bounded: one entity's attribute list, never the whole model). On drift, runs the same
+        /// carry-over + ProcessAttributeChanges + snapshot-advance sequence the pending-commit
+        /// path uses, so a late-landing erwin rename gets the full rule chain ('Physical name
+        /// changed' log line included).
+        /// </summary>
+        private void RecheckAttributeAgainstSnapshot(dynamic modelObjects, dynamic root, string objectId, string tableName, AttributeValidationSnapshot previousState)
+        {
+            dynamic entities = modelObjects.Collect(root, "Entity");
+            if (entities == null) return;
+            try
+            {
+                foreach (dynamic entity in entities)
+                {
+                    if (entity == null) continue;
+                    string entName = GetTableName(entity);
+                    if (!string.Equals(entName, tableName, StringComparison.Ordinal)
+                        && !string.Equals(entName, previousState.TableName ?? string.Empty, StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+
+                    dynamic attrs = modelObjects.Collect(entity, "Attribute");
+                    if (attrs == null) return;
+                    try
+                    {
+                        foreach (dynamic attr in attrs)
+                        {
+                            if (attr == null) continue;
+                            string aid;
+                            try { aid = attr.ObjectId?.ToString(); }
+                            catch { continue; }
+                            if (!string.Equals(aid, objectId, StringComparison.Ordinal)) continue;
+
+                            var snapshot = CreateSnapshot(attr, entName, modelObjects);
+                            bool nameDrift = !string.Equals(previousState.PhysicalName ?? string.Empty, snapshot.PhysicalName ?? string.Empty, StringComparison.Ordinal);
+                            bool typeDrift = !string.Equals(previousState.PhysicalDataType ?? string.Empty, snapshot.PhysicalDataType ?? string.Empty, StringComparison.Ordinal);
+                            if (!nameDrift && !typeDrift) return;
+
+                            Log($"[RECHECK] '{entName}' attr {objectId}: snapshot-vs-live drift" +
+                                (nameDrift ? $" name '{previousState.PhysicalName}' -> '{snapshot.PhysicalName}'" : string.Empty) +
+                                (typeDrift ? $" type '{previousState.PhysicalDataType}' -> '{snapshot.PhysicalDataType}'" : string.Empty) +
+                                " - running change validation");
+
+                            // Same carry-over the pending-commit path does: term type and UDPs are
+                            // not re-derivable from a bare snapshot.
+                            snapshot.TermTypeCanonical = previousState.TermTypeCanonical;
+                            foreach (var kvp in previousState.UdpValues) snapshot.UdpValues[kvp.Key] = kvp.Value;
+                            if (string.IsNullOrEmpty(snapshot.PhysicalDataType)) snapshot.PhysicalDataType = previousState.PhysicalDataType;
+
+                            var predefined = GetPredefinedColumnNames(entity);
+                            _pendingResults.Clear();
+                            bool discarded = ProcessAttributeChanges(attr, previousState, snapshot, predefined);
+                            if (discarded)
+                            {
+                                _attributeSnapshots.Remove(objectId);
+                                Log($"[RECHECK] '{entName}' attr {objectId} discarded during re-validation - snapshot removed");
+                            }
+                            else
+                            {
+                                _attributeSnapshots[objectId] = snapshot;
+                            }
+                            if (_pendingResults.Count > 0) ShowConsolidatedPopup();
+                            return;
+                        }
+                    }
+                    finally { ReleaseCom(attrs); }
+                    return; // entity found but attribute gone (deleted) - nothing to validate
+                }
+            }
+            finally { ReleaseCom(entities); }
+        }
+
+        /// <summary>
+        /// Inline-edit OPEN edge: captures which attributes the user might be editing in-place, by
+        /// matching the edit control's INITIAL text (the old value) against in-memory snapshots.
+        /// Name matches take priority over datatype matches (type strings like 'varchar(18)' are
+        /// shared by many columns); the candidate set is capped so the later recheck stays bounded.
+        /// In-memory string compares only - no SCAPI call happens here.
+        /// </summary>
+        private void CaptureInlineEditCandidates(IntPtr erwinHwnd)
+        {
+            _inlineEditRecheckCandidates.Clear();
+            string editText;
+            try { editText = Win32Helper.GetFocusedInlineEditText(erwinHwnd); }
+            catch (Exception ex) { Log($"[INLINE-EDIT] candidate capture failed: {ex.Message}"); return; }
+            if (string.IsNullOrWhiteSpace(editText)) return;
+
+            var snaps = new List<(string ObjectId, string TableName, string PhysicalName, string PhysicalDataType)>(_attributeSnapshots.Count);
+            foreach (var kv in _attributeSnapshots)
+            {
+                var s = kv.Value;
+                if (s == null) continue;
+                snaps.Add((kv.Key, s.TableName, s.PhysicalName, s.PhysicalDataType));
+            }
+
+            var (candidates, overflowed) = SelectInlineEditCandidates(snaps, editText.Trim(), InlineEditCandidateCap);
+            if (overflowed)
+            {
+                Log($"[INLINE-EDIT] more than {InlineEditCandidateCap} snapshot matches for edited text '{editText.Trim()}' - extra candidates skipped so the recheck stays bounded");
+            }
+            if (candidates.Count > 0)
+            {
+                _inlineEditRecheckCandidates.AddRange(candidates);
+                Log($"[INLINE-EDIT] captured {candidates.Count} recheck candidate(s) for edited text '{editText.Trim()}'");
+            }
+        }
+
+        public const int InlineEditCandidateCap = 8;
+
+        /// <summary>
+        /// Pure candidate selection for <see cref="CaptureInlineEditCandidates"/> (unit-tested).
+        /// Exact-name matches first, then exact-datatype matches while the cap allows; returns
+        /// whether matches had to be dropped. Ordinal compares - the edit shows the value verbatim.
+        /// </summary>
+        public static (List<(string ObjectId, string TableName)> Candidates, bool Overflowed) SelectInlineEditCandidates(
+            IReadOnlyList<(string ObjectId, string TableName, string PhysicalName, string PhysicalDataType)> snapshots,
+            string editText,
+            int cap)
+        {
+            var result = new List<(string, string)>();
+            bool overflowed = false;
+            if (string.IsNullOrEmpty(editText) || snapshots == null) return (result, false);
+
+            foreach (bool namePass in new[] { true, false })
+            {
+                foreach (var s in snapshots)
+                {
+                    if (string.IsNullOrEmpty(s.ObjectId) || string.IsNullOrEmpty(s.TableName)) continue;
+                    bool nameHit = string.Equals(s.PhysicalName ?? string.Empty, editText, StringComparison.Ordinal);
+                    bool hit = namePass ? nameHit
+                                        : (!nameHit && string.Equals(s.PhysicalDataType ?? string.Empty, editText, StringComparison.Ordinal));
+                    if (!hit) continue;
+                    if (result.Count >= cap) { overflowed = true; return (result, true); }
+                    result.Add((s.ObjectId, s.TableName));
+                }
+            }
+            return (result, overflowed);
+        }
+
+        /// <summary>
+        /// Inline-edit CLOSE edge: schedules the captured candidates for a live-vs-snapshot
+        /// recheck. Short delay - the in-place editor commits on focus loss, but erwin may finish
+        /// the write on a delayed transaction just after the edge.
+        /// </summary>
+        private void FlushInlineEditCandidates()
+        {
+            if (_inlineEditRecheckCandidates.Count == 0) return;
+            foreach (var (objectId, table) in _inlineEditRecheckCandidates)
+            {
+                ScheduleAttributeRecheck(objectId, table, delayMs: 400);
+            }
+            Log($"[INLINE-EDIT] scheduled {_inlineEditRecheckCandidates.Count} attribute recheck(s) after inline-edit close");
+            _inlineEditRecheckCandidates.Clear();
         }
 
         /// <summary>
@@ -6890,6 +7421,38 @@ namespace EliteSoft.Erwin.AddIn.Services
 
             if (AllowedDatatypeService.Instance.IsAllowed(attempted)) return; // permitted
 
+            // The NAME can be stale the same way the type was: erwin's delayed rename commits
+            // (auto-uniquify '__NNNN' after a name collision) land between the snapshot capture
+            // and this call. Re-read it so the glossary term lookup and every dialog below cite
+            // the column the user actually sees. A sync alone would silently absorb the rename,
+            // so renameCaught forces a naming re-validation before this method returns
+            // (the 'Pre_Abc__1070' bug, 2026-07-09).
+            bool renameCaught = RefreshNameAfterModal(attr, curr, "AllowedDatatype pre-enforcement");
+
+            // Term-type changeability (2026-07-09). The column's canonical term type (glossary
+            // TERM_TYPE_MAP) constrains which parts of the datatype may change: BUSINESS_TERM
+            // locks base+length, AMORPH_DATA_TYPE locks the length, AMORPH_DATA_LENGTH locks the
+            // base (TermTypeLocks = single source, mirrors EnforceTermTypePolicy). The picker was
+            // term-type-BLIND, so after the policy correctly reverted a Business column's type,
+            // this whitelist picker let the user override the lock (log 16:52: 'user picked
+            // NUMBER(45)' on a BUSINESS_TERM column). The authoritative value = the pre-edit type
+            // (prev snapshot); on new-column call sites (prev==null) the glossary cache supplies it.
+            var (termLockBase, termLockLength) = TermTypeLocks.Get(curr?.TermTypeCanonical);
+            string termAuthoritative = prev?.PhysicalDataType;
+            if (string.IsNullOrEmpty(termAuthoritative) && (termLockBase || termLockLength))
+                termAuthoritative = GetGlossaryAuthoritativeDatatype(curr?.PhysicalName);
+            bool termHasLock = (termLockBase || termLockLength) && !string.IsNullOrEmpty(termAuthoritative);
+            // The picker can only pin a locked base that exists in the whitelist combo; a locked
+            // base MISSING from the whitelist is a glossary/whitelist admin conflict - no picker
+            // can represent it, so fall through to the warn-only path and keep the authoritative
+            // value (authority wins; the admin must reconcile the Datatype Library).
+            string termAuthBase = termHasLock ? DataTypeParser.Parse(termAuthoritative).Base : null;
+            bool termBasePinnable = termHasLock && termLockBase
+                && AllowedDatatypeService.Instance.Allowed.Any(a =>
+                       a != null && string.Equals(a.Datatype, termAuthBase, StringComparison.OrdinalIgnoreCase));
+            bool termNoPicker = termHasLock
+                && ((termLockBase && termLockLength) || (termLockBase && !termBasePinnable));
+
             // Target type to write. Prefer the previous value when it is ITSELF allowed (least
             // surprising - the column goes back to what it was). Otherwise force an allowed type
             // (user decision 2026-06-19 "izinli tipe zorla"): a brand-new column whose first pick
@@ -6900,6 +7463,14 @@ namespace EliteSoft.Erwin.AddIn.Services
             bool canRestore = !string.IsNullOrEmpty(restored)
                               && AllowedDatatypeService.Instance.IsAllowed(restored);
             string target = canRestore ? restored : AllowedDatatypeService.Instance.GetFallbackDatatype();
+
+            // Term lock overrides the automatic target: a locked column must go back to its
+            // term-authoritative value, EVEN when that value is not whitelist-allowed (falling
+            // back to e.g. 'varchar(1)' would silently change a locked base/length - the exact
+            // override this fix removes). If glossary and whitelist disagree, that is admin data
+            // to reconcile; the add-in must not "fix" it by mutating a term-locked type.
+            if (termHasLock)
+                target = termAuthoritative;
 
             // Dedup erwin's double combo-commit: the Column Editor commits the user pick twice (the
             // combo commit + a later sync that RE-APPLIES the disallowed value). Suppress the SECOND
@@ -6928,7 +7499,11 @@ namespace EliteSoft.Erwin.AddIn.Services
                 && !string.IsNullOrEmpty(objId)
                 && _allowedDatatypeUserPicks.TryGetValue(objId, out var remembered)
                 && (DateTime.UtcNow - remembered.when).TotalSeconds < TermTypeDedupSeconds * 4
-                && AllowedDatatypeService.Instance.IsAllowed(remembered.pick))
+                && AllowedDatatypeService.Instance.IsAllowed(remembered.pick)
+                // A remembered pick may only override a term-locked target when it respects the
+                // locked parts (a pick made through the lock-aware picker always does; a stale
+                // pick from before the locks were known must not resurrect the override).
+                && (!termHasLock || TermTypeLocks.Honors(remembered.pick, termAuthoritative, termLockBase, termLockLength)))
             {
                 target = remembered.pick;
             }
@@ -6940,13 +7515,21 @@ namespace EliteSoft.Erwin.AddIn.Services
                 Log($"AllowedDatatype: {curr?.TableName}.{curr?.PhysicalName} attempted '{attempted}' not in whitelist and no allowed type to fall back on - warned only.");
                 if (!suppressPopup)
                 {
-                    AddinMessageDialog.Show(
+                    ShowValidationModal(
                         $"Column '{curr?.TableName}.{curr?.PhysicalName}': datatype '{attempted}' is not in the allowed datatype list for this configuration.\n\n" +
                         $"Please pick an allowed datatype.",
                         "Datatype not allowed",
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Warning);
+                    renameCaught |= RefreshNameAfterModal(attr, curr, "no-fallback warn");
                 }
+                // A rename caught before/during the warn must still get its Name rules.
+                if (renameCaught && curr != null)
+                {
+                    bool discardedWarnOnly = ValidateColumnNamingStandard(attr, curr, isNew: isNew);
+                    if (isNew && !discardedWarnOnly && _pendingResults.Count > 0) ShowConsolidatedPopup();
+                }
+                ScheduleAttributeRecheck(curr);
                 return;
             }
 
@@ -6972,7 +7555,43 @@ namespace EliteSoft.Erwin.AddIn.Services
                 Log($"AllowedDatatype: {curr?.TableName}.{curr?.PhysicalName} '{attempted}' not in whitelist - {(canRestore ? "reverted" : "forced")} to '{target}'" +
                     $"{(storedDiffers ? $" (erwin stored '{liveAfterWrite}')" : "")}{(roundTripped ? "" : " - WARNING: stored value still not allowed")}{(suppressPopup ? " (popup suppressed, duplicate within " + TermTypeDedupSeconds + "s)" : "")}");
 
-                if (!suppressPopup)
+                if (!suppressPopup && termNoPicker)
+                {
+                    // Term type locks everything the picker could offer (BUSINESS_TERM: base AND
+                    // length fixed; or a locked base the whitelist cannot even represent). There is
+                    // nothing for the user to choose - the authoritative value is already restored
+                    // above - so no picker: one warning explains WHY the type snapped back, plus an
+                    // admin note when the glossary type itself conflicts with the whitelist.
+                    Log($"AllowedDatatype: {curr?.TableName}.{curr?.PhysicalName} is term-locked ('{curr?.TermTypeCanonical}') - picker skipped, kept '{liveAfterWrite}'{(roundTripped ? "" : " (glossary type not in whitelist - admin conflict)")}");
+                    ShowValidationModal(
+                        $"Column '{curr?.TableName}.{curr?.PhysicalName}' is mapped to a glossary term (term type '{curr?.TermTypeCanonical}').\n\n" +
+                        $"Its datatype is fixed to '{liveAfterWrite}' by the term mapping and cannot be changed here." +
+                        (roundTripped ? "" :
+                            $"\n\nNOTE: '{liveAfterWrite}' is not in the allowed datatype list for this configuration - " +
+                            "ask your administrator to align the Datatype Library with the glossary."),
+                        "Datatype fixed by term mapping",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+
+                    // Remember the authoritative value so erwin's delayed duplicate combo-commit
+                    // re-enforces it silently, and restamp the dedup window (same as the pick path).
+                    if (!string.IsNullOrEmpty(objId))
+                    {
+                        _allowedDatatypeUserPicks[objId] = (liveAfterWrite, DateTime.UtcNow);
+                        _allowedDatatypeRecentAttempts[objId] = (attempted, DateTime.UtcNow);
+                    }
+
+                    // The warn modal pumps like the picker does - catch a rename that landed
+                    // during it and re-run the naming pass on the LIVE name (this branch has no
+                    // replay of its own).
+                    renameCaught |= RefreshNameAfterModal(attr, curr, "term-mapping warn");
+                    if (renameCaught)
+                    {
+                        bool discardedTermWarn = ValidateColumnNamingStandard(attr, curr, isNew: isNew);
+                        if (isNew && !discardedTermWarn && _pendingResults.Count > 0) ShowConsolidatedPopup();
+                    }
+                }
+                else if (!suppressPopup)
                 {
                     // Let the user pick the allowed replacement (2026-07-02 request):
                     // combo of the whitelist, parameter input for parameterized types.
@@ -6987,6 +7606,19 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                     string pickPreselect = AllowedDatatypePickerFormPreselect(liveAfterWrite, target);
 
+                    // Term-type partial locks (2026-07-09): pin the locked half to the
+                    // term-authoritative value and tell the picker to disable that control -
+                    // the combo when the base may not change (AMORPH_DATA_LENGTH), the
+                    // parameter field when the length may not change (AMORPH_DATA_TYPE).
+                    bool pickerLockBase = termHasLock && termLockBase;   // base pinnable, else termNoPicker took over
+                    bool pickerLockParam = termHasLock && termLockLength;
+                    string pickPrefill = Forms.AllowedDatatypePickerForm.ExtractParameter(attempted);
+                    if (pickerLockBase) pickPreselect = termAuthBase;
+                    if (pickerLockParam) pickPrefill = Forms.AllowedDatatypePickerForm.ExtractParameter(termAuthoritative);
+                    if (pickerLockBase || pickerLockParam)
+                        pickMessage += $"\n\nTerm mapping ('{curr?.TermTypeCanonical}'): " +
+                            (pickerLockBase ? "the base type is fixed and cannot be changed." : "the length/precision is fixed and cannot be changed.");
+
                     // treatAsNew mirrors ValidateColumnNamingStandardCore (isNew || pending-new) so
                     // the picker's inline rule validator - and the post-enforcement re-check below -
                     // evaluate exactly the Create/Update/Both rules the editor-close naming pass would.
@@ -6997,14 +7629,33 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // in the dialog with the admin's own message, so a rule-breaking datatype can
                     // never leave the picker - this is what closes the Model Explorer gap where the
                     // picked value was never regex-validated (no editor-close pass to catch it).
-                    var pickRc = Forms.AllowedDatatypePickerForm.Show(
-                        "Datatype not allowed",
-                        pickMessage,
-                        AllowedDatatypeService.Instance.Allowed,
-                        pickPreselect,
-                        Forms.AllowedDatatypePickerForm.ExtractParameter(attempted),
-                        out string userPick,
-                        validate: candidate => ValidateDatatypeCandidate(attr, candidate, treatAsNew));
+                    // Guard the whole modal so BOTH timers bail while it is up (no naming popup
+                    // stacked on top - they must come sequentially). Set immediately before Show,
+                    // cleared in finally so an exception can never leave it stuck (which would
+                    // wedge all validation).
+                    string userPick;
+                    DialogResult pickRc;
+                    _validationModalShowing = true;
+                    try
+                    {
+                        pickRc = Forms.AllowedDatatypePickerForm.Show(
+                            "Datatype not allowed",
+                            pickMessage,
+                            AllowedDatatypeService.Instance.Allowed,
+                            pickPreselect,
+                            pickPrefill,
+                            out userPick,
+                            validate: candidate => ValidateDatatypeCandidate(attr, candidate, treatAsNew),
+                            lockType: pickerLockBase,
+                            lockParam: pickerLockParam);
+                    }
+                    finally { _validationModalShowing = false; }
+
+                    // A rename can land while the picker pumps (57 s dwell in the 2026-07-09
+                    // repro: 'Pre_Abc' -> 'Pre_Abc__1070' committed mid-modal and, with both
+                    // timers gated, no detector ever saw it). Catch it here so the log lines and
+                    // the naming replay below run against the LIVE name.
+                    renameCaught |= RefreshNameAfterModal(attr, curr, "datatype picker");
 
                     if (pickRc == DialogResult.OK
                         && !string.IsNullOrEmpty(userPick)
@@ -7028,12 +7679,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 $"{(pickRoundTripped ? "" : " - WARNING: stored value still not allowed")}");
                             if (!pickRoundTripped)
                             {
-                                AddinMessageDialog.Show(
+                                ShowValidationModal(
                                     $"Column '{curr?.TableName}.{curr?.PhysicalName}': the picked datatype '{userPick}' could not be applied cleanly (the model now holds '{liveAfterPick}').\n\n" +
                                     $"Ask your administrator to check the Datatype Library entry for this DBMS.",
                                     "Datatype not allowed",
                                     MessageBoxButtons.OK,
                                     MessageBoxIcon.Warning);
+                                renameCaught |= RefreshNameAfterModal(attr, curr, "pick-apply warn");
                             }
                         }
                         catch (Exception pickEx)
@@ -7072,15 +7724,32 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // (isNew:false) already replays itself right after Enforce returns. No naming
                     // frame is active on the new-column sites (their ValidateColumnNamingStandard
                     // ran and returned BEFORE Enforce), so the reentrancy guard will not no-op us.
-                    if (isNew)
+                    // 2026-07-09: also runs when a rename landed before/during one of the modals
+                    // above (renameCaught) - curr now holds the LIVE name and the Name rules
+                    // (e.g. a no-digits Regexp vs erwin's '__NNNN' uniquify) must see it; for the
+                    // isNew:false type-change site the Core's IsAutoUniquifyRename baseline
+                    // bridge decides Create-vs-Update semantics.
+                    if (isNew || renameCaught)
                     {
-                        bool discardedAfterType = ValidateColumnNamingStandard(attr, curr, isNew: true);
+                        bool discardedAfterType = ValidateColumnNamingStandard(attr, curr, isNew: isNew);
                         if (!discardedAfterType && _pendingResults.Count > 0)
                         {
                             ShowConsolidatedPopup();
                         }
                     }
                 }
+                else if (renameCaught)
+                {
+                    // Silent duplicate path (suppressPopup): no modal was shown, but the entry
+                    // re-read caught a rename nothing else observed - validate it now.
+                    bool discardedSilent = ValidateColumnNamingStandard(attr, curr, isNew: isNew);
+                    if (isNew && !discardedSilent && _pendingResults.Count > 0) ShowConsolidatedPopup();
+                }
+
+                // erwin's auto-uniquify can land even LATER - after this method returns, with the
+                // gesture drained and nothing else watching the attribute. Schedule a targeted
+                // live-vs-snapshot recheck (drained by MonitorTimer) as the safety net.
+                ScheduleAttributeRecheck(curr);
             }
             catch (Exception ex)
             {
@@ -7100,6 +7769,32 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// transaction. Never throws - fails OPEN (returns null) and logs, so an internal
         /// validation error can never trap the user inside the picker.
         /// </summary>
+        /// <summary>
+        /// The glossary-authoritative Physical_Data_Type for a column (the DATA_TYPE the
+        /// glossary row maps to PROPERTY_CODE 'PHYSICAL_DATA_TYPE'), or null when the column
+        /// has no glossary mapping / no datatype field. In-memory cache lookup, no DB. Used by
+        /// the term-lock path when there is no prev snapshot (new-column Enforce call sites).
+        /// </summary>
+        private static string GetGlossaryAuthoritativeDatatype(string columnName)
+        {
+            if (string.IsNullOrEmpty(columnName)) return null;
+            try
+            {
+                var vals = GlossaryService.Instance.GetUdpValues(columnName);
+                if (vals == null) return null;
+                foreach (var kv in vals)
+                {
+                    if (string.Equals(kv.Key, "PHYSICAL_DATA_TYPE", StringComparison.OrdinalIgnoreCase))
+                        return string.IsNullOrWhiteSpace(kv.Value) ? null : kv.Value.Trim();
+                }
+            }
+            catch (Exception ex)
+            {
+                AddinLogger.Log($"GetGlossaryAuthoritativeDatatype('{columnName}') failed: {ex.Message}");
+            }
+            return null;
+        }
+
         private string ValidateDatatypeCandidate(dynamic attr, string candidate, bool treatAsNew)
         {
             if (!NamingStandardService.Instance.IsLoaded) return null;
@@ -7356,14 +8051,40 @@ namespace EliteSoft.Erwin.AddIn.Services
             // rule was silently skipped. New tables keep isNew=true through their own
             // pending-entity path; columns did not, which is this whole bug. (apply=Both
             // rules fire either way, so configs using Both are unaffected.)
+            // Also treat an erwin AUTO-UNIQUIFY rename as a fresh create: when the name the add-in
+            // applied collides with an existing column, erwin appends "__NNNN" (e.g. 'Pre_Abc' ->
+            // 'Pre_Abc__1069') AFTER our naming ran. That erwin-assigned name must be re-validated
+            // as isNew so apply=Create rules (name regex, forbidden words) re-fire on it - otherwise
+            // the '__NNNN' name (digits defeat a PascalCase rule) slips through, because by now the
+            // pending-new signal was already consumed at the placeholder->real-name commit.
             bool treatAsNew = isNew
-                || (!string.IsNullOrEmpty(snapshotId) && IsAttributePendingNew(snapshotId));
+                || (!string.IsNullOrEmpty(snapshotId) && IsAttributePendingNew(snapshotId))
+                || NamingValidationEngine.IsAutoUniquifyRename(baselinePhysicalName, state.PhysicalName);
+
+            // 2026-07-10: split the flag. `treatAsNew` above is the IDENTITY flag - "is this a
+            // genuinely new column" - and MUST stay driving the Required-popup Cancel contract
+            // (Create=discard the column, Update=revert the property). `revalidateAsNew` below is
+            // the VALIDATION-SCOPE flag - "should apply=Create naming rules (name regex, forbidden
+            // words, prefix/suffix apply) run on this name". The user's rule (stated repeatedly:
+            // "isim degisiyorsa kural kontrolleri bastan yapilmali") is that ANY real rename must
+            // re-run the naming chain on the new name - not just erwin's auto-uniquify. So a manual
+            // rename of an EXISTING column (Model Explorer F2 / Properties pane / Column Editor)
+            // gets revalidateAsNew=true (rule#1127 no-digits fires) while treatAsNew stays false
+            // (Cancel REVERTS to the old name, it does NOT delete the pre-existing column - the
+            // trap the two flags being one would spring). Not retroactive: it fires only because
+            // the user actively changed the name; an unchanged name keeps revalidateAsNew=false.
+            bool nameChangedFromBaseline =
+                !treatAsNew
+                && NamingValidationEngine.RenameRequiresRevalidation(baselinePhysicalName, state.PhysicalName, IsPlaceholderColumnName);
+            bool revalidateAsNew = treatAsNew || nameChangedFromBaseline;
+            if (nameChangedFromBaseline)
+                Log($"Column rename re-validation: '{state.TableName}.{baselinePhysicalName}' -> '{state.PhysicalName}' - re-running apply=Create naming rules (Cancel still reverts, not deletes)");
             bool attributeDeleted = false;
 
             // Step 1: silently apply AUTO_APPLY=true rules
             if (attrBoxed != null)
             {
-                string afterAuto = NamingValidationEngine.ApplyNamingStandards("Column", state.PhysicalName, attrBoxed, autoOnly: true, isNew: treatAsNew);
+                string afterAuto = NamingValidationEngine.ApplyNamingStandards("Column", state.PhysicalName, attrBoxed, autoOnly: true, isNew: revalidateAsNew);
                 if (!string.Equals(afterAuto, state.PhysicalName, StringComparison.Ordinal))
                 {
                     int transId = _session.BeginNamedTransaction("ApplyAutoColumnNaming");
@@ -7378,12 +8099,33 @@ namespace EliteSoft.Erwin.AddIn.Services
                         // cannot be missed. Owner is null so the dialog
                         // anchors to ErwinAddIn.ActiveForm's screen per
                         // AddinMessageDialog's own multi-monitor logic.
+                        // 2026-07-09: the displayed target is re-read LIVE, because erwin may
+                        // already have auto-uniquified our write ('Pre_Abc' -> 'Pre_Abc__1073'),
+                        // and the dialog must not cite a name that no longer exists.
+                        string afterLive = ReadLivePhysicalName(attr, afterAuto);
                         AddinMessageDialog.Show(
-                            $"Column '{state.TableName}.{state.PhysicalName}' -> '{afterAuto}'",
+                            $"Column '{state.TableName}.{state.PhysicalName}' -> '{afterLive}'",
                             "Naming standard applied",
                             MessageBoxButtons.OK,
                             MessageBoxIcon.Information);
-                        state.PhysicalName = afterAuto;
+                        // The uniquify can also land WHILE the modal pumps - continue Steps 2/3
+                        // with whatever erwin holds NOW, so the Name rules (no-digits Regexp etc.)
+                        // fire on the real '__NNNN' name in this same gesture instead of never.
+                        string afterModal = ReadLivePhysicalName(attr, afterLive);
+                        if (!string.Equals(afterModal, afterAuto, StringComparison.Ordinal))
+                        {
+                            Log($"Column naming auto-apply: erwin adjusted '{afterAuto}' to '{afterModal}' after our write - continuing validation with the live name");
+                            // Re-fire apply=Create rules on erwin's uniquified name, but DO NOT flip
+                            // the identity flag: for a manual rename that collided, treatAsNew must
+                            // stay false so a Required-popup Cancel reverts the name instead of
+                            // deleting the pre-existing column (2026-07-10 split).
+                            if (NamingValidationEngine.IsAutoUniquifyRename(afterAuto, afterModal))
+                                revalidateAsNew = true;
+                        }
+                        state.PhysicalName = afterModal;
+                        // And it can land even later, after this whole pass returned - schedule
+                        // the targeted live-vs-snapshot recheck as the safety net.
+                        ScheduleAttributeRecheck(state);
                     }
                     catch (Exception ex)
                     {
@@ -7396,7 +8138,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             // Step 2: prompt for AUTO_APPLY=false rules that would change the name
             if (attrBoxed != null)
             {
-                string afterAll = NamingValidationEngine.ApplyNamingStandards("Column", state.PhysicalName, attrBoxed, autoOnly: false, isNew: treatAsNew);
+                string afterAll = NamingValidationEngine.ApplyNamingStandards("Column", state.PhysicalName, attrBoxed, autoOnly: false, isNew: revalidateAsNew);
                 if (!string.Equals(afterAll, state.PhysicalName, StringComparison.Ordinal))
                 {
                     var answer = AddinMessageDialog.Show(
@@ -7415,7 +8157,11 @@ namespace EliteSoft.Erwin.AddIn.Services
                             attr.Properties("Physical_Name").Value = afterAll;
                             _session.CommitTransaction(transId);
                             Log($"Column naming applied (user confirmed): '{state.TableName}.{state.PhysicalName}' -> '{afterAll}'");
-                            state.PhysicalName = afterAll;
+                            // 2026-07-09: erwin may auto-uniquify our write; keep the snapshot on
+                            // whatever it actually holds and schedule the targeted recheck so a
+                            // late '__NNNN' rename still gets its Name rules.
+                            state.PhysicalName = ReadLivePhysicalName(attr, afterAll);
+                            ScheduleAttributeRecheck(state);
                             return false;
                         }
                         catch (Exception ex)
@@ -7428,7 +8174,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
 
             // Step 3: Validate remaining issues (warning popup for un-fixable rules)
-            var results = NamingValidationEngine.ValidateObjectName("Column", state.PhysicalName, attrBoxed, isNew: treatAsNew);
+            var results = NamingValidationEngine.ValidateObjectName("Column", state.PhysicalName, attrBoxed, isNew: revalidateAsNew);
             var failures = results.Where(r => !r.IsValid).ToList();
 
             // Step 3b (2026-06-05): the admin can author Column rules on any
@@ -7465,9 +8211,9 @@ namespace EliteSoft.Erwin.AddIn.Services
                         Log($"Naming standard: SCAPI did not surface 'Column.{propertyCode}' on this column (treating as empty): {ex.Message}");
                     }
 
-                    Log($"NamingValidate: 'Column.{propertyCode}' on '{state.TableName}.{state.PhysicalName}' liveValue='{propValue}' isNew={treatAsNew}");
+                    Log($"NamingValidate: 'Column.{propertyCode}' on '{state.TableName}.{state.PhysicalName}' liveValue='{propValue}' isNew={revalidateAsNew}");
                     var extraResults = NamingValidationEngine.ValidateObjectName(
-                        "Column", propValue, attrBoxed, propertyCode, isNew: treatAsNew);
+                        "Column", propValue, attrBoxed, propertyCode, isNew: revalidateAsNew);
                     failures.AddRange(extraResults.Where(r => !r.IsValid));
                 }
             }
@@ -7521,7 +8267,11 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // Show the OBJECT NAME (table.column) + a friendly property label,
                     // e.g. "VpE_LOG.ID (Comment)" - the raw "Column.Definition" was
                     // meaningless to the user (2026-06-06).
-                    string fieldLabel = $"{state.TableName}.{state.PhysicalName} ({NamingValidationEngine.FriendlyPropertyLabel(rf.Rule.PropertyCode)})";
+                    // 2026-07-09: rebuilt before EVERY dialog pass with the LIVE name - erwin's
+                    // delayed auto-uniquify can rename the column while a prior dialog pumped,
+                    // and the prompt must not cite a name that no longer exists.
+                    string friendlyProp = NamingValidationEngine.FriendlyPropertyLabel(rf.Rule.PropertyCode);
+                    string fieldLabel = $"{state.TableName}.{ReadLivePhysicalName(attr, state.PhysicalName)} ({friendlyProp})";
                     var cancelMode = treatAsNew ? Forms.RequiredOperationMode.Create : Forms.RequiredOperationMode.Update;
 
                     // Pre-fill the dialog with the column's current value
@@ -7542,6 +8292,9 @@ namespace EliteSoft.Erwin.AddIn.Services
                     string typed = "";
                     while (true)
                     {
+                        // Refresh the label each pass (see the 2026-07-09 note above): a prior
+                        // pass's dialog pump may have let erwin's auto-uniquify rename land.
+                        fieldLabel = $"{state.TableName}.{ReadLivePhysicalName(attr, state.PhysicalName)} ({friendlyProp})";
                         rc = EliteSoft.Erwin.AddIn.Forms.RequiredFieldDialog.Show(
                             title: "Required field",
                             message: promptMessage,
@@ -7671,7 +8424,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                             catch { liveValue = currentTyped; }
 
                             var freshResults = NamingValidationEngine.ValidateObjectName(
-                                "Column", liveValue, attrBoxed, rf.Rule.PropertyCode, isNew: treatAsNew);
+                                "Column", liveValue, attrBoxed, rf.Rule.PropertyCode, isNew: revalidateAsNew);
                             var freshFailure = freshResults?.FirstOrDefault(r => !r.IsValid);
                             if (freshFailure == null)
                             {
@@ -7806,7 +8559,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                     ValidationType = CollectedValidationResultType.NamingStandard,
                     TableName = state.TableName,
                     ColumnName = state.PhysicalName,
-                    Message = r.ErrorMessage
+                    Message = r.ErrorMessage,
+                    // 2026-07-09: carry the live handle so the consolidated popup can re-resolve
+                    // the CURRENT name at display time (erwin's auto-uniquify may rename the
+                    // column between queueing and the flush at editor close).
+                    Attribute = attr,
+                    ObjectId = state.ObjectId
                 });
             }
 
@@ -8270,7 +9028,11 @@ namespace EliteSoft.Erwin.AddIn.Services
                     ColumnName = state.PhysicalName,
                     DomainName = state.DomainParentValue,
                     Pattern = pattern,
-                    Message = message
+                    Message = message,
+                    // 2026-07-09: live handle for display-time name re-resolution (see the
+                    // NamingStandard queue note).
+                    Attribute = attr,
+                    ObjectId = state.ObjectId
                 });
             }
         }
@@ -8332,6 +9094,18 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         #region Popup Display
 
+        /// <summary>
+        /// Column name to DISPLAY for a queued result: prefers a live re-read via the stored
+        /// COM handle, because erwin's delayed auto-uniquify can rename the column between
+        /// queueing and the popup flush (editor close). Falls back to the frozen string when no
+        /// handle was stored (PK/Index results) or the object is gone.
+        /// </summary>
+        private string LiveColumnNameFor(CollectedValidationResult result)
+        {
+            if (result?.Attribute == null) return result?.ColumnName ?? string.Empty;
+            return ReadLivePhysicalName(result.Attribute, result.ColumnName ?? string.Empty);
+        }
+
         private void ShowConsolidatedPopup()
         {
             if (_pendingResults.Count == 0 || _popupVisible) return;
@@ -8359,7 +9133,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     foreach (var result in domainResults)
                     {
                         sb.AppendLine($"Table: {result.TableName}");
-                        sb.AppendLine($"Column: {result.ColumnName}");
+                        sb.AppendLine($"Column: {LiveColumnNameFor(result)}");
                         if (!string.IsNullOrEmpty(result.DomainName))
                         {
                             sb.AppendLine($"Domain: {result.DomainName}");
@@ -8385,7 +9159,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     foreach (var result in glossaryResults)
                     {
                         sb.AppendLine($"Table: {result.TableName}");
-                        sb.AppendLine($"Column: {result.ColumnName}");
+                        sb.AppendLine($"Column: {LiveColumnNameFor(result)}");
                         sb.AppendLine($"Issue: {result.Message}");
                         sb.AppendLine();
                     }
@@ -8405,7 +9179,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     foreach (var result in namingResults)
                     {
                         sb.AppendLine($"Table: {result.TableName}");
-                        sb.AppendLine($"Column: {result.ColumnName}");
+                        sb.AppendLine($"Column: {LiveColumnNameFor(result)}");
                         sb.AppendLine($"Issue: {result.Message}");
                         sb.AppendLine();
                     }
@@ -8848,12 +9622,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                 if (!PredefinedColumnService.Instance.IsLoaded)
                     PredefinedColumnService.Instance.LoadPredefinedColumns();
 
-                var allPredefined = PredefinedColumnService.Instance.GetAll();
-                var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                foreach (var col in allPredefined)
-                {
-                    names.Add(col.Name);
-                }
+                // ENTITY-SCOPED: only the predefined columns that actually apply to THIS entity
+                // (unconditional + conditional rows whose gating UDP matches, e.g. TableClass='Log').
+                // The old code used GetAll() across ALL table classes, so a column predefined for
+                // 'Parametre' (e.g. "OID") was wrongly treated as predefined on a 'Log' table and
+                // skipped from the glossary even though the user added it as a real column.
+                var names = PredefinedColumnService.Instance.GetApplicableNames(entity);
 
                 return names.Count > 0 ? names : null;
             }
