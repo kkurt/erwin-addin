@@ -59,5 +59,25 @@ namespace EliteSoft.Erwin.AddIn.Services
             if (lockLength && !string.Equals(c.Length ?? string.Empty, a.Length ?? string.Empty, StringComparison.Ordinal)) return false;
             return true;
         }
+
+        /// <summary>
+        /// The DURABLE locked length/precision for a length-locked term. GLOSSARY-FIRST: the term
+        /// mapping's PHYSICAL_DATA_TYPE (<paramref name="glossaryValue"/>) DEFINES the fixed
+        /// length, so when it carries one, it wins outright; the snapshot baseline
+        /// (<paramref name="snapshotValue"/>) only anchors when the mapping has no datatype.
+        /// Snapshot-first was tried first (2026-07-10 morning) and proved wrong in the field the
+        /// same day: the baseline can be POISONED - a term-canonical-unresolved window or a
+        /// whitelist-allowed delayed re-commit absorbed NUMERIC(555) into the snapshot, after
+        /// which every "revert" restored 555 instead of the term-fixed 5 ("Restored:
+        /// NUMERIC(555)" bug). The baseline can also legitimately lose the length entirely
+        /// (parameterless BIGINT picked under AMORPH_DATA_TYPE). Returns "" when neither side
+        /// carries a length (nothing to pin).
+        /// </summary>
+        public static string ResolveLockedLength(string snapshotValue, string glossaryValue)
+        {
+            string fromGlossary = DataTypeParser.Parse(glossaryValue ?? string.Empty).Length;
+            if (!string.IsNullOrEmpty(fromGlossary)) return fromGlossary;
+            return DataTypeParser.Parse(snapshotValue ?? string.Empty).Length ?? string.Empty;
+        }
     }
 }

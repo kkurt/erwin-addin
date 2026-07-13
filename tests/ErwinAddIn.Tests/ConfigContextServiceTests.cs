@@ -30,6 +30,11 @@ public class ConfigContextServiceTests
     [InlineData("erwin://Mart://Mart/Kursat/MetaRepo&version=2", "Kursat/MetaRepo")]
     // Mixed case for the schema portion.
     [InlineData("ERWIN://MART://MART/Kursat/MetaRepo?VNO=1", "Kursat/MetaRepo")]
+    // Renamed Mart root: the host segment is matched generically ([^/]+), so a root
+    // renamed from "Mart" to anything else still yields the SAME root-relative stem -
+    // keeping the add-in aligned with the admin's MODEL_CONFIG_MAPPING key across a rename.
+    [InlineData("Mart://AcmeMart/Kursat/MetaRepo?VNO=1", "Kursat/MetaRepo")]
+    [InlineData("erwin://Mart://Repository/Kursat/SubLib/MyModel", "Kursat/SubLib/MyModel")]
     public void ParseMartPath_extracts_path_stem(string locator, string expected)
     {
         ConfigContextService.ParseMartPath(locator).Should().Be(expected);

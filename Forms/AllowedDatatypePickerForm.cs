@@ -83,6 +83,12 @@ namespace EliteSoft.Erwin.AddIn.Forms
         // supplied via prefillParam. The base-type lock is applied directly to the combo in
         // the ctor (no field needed - the combo never re-enables).
         private readonly bool _lockParam;
+        // The term-locked parameter value (prefillParam captured at construction). SyncParamEnabled
+        // re-applies it whenever a parameter-taking type is selected: the initial preselect can be a
+        // PARAMETERLESS base (e.g. DATE picked earlier under AMORPH_DATA_TYPE), whose sync pass
+        // clears the textbox - without this, switching back to a parameterized type showed the
+        // pinned field EMPTY (live repro 2026-07-10, MUSTERI_NO DATE -> NUMBER).
+        private readonly string _pinnedParam;
 
         /// <summary>Composed datatype (<c>base</c> or <c>base(param)</c>) the user
         /// confirmed with OK. Empty when cancelled.</summary>
@@ -96,7 +102,15 @@ namespace EliteSoft.Erwin.AddIn.Forms
             string b = (baseToken ?? "").Trim();
             string p = (param ?? "").Trim();
             if (b.Length == 0) return "";
-            return p.Length == 0 ? b : $"{b}({Regex.Replace(p, @"\s+", "")})";
+            if (p.Length == 0) return b;
+            // Normalize ONLY whitespace around a separator comma ("10 , 2" -> "10,2", cosmetic for
+            // Standard precision,scale). Do NOT strip other internal whitespace: it is significant
+            // for Regex-parametrized types such as Oracle "VARCHAR2(55 CHAR)", whose admin regex
+            // requires the space. Stripping it (the old `\s+`->"" collapse) produced "55CHAR",
+            // which then failed the very Datatype-Library / naming regex the raw parameter had just
+            // passed in ValidateComposition - a compose-vs-validate divergence. (2026-07-10)
+            string normalized = Regex.Replace(p, @"\s*,\s*", ",");
+            return $"{b}({normalized})";
         }
 
         /// <summary>True when the parameter text is empty (bare type) or matches
@@ -126,6 +140,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
             _entries = entries.Where(e => e != null && !string.IsNullOrEmpty(e.Datatype)).ToList();
             _validate = validate;
             _lockParam = lockParam;
+            _pinnedParam = lockParam ? (prefillParam ?? "") : "";
 
             Text = title;
             FormBorderStyle = FormBorderStyle.None;
@@ -367,6 +382,10 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 _lblParam.ForeColor = on && !_lockParam ? ClrTextSecondary : ClrBorder;
                 paramFrame.BackColor = on && !_lockParam ? ClrFieldBorder : ClrBorder;
                 if (!on) { _txtParam.Text = ""; _lblError.Visible = false; }
+                // Re-apply the term-locked parameter on every switch TO a parameter-taking type:
+                // a parameterless preselect's pass above just cleared it, and the locked field is
+                // not user-editable so nobody else can restore it.
+                else if (_lockParam && _pinnedParam.Length > 0) _txtParam.Text = _pinnedParam;
             }
             _cmbType.SelectedIndexChanged += (_, _) => SyncParamEnabled();
             SyncParamEnabled();

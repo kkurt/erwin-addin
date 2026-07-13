@@ -246,11 +246,16 @@ public class AllowedDatatypePickerLogicTests
     [Theory]
     [InlineData("nvarchar", "50", "nvarchar(50)")]
     [InlineData("NUMBER", "10,2", "NUMBER(10,2)")]
-    [InlineData("NUMBER", " 10 , 2 ", "NUMBER(10,2)")]   // spaces stripped inside param
+    [InlineData("NUMBER", " 10 , 2 ", "NUMBER(10,2)")]   // whitespace AROUND the comma collapsed
     [InlineData("int", "", "int")]                        // empty param -> bare base
     [InlineData("int", null, "int")]
     [InlineData(" date ", "", "date")]                    // base trimmed
     [InlineData("", "50", "")]                            // no base -> nothing
+    // 2026-07-10: significant internal whitespace is PRESERVED (was wrongly stripped, breaking the
+    // Oracle "VARCHAR2(55 CHAR)" regex whose admin pattern requires the space).
+    [InlineData("VARCHAR2", "55 CHAR", "VARCHAR2(55 CHAR)")]
+    [InlineData("VARCHAR2", "  55   CHAR  ", "VARCHAR2(55   CHAR)")] // only leading/trailing trimmed
+    [InlineData("VARCHAR2", "10 BYTE", "VARCHAR2(10 BYTE)")]
     public void Compose_builds_physical_datatype(string baseToken, string param, string expected)
     {
         Forms.AllowedDatatypePickerForm.Compose(baseToken, param).Should().Be(expected);

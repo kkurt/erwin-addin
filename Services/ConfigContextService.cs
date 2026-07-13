@@ -189,22 +189,28 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// Parse the Mart path stem (e.g. "Kursat/MetaRepo") out of an erwin
         /// PU locator. Two real-world shapes are accepted (taken from
         /// VersionCompareService):
-        ///   "Mart://Mart/&lt;lib&gt;/&lt;model&gt;?...VNO=N..."
-        ///   "erwin://Mart://Mart/&lt;lib&gt;/&lt;model&gt;?&amp;version=N&amp;modelLongId=..."
-        /// The path stem is everything between "Mart://Mart/" and the first
-        /// '?' or '&amp;' (whichever comes first), trimmed of leading/trailing
-        /// slashes. The exact same value is what admin's
-        /// <c>ModelMappingService.GetByMartPath</c> compares against
-        /// MODEL_CONFIG_MAPPING.MART_PATH (verbatim, case-sensitive on the DB
-        /// side). Returns null for local-file locators or anything we cannot
-        /// parse.
+        ///   "Mart://&lt;root&gt;/&lt;lib&gt;/&lt;model&gt;?...VNO=N..."
+        ///   "erwin://Mart://&lt;root&gt;/&lt;lib&gt;/&lt;model&gt;?&amp;version=N&amp;modelLongId=..."
+        /// The stem is everything AFTER the "Mart://&lt;root&gt;/" host segment and
+        /// before the first '?' or '&amp;', trimmed of leading/trailing slashes.
+        /// The host segment is the Mart catalog ROOT and is matched generically
+        /// ([^/]+), NOT the literal "Mart", because the root library can be
+        /// renamed - a hard-coded "Mart://Mart/" would then fail to match and
+        /// the model would resolve to no config at all. Dropping whatever the
+        /// root is named yields the SAME root-relative stem the admin stores in
+        /// MODEL_CONFIG_MAPPING.MART_PATH (which itself drops the synthetic root),
+        /// so add-in and admin stay aligned across a rename. Compared verbatim
+        /// (case-sensitive on the DB side). Returns null for local-file locators
+        /// or anything we cannot parse.
         /// </summary>
         public static string ParseMartPath(string locator)
         {
             if (string.IsNullOrWhiteSpace(locator)) return null;
 
-            // Single regex governs how we read the active PU's Mart path stem.
-            var m = Regex.Match(locator, @"Mart://Mart/(?<path>[^?&]+?)(?:[?&]|$)",
+            // Single regex governs how we read the active PU's Mart path stem. The host
+            // segment after "Mart://" is the catalog root; match it as [^/]+ (rename-proof)
+            // rather than the literal "Mart" so a renamed root still resolves.
+            var m = Regex.Match(locator, @"Mart://[^/]+/(?<path>[^?&]+?)(?:[?&]|$)",
                 RegexOptions.IgnoreCase);
             if (!m.Success) return null;
 

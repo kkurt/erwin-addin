@@ -4,6 +4,61 @@ A running log of corrections and non-obvious findings that future sessions
 should not have to rediscover. Each entry is a short rule, the reason, and
 how to apply it.
 
+## 2026-07-10 (PM): Lazily-populated constraint metadata = windows where the constraint is OFF
+
+**Rule:** TermTypeCanonical was only populated by glossary-validation events (create/rename) and
+carried across snapshots. A fresh silent baseline of a PRE-EXISTING column therefore had
+canonical=null - and every term-lock check treats null as "no constraint". In that window the
+picker opened unlocked and accepted Numeric(555) (field log). If a constraint's activation
+depends on metadata, the metadata must be resolvable AT the enforcement site (lazy, cached), not
+only at bless-time events. Corollary: one machine's "value is fine by MY rules" (whitelist
+IsAllowed early-return) must not advance the shared baseline without asking the OTHER machine
+(term policy) - that absorb silently flipped the baseline 5 -> 555 on erwin's delayed re-commit.
+
+**How to apply:** ResolveTermCanonical(snap) lazy dict lookup at enforcement sites (cache "" only
+when the glossary is actually loaded); absorb gate at the whitelist pre-read routes lock-violating
+diffs through EnforceTermTypePolicy before accepting; ResolveLockedLength is glossary-first.
+
+## 2026-07-10: A locked value needs a DURABLE source, not the last snapshot
+
+**Rule:** the term-type "fixed length" was resolved from the snapshot baseline (prev.PhysicalDataType).
+A legitimate transition through a parameterless base (picker allows BIGINT under AMORPH_DATA_TYPE,
+and the picker write path bypasses EnforceTermTypePolicy because it advances the snapshot itself)
+erased the length from the baseline - the next picker pinned an EMPTY parameter and the policy
+reverted to a bare base. A constraint's authoritative value must come from the artifact that
+DEFINES it (the glossary term mapping's PHYSICAL_DATA_TYPE), with the snapshot only as a proxy.
+
+**How to apply:** TermTypeLocks.ResolveLockedLength(snapshot, glossary) - snapshot length first,
+glossary fallback - at every site that pins/restores the locked length. Do NOT tighten Honors the
+same way: the remembered parameterless pick must keep honoring, or the picker re-opens in a loop.
+
+## 2026-07-10: Modal loop labels must be rebuilt every pass - the fix itself can rename the object
+
+**Rule:** the Required-field re-prompt loop reused the fieldLabel string built before the FIRST
+prompt. When the user's accepted fix WAS a rename (Physical_Name), the second rule's dialog cited
+the old name (AbcDate__592 shown while the grid already said AbcDat). Any loop that shows a dialog
+must rebuild identity strings (and sync state.PhysicalName) at the top of each pass, not capture
+them once - same family as the live-name-at-display rule from the modal-race work.
+
+## 2026-07-10: A picker's Compose must emit EXACTLY what it validated - no post-validate mutation
+
+**Rule:** AllowedDatatypePickerForm.Compose stripped ALL internal whitespace from the parameter
+(`Regex.Replace(p, @"\s+", "")`), added to normalize Standard "10 , 2" -> "10,2". But
+ValidateComposition validates the RAW (Trim-only) param for Regex types, so for Oracle
+"VARCHAR2(55 CHAR)" the raw "55 CHAR" PASSED the admin regex, then Compose mutated it to "55CHAR"
+which FAILS the same regex (`[0-9]+\s+CHAR`, space required). The composed value that got written /
+DDL'd diverged from what was validated - a warning fired on a value the user had entered correctly.
+
+**Why:** whitespace is significant for Regex-parametrized datatypes; only whitespace AROUND the
+Standard precision,scale comma is cosmetic. A compose step that mutates the parameter after
+validation breaks the validate<->emit contract.
+
+**How to apply:** normalize ONLY around the separator comma (`\s*,\s*` -> `,`); preserve every
+other internal space. General principle: whatever a picker VALIDATES is what it must EMIT - never
+re-normalize a value between the validate call and the write. DataTypeParser already preserves the
+length verbatim (group `([^)]*)`), so the picker was the sole strip site. Tests:
+AllowedDatatypeMatcherTests Compose cases (55 CHAR, 10 BYTE preserved; "10 , 2" -> "10,2" kept).
+
 ## 2026-07-10: One flag must not drive both "which rules fire" and "does Cancel delete" - split them
 
 **Rule:** the `isNew`/`treatAsNew` flag was overloaded: it decided BOTH whether apply=Create

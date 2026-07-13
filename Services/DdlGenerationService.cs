@@ -151,7 +151,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                 string locator = "";
                 try { locator = currentPU.PropertyBag().Value("Locator")?.ToString() ?? ""; } catch { }
                 string modelPath = "";
-                var pathMatch = Regex.Match(locator, @"Mart://Mart/(.+?)(\?|$)");
+                // Host segment after "Mart://" is the catalog ROOT; match it generically ([^/]+),
+                // NOT the literal "Mart", so a renamed root ("Mart://TestRoot/...") still yields the
+                // correct stem instead of silently falling back to the bare model name.
+                var pathMatch = Regex.Match(locator, @"Mart://[^/]+/(.+?)(\?|$)", RegexOptions.IgnoreCase);
                 if (pathMatch.Success) modelPath = pathMatch.Groups[1].Value;
                 else modelPath = currentPU.Name?.ToString() ?? "";
 
@@ -286,8 +289,13 @@ namespace EliteSoft.Erwin.AddIn.Services
             string locator = "";
             try { locator = currentPU.PropertyBag().Value("Locator")?.ToString() ?? ""; } catch { }
             string modelPath = "";
-            var pathMatch = Regex.Match(locator, @"Mart://Mart/(.+?)(\?|$)");
-            if (pathMatch.Success) modelPath = pathMatch.Groups[1].Value;
+            // Host segment after "Mart://" is the catalog ROOT; match it generically ([^/]+), NOT the
+            // literal "Mart", so a renamed root ("Mart://TestRoot/...") still yields the correct stem.
+            // Capture the host too so the rebuilt open-locators below target the SAME root the model
+            // currently lives under (opening "mart://Mart/..." when the root is "TestRoot" would fail).
+            string martHost = "Mart";
+            var pathMatch = Regex.Match(locator, @"Mart://([^/]+)/(.+?)(\?|$)", RegexOptions.IgnoreCase);
+            if (pathMatch.Success) { martHost = pathMatch.Groups[1].Value; modelPath = pathMatch.Groups[2].Value; }
             else modelPath = currentPU.Name?.ToString() ?? "";
 
             FileLog($"Model: {modelPath}, Version: {version}");
@@ -304,17 +312,17 @@ namespace EliteSoft.Erwin.AddIn.Services
             var attempts = new List<(string url, string disposition, string desc)>();
 
             // GROUP 1: Known safe (return errors, don't crash)
-            attempts.Add(($"mart://Mart/{modelPath}?VNO={version}", "", "mart VNO + empty"));
-            attempts.Add(($"mart://Mart/{modelPath}?VNO={version}", "RDO=Yes", "mart VNO + RDO"));
-            attempts.Add(($"mart://Mart/{modelPath}?VNO={version}", "OVM=Yes", "mart VNO + OVM"));
+            attempts.Add(($"mart://{martHost}/{modelPath}?VNO={version}", "", "mart VNO + empty"));
+            attempts.Add(($"mart://{martHost}/{modelPath}?VNO={version}", "RDO=Yes", "mart VNO + RDO"));
+            attempts.Add(($"mart://{martHost}/{modelPath}?VNO={version}", "OVM=Yes", "mart VNO + OVM"));
 
             // GROUP 2: Add Mart ModelDirectory FIRST, then open model
             // Admin project does: ModelDirectories.Add(martLocator) THEN PersistenceUnits.Add
             // We never tried this! ModelDirectories only has FileSystem, not Mart.
             if (martInfo != null)
             {
-                string martDirLocator = $"mart://Mart?TRC=NO;SRV={martInfo.Value.host};PRT={martInfo.Value.port};ASR=MartServer;UID={martInfo.Value.username};PSW={martInfo.Value.password}";
-                string martModelUrl = $"mart://Mart/{modelPath}?TRC=NO;SRV={martInfo.Value.host};PRT={martInfo.Value.port};ASR=MartServer;UID={martInfo.Value.username};PSW={martInfo.Value.password};VNO={version}";
+                string martDirLocator = $"mart://{martHost}?TRC=NO;SRV={martInfo.Value.host};PRT={martInfo.Value.port};ASR=MartServer;UID={martInfo.Value.username};PSW={martInfo.Value.password}";
+                string martModelUrl = $"mart://{martHost}/{modelPath}?TRC=NO;SRV={martInfo.Value.host};PRT={martInfo.Value.port};ASR=MartServer;UID={martInfo.Value.username};PSW={martInfo.Value.password};VNO={version}";
 
                 // Try adding Mart directory first
                 try

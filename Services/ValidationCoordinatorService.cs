@@ -6921,7 +6921,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // diff there is intentional, not a user edit to constrain).
                 if (dataTypeChanged && !physicalNameChanged)
                 {
-                    Log($"Physical_Data_Type changed: {currentState.TableName}.{currentState.PhysicalName} '{previousState.PhysicalDataType}' -> '{currentState.PhysicalDataType}' (canonical='{currentState.TermTypeCanonical ?? "(none)"}')");
+                    Log($"Physical_Data_Type changed: {currentState.TableName}.{currentState.PhysicalName} '{previousState.PhysicalDataType}' -> '{currentState.PhysicalDataType}' (canonical='{ResolveTermCanonical(currentState) ?? "(none)"}')");
                     EnforceTermTypePolicy(attr, previousState, currentState);
 
                     // Datatype whitelist (admin "Datatype Library" -> DATATYPE_LIBRARY for the
@@ -6989,6 +6989,36 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// Lazily resolve a snapshot's canonical term type from the glossary match dictionary.
+        /// Fresh silent baselines (SilentPopulateEntity / CreateSnapshot) deliberately do not
+        /// resolve UDPs - but that left PRE-EXISTING columns with TermTypeCanonical=null until a
+        /// glossary validation event ran, a window in which every term lock was silently OFF
+        /// (field log 2026-07-10: the datatype picker opened UNLOCKED on an AMORPH_DATA_TYPE
+        /// column and accepted 'Numeric(555)', poisoning the baseline; the dialog later said
+        /// "Restored: NUMERIC(555)"). The resolution is a cheap in-memory dictionary lookup, so
+        /// the enforcement sites resolve it on demand. Caches "" (= resolved, no term) only when
+        /// the glossary is actually loaded, so a late glossary load is not frozen out.
+        /// </summary>
+        private string ResolveTermCanonical(AttributeValidationSnapshot snap)
+        {
+            if (snap == null) return null;
+            if (snap.TermTypeCanonical == null)
+            {
+                try
+                {
+                    var glossary = GlossaryService.Instance;
+                    if (glossary.IsLoaded)
+                        snap.TermTypeCanonical = glossary.GetTermTypeCanonical(snap.PhysicalName) ?? "";
+                }
+                catch (Exception ex)
+                {
+                    Log($"ResolveTermCanonical failed for '{snap.PhysicalName}': {ex.Message}");
+                }
+            }
+            return string.IsNullOrEmpty(snap.TermTypeCanonical) ? null : snap.TermTypeCanonical;
+        }
+
+        /// <summary>
         /// Apply the term-type policy when a column's Physical_Data_Type changed and the
         /// snapshot carries a canonical concept resolved at glossary-apply time:
         ///   BUSINESS_TERM       -> revert both base type and length to the previous value
@@ -7000,7 +7030,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// </summary>
         private void EnforceTermTypePolicy(dynamic attr, AttributeValidationSnapshot prev, AttributeValidationSnapshot curr)
         {
-            string canonical = curr.TermTypeCanonical;
+            string canonical = ResolveTermCanonical(curr);
             if (string.IsNullOrEmpty(canonical)) return;
             if (canonical.Equals("AMORPH", StringComparison.OrdinalIgnoreCase)) return;
 
@@ -7031,6 +7061,15 @@ namespace EliteSoft.Erwin.AddIn.Services
                     if (!lenChanged) return; // user only touched type, which is allowed
                     keepBase = newParts.Base;
                     keepSuffix = newParts.Suffix;
+                    // Durable locked length (2026-07-10): restore the length the TERM MAPPING
+                    // defines (glossary-first), not whatever the baseline happens to hold. The
+                    // baseline can be poisoned (a canonical-unresolved window or a whitelist-
+                    // allowed delayed re-commit absorbed e.g. NUMBER(555) - field bug "Restored:
+                    // NUMERIC(555)") or empty (parameterless BIGINT picked earlier); both would
+                    // perpetuate the drift if we kept oldParts.Length. Baseline length still
+                    // anchors when the term mapping carries no datatype.
+                    keepLength = TermTypeLocks.ResolveLockedLength(
+                        prev?.PhysicalDataType, GetGlossaryAuthoritativeDatatype(curr?.PhysicalName));
                     disallowed = "Length";
                     break;
                 case "AMORPH_DATA_LENGTH":
@@ -7410,7 +7449,8 @@ namespace EliteSoft.Erwin.AddIn.Services
             // a stale pre-domain default (e.g. char(18)). Re-read so we never clobber a value a
             // domain/glossary just applied or cite a type the user never set. Sync curr so the dedup
             // key and the baseline reflect what is actually in the model.
-            string attempted = curr?.PhysicalDataType ?? string.Empty;
+            string snapshotBefore = curr?.PhysicalDataType ?? string.Empty;
+            string attempted = snapshotBefore;
             try
             {
                 string liveNow = attr?.Properties("Physical_Data_Type").Value?.ToString();
@@ -7419,7 +7459,34 @@ namespace EliteSoft.Erwin.AddIn.Services
             catch (Exception preEx) { Log($"AllowedDatatype: live type pre-read failed for {curr?.PhysicalName}: {preEx.Message}"); }
             if (curr != null) curr.PhysicalDataType = attempted;
 
-            if (AllowedDatatypeService.Instance.IsAllowed(attempted)) return; // permitted
+            if (AllowedDatatypeService.Instance.IsAllowed(attempted))
+            {
+                // 2026-07-10: whitelist-allowed does NOT mean term-allowed. erwin's delayed double
+                // combo-commit re-writes the user's attempt AFTER EnforceTermTypePolicy reverted
+                // it; the pre-read above then absorbed it as the new baseline with no term check
+                // (field bug: NUMBER(555) - whitelist regex accepts any [0-9]+ - silently became
+                // the baseline, and every later "revert" restored the poison). Route the absorbed
+                // diff through the term policy before accepting it.
+                if (curr != null && !string.IsNullOrEmpty(snapshotBefore)
+                    && !string.Equals(snapshotBefore, attempted, StringComparison.Ordinal))
+                {
+                    var (absorbLockBase, absorbLockLength) = TermTypeLocks.Get(ResolveTermCanonical(curr));
+                    if ((absorbLockBase || absorbLockLength)
+                        && !TermTypeLocks.Honors(attempted, snapshotBefore, absorbLockBase, absorbLockLength))
+                    {
+                        Log($"AllowedDatatype: absorbed change '{snapshotBefore}' -> '{attempted}' on {curr.TableName}.{curr.PhysicalName} violates the term lock - routing through term policy");
+                        var baseline = new AttributeValidationSnapshot
+                        {
+                            TableName = curr.TableName,
+                            PhysicalName = curr.PhysicalName,
+                            PhysicalDataType = snapshotBefore,
+                            TermTypeCanonical = curr.TermTypeCanonical
+                        };
+                        EnforceTermTypePolicy(attr, baseline, curr);
+                    }
+                }
+                return; // permitted (possibly just re-corrected by the term policy)
+            }
 
             // The NAME can be stale the same way the type was: erwin's delayed rename commits
             // (auto-uniquify '__NNNN' after a name collision) land between the snapshot capture
@@ -7437,7 +7504,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             // this whitelist picker let the user override the lock (log 16:52: 'user picked
             // NUMBER(45)' on a BUSINESS_TERM column). The authoritative value = the pre-edit type
             // (prev snapshot); on new-column call sites (prev==null) the glossary cache supplies it.
-            var (termLockBase, termLockLength) = TermTypeLocks.Get(curr?.TermTypeCanonical);
+            var (termLockBase, termLockLength) = TermTypeLocks.Get(ResolveTermCanonical(curr));
             string termAuthoritative = prev?.PhysicalDataType;
             if (string.IsNullOrEmpty(termAuthoritative) && (termLockBase || termLockLength))
                 termAuthoritative = GetGlossaryAuthoritativeDatatype(curr?.PhysicalName);
@@ -7614,7 +7681,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                     bool pickerLockParam = termHasLock && termLockLength;
                     string pickPrefill = Forms.AllowedDatatypePickerForm.ExtractParameter(attempted);
                     if (pickerLockBase) pickPreselect = termAuthBase;
-                    if (pickerLockParam) pickPrefill = Forms.AllowedDatatypePickerForm.ExtractParameter(termAuthoritative);
+                    // Durable locked length (2026-07-10): the snapshot baseline can legitimately
+                    // pass through a parameterless base (BIGINT picked under AMORPH_DATA_TYPE),
+                    // erasing the length from termAuthoritative - the pinned parameter must then
+                    // come from the term mapping's own datatype (glossary), not arrive empty.
+                    if (pickerLockParam)
+                        pickPrefill = TermTypeLocks.ResolveLockedLength(
+                            termAuthoritative, GetGlossaryAuthoritativeDatatype(curr?.PhysicalName));
                     if (pickerLockBase || pickerLockParam)
                         pickMessage += $"\n\nTerm mapping ('{curr?.TermTypeCanonical}'): " +
                             (pickerLockBase ? "the base type is fixed and cannot be changed." : "the length/precision is fixed and cannot be changed.");
@@ -8433,6 +8506,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 break;
                             }
 
+                            // Rebuild the label EVERY pass: the accepted fix may itself have renamed
+                            // the column (PropertyCode == Physical_Name), so the label captured
+                            // before the first prompt is stale by now (live repro 2026-07-10: the
+                            // rule#1032 re-prompt still cited 'AbcDate__592' after the user had
+                            // already renamed to 'AbcDat' in the previous dialog).
+                            fieldLabel = $"{state.TableName}.{ReadLivePhysicalName(attr, state.PhysicalName)} ({friendlyProp})";
+
                             Log($"Required field re-prompt for {fieldLabel}: '{liveValue}' still violates rule#{freshFailure.Rule?.Id} ({freshFailure.RuleName})");
                             var rc2 = EliteSoft.Erwin.AddIn.Forms.RequiredFieldDialog.Show(
                                 title: "Required field",
@@ -8502,6 +8582,11 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 _session.CommitTransaction(loopTransId);
                                 Log($"Required field re-filled by user: {state.TableName}.{state.PhysicalName} {fieldLabel} = '{typed2}'");
                                 currentTyped = typed2;
+                                // Parity with the first-fill site: a re-fill of Physical_Name is a
+                                // rename too - keep the state in sync so later dialogs/logs in this
+                                // pass cite the new name.
+                                if (string.Equals(rf.Rule.PropertyCode, "Physical_Name", StringComparison.OrdinalIgnoreCase))
+                                    state.PhysicalName = typed2;
                                 state.WatchedProperties[rf.Rule.PropertyCode] = typed2;
                             }
                             catch (Exception loopEx)

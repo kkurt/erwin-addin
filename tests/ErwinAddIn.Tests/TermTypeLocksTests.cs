@@ -64,4 +64,28 @@ public class TermTypeLocksTests
     {
         TermTypeLocks.Honors(candidate, authoritative, true, false).Should().BeFalse();
     }
+
+    /// <summary>
+    /// 2026-07-10: the durable fixed length is GLOSSARY-FIRST - the term mapping's own datatype
+    /// DEFINES it; the snapshot baseline only anchors when the mapping carries no datatype.
+    /// Two field repros pinned here: (a) parameterless BIGINT picked under AMORPH_DATA_TYPE
+    /// erased the length from the snapshot (pin came up empty); (b) a poisoned baseline -
+    /// 'Numeric(555)' absorbed during a canonical-unresolved window - made every revert restore
+    /// 555 instead of the term-fixed 5 ("Restored: NUMERIC(555)" dialog).
+    /// </summary>
+    [Theory]
+    [InlineData("NUMERIC(5)", "NUMERIC(5)", "5")]      // agree - trivially 5
+    [InlineData("NUMERIC(555)", "NUMERIC(5)", "5")]    // poisoned snapshot - glossary wins (the field bug)
+    [InlineData("nvarchar(55)", "NVARCHAR(15)", "15")] // glossary defines the lock, snapshot drifted
+    [InlineData("BIGINT", "NUMERIC(5)", "5")]          // parameterless snapshot - glossary supplies it
+    [InlineData("", "NUMERIC(5)", "5")]                // no snapshot at all
+    [InlineData(null, "NUMERIC(5)", "5")]
+    [InlineData("NUMERIC(10,2)", "BIGINT", "10,2")]    // glossary has no length - snapshot anchors
+    [InlineData("BIGINT", "DATE", "")]                 // neither side has a length - nothing to pin
+    [InlineData("BIGINT", "", "")]
+    [InlineData(null, null, "")]
+    public void ResolveLockedLength_prefers_glossary_then_snapshot(string snapshot, string glossary, string expected)
+    {
+        TermTypeLocks.ResolveLockedLength(snapshot, glossary).Should().Be(expected);
+    }
 }
