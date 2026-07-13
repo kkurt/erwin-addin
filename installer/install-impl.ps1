@@ -781,12 +781,31 @@ function Read-WithDefault([string]$prompt, [string]$default) {
     return $val
 }
 
+# Default DB port by type. Mirrors MetaShared DbTypes.GetDefaultPort
+# (MetaShared/Models/DbType.cs) so that when neither the CLI nor the seed
+# supplied a port, the prompt/HKCU value is the driver's real default for the
+# chosen DBType (Oracle 1521, PostgreSQL 5432) instead of always MSSQL's 1433.
+# HkcuBootstrapReader applies the same fallback at runtime; keep the two in sync.
+function Get-DefaultPort([string]$dbType) {
+    switch (("" + $dbType).ToUpperInvariant()) {
+        "ORACLE"     { return "1521" }
+        "POSTGRESQL" { return "5432" }
+        default      { return "1433" }
+    }
+}
+
 $bsDBHost     = Resolve-Field $DBHost     "DBHost"     ""
 $bsDBName     = Resolve-Field $DBName     "DBName"     ""
 $bsDBUserName = Resolve-Field $DBUserName "DBUserName" ""
 $bsDBPassword = Resolve-Field $DBPassword "DBPassword" ""
 $bsDBType     = Resolve-Field $DBType     "DBType"     "MSSQL"
-$bsDBPort     = Resolve-Field $DBPort     "DBPort"     "1433"
+# Port resolution: an explicit port (CLI -DBPort or a non-empty seed DBPort)
+# always wins. When none was supplied, derive the default from the resolved
+# DBType (Oracle 1521, PostgreSQL 5432, MSSQL 1433) instead of hardcoding 1433.
+# $portExplicit is reused in the interactive branch below to re-derive the
+# default if the user changes DBType at the prompt.
+$portExplicit = (-not [string]::IsNullOrEmpty($DBPort)) -or ($null -ne $seedFromFile -and -not [string]::IsNullOrEmpty([string]$seedFromFile.DBPort))
+$bsDBPort     = if ($portExplicit) { Resolve-Field $DBPort "DBPort" "1433" } else { Get-DefaultPort $bsDBType }
 
 $haveHostAndName = -not [string]::IsNullOrEmpty($bsDBHost) -and -not [string]::IsNullOrEmpty($bsDBName)
 
@@ -819,6 +838,9 @@ if (-not $haveHostAndName) {
         Write-Host ""
         $bsDBType     = Read-WithDefault "  DB Type (MSSQL/ORACLE/POSTGRESQL)" $bsDBType
         $bsDBHost     = Read-WithDefault "  DB Host" $bsDBHost
+        # No explicit port supplied: the shown default follows the DBType the user
+        # just picked (Oracle -> 1521, PostgreSQL -> 5432) rather than a stale 1433.
+        if (-not $portExplicit) { $bsDBPort = Get-DefaultPort $bsDBType }
         $bsDBPort     = Read-WithDefault "  DB Port" $bsDBPort
         $bsDBName     = Read-WithDefault "  DB Name (catalog)" $bsDBName
         $bsDBUserName = Read-WithDefault "  DB UserName" $bsDBUserName

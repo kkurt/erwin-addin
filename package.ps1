@@ -71,7 +71,7 @@ if ($Help) {
     Write-Host "Bootstrap params (all map 1:1 to registry values under" -ForegroundColor Yellow
     Write-Host "SOFTWARE\EliteSoft\MetaRepo\Bootstrap):" -ForegroundColor Yellow
     Write-Host "  -DBHost      DB server hostname"
-    Write-Host "  -DBPort      DB server port (default 1433 if omitted)"
+    Write-Host "  -DBPort      DB server port (if omitted, install derives it from -DBType: MSSQL 1433, Oracle 1521, PostgreSQL 5432)"
     Write-Host "  -DBName      Catalog name"
     Write-Host "  -DBUserName  DB user (DPAPI-encrypted at install time)"
     Write-Host "  -DBPassword  DB password (DPAPI-encrypted at install time)"
@@ -258,8 +258,23 @@ if (Test-Path $packagedComHost) {
 $bootstrapSeedPath = Join-Path $publishDir "bootstrap.seed.json"
 $hasBootstrap = $DBHost -or $DBName -or $DBUserName -or $DBPassword -or $DBType -or $DBPort
 if ($hasBootstrap) {
-    if (-not $DBHost -or -not $DBName) {
-        Write-Host "`n  ERROR: Bootstrap seed requires both -DBHost and -DBName (got DBHost='$DBHost', DBName='$DBName')." -ForegroundColor Red
+    # A "connection seed" (any of host/name/user/password supplied) MUST carry
+    # both DBHost AND DBName. install-impl.ps1 only writes HKCU when both are
+    # non-empty (install-impl.ps1:838); with one missing it falls through to
+    # interactive prompts and any baked DBPassword is silently dropped
+    # (Read-PlainPassword takes no default). So a half-filled connection seed is
+    # a footgun and is rejected here.
+    #
+    # DBType/DBPort ALONE are not a connection: they are only installer prompt
+    # defaults (e.g. -DBType Oracle for a POC where the target DB coordinates are
+    # typed at install time). They may ship with empty host/name: install
+    # pre-fills the type (install-impl.ps1:820) and prompts for the rest, and
+    # HkcuBootstrapReader treats an empty host/name seed as "not configured"
+    # (HkcuBootstrapReader.cs:104-107), so nothing broken ever reaches runtime.
+    $hasConnectionIntent = $DBHost -or $DBName -or $DBUserName -or $DBPassword
+    if ($hasConnectionIntent -and (-not $DBHost -or -not $DBName)) {
+        Write-Host "`n  ERROR: Bootstrap seed requires both -DBHost and -DBName when any of -DBHost/-DBName/-DBUserName/-DBPassword is supplied (got DBHost='$DBHost', DBName='$DBName')." -ForegroundColor Red
+        Write-Host "  Tip: pass -DBType/-DBPort alone to bake only installer defaults with empty host/name." -ForegroundColor Gray
         Write-Host "`nPress any key to exit..." -ForegroundColor Gray
         $null = $(if (-not [Console]::IsOutputRedirected) { (Get-Host).UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') })
         exit 1
@@ -267,7 +282,12 @@ if ($hasBootstrap) {
     $seedObj = [ordered]@{
         DBType     = if ($DBType) { $DBType } else { "MSSQL" }
         DBHost     = $DBHost
-        DBPort     = if ($DBPort) { $DBPort } else { "1433" }
+        # Port is baked ONLY when -DBPort was passed. An unset port stays empty
+        # rather than defaulting to 1433 here: 1433 is MSSQL's port and would be
+        # wrong to bake into an Oracle/PostgreSQL package. install-impl.ps1
+        # applies the install-time default (Resolve-Field ... "1433") when the
+        # seed carries no port.
+        DBPort     = if ($DBPort) { $DBPort } else { "" }
         DBName     = $DBName
         DBUserName = if ($null -ne $DBUserName) { $DBUserName } else { "" }
         DBPassword = if ($null -ne $DBPassword) { $DBPassword } else { "" }
@@ -279,7 +299,7 @@ if ($hasBootstrap) {
     Write-Host "    NOTE: contains plaintext credentials; delete after install or treat the package as sensitive." -ForegroundColor Yellow
 } elseif (Test-Path -LiteralPath $bootstrapSeedPath) {
     Remove-Item -LiteralPath $bootstrapSeedPath -Force
-    Write-Host "  Removed stale bootstrap.seed.json (no -DBHost/-DBName supplied this run)" -ForegroundColor Gray
+    Write-Host "  Removed stale bootstrap.seed.json (no bootstrap params supplied this run)" -ForegroundColor Gray
 }
 
 # STEP 7: (intentionally empty) - uninstall.bat from STEP 5 already wraps

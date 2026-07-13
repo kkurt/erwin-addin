@@ -917,7 +917,17 @@ while ($true) {
     if (Test-Path $wmcmdLogPath) { $logSizeAtMonitorStart = (Get-Item $wmcmdLogPath).Length }
 
     while ($true) {
-        Start-Sleep -Seconds 3
+        # erwin-check interval: read live from HKCU each pass (the add-in mirrors
+        # DDL_GENERATION_CONF.ERWIN_CHECK_INTERVAL_SECONDS there). Default 3s;
+        # clamped 1..3600 so a bad value can't stall or busy-loop the watcher.
+        $checkInterval = 3
+        try {
+            $iv = (Get-ItemProperty -Path $watcherCfgPath -Name 'ErwinCheckIntervalSeconds' -ErrorAction SilentlyContinue).ErwinCheckIntervalSeconds
+            if ($null -ne $iv) { $checkInterval = [int]$iv }
+        } catch { }
+        if ($checkInterval -lt 1)    { $checkInterval = 3 }
+        if ($checkInterval -gt 3600) { $checkInterval = 3600 }
+        Start-Sleep -Seconds $checkInterval
         $stillRunning = Get-Process -Id $targetPid -ErrorAction SilentlyContinue
         if (-not $stillRunning) {
             Write-Log "erwin PID=$targetPid closed - resuming watch"

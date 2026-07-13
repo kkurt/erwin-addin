@@ -142,6 +142,17 @@ There is no `-Scope` flag on `package.ps1`. Every output package is
 User-scope; the receiver runs `.\install-impl.ps1` (no arguments needed) and gets
 a per-user install.
 
+The seed can be **full** or **partial**. Passing any connection field
+(`-DBHost`, `-DBName`, `-DBUserName`, `-DBPassword`) requires **both** `-DBHost`
+and `-DBName`, or packaging aborts: a half-filled connection seed would silently
+drop the baked password at install time (the interactive password prompt has no
+default). Passing only `-DBType` and/or `-DBPort` writes a **partial** seed with
+empty host/name; at install time those values become the pre-filled defaults for
+the interactive prompts (e.g. `-DBType Oracle` for a POC where the target DB
+coordinates are entered on the install machine). `HkcuBootstrapReader` treats an
+empty host/name seed as "not configured", so a partial seed never yields a
+broken runtime config.
+
 `bootstrap.seed.json` contains plaintext credentials (the receiver's machine
 hasn't run DPAPI yet at package time). `install-impl.ps1` encrypts the values with
 DPAPI `CurrentUser` and **deletes the seed file** as soon as the HKCU write

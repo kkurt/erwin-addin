@@ -41,6 +41,14 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <summary>Keep-alive ping interval in minutes (>= 1).</summary>
         public int KeepAliveMinutes { get; init; }
 
+        /// <summary>
+        /// How often (seconds) the WATCHER polls whether erwin is still running,
+        /// so it can relaunch it after a self-healing restart. The add-in reads
+        /// this from the DB and mirrors it to HKCU for the watcher (a PowerShell
+        /// process with no DB access). Default 3s.
+        /// </summary>
+        public int ErwinCheckIntervalSeconds { get; init; }
+
         /// <summary>The corporate this config row belongs to (DDL_GENERATION_CONF.CORPORATE_ID) - carried for logging.</summary>
         public int CorporateId { get; init; }
 
@@ -73,6 +81,19 @@ namespace EliteSoft.Erwin.AddIn.Services
             int v = raw ?? 5;
             if (v < 1) return 5;
             if (v > 1440) return 1440;
+            return v;
+        }
+
+        /// <summary>
+        /// Clamps the watcher erwin-check interval to a sane range. Null/&lt;1 -&gt;
+        /// default 3s; capped at 3600s (an hour) so a bad value can't make the
+        /// watcher effectively stop polling.
+        /// </summary>
+        public static int NormalizeErwinCheckIntervalSeconds(int? raw)
+        {
+            int v = raw ?? 3;
+            if (v < 1) return 3;
+            if (v > 3600) return 3600;
             return v;
         }
 

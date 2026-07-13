@@ -264,6 +264,10 @@ namespace EliteSoft.Erwin.AddIn
                 return;
             }
 
+            // Mirror the watcher's erwin-check interval to HKCU (the watcher is a
+            // PowerShell process with no DB access - it reads this value there).
+            WriteWatcherCheckInterval(cfg.ErwinCheckIntervalSeconds);
+
             _martLoginInProgress = true;
             UpdateStatus("Logging into Mart...", System.Drawing.Color.Gray);
             Action<string> log = msg =>
@@ -338,7 +342,11 @@ namespace EliteSoft.Erwin.AddIn
                 try
                 {
                     var cfg = DdlWorkerConfigService.Instance.ReadActiveConfig(log);
-                    if (cfg != null) freshMinutes = cfg.KeepAliveMinutes;
+                    if (cfg != null)
+                    {
+                        freshMinutes = cfg.KeepAliveMinutes;
+                        WriteWatcherCheckInterval(cfg.ErwinCheckIntervalSeconds); // live-refresh the watcher poll interval too
+                    }
                 }
                 catch (Exception ex) { log($"[MART-KEEPALIVE] config refresh failed ({ex.Message}) - keeping {_keepAliveMinutes}min."); }
 
@@ -390,6 +398,21 @@ namespace EliteSoft.Erwin.AddIn
             try { StopDdlWorker(); } catch (Exception ex) { Log($"[DDL-RESTART] StopDdlWorker note: {ex.Message}"); }
             try { MartMartAutomation.RequestErwinRestart(Log); }
             catch (Exception ex) { Log($"[DDL-RESTART] restart request failed: {ex.Message}"); }
+        }
+
+        /// <summary>
+        /// Mirrors the DB's ERWIN_CHECK_INTERVAL_SECONDS to HKCU so the watcher
+        /// (a PowerShell process with no DB access) can read it. Best-effort:
+        /// the watcher falls back to its own default when the value is absent.
+        /// </summary>
+        private void WriteWatcherCheckInterval(int seconds)
+        {
+            try
+            {
+                using var key = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(@"Software\EliteSoft\ErwinAddIn\Watcher");
+                key?.SetValue("ErwinCheckIntervalSeconds", seconds, Microsoft.Win32.RegistryValueKind.DWord);
+            }
+            catch (Exception ex) { Log($"[DDLWORKER] HKCU check-interval write failed: {ex.Message}"); }
         }
 
         /// <summary>

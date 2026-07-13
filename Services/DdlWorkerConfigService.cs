@@ -55,9 +55,9 @@ namespace EliteSoft.Erwin.AddIn.Services
             // second row is DETECTED rather than silently dropped).
             string sql = dbType?.ToUpper() switch
             {
-                "POSTGRESQL" => @"SELECT ""MART_AUTH_TYPE"",""MART_USER"",""MART_PASSWORD"",""MART_SERVER"",""MART_PORT"",""MART_USE_SSL"",""KEEPALIVE_MINUTES"",""CORPORATE_ID"" FROM ""DDL_GENERATION_CONF"" ORDER BY ""ID"" ASC",
-                "ORACLE"     => @"SELECT MART_AUTH_TYPE, MART_USER, MART_PASSWORD, MART_SERVER, MART_PORT, MART_USE_SSL, KEEPALIVE_MINUTES, CORPORATE_ID FROM DDL_GENERATION_CONF ORDER BY ID ASC",
-                _            => @"SELECT [MART_AUTH_TYPE],[MART_USER],[MART_PASSWORD],[MART_SERVER],[MART_PORT],[MART_USE_SSL],[KEEPALIVE_MINUTES],[CORPORATE_ID] FROM [dbo].[DDL_GENERATION_CONF] ORDER BY [ID] ASC",
+                "POSTGRESQL" => @"SELECT ""MART_AUTH_TYPE"",""MART_USER"",""MART_PASSWORD"",""MART_SERVER"",""MART_PORT"",""MART_USE_SSL"",""KEEPALIVE_MINUTES"",""ERWIN_CHECK_INTERVAL_SECONDS"",""CORPORATE_ID"" FROM ""DDL_GENERATION_CONF"" ORDER BY ""ID"" ASC",
+                "ORACLE"     => @"SELECT MART_AUTH_TYPE, MART_USER, MART_PASSWORD, MART_SERVER, MART_PORT, MART_USE_SSL, KEEPALIVE_MINUTES, ERWIN_CHECK_INTERVAL_SECONDS, CORPORATE_ID FROM DDL_GENERATION_CONF ORDER BY ID ASC",
+                _            => @"SELECT [MART_AUTH_TYPE],[MART_USER],[MART_PASSWORD],[MART_SERVER],[MART_PORT],[MART_USE_SSL],[KEEPALIVE_MINUTES],[ERWIN_CHECK_INTERVAL_SECONDS],[CORPORATE_ID] FROM [dbo].[DDL_GENERATION_CONF] ORDER BY [ID] ASC",
             };
 
             using (var conn = DatabaseService.Instance.CreateConnection())
@@ -83,6 +83,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                     bool useSsl = reader["MART_USE_SSL"] != DBNull.Value && Convert.ToBoolean(reader["MART_USE_SSL"]);
                     int keepAlive = DdlWorkerConfig.NormalizeKeepAliveMinutes(
                         reader["KEEPALIVE_MINUTES"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["KEEPALIVE_MINUTES"]));
+                    int checkInterval = DdlWorkerConfig.NormalizeErwinCheckIntervalSeconds(
+                        reader["ERWIN_CHECK_INTERVAL_SECONDS"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["ERWIN_CHECK_INTERVAL_SECONDS"]));
 
                     string encUser = reader["MART_USER"]?.ToString()?.Trim() ?? "";
                     string encPass = reader["MART_PASSWORD"]?.ToString()?.Trim() ?? "";
@@ -136,9 +138,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                         MartPort = martPort,
                         UseSsl = useSsl,
                         KeepAliveMinutes = keepAlive,
+                        ErwinCheckIntervalSeconds = checkInterval,
                         CorporateId = corporateId,
                     };
-                    log?.Invoke($"DdlWorkerConfig: loaded (corp={corporateId}, auth={authType}, server={(martServer ?? "(erwin default)")}, port={(martPort?.ToString() ?? "(erwin default)")}, ssl={useSsl}, keepAlive={keepAlive}min).");
+                    log?.Invoke($"DdlWorkerConfig: loaded (corp={corporateId}, auth={authType}, server={(martServer ?? "(erwin default)")}, port={(martPort?.ToString() ?? "(erwin default)")}, ssl={useSsl}, keepAlive={keepAlive}min, checkInterval={checkInterval}s).");
                     return cfg;
                 }
             }

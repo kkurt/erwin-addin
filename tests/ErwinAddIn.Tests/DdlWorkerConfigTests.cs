@@ -75,6 +75,38 @@ public class DdlWorkerConfigTests
         DdlWorkerConfig.NormalizeKeepAliveMinutes(99999).Should().Be(1440);
     }
 
+    // ---- NormalizeErwinCheckIntervalSeconds ----
+
+    [Theory]
+    [InlineData(3, 3)]
+    [InlineData(1, 1)]
+    [InlineData(10, 10)]
+    [InlineData(3600, 3600)]
+    public void NormalizeCheckInterval_passes_through_valid_values(int raw, int expected)
+    {
+        DdlWorkerConfig.NormalizeErwinCheckIntervalSeconds(raw).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-5)]
+    public void NormalizeCheckInterval_non_positive_becomes_default_3(int raw)
+    {
+        DdlWorkerConfig.NormalizeErwinCheckIntervalSeconds(raw).Should().Be(3);
+    }
+
+    [Fact]
+    public void NormalizeCheckInterval_null_becomes_default_3()
+    {
+        DdlWorkerConfig.NormalizeErwinCheckIntervalSeconds(null).Should().Be(3);
+    }
+
+    [Fact]
+    public void NormalizeCheckInterval_caps_absurd_values_at_one_hour()
+    {
+        DdlWorkerConfig.NormalizeErwinCheckIntervalSeconds(999999).Should().Be(3600);
+    }
+
     // ---- IsKeepAliveDue ----
 
     private static readonly DateTime T0 = new DateTime(2026, 07, 12, 12, 00, 00, DateTimeKind.Utc);

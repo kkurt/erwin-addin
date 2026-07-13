@@ -106,11 +106,24 @@ namespace EliteSoft.Erwin.AddIn.Services
                 if (string.IsNullOrEmpty(host) || string.IsNullOrEmpty(database))
                     return null;
 
+                var dbType = (key.GetValue("DBType") as string) ?? "MSSQL";
+                // Port: an empty or missing DBPort falls back to the driver's
+                // default for this DBType (Oracle 1521, PostgreSQL 5432, MSSQL
+                // 1433) instead of hardcoding MSSQL's 1433, which would be wrong
+                // for an Oracle package. install-impl.ps1 normally writes a
+                // concrete port, so this is a defensive fallback for old installs
+                // or hand-edited registries whose DBPort is blank.
+                // BootstrapConfig.GetConnectionString() interpolates the port
+                // unconditionally, so an empty value must never reach it.
+                var port = key.GetValue("DBPort") as string;
+                if (string.IsNullOrEmpty(port))
+                    port = DbTypes.GetDefaultPort(dbType);
+
                 return new BootstrapConfig
                 {
-                    DbType = (key.GetValue("DBType") as string) ?? "MSSQL",
+                    DbType = dbType,
                     Host = host,
-                    Port = (key.GetValue("DBPort") as string) ?? "1433",
+                    Port = port,
                     Database = database,
                     Username = DpapiDecrypt(key.GetValue("DBUserName") as string),
                     Password = DpapiDecrypt(key.GetValue("DBPassword") as string),
