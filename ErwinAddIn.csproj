@@ -26,6 +26,17 @@
     <DefineConstants>$(DefineConstants);PACKAGED</DefineConstants>
   </PropertyGroup>
 
+  <!-- DDL-generator flavor: set via `dotnet build -p:DdlGenerator=true`.
+       Defines DDLGENERATOR: this add-in instance is DEDICATED to unattended
+       DDL generation - the queue worker is always on (no checkbox), the
+       interactive validation surfaces never initialize (DDL-only connect
+       path), and only the General tab is shown. Combinable with both
+       PackagedBuild (production worker VM) and dev builds (testing).
+       One flavor per machine: both flavors share the same COM CLSID. -->
+  <PropertyGroup Condition="'$(DdlGenerator)' == 'true'">
+    <DefineConstants>$(DefineConstants);DDLGENERATOR</DefineConstants>
+  </PropertyGroup>
+
   <!-- Dev-only symbols, defined for every NON-packaged (developer) build and
        omitted from packaged production builds:
          DEV_DIAGNOSTICS - per-column-change traces ([PK-WALK], [TEMPLATE-COND])

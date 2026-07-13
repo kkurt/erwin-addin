@@ -126,6 +126,19 @@ function Wait-ForModel {
             return $true
         }
 
+        # No model yet. A modal startup dialog (license-expiry warning, Welcome/
+        # Start Page) can DISABLE erwin's main frame, blocking both the model
+        # load and the add-in command. OK it so startup can proceed (2026-07-13).
+        $anyErwin = Get-MyErwin | Select-Object -First 1
+        if ($anyErwin) {
+            try {
+                $dlgTitle = [WatcherWmPoster]::TopDialogTitle([uint32]$anyErwin.Id)
+                if ([WatcherWmPoster]::DismissBlockingStartupDialog([uint32]$anyErwin.Id)) {
+                    Write-Log "Dismissed a blocking startup dialog (OK): '$dlgTitle'"
+                }
+            } catch { }
+        }
+
         Start-Sleep -Seconds $modelCheckIntervalSec
         $elapsed += $modelCheckIntervalSec
     }
@@ -162,6 +175,13 @@ public static class WatcherWmPoster {
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int nCmdShow);
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr hAfter, int x, int y, int w, int h_, uint flags);
     [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool IsWindowEnabled(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint uCmd);
+    [DllImport("user32.dll")] public static extern int GetDlgCtrlID(IntPtr h);
+    public const uint GW_ENABLEDPOPUP = 6;
+    public const uint WM_COMMAND = 0x0111;
+    public const int  IDOK = 1;
     public const uint WM_MDIGETACTIVE = 0x0229;
     public const uint WM_MDIACTIVATE  = 0x0222;
     public const uint WM_MDIMAXIMIZE  = 0x0225;
@@ -198,6 +218,103 @@ public static class WatcherWmPoster {
         IntPtr activeChild;
         SendMessageTimeoutW(client, WM_MDIGETACTIVE, IntPtr.Zero, IntPtr.Zero, SMTO_ABORTIFHUNG, 500, out activeChild);
         return activeChild;
+    }
+
+    // Finds erwin's XTPMainFrame top-level window for the given process.
+    public static IntPtr FindMainFrame(uint pid) {
+        IntPtr found = IntPtr.Zero;
+        EnumWindows((h, _) => {
+            if (!IsWindowVisible(h)) return true;
+            uint wpid; GetWindowThreadProcessId(h, out wpid);
+            if (wpid != pid) return true;
+            var cls = new StringBuilder(64); GetClassNameW(h, cls, cls.Capacity);
+            if (cls.ToString() == "XTPMainFrame") { found = h; return false; }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+
+    // erwin can show a modal startup dialog BEFORE the add-in loads that blocks
+    // both the model load and the add-in command, so a human has to click OK:
+    //   * license-expiry warning: an OWNERLESS #32770 titled "erwin Data
+    //     Modeler" that appears BEFORE the main frame even exists (dump
+    //     2026-07-13: owner=0, no XTPMainFrame yet) - a main-frame-relative
+    //     lookup can't see it.
+    //   * Welcome / Start Page: an owned modal that DISABLES the main frame.
+    // Handled in that order. Called each Wait-ForModel iteration (no model is
+    // open yet, so any erwin #32770 is a startup blocker - safe to OK). MFC
+    // dialogs treat WM_COMMAND(IDOK) as the default OK action. Returns true if
+    // it acted (so the caller can log it).
+    public static bool DismissBlockingStartupDialog(uint pid) {
+        // (a) Any visible #32770 dialog of the erwin process (license warning
+        //     is ownerless + pre-main-frame, so match by process + class).
+        IntPtr dlg = IntPtr.Zero;
+        EnumWindows((h, _) => {
+            if (!IsWindowVisible(h)) return true;
+            uint wpid; GetWindowThreadProcessId(h, out wpid);
+            if (wpid != pid) return true;
+            var cls = new StringBuilder(64); GetClassNameW(h, cls, cls.Capacity);
+            if (cls.ToString() != "#32770") return true;
+            dlg = h;
+            return false;
+        }, IntPtr.Zero);
+
+        // (b) Otherwise an owned modal (Welcome/Start Page) disabling the main frame.
+        if (dlg == IntPtr.Zero) {
+            IntPtr main = FindMainFrame(pid);
+            if (main == IntPtr.Zero || IsWindowEnabled(main)) return false;
+            IntPtr modal = GetWindow(main, GW_ENABLEDPOPUP);
+            if (modal == IntPtr.Zero || modal == main || !IsWindow(modal)) return false;
+            dlg = modal;
+        }
+
+        return ClickDialogOkButton(dlg);
+    }
+
+    // Clicks the dialog's OK/Tamam button BY ITS REAL CONTROL ID. erwin's
+    // license popup gives OK the id 2 (normally IDCANCEL), not IDOK/1 (dump
+    // 2026-07-13), so a fixed WM_COMMAND(IDOK) is a no-op. Find the Button
+    // child whose caption is OK/Tamam, read its actual id, and post
+    // WM_COMMAND(id) with the button hwnd (the XTP/MFC-safe form). Falls back
+    // to trying ids 1 then 2 when no captioned OK button is found.
+    private static bool ClickDialogOkButton(IntPtr dlg) {
+        IntPtr btn = IntPtr.Zero; int id = 0;
+        EnumChildWindows(dlg, (h, _) => {
+            var c = new StringBuilder(32); GetClassNameW(h, c, c.Capacity);
+            if (c.ToString() != "Button") return true;
+            var t = new StringBuilder(64); GetWindowTextW(h, t, t.Capacity);
+            string tx = t.ToString().Replace("&", "").Trim();
+            if (string.Equals(tx, "OK", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(tx, "Tamam", StringComparison.OrdinalIgnoreCase)) {
+                btn = h; id = GetDlgCtrlID(h); return false;
+            }
+            return true;
+        }, IntPtr.Zero);
+        if (btn != IntPtr.Zero) {
+            PostMessageW(dlg, WM_COMMAND, (IntPtr)id, btn);
+            return true;
+        }
+        // Fallback: no captioned OK found - try the two common ids.
+        PostMessageW(dlg, WM_COMMAND, (IntPtr)1, IntPtr.Zero);
+        PostMessageW(dlg, WM_COMMAND, (IntPtr)2, IntPtr.Zero);
+        return true;
+    }
+
+    // Reads the title of the top visible #32770 dialog of the erwin process
+    // (for logging which startup dialog was dismissed). Empty if none.
+    public static string TopDialogTitle(uint pid) {
+        string title = "";
+        EnumWindows((h, _) => {
+            if (!IsWindowVisible(h)) return true;
+            uint wpid; GetWindowThreadProcessId(h, out wpid);
+            if (wpid != pid) return true;
+            var cls = new StringBuilder(64); GetClassNameW(h, cls, cls.Capacity);
+            if (cls.ToString() != "#32770") return true;
+            var t = new StringBuilder(256); GetWindowTextW(h, t, t.Capacity);
+            title = t.ToString();
+            return false;
+        }, IntPtr.Zero);
+        return title;
     }
 
     public const uint WM_NULL = 0x0000;
@@ -479,6 +596,61 @@ try {
 # Injector pre-flight check removed 2026-05-26 - PostMessage auto-load
 # path replaces the injection mechanism. No external binaries needed.
 
+# --- DDL-generator mode (Phase 6, 2026-07-12) -----------------------------
+# When the add-in is deployed as the dedicated DDL-generator flavor, the
+# worker VM must run erwin unattended: nobody opens erwin or a model. This
+# watcher then LAUNCHES erwin itself with a throwaway bootstrap model (a
+# read-only blank .erwin) so the add-in command is enabled and loads
+# (a model-less erwin ignores the command - S1 spike). The add-in closes the
+# bootstrap right after loading, logs into Mart, and starts processing the
+# queue. Config lives in HKCU (written by the installer / build-and-run
+# -DdlGenerator): DdlGeneratorMode (DWORD), BootstrapModelPath, ErwinExePath.
+$watcherCfgPath = 'HKCU:\Software\EliteSoft\ErwinAddIn\Watcher'
+$ddlGenMode = $false
+$bootstrapPath = ''
+$erwinExePath = ''
+try {
+    if (Test-Path $watcherCfgPath) {
+        $p = Get-ItemProperty -Path $watcherCfgPath -ErrorAction SilentlyContinue
+        if ($p.DdlGeneratorMode -eq 1) { $ddlGenMode = $true }
+        if ($p.BootstrapModelPath) { $bootstrapPath = [string]$p.BootstrapModelPath }
+        if ($p.ErwinExePath)       { $erwinExePath  = [string]$p.ErwinExePath }
+    }
+} catch { Write-Log "DDL-gen config read failed: $($_.Exception.Message)" }
+
+# Resolve erwin.exe: explicit HKCU value first, then the known r10 locations.
+function Resolve-ErwinExe {
+    if ($erwinExePath -and (Test-Path $erwinExePath)) { return $erwinExePath }
+    foreach ($c in @(
+        'C:\Program Files\erwin\Data Modeler r10\erwin.exe',
+        'C:\Program Files (x86)\erwin\Data Modeler r10\erwin.exe')) {
+        if (Test-Path $c) { return $c }
+    }
+    return $null
+}
+
+# Launch erwin with the bootstrap model and wait for our-session erwin to
+# appear. Returns $true when it is up, $false on any failure (caller backs off).
+function Start-ErwinWithBootstrap {
+    $exe = Resolve-ErwinExe
+    if (-not $exe) { Write-Log "DDL-gen: erwin.exe not found (HKCU ErwinExePath + known paths) - cannot launch"; return $false }
+    if (-not $bootstrapPath -or -not (Test-Path $bootstrapPath)) {
+        Write-Log "DDL-gen: bootstrap model not found ('$bootstrapPath') - cannot launch"; return $false
+    }
+    Write-Log "DDL-gen: launching erwin '$exe' with bootstrap '$bootstrapPath'"
+    try { Start-Process -FilePath $exe -ArgumentList ('"' + $bootstrapPath + '"') } catch {
+        Write-Log "DDL-gen: erwin launch failed: $($_.Exception.Message)"; return $false
+    }
+    for ($i = 0; $i -lt 30; $i++) {
+        Start-Sleep -Seconds 1
+        if (Get-MyErwin) { Write-Log "DDL-gen: erwin present after launch"; return $true }
+    }
+    Write-Log "DDL-gen: erwin did not appear within 30s after launch"
+    return $false
+}
+
+if ($ddlGenMode) { Write-Log "DDL-generator mode ON (bootstrap='$bootstrapPath', erwinExe='$erwinExePath')" }
+
 while ($true) {
   # Outer guard: any unhandled exception in the iteration body must NOT kill
   # the watcher. Watcher silently died once on 2026-05-02 and only logon-cycle
@@ -487,7 +659,17 @@ while ($true) {
   try {
     # Skip if erwin is already running
     $existing = Get-MyErwin
-    if (-not $existing) {
+    if (-not $existing -and $ddlGenMode) {
+        # DDL-generator mode: don't wait for a human to open erwin - launch it
+        # ourselves with the bootstrap model. On failure, back off and retry.
+        if (Start-ErwinWithBootstrap) {
+            $detected = $true
+        } else {
+            Start-Sleep -Seconds 15
+            continue
+        }
+    }
+    elseif (-not $existing) {
         # --- WMI Event: wait for erwin.exe to start ---
         $wmiQuery = "SELECT * FROM __InstanceCreationEvent WITHIN 2 WHERE TargetInstance ISA 'Win32_Process' AND TargetInstance.Name = '$erwinName'"
         $detected = $false

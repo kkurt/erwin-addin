@@ -1,3 +1,350 @@
+# DDLGENERATOR build flavor: dedicated DDL-generation add-in (2026-07-11) - PLAN APPROVED 2026-07-12
+
+## Phase 7 - Unattended robustness (2026-07-13, live-test findings)
+- [x] Self-healing restart: Mart server enforces a ~4h ABSOLUTE session
+      timeout (keep-alive ping can't extend it; an in-place drop -> "Access
+      Denied" modal -> stalled worker -> erwin crash). DDL-generator now
+      restarts erwin for a fresh session: PROACTIVE (session age >=
+      MartSessionMaxAgeMinutes=210, idle only) + REACTIVE (keep-alive detects
+      drop). MartMartAutomation.RequestErwinRestart: dismiss blocking modal ->
+      WM_CLOSE main -> popup dismisser -> 20s force-kill fallback. Watcher
+      relaunches. _martLoginTimeUtc stamped at login.
+- [x] Startup popup auto-dismiss (blocks add-in load, must be handled BEFORE
+      add-in loads -> WATCHER): license-expiry warning + Welcome/Start Page
+      DISABLE erwin's main frame. Watcher.DismissBlockingStartupDialog
+      (GetWindow(main,GW_ENABLEDPOPUP) -> WM_COMMAND IDOK) called each
+      Wait-ForModel iteration. Add-in DismissBlockingStartupDialog is the
+      post-load backstop.
+- [x] Configuration Warning suppressed in DDLGENERATOR: a config-less model
+      (the bootstrap) used to pop "Add-in loaded with controls disabled" modal
+      (nobody clicks OK on the worker VM). `#if DDLGENERATOR` -> log + degrade
+      silently, no modal.
+- [x] Both flavors 0 warn / 0 err; 629/629 tests.
+- [ ] OPEN: MartSessionMaxAgeMinutes hardcoded 210 - move to DDL_GENERATION_CONF
+      if the server timeout differs per site. Confirm ~4h is the real timeout
+      (single observation 2026-07-13: 18:26 login -> 22:26 drop).
+- [ ] LIVE TEST: leave running >3.5h -> proactive restart before the 4h drop;
+      + license popup path when license nears expiry.
+
+
+
+## Requirements (user, 2026-07-11)
+1. Compile-time flavor: built with a "DDLGenerator" flag the worker mode is
+   ALWAYS on - the checkbox is removed.
+2. The watcher for this flavor loads the add-in as soon as erwin runs (no
+   model-open wait).
+3. Auto Mart login on load: Mart tab > Connect; if Authentication shows
+   "Server Authentication" fill User Name + Password (from DB), Windows auth
+   fills nothing; click Connect; dismiss the optional "Mart Connected
+   Successfully" OK box. Keep-alive: every N minutes (N from DB, default 5)
+   Mart > Open then Cancel; last-activity timestamp also reset by a DDL job
+   START; keep-alive must NEVER run while a DDL generation is active.
+   Auth type + credentials + timeout interval all come from the admin DB.
+4. UI: only the General tab visible, a "DDL Generation MODE ON!" banner, no
+   other buttons (dev controls still visible in DEV builds).
+
+## Phase 0 - Spikes (must close before coding; ~half day, on the worker VM)
+- [x] S1 RESOLVED 2026-07-12 (live tests on the dev machine):
+      (a) WM_COMMAND(1181) on a model-less erwin = NO-OP, even with the
+          Welcome dialog closed (MFC UPDATE_COMMAND_UI disable confirmed).
+      (b) NO startup-autoload registry value exists (Add-Ins\<name> has only
+          Menu Identifier / ProgID / Invoke Method / Invoke EXE).
+      (c) OPTION F PROVEN: start erwin WITH a bootstrap .erwin argument
+          (copy of BlankTemplate.erwin) -> title 'erwin DM - ddlgen-bootstrap'
+          -> post 1181 -> add-in LOADED (dev DB picker appeared = Execute ran).
+      DECISION: DdlGeneratorMode watcher launches erwin with a bundled
+      bootstrap model (installer ships it); existing wait-for-model + post
+      flow stays unchanged; the DDLGENERATOR add-in closes the bootstrap
+      model (discard) right after load, then logs into Mart. (Add-in
+      surviving model-less is already proven in production logs.)
+- [x] S2 RESOLVED 2026-07-12 (user RECON capture): Mart > Connect =
+      WM_COMMAND 1059. New const CMD_MART_CONNECT = 1059.
+- [x] S3 RESOLVED 2026-07-12 (Ctrl+Alt+D dump of 'Connect to Mart' #32770):
+      Server Name  = Edit    id=1005
+      Port         = Edit    id=1007
+      Use SSL      = Button  id=35797 (checkbox)
+      App Name     = Edit    id=1020 (disabled)
+      Authentication = ComboBox id=1011 (text e.g. 'Server Authentication')
+      User Name    = Edit    id=1012
+      Password     = Edit    id=1013
+      Recent Conns = SysListView32 id=1017
+      Connect      = Button  id=1002   Cancel=2  Help=9
+      Phase-4 automation drives these BY ID (GetDlgItem), not by text.
+      Bonus finding: the bootstrap model opened READ-ONLY (title suffix
+      '(Read-Only)') - ship the bootstrap .erwin with the read-only file
+      attribute so its close can never raise a save prompt.
+
+## Phase 0 status: COMPLETE (S1+S2+S3). Next: Phase 1 after user approval.
+
+## Phase 1 - Build flavor - DONE 2026-07-12
+- [x] csproj: `-p:DdlGenerator=true` adds `DDLGENERATOR` to DefineConstants
+      (mirrors the PackagedBuild=true -> PACKAGED pattern; combinable with
+      both PACKAGED and DEV).
+- [x] IsDdlDedicatedInstance: compile-time (`#if DDLGENERATOR` true, else
+      false). chkDdlWorker checkbox REMOVED everywhere (creation, reveal
+      gesture, Designer field, CheckedChanged incl. the live-toggle re-init);
+      HKCU DdlWorker\Enabled flag code deleted. Worker auto-starts from
+      ModelConfigForm_Load via InitializeDdlWorker() (#if DDLGENERATOR only).
+      Normal builds cannot ever start the worker (no caller of
+      StartDdlWorker outside the flavor).
+- [x] build-and-run.ps1 + package.ps1: -DdlGenerator switch -> passes
+      -p:DdlGenerator=true (package keeps PackagedBuild=true too).
+- [x] Single-worker mutex: Local\EliteSoft.ErwinAddIn.DdlWorker acquired in
+      InitializeDdlWorker; not acquired -> LOUD log + red status, worker NOT
+      started. AbandonedMutexException treated as acquired (prior owner died).
+- [x] Verified: both flavors build 0 warn / 0 err; 605/605 tests; raw-byte
+      string check proves the flavor-only code exists ONLY in the
+      -p:DdlGenerator=true DLL.
+
+## Phase 2 - UI restriction (DDLGENERATOR only) - DONE 2026-07-12
+- [x] ApplyDdlGeneratorUiRestrictions (DdlWorker partial, ctor after
+      InitializeGeneralTab): tabValidation/tabTableProcesses/tabDdlGeneration
+      REMOVED from the TabControl (not disposed - the worker pipeline drives
+      the DDL tab's controls programmatically; tabIntegrate never appears in
+      DDL-only mode, Debug Log tab was already retired).
+- [x] Red banner "DDL Generation MODE ON!" top-right of the General header
+      (x=360, clear of title and cards); subtitle text swapped to "Dedicated
+      DDL generation instance..."; form title suffix " - DDL Generator".
+- [x] Buttons hidden in flavor: General-tab "Close erwin" + the bottom
+      status-bar Close (either would kill the worker with one click).
+      `#if DEV` controls (Change DB / Reload Config, RECON hotkeys) untouched.
+- [x] build-and-run-ddlgenerator.ps1 wrapper added (user request): calls
+      build-and-run.ps1 -DdlGenerator (same-CLSID replace warning in header).
+- [x] Both flavors 0 warn / 0 err; 605/605 tests.
+      NOTE: banner placement needs one live visual check on the next
+      -DdlGenerator dev install (absolute coords; expected clear, unverified).
+
+## Phase 3 - Worker config table + service - DONE 2026-07-12 (CORRECTED to real schema)
+- CORRECTION: DDL_GENERATION_CONF is an EXISTING admin-system table, not one we
+  create. My initial CREATE-TABLE script was wrong (USERNAME/PASSWORD/IS_ACTIVE)
+  and was DELETED. Real schema (live DB MetaRepoZeynep): ID, CORPORATE_ID,
+  API_KEY_HASH, MART_USER, MART_PASSWORD (encrypted), UPDATED_AT, MART_SERVER,
+  MART_PORT, MART_USE_SSL (bit), MART_AUTH_TYPE (default 'SERVER'),
+  + KEEPALIVE_MINUTES (int NULL) - admin added this column 2026-07-12.
+- Decisions: row selection = the single row (zero->disabled, 2+->ambiguous
+  refuse); keep-alive minutes = the new KEEPALIVE_MINUTES column.
+- [x] DdlWorkerConfigService.ReadActiveConfig: real columns; single-row contract
+      (reads first row, then detects a second -> null+loud log); decrypts
+      MART_USER/MART_PASSWORD (Server auth) via DecryptConnectionSecret, decrypt
+      failure/echo -> null (no silent fallback). Windows auth skips creds.
+      Reads MART_USE_SSL + CORPORATE_ID (logged).
+- [x] DdlWorkerConfig POCO: + UseSsl, + CorporateId. ParseAuthType,
+      NormalizeKeepAliveMinutes, IsKeepAliveDue unchanged.
+- [x] 24 unit tests (DdlWorkerConfigTests, pure logic) - 629/629 green; both
+      flavors 0 warn / 0 err. Live DB column verified via sqlcmd.
+
+## Phase 4 - Mart auto-login automation - CODE DONE 2026-07-12 (needs live test)
+- [x] MartMartAutomation.ConnectToMart(cfg, log) - all pure Win32:
+      1. Post Mart>Connect (WM_COMMAND 1059) to XTPMainFrame; wait for the
+         "Connect to Mart" #32770 dialog (10s). No dialog -> ProbeMartConnected
+         (Mart>Open: picker => AlreadyConnected, "Connect to Mart" => not).
+      2. EnsureAuthCombo: align combo 1011 to cfg.AuthType (CB_SELECTSTRING +
+         CBN_SELCHANGE) so credential fields enable/disable right. Optional
+         server/port -> ids 1005/1007.
+      3. SERVER -> WM_SETTEXT user (1012) + pass (1013); WINDOWS -> nothing.
+         Click Connect (1002; text match + id fallback).
+      4. WaitForLoginOutcome (25s): Connect dialog closes = LoggedIn; success
+         "erwin Data Modeler" box OK'd (OK only, never the checkbox); error box
+         while dialog open = Failed; timeout = Failed + Cancel the dialog.
+- [x] Worker gating: DdlWorkerTryStartNextJob has a `#if DDLGENERATOR` login
+      gate - no job claim until _martLoginVerified. EnsureMartLogin (non-
+      blocking): reads DDL_GENERATION_CONF once (60s backoff on
+      missing/undecryptable), runs ConnectToMart on a background Task (25s+
+      dialog waits must not freeze erwin UI), marshals result to
+      OnMartLoginComplete (verified+stamp _lastMartActivityUtc | 60s retry).
+- [x] Both flavors 0 warn / 0 err; 629/629 tests.
+- [ ] LIVE TEST (next): assumptions to confirm on the worker erwin -
+      (a) Mart>Connect (1059) works model-less;
+      (b) the success box title is "erwin Data Modeler" / text contains
+          "Connected"/"Successfully" (WaitForLoginOutcome keys on that);
+      (c) the auth combo items start with "Server"/"Windows".
+      All are logged verbatim ([MART-LOGIN] ...) so one run captures any drift.
+
+## Phase 5 - Keep-alive ping - CODE DONE 2026-07-12 (needs live test)
+- [x] _lastMartActivityUtc stamped on: login success, ping success, JOB
+      COMPLETION (both OnDdlWorkerCloseComplete paths, `#if DDLGENERATOR`).
+- [x] MartMartAutomation.PingMartSession = ProbeMartConnected (Mart>Open ->
+      picker=alive+IDCANCEL / "Connect to Mart"=dropped+IDCANCEL), shared with
+      the login probe via a `tag` param ([MART-KEEPALIVE] prefix).
+- [x] Worker tick gate (after login-verified, before claim):
+      MaybeStartKeepAlivePing - IsKeepAliveDue(_lastMartActivityUtc, now,
+      _keepAliveMinutes, busy, pingActive); busy = _ddlQueueActive ||
+      _martMartPipelineActive || _currentDdlJob!=null (defensive; tick already
+      returned on the first two). Ping runs on a background Task (dialog waits
+      must not freeze UI); returns true so no claim while pinging.
+- [x] Live-refresh: the ping task re-reads DDL_GENERATION_CONF for the current
+      KEEPALIVE_MINUTES (admin edit takes effect within one interval); login
+      also seeds it. OnKeepAlivePingComplete: alive -> stamp; dropped ->
+      _martLoginVerified=false + immediate re-login (login gate drives
+      Mart>Connect again).
+- [x] Both flavors 0 warn / 0 err; 629/629 tests.
+- [ ] LIVE TEST: with KEEPALIVE_MINUTES=1, leave the worker idle > 1 min and
+      confirm [MART-KEEPALIVE] due -> ping OK cycle; then confirm a job resets
+      the clock (no ping right after a job).
+
+## Phase 6 - Watcher + bootstrap auto-load - DEV DONE 2026-07-12 (prod installer TODO)
+- [x] installer/assets/ddlgen-bootstrap.erwin (copy of BlankTemplate, git-tracked).
+- [x] autostart-watcher.ps1: reads HKCU DdlGeneratorMode/BootstrapModelPath/
+      ErwinExePath; in DDL-gen mode, when erwin is NOT running it LAUNCHES
+      erwin itself with the bootstrap (Start-ErwinWithBootstrap, Resolve-ErwinExe
+      known-paths fallback), then the existing Wait-ForModel + post flow runs
+      untouched. Non-DDL builds unaffected (mode flag = 0).
+- [x] Add-in (DDLGENERATOR): MartMartAutomation.CloseBootstrapModelIfActive
+      (title marker "ddlgen-bootstrap" -> WM_CLOSE active MDI child, read-only
+      so no save prompt). Worker tick bootstrap gate runs BEFORE the login
+      gate; one-shot (_bootstrapHandled). Never touches a non-bootstrap model.
+- [x] build-and-run.ps1 -DdlGenerator: copies bootstrap to installDir (read-
+      only), writes the 3 HKCU values; normal build clears DdlGeneratorMode=0.
+- [x] Both flavors 0 warn / 0 err; watcher + build-and-run parse clean.
+- [ ] PROD installer (install-impl.ps1 / package.ps1 -DdlGenerator): copy
+      bootstrap + write HKCU flags (same as build-and-run). NOT done yet -
+      dev flow (build-and-run-ddlgenerator.ps1) covers testing first.
+- [ ] LIVE TEST: run build-and-run-ddlgenerator.ps1, CLOSE erwin, watch the
+      watcher launch erwin+bootstrap -> add-in loads -> [DDL-BOOTSTRAP] closes
+      it -> [MART-LOGIN] -> job. autostart.log + erwin-addin-debug.log.
+
+## Phase 7 - End-to-end verification + docs
+- [ ] Fresh logon -> watcher -> erwin (no model) -> add-in loads -> auto
+      login -> job -> no-diff job -> 5-min keep-alive observed -> second job.
+      Log markers: [DDL-ONLY], [MART-LOGIN], [MART-KEEPALIVE], [FORM].
+- [ ] README + docs/ARCHITECTURE.md + memory update.
+
+## Decisions (user, 2026-07-12)
+1. Credentials: stored in DDL_GENERATION_CONF encrypted the same way the
+   glossary CONNECTION_DEF credentials are (DecryptConnectionSecret,
+   erwin-admin writes them).
+2. Normal interactive builds lose the worker entirely (checkbox removed;
+   worker exists only in the DDLGENERATOR flavor). CONFIRMED.
+3. Keep-alive stamp at job END. CONFIRMED.
+4. Spikes (Phase 0) are the first implementation step. CONFIRMED.
+   S1 outcome still unknown (model-less load) - riskiest item; plan assumes
+   one of the two paths (WM_COMMAND post OR erwin startup-autoload) works.
+
+---
+
+# DDL-dedicated instance mode + form hide during automation (2026-07-11 round 3) - DONE
+
+## Findings (job-6 retest + manual CC hang, log 20:17-20:41)
+- Job 6 SUCCEEDED end-to-end: empty-RD no-diff detected, row DONE (ddlLen=80 note),
+  quiesced close worked first try (Mart Offline dismissed, HandleSessionLost reset).
+- User then MANUALLY opened v2+v1 and launched Complete Compare: the add-in had
+  adopted BOTH models (full validation init) and UDP-synced BOTH (creates=6,
+  updates=2 each - both dirtied), holding a live session on v1. The manual
+  compare stuck at "Comparing / Processing Left Model"; during the hang the
+  add-in was idle (timers modal-guarded; only DB-only glossary refresh ran).
+  Add-in's background interference (dirty writes + open session + walks) is the
+  only delta vs vanilla erwin.
+
+## Plan
+- [x] A: DDL-only mode: when chkDdlWorker is ON the instance is DDL-dedicated:
+      InitializeValidationService skips glossary/naming/predefined/dependency/
+      UDP sync/UDP runtime/monitors/validate-tab; keeps ConfigContext + DBMS
+      mismatch guard + General tab + PopulateVersionCombos (DDL gates + combo).
+      IsDdlDedicatedInstance predicate lives in the DdlWorker partial.
+- [x] B: glossary auto-refresh tick no-ops in DDL-only mode.
+- [x] C: checkbox live-toggle re-runs InitializeValidationService(closeConfigLess
+      MartModel:false) so the mode applies without restart.
+- [x] D: HideFormForAutomation/RestoreFormAfterAutomation: manual pipeline hides
+      at start, restores at tail (only when _ddlWorkerState==Idle); worker jobs
+      hide at claim and restore in OnDdlWorkerCloseComplete (success + give-up),
+      so the Save-Models checkbox mouse-sim can never land on add-in UI.
+- [x] E: build 0 warn/0 err + 605 tests green.
+
+## Review
+- Manual-CC-hang root: add-in was IDLE during the hang (timers modal-guarded);
+  delta vs vanilla erwin = UDP-sync dirty writes on BOTH manually opened models
+  + live session + walks. DDL-only mode removes all of it on the worker
+  instance. If the hang reproduces with the add-in quiet, it is native erwin
+  behavior (test with worker checkbox OFF + fresh erwin to isolate).
+- Worker still needs: ConfigContext (job gates), DBMS-mismatch guard,
+  PopulateVersionCombos (right-version combo), reconnect tick (adoption).
+
+---
+
+# Auto-DDL worker: no-diff compare freezes erwin (job 4 incident, 2026-07-11) - DONE
+
+## Root cause (from %TEMP%\erwin-addin-debug.log 17:34-17:43)
+1. Job 4 (v2 vs v1) had NO differences. After CC_COMPARE the pipeline only waits
+   1.5s for a popup then 10s for Resolve Differences / Type Resolution. The no-diff
+   outcome (erwin info box arriving AFTER the compare finishes, or RD simply never
+   opening) is not watched, so the run dies with the generic "did not reach Resolve
+   Differences" FAILED.
+2. Teardown posts IDCANCEL to the CC wizard and NEVER verifies it closed. It did not
+   close: POST-CLOSE diag still shows the ;Duplicate=YES PU; user screenshot shows the
+   wizard alive on the Right Model page.
+3. Worker cleanup: dirty v2 model cannot close while the CC wizard holds the
+   ;Duplicate PU, so CloseActiveMartModelDiscardingChanges returns false and
+   OnDdlWorkerCloseComplete retries FOREVER every ~15s (WM_CLOSE + Save-Models sweep +
+   ForceForeground each pass): erwin unusable = the reported freeze.
+   Side finding: a SECOND erwin instance (PID 65360) ran the worker simultaneously
+   (claimed job 2 mid-flight) - HKCU flag is per-user, both processes saw enabled=True.
+
+## Plan
+- [x] A: CCSession.CompareNoDifferences flag + IsNoDifferenceInfoText (pure, testable)
+      + combined post-Compare watcher (RD | Type Resolution | info box) in
+      DriveCompareToResolveDifferences only.
+- [x] B: CloseCcWizardVerified escalation (IDCANCEL, verify, dismiss blocking
+      child dialog by OK, IDCANCEL again, CC_CLOSE, verify; loud logs). Used on the
+      no-diff exit AND in CloseReviewSession instead of the blind IDCANCEL+Sleep(800).
+- [x] C: ModelConfigForm cross-version branch: CompareNoDifferences means script=""
+      (NOT an error): interactive shows info status, queue writes DONE with the
+      explicit note "-- No differences detected between the compared versions; no
+      alter DDL required." (upgraded from the silent empty-DDL contract).
+- [x] D: DdlWorker cleanup retry CAP (4 attempts): then loud log + Idle +
+      DdlWorkerActiveUnattended=false; worker stops hammering, resumes when the
+      operator closes the model (Idle guard already waits for model-less).
+- [x] E: unit tests for IsNoDifferenceInfoText (19 cases).
+- [x] F: build clean (main project 0 warnings / 0 errors) + full test run 605/605.
+
+## Round 2 (2026-07-11 evening, job-5 retest findings)
+erwin does NOT show an info box for identical versions: it OPENS Resolve
+Differences with an EMPTY diff grid (job-5 log: no "listview ready (items=N)"
+line = count stayed 0 for the whole poll; the arrow click on blank canvas can
+never fire an EDR tx -> old error "Apply-to-Right did not register (no EDR tx)").
+Also the worker's model close aborted after every Save-Models discard (Mart
+Offline never raised) because the close ran with the reconnect tick + validation
+walks resumed and the add-in's SCAPI session still open on the job model; the
+pipeline's v1 child (no session, monitoring suspended) closed clean seconds
+earlier.
+- [x] ApplyToRightOutcome enum (Applied | NoDifferences | Failed) in the shared
+      ApplyToRightArrowAndWaitForRas: empty grid confirmed with a +3.5s
+      count-only watch -> NoDifferences (both Review and From-DB pipelines).
+- [x] Review caller: NoDifferences -> script="" + precise status; queue row goes
+      DONE with EMPTY RESULT_DDL (no placeholder note - misleading; user
+      2026-07-11). From-DB caller: returns (empty, null) -> informational dbMode
+      status.
+- [x] Defensive tail branch narrowed to script==null so the explicit "" reaches
+      the informational no-diff status label.
+- [x] Worker cleanup QUIESCE before WM_CLOSE: StopReconnectTimer +
+      SuspendValidation + StopMonitoring x2 + CloseCurrentSession; on success
+      AND give-up -> HandleSessionLost() (canonical disconnected reset; without
+      it the tick's count==0 early-return + suspended monitoring would leave
+      _isConnected latched and the worker stuck).
+- [x] Build 0 warn / 0 err; tests 605/605.
+
+## Review (2026-07-11)
+- New file Services/CcCompareOutcome.cs (public static, pure text classifier,
+  #nullable enable) + tests/CcCompareOutcomeTests.cs.
+- MartMartAutomation: watcher only ACTS on "erwin Data Modeler"-titled message
+  boxes (same family the old 1.5s popup guard targeted); any other new dialog
+  (e.g. compare progress meter) is logged once and left alone - zero new risk to
+  healthy compares. Unknown erwin boxes keep the old No/Cancel dismiss + abort.
+- CloseCcWizardVerified deliberately has NO ForceDestroy (CC engine corruption,
+  see reference_cross_version_orphan_unsolved) - worst case it reports loudly and
+  the worker's bounded cleanup keeps erwin usable.
+- Freeze is eliminated in EVERY branch: even if erwin's no-diff wording is not in
+  the classifier, the box is logged verbatim (ground truth for extending the
+  list), the run fails explicitly, the wizard close is verified, and the cleanup
+  loop is capped at 4 attempts (~1 min) instead of forever.
+- NOT changed: dual-erwin-instance worker guard (see Deferred).
+
+## Deferred (noted for user)
+- Single-worker mutex per logon session (two erwin processes both ran the worker).
+- Exact no-diff info-box title/text ground truth: watcher logs FULL title+text of any
+  unexpected dialog so the next live run captures it even if classification misses.
+
+---
+
 # Manual-rename revalidation + Properties-pane dropdown coverage (2026-07-10) - DONE
 
 ## From live test of the A-F fixes

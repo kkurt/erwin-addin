@@ -583,10 +583,6 @@ namespace EliteSoft.Erwin.AddIn
 #endif
             this.tabDdlGeneration.Controls.Add(this.btnStepMode);
 
-            // chkDdlWorker is created + placed at runtime in InitializeGeneralTab
-            // (the General tab is built there, not by the designer); placing it here
-            // with a fixed location collided with the runtime "Active Model" card.
-
             this.lblDDLStatus = new System.Windows.Forms.Label();
 #if !PACKAGED
             // Debug button sits to the right of the production button; status
@@ -720,7 +716,6 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.GroupBox grpDdlOptions;
         private System.Windows.Forms.Label lblDDLStatus;
         private System.Windows.Forms.CheckBox chkFilterObjects;
-        private System.Windows.Forms.CheckBox chkDdlWorker;
 
         private System.Windows.Forms.GroupBox grpModel;
         private System.Windows.Forms.Label lblModelName;

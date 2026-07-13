@@ -12,6 +12,10 @@
 -- The producer (admin tool / operator) INSERTs PENDING rows.
 --
 -- STATUS lifecycle: PENDING -> RUNNING -> DONE | FAILED.
+-- No-diff contract: when the compared versions are identical the row is DONE
+-- with an EMPTY RESULT_DDL (no alter DDL to apply). The DONE status - not the
+-- content - distinguishes it from a FAILED job; a placeholder comment would
+-- read as if a script had been generated.
 -- Single worker, sequential processing (erwin is single-instance-per-logon), so
 -- contention is minimal; the CLAIM is still an atomic conditional UPDATE.
 --

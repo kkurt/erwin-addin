@@ -228,6 +228,12 @@ namespace EliteSoft.Erwin.AddIn
                 InitializeValidationUI();
             using (AddinLogger.BeginScope("InitializeGeneralTab"))
                 InitializeGeneralTab();
+#if DDLGENERATOR
+            // DDL-generator flavor: strip the UI down to the General tab +
+            // "DDL Generation MODE ON!" banner (defined in the DdlWorker partial).
+            using (AddinLogger.BeginScope("ApplyDdlGeneratorUiRestrictions"))
+                ApplyDdlGeneratorUiRestrictions();
+#endif
             using (AddinLogger.BeginScope("InitializeGlossaryRefreshTimer"))
                 InitializeGlossaryRefreshTimer();
 
@@ -278,9 +284,12 @@ namespace EliteSoft.Erwin.AddIn
             using (AddinLogger.BeginScope("ModelConfigForm_Load"))
                 LoadOpenModels();
 
-            // DDL queue worker: restore the on/off state from HKCU (only the
-            // dedicated console worker user has it set) and start polling if enabled.
-            InitializeDdlWorkerFromRegistry();
+#if DDLGENERATOR
+            // DDL-generator flavor: the queue worker is ALWAYS on (no checkbox,
+            // no HKCU flag) - start polling as soon as the form is up. The
+            // per-logon-session mutex inside refuses a second worker instance.
+            InitializeDdlWorker();
+#endif
         }
 
         protected override void OnFormClosed(FormClosedEventArgs e)
@@ -1666,6 +1675,29 @@ namespace EliteSoft.Erwin.AddIn
                 ok = ctx.Initialize(locator);
             if (!ok)
             {
+#if DDLGENERATOR
+                // DDL-generator (unattended): a config-less model is the
+                // bootstrap (about to be closed) or a transient pre-job state.
+                // NEVER pop the "Configuration Warning" modal - nobody can click
+                // OK on the worker VM and it disables erwin's main frame,
+                // stalling the worker (user requirement 2026-07-13). Degrade
+                // silently; the worker's bootstrap gate / job open handles the
+                // model, and a config-mapped job model takes the normal path
+                // (ok==true) instead.
+                Log("[DDL-ONLY] config-less model - suppressing Configuration Warning (unattended worker).");
+                btnValidateAll.Enabled = false;
+                btnAlterWizardProd.Enabled = false;
+                btnMartReview.Enabled = false;
+                // Track degraded state so the reconnect timer recovers when a
+                // config-mapped job model replaces this config-less one (the
+                // bootstrap), same as the interactive degraded path.
+                _inDegradedMode = true;
+                _lastDegradedLocator = locator ?? "";
+                using (AddinLogger.BeginScope("UpdateGeneralTab(ddlgen-config-less)"))
+                    UpdateGeneralTab();
+                StartReconnectTimer();
+                return;
+#else
                 // No CONFIG resolved for the active model. Two cases, handled
                 // differently (2026-06-22):
                 //   * Mart-bound model with NO CONFIG mapping -> same policy as a
@@ -1796,6 +1828,7 @@ namespace EliteSoft.Erwin.AddIn
                 _lastDegradedLocator = locator ?? "";
                 StartReconnectTimer();
                 return;
+#endif
             }
             Log($"Config: {ctx.ActiveConfigName} (ID={ctx.ActiveConfigId}), corporate='{ctx.CorporateName ?? "(none)"}', mart='{ctx.MartPath}'");
             // Local-file model with a registered CONFIG (2026-06-13): all
@@ -1820,6 +1853,39 @@ namespace EliteSoft.Erwin.AddIn
             // a new locator appears - covers both sequential model switches
             // and side-by-side new-model creation.
             _lastConnectedLocator = locator ?? "";
+
+            // DDL-dedicated instance (worker checkbox ON): the add-in must stay
+            // completely out of erwin's way - no glossary, naming standards,
+            // predefined columns, dependency sets, UDP sync/runtime or
+            // validation monitoring. Those interactive services dirtied BOTH
+            // sides of a manual Complete Compare (UDP sync creates on every
+            // adopted model) and kept walks + a live session on the compare
+            // LEFT; the compare hung at "Processing Left Model"
+            // (user requirement 2026-07-11). Only ConfigContext (resolved
+            // above), the DBMS-mismatch guard and the DDL Generation surfaces
+            // are initialized here.
+            if (IsDdlDedicatedInstance)
+            {
+                Log("[DDL-ONLY] DDL-dedicated instance: skipping glossary, naming standards, predefined columns, dependency sets, UDP sync/runtime and ALL validation monitoring.");
+                using (AddinLogger.BeginScope("DisposeServices"))
+                    DisposeServices();
+                // A wrong-platform model would produce wrong DDL - the mismatch
+                // guard applies in DDL-only mode too (queues warning + close).
+                if (CheckDbmsMismatch())
+                {
+                    btnValidateAll.Enabled = false;
+                    lblPlatformStatus.Text = "DBMS mismatch - operations disabled. Contact the Data Architecture team.";
+                    lblPlatformStatus.ForeColor = Color.OrangeRed;
+                    return;
+                }
+                btnValidateAll.Enabled = false; // validation surfaces stay OFF in this mode
+                using (AddinLogger.BeginScope("UpdateGeneralTab"))
+                    UpdateGeneralTab();
+                using (AddinLogger.BeginScope("PopulateVersionCombos"))
+                    PopulateVersionCombos();
+                Log("[DDL-ONLY] init complete (ConfigContext + DDL Generation tab only).");
+                return;
+            }
 
             // Global data (corporate-scoped, not model-specific)
             using (AddinLogger.BeginScope("DisposeServices"))
@@ -2498,6 +2564,9 @@ namespace EliteSoft.Erwin.AddIn
                 AutoSize = true,
                 Location = new Point(26, 46)
             };
+#if DDLGENERATOR
+            lblSubtitle.Text = "Dedicated DDL generation instance - validation surfaces are disabled.";
+#endif
             tabGeneral.Controls.Add(lblSubtitle);
 
             var pnlAccent = new Panel
@@ -2544,24 +2613,15 @@ namespace EliteSoft.Erwin.AddIn
                         Log($"Restored {restored} hidden tab(s)");
 
                     // Reveal the diagnostic Step Mode button (created hidden in
-                    // packaged builds) and jump to the DDL Generation tab so the
-                    // field user can run the RDP black-rectangle bisection.
+                    // packaged builds) so the field user can run the RDP
+                    // black-rectangle bisection from the DDL Generation tab.
+                    // Stays on the General tab (user request 2026-06-15) - no
+                    // auto-jump. (The old DDL-worker checkbox this gesture also
+                    // revealed is gone: the worker is a compile-time flavor now.)
                     if (btnStepMode != null && !btnStepMode.Visible)
                     {
                         btnStepMode.Visible = true;
-                        // Stay on the General tab (user request 2026-06-15): the reveal
-                        // gesture is now mostly used for the worker checkbox here, so do
-                        // NOT auto-jump to the DDL Generation tab. btnStepMode is still
-                        // revealed (on the DDL tab) for when the user switches there.
                         Log("Step Mode button revealed on the DDL Generation tab.");
-                    }
-
-                    // Reveal the DDL queue-worker on/off checkbox (General tab). Same
-                    // gesture; the worker is the dedicated console machine's switch.
-                    if (chkDdlWorker != null && !chkDdlWorker.Visible)
-                    {
-                        chkDdlWorker.Visible = true;
-                        Log("DDL queue worker checkbox revealed on the General tab.");
                     }
                 }
             };
@@ -2710,26 +2770,9 @@ namespace EliteSoft.Erwin.AddIn
             int footerY = glossY + glossH + 30 + 12;
             lblCopyright.Location = new Point(24, footerY);
 
-            // DDL queue-worker on/off (Phase 1). Built here (not in the designer) so
-            // it sits on the footer row between the copyright (bottom-left) and the
-            // "Close erwin" button (bottom-right) without colliding with the runtime
-            // "Active Model" card. Hidden in ALL builds (only the dedicated console
-            // worker user enables it); revealed via Ctrl+Shift+LeftClick on the
-            // copyright label. State persists in HKCU; CheckedChanged starts/stops the
-            // worker timer (see ModelConfigForm.DdlWorker.cs).
-            chkDdlWorker = new CheckBox
-            {
-                Text = "Enable DDL queue worker (this machine)",
-                Font = new Font("Segoe UI", 9f),
-                ForeColor = Color.FromArgb(120, 120, 120),
-                AutoSize = true,
-                Visible = false,
-                Anchor = AnchorStyles.Bottom | AnchorStyles.Left,
-                Location = new Point(cardX + 300, footerY - 2)
-            };
-            chkDdlWorker.CheckedChanged += ChkDdlWorker_CheckedChanged;
-            tabGeneral.Controls.Add(chkDdlWorker);
-            chkDdlWorker.BringToFront();
+            // (2026-07-12: the DDL queue-worker on/off checkbox that used to sit on
+            // this footer row is GONE - the worker is a compile-time build flavor
+            // now (DDLGENERATOR, always on) and normal builds have no worker at all.)
 
             // --- Footer action: Close erwin ---
             // Destructive action lives in the bottom-right corner, kept apart
@@ -2758,6 +2801,12 @@ namespace EliteSoft.Erwin.AddIn
             btnCloseErwin.MouseEnter += (s, e) => btnCloseErwin.BackColor = Color.FromArgb(168, 44, 44);
             btnCloseErwin.MouseLeave += (s, e) => btnCloseErwin.BackColor = Color.FromArgb(200, 60, 60);
             btnCloseErwin.Click += BtnCloseErwin_Click;
+#if DDLGENERATOR
+            // Dedicated worker instance: one accidental click would take down
+            // erwin AND the queue worker with it - no buttons in this flavor
+            // (user requirement 2026-07-12).
+            btnCloseErwin.Visible = false;
+#endif
             tabGeneral.Controls.Add(btnCloseErwin);
         }
 
@@ -3860,6 +3909,10 @@ namespace EliteSoft.Erwin.AddIn
 
         private void GlossaryRefreshTimer_Tick(object sender, EventArgs e)
         {
+            // DDL-dedicated instance: the glossary is never consumed (all
+            // validation surfaces are off), so skip the periodic DB reload.
+            if (IsDdlDedicatedInstance) return;
+
             // Prevent re-entrancy - skip if already refreshing
             if (_isRefreshingGlossary) return;
 
@@ -5009,6 +5062,15 @@ namespace EliteSoft.Erwin.AddIn
             lblDDLStatus.ForeColor = Color.Gray;
             Application.DoEvents();
 
+            // The pipelines below synthesize REAL mouse clicks at absolute
+            // screen coordinates (RD Apply-to-Right arrow, wizard Preview
+            // jump); the add-in form must not sit under any of them. Hidden
+            // here for manual AND worker runs; restored at the tail (manual)
+            // or after the worker's model cleanup (queue jobs keep it hidden
+            // through the Save-Models sweep, whose checkbox click is also a
+            // raw mouse click).
+            HideFormForAutomation("Generate DDL pipeline");
+
             bool martMode = rbFromMart.Checked;
             bool dbMode = rbFromDB.Checked;
 
@@ -5032,6 +5094,10 @@ namespace EliteSoft.Erwin.AddIn
             // the DDL applies to). Set in each branch below; final success
             // path passes it to ShowDDLResult.
             string sourceMode = null;
+            // Precise no-diff status for the cross-version compare (set where
+            // the right version 'v' is still in scope); the generic per-mode
+            // texts at the tail are used when this stays null.
+            string noDiffStatusOverride = null;
 
             // Faz 2.1 (active-vs-older-version via Review) reaches "Resolve
             // Differences" but does NOT capture DDL yet (Apply-to-Right + 1057
@@ -5507,7 +5573,21 @@ namespace EliteSoft.Erwin.AddIn
                                 rsess = await System.Threading.Tasks.Task.Run(() =>
                                     Services.MartMartAutomation.DriveCompareToResolveDifferences(v, catalog, keepVisible, useCompleteCompare, (Action<string>)log));
 
-                                if (rsess == null || rsess.ResolveDifferences == IntPtr.Zero)
+                                if (rsess != null && rsess.CompareNoDifferences)
+                                {
+                                    // Identical versions (job-4 incident 2026-07-11):
+                                    // NOT an error. The empty script routes to the
+                                    // informational no-diff status at the tail, and
+                                    // the queue worker's FinishCurrentDdlJob
+                                    // finalizes the row DONE with the no-diff note
+                                    // instead of the old generic "did not reach
+                                    // Resolve Differences" FAILED.
+                                    script = string.Empty;
+                                    noDiffStatusOverride =
+                                        $"No differences between the compared versions ({(useCompleteCompare ? "last saved" : "active")} vs v{v}) - no alter DDL needed.";
+                                    log($"[REVIEW] compare found NO differences ({(useCompleteCompare ? "last saved" : "active")} vs v{v}) - no alter DDL to generate.");
+                                }
+                                else if (rsess == null || rsess.ResolveDifferences == IntPtr.Zero)
                                 {
                                     // Precise text beats the generic timeout one:
                                     // ReviewRefusedNoChanges here means erwin refused
@@ -5536,9 +5616,21 @@ namespace EliteSoft.Erwin.AddIn
                                     IntPtr capturedWizard = IntPtr.Zero;
                                     try
                                     {
-                                        bool applied = await System.Threading.Tasks.Task.Run(() =>
+                                        var applyOutcome = await System.Threading.Tasks.Task.Run(() =>
                                             Services.MartMartAutomation.ApplyToRightArrowOnReviewRd(rsess.ResolveDifferences, (Action<string>)log));
-                                        if (!applied)
+                                        if (applyOutcome == Services.MartMartAutomation.ApplyToRightOutcome.NoDifferences)
+                                        {
+                                            // Identical versions manifest as an RD whose diff grid
+                                            // stays EMPTY (job-5 finding 2026-07-11) - erwin opens
+                                            // RD even with nothing to resolve. NOT an error: empty
+                                            // script routes to the informational tail; the queue
+                                            // worker finalizes the row DONE with the no-diff note.
+                                            script = string.Empty;
+                                            noDiffStatusOverride =
+                                                $"No differences between the compared versions ({(useCompleteCompare ? "last saved" : "active")} vs v{v}) - no alter DDL needed.";
+                                            log($"[REVIEW] Resolve Differences grid is empty ({(useCompleteCompare ? "last saved" : "active")} vs v{v}) - no alter DDL to generate.");
+                                        }
+                                        else if (applyOutcome != Services.MartMartAutomation.ApplyToRightOutcome.Applied)
                                         {
                                             err = "Review Apply-to-Right did not register (no EDR tx) - see Debug Log.";
                                         }
@@ -5779,13 +5871,16 @@ namespace EliteSoft.Erwin.AddIn
                 if (!_ddlQueueActive)
                     ErwinAddIn.ShowTopMostMessage($"DDL generation failed:\n\n{err}", "Generate DDL", isError: true);
             }
-            else if (reviewReachedRd && string.IsNullOrEmpty(script))
+            else if (reviewReachedRd && script == null)
             {
                 // Review path reached Resolve Differences but produced no DDL
                 // AND set no error (defensive). Status label already shows the
                 // checkpoint; do NOT fall through to the generic "did not
                 // produce DDL" error. When capture succeeds, script is set and
                 // this guard is skipped so the DDL renders normally below.
+                // (script == null, NOT IsNullOrEmpty: an explicit "" is the
+                // no-differences outcome and must reach the informational
+                // status branch below.)
             }
             else if (script == null)
             {
@@ -5820,9 +5915,10 @@ namespace EliteSoft.Erwin.AddIn
                 // No diff = informational, not an error. One-line status is
                 // sufficient; no need to pop a modal that the user has to
                 // dismiss every time they verify "nothing's changed".
-                string noDiffText = martMode ? "No differences between current model and Mart baseline."
-                                   : dbMode  ? "No differences between current model and DB schema."
-                                             : "No differences between model and last save.";
+                string noDiffText = noDiffStatusOverride
+                                   ?? (martMode ? "No differences between current model and Mart baseline."
+                                     : dbMode  ? "No differences between current model and DB schema."
+                                               : "No differences between model and last save.");
                 lblDDLStatus.Text = noDiffText;
                 lblDDLStatus.ForeColor = Color.OrangeRed;
             }
@@ -5868,6 +5964,14 @@ namespace EliteSoft.Erwin.AddIn
             }
 
             btnAlterWizardProd.Enabled = DdlSourceEnabled;
+
+            // Restore the form hidden at pipeline start - MANUAL runs only.
+            // For a queue job the worker state is already Cleanup here
+            // (FinishCurrentDdlJob above): the form stays hidden through the
+            // model-close mouse-sim sweep and OnDdlWorkerCloseComplete
+            // restores it.
+            if (_ddlWorkerState == DdlWorkerState.Idle)
+                RestoreFormAfterAutomation("pipeline finished");
 
             // Bring the add-in form back to the foreground. The Ctrl+Alt+T
             // path pushes erwin's main window up, and the brief
@@ -6987,6 +7091,10 @@ namespace EliteSoft.Erwin.AddIn
 
                 log($"[From-DB] DriveCCDbAndApply(reModelName='{rePuName}')");
                 sess = await Services.MartMartAutomation.DriveCCDbAndApplyAsync(rePuName, log, overlayToggle, dbgPauseBeforeApply: Services.DebugMode.KeepDialogsVisible);
+                if (sess != null && sess.CompareNoDifferences)
+                    // Model matches the DB schema (empty RD grid): informational,
+                    // not a failure - the tail shows the dbMode no-diff status.
+                    return (string.Empty, null);
                 if (sess == null || !sess.Applied)
                     return (null, "Programmatic CC + Apply-to-Right failed - see Debug Log.");
 
@@ -8349,6 +8457,9 @@ namespace EliteSoft.Erwin.AddIn
         /// <summary>
         /// Extracts the Mart catalog path (folder/model) from the active PU's
         /// locator, e.g. "Mart://Mart/Kursat/MetaRepo?..." -> "Kursat/MetaRepo".
+        /// The host segment after "Mart://" is the catalog ROOT and is matched
+        /// generically ([^/]+), NOT the literal "Mart", so a renamed root (e.g.
+        /// "Mart://TestRoot/Kursat/MetaRepo") still yields the same stem.
         /// Returns "" if the active PU is not a Mart-opened model.
         /// </summary>
         private string ParseActivePuCatalog()
@@ -8356,7 +8467,7 @@ namespace EliteSoft.Erwin.AddIn
             try
             {
                 string locator = _currentModel?.PropertyBag()?.Value("Locator")?.ToString() ?? "";
-                var mm = System.Text.RegularExpressions.Regex.Match(locator, @"Mart://Mart/([^?&]+)",
+                var mm = System.Text.RegularExpressions.Regex.Match(locator, @"Mart://[^/]+/([^?&]+)",
                     System.Text.RegularExpressions.RegexOptions.IgnoreCase);
                 if (mm.Success) return mm.Groups[1].Value;
             }

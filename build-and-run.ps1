@@ -19,7 +19,12 @@ param(
     # killing another logged-in user's editor session is destructive.
     # (ErwinInjector.exe was removed 2026-05-26 along with the
     # injection-based auto-load path.)
-    [switch]$KillAllErwinProcs
+    [switch]$KillAllErwinProcs,
+
+    # DDL-generator flavor: compiles with the DDLGENERATOR symbol - the add-in
+    # becomes a dedicated, always-on DDL queue worker (no validation surfaces).
+    # ONE flavor per machine (same COM CLSID); a normal dev build overwrites it.
+    [switch]$DdlGenerator
 )
 
 if ($Help) {
@@ -277,8 +282,10 @@ if (Test-Path $bridgeScript) {
 # implicit restore inside `dotnet build` handles legitimate csproj/lock
 # changes on its own. A no-source-change rebuild now finishes in 1-2s
 # instead of the old 25-40s clean+restore+build cycle.
-Write-Host "`n[1b/5] Building project (incremental)..." -ForegroundColor Yellow
-dotnet build erwin-addin.sln -c Release -nologo -clp:Summary
+Write-Host "`n[1b/5] Building project (incremental)$(if ($DdlGenerator) { ' [DDLGENERATOR flavor]' })..." -ForegroundColor Yellow
+$buildProps = @()
+if ($DdlGenerator) { $buildProps += '-p:DdlGenerator=true' }
+dotnet build erwin-addin.sln -c Release -nologo -clp:Summary @buildProps
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Build failed!" -ForegroundColor Red
@@ -590,6 +597,30 @@ $existingCmdId = (Get-ItemProperty -Path $watcherRegPath -Name 'AddinCmdId' -Err
 if ($null -eq $existingCmdId) {
     Set-ItemProperty -Path $watcherRegPath -Name 'AddinCmdId' -Value 1181 -Type DWord
     Write-Host "  Pre-seeded AddinCmdId=1181 (WmCommandLogger self-heals if different)" -ForegroundColor Gray
+}
+
+# DDL-generator mode watcher config (Phase 6): when built with -DdlGenerator,
+# tell the watcher to launch erwin itself with the bootstrap model. Cleared
+# (DdlGeneratorMode=0) on a normal build so switching back disables it.
+if ($DdlGenerator) {
+    $bootstrapSrc = Join-Path $scriptDir 'installer\assets\ddlgen-bootstrap.erwin'
+    $bootstrapDst = Join-Path $installDir 'ddlgen-bootstrap.erwin'
+    if (Test-Path $bootstrapSrc) {
+        Copy-Item $bootstrapSrc $bootstrapDst -Force
+        # Read-only so a stray edit can never dirty it -> no Save prompt on close.
+        try { (Get-Item $bootstrapDst).IsReadOnly = $true } catch { }
+    } else {
+        Write-Host "  WARNING: bootstrap model missing at $bootstrapSrc" -ForegroundColor Yellow
+    }
+    $erwinExe = @('C:\Program Files\erwin\Data Modeler r10\erwin.exe',
+                  'C:\Program Files (x86)\erwin\Data Modeler r10\erwin.exe') |
+                Where-Object { Test-Path $_ } | Select-Object -First 1
+    Set-ItemProperty -Path $watcherRegPath -Name 'DdlGeneratorMode' -Value 1 -Type DWord
+    Set-ItemProperty -Path $watcherRegPath -Name 'BootstrapModelPath' -Value $bootstrapDst -Type String
+    if ($erwinExe) { Set-ItemProperty -Path $watcherRegPath -Name 'ErwinExePath' -Value $erwinExe -Type String }
+    Write-Host "  DDL-generator watcher config written (mode=1, bootstrap=$bootstrapDst, erwin=$erwinExe)" -ForegroundColor Cyan
+} else {
+    Set-ItemProperty -Path $watcherRegPath -Name 'DdlGeneratorMode' -Value 0 -Type DWord
 }
 
 $addInPath = "HKCU:\SOFTWARE\erwin\Data Modeler\10.10\Add-Ins\$addInDisplayName"

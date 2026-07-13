@@ -615,13 +615,50 @@ namespace EliteSoft.Erwin.AddIn.Services
         // to GC, crashed erwin's finalizer ~6s after teardown (dump erwin.exe.50436).
         private const int CMD_MART_OPEN_VERSION = 1060;
         private const int CMD_MART_REVIEW       = 1168;
+        private const int CMD_MART_CONNECT      = 1059;  // ribbon Mart > Connect (RECON capture 2026-07-12)
         private const int IDCANCEL = 2;
         private const int IDOK     = 1;
+
+        // "Connect to Mart" dialog (#32770) control ids - RECON dump 2026-07-12
+        // (reference_mart_connect_dialog_map). Driven BY ID (locale/theme proof).
+        private const int MART_DLG_SERVER   = 1005; // Edit: Server Name
+        private const int MART_DLG_PORT      = 1007; // Edit: Port
+        private const int MART_DLG_AUTHCOMBO = 1011; // ComboBox: Authentication (window text = selected item)
+        private const int MART_DLG_USER      = 1012; // Edit: User Name
+        private const int MART_DLG_PASS      = 1013; // Edit: Password
+        private const int MART_DLG_USESSL    = 35797; // Button: Use SSL (checkbox)
+        private const int MART_DLG_CONNECT   = 1002; // Button: Connect
+
+        private const uint WM_SETTEXT = 0x000C;
+        private const uint BM_GETCHECK = 0x00F0;
+        private const uint BM_SETCHECK = 0x00F1;
+        private const int  BST_UNCHECKED = 0;
+        private const int  BST_CHECKED   = 1;
+        // BN_CLICKED (0) is already defined further down (toolbar region).
+        [DllImport("user32.dll", EntryPoint = "SendMessageW", CharSet = CharSet.Unicode)]
+        private static extern IntPtr SendMessageSetText(IntPtr hWnd, uint Msg, IntPtr wParam, string lParam);
         private const int IDYES    = 6;
         private const int IDNO     = 7;
 
         private static IntPtr MakeWParam(int low, int high) =>
             new IntPtr(((high & 0xFFFF) << 16) | (low & 0xFFFF));
+
+        /// <summary>
+        /// Outcome of an Apply-to-Right attempt on the Resolve Differences
+        /// dialog. Distinguishes "the click registered" from "there was
+        /// NOTHING to apply" (job-5 finding 2026-07-11: identical versions
+        /// open an RD whose diff grid stays EMPTY - the old bool collapsed
+        /// that into the misleading "no EDR tx" failure).
+        /// </summary>
+        internal enum ApplyToRightOutcome
+        {
+            /// <summary>Click registered an EDR transaction; alter DDL capture can proceed.</summary>
+            Applied,
+            /// <summary>RD opened but its diff grid has zero rows: the compared sides are identical.</summary>
+            NoDifferences,
+            /// <summary>RD/listview missing or the click never produced an EDR transaction.</summary>
+            Failed,
+        }
 
         /// <summary>
         /// Holds the CC-wizard + Resolve-Differences window handles produced
@@ -654,6 +691,14 @@ namespace EliteSoft.Erwin.AddIn.Services
             // surfaces a precise error instead of the generic "did not reach
             // Resolve Differences".
             public bool ReviewRefusedNoChanges;
+            // True when the post-Compare watcher saw erwin's no-differences
+            // notification instead of Resolve Differences: the compared sides
+            // are IDENTICAL. Not a failure - the caller reports "no diff" and
+            // the queue worker finalizes the job DONE with an empty DDL
+            // (job-4 incident 2026-07-11: this outcome used to die with the
+            // generic "did not reach Resolve Differences" error and the
+            // leftover wizard deadlocked the worker's model-close loop).
+            public bool CompareNoDifferences;
             // True once the Review/CC launch command was posted. Combined
             // with CCWizard==Zero it means the wizard may still appear LATE
             // (erwin builds the ;Duplicate=YES copy of the LEFT model before
@@ -1053,22 +1098,31 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // ---- STEP 5: Compare -> Resolve Differences.
                 LogChildDirty("before CC_COMPARE", session.VersionChild, log);
                 log?.Invoke("  [REVIEW-5] Compare");
+                // Snapshot BEFORE Compare so the watcher can tell a genuinely
+                // new dialog (no-diff info box / error popup) from everything
+                // already on screen (wizard, main frame, add-in form).
+                var dialogsBeforeCompare = EnumerateVisibleDialogs();
+                dialogsBeforeCompare.Add(ccWizard);
                 PostMessage(ccWizard, WM_COMMAND, MakeWParam(CC_COMPARE, 0), IntPtr.Zero);
                 Thread.Sleep(800);
 
-                IntPtr popup = WaitForDialog("erwin Data Modeler", 1500);
-                if (popup != IntPtr.Zero && popup != ccWizard)
+                // Combined watcher (job-4 incident 2026-07-11): the old fixed
+                // sequence (1.5s "erwin Data Modeler" popup check, then a
+                // 10s RD-only wait) missed the no-differences notification
+                // erwin raises only AFTER the compare engine finishes - which
+                // can take far longer than 1.5s. The identical-versions run
+                // then failed with the generic timeout and its leftover wizard
+                // deadlocked the worker's model-close loop (erwin froze).
+                IntPtr rd = WaitForResolveDifferencesOrNoDiff(session, dialogsBeforeCompare, 30000, log);
+                if (session.CompareNoDifferences)
                 {
-                    try
-                    {
-                        ClickDialogButtonByTextWin32(popup, new[] { "No", "Hayır", "Cancel", "İptal" }, log);
-                    }
-                    catch { }
-                    log?.Invoke("  [REVIEW] unexpected popup after Compare - dismissed (Win32); aborting.");
+                    // Identical sides: no RD, nothing to apply. Close the
+                    // wizard NOW (verified) so erwin releases the
+                    // ;Duplicate=YES left copy while no modal can interfere;
+                    // CloseReviewSession still owns the version-child teardown.
+                    CloseCcWizardVerified(session, log);
                     return session;
                 }
-
-                IntPtr rd = WaitForResolveDifferencesHandlingTypeResolution(10000, log);
                 if (rd == IntPtr.Zero) { log?.Invoke("  [REVIEW] Resolve Differences did not open."); return session; }
                 log?.Invoke($"  [REVIEW] Resolve Differences = 0x{rd.ToInt64():X}");
                 session.ResolveDifferences = rd;
@@ -1119,12 +1173,12 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// active-vs-version compare (Review).</param>
         /// <param name="pollMaxMs">Listview-ready poll cap (typical 800-1500ms).</param>
         /// <param name="pollStep">Listview-ready poll interval (typical 5-50ms).</param>
-        private static bool ApplyToRightArrowAndWaitForRas(
+        private static ApplyToRightOutcome ApplyToRightArrowAndWaitForRas(
             IntPtr rd, string logPrefix, Action<string> log,
             bool hideAfterClick, bool dumpItems,
             int pollMaxMs, int pollStep)
         {
-            if (rd == IntPtr.Zero || !IsWindow(rd)) { log?.Invoke($"  [{logPrefix}] RD invalid"); return false; }
+            if (rd == IntPtr.Zero || !IsWindow(rd)) { log?.Invoke($"  [{logPrefix}] RD invalid"); return ApplyToRightOutcome.Failed; }
 
             // Poll the RD listview (id=200) until it has >=1 item AND the
             // row-0 arrow subitem rect is non-zero. Clicking too early fires
@@ -1151,7 +1205,33 @@ namespace EliteSoft.Erwin.AddIn.Services
                 Thread.Sleep(pollStep);
                 polled += pollStep;
             }
-            if (lv == IntPtr.Zero) { log?.Invoke($"  [{logPrefix}] listview id=200 not found within {pollMaxMs}ms"); return false; }
+            if (lv == IntPtr.Zero) { log?.Invoke($"  [{logPrefix}] listview id=200 not found within {pollMaxMs}ms"); return ApplyToRightOutcome.Failed; }
+
+            // EMPTY diff grid = identical sides (job-5 finding 2026-07-11: for
+            // a no-diff compare erwin opens RD anyway; the grid simply never
+            // gets a row, the arrow click lands on blank canvas and no EDR tx
+            // can ever fire). Confirm with a longer count-only watch so a
+            // slow-populating grid on a big compare is not misread, then
+            // report the distinct outcome instead of the misleading
+            // "no EDR tx" failure.
+            if (SendMessage(lv, LVM_GETITEMCOUNT, IntPtr.Zero, IntPtr.Zero).ToInt32() == 0)
+            {
+                int confirmMs = 0;
+                int lateCnt = 0;
+                while (confirmMs < 3500)
+                {
+                    Thread.Sleep(250);
+                    confirmMs += 250;
+                    lateCnt = SendMessage(lv, LVM_GETITEMCOUNT, IntPtr.Zero, IntPtr.Zero).ToInt32();
+                    if (lateCnt > 0) break;
+                }
+                if (lateCnt == 0)
+                {
+                    log?.Invoke($"  [{logPrefix}] RD diff grid EMPTY (0 rows after {pollMaxMs + confirmMs}ms) - the compared sides have NO differences to apply.");
+                    return ApplyToRightOutcome.NoDifferences;
+                }
+                log?.Invoke($"  [{logPrefix}] diff grid populated late ({lateCnt} row(s) after {pollMaxMs + confirmMs}ms) - proceeding with the arrow click.");
+            }
 
             if (dumpItems)
             {
@@ -1172,11 +1252,11 @@ namespace EliteSoft.Erwin.AddIn.Services
             RECT rc = new RECT { left = LVIR_BOUNDS, top = 6, right = 0, bottom = 0 };
             SendMessage(lv, LVM_GETSUBITEMRECT, new IntPtr(0), ref rc);
             POINT pt = new POINT { X = (rc.left + rc.right) / 2, Y = (rc.top + rc.bottom) / 2 };
-            if (!ClientToScreen(lv, ref pt)) { log?.Invoke($"  [{logPrefix}] ClientToScreen failed"); return false; }
+            if (!ClientToScreen(lv, ref pt)) { log?.Invoke($"  [{logPrefix}] ClientToScreen failed"); return ApplyToRightOutcome.Failed; }
             log?.Invoke($"  [{logPrefix}] click target (screen) = ({pt.X},{pt.Y})");
 
             int txBefore = NativeBridgeService.GetEdrTxCount();
-            if (!GetCursorPos(out POINT saved)) { log?.Invoke($"  [{logPrefix}] GetCursorPos failed"); return false; }
+            if (!GetCursorPos(out POINT saved)) { log?.Invoke($"  [{logPrefix}] GetCursorPos failed"); return ApplyToRightOutcome.Failed; }
 
             int txAfter = txBefore;
             for (int attempt = 1; attempt <= 2; attempt++)
@@ -1205,7 +1285,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             if (txAfter <= txBefore)
             {
                 log?.Invoke($"  [{logPrefix}] [WARN] click did not trigger EDR tx after 2 attempts.");
-                return false;
+                return ApplyToRightOutcome.Failed;
             }
 
             // After Apply-to-Right, RIGHT Alter Script (cmd 1057) becomes
@@ -1214,7 +1294,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             // toolbar button (also dumps every RD toolbar button's enabled
             // state as [RAS-WAIT] for diagnostic).
             WaitForRdAlterScriptEnabled(rd, CMD_RD_RIGHT_ALTER_SCRIPT, log);
-            return true;
+            return ApplyToRightOutcome.Applied;
         }
 
         /// <summary>
@@ -1230,9 +1310,9 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// re-hides it AFTER on success when not in debug-visible mode (the
         /// helper itself does not hide-per-attempt for the Review pattern).
         /// </summary>
-        public static bool ApplyToRightArrowOnReviewRd(IntPtr rd, Action<string> log)
+        public static ApplyToRightOutcome ApplyToRightArrowOnReviewRd(IntPtr rd, Action<string> log)
         {
-            if (rd == IntPtr.Zero || !IsWindow(rd)) { log?.Invoke("  [REVIEW-APPLY] RD invalid"); return false; }
+            if (rd == IntPtr.Zero || !IsWindow(rd)) { log?.Invoke("  [REVIEW-APPLY] RD invalid"); return ApplyToRightOutcome.Failed; }
             try
             {
                 // Pre-helper foreground prep: in production RD may be hidden
@@ -1240,7 +1320,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 try { BringWindowToTop(rd); SetForegroundWindow(rd); UnhideWindow(rd); } catch { }
                 Thread.Sleep(60);
 
-                bool applied = ApplyToRightArrowAndWaitForRas(
+                ApplyToRightOutcome outcome = ApplyToRightArrowAndWaitForRas(
                     rd, "REVIEW-APPLY", log,
                     hideAfterClick: false, dumpItems: false,
                     pollMaxMs: 1500, pollStep: 50);
@@ -1251,10 +1331,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // before, so RD stays visible an extra ~0-300ms vs the prior
                 // hand-written body; acceptable trade-off for one source of
                 // truth across both pipelines.
-                if (applied && !DebugMode.KeepDialogsVisible) { try { HideWindow(rd); } catch { } }
-                return applied;
+                if (outcome == ApplyToRightOutcome.Applied && !DebugMode.KeepDialogsVisible) { try { HideWindow(rd); } catch { } }
+                return outcome;
             }
-            catch (Exception ex) { log?.Invoke($"  [REVIEW-APPLY] threw: {ex.GetType().Name}: {ex.Message}"); return false; }
+            catch (Exception ex) { log?.Invoke($"  [REVIEW-APPLY] threw: {ex.GetType().Name}: {ex.Message}"); return ApplyToRightOutcome.Failed; }
         }
 
         /// <summary>
@@ -1680,11 +1760,19 @@ namespace EliteSoft.Erwin.AddIn.Services
                 try { overlayToggle?.Invoke(false); } catch { }
                 try
                 {
-                    bool applied = ApplyToRightArrowAndWaitForRas(
+                    ApplyToRightOutcome outcome = ApplyToRightArrowAndWaitForRas(
                         resolveDlg, "DB-7", log,
                         hideAfterClick: true, dumpItems: true,
                         pollMaxMs: 800, pollStep: 5);
-                    session.Applied = applied;
+                    session.Applied = outcome == ApplyToRightOutcome.Applied;
+                    if (outcome == ApplyToRightOutcome.NoDifferences)
+                    {
+                        // DB schema == model: nothing to apply. The caller turns
+                        // this into the informational "no differences" result
+                        // instead of the generic apply failure.
+                        session.CompareNoDifferences = true;
+                        log?.Invoke("  [DB-7] compare found NO differences (model matches the DB schema) - nothing to apply.");
+                    }
                 }
                 finally
                 {
@@ -3620,12 +3708,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                     PostMessage(s.ResolveDifferences, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero);
                     Thread.Sleep(800);
                 }
-                if (s.CCWizard != IntPtr.Zero && IsWindow(s.CCWizard))
-                {
-                    log?.Invoke($"  [REVIEW-CLEAN] IDCANCEL CC wizard 0x{s.CCWizard.ToInt64():X} (lets erwin release the ;Duplicate=YES left copy)");
-                    PostMessage(s.CCWizard, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero);
-                    Thread.Sleep(800);
-                }
+                // VERIFIED wizard close (job-4 incident 2026-07-11): the old
+                // blind IDCANCEL+Sleep(800) left the wizard open when a message
+                // box sat above it; the surviving ;Duplicate=YES PU then blocked
+                // the worker's model close forever. CloseCcWizardVerified
+                // escalates (IDCANCEL -> dismiss blocking dialog -> IDCANCEL ->
+                // wizard Close cmd) and reports loudly when even that fails.
+                CloseCcWizardVerified(s, log);
 
                 // Late-arrival adoption (2026-06-10): when the open-wait timed
                 // out, VersionChild is Zero but the version copy's window may
@@ -4620,6 +4709,146 @@ namespace EliteSoft.Erwin.AddIn.Services
             return GetActiveMdiChild(mdiClient) != IntPtr.Zero;
         }
 
+        /// <summary>
+        /// Closes the DDL-generator bootstrap model if it is the active MDI
+        /// child. The watcher launches erwin with a throwaway bootstrap .erwin
+        /// (a read-only blank model) purely so the add-in command becomes
+        /// enabled and loads (model-less erwin ignores it - S1 spike 2026-07-12).
+        /// Once loaded, the add-in closes that bootstrap here so erwin is
+        /// model-less and the worker can open job models. The bootstrap is
+        /// recognized by <paramref name="marker"/> in the active child's title
+        /// (its file name, e.g. "ddlgen-bootstrap"); a real user/job model is
+        /// never touched. Read-only + never dirtied, so WM_CLOSE raises no
+        /// Save prompt. Returns true when a bootstrap child was found and its
+        /// close was posted; false when the active model is not the bootstrap.
+        /// </summary>
+        [DllImport("user32.dll")]
+        private static extern bool IsWindowEnabled(IntPtr hWnd);
+        private const uint GW_ENABLEDPOPUP = 6;
+
+        /// <summary>
+        /// Closes erwin so the watcher relaunches it with a fresh Mart login.
+        /// The Mart server enforces an absolute session lifetime (~4h observed
+        /// 2026-07-13); no client-side keep-alive can extend it, and letting the
+        /// session drop in place produces an "Access Denied" modal that stalls
+        /// the worker and then crashes erwin. The DDL-generator instance instead
+        /// restarts itself for a clean session (proactively before the timeout,
+        /// or reactively on a detected drop). Called ONLY when idle (no job).
+        /// Posts WM_CLOSE to the main frame (erwin is model-less between jobs, so
+        /// no Save prompt), dismisses any Mart-disconnect popup in the
+        /// background, and force-kills erwin after a grace period if a lingering
+        /// modal blocks the graceful close. The add-in dies with erwin either
+        /// way; the watcher brings it back.
+        /// </summary>
+        internal static void RequestErwinRestart(Action<string> log)
+        {
+            IntPtr main = FindErwinMain();
+            if (main == IntPtr.Zero)
+            {
+                // No main frame: nothing to close gracefully - kill our own
+                // (erwin) process so the watcher relaunches.
+                log?.Invoke("[DDL-RESTART] erwin main frame not found - force-exiting the process for restart.");
+                try { System.Diagnostics.Process.GetCurrentProcess().Kill(); } catch { }
+                return;
+            }
+
+            // First clear any modal that would block WM_CLOSE (e.g. the
+            // "Access Denied" box from the dropped session).
+            try
+            {
+                IntPtr modal = GetWindow(main, GW_ENABLEDPOPUP);
+                if (modal != IntPtr.Zero && modal != main && IsWindow(modal))
+                {
+                    log?.Invoke($"[DDL-RESTART] dismissing blocking modal 0x{modal.ToInt64():X} (title='{GetTitle(modal)}') before close.");
+                    PostMessage(modal, WM_CLOSE_MSG, IntPtr.Zero, IntPtr.Zero);
+                    Thread.Sleep(500);
+                }
+            }
+            catch { }
+
+            log?.Invoke("[DDL-RESTART] posting WM_CLOSE to erwin main frame for a clean restart.");
+            DismissErwinPopupInBackground(8000, log); // Mart-disconnect / Save prompt, if any
+            PostMessage(main, WM_CLOSE_MSG, IntPtr.Zero, IntPtr.Zero);
+
+            // Force-kill fallback: if erwin is still alive after the grace
+            // window (a modal swallowed the close), kill it so the restart is
+            // guaranteed. Runs on a background thread; if erwin (and thus this
+            // add-in) already exited, the thread dies with it - harmless.
+            Task.Run(() =>
+            {
+                Thread.Sleep(20000);
+                try
+                {
+                    if (IsWindow(main))
+                    {
+                        log?.Invoke("[DDL-RESTART] erwin still alive 20s after WM_CLOSE - force-killing for restart.");
+                        System.Diagnostics.Process.GetCurrentProcess().Kill();
+                    }
+                }
+                catch { }
+            });
+        }
+
+        /// <summary>
+        /// Closes the startup Welcome / Start Page modal that erwin shows on a
+        /// cold launch. That modal DISABLES erwin's main window
+        /// (IsWindowEnabled(main)==false), which stalls the DDL worker at the
+        /// IsErwinMainWindowBlockedByModal tick gate until a human closes it
+        /// (job 2026-07-12: a 62s stall on the unattended worker VM). This runs
+        /// pre-login only (the caller gates on !loginInProgress), so the modal
+        /// it finds is the startup Welcome, never our own Connect dialog. Uses
+        /// GW_ENABLEDPOPUP to get exactly the enabled pop-up that owns the
+        /// main's disabled state, and skips our own WinForms add-in window.
+        /// Returns true when a close was posted.
+        /// </summary>
+        internal static bool DismissBlockingStartupDialog(Action<string> log)
+        {
+            IntPtr main = FindErwinMain();
+            if (main == IntPtr.Zero) return false;
+            if (IsWindowEnabled(main)) return false; // not blocked
+
+            IntPtr modal = GetWindow(main, GW_ENABLEDPOPUP);
+            if (modal == IntPtr.Zero || modal == main || !IsWindow(modal)) return false;
+
+            // Never close our own add-in form (a WinForms window); only the
+            // native erwin startup dialog.
+            var cls = new StringBuilder(64);
+            GetClassName(modal, cls, cls.Capacity);
+            if (cls.ToString().StartsWith("WindowsForms", StringComparison.OrdinalIgnoreCase)) return false;
+
+            log?.Invoke($"[DDL-WELCOME] main window blocked by startup modal 0x{modal.ToInt64():X} (cls='{cls}', title='{GetTitle(modal)}') - closing it so the worker can proceed.");
+            // Prefer clicking OK/Tamam by its REAL control id (erwin's popups
+            // give OK non-standard ids, e.g. 2; a fixed IDOK is a no-op - dump
+            // 2026-07-13). Fall back to WM_CLOSE for a Start Page with no OK.
+            if (!ClickDialogButtonByTextWin32(modal, new[] { "OK", "Tamam" }, log))
+                PostMessage(modal, WM_CLOSE_MSG, IntPtr.Zero, IntPtr.Zero);
+            WaitForWindowGone(modal, 3000);
+            return true;
+        }
+
+        internal static bool CloseBootstrapModelIfActive(string marker, Action<string> log)
+        {
+            if (string.IsNullOrEmpty(marker)) return false;
+            IntPtr main = FindErwinMain();
+            if (main == IntPtr.Zero) return false;
+            IntPtr mdiClient = FindMdiClientOf(main);
+            if (mdiClient == IntPtr.Zero) return false;
+            IntPtr child = GetActiveMdiChild(mdiClient);
+            if (child == IntPtr.Zero) return false;
+
+            string title = GetTitle(child) ?? "";
+            if (title.IndexOf(marker, StringComparison.OrdinalIgnoreCase) < 0)
+                return false; // active model is not the bootstrap - leave it alone
+
+            log?.Invoke($"[DDL-BOOTSTRAP] active model is the bootstrap ('{title}') - closing it (WM_CLOSE, read-only so no save prompt).");
+            PostMessage(child, WM_CLOSE_MSG, IntPtr.Zero, IntPtr.Zero);
+            if (WaitForWindowGone(child, 5000))
+                log?.Invoke("[DDL-BOOTSTRAP] bootstrap model closed - erwin is now model-less for jobs.");
+            else
+                log?.Invoke("[DDL-BOOTSTRAP] bootstrap child still alive after WM_CLOSE - will retry next tick.");
+            return true;
+        }
+
         /// <summary>Activate a SPECIFIC MDI child (used to flip Left back to the
         /// dirty model after opening the version child).</summary>
         private static void ActivateMdiChildHandle(IntPtr mdiClient, IntPtr child, Action<string> log)
@@ -4883,6 +5112,336 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
             }
             catch { }
+        }
+
+        // ── Mart auto-login (DDLGENERATOR flavor) ───────────────────────────
+
+        /// <summary>Outcome of <see cref="ConnectToMart"/>.</summary>
+        internal enum MartLoginResult
+        {
+            /// <summary>A Mart session was already live (no login needed).</summary>
+            AlreadyConnected,
+            /// <summary>Login succeeded (Connect dialog filled + accepted).</summary>
+            LoggedIn,
+            /// <summary>Login could not complete (dialog never appeared, or Connect rejected).</summary>
+            Failed,
+        }
+
+        /// <summary>
+        /// Drives erwin's ribbon Mart &gt; Connect for the unattended DDL-
+        /// generator instance, entirely via Win32 (no UIA - the [SM-WIN32]
+        /// lesson). Flow (control ids from reference_mart_connect_dialog_map):
+        /// <list type="number">
+        /// <item>Post WM_COMMAND 1059 to the XTPMainFrame; wait for the
+        /// "Connect to Mart" #32770 dialog. If it never appears, probe whether
+        /// a Mart session is already live (Mart&gt;Open shows the picker) -&gt;
+        /// <see cref="MartLoginResult.AlreadyConnected"/>.</item>
+        /// <item>Align the Authentication combo (id 1011) to
+        /// <paramref name="cfg"/>.AuthType so the credential fields are in the
+        /// right enabled state, optionally set Server/Port (ids 1005/1007).</item>
+        /// <item>Server auth: WM_SETTEXT User (1012) + Password (1013).
+        /// Windows auth: fill nothing.</item>
+        /// <item>Click Connect (id 1002); wait for the dialog to close and
+        /// dismiss the optional "Mart Connected Successfully" OK box (OK only -
+        /// NEVER the "Don't show again" checkbox, feedback_no_user_pref_changes).
+        /// A still-open dialog after the timeout = failure (bad creds/server).</item>
+        /// </list>
+        /// All settle timings are generous: this runs unattended on a console
+        /// session, correctness beats speed.
+        /// </summary>
+        internal static MartLoginResult ConnectToMart(DdlWorkerConfig cfg, Action<string> log)
+        {
+            if (cfg == null) { log?.Invoke("[MART-LOGIN] no config - aborting login."); return MartLoginResult.Failed; }
+
+            IntPtr main = FindErwinMain();
+            if (main == IntPtr.Zero) { log?.Invoke("[MART-LOGIN] erwin XTPMainFrame not found - aborting."); return MartLoginResult.Failed; }
+
+            // Reuse a Connect dialog if one is already up (e.g. a prior partial
+            // attempt); otherwise post the ribbon command and wait for it.
+            IntPtr dlg = FindVisibleOwnTopLevel("Connect to Mart");
+            if (dlg == IntPtr.Zero)
+            {
+                log?.Invoke("[MART-LOGIN] posting Mart > Connect (WM_COMMAND 1059).");
+                PostMessage(main, WM_COMMAND, MakeWParam(CMD_MART_CONNECT, 0), IntPtr.Zero);
+                dlg = WaitForDialog("Connect to Mart", 10000);
+            }
+
+            if (dlg == IntPtr.Zero)
+            {
+                // No dialog: either already connected (Connect is a no-op with a
+                // live session) or the command did not dispatch. Distinguish by
+                // probing Mart > Open for the model picker.
+                if (ProbeMartConnected(main, "MART-LOGIN", log))
+                {
+                    log?.Invoke("[MART-LOGIN] no Connect dialog + Open picker present => already connected.");
+                    return MartLoginResult.AlreadyConnected;
+                }
+                log?.Invoke("[MART-LOGIN] no Connect dialog appeared AND not connected - Connect command did not take. FAILED.");
+                return MartLoginResult.Failed;
+            }
+
+            IntPtr combo = GetDlgItem(dlg, MART_DLG_AUTHCOMBO);
+            string authText = combo != IntPtr.Zero ? (GetTitle(combo) ?? "").Trim() : "";
+            log?.Invoke($"[MART-LOGIN] Connect dialog up (0x{dlg.ToInt64():X}); Authentication='{authText}', target auth={cfg.AuthType}.");
+
+            EnsureAuthCombo(dlg, combo, cfg.AuthType, authText, log);
+
+            if (!string.IsNullOrWhiteSpace(cfg.MartServer))
+            {
+                SetEditTextById(dlg, MART_DLG_SERVER, cfg.MartServer);
+                log?.Invoke($"[MART-LOGIN] server override set '{cfg.MartServer}'.");
+            }
+            if (cfg.MartPort.HasValue)
+            {
+                SetEditTextById(dlg, MART_DLG_PORT, cfg.MartPort.Value.ToString());
+                log?.Invoke($"[MART-LOGIN] port override set {cfg.MartPort.Value}.");
+            }
+            SetCheckboxById(dlg, MART_DLG_USESSL, cfg.UseSsl, log);
+
+            if (cfg.AuthType == MartAuthType.Server)
+            {
+                SetEditTextById(dlg, MART_DLG_USER, cfg.UserName ?? "");
+                SetEditTextById(dlg, MART_DLG_PASS, cfg.Password ?? "");
+                log?.Invoke($"[MART-LOGIN] Server auth: User='{cfg.UserName}' + Password (len={cfg.Password?.Length ?? 0}) filled.");
+            }
+            else
+            {
+                log?.Invoke("[MART-LOGIN] Windows auth: no credentials filled.");
+            }
+
+            var before = EnumerateVisibleDialogs();
+            Thread.Sleep(200);
+            if (!ClickDialogButtonByTextWin32(dlg, new[] { "Connect", "Bağlan" }, log))
+            {
+                // Fall back to the known id if the text match missed.
+                IntPtr btn = GetDlgItem(dlg, MART_DLG_CONNECT);
+                PostMessage(dlg, WM_COMMAND, MakeWParam(MART_DLG_CONNECT, 0), btn);
+                log?.Invoke("[MART-LOGIN] Connect not matched by text - posted WM_COMMAND id=1002 as fallback.");
+            }
+            log?.Invoke("[MART-LOGIN] Connect posted - waiting for outcome.");
+
+            return WaitForLoginOutcome(dlg, before, log);
+        }
+
+        /// <summary>
+        /// Aligns the Authentication combo (id 1011) to the configured auth
+        /// type when it differs, so erwin enables/disables the User/Password
+        /// fields correctly. erwin remembers the last auth type, so on a
+        /// stable worker VM this is usually a no-op; the alignment is defensive
+        /// (a drifted combo would otherwise silently ignore the credentials for
+        /// Server auth, or demand them for Windows auth).
+        /// </summary>
+        private static void EnsureAuthCombo(IntPtr dlg, IntPtr combo, MartAuthType want, string currentText, Action<string> log)
+        {
+            if (combo == IntPtr.Zero) { log?.Invoke("[MART-LOGIN] auth combo (id 1011) not found - leaving auth mode as-is."); return; }
+
+            string wantPrefix = want == MartAuthType.Server ? "Server" : "Windows";
+            if (currentText.StartsWith(wantPrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                log?.Invoke($"[MART-LOGIN] auth combo already '{currentText}' - matches target, no change.");
+                return;
+            }
+
+            IntPtr strPtr = Marshal.StringToHGlobalUni(wantPrefix);
+            try
+            {
+                IntPtr idx = SendMessageCb(combo, CB_SELECTSTRING, new IntPtr(-1), strPtr);
+                if (idx.ToInt64() < 0)
+                {
+                    log?.Invoke($"[MART-LOGIN] '{wantPrefix}...' not found in the auth combo (current='{currentText}') - left as-is; login may use the wrong auth mode.");
+                    return;
+                }
+                // Notify the dialog so it enables/disables the credential fields.
+                PostMessage(dlg, WM_COMMAND, MakeWParam(MART_DLG_AUTHCOMBO, CBN_SELCHANGE), combo);
+                Thread.Sleep(150);
+                log?.Invoke($"[MART-LOGIN] auth combo switched '{currentText}' -> '{wantPrefix} ...' (idx {idx.ToInt64()}) + CBN_SELCHANGE.");
+            }
+            finally { Marshal.FreeHGlobal(strPtr); }
+        }
+
+        /// <summary>Sets an edit control's text by dialog-item id via WM_SETTEXT (erwin is Unicode).</summary>
+        private static void SetEditTextById(IntPtr dlg, int id, string text)
+        {
+            IntPtr edit = GetDlgItem(dlg, id);
+            if (edit != IntPtr.Zero) SendMessageSetText(edit, WM_SETTEXT, IntPtr.Zero, text ?? "");
+        }
+
+        /// <summary>
+        /// Sets a checkbox to the wanted state by dialog-item id, but only when
+        /// it differs from the current state (so a no-op leaves erwin's own
+        /// remembered value untouched). BM_SETCHECK does not itself notify the
+        /// parent, so a BN_CLICKED WM_COMMAND is posted after a real change to
+        /// let the dialog react (enable/disable dependent fields).
+        /// </summary>
+        private static void SetCheckboxById(IntPtr dlg, int id, bool wantChecked, Action<string> log)
+        {
+            IntPtr cb = GetDlgItem(dlg, id);
+            if (cb == IntPtr.Zero) { log?.Invoke($"[MART-LOGIN] checkbox id={id} not found - leaving as-is."); return; }
+            int cur = SendMessage(cb, BM_GETCHECK, IntPtr.Zero, IntPtr.Zero).ToInt32();
+            bool isChecked = cur == BST_CHECKED;
+            if (isChecked == wantChecked)
+            {
+                log?.Invoke($"[MART-LOGIN] Use-SSL already {(wantChecked ? "checked" : "unchecked")} - no change.");
+                return;
+            }
+            SendMessage(cb, BM_SETCHECK, new IntPtr(wantChecked ? BST_CHECKED : BST_UNCHECKED), IntPtr.Zero);
+            PostMessage(dlg, WM_COMMAND, MakeWParam(id, BN_CLICKED), cb);
+            log?.Invoke($"[MART-LOGIN] Use-SSL set to {(wantChecked ? "checked" : "unchecked")} (+ BN_CLICKED).");
+        }
+
+        /// <summary>
+        /// Waits for the login outcome after Connect is clicked and, crucially,
+        /// DISMISSES the "Mart Connected Successfully" info box that appears
+        /// AFTER the Connect dialog closes (job 2026-07-12: the dialog closed in
+        /// ~4ms and the old logic returned LoggedIn before that box existed, so
+        /// it was left on screen blocking everything downstream).
+        ///
+        /// Loop, all pure Win32:
+        /// <list type="bullet">
+        /// <item>A NEW "erwin Data Modeler" box appears: OK it (OK button only -
+        /// NEVER the "Don't show this again" checkbox,
+        /// feedback_no_user_pref_changes). If the Connect dialog is still open
+        /// AND the text is not a success notice, it is an error box -&gt;
+        /// <see cref="MartLoginResult.Failed"/>. Otherwise it is the success
+        /// box -&gt; dismissed, <see cref="MartLoginResult.LoggedIn"/>.</item>
+        /// <item>The Connect dialog closes: login is accepted, but the success
+        /// box may still be about to appear - do NOT return yet; wait up to a
+        /// short grace window for it, then return LoggedIn if none shows (it may
+        /// have been suppressed via "Don't show again" on a prior run).</item>
+        /// <item>Overall 25s timeout with the dialog still open = bad
+        /// credentials / unreachable server -&gt; Cancel + Failed.</item>
+        /// </list>
+        /// </summary>
+        private static MartLoginResult WaitForLoginOutcome(IntPtr dlg, HashSet<IntPtr> before, Action<string> log)
+        {
+            uint deadline = unchecked((uint)Environment.TickCount) + 25000u;
+            bool connectClosed = false;
+            uint successGraceDeadline = 0; // set once the Connect dialog closes
+
+            while (unchecked((int)((uint)Environment.TickCount - deadline)) < 0)
+            {
+                Thread.Sleep(150);
+
+                // Inspect any NEW erwin message box (success or error).
+                foreach (var h in EnumerateVisibleDialogs())
+                {
+                    if (before.Contains(h) || h == dlg || !IsWindow(h)) continue;
+                    string title = GetTitle(h);
+                    if (string.IsNullOrEmpty(title) ||
+                        title.IndexOf("erwin Data Modeler", StringComparison.OrdinalIgnoreCase) < 0)
+                        continue;
+
+                    string text = CollectDialogStaticText(h);
+                    bool connectDlgGone = connectClosed || !IsWindow(dlg) || !IsWindowVisible(dlg);
+                    bool looksSuccess =
+                        text.IndexOf("Connected", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        text.IndexOf("Successfully", StringComparison.OrdinalIgnoreCase) >= 0;
+
+                    if (looksSuccess || connectDlgGone)
+                    {
+                        log?.Invoke($"[MART-LOGIN] success box '{title}' text='{text.Trim()}' - OK.");
+                        DismissOkBox(h, log);
+                        return MartLoginResult.LoggedIn;
+                    }
+
+                    log?.Invoke($"[MART-LOGIN] error box '{title}' text='{text.Trim()}' while Connect dialog still open - login FAILED.");
+                    DismissOkBox(h, log);
+                    return MartLoginResult.Failed;
+                }
+
+                if (!connectClosed && (!IsWindow(dlg) || !IsWindowVisible(dlg)))
+                {
+                    // Login accepted. The success box may still be about to
+                    // appear - give it a short grace window before declaring
+                    // success (so we dismiss it instead of leaving it up).
+                    connectClosed = true;
+                    successGraceDeadline = unchecked((uint)Environment.TickCount) + 4000u;
+                    log?.Invoke("[MART-LOGIN] Connect dialog closed - login accepted; waiting briefly for the 'Mart Connected' box to dismiss it.");
+                }
+
+                if (connectClosed && unchecked((int)((uint)Environment.TickCount - successGraceDeadline)) >= 0)
+                {
+                    log?.Invoke("[MART-LOGIN] no success box within grace window (likely suppressed via 'Don't show again') - login SUCCEEDED.");
+                    return MartLoginResult.LoggedIn;
+                }
+            }
+
+            log?.Invoke("[MART-LOGIN] Connect dialog still open after 25s - login FAILED (bad credentials or unreachable server). Cancelling the dialog.");
+            IntPtr cancelBtn = GetDlgItem(dlg, IDCANCEL);
+            PostMessage(dlg, WM_COMMAND, MakeWParam(IDCANCEL, 0), cancelBtn);
+            WaitForWindowGone(dlg, 3000);
+            return MartLoginResult.Failed;
+        }
+
+        /// <summary>Clicks OK on an erwin message box (OK button only - never a "Don't show again" checkbox) and waits for it to close.</summary>
+        private static void DismissOkBox(IntPtr box, Action<string> log)
+        {
+            if (!ClickDialogButtonByTextWin32(box, new[] { "OK", "Tamam" }, log))
+            {
+                IntPtr okBtn = GetDlgItem(box, IDOK);
+                PostMessage(box, WM_COMMAND, MakeWParam(IDOK, 0), okBtn);
+            }
+            WaitForWindowGone(box, 3000);
+        }
+
+        /// <summary>
+        /// Probes whether a Mart session is live by posting Mart &gt; Open and
+        /// checking for the model-picker dialog; cancels it immediately either
+        /// way (opens nothing). Returns true when the picker appeared (session
+        /// live), false when the "Connect to Mart" dialog appeared instead
+        /// (session dropped) or neither did. Shared by the login "already
+        /// connected?" probe and the keep-alive ping (<paramref name="tag"/>
+        /// selects the log prefix).
+        /// </summary>
+        private static bool ProbeMartConnected(IntPtr main, string tag, Action<string> log)
+        {
+            var before = EnumerateVisibleDialogs();
+            PostMessage(main, WM_COMMAND, MakeWParam(CMD_MART_OPEN_VERSION, 0), IntPtr.Zero);
+            // The picker OR a "Connect to Mart" (disconnected) dialog may appear.
+            IntPtr picker = IntPtr.Zero;
+            uint deadline = unchecked((uint)Environment.TickCount) + 6000u;
+            while (unchecked((int)((uint)Environment.TickCount - deadline)) < 0)
+            {
+                Thread.Sleep(120);
+                IntPtr open = FindVisibleOwnTopLevel("Open");
+                IntPtr connect = FindVisibleOwnTopLevel("Connect to Mart");
+                if (connect != IntPtr.Zero)
+                {
+                    log?.Invoke($"[{tag}] probe: Mart>Open raised 'Connect to Mart' - NOT connected.");
+                    PostMessage(connect, WM_COMMAND, MakeWParam(IDCANCEL, 0), GetDlgItem(connect, IDCANCEL));
+                    WaitForWindowGone(connect, 3000);
+                    return false;
+                }
+                if (open != IntPtr.Zero && !before.Contains(open))
+                {
+                    picker = open;
+                    break;
+                }
+            }
+            if (picker != IntPtr.Zero)
+            {
+                log?.Invoke($"[{tag}] probe: Mart>Open picker present - connected. Cancelling picker.");
+                PostMessage(picker, WM_COMMAND, MakeWParam(IDCANCEL, 0), GetDlgItem(picker, IDCANCEL));
+                WaitForWindowGone(picker, 3000);
+                return true;
+            }
+            log?.Invoke($"[{tag}] probe: neither picker nor Connect dialog appeared - treating as NOT connected.");
+            return false;
+        }
+
+        /// <summary>
+        /// Keep-alive ping: posts Mart &gt; Open and immediately cancels the
+        /// picker to keep the Mart login from timing out. Returns true when the
+        /// session is still live (picker appeared), false when it has dropped
+        /// (the "Connect to Mart" dialog appeared instead - the caller then
+        /// forces a re-login). Pure Win32, opens nothing. Must NEVER be called
+        /// while a DDL job/pipeline is active (the caller guards that).
+        /// </summary>
+        internal static bool PingMartSession(Action<string> log)
+        {
+            IntPtr main = FindErwinMain();
+            if (main == IntPtr.Zero) { log?.Invoke("[MART-KEEPALIVE] erwin main frame not found - skipping ping."); return false; }
+            return ProbeMartConnected(main, "MART-KEEPALIVE", log);
         }
 
         // ── Window enumeration ──────────────────────────────────────────────
@@ -5171,6 +5730,195 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
             }
             return IntPtr.Zero;
+        }
+
+        /// <summary>
+        /// Post-Compare watcher for the cross-version Review/CC path. Waits for
+        /// Resolve Differences while ALSO handling the two interrupts erwin can
+        /// raise instead of it (job-4 incident 2026-07-11):
+        /// <list type="bullet">
+        /// <item>"Type Resolution" wizard (UDP type conflicts): Finish is pressed
+        /// and the deadline re-armed once - same recipe as
+        /// <see cref="WaitForResolveDifferencesHandlingTypeResolution"/>.</item>
+        /// <item>An "erwin Data Modeler" message box - most importantly the
+        /// NO-DIFFERENCES notification erwin shows when the compared sides are
+        /// identical. Its title+static text is logged VERBATIM (ground truth if
+        /// erwin's wording ever differs), then classified via
+        /// <see cref="CcCompareOutcome.IsNoDifferenceInfoText"/>: no-diff is
+        /// dismissed with OK and flagged on
+        /// <see cref="CCSession.CompareNoDifferences"/>; anything else is
+        /// dismissed with No/Cancel (the old post-Compare popup guard) and the
+        /// wait aborts so the caller fails the run explicitly.</item>
+        /// </list>
+        /// Other new dialogs (e.g. the compare progress meter) are logged once
+        /// and left alone - dismissing them would kill a healthy compare.
+        /// All interaction is PURE Win32 (no UIA - the [SM-WIN32] lesson).
+        /// </summary>
+        private static IntPtr WaitForResolveDifferencesOrNoDiff(
+            CCSession session, HashSet<IntPtr> dialogsBeforeCompare, int timeoutMs, Action<string> log)
+        {
+            const string TypeResolutionTitle = "Type Resolution";
+            bool deadlineReArmed = false;
+            uint lastFinishClickTick = 0;
+            uint deadline = unchecked((uint)Environment.TickCount) + (uint)timeoutMs;
+            var loggedDialogs = new HashSet<IntPtr>();
+
+            while (unchecked((int)((uint)Environment.TickCount - deadline)) < 0)
+            {
+                Thread.Sleep(100);
+
+                IntPtr rd = FindVisibleOwnTopLevel("Resolve Differences");
+                if (rd != IntPtr.Zero) return rd;
+
+                IntPtr tr = FindVisibleOwnTopLevel(TypeResolutionTitle);
+                if (tr != IntPtr.Zero)
+                {
+                    // Throttle re-clicks: the wizard needs a moment to process
+                    // Finish and close; hammering it every 100 ms spams the log.
+                    uint now = unchecked((uint)Environment.TickCount);
+                    if (lastFinishClickTick != 0 && unchecked((int)(now - lastFinishClickTick)) < 1500)
+                        continue;
+                    lastFinishClickTick = now;
+
+                    bool clicked = false;
+                    try
+                    {
+                        clicked = ClickDialogButtonByTextWin32(tr, new[] { "Finish", "Son" }, log);
+                    }
+                    catch (Exception ex)
+                    {
+                        log?.Invoke($"  [TYPE-RES] Finish click error on 0x{tr.ToInt64():X}: {ex.Message}");
+                    }
+                    log?.Invoke(clicked
+                        ? $"  [TYPE-RES] Type Resolution wizard 0x{tr.ToInt64():X} intercepted - Finish pressed (default UDP type resolutions accepted)."
+                        : $"  [TYPE-RES] Type Resolution wizard 0x{tr.ToInt64():X} present but Finish button not found - will retry.");
+
+                    if (clicked && !deadlineReArmed)
+                    {
+                        deadlineReArmed = true;
+                        deadline = unchecked((uint)Environment.TickCount) + (uint)timeoutMs;
+                    }
+                    continue;
+                }
+
+                // erwin's compare-outcome notifications are AfxMessageBoxes
+                // titled "erwin Data Modeler" (same family as the GDM popups).
+                // Only THOSE are acted on; any other new dialog is logged once
+                // for diagnosis and left untouched (it may be the progress
+                // meter of a still-running compare).
+                foreach (var h in EnumerateVisibleDialogs())
+                {
+                    if (dialogsBeforeCompare.Contains(h)) continue;
+                    if (h == session.CCWizard || h == session.ResolveDifferences) continue;
+                    if (!IsWindow(h)) continue;
+
+                    string title = GetTitle(h);
+                    bool isErwinBox = !string.IsNullOrEmpty(title) &&
+                        title.IndexOf("erwin Data Modeler", StringComparison.OrdinalIgnoreCase) >= 0;
+
+                    if (!isErwinBox)
+                    {
+                        if (loggedDialogs.Add(h))
+                            log?.Invoke($"  [REVIEW-5] new dialog during compare 0x{h.ToInt64():X} title='{title}' (not an erwin message box - left alone)");
+                        continue;
+                    }
+
+                    string text = CollectDialogStaticText(h);
+                    log?.Invoke($"  [REVIEW-5] post-Compare message box 0x{h.ToInt64():X} title='{title}' text='{text.Trim()}'");
+
+                    if (CcCompareOutcome.IsNoDifferenceInfoText(text))
+                    {
+                        session.CompareNoDifferences = true;
+                        log?.Invoke("  [REVIEW-5] compare found NO DIFFERENCES (sides identical) - dismissing the info box via OK.");
+                        if (!ClickDialogButtonByTextWin32(h, new[] { "OK", "Tamam" }, log))
+                        {
+                            IntPtr okBtn = GetDlgItem(h, IDOK);
+                            PostMessage(h, WM_COMMAND, MakeWParam(IDOK, 0), okBtn);
+                            log?.Invoke("  [REVIEW-5] OK button not found by text - posted WM_COMMAND IDOK as fallback.");
+                        }
+                        WaitForWindowGone(h, 3000);
+                        return IntPtr.Zero;
+                    }
+
+                    try
+                    {
+                        ClickDialogButtonByTextWin32(h, new[] { "No", "Hayır", "Cancel", "İptal" }, log);
+                    }
+                    catch { /* dismissal is best-effort; the abort below is the real handling */ }
+                    log?.Invoke("  [REVIEW-5] unexpected post-Compare message box - dismissed (Win32); aborting the compare wait.");
+                    return IntPtr.Zero;
+                }
+            }
+            return IntPtr.Zero;
+        }
+
+        /// <summary>
+        /// Closes the CC/Review wizard and VERIFIES it died. The old blind
+        /// "post IDCANCEL + Sleep(800)" left the wizard open in the job-4
+        /// incident (2026-07-11): a message box above it was eating input, the
+        /// ;Duplicate=YES left copy stayed alive, the job model could then
+        /// never close, and the worker's cleanup retried forever (erwin
+        /// froze). Escalation, all PURE Win32:
+        /// <list type="number">
+        /// <item>WM_COMMAND IDCANCEL (MFC OnCancel - the proven safe path).</item>
+        /// <item>Still alive: log VERBATIM + OK-dismiss every dialog that
+        /// appeared over the wizard since its launch, then IDCANCEL again.</item>
+        /// <item>Still alive: the wizard's own Close command
+        /// (<see cref="CC_CLOSE"/>).</item>
+        /// </list>
+        /// Deliberately NO ForceDestroy: destroying a live CC wizard corrupts
+        /// erwin's CC engine and kills the process minutes later
+        /// (reference_cross_version_orphan_unsolved). When all three steps
+        /// fail the wizard is reported loudly and left for the user; the
+        /// worker's bounded cleanup keeps erwin usable regardless.
+        /// </summary>
+        private static bool CloseCcWizardVerified(CCSession s, Action<string> log)
+        {
+            if (s == null || s.CCWizard == IntPtr.Zero || !IsWindow(s.CCWizard)) return true;
+
+            log?.Invoke($"  [REVIEW-CLEAN] IDCANCEL CC wizard 0x{s.CCWizard.ToInt64():X} (lets erwin release the ;Duplicate=YES left copy)");
+            PostMessage(s.CCWizard, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero);
+            if (WaitForWindowGone(s.CCWizard, 5000)) return true;
+
+            // A message box above the wizard (e.g. a compare-outcome
+            // notification nobody dismissed) keeps it alive: log + OK it away,
+            // then cancel again. Type Resolution gets its Finish instead.
+            if (s.DialogsBeforeWizard != null)
+            {
+                foreach (var h in EnumerateVisibleDialogs())
+                {
+                    if (s.DialogsBeforeWizard.Contains(h)) continue;
+                    if (h == s.CCWizard || h == s.ResolveDifferences) continue;
+                    if (!IsWindow(h)) continue;
+                    string t = GetTitle(h);
+                    string txt = CollectDialogStaticText(h);
+                    log?.Invoke($"  [REVIEW-CLEAN] wizard still open; dialog above it 0x{h.ToInt64():X} title='{t}' text='{txt.Trim()}' - dismissing.");
+                    if (!ClickDialogButtonByTextWin32(h, new[] { "OK", "Tamam", "Finish", "Son", "Close", "Kapat" }, log))
+                    {
+                        IntPtr okBtn = GetDlgItem(h, IDOK);
+                        PostMessage(h, WM_COMMAND, MakeWParam(IDOK, 0), okBtn);
+                        log?.Invoke("  [REVIEW-CLEAN] no dismiss button matched by text - posted WM_COMMAND IDOK as fallback.");
+                    }
+                    WaitForWindowGone(h, 2000);
+                }
+            }
+            PostMessage(s.CCWizard, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero);
+            if (WaitForWindowGone(s.CCWizard, 5000))
+            {
+                log?.Invoke("  [REVIEW-CLEAN] CC wizard closed on the second IDCANCEL (after dismissing the blocking dialog).");
+                return true;
+            }
+
+            log?.Invoke($"  [REVIEW-CLEAN] CC wizard still open - posting its own Close command ({CC_CLOSE}).");
+            PostMessage(s.CCWizard, WM_COMMAND, MakeWParam(CC_CLOSE, 0), IntPtr.Zero);
+            if (WaitForWindowGone(s.CCWizard, 5000))
+            {
+                log?.Invoke("  [REVIEW-CLEAN] CC wizard closed via its Close command.");
+                return true;
+            }
+
+            log?.Invoke("  [REVIEW-CLEAN] CC wizard COULD NOT be closed (IDCANCEL x2 + Close cmd) - leaving it for manual close; the ;Duplicate=YES copy stays alive until then.");
+            return false;
         }
 
         // ── Hide-wizard via LAYERED + alpha=0 ───────────────────────────────

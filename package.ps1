@@ -45,6 +45,11 @@ param(
     # Output directory (tool-driven): the .zip lands directly in here as <PackageName>.zip
     # (implies -Zip). When omitted, the legacy C:\EliteSoft\<PackageName> layout is used.
     [string]$OutDir,
+    # DDL-generator flavor: compiles with the DDLGENERATOR symbol - the packaged
+    # add-in is a dedicated, always-on DDL queue worker (no validation surfaces,
+    # General tab only). Deploy to the dedicated worker VM ONLY (same COM CLSID
+    # as the normal flavor - one flavor per machine).
+    [switch]$DdlGenerator,
     [Alias('?')]
     [switch]$Help
 )
@@ -174,9 +179,11 @@ if (Test-Path $bridgeScript) {
 }
 
 # STEP 1: Publish
-Write-Host "`n[1] Publishing release build..." -ForegroundColor Yellow
+Write-Host "`n[1] Publishing release build$(if ($DdlGenerator) { ' [DDLGENERATOR flavor]' })..." -ForegroundColor Yellow
 dotnet clean ErwinAddIn.csproj -c Release 2>&1 | Out-Null
-dotnet publish ErwinAddIn.csproj -c Release -r win-x64 --self-contained false -p:PackagedBuild=true -o $publishDir
+$publishProps = @('-p:PackagedBuild=true')
+if ($DdlGenerator) { $publishProps += '-p:DdlGenerator=true' }
+dotnet publish ErwinAddIn.csproj -c Release -r win-x64 --self-contained false @publishProps -o $publishDir
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Publish failed!" -ForegroundColor Red
