@@ -129,14 +129,24 @@ function Wait-ForModel {
         # No model yet. A modal startup dialog (license-expiry warning, Welcome/
         # Start Page) can DISABLE erwin's main frame, blocking both the model
         # load and the add-in command. OK it so startup can proceed (2026-07-13).
-        $anyErwin = Get-MyErwin | Select-Object -First 1
-        if ($anyErwin) {
-            try {
-                $dlgTitle = [WatcherWmPoster]::TopDialogTitle([uint32]$anyErwin.Id)
-                if ([WatcherWmPoster]::DismissBlockingStartupDialog([uint32]$anyErwin.Id)) {
-                    Write-Log "Dismissed a blocking startup dialog (OK): '$dlgTitle'"
-                }
-            } catch { }
+        #
+        # DDL-GENERATOR MODE ONLY. In a normal interactive install the watcher
+        # must NEVER touch erwin's dialogs - doing so closed a real user's
+        # "Connect to Mart" dialog the instant they opened it (bug 2026-07-14:
+        # user "Damla", normal build, no model open yet so the watcher was still
+        # in Wait-ForModel). The DismissBlockingStartupDialog helper also skips
+        # "Connect to Mart" explicitly, so even in DDL-gen mode our own login
+        # dialog is never dismissed.
+        if ($ddlGenMode) {
+            $anyErwin = Get-MyErwin | Select-Object -First 1
+            if ($anyErwin) {
+                try {
+                    $dlgTitle = [WatcherWmPoster]::TopDialogTitle([uint32]$anyErwin.Id)
+                    if ([WatcherWmPoster]::DismissBlockingStartupDialog([uint32]$anyErwin.Id)) {
+                        Write-Log "Dismissed a blocking startup dialog (OK): '$dlgTitle'"
+                    }
+                } catch { }
+            }
         }
 
         Start-Sleep -Seconds $modelCheckIntervalSec
@@ -255,6 +265,11 @@ public static class WatcherWmPoster {
             if (wpid != pid) return true;
             var cls = new StringBuilder(64); GetClassNameW(h, cls, cls.Capacity);
             if (cls.ToString() != "#32770") return true;
+            // NEVER the "Connect to Mart" login dialog - closing it broke a real
+            // user's Mart connect (bug 2026-07-14) and would kill the add-in's
+            // own DDL-gen login too.
+            var t = new StringBuilder(256); GetWindowTextW(h, t, t.Capacity);
+            if (t.ToString().IndexOf("Connect to Mart", StringComparison.OrdinalIgnoreCase) >= 0) return true;
             dlg = h;
             return false;
         }, IntPtr.Zero);

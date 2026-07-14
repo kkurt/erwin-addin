@@ -248,6 +248,20 @@ if (Test-Path $packagedComHost) {
 [System.IO.File]::Copy((Join-Path $scriptDir "installer\watcher-control.ps1"), (Join-Path $publishDir "watcher-control.ps1"), $true)
 [System.IO.File]::Copy((Join-Path $scriptDir "scripts\autostart-watcher.ps1"), (Join-Path $publishDir "autostart-watcher.ps1"), $true)
 
+# DDL-generator flavor: ship the bootstrap model next to install-impl.ps1. Its
+# PRESENCE is what tells install-impl.ps1 to configure DDL-gen watcher mode
+# (install.bat cannot pass -DdlGenerator). A normal package never contains it,
+# so install-impl.ps1 writes DdlGeneratorMode=0 there.
+if ($DdlGenerator) {
+    $bootstrapSrc = Join-Path $scriptDir "installer\assets\ddlgen-bootstrap.erwin"
+    if (Test-Path $bootstrapSrc) {
+        [System.IO.File]::Copy($bootstrapSrc, (Join-Path $publishDir "ddlgen-bootstrap.erwin"), $true)
+        Write-Host "  Bundled DDL-gen bootstrap model (flavor marker)" -ForegroundColor Cyan
+    } else {
+        Write-Host "  WARNING: -DdlGenerator set but bootstrap model missing at $bootstrapSrc" -ForegroundColor Yellow
+    }
+}
+
 # STEP 6: Bake bootstrap seed (DB connection) into the package when any of the
 # bootstrap params were supplied. Plaintext is unavoidable here: DPAPI keys are
 # bound to the build host and cannot survive transit. install-impl.ps1 reads this
@@ -284,9 +298,9 @@ if ($hasBootstrap) {
         DBHost     = $DBHost
         # Port is baked ONLY when -DBPort was passed. An unset port stays empty
         # rather than defaulting to 1433 here: 1433 is MSSQL's port and would be
-        # wrong to bake into an Oracle/PostgreSQL package. install-impl.ps1
-        # applies the install-time default (Resolve-Field ... "1433") when the
-        # seed carries no port.
+        # wrong to bake into an Oracle/PostgreSQL package. When the seed carries
+        # no port, install-impl.ps1 derives the install-time default from the
+        # DBType (Oracle 1521, PostgreSQL 5432, MSSQL 1433) via Get-DefaultPort.
         DBPort     = if ($DBPort) { $DBPort } else { "" }
         DBName     = $DBName
         DBUserName = if ($null -ne $DBUserName) { $DBUserName } else { "" }

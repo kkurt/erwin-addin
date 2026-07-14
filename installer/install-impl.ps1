@@ -60,6 +60,13 @@ param(
     [string]$DBUserName,
     [string]$DBPassword,
     [string]$DBType,
+    # DDL-generator flavor install. When set (package.ps1 -DdlGenerator forwards
+    # it), the watcher is configured to launch erwin with the bootstrap model
+    # and this instance is the dedicated DDL queue worker. When NOT set (normal
+    # install), the watcher's DdlGeneratorMode flag is explicitly cleared to 0,
+    # so a machine that once ran the DDL-gen flavor does not leave the flag set
+    # and start closing a real user's dialogs (bug 2026-07-14).
+    [switch]$DdlGenerator,
     [Alias("?")]
     [switch]$Help
 )
@@ -666,6 +673,39 @@ if ($null -eq $existingCmdId) {
     Write-Host "  Pre-seeded AddinCmdId=1181 (empirically stable on r10.10; WmCommandLogger self-heals if different)" -ForegroundColor Gray
 } else {
     Write-Host "  AddinCmdId=$existingCmdId already set (preserved)" -ForegroundColor Gray
+}
+
+# DDL-generator watcher mode. This flag decides whether the watcher launches
+# erwin with a bootstrap model and drives its startup dialogs. It MUST be
+# written on every install (not just when set): a normal install has to CLEAR
+# it to 0 so a machine that previously ran the DDL-gen flavor stops the watcher
+# from touching a real user's dialogs (bug 2026-07-14 - a normal user's
+# "Connect to Mart" dialog was auto-closed by a leftover DDL-gen watcher).
+#
+# The flavor is detected by the bootstrap model shipped in the package
+# (package.ps1 -DdlGenerator copies ddlgen-bootstrap.erwin next to this
+# script). install.bat cannot pass -DdlGenerator, so the file IS the marker;
+# an explicit -DdlGenerator switch also forces it for CLI installs.
+$bootstrapSrc = Join-Path $PSScriptRoot 'ddlgen-bootstrap.erwin'
+$isDdlGen = $DdlGenerator -or (Test-Path $bootstrapSrc)
+if ($isDdlGen) {
+    $bootstrapDst = Join-Path $installDir 'ddlgen-bootstrap.erwin'
+    if (Test-Path $bootstrapSrc) {
+        Copy-Item $bootstrapSrc $bootstrapDst -Force
+        try { (Get-Item $bootstrapDst).IsReadOnly = $true } catch { }
+    } else {
+        Write-Host "  WARNING: DDL-gen bootstrap model missing at $bootstrapSrc" -ForegroundColor Yellow
+    }
+    $erwinExe = @('C:\Program Files\erwin\Data Modeler r10\erwin.exe',
+                  'C:\Program Files (x86)\erwin\Data Modeler r10\erwin.exe') |
+                Where-Object { Test-Path $_ } | Select-Object -First 1
+    Set-ItemProperty -Path $watcherRegPath -Name 'DdlGeneratorMode' -Value 1 -Type DWord
+    Set-ItemProperty -Path $watcherRegPath -Name 'BootstrapModelPath' -Value $bootstrapDst -Type String
+    if ($erwinExe) { Set-ItemProperty -Path $watcherRegPath -Name 'ErwinExePath' -Value $erwinExe -Type String }
+    Write-Host "  DDL-generator watcher mode ON (mode=1, bootstrap=$bootstrapDst)" -ForegroundColor Cyan
+} else {
+    Set-ItemProperty -Path $watcherRegPath -Name 'DdlGeneratorMode' -Value 0 -Type DWord
+    Write-Host "  Normal watcher mode (DdlGeneratorMode=0 - watcher only auto-loads the add-in)" -ForegroundColor Gray
 }
 
 # Write the canonical HKCU entry. New-Item -Force creates every missing parent
