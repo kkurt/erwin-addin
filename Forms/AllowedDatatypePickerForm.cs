@@ -68,6 +68,14 @@ namespace EliteSoft.Erwin.AddIn.Forms
         private readonly TextBox _txtParam;
         private readonly Label _lblParam;
         private readonly Label _lblError;
+        // Admin DESCRIPTION of the selected type, shown under the combo (2026-07-14).
+        // Empty/absent -> hidden (height 0). Sits BETWEEN the combo and the parameter
+        // label, so when it grows/shrinks the parameter + error rows and the form
+        // height shift by the delta (same technique as ShowInlineError).
+        private readonly Label _lblDescription;
+        private readonly Panel _paramFrame;
+        private int _descHeight; // current occupied height of the description block (0 when hidden)
+        private const int DescriptionGap = 12; // space below the description before the parameter label
 
         // Optional rule validator (2026-07-07): the composed datatype token is passed
         // here on Accept; a non-empty return is a violation message that keeps the
@@ -305,6 +313,23 @@ namespace EliteSoft.Erwin.AddIn.Forms
             typeFrame.Controls.Add(_cmbType);
             yCursor += FieldHeight + 12;
 
+            // Admin DESCRIPTION of the selected type - sits here, between the combo and the
+            // parameter label, at the parameter's baseline Y. Starts hidden (height 0);
+            // LayoutDescription() (invoked from SyncParamEnabled) fills it for the current
+            // selection and pushes the parameter + error rows and the form height down by
+            // its measured height, so an empty description takes no space.
+            _lblDescription = new Label
+            {
+                Font = new Font("Segoe UI", 8.75F, FontStyle.Italic),
+                ForeColor = ClrTextSecondary,
+                AutoSize = false,
+                Width = contentWidth,
+                Location = new Point(BodyHorizontalPadding, yCursor),
+                Height = 0,
+                Visible = false,
+                UseMnemonic = false,
+            };
+
             _lblParam = new Label
             {
                 Text = "Parameter (length or precision,scale) - optional",
@@ -316,7 +341,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
             };
             yCursor += _lblParam.PreferredHeight + LabelToFieldGap;
 
-            var paramFrame = new Panel
+            _paramFrame = new Panel
             {
                 Location = new Point(BodyHorizontalPadding, yCursor),
                 Size = new Size(contentWidth, FieldHeight),
@@ -332,7 +357,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 ForeColor = ClrTextPrimary,
                 Text = prefillParam ?? "",
             };
-            paramFrame.Controls.Add(_txtParam);
+            _paramFrame.Controls.Add(_txtParam);
             yCursor += FieldHeight + 8;
 
             // AutoSize=false + fixed width so a long rule message (e.g. an admin
@@ -380,12 +405,15 @@ namespace EliteSoft.Erwin.AddIn.Forms
                             ? "Parameter (length or precision,scale) - optional"
                             : "Parameter (length or precision,scale) - required";
                 _lblParam.ForeColor = on && !_lockParam ? ClrTextSecondary : ClrBorder;
-                paramFrame.BackColor = on && !_lockParam ? ClrFieldBorder : ClrBorder;
+                _paramFrame.BackColor = on && !_lockParam ? ClrFieldBorder : ClrBorder;
                 if (!on) { _txtParam.Text = ""; _lblError.Visible = false; }
                 // Re-apply the term-locked parameter on every switch TO a parameter-taking type:
                 // a parameterless preselect's pass above just cleared it, and the locked field is
                 // not user-editable so nobody else can restore it.
                 else if (_lockParam && _pinnedParam.Length > 0) _txtParam.Text = _pinnedParam;
+                // Show the selected type's admin DESCRIPTION under the combo and re-flow the
+                // parameter/error rows + form height for its size (no-op height change when blank).
+                LayoutDescription();
             }
             _cmbType.SelectedIndexChanged += (_, _) => SyncParamEnabled();
             SyncParamEnabled();
@@ -410,8 +438,9 @@ namespace EliteSoft.Erwin.AddIn.Forms
             body.Controls.Add(lblMessage);
             body.Controls.Add(lblType);
             body.Controls.Add(typeFrame);
+            body.Controls.Add(_lblDescription);
             body.Controls.Add(_lblParam);
-            body.Controls.Add(paramFrame);
+            body.Controls.Add(_paramFrame);
             body.Controls.Add(_lblError);
 
             var footerSep = new Panel { Dock = DockStyle.Bottom, Height = 1, BackColor = ClrBorder };
@@ -478,7 +507,9 @@ namespace EliteSoft.Erwin.AddIn.Forms
             ActiveControl = _cmbType;
 
             int chromeHeight = AccentStripHeight + HeaderHeight + 1 + 1 + FooterHeight;
-            ClientSize = new Size(DialogWidth, chromeHeight + yCursor + BodyTopPadding);
+            // _descHeight was set by the initial LayoutDescription() (via SyncParamEnabled above)
+            // for the preselected type; include it so the form opens tall enough for a description.
+            ClientSize = new Size(DialogWidth, chromeHeight + yCursor + BodyTopPadding + _descHeight);
 
             Shown += (_, _) =>
             {
@@ -492,6 +523,51 @@ namespace EliteSoft.Erwin.AddIn.Forms
             => _cmbType.SelectedIndex >= 0 && _cmbType.SelectedIndex < _entries.Count
                 ? _entries[_cmbType.SelectedIndex]
                 : null;
+
+        /// <summary>
+        /// Shows the selected type's admin DESCRIPTION (DATATYPE_LIBRARY.DESCRIPTION) under the
+        /// combo, hidden when blank. The label sits at the parameter row's baseline Y, so its
+        /// occupied height (measured text + <see cref="DescriptionGap"/>) pushes the parameter and
+        /// error rows and the form height DOWN by the change since the last layout - the same delta
+        /// technique <see cref="ShowInlineError"/> uses. Called on every combo selection change and
+        /// once from the ctor for the preselected type (that first call sets <c>_descHeight</c>,
+        /// which the ctor folds into <see cref="Form.ClientSize"/>).
+        /// </summary>
+        private void LayoutDescription()
+        {
+            string desc = SelectedEntry()?.Description?.Trim() ?? "";
+            int occupied = 0;
+            if (desc.Length > 0)
+            {
+                int textHeight;
+                using (var g = CreateGraphics())
+                {
+                    textHeight = TextRenderer.MeasureText(
+                        g, desc, _lblDescription.Font,
+                        new Size(_lblDescription.Width, int.MaxValue),
+                        TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl).Height;
+                }
+                _lblDescription.Text = desc;
+                _lblDescription.Height = textHeight + 2;
+                _lblDescription.Visible = true;
+                occupied = _lblDescription.Height + DescriptionGap;
+            }
+            else
+            {
+                _lblDescription.Visible = false;
+                _lblDescription.Text = "";
+            }
+
+            int delta = occupied - _descHeight;
+            if (delta != 0)
+            {
+                _lblParam.Top += delta;
+                _paramFrame.Top += delta;
+                _lblError.Top += delta;
+                Height += delta;
+                _descHeight = occupied;
+            }
+        }
 
         /// <summary>A type takes a parameter when its parametrization is Standard or Regex
         /// (None is bare-only). Drives the parameter field enable + the accept logic.</summary>

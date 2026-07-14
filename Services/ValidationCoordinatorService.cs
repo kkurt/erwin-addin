@@ -7435,13 +7435,21 @@ namespace EliteSoft.Erwin.AddIn.Services
         private void EnforceAllowedDatatypeWhitelist(dynamic attr, AttributeValidationSnapshot prev, AttributeValidationSnapshot curr, bool isNew = false)
         {
             // No whitelist configured for this config -> nothing to enforce.
-            if (!AllowedDatatypeService.Instance.HasRestriction) return;
+            if (!AllowedDatatypeService.Instance.HasRestriction)
+            {
+                Log($"[DT-ENFORCE] {curr?.TableName}.{curr?.PhysicalName}: SKIP - no restriction (IsLoaded={AllowedDatatypeService.Instance.IsLoaded}, count={AllowedDatatypeService.Instance.AllowedCount})");
+                return;
+            }
 
             // Defer while the column still carries erwin's transient '<default>' placeholder name:
             // the popup would otherwise surface '<default>', and the name-commit path re-checks the
             // final type once the user names the column. This is the single placeholder guard for
             // every caller (change path, new-attribute path, name-commit paths).
-            if (IsPlaceholderColumnName(curr?.PhysicalName ?? string.Empty)) return;
+            if (IsPlaceholderColumnName(curr?.PhysicalName ?? string.Empty))
+            {
+                Log($"[DT-ENFORCE] {curr?.TableName}.{curr?.PhysicalName}: SKIP - placeholder name (deferred until renamed)");
+                return;
+            }
 
             // Validate the LIVE type, not the snapshot field. A prior SCAPI writer in this same
             // gesture (e.g. ValidateDomain/ApplyDomainProperties applying a domain's datatype) can
@@ -7458,6 +7466,8 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
             catch (Exception preEx) { Log($"AllowedDatatype: live type pre-read failed for {curr?.PhysicalName}: {preEx.Message}"); }
             if (curr != null) curr.PhysicalDataType = attempted;
+
+            Log($"[DT-ENFORCE] {curr?.TableName}.{curr?.PhysicalName}: attempted='{attempted}' (snapshot='{snapshotBefore}') isNew={isNew} allowed={AllowedDatatypeService.Instance.IsAllowed(attempted)}");
 
             if (AllowedDatatypeService.Instance.IsAllowed(attempted))
             {
@@ -8233,9 +8243,24 @@ namespace EliteSoft.Erwin.AddIn.Services
                             // 2026-07-09: erwin may auto-uniquify our write; keep the snapshot on
                             // whatever it actually holds and schedule the targeted recheck so a
                             // late '__NNNN' rename still gets its Name rules.
+                            string confirmedFrom = state.PhysicalName;
                             state.PhysicalName = ReadLivePhysicalName(attr, afterAll);
                             ScheduleAttributeRecheck(state);
-                            return false;
+                            // 2026-07-14: NO early return here. Returning after the confirmed
+                            // apply exempted the APPLIED name from Step 3: 'DefDate__582' ->
+                            // Yes -> 'DefDate__582Date' kept its forbidden digits (rule#1127
+                            // Regexp never ran), while the No path fell through and the rule
+                            // fired. The scheduled recheck above cannot catch it either -
+                            // state.PhysicalName already advanced to the applied name, so the
+                            // recheck's drift gate sees no change and bails. Fall through to
+                            // Step 3 exactly like Step 1's silent-apply path does ("isim
+                            // degisiyorsa kural kontrolleri bastan yapilmali"). The confirmed
+                            // apply is a real rename, so apply=Create rules re-fire on the new
+                            // name; the identity flag treatAsNew stays untouched (Cancel keeps
+                            // its discard-vs-revert contract from the 2026-07-10 split).
+                            if (!revalidateAsNew && NamingValidationEngine.RenameRequiresRevalidation(
+                                    confirmedFrom, state.PhysicalName, IsPlaceholderColumnName))
+                                revalidateAsNew = true;
                         }
                         catch (Exception ex)
                         {

@@ -2876,8 +2876,21 @@ namespace EliteSoft.Erwin.AddIn.Services
                             if (_entitySnapshots.ContainsKey(objectId))
                                 _entitySnapshots[objectId].PhysicalName = afterAll;
 
+                            // 2026-07-14: NO early return here (was "re-validate on next
+                            // tick"). The snapshot above is already advanced to the applied
+                            // name, so the next tick sees no drift and never re-validates -
+                            // the applied name escaped Step 3 (regex/no-digits rules), same
+                            // asymmetry as the column path in ValidationCoordinatorService.
+                            // Fall through to Step 3, which re-reads the live Physical_Name
+                            // itself (also covers an erwin auto-uniquify of our write). The
+                            // confirmed apply is a real rename, so apply=Create rules re-fire
+                            // on the new name; identity flag isNew stays untouched (Cancel
+                            // keeps its discard-vs-revert contract).
+                            string confirmedFrom = physicalName;
                             physicalName = afterAll;
-                            return; // User-applied — re-validate on next tick
+                            if (!revalidateAsNew && NamingValidationEngine.RenameRequiresRevalidation(
+                                    confirmedFrom, afterAll, n => IsPlaceholderNameForObjectType(objectType, n)))
+                                revalidateAsNew = true;
                         }
                         catch (Exception ex)
                         {

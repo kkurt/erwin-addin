@@ -54,6 +54,10 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <summary>DATATYPE_LIBRARY.REGEX_ERROR (Regex only, nullable): custom message shown when
         /// the parameter fails REGEX_PATTERN. Falls back to a generic message when blank.</summary>
         public string RegexError { get; set; }
+
+        /// <summary>DATATYPE_LIBRARY.DESCRIPTION (nullable): admin-authored explanation shown under
+        /// the selected type in the datatype picker. Not shown when null/blank.</summary>
+        public string Description { get; set; }
     }
 
     /// <summary>
@@ -103,6 +107,9 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         /// <summary>True when a non-empty whitelist is loaded - i.e. the config restricts datatypes.</summary>
         public bool HasRestriction => _isLoaded && _allowed.Count > 0;
+
+        /// <summary>Number of whitelist entries currently loaded (diagnostic).</summary>
+        public int AllowedCount => _allowed.Count;
 
         public IReadOnlyList<AllowedDatatypeEntry> Allowed => _allowed;
         public string LastError => _lastError;
@@ -165,6 +172,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     ? null : reader["REGEX_PATTERN"]?.ToString();
                                 string regexError = reader["REGEX_ERROR"] == DBNull.Value
                                     ? null : reader["REGEX_ERROR"]?.ToString();
+                                string description = reader["DESCRIPTION"] == DBNull.Value
+                                    ? null : reader["DESCRIPTION"]?.ToString();
 
                                 // Validate a REGEX pattern's compilability at load so the matcher
                                 // never throws on a malformed admin pattern; a broken pattern is
@@ -188,6 +197,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     AllowNonParametrized = allowBare,
                                     RegexPattern = regexPattern,
                                     RegexError = regexError,
+                                    Description = description,
                                 });
                             }
                         }
@@ -220,20 +230,20 @@ namespace EliteSoft.Erwin.AddIn.Services
             switch (dbType?.ToUpper())
             {
                 case "POSTGRESQL":
-                    return @"SELECT ""DATATYPE"", ""PARAMETRIZATION_TYPE"", ""ALLOW_NON_PARAMETRIZED"", ""REGEX_PATTERN"", ""REGEX_ERROR""
+                    return @"SELECT ""DATATYPE"", ""PARAMETRIZATION_TYPE"", ""ALLOW_NON_PARAMETRIZED"", ""REGEX_PATTERN"", ""REGEX_ERROR"", ""DESCRIPTION""
                             FROM ""DATATYPE_LIBRARY""
                             WHERE ""CONFIG_ID"" = @configId
                             ORDER BY ""DATATYPE""";
 
                 case "ORACLE":
-                    return @"SELECT DATATYPE, PARAMETRIZATION_TYPE, ALLOW_NON_PARAMETRIZED, REGEX_PATTERN, REGEX_ERROR
+                    return @"SELECT DATATYPE, PARAMETRIZATION_TYPE, ALLOW_NON_PARAMETRIZED, REGEX_PATTERN, REGEX_ERROR, DESCRIPTION
                             FROM DATATYPE_LIBRARY
                             WHERE CONFIG_ID = :configId
                             ORDER BY DATATYPE";
 
                 case "MSSQL":
                 default:
-                    return @"SELECT [DATATYPE], [PARAMETRIZATION_TYPE], [ALLOW_NON_PARAMETRIZED], [REGEX_PATTERN], [REGEX_ERROR]
+                    return @"SELECT [DATATYPE], [PARAMETRIZATION_TYPE], [ALLOW_NON_PARAMETRIZED], [REGEX_PATTERN], [REGEX_ERROR], [DESCRIPTION]
                             FROM [dbo].[DATATYPE_LIBRARY]
                             WHERE [CONFIG_ID] = @configId
                             ORDER BY [DATATYPE]";
