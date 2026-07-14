@@ -149,9 +149,13 @@ drop the baked password at install time (the interactive password prompt has no
 default). Passing only `-DBType` and/or `-DBPort` writes a **partial** seed with
 empty host/name; at install time those values become the pre-filled defaults for
 the interactive prompts (e.g. `-DBType Oracle` for a POC where the target DB
-coordinates are entered on the install machine). `HkcuBootstrapReader` treats an
-empty host/name seed as "not configured", so a partial seed never yields a
-broken runtime config.
+coordinates are entered on the install machine). When `-DBPort` is omitted the
+seed carries no port, and `install-impl.ps1` derives the prompt/HKCU default
+from the DBType (Oracle 1521, PostgreSQL 5432, MSSQL 1433) rather than assuming
+MSSQL's 1433; `HkcuBootstrapReader` applies the same DBType-derived fallback at
+runtime for any blank stored port. `HkcuBootstrapReader` treats an empty
+host/name seed as "not configured", so a partial seed never yields a broken
+runtime config.
 
 `bootstrap.seed.json` contains plaintext credentials (the receiver's machine
 hasn't run DPAPI yet at package time). `install-impl.ps1` encrypts the values with

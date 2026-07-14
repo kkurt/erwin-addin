@@ -3332,9 +3332,9 @@ namespace EliteSoft.Erwin.AddIn
                 using (AddinLogger.BeginScope($"UpdateGeneralTab({logPrefix})"))
                     UpdateGeneralTab();
 
-                // Re-apply user-session tracking settings (USER_TRACKING_ENABLED /
-                // USER_TRACKING_INTERVAL_MINUTES) so a mid-session change takes effect
-                // without restarting erwin. Non-blocking + best-effort.
+                // Re-apply user-session tracking interval (USER_TRACKING_INTERVAL_MINUTES)
+                // so a mid-session change takes effect without restarting erwin.
+                // Non-blocking + best-effort.
                 Services.SessionTrackingService.Instance.ReloadSettings();
 
                 Log($"{logPrefix}: complete.");

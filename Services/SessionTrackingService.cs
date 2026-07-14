@@ -37,8 +37,8 @@ namespace EliteSoft.Erwin.AddIn.Services
     ///   slow DB can never hang the host.
     /// - Best-effort: every DB call is wrapped; a failure is logged (never
     ///   swallowed) and tracking simply degrades - it must NEVER block modeling.
-    /// - <see cref="ReloadSettings"/> re-reads USER_TRACKING_* and re-applies the
-    ///   interval / enabled-state at runtime (wired into the add-in's Reload
+    /// - <see cref="ReloadSettings"/> re-reads USER_TRACKING_INTERVAL_MINUTES and
+    ///   re-applies the interval at runtime (wired into the add-in's Reload
     ///   Config). The interval used to be read once at startup, so a mid-session
     ///   change was silently ignored.
     /// - END_TIME is stamped via <see cref="NotifyHostClosing"/>, called from the
@@ -50,7 +50,6 @@ namespace EliteSoft.Erwin.AddIn.Services
     /// </summary>
     public sealed class SessionTrackingService
     {
-        private const string KeyEnabled = "USER_TRACKING_ENABLED";
         private const string KeyIntervalMinutes = "USER_TRACKING_INTERVAL_MINUTES";
         private const int DefaultIntervalMinutes = 5;
 
@@ -107,9 +106,23 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// Pure resolution of the effective heartbeat interval (minutes) from the
+        /// raw USER_TRACKING_INTERVAL_MINUTES value. Absent / blank / non-numeric /
+        /// non-positive all fall back to <see cref="DefaultIntervalMinutes"/>: the
+        /// interval only sets the polling period, it never disables tracking.
+        /// User-session tracking runs by default (the former USER_TRACKING_ENABLED
+        /// gate was removed), so this resolver always yields a usable period.
+        /// </summary>
+        public static int ResolveIntervalMinutes(string intervalRaw)
+        {
+            int minutes = ConfigContextService.ParseEffectiveInt(intervalRaw, DefaultIntervalMinutes);
+            return minutes <= 0 ? DefaultIntervalMinutes : minutes;
+        }
+
+        /// <summary>
         /// Starts tracking once per process. Idempotent and non-blocking: the
-        /// corporate resolve + enabled-gate + INSERT all run on a background task
-        /// so erwin startup is never delayed.
+        /// corporate resolve + INSERT all run on a background task so erwin
+        /// startup is never delayed.
         /// </summary>
         public void Start()
         {
@@ -129,10 +142,10 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// Re-reads USER_TRACKING_ENABLED / USER_TRACKING_INTERVAL_MINUTES and
-        /// reconciles the running tracker (new interval, or enable/disable).
-        /// Wired into the add-in's Reload Config so an admin settings change
-        /// takes effect without restarting erwin. Non-blocking (background task).
+        /// Re-reads USER_TRACKING_INTERVAL_MINUTES and reconciles the running
+        /// tracker (new interval). Wired into the add-in's Reload Config so an
+        /// admin settings change takes effect without restarting erwin.
+        /// Non-blocking (background task).
         /// </summary>
         public void ReloadSettings()
         {
@@ -148,9 +161,9 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// Reads settings, gates on USER_TRACKING_ENABLED, ensures the session
-        /// row exists, and (re)starts the heartbeat timer at the current interval.
-        /// Serialised so a startup and a reload can never interleave.
+        /// Reads the interval, ensures the session row exists, and (re)starts the
+        /// heartbeat timer at the current interval. Tracking runs by default (no
+        /// enable gate). Serialised so a startup and a reload can never interleave.
         /// </summary>
         private void ApplySettings(string reason)
         {
@@ -166,7 +179,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                     }
 
                     int? corporateId;
-                    string enabledRaw;
                     string intervalRaw;
                     using (var ctx = new RepoDbContext(config))
                     {
@@ -181,27 +193,14 @@ namespace EliteSoft.Erwin.AddIn.Services
                             return;
                         }
 
-                        enabledRaw = ReadCorporateProperty(ctx, corporateId.Value, KeyEnabled);
+                        // User-session tracking runs by default. The former
+                        // USER_TRACKING_ENABLED gate was removed - only the interval
+                        // is read now, and it just sets the heartbeat period (it
+                        // never disables tracking).
                         intervalRaw = ReadCorporateProperty(ctx, corporateId.Value, KeyIntervalMinutes);
                     }
 
-                    bool enabled = ConfigContextService.ParseEffectiveBool(enabledRaw, false);
-                    if (!enabled)
-                    {
-                        if (_sessionId != null)
-                        {
-                            Log($"{reason}: tracking now disabled - stopping heartbeat (session {_sessionId}).");
-                            StopTimer();
-                        }
-                        else
-                        {
-                            Log($"{reason}: tracking disabled for corporate {corporateId} ({KeyEnabled}='{enabledRaw ?? "<absent>"}').");
-                        }
-                        return;
-                    }
-
-                    int minutes = ConfigContextService.ParseEffectiveInt(intervalRaw, DefaultIntervalMinutes);
-                    if (minutes <= 0) minutes = DefaultIntervalMinutes;
+                    int minutes = ResolveIntervalMinutes(intervalRaw);
 
                     if (_sessionId == null)
                         InsertSession(corporateId);

@@ -394,8 +394,8 @@ namespace EliteSoft.Erwin.AddIn
 
                 // Best-effort user-session tracking + remote shutdown. Idempotent:
                 // starts once per erwin process, survives model switches, and does
-                // all DB work off this thread - it never blocks the add-in. No-op
-                // unless the corporate has USER_TRACKING_ENABLED=True.
+                // all DB work off this thread - it never blocks the add-in. Runs by
+                // default; only USER_TRACKING_INTERVAL_MINUTES tunes the heartbeat.
                 Services.SessionTrackingService.Instance.Start();
             }
             catch (Exception ex)
