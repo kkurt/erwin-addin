@@ -23,8 +23,8 @@ namespace EliteSoft.Erwin.AddIn.Forms
     ///
     /// UX rules:
     ///  - OK stays disabled until every required UDP has a non-empty value
-    ///    (List = ComboBox with the admin-defined options, Text = free TextBox,
-    ///    Date = DateTimePicker, Int/Real = TextBox with numeric validation
+    ///    (List / Boolean = ComboBox with the admin-defined options, Text = free
+    ///    TextBox, Date = DateTimePicker, Int/Real = TextBox with numeric validation
     ///    deferred to UdpValidationEngine on save).
     ///  - Cancel / [X] returns DialogResult.Cancel and an empty value map.
     ///    Per the 2026-05-20 contract the caller deletes the new object on
@@ -280,7 +280,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
         /// <summary>
         /// Build the input control for a single required UDP. The mapping is
         /// intentionally narrow - we only handle the UDP types admin can
-        /// actually mark IS_REQUIRED on today (List, Text, Date, Int, Real).
+        /// actually mark IS_REQUIRED on today (List, Boolean, Text, Date, Int, Real).
         /// Unknown types fall back to a TextBox so the dialog still works,
         /// rather than silently dropping the UDP from the requirement list.
         /// </summary>
@@ -288,7 +288,10 @@ namespace EliteSoft.Erwin.AddIn.Forms
         {
             string type = def.UdpType?.Trim().ToLowerInvariant() ?? "text";
 
-            if (type == "list" && def.ListOptions != null && def.ListOptions.Count > 0)
+            // Boolean is a fixed-set list (True/False) stored in MC_UDP_LIST_OPTION just
+            // like List, so it takes the same ComboBox of admin-defined display values -
+            // never a free TextBox, which is exactly what OpenProject #278 asked for.
+            if ((type == "list" || type == "boolean") && def.ListOptions != null && def.ListOptions.Count > 0)
             {
                 var cmb = new ComboBox
                 {
