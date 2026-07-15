@@ -772,4 +772,47 @@ public class UdpSyncEngineDiffTests
         diff.Updates[0].Changes.Should().HaveFlag(UdpUpdateChanges.Description);
     }
 
+    // ---------- tag_Udp_Owner_Type: class-ID GUID, not the plain class name ----------
+    // The plain class name does NOT round-trip through a Mart save, so the created UDP loses its
+    // owner on reload and the sync re-detects it as a missing Create forever (bug 2026-07-15). The
+    // writer must emit the class-ID GUID; these tests lock the GUID form AND its round-trip back
+    // through the reader (OwnerClassFromOwnerTypeTag) so a future edit cannot silently regress it.
+
+    [Theory]
+    [InlineData("Model", "40200002")]
+    [InlineData("model", "40200002")]
+    [InlineData("Table", "40200003")]   // Entity
+    [InlineData("Column", "40200005")]  // Attribute
+    [InlineData("Subject Area", "40200026")]
+    public void MapObjectTypeToOwnerGuid_returns_the_erwin_class_id(string objectType, string expectedSuffix)
+    {
+        var guid = UdpSyncEngine.MapObjectTypeToOwnerGuid(objectType);
+        guid.Should().NotBeNull();
+        guid.Should().StartWith("{E7AB3CC0-47AD-4A10-8972-C0FB869EE7CB}+");
+        guid.Should().EndWith("+" + expectedSuffix);
+    }
+
+    [Theory]
+    [InlineData("View")]
+    [InlineData("Procedure")]
+    [InlineData("")]
+    [InlineData(null)]
+    public void MapObjectTypeToOwnerGuid_is_null_for_classes_without_a_known_id(string objectType)
+    {
+        // No known class-ID -> caller falls back to the plain class name (reader still accepts it).
+        UdpSyncEngine.MapObjectTypeToOwnerGuid(objectType).Should().BeNull();
+    }
+
+    [Theory]
+    [InlineData("Model", "Model")]
+    [InlineData("Table", "Entity")]
+    [InlineData("Column", "Attribute")]
+    [InlineData("Subject Area", "Subject_Area")]
+    public void OwnerType_guid_round_trips_back_to_its_owner_class(string objectType, string expectedOwnerClass)
+    {
+        // The exact invariant the plain-name owner broke: what the writer emits must resolve back to
+        // the right owner class through the reader. GUID form must round-trip.
+        var guid = UdpSyncEngine.MapObjectTypeToOwnerGuid(objectType);
+        UdpSyncEngine.OwnerClassFromOwnerTypeTag(guid).Should().Be(expectedOwnerClass);
+    }
 }

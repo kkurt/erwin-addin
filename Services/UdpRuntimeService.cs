@@ -164,7 +164,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                             dynamic pt = mmObjects.Add("Property_Type");
                             string fullName = $"Entity.Physical.{def.Name}";
                             pt.Properties("Name").Value = fullName;
-                            TrySetMetaProp(pt, "tag_Udp_Owner_Type", "Entity");
+                            // Class-ID GUID, NOT the plain name "Entity": the plain name does not
+                            // round-trip through a Mart save (owner lost on reload -> UDP dropped ->
+                            // sync loops). See UdpSyncEngine.MapObjectTypeToOwnerGuid. These are
+                            // Entity (table) UDPs.
+                            TrySetMetaProp(pt, "tag_Udp_Owner_Type",
+                                UdpSyncEngine.MapObjectTypeToOwnerGuid("table") ?? "Entity");
                             TrySetMetaProp(pt, "tag_Is_Physical", true);
                             TrySetMetaProp(pt, "tag_Is_Logical", false);
                             TrySetMetaProp(pt, "tag_Udp_Data_Type", UdpSyncEngine.MapUdpTypeToErwinDataTypeId(def.UdpType));

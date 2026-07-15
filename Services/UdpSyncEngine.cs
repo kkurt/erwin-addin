@@ -210,6 +210,36 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
         }
 
+        // erwin metamodel namespace GUID shared by every built-in class ID; the numeric
+        // suffix after '+' selects the class (see OwnerClassFromOwnerTypeTag).
+        private const string OwnerTypeIdBase = "{E7AB3CC0-47AD-4A10-8972-C0FB869EE7CB}+";
+
+        /// <summary>
+        /// erwin metamodel class-ID (objectId) for <c>tag_Udp_Owner_Type</c>. erwin accepts the
+        /// owner as EITHER a class name OR this class-ID GUID, but the plain class NAME does NOT
+        /// round-trip through a Mart save: erwin drops the owner reference on save, the UDP becomes
+        /// an unresolvable "internal type" that our metamodel walk can no longer enumerate, and the
+        /// diff re-detects it as a missing Create every time - the "UDP sync dialog reappears after
+        /// saving to Mart" loop (verified 2026-07-15 via the AdminUdpSync EBS-1057 advisories).
+        /// Writing the class-ID GUID persists correctly (MetaSync UdpDefinitionService does the same
+        /// and is verified across save/reopen on r10.10). Suffixes mirror
+        /// <see cref="OwnerClassFromOwnerTypeTag"/> and MetaSync UdpConstants. Returns null for
+        /// classes without a known ID (View, Stored_Procedure) - the caller falls back to the class
+        /// name for those (the reader still accepts the name form; only Mart round-trip is at risk).
+        /// </summary>
+        public static string? MapObjectTypeToOwnerGuid(string objectType)
+        {
+            if (string.IsNullOrEmpty(objectType)) return null;
+            switch (objectType.Trim().ToLowerInvariant())
+            {
+                case "model":        return OwnerTypeIdBase + "40200002";
+                case "table":        return OwnerTypeIdBase + "40200003"; // Entity
+                case "column":       return OwnerTypeIdBase + "40200005"; // Attribute
+                case "subject area": return OwnerTypeIdBase + "40200026";
+                default:             return null; // View / Stored_Procedure: no known class-ID
+            }
+        }
+
         /// <summary>
         /// Map admin UDP_TYPE to erwin metamodel tag_Udp_Data_Type integer.
         /// 1=Integer, 2=Text, 3=Date, 4=Command, 5=Real, 6=List. The single source
@@ -1259,9 +1289,26 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// </summary>
         private void SetPropertyTypeTags(dynamic pt, UdpDefinitionSnapshot adminUdp)
         {
-            string? ownerClass = MapObjectTypeToOwnerClass(adminUdp.ObjectType);
-            if (ownerClass != null)
-                TrySetProperty(pt, "tag_Udp_Owner_Type", ownerClass);
+            // tag_Udp_Owner_Type MUST be the class-ID GUID, not the plain class name: the plain
+            // name does NOT round-trip through a Mart save, so the UDP loses its owner on reload
+            // and the sync re-detects it as a missing Create forever (see MapObjectTypeToOwnerGuid).
+            // Fall back to the class name only for classes with no known ID (View, Stored_Procedure).
+            string? ownerId = MapObjectTypeToOwnerGuid(adminUdp.ObjectType);
+            string? ownerValue = ownerId ?? MapObjectTypeToOwnerClass(adminUdp.ObjectType);
+            if (ownerValue != null)
+            {
+                TrySetProperty(pt, "tag_Udp_Owner_Type", ownerValue);
+                // Verify erwin actually stored our owner id; a silent normalization/reject here is
+                // exactly what caused the persistence loop, so surface any mismatch (MetaSync does
+                // the same readback check).
+                try
+                {
+                    string ownerBack = pt.Properties("tag_Udp_Owner_Type")?.Value?.ToString() ?? "";
+                    if (ownerBack.Length > 0 && !string.Equals(ownerBack, ownerValue, StringComparison.OrdinalIgnoreCase))
+                        Log($"UdpSyncEngine.Apply [{adminUdp.Name}] tag_Udp_Owner_Type readback differs: set='{ownerValue}' readback='{ownerBack}'");
+                }
+                catch (Exception ex) { Log($"UdpSyncEngine.Apply [{adminUdp.Name}] tag_Udp_Owner_Type readback failed: {ex.Message}"); }
+            }
             TrySetProperty(pt, "tag_Is_Physical", true);
             TrySetProperty(pt, "tag_Is_Logical", false);
 
