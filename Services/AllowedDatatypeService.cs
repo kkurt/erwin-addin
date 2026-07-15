@@ -325,11 +325,15 @@ namespace EliteSoft.Erwin.AddIn.Services
             => ValidateDatatype(physicalDataType, allowed).IsValid;
 
         /// <summary>
-        /// Pure matcher (no DB / no SCAPI), the single source of the whitelist semantics. A value
-        /// is valid when: the whitelist is empty (no restriction); OR its parsed base token matches
-        /// an entry case-insensitively AND the value satisfies that entry's parametrization rule
-        /// (<see cref="ValidateAgainstEntry"/>). A base with no matching entry is a whitelist
-        /// violation. An empty/unparseable value is treated as valid (cannot classify - do not block).
+        /// Pure matcher (no DB / no SCAPI), the single source of the whitelist semantics. Since the
+        /// 2026-07-14 admin change a config may hold SEVERAL entries with the same DATATYPE name (the
+        /// UNIQUE (CONFIG_ID, DATATYPE) index was dropped), each a distinct definition differing in
+        /// parametrization / regex / description. ANY-match: a value is valid when the whitelist is
+        /// empty (no restriction); OR its parsed base token matches an entry name case-insensitively
+        /// AND the value satisfies the parametrization rule (<see cref="ValidateAgainstEntry"/>) of AT
+        /// LEAST ONE same-named entry. A base whose name matches one or more entries but satisfies none
+        /// of them is a violation; so is a base matching no entry at all. The verdict is independent of
+        /// entry order. An empty/unparseable value is treated as valid (cannot classify - do not block).
         /// </summary>
         public static DatatypeValidationResult ValidateDatatype(string physicalDataType, IReadOnlyCollection<AllowedDatatypeEntry> allowed)
         {
@@ -338,15 +342,36 @@ namespace EliteSoft.Erwin.AddIn.Services
             var parts = DataTypeParser.Parse(physicalDataType);
             if (string.IsNullOrEmpty(parts.Base)) return DatatypeValidationResult.Valid; // cannot classify - do not block
 
+            // ANY-match: the base name may now appear on several entries (unique index dropped
+            // 2026-07-14). The value is valid if it satisfies ANY same-named definition; scan them
+            // all rather than trusting the first. Order-independent by construction: a single pass
+            // returns Valid on the first satisfied entry, otherwise aggregates the failures.
+            DatatypeValidationResult? firstFailure = null;
+            int matchCount = 0;
             foreach (var a in allowed)
             {
                 if (a == null || string.IsNullOrEmpty(a.Datatype)) continue;
                 if (!string.Equals(a.Datatype, parts.Base, StringComparison.OrdinalIgnoreCase)) continue;
-                // Base is unique per config, so the matching entry is authoritative.
-                return ValidateAgainstEntry(a, parts.HasLength, parts.Length);
+
+                var result = ValidateAgainstEntry(a, parts.HasLength, parts.Length);
+                if (result.IsValid) return result; // satisfied by this definition - valid regardless of order
+                matchCount++;
+                if (firstFailure == null) firstFailure = result;
             }
-            return DatatypeValidationResult.Invalid(
-                $"Datatype '{parts.Base}' is not in the allowed datatype list for this configuration.");
+
+            if (matchCount == 0)
+                return DatatypeValidationResult.Invalid(
+                    $"Datatype '{parts.Base}' is not in the allowed datatype list for this configuration.");
+
+            // The base name matched but every same-named definition rejected the value.
+            // ONE matching entry: surface its own message verbatim so the single-row behavior and its
+            // specific text (e.g. a custom REGEX_ERROR) are byte-for-byte unchanged. TWO OR MORE: no
+            // single per-entry message is authoritative, so give a clear aggregate that still explains
+            // the failure.
+            return matchCount == 1
+                ? firstFailure.Value
+                : DatatypeValidationResult.Invalid(
+                    $"Value '{physicalDataType}' is not valid for any allowed definition of '{parts.Base}'.");
         }
 
         /// <summary>

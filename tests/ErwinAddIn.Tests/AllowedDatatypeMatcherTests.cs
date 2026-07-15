@@ -169,6 +169,66 @@ public class AllowedDatatypeMatcherTests
         AllowedDatatypeService.ValidateDatatype("varchar2(5000)", allowed).IsValid.Should().BeFalse(); // param fails regex
     }
 
+    // ---------- ANY-match: same name defined several times (unique index dropped 2026-07-14) ----------
+    // A used datatype is valid when it satisfies the rule of ANY same-named entry; invalid only when
+    // the base name matches one or more entries but the value satisfies NONE. Order-independent.
+
+    [Fact]
+    public void AnyMatch_value_valid_when_a_sibling_regex_accepts_it()
+    {
+        // Two "nvarchar" REGEX rows: ^\d{1,4}$ (max 4 digits) and ^\d{1,10}$ (max 10). A 5-digit
+        // length is REJECTED by the first and ACCEPTED by the second, so ANY-match makes it valid.
+        // (The task's "8000" is only 4 digits and would already pass the first row; 50000 forces the
+        //  scan to fall through a real failure onto the accepting sibling.)
+        var forward = Set(Rgx("nvarchar", @"^\d{1,4}$"), Rgx("nvarchar", @"^\d{1,10}$"));
+        AllowedDatatypeService.ValidateDatatype("nvarchar(50000)", forward).IsValid.Should().BeTrue();
+
+        // Same assertion with the rows REVERSED proves the verdict does not depend on entry order.
+        var reversed = Set(Rgx("nvarchar", @"^\d{1,10}$"), Rgx("nvarchar", @"^\d{1,4}$"));
+        AllowedDatatypeService.ValidateDatatype("nvarchar(50000)", reversed).IsValid.Should().BeTrue();
+    }
+
+    [Fact]
+    public void AnyMatch_invalid_when_no_sibling_accepts_and_message_names_the_base()
+    {
+        // Two "nvarchar" rows, neither accepts a 5-digit length -> Invalid, with a message that still
+        // explains the failure (names the base). Order-independent: both arrangements reject.
+        var forward = Set(Rgx("nvarchar", @"^\d{1,3}$"), Rgx("nvarchar", @"^\d{1,4}$"));
+        var r = AllowedDatatypeService.ValidateDatatype("nvarchar(50000)", forward);
+        r.IsValid.Should().BeFalse();
+        r.Message.Should().Contain("nvarchar");
+
+        AllowedDatatypeService.ValidateDatatype(
+            "nvarchar(50000)", Set(Rgx("nvarchar", @"^\d{1,4}$"), Rgx("nvarchar", @"^\d{1,3}$")))
+            .IsValid.Should().BeFalse();
+    }
+
+    [Fact]
+    public void AnyMatch_single_matching_row_that_rejects_keeps_its_verbatim_message()
+    {
+        // Exactly one matching entry that fails -> its OWN message is surfaced byte-for-byte (no
+        // aggregate wrapper), so single-row behavior is unchanged by the ANY-match aggregation.
+        var allowed = Set(Rgx("varchar2", @"^\d{1,3}$", error: "varchar2 length must be 1-999."));
+        var r = AllowedDatatypeService.ValidateDatatype("varchar2(5000)", allowed);
+        r.IsValid.Should().BeFalse();
+        r.Message.Should().Be("varchar2 length must be 1-999.");
+    }
+
+    [Fact]
+    public void AnyMatch_across_none_and_standard_siblings()
+    {
+        // Same name defined twice: one NONE (bare-only) + one STANDARD (parameter required). ANY-match:
+        // the bare form is valid via the NONE row, the parameterized form via the STANDARD row - the
+        // scan falls through the row that rejects onto the one that accepts, in either order.
+        var allowed = Set(None("nvarchar"), Std("nvarchar"));
+        AllowedDatatypeService.ValidateDatatype("nvarchar", allowed).IsValid.Should().BeTrue();      // NONE row
+        AllowedDatatypeService.ValidateDatatype("nvarchar(30)", allowed).IsValid.Should().BeTrue();  // STANDARD row
+
+        var reversed = Set(Std("nvarchar"), None("nvarchar"));
+        AllowedDatatypeService.ValidateDatatype("nvarchar", reversed).IsValid.Should().BeTrue();
+        AllowedDatatypeService.ValidateDatatype("nvarchar(30)", reversed).IsValid.Should().BeTrue();
+    }
+
     // ---------- GetFallbackDatatype: the type a disallowed value is forced to ----------
 
     [Fact]
