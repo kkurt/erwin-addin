@@ -3973,12 +3973,23 @@ namespace EliteSoft.Erwin.AddIn.Services
                                         // disallowed. (New-column path only - existing columns are never
                                         // retroactively re-typed; see feedback_rules_new_objects_only.)
                                         EnforceAllowedDatatypeWhitelist(attr, null, snapshot, isNew: true);
-                                        _attributeSnapshots[aid] = snapshot;
-                                        // erwin's auto-uniquify may rename this just-committed
-                                        // column on a DELAYED transaction after the drain, with
-                                        // nothing else watching - schedule the targeted recheck
-                                        // (2026-07-09, 'Pre_Abc__1070').
-                                        ScheduleAttributeRecheck(snapshot);
+                                        // Enforce COLUMN-level required UDPs now that the column has its
+                                        // real name + committed type (WP 281). Cancel deletes the new
+                                        // column, the same contract as the Required-field Cancel above.
+                                        if (PromptForMissingRequiredColumnUdps(attr, tableName, currentName))
+                                        {
+                                            _attributeSnapshots.Remove(aid);
+                                            Log($"[REQUIRED-UDP-DISCARD] entity='{tableName}' attr id={aid} discarded via required-UDP Cancel - removed");
+                                        }
+                                        else
+                                        {
+                                            _attributeSnapshots[aid] = snapshot;
+                                            // erwin's auto-uniquify may rename this just-committed
+                                            // column on a DELAYED transaction after the drain, with
+                                            // nothing else watching - schedule the targeted recheck
+                                            // (2026-07-09, 'Pre_Abc__1070').
+                                            ScheduleAttributeRecheck(snapshot);
+                                        }
                                     }
                                     else
                                     {
@@ -6824,13 +6835,19 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // Validate Column naming standards. isNew=true so the
                 // Required-popup Cancel branch deletes the new column
                 // (no pre-edit value to revert to).
-                ValidateColumnNamingStandard(attr, currentState, isNew: true);
+                bool namingDiscarded = ValidateColumnNamingStandard(attr, currentState, isNew: true);
 
                 // New column: enforce the datatype whitelist against its committed type so a
                 // disallowed erwin default (e.g. char(18)) is caught at creation, not only on a
                 // later type edit. EnforceAllowedDatatypeWhitelist self-skips the '<default>'
                 // placeholder, so the check effectively waits for the real name.
                 EnforceAllowedDatatypeWhitelist(attr, null, currentState, isNew: true);
+
+                // Enforce COLUMN-level required UDPs (WP 281), unless the naming Required-field
+                // Cancel just above already deleted the column. Cancel here deletes the new column
+                // too, so we must not run it on a column that is already gone.
+                if (!namingDiscarded)
+                    PromptForMissingRequiredColumnUdps(attr, currentState.TableName, currentState.PhysicalName);
             }
             finally
             {
@@ -8696,6 +8713,85 @@ namespace EliteSoft.Erwin.AddIn.Services
             foreach (var pendSet in _pendingNamedAttrs.Values)
                 if (pendSet.Contains(objectId)) return true;
             return false;
+        }
+
+        /// <summary>
+        /// Enforce COLUMN-level required UDPs (admin Object Type = COLUMN, IS_REQUIRED=true) when a
+        /// new column is created - the same UDP-screen "Required" contract that Table/Model/View
+        /// already honour, extended to columns (WP 281). Reads the column's current UDP values,
+        /// prompts (RequiredUdpForm, Create mode) for any required column UDP left empty, and on
+        /// Cancel deletes the just-added column via <see cref="TryDeleteNewAttribute"/> - identical
+        /// to the Required-field Cancel contract. Idempotent (no prompt once the values exist) and
+        /// self-skips erwin's transient '&lt;default&gt;' placeholder name, so it is safe to call
+        /// from every new-column completion path. Returns true when the user cancelled and the
+        /// column was deleted, so the caller drops its snapshot and skips post-work on the dead
+        /// COM object. New-column path only (see feedback_rules_new_objects_only).
+        /// </summary>
+        private bool PromptForMissingRequiredColumnUdps(dynamic attr, string tableName, string columnName)
+        {
+            if (_udpRuntimeService == null || attr == null) return false;
+            if (string.IsNullOrEmpty(columnName) || IsPlaceholderColumnName(columnName)) return false;
+
+            List<UdpDefinitionRuntime> requiredDefs;
+            try
+            {
+                requiredDefs = UdpDefinitionService.Instance.GetByObjectType("Column")
+                    .Where(d => d != null && d.IsRequired)
+                    .ToList();
+            }
+            catch (Exception ex)
+            {
+                Log($"PromptForMissingRequiredColumnUdps: definition read failed for '{tableName}.{columnName}': {ex.Message}");
+                return false;
+            }
+            if (requiredDefs.Count == 0) return false;
+
+            // ReadUdpValues swallows per-property COM errors so a misconfigured UDP does not block
+            // the prompt for unrelated required column UDPs (mirror of the Table path).
+            Dictionary<string, string> currentValues;
+            try { currentValues = _udpRuntimeService.ReadUdpValues((object)attr, "Column"); }
+            catch (Exception ex)
+            {
+                Log($"PromptForMissingRequiredColumnUdps: ReadUdpValues failed on '{tableName}.{columnName}': {ex.Message}");
+                currentValues = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            }
+
+            var missing = requiredDefs
+                .Where(d => !currentValues.TryGetValue(d.Name, out var v) || string.IsNullOrEmpty(v))
+                .ToList();
+            if (missing.Count == 0) return false;
+
+            Log($"PromptForMissingRequiredColumnUdps: '{tableName}.{columnName}' missing {missing.Count} required UDP(s): {string.Join(", ", missing.Select(m => m.Name))}");
+
+            using (var form = new Forms.RequiredUdpForm(columnName, missing, Forms.RequiredOperationMode.Create, "Column"))
+            {
+                var result = form.ShowDialog();
+                if (result != DialogResult.OK || form.SelectedValues.Count == 0)
+                {
+                    Log($"PromptForMissingRequiredColumnUdps: user cancelled for '{tableName}.{columnName}' - deleting new column");
+                    return TryDeleteNewAttribute(attr, tableName, columnName);
+                }
+
+                try
+                {
+                    _udpRuntimeService.WriteUdpValues((object)attr, form.SelectedValues, "Column");
+                    Log($"PromptForMissingRequiredColumnUdps: wrote {form.SelectedValues.Count} required UDP value(s) on '{tableName}.{columnName}'");
+                }
+                catch (Exception ex)
+                {
+                    Log($"PromptForMissingRequiredColumnUdps: WriteUdpValues failed on '{tableName}.{columnName}': {ex.Message}");
+                    return false;
+                }
+
+                // Refresh any dependent UDPs immediately (mirror the Table cascade). Column-scoped,
+                // so NO predefined-column cascade - predefined columns are a table-level concept.
+                foreach (var kvp in form.SelectedValues)
+                {
+                    try { _udpRuntimeService.HandleUdpValueChange(attr, kvp.Key, kvp.Value, "Column"); }
+                    catch (Exception ex) { Log($"PromptForMissingRequiredColumnUdps: dependency cascade failed for '{kvp.Key}' on '{tableName}.{columnName}': {ex.Message}"); }
+                }
+                return false;
+            }
         }
 
         /// <summary>
