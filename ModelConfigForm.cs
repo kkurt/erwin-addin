@@ -2231,6 +2231,29 @@ namespace EliteSoft.Erwin.AddIn
                 return;
             }
 
+            // Permission gate (bug 2026-07-16, user 'Tarik'): a Mart user with read-write MODEL
+            // access but no UDP/library permission cannot write UDP definitions. Applying anyway
+            // fails, and - far worse - the WARN_AND_APPLY notification modal shown during the
+            // connect settle crashes erwin with an unrecoverable native AV (mfc140 -> PMAddMgr)
+            // for such a permission-limited PU. So before touching the modal, probe write
+            // capability WITHOUT any dialog (a rolled-back metamodel transaction). If the user
+            // cannot write, skip the sync entirely and tell them via a native message box - safe
+            // in this fragile connect window, unlike the WinForms modal. The DDL worker runs with
+            // permission (probe passes), so its unattended flow is unaffected; suppress the popup
+            // there regardless so nothing can block an unattended run.
+            if (!syncEngine.CanWriteMetamodel())
+            {
+                Log($"UDP sync skipped: current user cannot modify UDP definitions on this model (creates={diff.Creates.Count}, updates={diff.Updates.Count}).");
+                AddConnectWarning("UDP definitions could not be updated - your account lacks permission to modify UDP definitions. Contact your administrator.");
+                if (!DdlWorkerActiveUnattended)
+                {
+                    ErwinAddIn.ShowTopMostMessage(
+                        "UDP definition changes could not be applied to this model because your account does not have permission to modify UDP definitions.\n\nPlease contact your administrator.",
+                        "UDP Sync", isError: false);
+                }
+                return;
+            }
+
             // SILENTLY_APPLY: write the diff straight to the metamodel, no
             // dialog. Used by admin-managed shops where UDP definitions are
             // centrally controlled and users should not see a prompt every model

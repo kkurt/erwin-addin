@@ -1247,6 +1247,57 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// Probes whether the current user may modify UDP DEFINITIONS on this model, WITHOUT
+        /// persisting anything and WITHOUT showing any dialog. A Mart user with read-write MODEL
+        /// access but no UDP/library permission cannot: erwin lets the metamodel transaction begin
+        /// but rejects the write. We must know this BEFORE the WARN_AND_APPLY notification modal is
+        /// shown, because that modal is a WinForms ShowDialog that pumps erwin's message loop during
+        /// the connect settle, and for a permission-limited Mart PU that reentrancy crashes erwin
+        /// with an unrecoverable native AV in PMAddMgr (bug 2026-07-16, user 'Tarik' - no managed
+        /// catch can save it). This probe creates a throwaway Property_Type inside a transaction
+        /// that is ALWAYS rolled back (nothing persists) and shows NO dialog, so it cannot trigger
+        /// that crash. Returns false on ANY failure; the caller then skips the sync and informs the
+        /// user with a native message box instead of crashing.
+        /// </summary>
+        public bool CanWriteMetamodel()
+        {
+            dynamic? metamodelSession = null;
+            int transId = 0;
+            bool transOpen = false;
+            try
+            {
+                metamodelSession = _scapi.Sessions.Add();
+                metamodelSession.Open(_currentModel, 1); // SCD_SL_M1 = Metamodel level
+                transId = metamodelSession.BeginNamedTransaction("UdpWriteProbe");
+                transOpen = true;
+                dynamic mmObjects = metamodelSession.ModelObjects;
+                // Throwaway definition - the transaction is rolled back below so it never persists.
+                // If the user lacks UDP-edit permission, Add / the Name set throws here -> false.
+                dynamic probe = mmObjects.Add("Property_Type");
+                probe.Properties("Name").Value = "EliteSoft.Physical.__UdpWriteProbe__";
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log($"UdpSyncEngine.CanWriteMetamodel: metamodel write not permitted ({ex.Message})");
+                return false;
+            }
+            finally
+            {
+                if (transOpen && metamodelSession != null)
+                {
+                    try { metamodelSession!.RollbackTransaction(transId); }
+                    catch (Exception ex) { Log($"UdpSyncEngine.CanWriteMetamodel: rollback failed: {ex.Message}"); }
+                }
+                if (metamodelSession != null)
+                {
+                    try { metamodelSession!.Close(); }
+                    catch (Exception ex) { Log($"UdpSyncEngine.CanWriteMetamodel: session close failed: {ex.Message}"); }
+                }
+            }
+        }
+
+        /// <summary>
         /// Create a Property_Type in the open metamodel session for the
         /// given Create / Update-recreate entry. Returns the new object on
         /// success, null on failure. All tag_Udp_* properties are set via
