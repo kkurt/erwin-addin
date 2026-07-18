@@ -140,7 +140,12 @@ namespace EliteSoft.Erwin.AddIn.Forms
 
             var lblTitle = new Label
             {
-                Text = "Review DDL before sending to approval queue",
+                // USE_APPROVEMENT_MECHANISM off -> there is no approval queue and the
+                // action button reads "Save Model", so the header must describe the
+                // save rather than "sending to approval queue".
+                Text = _approvalEnabled
+                    ? "Review DDL before sending to approval queue"
+                    : "Review DDL before saving the model",
                 Font = new Font("Segoe UI", 11f, FontStyle.Bold),
                 ForeColor = clrTextDark,
                 AutoSize = false,
@@ -210,10 +215,10 @@ namespace EliteSoft.Erwin.AddIn.Forms
 
             _btnSend = new Button
             {
-                // USE_APPROVEMENT_MECHANISM off -> this is a direct send (the add-in
-                // fires the REST callback itself), so the verb is just "Send" rather
-                // than "Send to Approve".
-                Text = _approvalEnabled ? "Send to Approve" : "Send",
+                // USE_APPROVEMENT_MECHANISM off -> there is no approval queue; the
+                // add-in commits the model to the Mart itself, so the verb is
+                // "Save Model" rather than "Send to Approve".
+                Text = _approvalEnabled ? "Send to Approve" : "Save Model",
                 Size = new Size(160, 32),
                 FlatStyle = FlatStyle.Flat,
                 BackColor = Color.FromArgb(46, 125, 50),
@@ -482,7 +487,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
             // would have asked for - we route it programmatically via the
             // native bridge instead so no extra dialog appears.
             string versionDescription;
-            using (var confirm = new ConfirmSubmitDialog())
+            using (var confirm = new ConfirmSubmitDialog(_approvalEnabled))
             {
                 if (confirm.ShowDialog(this) != DialogResult.OK)
                     return;

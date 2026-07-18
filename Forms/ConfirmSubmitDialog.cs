@@ -21,20 +21,30 @@ namespace EliteSoft.Erwin.AddIn.Forms
     {
         private TextBox _txtDescription;
 
+        // Mirrors USE_APPROVEMENT_MECHANISM. When false there is no approval
+        // queue: the review button just saves the model, so this confirmation
+        // reads as a save ("Save the model") rather than a submit.
+        private readonly bool _approvalEnabled;
+
         /// <summary>
         /// The Mart version description the user typed. Empty string when
         /// the user left the field blank.
         /// </summary>
         public string Description => _txtDescription?.Text ?? string.Empty;
 
-        public ConfirmSubmitDialog()
+        /// <param name="approvalEnabled">
+        /// When false the dialog reflects a direct save instead of a submit
+        /// (no approval queue). See <see cref="_approvalEnabled"/>.
+        /// </param>
+        public ConfirmSubmitDialog(bool approvalEnabled)
         {
+            _approvalEnabled = approvalEnabled;
             BuildUi();
         }
 
         private void BuildUi()
         {
-            Text             = "Submit for Approval";
+            Text             = _approvalEnabled ? "Submit for Approval" : "Save the model";
             FormBorderStyle  = FormBorderStyle.FixedDialog;
             StartPosition    = FormStartPosition.CenterParent;
             MaximizeBox      = false;
@@ -58,7 +68,9 @@ namespace EliteSoft.Erwin.AddIn.Forms
 
             var lblHeading = new Label
             {
-                Text = "Submitting will save the model and bump its version.",
+                Text = _approvalEnabled
+                    ? "Submitting will save the model and bump its version."
+                    : "Saving will bump the model version.",
                 Font = new Font("Segoe UI", 11f, FontStyle.Bold),
                 ForeColor = Color.FromArgb(40, 40, 40),
                 AutoSize = false,
