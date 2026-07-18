@@ -694,6 +694,23 @@ namespace EliteSoft.Erwin.AddIn.Services
                 return;
             }
 
+            // WP 305: the object-type + APPLY_ON filter above would warn, but each PRIMARY KEY
+            // existence rule may carry a CONDITION (e.g. udp[PK_EXEMPT] in [False]) that exempts
+            // the table. ComputePkRequirementWarning is pure (no SCAPI), so evaluate the condition
+            // HERE against THIS table - only on the would-warn path so the per-check UDP read stays
+            // off the hot path. Suppress the warning when NO applicable PK rule's condition is met
+            // (e.g. PK_EXEMPT=True). Rules with no condition stay applicable (IsRuleApplicable true).
+            // Same condition machinery the column/table naming rules use, so behaviour is consistent.
+            bool anyConditionMet = rules.Any(r => IsPrimaryKeyObjectType(r?.ObjectType)
+                                                  && NamingValidationEngine.MatchesApplyOn(r, isNew)
+                                                  && NamingValidationEngine.IsRuleApplicable(r, "Table", entity, null));
+            if (!anyConditionMet)
+            {
+                if (!string.IsNullOrEmpty(entId)) _pkWarnedEntityIds.Remove(entId);
+                Log($"CheckTablePrimaryKeyRequired: '{tableName}' - PRIMARY KEY rule condition not met (e.g. PK_EXEMPT) - warning suppressed.");
+                return;
+            }
+
             // Warn once per entity while it lacks a PK - the naming auto-rename chain
             // re-fires this check repeatedly for one add gesture; the same warning must
             // not repeat back-to-back.

@@ -152,4 +152,21 @@ public sealed class ModelScopedUdpConditionTests : IDisposable
 
         NamingValidationEngine.IsRuleApplicable(rule, "Table", entity).Should().BeFalse();
     }
+
+    [Fact]
+    public void PkExempt_condition_gates_the_primary_key_required_rule()
+    {
+        // WP 305: a PRIMARY KEY existence rule conditioned on udp[PK_EXEMPT] in [False] must NOT
+        // apply to a table whose PK_EXEMPT entity UDP is True (exempt), and MUST apply when it is
+        // False. CheckTablePrimaryKeyRequired now evaluates exactly this via
+        // IsRuleApplicable(rule, "Table", entity) before warning - previously the condition was
+        // ignored so the "PK required" warning fired even on exempt tables.
+        var exempt    = new PartialEntity(new Dictionary<string, object> { ["Entity.Physical.PK_EXEMPT"] = "True" });
+        var notExempt = new PartialEntity(new Dictionary<string, object> { ["Entity.Physical.PK_EXEMPT"] = "False" });
+
+        var rule = TableRule(Udp(0, null, "PK_EXEMPT", "False"));
+
+        NamingValidationEngine.IsRuleApplicable(rule, "Table", exempt).Should().BeFalse();    // exempt -> suppress warning
+        NamingValidationEngine.IsRuleApplicable(rule, "Table", notExempt).Should().BeTrue();  // not exempt -> PK required
+    }
 }
