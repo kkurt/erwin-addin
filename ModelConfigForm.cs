@@ -4020,6 +4020,17 @@ namespace EliteSoft.Erwin.AddIn
                     glossary.LoadGlossary();
                 }
 
+                // Glossary intentionally OFF for this model's config (USE_EXTERNAL_GLOSSARY=false):
+                // this is NOT a failure - the model simply does not use a glossary. Show it as
+                // neutral info (grey, no error red) and add NO connect warning, so it does not look
+                // like an error in the status row or the Warnings line (WP 311).
+                if (!glossary.IsExternalGlossaryEnabled)
+                {
+                    lblGlossaryStatus.Text = "Not used - this model does not use a glossary.";
+                    lblGlossaryStatus.ForeColor = Color.FromArgb(120, 120, 120);
+                    return;
+                }
+
                 if (glossary.IsLoaded)
                 {
                     lblGlossaryStatus.Text = $"Loaded ({glossary.Count} entries)";
