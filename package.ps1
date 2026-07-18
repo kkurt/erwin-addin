@@ -45,6 +45,15 @@ param(
     # Output directory (tool-driven): the .zip lands directly in here as <PackageName>.zip
     # (implies -Zip). When omitted, the legacy C:\EliteSoft\<PackageName> layout is used.
     [string]$OutDir,
+    # Dev-flavored package: OMITS the PackagedBuild=true define so the build
+    # compiles the DEVELOPER surfaces INTO the package. Per ErwinAddIn.csproj,
+    # when PackagedBuild is unset the compiler defines DEV + DEV_DIAGNOSTICS and
+    # does NOT define PACKAGED - so a -Dev package shows the "Reload Config" and
+    # "Change DB" buttons on the General tab and the Debug Log tab, and runs the
+    # startup MetaRepo* DB picker. Ship ONLY to developers/testers (e.g. Emre),
+    # never to a customer: the startup DB picker + dev surfaces are not
+    # production behavior.
+    [switch]$Dev,
     # DDL-generator flavor: compiles with the DDLGENERATOR symbol - the packaged
     # add-in is a dedicated, always-on DDL queue worker (no validation surfaces,
     # General tab only). Deploy to the dedicated worker VM ONLY (same COM CLSID
@@ -67,6 +76,11 @@ if ($Help) {
     Write-Host "  .\package.ps1 -DBHost srv -DBName MR \           Bake bootstrap config (DB connection) into"
     Write-Host "                -DBUserName sa -DBPassword Pwd       the package; install-impl.ps1 writes HKCU and"
     Write-Host "                                                     DPAPI-encrypts on the target machine."
+    Write-Host ""
+    Write-Host "Build flavors:" -ForegroundColor Yellow
+    Write-Host "  -Dev           Include developer surfaces in the package: 'Reload Config' + 'Change DB'"
+    Write-Host "                 buttons, Debug Log tab, startup MetaRepo* DB picker. Devs/testers ONLY."
+    Write-Host "  -DdlGenerator  Dedicated always-on DDL queue worker flavor (General tab only)."
     Write-Host ""
     Write-Host "Bootstrap params (all map 1:1 to registry values under" -ForegroundColor Yellow
     Write-Host "SOFTWARE\EliteSoft\MetaRepo\Bootstrap):" -ForegroundColor Yellow
@@ -104,6 +118,12 @@ if (-not $isAdmin) {
     if ($DBPassword)                           { $elevateArgs += " -DBPassword `"$DBPassword`"" }
     if ($DBType)                               { $elevateArgs += " -DBType `"$DBType`"" }
     if ($PackageName)                          { $elevateArgs += " -PackageName `"$PackageName`"" }
+    # 2026-07-14: these three were previously NOT forwarded across the elevation
+    # relaunch, so a non-admin run silently lost -OutDir (wrong output path),
+    # -Dev (dev surfaces dropped), and -DdlGenerator (wrong flavor).
+    if ($OutDir)                               { $elevateArgs += " -OutDir `"$OutDir`"" }
+    if ($Dev)                                  { $elevateArgs += " -Dev" }
+    if ($DdlGenerator)                         { $elevateArgs += " -DdlGenerator" }
     Start-Process powershell.exe -ArgumentList $elevateArgs -Verb RunAs
     exit
 }
@@ -179,9 +199,14 @@ if (Test-Path $bridgeScript) {
 }
 
 # STEP 1: Publish
-Write-Host "`n[1] Publishing release build$(if ($DdlGenerator) { ' [DDLGENERATOR flavor]' })..." -ForegroundColor Yellow
+Write-Host "`n[1] Publishing release build$(if ($Dev) { ' [DEV flavor - developer surfaces INCLUDED]' })$(if ($DdlGenerator) { ' [DDLGENERATOR flavor]' })..." -ForegroundColor Yellow
 dotnet clean ErwinAddIn.csproj -c Release 2>&1 | Out-Null
-$publishProps = @('-p:PackagedBuild=true')
+# -Dev omits PackagedBuild=true so ErwinAddIn.csproj defines DEV + DEV_DIAGNOSTICS
+# and does NOT define PACKAGED: the package then compiles the developer surfaces
+# (Reload Config + Change DB buttons, Debug Log tab, startup DB picker). A normal
+# (no -Dev) package keeps PackagedBuild=true and hides all of that.
+$publishProps = @()
+if (-not $Dev) { $publishProps += '-p:PackagedBuild=true' }
 if ($DdlGenerator) { $publishProps += '-p:DdlGenerator=true' }
 dotnet publish ErwinAddIn.csproj -c Release -r win-x64 --self-contained false @publishProps -o $publishDir
 

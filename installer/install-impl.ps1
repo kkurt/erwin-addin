@@ -23,7 +23,7 @@
 # (HKLM support removed 2026-07-02 - the add-in reads HKCU only):
 #   1. bootstrap.seed.json next to install-impl.ps1 contains DBHost+DBName -> write
 #      HKCU silently, DPAPI CurrentUser, delete the seed file.
-#   2. HKCU already has Bootstrap -> "Overwrite existing? [y/N]" prompt.
+#   2. HKCU already has Bootstrap + new values supplied -> overwrite silently.
 #   3. Otherwise -> interactive Read-Host prompts, write HKCU.
 #
 # See docs/INSTALL.md for the complete reference.
@@ -90,8 +90,8 @@ if ($Help) {
     Write-Host ""
     Write-Host "Usage (CLI):" -ForegroundColor Yellow
     Write-Host "  .\install-impl.ps1                              " -NoNewline; Write-Host "Same as install.bat (no admin needed)" -ForegroundColor Gray
-    Write-Host "  .\install-impl.ps1 -Uninstall                   " -NoNewline; Write-Host "Same as uninstall.bat (preserves DB connection info; asks)" -ForegroundColor Gray
-    Write-Host "  .\install-impl.ps1 -Uninstall -RemoveConnectionInfo " -NoNewline; Write-Host "Uninstall + wipe HKCU MetaRepo (no prompt)" -ForegroundColor Gray
+    Write-Host "  .\install-impl.ps1 -Uninstall                   " -NoNewline; Write-Host "Same as uninstall.bat (always wipes HKCU MetaRepo; no prompt)" -ForegroundColor Gray
+    Write-Host "  .\install-impl.ps1 -Uninstall -RemoveConnectionInfo " -NoNewline; Write-Host "Same (switch kept for compat; wipe is now the default)" -ForegroundColor Gray
     Write-Host "  .\install-impl.ps1 -?                           " -NoNewline; Write-Host "Show this help" -ForegroundColor Gray
     Write-Host ""
     Write-Host "Notes:" -ForegroundColor Yellow
@@ -346,12 +346,11 @@ if ($Uninstall) {
 
     # HKCU MetaRepo entries: Bootstrap holds the user's DB connection (DBHost,
     # DBPort, DBName, DPAPI-encrypted DBUserName/DBPassword); Extension holds
-    # UI prefs. Default is PRESERVE - a normal uninstall/reinstall cycle (e.g.
-    # upgrade) should not silently wipe credentials the user entered manually.
-    # The user gets an explicit prompt with N as default, or can pass
-    # -RemoveConnectionInfo to skip the prompt and wipe outright (support
-    # tooling / machine handoff). HKLM bootstrap (if present) is corporate
-    # IT territory and is never touched here.
+    # UI prefs. These are now ALWAYS removed on uninstall (owner decision
+    # 2026-07-14: question-free uninstall). Upgrades run through install.bat -
+    # which re-seeds from bootstrap.seed.json - not through uninstall, so the
+    # old "preserve on upgrade" prompt is gone. HKLM bootstrap (if present) is
+    # corporate IT territory and is never touched here.
     $metaRepoBase = "HKCU:\Software\EliteSoft\MetaRepo"
     $bootstrapPath = "$metaRepoBase\Bootstrap"
     $extensionPath = "$metaRepoBase\Extension"
@@ -359,43 +358,38 @@ if ($Uninstall) {
     $hasExtension = Test-Path $extensionPath
 
     if ($hasBootstrap -or $hasExtension) {
-        $removeConn = $RemoveConnectionInfo.IsPresent
-        if (-not $removeConn) {
-            Write-Host ""
-            Write-Host "  MetaRepo HKCU registry entries detected:" -ForegroundColor Yellow
-            if ($hasBootstrap) {
-                try {
-                    $bs = Get-ItemProperty -LiteralPath $bootstrapPath -ErrorAction Stop
-                    $bsType = if ($bs.PSObject.Properties['DBType']) { $bs.DBType } else { '(missing)' }
-                    $bsHost = if ($bs.PSObject.Properties['DBHost']) { $bs.DBHost } else { '(missing)' }
-                    $bsPort = if ($bs.PSObject.Properties['DBPort']) { $bs.DBPort } else { '(missing)' }
-                    $bsName = if ($bs.PSObject.Properties['DBName']) { $bs.DBName } else { '(missing)' }
-                    Write-Host "    Bootstrap (DB connection): DBType=$bsType DBHost=$bsHost DBPort=$bsPort DBName=$bsName" -ForegroundColor Gray
-                } catch {
-                    Write-Host "    Bootstrap (DB connection): (could not read - $($_.Exception.Message))" -ForegroundColor DarkGray
-                }
+        # Uninstall ALWAYS removes the MetaRepo HKCU entries (DB connection + UI
+        # prefs). The confirm prompt was removed 2026-07-14 (owner decision:
+        # question-free uninstall). Upgrades run through install.bat - which
+        # re-seeds from bootstrap.seed.json - not through uninstall, so there is
+        # nothing to preserve here. -RemoveConnectionInfo is kept for CLI compat
+        # but removal is now unconditional (the switch is a no-op).
+        Write-Host ""
+        Write-Host "  Removing MetaRepo HKCU registry entries (DB connection + UI prefs):" -ForegroundColor Yellow
+        if ($hasBootstrap) {
+            try {
+                $bs = Get-ItemProperty -LiteralPath $bootstrapPath -ErrorAction Stop
+                $bsType = if ($bs.PSObject.Properties['DBType']) { $bs.DBType } else { '(missing)' }
+                $bsHost = if ($bs.PSObject.Properties['DBHost']) { $bs.DBHost } else { '(missing)' }
+                $bsPort = if ($bs.PSObject.Properties['DBPort']) { $bs.DBPort } else { '(missing)' }
+                $bsName = if ($bs.PSObject.Properties['DBName']) { $bs.DBName } else { '(missing)' }
+                Write-Host "    Bootstrap (DB connection): DBType=$bsType DBHost=$bsHost DBPort=$bsPort DBName=$bsName" -ForegroundColor Gray
+            } catch {
+                Write-Host "    Bootstrap (DB connection): (could not read - $($_.Exception.Message))" -ForegroundColor DarkGray
             }
-            if ($hasExtension) {
-                Write-Host "    Extension (UI prefs / per-user state)" -ForegroundColor Gray
-            }
-            Write-Host ""
-            Write-Host "  Removing these clears your DB connection. The next install will ask for DBHost/DBName/UserName/Password again." -ForegroundColor Yellow
-            $resp = Read-Host "  Also remove MetaRepo HKCU entries? [y/N]"
-            $removeConn = ($resp -match '^[yY]')
+        }
+        if ($hasExtension) {
+            Write-Host "    Extension (UI prefs / per-user state)" -ForegroundColor Gray
         }
 
-        if ($removeConn) {
-            foreach ($p in @($bootstrapPath, $extensionPath)) {
-                if (-not (Test-Path $p)) { continue }
-                try {
-                    Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction Stop
-                    Write-Host "  Removed $p" -ForegroundColor Green
-                } catch {
-                    Write-Host "  WARNING: Could not remove ${p}: $($_.Exception.Message)" -ForegroundColor Yellow
-                }
+        foreach ($p in @($bootstrapPath, $extensionPath)) {
+            if (-not (Test-Path $p)) { continue }
+            try {
+                Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction Stop
+                Write-Host "  Removed $p" -ForegroundColor Green
+            } catch {
+                Write-Host "  WARNING: Could not remove ${p}: $($_.Exception.Message)" -ForegroundColor Yellow
             }
-        } else {
-            Write-Host "  MetaRepo HKCU entries PRESERVED (DB connection + UI prefs kept for next install)." -ForegroundColor Green
         }
     }
 
@@ -758,8 +752,8 @@ try {
 # would just shadow the user's HKCU config). Decision tree, in priority order:
 #   1. bootstrap.seed.json next to install-impl.ps1 has DBHost AND DBName -> write
 #      HKCU silently (DPAPI CurrentUser), delete the seed file.
-#   2. HKCU already has a populated Bootstrap key -> show current vs new and
-#      ask "Overwrite? [y/N]". Default N preserves the prior config.
+#   2. HKCU already has a populated Bootstrap key + new values supplied -> show
+#      old vs new and overwrite silently (no prompt; owner decision 2026-07-14).
 #   3. None of the above -> interactive Read-Host prompts, then write HKCU.
 #
 # DPAPI scope at write time is always CurrentUser (install-impl.ps1 only ever
@@ -917,38 +911,35 @@ if (-not [string]::IsNullOrEmpty($bsDBHost) -and -not [string]::IsNullOrEmpty($b
         return [System.Convert]::ToBase64String($protected)
     }
 
-    # Existing HKCU config: summary + overwrite prompt. Default N
-    # preserves the prior config exactly as-is.
+    # Existing HKCU config is OVERWRITTEN unconditionally when new DB values were
+    # supplied (CLI / seed / interactive). The confirm prompt was removed
+    # 2026-07-14 (owner decision: question-free install). This branch only runs
+    # when new host+name are present; a no-arg re-run on an already-configured
+    # machine takes the "keep existing" path above and never reaches here, so it
+    # still preserves the user's config.
     $writeBootstrap = $true
     if (Test-Path -LiteralPath $hkcuBootstrap) {
         Write-Host ""
-        Write-Host "  An existing Bootstrap config was found in HKCU\Software\EliteSoft\MetaRepo\Bootstrap:" -ForegroundColor Yellow
+        Write-Host "  Overwriting existing Bootstrap config in HKCU\Software\EliteSoft\MetaRepo\Bootstrap:" -ForegroundColor Yellow
         try {
             $existing = Get-ItemProperty -LiteralPath $hkcuBootstrap -ErrorAction Stop
             $oldType = if ($existing.PSObject.Properties['DBType']) { $existing.DBType } else { '(missing)' }
             $oldHost = if ($existing.PSObject.Properties['DBHost']) { $existing.DBHost } else { '(missing)' }
             $oldPort = if ($existing.PSObject.Properties['DBPort']) { $existing.DBPort } else { '(missing)' }
             $oldName = if ($existing.PSObject.Properties['DBName']) { $existing.DBName } else { '(missing)' }
-            Write-Host "    Current: DBType=$oldType DBHost=$oldHost DBPort=$oldPort DBName=$oldName" -ForegroundColor Gray
+            Write-Host "    Old: DBType=$oldType DBHost=$oldHost DBPort=$oldPort DBName=$oldName" -ForegroundColor Gray
         } catch {
-            Write-Host "    Current: (could not read - $($_.Exception.Message))" -ForegroundColor DarkGray
+            Write-Host "    Old: (could not read - $($_.Exception.Message))" -ForegroundColor DarkGray
         }
-        Write-Host "    New:     DBType=$bsDBType DBHost=$bsDBHost DBPort=$bsDBPort DBName=$bsDBName" -ForegroundColor Gray
-        Write-Host ""
-        $resp = Read-Host "  Clear existing Bootstrap key and write new values? [y/N]"
-        if ($resp -notmatch '^[yY]') {
-            Write-Host "  Bootstrap write SKIPPED. Existing config preserved." -ForegroundColor Yellow
-            $writeBootstrap = $false
-        } else {
-            # Wipe the whole key so legacy value names (Host/Database/...)
-            # get cleared rather than masked by the new DB* names.
-            try {
-                Remove-Item -LiteralPath $hkcuBootstrap -Recurse -Force -ErrorAction Stop
-                Write-Host "  Cleared existing HKCU\Software\EliteSoft\MetaRepo\Bootstrap" -ForegroundColor Gray
-            } catch {
-                Write-Host "  WARNING: Could not clear existing HKCU Bootstrap key: $($_.Exception.Message)" -ForegroundColor Yellow
-                Write-Host "           Proceeding to overwrite individual values; legacy names may remain." -ForegroundColor Yellow
-            }
+        Write-Host "    New: DBType=$bsDBType DBHost=$bsDBHost DBPort=$bsDBPort DBName=$bsDBName" -ForegroundColor Gray
+        # Wipe the whole key so legacy value names (Host/Database/...) get cleared
+        # rather than masked by the new DB* names.
+        try {
+            Remove-Item -LiteralPath $hkcuBootstrap -Recurse -Force -ErrorAction Stop
+            Write-Host "  Cleared existing HKCU\Software\EliteSoft\MetaRepo\Bootstrap" -ForegroundColor Gray
+        } catch {
+            Write-Host "  WARNING: Could not clear existing HKCU Bootstrap key: $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-Host "           Proceeding to overwrite individual values; legacy names may remain." -ForegroundColor Yellow
         }
     }
 
