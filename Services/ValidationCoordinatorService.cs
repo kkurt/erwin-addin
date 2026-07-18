@@ -7449,12 +7449,108 @@ namespace EliteSoft.Erwin.AddIn.Services
             return (p > 0 ? src.Substring(0, p) : src).Trim();
         }
 
+        /// <summary>
+        /// DATATYPE_LIBRARY_ALWAYS_ASK: prompt the datatype picker for a NEW column whose type is
+        /// ALREADY allowed, so the user explicitly confirms it. Unlike the not-allowed enforcement
+        /// path this NEVER writes a fallback and Cancel simply keeps the current (valid) type - only
+        /// an explicit different pick changes it. Self-contained: it does not touch the enforcement
+        /// flow. A fully term-locked column (glossary-authoritative datatype) is skipped; a partial
+        /// lock pins the fixed half in the picker (the live type already carries the authoritative
+        /// value, so no glossary re-resolution is needed here).
+        /// </summary>
+        private void PromptAlwaysAskDatatype(dynamic attr, AttributeValidationSnapshot curr, string currentType, bool isNew)
+        {
+            if (curr == null) return;
+
+            // Re-read the live type: the caller's term-policy absorb pass just above may have
+            // adjusted it, and we want to preselect exactly what the model holds now.
+            string liveType = currentType;
+            try
+            {
+                string live = attr?.Properties("Physical_Data_Type").Value?.ToString();
+                if (!string.IsNullOrEmpty(live)) liveType = live;
+            }
+            catch (Exception ex) { Log($"AllowedDatatype always-ask: live re-read failed for {curr.PhysicalName}: {ex.Message}"); }
+
+            // A fully term-locked column has an authoritative (glossary) datatype - nothing to ask.
+            var (lockBase, lockLength) = TermTypeLocks.Get(ResolveTermCanonical(curr));
+            if (lockBase && lockLength)
+            {
+                Log($"AllowedDatatype always-ask: {curr.TableName}.{curr.PhysicalName} is term-locked - skipping (type fixed to '{liveType}').");
+                return;
+            }
+
+            string objId = null;
+            try { objId = attr?.ObjectId?.ToString(); } catch { /* transient COM state */ }
+
+            // The live type already carries the authoritative base + length, so a partial lock just
+            // pins the current value's half (combo when base locked, param when length locked).
+            string preselect = AllowedDatatypePickerFormPreselect(liveType, liveType);
+            string prefill = Forms.AllowedDatatypePickerForm.ExtractParameter(liveType);
+            bool treatAsNew = isNew || (!string.IsNullOrEmpty(objId) && IsAttributePendingNew(objId));
+
+            string userPick;
+            DialogResult pickRc;
+            _validationModalShowing = true;
+            try
+            {
+                pickRc = Forms.AllowedDatatypePickerForm.Show(
+                    "Choose column datatype",
+                    $"Column '{curr.TableName}.{curr.PhysicalName}': choose the datatype for this column (current: '{liveType}').\n\nCancel keeps '{liveType}'.",
+                    AllowedDatatypeService.Instance.Allowed,
+                    preselect,
+                    prefill,
+                    out userPick,
+                    validate: candidate => ValidateDatatypeCandidate(attr, candidate, treatAsNew),
+                    lockType: lockBase,
+                    lockParam: lockLength);
+            }
+            finally { _validationModalShowing = false; }
+
+            // A rename can land while the picker pumps - re-read the live name so the naming replay
+            // below runs against the column the user actually sees.
+            RefreshNameAfterModal(attr, curr, "always-ask datatype picker");
+
+            if (pickRc == DialogResult.OK
+                && !string.IsNullOrEmpty(userPick)
+                && !string.Equals(userPick, liveType, StringComparison.Ordinal))
+            {
+                int pickTrans = _session.BeginNamedTransaction("AlwaysAskDatatypePick");
+                try
+                {
+                    attr.Properties("Physical_Data_Type").Value = userPick;
+                    _session.CommitTransaction(pickTrans);
+                    curr.PhysicalDataType = userPick;
+                    if (!string.IsNullOrEmpty(objId)) _allowedDatatypeUserPicks[objId] = (userPick, DateTime.UtcNow);
+                    Log($"AllowedDatatype always-ask: {curr.TableName}.{curr.PhysicalName} user picked '{userPick}' (was '{liveType}')");
+                }
+                catch (Exception ex)
+                {
+                    try { _session.RollbackTransaction(pickTrans); }
+                    catch (Exception rb) { Log($"AllowedDatatype always-ask rollback failed for {curr.PhysicalName}: {rb.Message}"); }
+                    Log($"AllowedDatatype always-ask write failed for {curr.PhysicalName}: {ex.Message}");
+                }
+            }
+            else
+            {
+                Log($"AllowedDatatype always-ask: {curr.TableName}.{curr.PhysicalName} kept '{liveType}' (rc={pickRc}, pick='{userPick}').");
+            }
+
+            // The picked type (or a rename caught during the modal) may trigger type-conditioned
+            // naming rules (e.g. the Date suffix) - replay the column naming pass on the live state.
+            bool discarded = ValidateColumnNamingStandard(attr, curr, isNew: isNew);
+            if (isNew && !discarded && _pendingResults.Count > 0) ShowConsolidatedPopup();
+            ScheduleAttributeRecheck(curr);
+        }
+
         private void EnforceAllowedDatatypeWhitelist(dynamic attr, AttributeValidationSnapshot prev, AttributeValidationSnapshot curr, bool isNew = false)
         {
-            // No whitelist configured for this config -> nothing to enforce.
-            if (!AllowedDatatypeService.Instance.HasRestriction)
+            // DATATYPE_LIBRARY_ENABLED (config-scoped, default OFF / opt-in) is the master switch:
+            // no enforcement unless the admin turned it on, even when the whitelist is non-empty.
+            // HasRestriction still guards an empty whitelist (= no restriction).
+            if (!AllowedDatatypeService.Instance.LibraryEnabled || !AllowedDatatypeService.Instance.HasRestriction)
             {
-                Log($"[DT-ENFORCE] {curr?.TableName}.{curr?.PhysicalName}: SKIP - no restriction (IsLoaded={AllowedDatatypeService.Instance.IsLoaded}, count={AllowedDatatypeService.Instance.AllowedCount})");
+                Log($"[DT-ENFORCE] {curr?.TableName}.{curr?.PhysicalName}: SKIP - {(!AllowedDatatypeService.Instance.LibraryEnabled ? "library disabled (DATATYPE_LIBRARY_ENABLED off)" : $"no restriction (IsLoaded={AllowedDatatypeService.Instance.IsLoaded}, count={AllowedDatatypeService.Instance.AllowedCount})")}");
                 return;
             }
 
@@ -7512,6 +7608,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                         EnforceTermTypePolicy(attr, baseline, curr);
                     }
                 }
+
+                // DATATYPE_LIBRARY_ALWAYS_ASK: a valid type on a NEW column must still be explicitly
+                // confirmed via the picker (current type preselected; Cancel keeps it - no fallback,
+                // no forced change). Existing-column edits are never re-asked.
+                if (isNew && AllowedDatatypeService.Instance.AlwaysAsk)
+                    PromptAlwaysAskDatatype(attr, curr, attempted, isNew);
+
                 return; // permitted (possibly just re-corrected by the term policy)
             }
 

@@ -293,6 +293,31 @@ public class AllowedDatatypeMatcherTests
         AllowedDatatypeService.Instance.HasRestriction.Should().BeFalse();
         AllowedDatatypeService.Instance.IsAllowed("anything").Should().BeTrue();
     }
+
+    [Fact]
+    public void SeedForTesting_sets_the_library_enabled_and_always_ask_flags()
+    {
+        // The two config flags (DATATYPE_LIBRARY_ENABLED / DATATYPE_LIBRARY_ALWAYS_ASK) gate the
+        // enforce path in ValidationCoordinatorService; lock the property + seed contract here.
+        AllowedDatatypeService.Instance.SeedForTesting(new[] { None("int") }, libraryEnabled: false, alwaysAsk: true);
+        try
+        {
+            AllowedDatatypeService.Instance.LibraryEnabled.Should().BeFalse();
+            AllowedDatatypeService.Instance.AlwaysAsk.Should().BeTrue();
+            // The pure matcher is independent of the flags - a seeded whitelist still classifies.
+            AllowedDatatypeService.Instance.HasRestriction.Should().BeTrue();
+        }
+        finally { AllowedDatatypeService.Instance.SeedForTesting(Array.Empty<AllowedDatatypeEntry>()); }
+
+        // Default seed -> enabled true, alwaysAsk false.
+        AllowedDatatypeService.Instance.SeedForTesting(new[] { None("int") });
+        try
+        {
+            AllowedDatatypeService.Instance.LibraryEnabled.Should().BeTrue();
+            AllowedDatatypeService.Instance.AlwaysAsk.Should().BeFalse();
+        }
+        finally { AllowedDatatypeService.Instance.SeedForTesting(Array.Empty<AllowedDatatypeEntry>()); }
+    }
 }
 
 /// <summary>
@@ -346,6 +371,64 @@ public class AllowedDatatypePickerLogicTests
     public void ExtractParameter_pulls_parenthesized_part(string datatype, string expected)
     {
         Forms.AllowedDatatypePickerForm.ExtractParameter(datatype).Should().Be(expected);
+    }
+
+    // ---------- FormatComboLabel: admin LABEL in the dropdown, base-token fallback (WP 303) ----------
+
+    [Fact]
+    public void FormatComboLabel_uses_the_admin_label_when_set()
+    {
+        var entry = new AllowedDatatypeEntry
+        {
+            Datatype = "nvarchar",
+            ParametrizationType = DatatypeParametrization.Regex,
+            Label = "nvarchar(max)",
+        };
+        Forms.AllowedDatatypePickerForm.FormatComboLabel(entry).Should().Be("nvarchar(max)");
+    }
+
+    [Fact]
+    public void FormatComboLabel_trims_the_label()
+    {
+        var entry = new AllowedDatatypeEntry { Datatype = "int", Label = "  Whole number  " };
+        Forms.AllowedDatatypePickerForm.FormatComboLabel(entry).Should().Be("Whole number");
+    }
+
+    [Fact]
+    public void FormatComboLabel_falls_back_to_base_token_with_n_for_parametric()
+    {
+        var entry = new AllowedDatatypeEntry
+        {
+            Datatype = "nvarchar",
+            ParametrizationType = DatatypeParametrization.Standard, // takes a parameter
+            Label = null,
+        };
+        Forms.AllowedDatatypePickerForm.FormatComboLabel(entry).Should().Be("nvarchar (n)");
+    }
+
+    [Fact]
+    public void FormatComboLabel_falls_back_to_bare_base_token_for_none()
+    {
+        var entry = new AllowedDatatypeEntry
+        {
+            Datatype = "int",
+            ParametrizationType = DatatypeParametrization.None,
+            Label = "   ", // blank -> fallback
+        };
+        Forms.AllowedDatatypePickerForm.FormatComboLabel(entry).Should().Be("int");
+    }
+
+    [Fact]
+    public void FormatComboLabel_distinguishes_two_same_named_rows_by_label()
+    {
+        // The WP 303 scenario: two "nvarchar" rows, same base token, different rules -> distinct
+        // labels so the picker dropdown shows them as separate, choosable entries.
+        var wide = new AllowedDatatypeEntry { Datatype = "nvarchar", ParametrizationType = DatatypeParametrization.Regex, Label = "nvarchar(max)" };
+        var bounded = new AllowedDatatypeEntry { Datatype = "nvarchar", ParametrizationType = DatatypeParametrization.Regex, Label = "nvarchar(<=4000)" };
+        Forms.AllowedDatatypePickerForm.FormatComboLabel(wide).Should().Be("nvarchar(max)");
+        Forms.AllowedDatatypePickerForm.FormatComboLabel(bounded).Should().Be("nvarchar(<=4000)");
+        Forms.AllowedDatatypePickerForm.FormatComboLabel(wide)
+            .Should().NotBe(Forms.AllowedDatatypePickerForm.FormatComboLabel(bounded));
     }
 
     // ---------- ValidateComposition: the picker's accept/reject decision ----------

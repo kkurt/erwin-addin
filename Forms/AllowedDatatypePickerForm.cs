@@ -292,7 +292,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 FlatStyle = FlatStyle.Flat,
             };
             foreach (var entry in _entries)
-                _cmbType.Items.Add(TakesParameter(entry) ? $"{entry.Datatype} (n)" : entry.Datatype);
+                _cmbType.Items.Add(FormatComboLabel(entry));
             int matchIdx = -1;
             if (!string.IsNullOrEmpty(preselectBase))
             {
@@ -573,6 +573,21 @@ namespace EliteSoft.Erwin.AddIn.Forms
         /// (None is bare-only). Drives the parameter field enable + the accept logic.</summary>
         private static bool TakesParameter(AllowedDatatypeEntry? entry) =>
             entry != null && entry.ParametrizationType != DatatypeParametrization.None;
+
+        /// <summary>
+        /// Combo dropdown text for a whitelisted datatype: the admin LABEL when set, otherwise the
+        /// base token (plus "(n)" when the type takes a parameter). The label lets two rows with the
+        /// SAME base datatype but different rules - e.g. an "nvarchar(max)" row and an
+        /// "nvarchar &lt;= 4000" row - render distinctly in the picker (WP 303). Display-only: the
+        /// composed value still uses the entry's base <see cref="AllowedDatatypeEntry.Datatype"/>.
+        /// Public + pure so the fallback is unit-tested.
+        /// </summary>
+        public static string FormatComboLabel(AllowedDatatypeEntry entry)
+        {
+            if (entry == null) return "";
+            if (!string.IsNullOrWhiteSpace(entry.Label)) return entry.Label.Trim();
+            return TakesParameter(entry) ? $"{entry.Datatype} (n)" : entry.Datatype;
+        }
 
         /// <summary>
         /// Pure accept/reject decision for <see cref="AcceptIfValid"/>: given the selected entry,

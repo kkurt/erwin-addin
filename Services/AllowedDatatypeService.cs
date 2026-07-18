@@ -58,6 +58,12 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <summary>DATATYPE_LIBRARY.DESCRIPTION (nullable): admin-authored explanation shown under
         /// the selected type in the datatype picker. Not shown when null/blank.</summary>
         public string Description { get; set; }
+
+        /// <summary>DATATYPE_LIBRARY.LABEL (nullable): admin-authored display name for the datatype
+        /// picker combo. When set it REPLACES the raw base token (+"(n)") in the dropdown, so two
+        /// rows with the SAME base datatype but different rules (e.g. an "nvarchar(max)" row and an
+        /// "nvarchar &lt;= 4000" row) are distinguishable. Blank/null -&gt; fall back to the base token.</summary>
+        public string Label { get; set; }
     }
 
     /// <summary>
@@ -100,6 +106,8 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         private List<AllowedDatatypeEntry> _allowed = new List<AllowedDatatypeEntry>();
         private bool _isLoaded;
+        private bool _libraryEnabled;
+        private bool _alwaysAsk;
         private string _lastError;
 
         /// <summary>True once a load attempt completed (success or "no rows"); false on hard failure.</summary>
@@ -107,6 +115,22 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         /// <summary>True when a non-empty whitelist is loaded - i.e. the config restricts datatypes.</summary>
         public bool HasRestriction => _isLoaded && _allowed.Count > 0;
+
+        /// <summary>
+        /// CONFIG_PROPERTY "DATATYPE_LIBRARY_ENABLED" (config-scoped, default FALSE / opt-in): the
+        /// master switch for datatype-library enforcement. When false the whitelist is NOT enforced
+        /// even if it is non-empty (no picker on new/changed columns). Cached at Load() so the
+        /// per-column enforce path does not hit the DB.
+        /// </summary>
+        public bool LibraryEnabled => _libraryEnabled;
+
+        /// <summary>
+        /// CONFIG_PROPERTY "DATATYPE_LIBRARY_ALWAYS_ASK" (config-scoped, default FALSE): when true a
+        /// NEW column whose datatype is ALREADY allowed still prompts the picker (current type
+        /// preselected) so the user explicitly confirms it. Only meaningful while
+        /// <see cref="LibraryEnabled"/> is true. Cached at Load().
+        /// </summary>
+        public bool AlwaysAsk => _alwaysAsk;
 
         /// <summary>Number of whitelist entries currently loaded (diagnostic).</summary>
         public int AllowedCount => _allowed.Count;
@@ -125,6 +149,8 @@ namespace EliteSoft.Erwin.AddIn.Services
             try
             {
                 _allowed = new List<AllowedDatatypeEntry>();
+                _libraryEnabled = false;
+                _alwaysAsk = false;
                 _lastError = null;
 
                 if (!DatabaseService.Instance.IsConfigured)
@@ -174,6 +200,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     ? null : reader["REGEX_ERROR"]?.ToString();
                                 string description = reader["DESCRIPTION"] == DBNull.Value
                                     ? null : reader["DESCRIPTION"]?.ToString();
+                                string label = reader["LABEL"] == DBNull.Value
+                                    ? null : reader["LABEL"]?.ToString();
 
                                 // Validate a REGEX pattern's compilability at load so the matcher
                                 // never throws on a malformed admin pattern; a broken pattern is
@@ -198,16 +226,24 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     RegexPattern = regexPattern,
                                     RegexError = regexError,
                                     Description = description,
+                                    Label = label,
                                 });
                             }
                         }
                     }
                 }
 
+                // Enforcement master switch + always-ask, cached here so the per-column enforce
+                // path never hits the DB. DATATYPE_LIBRARY_ENABLED defaults OFF (opt-in): a config
+                // with a whitelist does NOT enforce until the admin turns it on.
+                _libraryEnabled = ctx.GetEffectiveBool("DATATYPE_LIBRARY_ENABLED", false);
+                _alwaysAsk = ctx.GetEffectiveBool("DATATYPE_LIBRARY_ALWAYS_ASK", false);
+
                 _isLoaded = true;
                 System.Diagnostics.Debug.WriteLine(
                     $"AllowedDatatypeService: loaded {_allowed.Count} allowed datatype(s) for config {ctx.ActiveConfigId} " +
-                    $"({(_allowed.Count == 0 ? "no restriction (config whitelist empty)" : string.Join(", ", _allowed.Select(DescribeEntry)))})");
+                    $"(enabled={_libraryEnabled}, alwaysAsk={_alwaysAsk}, " +
+                    $"{(_allowed.Count == 0 ? "no restriction (config whitelist empty)" : string.Join(", ", _allowed.Select(DescribeEntry)))})");
                 return true;
             }
             catch (Exception ex)
@@ -230,20 +266,20 @@ namespace EliteSoft.Erwin.AddIn.Services
             switch (dbType?.ToUpper())
             {
                 case "POSTGRESQL":
-                    return @"SELECT ""DATATYPE"", ""PARAMETRIZATION_TYPE"", ""ALLOW_NON_PARAMETRIZED"", ""REGEX_PATTERN"", ""REGEX_ERROR"", ""DESCRIPTION""
+                    return @"SELECT ""DATATYPE"", ""PARAMETRIZATION_TYPE"", ""ALLOW_NON_PARAMETRIZED"", ""REGEX_PATTERN"", ""REGEX_ERROR"", ""DESCRIPTION"", ""LABEL""
                             FROM ""DATATYPE_LIBRARY""
                             WHERE ""CONFIG_ID"" = @configId
                             ORDER BY ""DATATYPE""";
 
                 case "ORACLE":
-                    return @"SELECT DATATYPE, PARAMETRIZATION_TYPE, ALLOW_NON_PARAMETRIZED, REGEX_PATTERN, REGEX_ERROR, DESCRIPTION
+                    return @"SELECT DATATYPE, PARAMETRIZATION_TYPE, ALLOW_NON_PARAMETRIZED, REGEX_PATTERN, REGEX_ERROR, DESCRIPTION, LABEL
                             FROM DATATYPE_LIBRARY
                             WHERE CONFIG_ID = :configId
                             ORDER BY DATATYPE";
 
                 case "MSSQL":
                 default:
-                    return @"SELECT [DATATYPE], [PARAMETRIZATION_TYPE], [ALLOW_NON_PARAMETRIZED], [REGEX_PATTERN], [REGEX_ERROR], [DESCRIPTION]
+                    return @"SELECT [DATATYPE], [PARAMETRIZATION_TYPE], [ALLOW_NON_PARAMETRIZED], [REGEX_PATTERN], [REGEX_ERROR], [DESCRIPTION], [LABEL]
                             FROM [dbo].[DATATYPE_LIBRARY]
                             WHERE [CONFIG_ID] = @configId
                             ORDER BY [DATATYPE]";
@@ -435,11 +471,13 @@ namespace EliteSoft.Erwin.AddIn.Services
         public void Reload() => Load();
 
         /// <summary>Test-only seed (mirrors NamingStandardService.SeedForTesting). Production never calls this.</summary>
-        public void SeedForTesting(IEnumerable<AllowedDatatypeEntry> entries)
+        public void SeedForTesting(IEnumerable<AllowedDatatypeEntry> entries, bool libraryEnabled = true, bool alwaysAsk = false)
         {
             _allowed = (entries ?? Enumerable.Empty<AllowedDatatypeEntry>())
                 .Where(e => e != null && !string.IsNullOrEmpty(e.Datatype))
                 .ToList();
+            _libraryEnabled = libraryEnabled;
+            _alwaysAsk = alwaysAsk;
             _lastError = null;
             _isLoaded = true;
         }
