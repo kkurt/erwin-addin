@@ -136,6 +136,14 @@ namespace EliteSoft.Erwin.AddIn
         // dialog - no silent state).
         private readonly HashSet<string> _pipelineOwnedLocators = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+        // User-opened Mart-version copies of the BOUND model (Complete Compare
+        // right side, Mart version browse) the reconnect gates refused to
+        // adopt. Purely a log latch: membership only suppresses repeat logging
+        // of the refusal (the 500 ms tick re-sees the copy on every pass); the
+        // refusal itself is decided fresh by IsVersionCopyOfBoundModel each
+        // tick. Cleared together with _knownLocators on every connect seed.
+        private readonly HashSet<string> _ignoredVersionCopyLocators = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
         // One-shot latch so the disconnected tick logs "only pipeline-owned
         // copies are open" once instead of every 500 ms while the user is
         // still closing the leftover tab. Reset when a real PU is adopted.
@@ -575,6 +583,7 @@ namespace EliteSoft.Erwin.AddIn
                 // kept in the set with the empty string entry so RE models do
                 // not look "new" on every tick either.
                 _knownLocators.Clear();
+                _ignoredVersionCopyLocators.Clear();
                 int pipelineOwnedOpen = 0;
                 try
                 {
@@ -961,6 +970,34 @@ namespace EliteSoft.Erwin.AddIn
         }
 
         /// <summary>
+        /// True when <paramref name="locator"/> (either locator shape: the
+        /// window-title "?VNO=N" form or the PropertyBag "&amp;version=N"
+        /// form) points at a DIFFERENT Mart version of the model the add-in
+        /// is currently bound to. Used by every reconnect adoption gate: a
+        /// version copy the USER opened (Complete Compare right side, Mart
+        /// version browse) must never be adopted, because the full re-init
+        /// against the copy runs UDP sync INTO it (8 defs committed into the
+        /// v1 compare target MID-COMPARE, erwin-addin-debug.log 2026-07-18
+        /// 19:36:46), dirtying a model the user never meant to edit,
+        /// falsifying the running compare and interrupting the user with the
+        /// sync dialog. Returns false when nothing is bound or either side
+        /// has no readable stem/version, so the guard only suppresses
+        /// adoption when both facts are certain.
+        /// </summary>
+        private bool IsVersionCopyOfBoundModel(string locator)
+        {
+            string bound = _lastConnectedLocator;
+            if (string.IsNullOrEmpty(bound) || string.IsNullOrEmpty(locator)) return false;
+            string boundStem = ExtractMartStem(bound);
+            string stem = ExtractMartStem(locator);
+            if (string.IsNullOrEmpty(boundStem) || string.IsNullOrEmpty(stem)) return false;
+            if (!string.Equals(boundStem, stem, StringComparison.OrdinalIgnoreCase)) return false;
+            int boundVersion = ExtractLocatorVersion(bound);
+            int version = ExtractLocatorVersion(locator);
+            return boundVersion > 0 && version > 0 && version != boundVersion;
+        }
+
+        /// <summary>
         /// First PU index the reconnect logic may bind to: skips erwin's
         /// ephemeral ;Duplicate=YES copies and every pipeline-owned version
         /// copy. Returns -1 when nothing adoptable is open (the caller must
@@ -1296,6 +1333,20 @@ namespace EliteSoft.Erwin.AddIn
                         continue;
                     }
 
+                    // Skip Mart-version copies of the BOUND model the USER
+                    // opened (Complete Compare right side, version browse) -
+                    // user directive 2026-07-18: while a CC is running the
+                    // add-in must not re-init or UDP-sync against the compare
+                    // target. See IsVersionCopyOfBoundModel for the incident
+                    // chain. Latched log: the tick re-sees the copy every
+                    // 500 ms until it is closed.
+                    if (IsVersionCopyOfBoundModel(loc))
+                    {
+                        if (_ignoredVersionCopyLocators.Add(loc))
+                            Log($"Reconnect: PU '{loc}' is a different Mart VERSION of the bound model (user CC / version browse) - NOT adopting. Validation, UDP sync and monitoring stay on '{_lastConnectedLocator}'.");
+                        continue;
+                    }
+
                     if (!_knownLocators.Contains(loc))
                     {
                         newIndex = i;
@@ -1370,6 +1421,18 @@ namespace EliteSoft.Erwin.AddIn
                             if (string.IsNullOrEmpty(loc)) continue;
                             if (loc.IndexOf(";Duplicate=YES", StringComparison.OrdinalIgnoreCase) >= 0) continue;
                             if (_pipelineOwnedLocators.Contains(loc)) continue;
+
+                            // The single visible PU being a different VERSION
+                            // of the bound model means the user activated the
+                            // CC / version-browse copy's tab (in-process SCAPI
+                            // surfaces only the ACTIVE PU). Do not adopt it -
+                            // stay bound and wait for the user to come back.
+                            if (IsVersionCopyOfBoundModel(loc))
+                            {
+                                if (_ignoredVersionCopyLocators.Add(loc))
+                                    Log($"Reconnect: active PU '{loc}' is a different Mart VERSION of the bound model (user CC / version browse) - NOT adopting. Validation, UDP sync and monitoring stay on '{_lastConnectedLocator}'.");
+                                break;
+                            }
 
                             if (!string.Equals(loc, _lastConnectedLocator, StringComparison.OrdinalIgnoreCase))
                             {
@@ -1477,6 +1540,21 @@ namespace EliteSoft.Erwin.AddIn
                                 return;
                             }
 
+                            // Same protection for a version copy the USER
+                            // opened (Complete Compare right side, version
+                            // browse): tabbing onto it must not rebind - a
+                            // re-init would UDP-sync into the copy (user
+                            // directive 2026-07-18). Snapshots are updated so
+                            // this logs once and tabbing BACK to the bound
+                            // model fires a normal reconnect.
+                            if (IsVersionCopyOfBoundModel(currentTitleLoc))
+                            {
+                                Log($"Tab switch onto a different Mart VERSION of the bound model ('{currentTitleLoc}') - NOT reconnecting (user CC / version browse). Validation, UDP sync and monitoring stay on '{_lastConnectedLocator}'.");
+                                _lastObservedTitleLocator = currentTitleLoc;
+                                _lastActiveMdiChildHwnd = activeChild;
+                                return;
+                            }
+
                             Log($"Active tab switch detected: window title locator '{_lastObservedTitleLocator}' -> '{currentTitleLoc}'; reconnecting with full re-init.");
                             DumpDiagnosticsForTabSwitch("[TabSwitch] pre-reconnect ground truth", persistenceUnits, count);
                             _globalDataLoaded = false;
@@ -1548,6 +1626,15 @@ namespace EliteSoft.Erwin.AddIn
                                     // crashed erwin (coreclr 0xC0000005).
                                     if (loc.IndexOf(";Duplicate=YES", StringComparison.OrdinalIgnoreCase) >= 0)
                                     {
+                                        continue;
+                                    }
+                                    // A user-opened version copy of the bound
+                                    // model is locator-different BY DEFINITION
+                                    // (only version= differs), so without this
+                                    // skip the fallback would adopt it directly.
+                                    if (IsVersionCopyOfBoundModel(loc))
+                                    {
+                                        Log($"TabSwitch: PU[{i}] skipped (different Mart VERSION of the bound model - user CC / version browse)");
                                         continue;
                                     }
                                     if (!string.Equals(loc, boundLoc, StringComparison.OrdinalIgnoreCase))
