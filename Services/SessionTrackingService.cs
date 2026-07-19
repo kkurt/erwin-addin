@@ -53,6 +53,18 @@ namespace EliteSoft.Erwin.AddIn.Services
         private const string KeyIntervalMinutes = "USER_TRACKING_INTERVAL_MINUTES";
         private const int DefaultIntervalMinutes = 5;
 
+        // Compile-time build-flavor tag stamped onto ADDIN_SESSION.IS_AUTO_DDL_GENERATOR
+        // on INSERT. True ONLY in the dedicated DDL-generator build
+        // (`dotnet build -p:DdlGenerator=true`, which defines DDLGENERATOR): that
+        // instance runs unattended DDL generation, never as an interactive modeler.
+        // The admin User Management screen uses the column to tell the two apart.
+        // Every normal build writes false.
+#if DDLGENERATOR
+        private const bool IsAutoDdlGeneratorBuild = true;
+#else
+        private const bool IsAutoDdlGeneratorBuild = false;
+#endif
+
         private static readonly object _instanceLock = new object();
         private static SessionTrackingService _instance;
 
@@ -237,6 +249,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     MachineName = Truncate(machine, 128),
                     ProcessId = pid,
                     AppVersion = Truncate(version, 50),
+                    IsAutoDdlGenerator = IsAutoDdlGeneratorBuild,
                     StartTime = DateTime.UtcNow,
                     LastSeen = DateTime.UtcNow,
                 };
@@ -245,7 +258,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 _sessionId = session.Id; // EF populates the IDENTITY id
             }
 
-            Log($"session started: id={_sessionId}, corporate={corporateId}, user='{user}', machine='{machine}', pid={pid}, version='{version}'.");
+            Log($"session started: id={_sessionId}, corporate={corporateId}, user='{user}', machine='{machine}', pid={pid}, version='{version}', autoDdl={IsAutoDdlGeneratorBuild}.");
         }
 
         private static string ReadCorporateProperty(RepoDbContext ctx, int corporateId, string key)
