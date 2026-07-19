@@ -50,7 +50,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
             MaximizeBox      = false;
             MinimizeBox      = false;
             ShowInTaskbar    = false;
-            ClientSize       = new Size(560, 340);
+            ClientSize       = new Size(560, 356);
             BackColor        = Color.White;
             KeyPreview       = true;
 
@@ -69,8 +69,8 @@ namespace EliteSoft.Erwin.AddIn.Forms
             var lblHeading = new Label
             {
                 Text = _approvalEnabled
-                    ? "Submitting will save the model and bump its version."
-                    : "Saving will bump the model version.",
+                    ? "Submitting will save the model, bump its version, then close it."
+                    : "Saving will bump the model version, then close the model.",
                 Font = new Font("Segoe UI", 11f, FontStyle.Bold),
                 ForeColor = Color.FromArgb(40, 40, 40),
                 AutoSize = false,
@@ -82,15 +82,16 @@ namespace EliteSoft.Erwin.AddIn.Forms
             var lblBody = new Label
             {
                 Text =
-                    "When you click OK, the model will be saved to the Mart " +
-                    "repository and its version will be incremented. The text " +
-                    "below is stamped on the new Mart version (separate from " +
-                    "the optional admin note on the previous screen).",
+                    "When you click the button below, the model will be saved to " +
+                    "the Mart repository, its version will be incremented, and then " +
+                    "the model will be closed. The text below is stamped on the new " +
+                    "Mart version (separate from the optional admin note on the " +
+                    "previous screen).",
                 Font = fontBody,
                 ForeColor = Color.FromArgb(70, 70, 70),
                 AutoSize = false,
                 Location = new Point(70, 48),
-                Size = new Size(470, 60),
+                Size = new Size(470, 76),
             };
             Controls.Add(lblBody);
 
@@ -102,14 +103,14 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 Font = fontBodyBold,
                 ForeColor = Color.FromArgb(80, 80, 80),
                 AutoSize = true,
-                Location = new Point(20, 120),
+                Location = new Point(20, 136),
             };
             Controls.Add(lblDesc);
 
             _txtDescription = new TextBox
             {
                 Font = fontBody,
-                Location = new Point(20, 144),
+                Location = new Point(20, 160),
                 Size = new Size(ClientSize.Width - 40, 130),
                 Multiline = true,
                 AcceptsReturn = true,
@@ -122,10 +123,10 @@ namespace EliteSoft.Erwin.AddIn.Forms
             // Bottom-right button row: [Cancel] [OK].
             var btnOk = new Button
             {
-                Text = "OK",
+                Text = _approvalEnabled ? "Submit and Close" : "Save and Close",
                 DialogResult = DialogResult.OK,
-                Size = new Size(110, 32),
-                Location = new Point(ClientSize.Width - 130, ClientSize.Height - 50),
+                Size = new Size(150, 32),
+                Location = new Point(ClientSize.Width - 170, ClientSize.Height - 50),
                 FlatStyle = FlatStyle.Flat,
                 BackColor = Color.FromArgb(46, 125, 50),
                 ForeColor = Color.White,
@@ -142,7 +143,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 Text = "Cancel",
                 DialogResult = DialogResult.Cancel,
                 Size = new Size(100, 32),
-                Location = new Point(ClientSize.Width - 240, ClientSize.Height - 50),
+                Location = new Point(ClientSize.Width - 280, ClientSize.Height - 50),
                 FlatStyle = FlatStyle.Flat,
                 BackColor = Color.White,
                 ForeColor = Color.FromArgb(60, 60, 60),

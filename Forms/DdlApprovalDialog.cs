@@ -641,6 +641,33 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 }
             }
 
+            // Step 6 (WP 319): the save is committed (and, for the no-approval
+            // path, the REST callback attempted), so the DDL review/save flow is
+            // done - close the model automatically (the review dialog's confirm
+            // step is labelled "...and Close" and already told the user this would
+            // happen). The Mart save above is verified (SaveCurrentModelWithDescription
+            // re-probes dirty), so the model is CLEAN and this discard-close drops
+            // nothing. Reuses the fast poll-driven close, which dismisses erwin's
+            // "Mart Offline" prompt; it MUST run OFF the UI thread so erwin's UI
+            // thread stays free to raise + tear down that prompt.
+            bool modelClosed;
+            try
+            {
+                _lblStatus.Text = "Closing the model...";
+                Application.DoEvents();
+                modelClosed = await System.Threading.Tasks.Task
+                    .Run(() => MartMartAutomation.CloseActiveModelFast(_log))
+                    .ConfigureAwait(true);
+            }
+            catch (Exception ex)
+            {
+                // Do not swallow: the save already succeeded, but the auto-close
+                // failed - the confirmation popup below surfaces it so the user
+                // knows to close the model by hand.
+                _log($"DdlApprovalDialog: model auto-close threw {ex.GetType().Name}: {ex.Message}");
+                modelClosed = false;
+            }
+
             // Success: the row is saved (and, for the no-approval path, the REST
             // callback - if any - has been attempted). Update the status strip and
             // surface an explicit confirmation modal (user rule 2026-05-31: the
@@ -653,14 +680,16 @@ namespace EliteSoft.Erwin.AddIn.Forms
             _btnCancel.Enabled = true;
             _btnCopy.Enabled = true;
 
-            // User rule 2026-06-07: the no-approval "Send" path must NOT pop a
-            // success "saved / Queue ID" modal - there is no approval queue to
-            // confirm (the DDL is sent directly via the REST callback) and the
-            // status strip already shows the outcome. A REST callback FAILURE
-            // still pops, because the form auto-closes below and the error would
-            // otherwise vanish unseen. The approval ("Send to Approve") path is
-            // unchanged - its queue confirmation is legitimate.
-            bool showSuccessModal = _approvalEnabled || restFailed;
+            // User rule 2026-06-07: the no-approval path must NOT pop a success
+            // "saved / Queue ID" modal - there is no approval queue to confirm and
+            // the ConfirmSubmitDialog already told the user the model would be
+            // saved AND closed. It still pops when something that must not vanish
+            // unseen happened (a REST callback failure, or the model could NOT be
+            // closed automatically) - the form auto-closes below. The approval
+            // path is unchanged: its queue confirmation is legitimate and now also
+            // reports the close.
+            bool closeFailed = !modelClosed;
+            bool showSuccessModal = _approvalEnabled || restFailed || closeFailed;
 
             try
             {
@@ -692,6 +721,19 @@ namespace EliteSoft.Erwin.AddIn.Forms
                     body = $"Model committed to Mart, saved, and the REST callback succeeded.\n\nQueue ID: {newId}\n{restSummary}";
                     icon = MessageBoxIcon.Information;
                     title = "Success";
+                }
+
+                // WP 319: report the automatic model close (or its failure) so the
+                // user always knows the current model is gone.
+                if (modelClosed)
+                {
+                    body += "\n\nThe model has been closed.";
+                }
+                else
+                {
+                    body += "\n\nWARNING: the model could NOT be closed automatically - please close it manually.";
+                    if (icon == MessageBoxIcon.Information) icon = MessageBoxIcon.Warning;
+                    if (title == "Success") title = "Saved - model not closed";
                 }
 
                 if (showSuccessModal)

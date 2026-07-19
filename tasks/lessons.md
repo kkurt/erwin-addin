@@ -4,6 +4,21 @@ A running log of corrections and non-obvious findings that future sessions
 should not have to rediscover. Each entry is a short rule, the reason, and
 how to apply it.
 
+## 2026-07-19: A WP that names "the SEND/SAVE button" can point at either dialog in a two-step flow
+
+**Rule:** WP 319 said "the SEND or SAVE button in the modal after Generate DDL should become
+'...AND CLOSE'". The Generate-DDL flow has TWO dialogs: the review dialog (DdlApprovalDialog, button
+"Send to Approve" / "Save Model") AND the confirm dialog it opens (ConfirmSubmitDialog, "Submit for
+Approval" / "Save the model", OK/Cancel). The button TEXT matched the review dialog, so I mapped the
+change there - but the user meant the CONFIRM dialog's OK button (the actual save trigger). I also
+built a clarifying question on a wrong premise (approval-off "shows no popup") when in fact the
+confirm modal always appears; the question was rejected.
+
+**How to apply:** When a WP references "the button/modal" in a multi-step UI flow, resolve WHICH
+dialog before designing - name both candidates back to the user (or ask for the screenshot) instead
+of picking by literal button text. The actual commit/action step (here the final confirm OK) is
+usually the intended anchor, not the intent step that merely opens it.
+
 ## 2026-07-10 (PM): Lazily-populated constraint metadata = windows where the constraint is OFF
 
 **Rule:** TermTypeCanonical was only populated by glossary-validation events (create/rename) and
