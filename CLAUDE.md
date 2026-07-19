@@ -97,5 +97,13 @@ Yazılımı oluşturuken profesyönel ve deneyimli bir yazılımcı olarak düş
 
 Ekranları yaparken profesyönel bir UX gözü ile değerlendirerek iyi analiz ederek yap.
 
-Yeni bir özellik/fonksiyonelaite eklerken mevcutta benzer işlem var mı bak, benzer yolları kullanmayı dene.
+
+Yapılacak işleri eğer bağımsız agentlar yapabiliyorsa paralel agent başlat.
+Yeni bir özellik/fonksiyonelaite eklerken mevcutta benzer işlem var mı bak, kullanılabilecek mevcut metodları kullanmayı dene.
 Yeni ekleme yaparken SOLID proensiplerine dikkat et!
+
+## OpenProject
+Bir Bugı çözerken öncelikle bu Bug'ın gerçekten var olduğundan emin ol, gerekiyorsa test et çünkü yanlış girilimiş de olabilir.
+Bir iş paketine başlarken İLK İŞ olarak `start_work_package` çağır (WP'yi "In progress"e alır).
+Bitince `add_comment` ile özet ekle; uygunsa `update_work_package_status` ile ilerlet.
+WP'lere not/açıklama eklerken Türkçe, kısa ve öz olsun. Notlar/Açıklamalar teknik detay içermemeli.
