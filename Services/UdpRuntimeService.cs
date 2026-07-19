@@ -649,7 +649,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 foreach (var kvp in values)
                 {
                     string fullPath = $"{prefix}.{kvp.Key}";
-                    if (!TrySetUdpProperty(entity, fullPath, kvp.Value, out Exception setEx))
+                    if (!TrySetUdpProperty((object)entity, fullPath, kvp.Value, out Exception setEx, Log))
                         Log($"UdpRuntime.WriteUdpValues: Failed to set '{kvp.Key}' = '{kvp.Value}': {setEx?.Message}");
                 }
 
@@ -677,8 +677,12 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <c>ISCModelPropertyCollection::Add</c>); the second
         /// <c>Properties(...).Value = ...</c> then succeeds.
         /// Returns true on success.
+        /// Static so other writers (e.g. the Template naming applier filling a
+        /// TARGET_UDP_ID) reuse the exact same materialise-then-set semantics
+        /// instead of duplicating them; <paramref name="log"/> keeps each
+        /// caller's own log routing.
         /// </summary>
-        private bool TrySetUdpProperty(dynamic entity, string fullPath, string value, out Exception failure)
+        internal static bool TrySetUdpProperty(dynamic entity, string fullPath, string value, out Exception failure, Action<string> log)
         {
             failure = null;
             try
@@ -700,7 +704,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 entity.Properties.Add(fullPath);
                 entity.Properties(fullPath).Value = value;
                 failure = null;
-                Log($"UdpRuntime.TrySetUdpProperty: materialised + set '{fullPath}' = '{value}' (initial direct set was rejected)");
+                log?.Invoke($"UdpRuntime.TrySetUdpProperty: materialised + set '{fullPath}' = '{value}' (initial direct set was rejected)");
                 return true;
             }
             catch (Exception addEx)
@@ -734,7 +738,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 foreach (var kvp in values)
                 {
                     string fullPath = $"{prefix}.{kvp.Key}";
-                    if (!TrySetUdpProperty(entity, fullPath, kvp.Value, out Exception setEx))
+                    if (!TrySetUdpProperty((object)entity, fullPath, kvp.Value, out Exception setEx, Log))
                     {
                         failed.Add(kvp.Key);
                         Log($"UdpRuntime.WriteUdpValuesWithFailures: Failed to set '{kvp.Key}' = '{kvp.Value}': {setEx?.Message}");

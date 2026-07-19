@@ -5,14 +5,17 @@ using System.Linq;
 namespace EliteSoft.Erwin.AddIn.Services
 {
     /// <summary>
-    /// Represents a PREDEFINED_COLUMN entry. The UDP-condition fields are
-    /// nullable to support BOTH shapes admin can author:
-    ///   * conditional   : both DependsOnUdpId and DependsOnUdpValue set,
-    ///                     column added only when the named UDP takes the
-    ///                     listed value on a new table.
-    ///   * unconditional : DependsOnUdpId == null (DEPENDS_ON_UDP_ID stored
-    ///                     as SQL NULL); column added to EVERY new table
-    ///                     under this config regardless of UDP state.
+    /// Represents a PREDEFINED_COLUMN entry. Applicability is carried by an ordered
+    /// AND/OR condition list (<see cref="Conditions"/>, rows of
+    /// <c>MC_PREDEFINED_COLUMN_CONDITION</c>) - the SAME contract naming rules use
+    /// (WP#280). Two shapes admin can author:
+    ///   * conditional   : one or more condition terms; the column is added to a new
+    ///                     table only when the folded AND/OR result is TRUE.
+    ///   * unconditional : no condition terms (<see cref="Conditions"/> empty); the
+    ///                     column is added to EVERY new table under this config.
+    /// The former flat <c>DEPENDS_ON_UDP_ID</c>/<c>DEPENDS_ON_UDP_VALUE</c> columns
+    /// were dropped; the migration moved each old single condition to a single
+    /// ORDER_INDEX=0 row so migrated columns fold to the identical boolean.
     /// </summary>
     public class PredefinedColumn
     {
@@ -53,29 +56,35 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <see cref="PredefinedColumnService.TryLoadComments"/>).
         /// </summary>
         public string Comment { get; set; } = "";
-        // Nullable to match admin's schema (admin authored 2026-05-14:
-        // "rule-independent predefined columns"). HasValue==false means
-        // the column is unconditional and should be added to every new
-        // table; HasValue==true means it is gated by a UDP/value match.
-        public int? DependsOnUdpId { get; set; }
-        public string DependsOnUdpValue { get; set; }
-        public string DependsOnUdpName { get; set; } // Resolved from JOIN
         public int SortOrder { get; set; }
 
         /// <summary>
-        /// True when the row carries no UDP gating - applies to every
+        /// The column's ordered DEPENDS_ON conditions (rows of
+        /// <c>MC_PREDEFINED_COLUMN_CONDITION</c>, ORDER_INDEX order), folded strictly
+        /// left-to-right (no precedence) by
+        /// <see cref="NamingValidationEngine.AreConditionsSatisfied"/> - the exact same
+        /// engine and row type (<see cref="NamingRuleCondition"/>) naming rules use.
+        /// Empty == the column is unconditional (always applies). This list is the SOLE
+        /// authority; the former flat <c>DEPENDS_ON_UDP_*</c> columns were dropped
+        /// (WP#280).
+        /// </summary>
+        public List<NamingRuleCondition> Conditions { get; } = new List<NamingRuleCondition>();
+
+        /// <summary>
+        /// True when the row carries no conditions - applies to every
         /// new entity unconditionally.
         /// </summary>
-        public bool IsUnconditional => !DependsOnUdpId.HasValue;
+        public bool IsUnconditional => Conditions.Count == 0;
 
         // Backward compat - old code uses .Name
         public string Name => ColumnName;
     }
 
     /// <summary>
-    /// Service for loading and caching PREDEFINED_COLUMN entries.
-    /// Columns are conditioned on UDP values (DEPENDS_ON_UDP_ID + DEPENDS_ON_UDP_VALUE)
-    /// and filtered by DB_TYPE (platform-specific columns).
+    /// Service for loading and caching PREDEFINED_COLUMN entries. Applicability is
+    /// carried by an ordered AND/OR condition list per column
+    /// (<c>MC_PREDEFINED_COLUMN_CONDITION</c>), evaluated by the shared
+    /// <see cref="NamingValidationEngine.AreConditionsSatisfied"/> engine (WP#280).
     /// </summary>
     public class PredefinedColumnService
     {
@@ -168,17 +177,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 string colName = reader["COLUMN_NAME"]?.ToString()?.Trim() ?? "";
                                 if (string.IsNullOrEmpty(colName)) continue;
 
-                                // DEPENDS_ON_UDP_ID is read as nullable so the
-                                // unconditional shape (SQL NULL) is preserved.
-                                // Treating SQL NULL as the sentinel 0 was
-                                // ambiguous because some test runs returned 0
-                                // from a legitimately-zero UDP id in another
-                                // codebase; null is the unambiguous "no UDP
-                                // gate" marker that admin's schema commits to.
-                                int? dependsOnUdpId = reader["DEPENDS_ON_UDP_ID"] == DBNull.Value
-                                    ? (int?)null
-                                    : Convert.ToInt32(reader["DEPENDS_ON_UDP_ID"]);
-
                                 // IS_PRIMARY_KEY is admin's 2026-05-14 flag; rows
                                 // authored before that migration store it as NULL
                                 // which we treat as false (the historical default).
@@ -202,14 +200,19 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     IsPrimaryKey = isPrimaryKey,
                                     IsLocked = isLocked,
                                     DefaultValue = reader["DEFAULT_VALUE"] == DBNull.Value ? "" : reader["DEFAULT_VALUE"]?.ToString() ?? "",
-                                    DependsOnUdpId = dependsOnUdpId,
-                                    DependsOnUdpValue = reader["DEPENDS_ON_UDP_VALUE"] == DBNull.Value ? "" : reader["DEPENDS_ON_UDP_VALUE"]?.ToString()?.Trim() ?? "",
-                                    DependsOnUdpName = reader["UDP_NAME"] == DBNull.Value ? "" : reader["UDP_NAME"]?.ToString()?.Trim() ?? "",
                                     SortOrder = reader["SORT_ORDER"] == DBNull.Value ? 0 : Convert.ToInt32(reader["SORT_ORDER"])
                                 });
                             }
                         }
                     }
+
+                    // Load each column's ordered AND/OR condition list from
+                    // MC_PREDEFINED_COLUMN_CONDITION onto the columns just loaded
+                    // (reusing the open connection). Inside the try so a
+                    // condition-load failure fails the whole load instead of
+                    // silently treating conditional columns as unconditional -
+                    // exactly as NamingStandardService.LoadRuleConditions does.
+                    LoadColumnConditions(connection, ctx.ActiveConfigId, dbType);
 
                     // Best-effort second pass for the optional "Comment" field
                     // (admin column DEFINITION, 2026-06-08). Kept separate from
@@ -241,22 +244,18 @@ namespace EliteSoft.Erwin.AddIn.Services
                 case "POSTGRESQL":
                     return @"SELECT pc.""ID"", pc.""CONFIG_ID"", pc.""COLUMN_NAME"", pc.""DATA_TYPE"", pc.""NULLABLE"",
                             pc.""IS_PRIMARY_KEY"", pc.""IS_LOCKED"",
-                            pc.""DEFAULT_VALUE"", pc.""DEPENDS_ON_UDP_ID"", pc.""DEPENDS_ON_UDP_VALUE"",
-                            pc.""SORT_ORDER"",
-                            udp.""NAME"" AS ""UDP_NAME""
+                            pc.""DEFAULT_VALUE"",
+                            pc.""SORT_ORDER""
                             FROM ""PREDEFINED_COLUMN"" pc
-                            LEFT JOIN ""MC_UDP_DEFINITION"" udp ON pc.""DEPENDS_ON_UDP_ID"" = udp.""ID""
                             WHERE pc.""CONFIG_ID"" = @cfgId
                             ORDER BY pc.""SORT_ORDER""";
 
                 case "ORACLE":
                     return @"SELECT pc.ID, pc.CONFIG_ID, pc.COLUMN_NAME, pc.DATA_TYPE, pc.NULLABLE,
                             pc.IS_PRIMARY_KEY, pc.IS_LOCKED,
-                            pc.DEFAULT_VALUE, pc.DEPENDS_ON_UDP_ID, pc.DEPENDS_ON_UDP_VALUE,
-                            pc.SORT_ORDER,
-                            udp.NAME AS UDP_NAME
+                            pc.DEFAULT_VALUE,
+                            pc.SORT_ORDER
                             FROM PREDEFINED_COLUMN pc
-                            LEFT JOIN MC_UDP_DEFINITION udp ON pc.DEPENDS_ON_UDP_ID = udp.ID
                             WHERE pc.CONFIG_ID = :cfgId
                             ORDER BY pc.SORT_ORDER";
 
@@ -264,13 +263,129 @@ namespace EliteSoft.Erwin.AddIn.Services
                 default:
                     return @"SELECT pc.[ID], pc.[CONFIG_ID], pc.[COLUMN_NAME], pc.[DATA_TYPE], pc.[NULLABLE],
                             pc.[IS_PRIMARY_KEY], pc.[IS_LOCKED],
-                            pc.[DEFAULT_VALUE], pc.[DEPENDS_ON_UDP_ID], pc.[DEPENDS_ON_UDP_VALUE],
-                            pc.[SORT_ORDER],
-                            udp.[NAME] AS [UDP_NAME]
+                            pc.[DEFAULT_VALUE],
+                            pc.[SORT_ORDER]
                             FROM [dbo].[PREDEFINED_COLUMN] pc
-                            LEFT JOIN [dbo].[MC_UDP_DEFINITION] udp ON pc.[DEPENDS_ON_UDP_ID] = udp.[ID]
                             WHERE pc.[CONFIG_ID] = @cfgId
                             ORDER BY pc.[SORT_ORDER]";
+            }
+        }
+
+        /// <summary>
+        /// Loads <c>MC_PREDEFINED_COLUMN_CONDITION</c> for the active config and attaches
+        /// each row (ORDER_INDEX order) to its owning column's
+        /// <see cref="PredefinedColumn.Conditions"/>, reusing the already-open
+        /// <paramref name="connection"/>. A row that names neither source or both is
+        /// skipped + logged (mirrors the admin XOR CHECK). Lets a query failure propagate
+        /// so the caller fails the whole load rather than treating conditional columns as
+        /// unconditional. A direct clone of
+        /// <c>NamingStandardService.LoadRuleConditions</c> - the two child tables share the
+        /// exact same shape and the <see cref="NamingRuleCondition"/> row type (WP#280).
+        /// </summary>
+        private void LoadColumnConditions(System.Data.Common.DbConnection connection, int configId, string dbType)
+        {
+            if (_columns.Count == 0) return;
+
+            var byId = new Dictionary<int, PredefinedColumn>();
+            foreach (var c in _columns) byId[c.Id] = c;
+
+            string query = GetConditionQuery(dbType);
+            int loaded = 0, skipped = 0;
+
+            using (var command = DatabaseService.Instance.CreateCommand(query, connection))
+            {
+                var pCfg = command.CreateParameter();
+                pCfg.ParameterName = SqlDialect.Param(dbType, "cfgId");
+                pCfg.Value = configId;
+                command.Parameters.Add(pCfg);
+
+                using (var reader = command.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        int columnId = Convert.ToInt32(reader["PREDEFINED_COLUMN_ID"]);
+                        if (!byId.TryGetValue(columnId, out var col)) continue; // condition for a column we did not load (other config)
+
+                        int? udpId = reader["DEPENDS_ON_UDP_ID"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["DEPENDS_ON_UDP_ID"]);
+                        int? propDefId = reader["DEPENDS_ON_PROPERTY_DEF_ID"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["DEPENDS_ON_PROPERTY_DEF_ID"]);
+
+                        // Mirror admin's CK XOR: each term must name EXACTLY one source.
+                        if (udpId.HasValue == propDefId.HasValue)
+                        {
+                            System.Diagnostics.Debug.WriteLine(
+                                $"PREDEFINED_COLUMN_CONDITION SKIP: column {columnId} order {reader["ORDER_INDEX"]} names {(udpId.HasValue ? "BOTH" : "NO")} source(s) - term dropped");
+                            skipped++;
+                            continue;
+                        }
+
+                        col.Conditions.Add(new NamingRuleCondition
+                        {
+                            OrderIndex = Convert.ToInt32(reader["ORDER_INDEX"]),
+                            Connector = reader["CONNECTOR"] == DBNull.Value ? null : reader["CONNECTOR"]?.ToString()?.Trim(),
+                            DependsOnUdpId = udpId,
+                            DependsOnUdpName = reader["UDP_NAME"] == DBNull.Value ? "" : reader["UDP_NAME"]?.ToString()?.Trim() ?? "",
+                            DependsOnPropertyDefId = propDefId,
+                            DependsOnPropertyCode = reader["COND_PROPERTY_CODE"] == DBNull.Value ? "" : reader["COND_PROPERTY_CODE"]?.ToString()?.Trim() ?? "",
+                            DependsOnPropertyObjectType = reader["COND_PROPERTY_OBJECT_TYPE"] == DBNull.Value ? "" : reader["COND_PROPERTY_OBJECT_TYPE"]?.ToString()?.Trim() ?? "",
+                            DependsOnPropertyValues = reader["DEPENDS_ON_PROPERTY_VALUES"] == DBNull.Value ? "" : reader["DEPENDS_ON_PROPERTY_VALUES"]?.ToString()?.Trim() ?? "",
+                        });
+                        loaded++;
+                    }
+                }
+            }
+
+            // Defensive: the fold relies on ORDER_INDEX order. The query already sorts,
+            // but a per-column sort guarantees it regardless of provider quirks.
+            foreach (var col in _columns)
+                col.Conditions.Sort((a, b) => a.OrderIndex.CompareTo(b.OrderIndex));
+
+            System.Diagnostics.Debug.WriteLine(
+                $"PredefinedColumnService: loaded {loaded} condition term(s), skipped {skipped}");
+        }
+
+        private static string GetConditionQuery(string dbType)
+        {
+            switch (dbType?.ToUpper())
+            {
+                case "POSTGRESQL":
+                    return @"SELECT cc.""PREDEFINED_COLUMN_ID"", cc.""ORDER_INDEX"", cc.""CONNECTOR"",
+                            cc.""DEPENDS_ON_UDP_ID"", cc.""DEPENDS_ON_PROPERTY_DEF_ID"", cc.""DEPENDS_ON_PROPERTY_VALUES"",
+                            udp.""NAME"" AS ""UDP_NAME"",
+                            cond_pd.""PROPERTY_CODE"" AS ""COND_PROPERTY_CODE"",
+                            cond_ot.""NAME"" AS ""COND_PROPERTY_OBJECT_TYPE""
+                            FROM ""MC_PREDEFINED_COLUMN_CONDITION"" cc
+                            JOIN ""PREDEFINED_COLUMN"" pc ON pc.""ID"" = cc.""PREDEFINED_COLUMN_ID""
+                            LEFT JOIN ""MC_UDP_DEFINITION"" udp ON udp.""ID"" = cc.""DEPENDS_ON_UDP_ID""
+                            LEFT JOIN ""MC_PROPERTY_DEF"" cond_pd ON cond_pd.""ID"" = cc.""DEPENDS_ON_PROPERTY_DEF_ID""
+                            LEFT JOIN ""MC_OBJECT_TYPE"" cond_ot ON cond_ot.""ID"" = cond_pd.""OBJECT_TYPE_ID""
+                            WHERE pc.""CONFIG_ID"" = @cfgId
+                            ORDER BY cc.""PREDEFINED_COLUMN_ID"", cc.""ORDER_INDEX""";
+                case "ORACLE":
+                    return @"SELECT cc.PREDEFINED_COLUMN_ID, cc.ORDER_INDEX, cc.CONNECTOR,
+                            cc.DEPENDS_ON_UDP_ID, cc.DEPENDS_ON_PROPERTY_DEF_ID, cc.DEPENDS_ON_PROPERTY_VALUES,
+                            udp.NAME AS UDP_NAME,
+                            cond_pd.PROPERTY_CODE AS COND_PROPERTY_CODE,
+                            cond_ot.NAME AS COND_PROPERTY_OBJECT_TYPE
+                            FROM MC_PREDEFINED_COLUMN_CONDITION cc
+                            JOIN PREDEFINED_COLUMN pc ON pc.ID = cc.PREDEFINED_COLUMN_ID
+                            LEFT JOIN MC_UDP_DEFINITION udp ON udp.ID = cc.DEPENDS_ON_UDP_ID
+                            LEFT JOIN MC_PROPERTY_DEF cond_pd ON cond_pd.ID = cc.DEPENDS_ON_PROPERTY_DEF_ID
+                            LEFT JOIN MC_OBJECT_TYPE cond_ot ON cond_ot.ID = cond_pd.OBJECT_TYPE_ID
+                            WHERE pc.CONFIG_ID = :cfgId
+                            ORDER BY cc.PREDEFINED_COLUMN_ID, cc.ORDER_INDEX";
+                default: // SQL Server
+                    return @"SELECT cc.[PREDEFINED_COLUMN_ID], cc.[ORDER_INDEX], cc.[CONNECTOR],
+                            cc.[DEPENDS_ON_UDP_ID], cc.[DEPENDS_ON_PROPERTY_DEF_ID], cc.[DEPENDS_ON_PROPERTY_VALUES],
+                            udp.[NAME] AS [UDP_NAME],
+                            cond_pd.[PROPERTY_CODE] AS [COND_PROPERTY_CODE],
+                            cond_ot.[NAME] AS [COND_PROPERTY_OBJECT_TYPE]
+                            FROM [dbo].[MC_PREDEFINED_COLUMN_CONDITION] cc
+                            JOIN [dbo].[PREDEFINED_COLUMN] pc ON pc.[ID] = cc.[PREDEFINED_COLUMN_ID]
+                            LEFT JOIN [dbo].[MC_UDP_DEFINITION] udp ON udp.[ID] = cc.[DEPENDS_ON_UDP_ID]
+                            LEFT JOIN [dbo].[MC_PROPERTY_DEF] cond_pd ON cond_pd.[ID] = cc.[DEPENDS_ON_PROPERTY_DEF_ID]
+                            LEFT JOIN [dbo].[MC_OBJECT_TYPE] cond_ot ON cond_ot.[ID] = cond_pd.[OBJECT_TYPE_ID]
+                            WHERE pc.[CONFIG_ID] = @cfgId
+                            ORDER BY cc.[PREDEFINED_COLUMN_ID], cc.[ORDER_INDEX]";
             }
         }
 
@@ -332,35 +447,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                 System.Diagnostics.Debug.WriteLine(
                     $"PredefinedColumnService.TryLoadComments: optional DEFINITION column not loaded ({ex.Message})");
             }
-        }
-
-        /// <summary>
-        /// Get predefined columns that match a specific UDP condition.
-        /// Used when a UDP value changes — find columns conditioned on that UDP+value.
-        /// </summary>
-        public IEnumerable<PredefinedColumn> GetByUdpCondition(string udpName, string udpValue)
-        {
-            if (!_isLoaded) return Enumerable.Empty<PredefinedColumn>();
-
-            return _columns.Where(c =>
-                !string.IsNullOrEmpty(c.DependsOnUdpName) &&
-                c.DependsOnUdpName.Equals(udpName, StringComparison.OrdinalIgnoreCase) &&
-                c.DependsOnUdpValue.Equals(udpValue, StringComparison.OrdinalIgnoreCase))
-                .OrderBy(c => c.SortOrder);
-        }
-
-        /// <summary>
-        /// Get predefined columns conditioned on a specific UDP (any value).
-        /// Used to find all columns that depend on a given UDP.
-        /// </summary>
-        public IEnumerable<PredefinedColumn> GetByUdpName(string udpName)
-        {
-            if (!_isLoaded) return Enumerable.Empty<PredefinedColumn>();
-
-            return _columns.Where(c =>
-                !string.IsNullOrEmpty(c.DependsOnUdpName) &&
-                c.DependsOnUdpName.Equals(udpName, StringComparison.OrdinalIgnoreCase))
-                .OrderBy(c => c.SortOrder);
         }
 
         /// <summary>
@@ -450,92 +536,58 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // Unconditional locked rule always applies.
                 if (rule.IsUnconditional) return rule;
 
-                // Conditional rule: read the gating UDP on this entity and
-                // compare. Wrap in try/catch because reading a UDP that the
-                // entity has never been assigned can throw on r10.10 (sparse
-                // storage) - treat as "not applicable" which is the safe
-                // default (column not locked, user can edit). Without this
-                // guard a single broken UDP would surface as a SCAPI exception
-                // every tick the user clicked the column.
+                // Conditional rule: evaluate its full AND/OR condition list against the
+                // entity via the shared engine (WP#280). It reads each gating UDP with
+                // the same sparse-storage guard the old single-UDP compare used (an
+                // unassigned UDP reads "" -> the IN-match cannot hold -> not locked, so
+                // the user can edit). "Conditional locks release when the condition no
+                // longer holds" - the 2026-05-24 semantic - is preserved.
                 if (entity == null) continue;
-                try
-                {
-                    string path = $"Entity.Physical.{rule.DependsOnUdpName}";
-                    string liveValue = entity.Properties(path)?.Value?.ToString() ?? "";
-                    if (string.Equals(liveValue, rule.DependsOnUdpValue, StringComparison.OrdinalIgnoreCase))
-                        return rule;
-                }
-                catch
-                {
-                    // SCAPI returned "Entity class does not use a property of
-                    // ... type" - the entity has not been assigned this UDP,
-                    // so the gating condition cannot be met. Skip this rule.
-                }
+                if (NamingValidationEngine.AreConditionsSatisfied(rule.Conditions, "Table", entity))
+                    return rule;
             }
             return null;
         }
 
         /// <summary>
         /// Names of the predefined columns that currently APPLY to the given entity: every
-        /// unconditional row, plus each conditional row whose gating UDP
-        /// (<c>Entity.Physical.{DependsOnUdpName}</c>) equals <c>DependsOnUdpValue</c>. This is the
-        /// SAME applicability that ApplyPredefined uses to auto-add columns, so the set treated as
-        /// "predefined" (e.g. exempt from glossary loading) exactly matches the set that was
-        /// actually added. Entity-scoped by design: a column gated on <c>TableClass='Parametre'</c>
-        /// must NOT count as predefined on a <c>TableClass='Log'</c> table - otherwise a user
-        /// column that happens to share a name (e.g. "OID") is wrongly skipped from the glossary.
+        /// unconditional row, plus each conditional row whose ordered AND/OR condition list
+        /// folds TRUE (via <see cref="NamingValidationEngine.AreConditionsSatisfied"/>). This
+        /// is the SAME applicability that ApplyPredefined uses to auto-add columns, so the set
+        /// treated as "predefined" (e.g. exempt from glossary loading) exactly matches the set
+        /// that was actually added. Entity-scoped by design: a column gated on
+        /// <c>TableClass='Parametre'</c> must NOT count as predefined on a
+        /// <c>TableClass='Log'</c> table - otherwise a user column that happens to share a name
+        /// (e.g. "OID") is wrongly skipped from the glossary.
         /// </summary>
         public HashSet<string> GetApplicableNames(dynamic entity)
         {
             if (!_isLoaded) return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            return GetApplicableNames(_columns, udpName => ReadEntityUdp(entity, udpName));
+            return GetApplicableNames(_columns, entity);
         }
 
         /// <summary>
-        /// Pure applicability core (no SCAPI) so it is unit-testable. <paramref name="readUdp"/>
-        /// resolves a UDP name to the entity's live value (called at most once per distinct UDP,
-        /// results cached). A conditional row applies when that value equals its DependsOnUdpValue
-        /// (case-insensitive); unconditional rows always apply.
+        /// Applicability core: the columns from <paramref name="columns"/> whose ordered
+        /// AND/OR condition list evaluates TRUE against <paramref name="entity"/> (an
+        /// empty list == unconditional == always). Evaluated by the shared
+        /// <see cref="NamingValidationEngine.AreConditionsSatisfied"/> engine (WP#280), so
+        /// predefined applicability is bit-for-bit the same fold naming rules use, with the
+        /// same sparse-storage / model-scoped-UDP handling. Unit-testable by passing a fake
+        /// entity that implements <c>.Properties(path).Value</c> (see the naming engine
+        /// tests' PartialEntity/FakeProp pattern).
         /// </summary>
-        public static HashSet<string> GetApplicableNames(IEnumerable<PredefinedColumn> columns, Func<string, string> readUdp)
+        public static HashSet<string> GetApplicableNames(IEnumerable<PredefinedColumn> columns, dynamic entity)
         {
             var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             if (columns == null) return names;
 
-            var udpCache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             foreach (var col in columns)
             {
                 if (col == null || string.IsNullOrEmpty(col.ColumnName)) continue;
-                if (col.IsUnconditional) { names.Add(col.ColumnName); continue; }
-                if (string.IsNullOrEmpty(col.DependsOnUdpName)) continue;
-
-                if (!udpCache.TryGetValue(col.DependsOnUdpName, out var live))
-                {
-                    live = readUdp?.Invoke(col.DependsOnUdpName) ?? "";
-                    udpCache[col.DependsOnUdpName] = live;
-                }
-                if (string.Equals(live, col.DependsOnUdpValue, StringComparison.OrdinalIgnoreCase))
+                if (NamingValidationEngine.AreConditionsSatisfied(col.Conditions, "Table", entity))
                     names.Add(col.ColumnName);
             }
             return names;
-        }
-
-        /// <summary>Read <c>Entity.Physical.{udpName}</c> off a live entity; returns "" when the
-        /// UDP is not assigned (r10.10 sparse storage throws on an unassigned UDP - the expected
-        /// "condition cannot hold" case, mirroring <see cref="FindApplicableLockedRule"/>).</summary>
-        private static string ReadEntityUdp(dynamic entity, string udpName)
-        {
-            if (entity == null || string.IsNullOrEmpty(udpName)) return "";
-            try
-            {
-                return entity.Properties($"Entity.Physical.{udpName}")?.Value?.ToString() ?? "";
-            }
-            catch
-            {
-                // SCAPI "Entity class does not use a property of ... type": the entity has never
-                // been assigned this UDP, so the gating condition cannot be met - treat as "".
-                return "";
-            }
         }
 
         public void Reload(string platformDbType = null)

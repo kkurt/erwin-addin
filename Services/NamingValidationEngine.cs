@@ -500,8 +500,25 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// resolved boolean (Key_Group_Member walk) instead of a property read.
         /// </summary>
         public static bool IsRuleApplicable(NamingStandardRule rule, string objectType, dynamic scapiObject, bool? pkMembership)
+            => AreConditionsSatisfied(rule?.Conditions, objectType, scapiObject, pkMembership);
+
+        /// <summary>
+        /// Evaluate an ordered DEPENDS_ON condition list - the shared applicability
+        /// engine for EVERY feature that carries a MC_*_CONDITION child table
+        /// (<c>MC_NAMING_RULE_CONDITION</c> for naming rules,
+        /// <c>MC_PREDEFINED_COLUMN_CONDITION</c> for predefined columns). The list is
+        /// folded strictly LEFT-TO-RIGHT with no precedence and no parentheses:
+        /// <c>result = term0; result = result AND/OR termN</c> per each later term's
+        /// CONNECTOR. An EMPTY/null list means unconditional (always true). Each term
+        /// matches exactly as the legacy single condition did (a UDP or erwin built-in
+        /// property value IN the CSV, case-insensitive). <paramref name="objectType"/>
+        /// selects the UDP owner class ("Table" -> <c>Entity.Physical.X</c>). Callers
+        /// MUST reuse this rather than reimplement the fold, so naming and predefined
+        /// stay bit-for-bit identical (WP#280).
+        /// </summary>
+        public static bool AreConditionsSatisfied(
+            IReadOnlyList<NamingRuleCondition> conditions, string objectType, dynamic scapiObject, bool? pkMembership = null)
         {
-            var conditions = rule?.Conditions;
             if (conditions == null || conditions.Count == 0)
                 return true; // unconditional
 
@@ -529,12 +546,23 @@ namespace EliteSoft.Erwin.AddIn.Services
             bool hasUdpSource = c.DependsOnUdpId.HasValue && !string.IsNullOrEmpty(c.DependsOnUdpName);
             bool hasPropSource = c.DependsOnPropertyDefId.HasValue && !string.IsNullOrEmpty(c.DependsOnPropertyCode);
 
-            // The loader skips source-less terms (NamingStandardService.LoadRuleConditions),
-            // so this path is unreachable in practice. If one still arrives, treat it as
-            // vacuously satisfied (true): the neutral element for AND. (An OR'd vacuous
-            // term would force the result true, but that cannot happen given the loader filter.)
-            if (!hasUdpSource && !hasPropSource)
+            // A term that names NO source at all is dropped by both loaders (the XOR-skip),
+            // so this is unreachable in practice; treat it as vacuously satisfied (true),
+            // the neutral element for AND.
+            if (!c.DependsOnUdpId.HasValue && !c.DependsOnPropertyDefId.HasValue)
                 return true;
+
+            // A term that DOES name a source (a UDP / property FK) but whose resolved
+            // name/code came back empty is a DANGLING reference - the gating UDP or
+            // property was deleted while the condition row still points at it (the loader's
+            // LEFT JOIN then yields a NULL name). The gate targets a source that no longer
+            // exists, so it can never hold: the term does NOT match. Returning the old
+            // vacuous-true here would flip a single-term column to "applies to EVERY object"
+            // - the pre-WP#280 predefined path guarded exactly this with an empty-name skip,
+            // so this keeps predefined bit-for-bit AND hardens naming against the same
+            // fail-open (both share this method).
+            if (!hasUdpSource && !hasPropSource)
+                return false;
 
             if (pkMembership.HasValue && IsPkMembershipCondition(c))
                 return MatchesCsv(pkMembership.Value ? "True" : "False", c.DependsOnPropertyValues);
@@ -711,6 +739,19 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// lets a model-level condition (e.g. the model's Application) gate a table
         /// rule model-wide.</para>
         /// </summary>
+        /// <summary>
+        /// Public wrapper over <see cref="ReadUdpValue"/> for the Template
+        /// applier's <c>{Udp:Name}</c> token source (migration 9). Reuses the
+        /// exact condition-read semantics on purpose: owner class derived from
+        /// the rule's object type, and the <c>Model.Physical</c> fallback so a
+        /// column template can read a MODEL-scoped UDP (most admin UDPs are
+        /// model-scoped, e.g. ApplicationCode). Returns "" when the UDP is
+        /// absent; the renderer's empty-token check turns that into a
+        /// <see cref="TemplateResolutionException"/> (never a silent blank).
+        /// </summary>
+        public static string ReadUdpValueForRule(dynamic scapiObject, string objectType, string udpName)
+            => ReadUdpValue(scapiObject, objectType, udpName);
+
         private static string ReadUdpValue(dynamic scapiObject, string objectType, string udpName)
         {
             string ownerClass = objectType?.ToLower() switch

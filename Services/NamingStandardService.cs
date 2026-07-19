@@ -144,6 +144,28 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// </summary>
         public string TemplateFillMode { get; set; }
 
+        // --- UDP write target (migration 9, 2026-07-19) ---
+        // A Template rule targets EITHER an erwin property (PROPERTY_DEF_ID ->
+        // PropertyCode) OR a UDP (TARGET_UDP_ID -> MC_UDP_DEFINITION); the DB
+        // check CK_MC_NAMING_TARGET_XOR forbids both. When TargetUdpId is set
+        // the rendered value is written to "{OwnerClass}.Physical.{TargetUdpName}"
+        // instead of a property code.
+
+        /// <summary>TARGET_UDP_ID (FK to MC_UDP_DEFINITION); null for property-targeted rules.</summary>
+        public int? TargetUdpId { get; set; }
+
+        /// <summary>Resolved MC_UDP_DEFINITION.NAME for <see cref="TargetUdpId"/>; "" when property-targeted.</summary>
+        public string TargetUdpName { get; set; }
+
+        /// <summary>
+        /// Resolved MC_UDP_DEFINITION.OBJECT_TYPE (e.g. "TABLE", "COLUMN",
+        /// "MODEL") for <see cref="TargetUdpId"/>; "" when property-targeted.
+        /// The applier requires this to match the rule's own object type
+        /// (a COLUMN rule may only fill a COLUMN UDP) and skips-with-log on a
+        /// mismatch - it never writes to a differently-scoped object.
+        /// </summary>
+        public string TargetUdpObjectType { get; set; }
+
         /// <summary>
         /// Context gate (2026-05-25 admin schema): "Create" fires only when
         /// the rule's target object/column was just newly created in this
@@ -380,7 +402,24 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     // leading/trailing spaces in the literal text.
                                     ValueTemplate = reader["VALUE_TEMPLATE"] == DBNull.Value ? "" : reader["VALUE_TEMPLATE"]?.ToString() ?? "",
                                     TemplateFillMode = reader["TEMPLATE_FILL_MODE"] == DBNull.Value ? "" : reader["TEMPLATE_FILL_MODE"]?.ToString()?.Trim() ?? "",
+                                    // UDP write target (migration 9): resolved via the
+                                    // tudp LEFT JOIN; null/"" for property-targeted rules.
+                                    TargetUdpId = reader["TARGET_UDP_ID"] == DBNull.Value
+                                        ? (int?)null
+                                        : Convert.ToInt32(reader["TARGET_UDP_ID"]),
+                                    TargetUdpName = reader["TARGET_UDP_NAME"] == DBNull.Value ? "" : reader["TARGET_UDP_NAME"]?.ToString()?.Trim() ?? "",
+                                    TargetUdpObjectType = reader["TARGET_UDP_OBJECT_TYPE"] == DBNull.Value ? "" : reader["TARGET_UDP_OBJECT_TYPE"]?.ToString()?.Trim() ?? "",
                                 };
+
+                                // CK_MC_NAMING_TARGET_XOR forbids a rule that targets both a
+                                // property and a UDP; defend against pre-constraint rows the
+                                // same way the condition loader defends its XOR (skip + log).
+                                if (rule.PropertyDefId.HasValue && rule.TargetUdpId.HasValue)
+                                {
+                                    System.Diagnostics.Debug.WriteLine(
+                                        $"NamingStandardService: skipping rule ID={rule.Id} - both PROPERTY_DEF_ID and TARGET_UDP_ID set (violates CK_MC_NAMING_TARGET_XOR)");
+                                    continue;
+                                }
 
                                 if (!rule.IsActive) continue;
 
@@ -422,6 +461,9 @@ namespace EliteSoft.Erwin.AddIn.Services
         // Schema (post 2026-05-17 admin refactor + C3 polymorphic condition):
         //   MC_NAMING_STANDARD.OBJECT_TYPE_ID            -> MC_OBJECT_TYPE.ID
         //   MC_NAMING_STANDARD.PROPERTY_DEF_ID           -> MC_PROPERTY_DEF.ID (the property the rule constrains)
+        //   MC_NAMING_STANDARD.TARGET_UDP_ID              -> MC_UDP_DEFINITION.ID (migration 9: Template rule's UDP
+        //                                                    write target; CK_MC_NAMING_TARGET_XOR forbids setting
+        //                                                    it together with PROPERTY_DEF_ID)
         //   MC_NAMING_STANDARD.RULE_TYPE                  -> one of Prefix/Suffix/Length/Regexp
         //   MC_NAMING_STANDARD.IS_REQUIRED                -> orthogonal non-empty gate
         //   MC_NAMING_STANDARD.DEPENDS_ON_UDP_ID          -> MC_UDP_DEFINITION.ID (XOR with PROPERTY_DEF_ID below)
@@ -572,10 +614,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                             ns.""PREFIX"", ns.""SUFFIX"", ns.""LENGTH_OPERATOR"", ns.""LENGTH_VALUE"",
                             ns.""REGEXP_PATTERN"", ns.""ERROR_MESSAGE"", ns.""AUTO_APPLY"", ns.""IS_ACTIVE"", ns.""SORT_ORDER"",
                             ns.""CONFIG_ID"", ns.""APPLY_ON"",
-                            ns.""VALUE_TEMPLATE"", ns.""TEMPLATE_FILL_MODE""
+                            ns.""VALUE_TEMPLATE"", ns.""TEMPLATE_FILL_MODE"",
+                            ns.""TARGET_UDP_ID"", tudp.""NAME"" AS ""TARGET_UDP_NAME"", tudp.""OBJECT_TYPE"" AS ""TARGET_UDP_OBJECT_TYPE""
                             FROM ""MC_NAMING_STANDARD"" ns
                             JOIN ""MC_OBJECT_TYPE""  ot ON ot.""ID"" = ns.""OBJECT_TYPE_ID""
                             LEFT JOIN ""MC_PROPERTY_DEF"" pd ON pd.""ID"" = ns.""PROPERTY_DEF_ID""
+                            LEFT JOIN ""MC_UDP_DEFINITION"" tudp ON tudp.""ID"" = ns.""TARGET_UDP_ID""
                             WHERE ns.""IS_ACTIVE"" = true
                               AND ns.""CONFIG_ID"" = @cfgId
                               AND (ns.""PROPERTY_DEF_ID"" IS NULL OR pd.""DBMS_VERSION_ID"" IS NULL)
@@ -587,10 +631,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                             ns.PREFIX, ns.SUFFIX, ns.LENGTH_OPERATOR, ns.LENGTH_VALUE,
                             ns.REGEXP_PATTERN, ns.ERROR_MESSAGE, ns.AUTO_APPLY, ns.IS_ACTIVE, ns.SORT_ORDER,
                             ns.CONFIG_ID, ns.APPLY_ON,
-                            ns.VALUE_TEMPLATE, ns.TEMPLATE_FILL_MODE
+                            ns.VALUE_TEMPLATE, ns.TEMPLATE_FILL_MODE,
+                            ns.TARGET_UDP_ID, tudp.NAME AS TARGET_UDP_NAME, tudp.OBJECT_TYPE AS TARGET_UDP_OBJECT_TYPE
                             FROM MC_NAMING_STANDARD ns
                             JOIN MC_OBJECT_TYPE  ot ON ot.ID = ns.OBJECT_TYPE_ID
                             LEFT JOIN MC_PROPERTY_DEF pd ON pd.ID = ns.PROPERTY_DEF_ID
+                            LEFT JOIN MC_UDP_DEFINITION tudp ON tudp.ID = ns.TARGET_UDP_ID
                             WHERE ns.IS_ACTIVE = 1
                               AND ns.CONFIG_ID = :cfgId
                               AND (ns.PROPERTY_DEF_ID IS NULL OR pd.DBMS_VERSION_ID IS NULL)
@@ -603,10 +649,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                             ns.[PREFIX], ns.[SUFFIX], ns.[LENGTH_OPERATOR], ns.[LENGTH_VALUE],
                             ns.[REGEXP_PATTERN], ns.[ERROR_MESSAGE], ns.[AUTO_APPLY], ns.[IS_ACTIVE], ns.[SORT_ORDER],
                             ns.[CONFIG_ID], ns.[APPLY_ON],
-                            ns.[VALUE_TEMPLATE], ns.[TEMPLATE_FILL_MODE]
+                            ns.[VALUE_TEMPLATE], ns.[TEMPLATE_FILL_MODE],
+                            ns.[TARGET_UDP_ID], tudp.[NAME] AS [TARGET_UDP_NAME], tudp.[OBJECT_TYPE] AS [TARGET_UDP_OBJECT_TYPE]
                             FROM [dbo].[MC_NAMING_STANDARD] ns
                             JOIN [dbo].[MC_OBJECT_TYPE]  ot ON ot.[ID] = ns.[OBJECT_TYPE_ID]
                             LEFT JOIN [dbo].[MC_PROPERTY_DEF] pd ON pd.[ID] = ns.[PROPERTY_DEF_ID]
+                            LEFT JOIN [dbo].[MC_UDP_DEFINITION] tudp ON tudp.[ID] = ns.[TARGET_UDP_ID]
                             WHERE ns.[IS_ACTIVE] = 1
                               AND ns.[CONFIG_ID] = @cfgId
                               AND (ns.[PROPERTY_DEF_ID] IS NULL OR pd.[DBMS_VERSION_ID] IS NULL)
@@ -733,11 +781,13 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <summary>
         /// Active <see cref="NamingRuleKind.Template"/> rules for the given
         /// object type (e.g. "Column"), ordered by SortOrder. A Template rule
-        /// must target a property (PropertyCode) and carry a non-empty
-        /// ValueTemplate; malformed rows missing either are skipped here so the
-        /// runtime applier never renders against nothing. The runtime applier
-        /// uses this instead of the per-property <c>_byKey</c> buckets because
-        /// it iterates Template rules by object type, not by target property.
+        /// must target EITHER a property (PropertyCode) OR a UDP (TargetUdpId
+        /// with a resolved TargetUdpName - migration 9) and carry a non-empty
+        /// ValueTemplate; malformed rows missing both targets (or the template)
+        /// are skipped here so the runtime applier never renders against
+        /// nothing. The runtime applier uses this instead of the per-property
+        /// <c>_byKey</c> buckets because it iterates Template rules by object
+        /// type, not by target property.
         /// </summary>
         public IReadOnlyList<NamingStandardRule> GetTemplateRules(string objectType)
         {
@@ -747,7 +797,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                             && r.IsActive
                             && r.RuleType == NamingRuleKind.Template
                             && string.Equals(r.ObjectType, objectType, StringComparison.OrdinalIgnoreCase)
-                            && !string.IsNullOrEmpty(r.PropertyCode)
+                            && (!string.IsNullOrEmpty(r.PropertyCode)
+                                || (r.TargetUdpId.HasValue && !string.IsNullOrEmpty(r.TargetUdpName)))
                             && !string.IsNullOrEmpty(r.ValueTemplate))
                 .OrderBy(r => r.SortOrder)
                 .ToList();

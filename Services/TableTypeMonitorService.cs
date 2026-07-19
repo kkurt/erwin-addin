@@ -364,30 +364,21 @@ namespace EliteSoft.Erwin.AddIn.Services
                     catch (Exception ex) { Log($"PromptForMissingRequiredUdps: dependency cascade failed for '{kvp.Key}': {ex.Message}"); }
                 }
 
-                // Conditional predefined columns (2026-05-24 fix): admin can
-                // attach predefined columns to a UDP value (e.g. "every Log
-                // table gets a LogTime column"). The legacy cascade lived
-                // inside the dead CheckForUdpValueChanges path; with the
-                // Required-UDP popup now being the canonical "user picked
-                // the conditional UDP" event we trigger AddPredefinedColumnsForUdp
-                // directly here so the column lands on the same gesture
-                // that filled the UDP. Per-value try/catch keeps a broken
-                // predefined-column rule from poisoning the cascade for
-                // other UDPs picked in the same form.
-                foreach (var kvp in form.SelectedValues)
+                // Conditional predefined columns (2026-05-24 fix; WP#280 multi-condition):
+                // admin can attach predefined columns to a condition (e.g. "every Log table
+                // gets a LogTime column"). The Required-UDP popup is the canonical "user
+                // picked the conditional UDP(s)" event; the values were just written to the
+                // entity above, so we re-evaluate every conditional column's full ordered
+                // AND/OR list against the entity's now-current state and add the applicable
+                // ones. Evaluating once (not per-kvp) is required because a multi-term
+                // condition can span several UDPs the user filled in this same form.
+                try
                 {
-                    try
-                    {
-                        var conditional = PredefinedColumnService.Instance.GetByUdpCondition(kvp.Key, kvp.Value);
-                        if (conditional != null && conditional.Any())
-                        {
-                            AddPredefinedColumnsForUdp(entity, kvp.Key, kvp.Value, physicalName);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Log($"PromptForMissingRequiredUdps: predefined-column cascade failed for '{kvp.Key}'='{kvp.Value}' on '{physicalName}': {ex.Message}");
-                    }
+                    ReevaluateConditionalPredefinedColumns(entity, physicalName);
+                }
+                catch (Exception ex)
+                {
+                    Log($"PromptForMissingRequiredUdps: conditional predefined re-eval failed on '{physicalName}': {ex.Message}");
                 }
                 return false;
             }
@@ -3558,8 +3549,9 @@ namespace EliteSoft.Erwin.AddIn.Services
                         // than an explicit "system write" flag:
                         //
                         //   1. currentValues is read ONCE per tick BEFORE the
-                        //      HandleUdpValueChange / AddPredefinedColumnsForUdp
-                        //      calls inside this foreach. Any UDP that dependency
+                        //      HandleUdpValueChange calls inside this foreach (the
+                        //      conditional-predefined re-eval now runs once after it).
+                        //      Any UDP that dependency
                         //      logic writes downstream lands in the model AFTER
                         //      currentValues was read, so this foreach iteration
                         //      will not observe it as a diff against snapshot.
@@ -3647,13 +3639,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                         // Evaluate dependencies for this change
                         _udpRuntimeService.HandleUdpValueChange(entity, kvp.Key, kvp.Value);
 
-                        // Check if this UDP change triggers predefined columns
-                        var newPredefined = PredefinedColumnService.Instance.GetByUdpCondition(kvp.Key, kvp.Value);
-                        if (newPredefined.Any())
-                        {
-                            AddPredefinedColumnsForUdp(entity, kvp.Key, kvp.Value, physicalName);
-                        }
-
                         snapshot.UdpValues[kvp.Key] = kvp.Value;
                     }
                 }
@@ -3666,6 +3651,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                     {
                         snapshot.UdpValues[kvp.Key] = kvp.Value;
                     }
+
+                    // A UDP change can complete a predefined column's ordered AND/OR condition
+                    // (WP#280). Re-evaluate every conditional column's full list against the
+                    // entity's now-current state and add the applicable ones. Evaluated once per
+                    // tick (not per changed UDP) so a multi-term condition spanning several UDPs
+                    // resolves correctly; idempotent + self-guarded.
+                    ReevaluateConditionalPredefinedColumns(entity, physicalName);
 
                     // UDP value change can affect UDP-conditional naming rules
                     // (e.g. TABLE_TYPE='LOG' triggers a 'LOG_' prefix rule scoped to TABLE_TYPE=LOG).
@@ -3737,24 +3729,17 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// Add predefined columns to the entity based on a UDP condition match.
-        /// Called when a UDP value change matches predefined column rules.
-        /// </summary>
-        /// <summary>
-        /// Re-evaluate every conditional predefined-column rule against
-        /// the entity's CURRENT UDP values. For each rule whose
-        /// <c>DEPENDS_ON_UDP_VALUE</c> matches the entity's current UDP
-        /// value, apply its predefined columns (idempotent: already-
-        /// present columns are skipped by
-        /// <see cref="ApplyPredefinedColumnsToEntity"/>). Used by the
-        /// Entity / Column Editor close paths to pick up UDP changes the
-        /// user made via the grid - the live per-tick UDP watcher was
-        /// disabled 2026-05-22 due to erwin crashes, so the close-edge
-        /// pass is the only place we can re-evaluate without paying the
-        /// per-tick read cost. Columns added by a rule whose UDP no
-        /// longer matches are intentionally NOT removed - admin's intent
-        /// was "add these when UDP=X", and dropping them later would
-        /// risk losing user-typed column metadata.
+        /// Re-evaluate every conditional predefined column against the entity's CURRENT
+        /// state. For each column whose ordered AND/OR condition list folds TRUE (via
+        /// <see cref="NamingValidationEngine.AreConditionsSatisfied"/>, WP#280), apply its
+        /// columns (idempotent: already-present columns are skipped by
+        /// <see cref="ApplyPredefinedColumnsToEntity"/>). Used by the Entity / Column Editor
+        /// close paths and the required-UDP / UDP-change gestures to pick up condition
+        /// changes the user made - the live per-tick UDP watcher was disabled 2026-05-22 due
+        /// to erwin crashes, so these close-edge passes are the only place we re-evaluate
+        /// without paying the per-tick read cost. Columns added by a condition that no longer
+        /// holds are intentionally NOT removed - admin's intent was "add when the condition
+        /// holds", and dropping them later would risk losing user-typed column metadata.
         /// </summary>
         public void ReevaluateConditionalPredefinedColumns(dynamic entity, string physicalName)
         {
@@ -3766,71 +3751,30 @@ namespace EliteSoft.Erwin.AddIn.Services
                     PredefinedColumnService.Instance.LoadPredefinedColumns();
                 }
 
-                // Distinct list of UDP names referenced by any conditional
-                // rule. Reading per-UDP once keeps the SCAPI cost bounded
-                // to O(rules) regardless of how many predefined columns
-                // each rule produces.
-                var conditionalRules = PredefinedColumnService.Instance.GetAll()
-                    .Where(c => c != null && !string.IsNullOrEmpty(c.DependsOnUdpName) && !string.IsNullOrEmpty(c.DependsOnUdpValue))
+                // Every conditional column (empty condition list == unconditional, handled
+                // separately on new-entity creation). WP#280: a column may now depend on an
+                // ordered AND/OR list of UDP/property terms, so we re-evaluate the whole list
+                // against the entity's CURRENT state via the shared engine instead of the old
+                // single UDP=value compare. This is triggered on the editor-close / required-UDP
+                // gestures (the live per-tick watcher was disabled 2026-05-22), so it is the one
+                // place a multi-term condition that just became satisfied gets its columns.
+                var conditionalColumns = PredefinedColumnService.Instance.GetAll()
+                    .Where(c => c != null && c.Conditions.Count > 0)
                     .ToList();
-                Log($"ReevaluateConditionalPredefinedColumns: '{physicalName}' - {conditionalRules.Count} conditional rule(s) loaded (total loaded={PredefinedColumnService.Instance.GetAll().Count()})");
-                if (conditionalRules.Count == 0) return;
+                if (conditionalColumns.Count == 0) return;
 
-                var udpNames = conditionalRules.Select(c => c.DependsOnUdpName)
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                var toApply = conditionalColumns
+                    .Where(c => NamingValidationEngine.AreConditionsSatisfied(c.Conditions, "Table", entity))
+                    .OrderBy(c => c.SortOrder)
                     .ToList();
+                Log($"ReevaluateConditionalPredefinedColumns: '{physicalName}' - {toApply.Count}/{conditionalColumns.Count} conditional column(s) now applicable");
+                if (toApply.Count == 0) return;
 
-                var liveUdp = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                foreach (var udpName in udpNames)
-                {
-                    string path = $"Entity.Physical.{udpName}";
-                    try
-                    {
-                        liveUdp[udpName] = entity.Properties(path)?.Value?.ToString() ?? "";
-                        Log($"ReevaluateConditionalPredefinedColumns: read '{path}' on '{physicalName}' = '{liveUdp[udpName]}'");
-                    }
-                    catch (Exception ex)
-                    {
-                        Log($"ReevaluateConditionalPredefinedColumns: read '{path}' on '{physicalName}' failed: {ex.Message}");
-                        liveUdp[udpName] = "";
-                    }
-                }
-
-                // Distinct (udpName, udpValue) pairs that match the live
-                // state. AddPredefinedColumnsForUdp re-queries by the same
-                // key so calling it once per pair is sufficient.
-                var firedPairs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                foreach (var rule in conditionalRules)
-                {
-                    if (!liveUdp.TryGetValue(rule.DependsOnUdpName, out var liveVal))
-                    {
-                        Log($"ReevaluateConditionalPredefinedColumns: rule '{rule.DependsOnUdpName}'='{rule.DependsOnUdpValue}' SKIP - liveUdp has no entry for '{rule.DependsOnUdpName}'");
-                        continue;
-                    }
-                    if (string.IsNullOrEmpty(liveVal))
-                    {
-                        Log($"ReevaluateConditionalPredefinedColumns: rule '{rule.DependsOnUdpName}'='{rule.DependsOnUdpValue}' SKIP - live value empty");
-                        continue;
-                    }
-                    if (!rule.DependsOnUdpValue.Equals(liveVal, StringComparison.OrdinalIgnoreCase))
-                    {
-                        Log($"ReevaluateConditionalPredefinedColumns: rule '{rule.DependsOnUdpName}'='{rule.DependsOnUdpValue}' SKIP - live value='{liveVal}' (mismatch)");
-                        continue;
-                    }
-                    Log($"ReevaluateConditionalPredefinedColumns: rule '{rule.DependsOnUdpName}'='{rule.DependsOnUdpValue}' MATCH live='{liveVal}' on '{physicalName}'");
-
-                    string key = rule.DependsOnUdpName + "\0" + rule.DependsOnUdpValue;
-                    if (!firedPairs.Add(key)) continue;
-
-                    try
-                    {
-                        AddPredefinedColumnsForUdp(entity, rule.DependsOnUdpName, rule.DependsOnUdpValue, physicalName);
-                    }
-                    catch (Exception ex)
-                    {
-                        Log($"ReevaluateConditionalPredefinedColumns: AddPredefinedColumnsForUdp err for '{rule.DependsOnUdpName}'='{rule.DependsOnUdpValue}' on '{physicalName}': {ex.Message}");
-                    }
-                }
+                // Idempotent: ApplyPredefinedColumnsToEntity skips columns already present,
+                // and columns whose condition no longer holds are intentionally NOT removed
+                // (admin intent was "add when the condition holds"; dropping later would risk
+                // losing user-typed column metadata).
+                ApplyPredefinedColumnsToEntity(entity, toApply, physicalName, "conditional re-eval");
             }
             catch (Exception ex)
             {
@@ -4148,7 +4092,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             {
                 string contextLabel = rule.IsUnconditional
                     ? "LOCKED-RESTORE unconditional"
-                    : $"LOCKED-RESTORE UDP '{rule.DependsOnUdpName}'='{rule.DependsOnUdpValue}'";
+                    : $"LOCKED-RESTORE conditional ({rule.Conditions.Count} term(s))";
                 ApplyPredefinedColumnsToEntity(entity, new[] { rule }, physicalName, contextLabel);
             }
             catch (Exception ex)
@@ -4157,34 +4101,12 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
         }
 
-        private void AddPredefinedColumnsForUdp(dynamic entity, string udpName, string udpValue, string physicalName)
-        {
-            try
-            {
-                // Ensure PredefinedColumnService is loaded
-                if (!PredefinedColumnService.Instance.IsLoaded)
-                {
-                    PredefinedColumnService.Instance.LoadPredefinedColumns();
-                }
-
-                var predefinedColumns = PredefinedColumnService.Instance.GetByUdpCondition(udpName, udpValue);
-                if (!predefinedColumns.Any()) return;
-
-                string context = $"UDP '{udpName}'='{udpValue}'";
-                ApplyPredefinedColumnsToEntity(entity, predefinedColumns, physicalName, context);
-            }
-            catch (Exception ex)
-            {
-                Log($"AddPredefinedColumnsForUdp error for '{physicalName}': {ex.Message}");
-            }
-        }
-
         /// <summary>
         /// Add the config's UNCONDITIONAL predefined columns to <paramref name="entity"/>.
         /// Called once when a brand-new entity is first detected so the
-        /// "always apply" rows admin authored (DEPENDS_ON_UDP_ID = NULL,
-        /// 2026-05-14 schema extension) land on every new table independently
-        /// of UDP cascades. Idempotent through the in-entity name check inside
+        /// "always apply" rows admin authored (no condition terms, i.e.
+        /// <see cref="PredefinedColumn.IsUnconditional"/>) land on every new table
+        /// independently of condition cascades. Idempotent through the in-entity name check inside
         /// <see cref="ApplyPredefinedColumnsToEntity"/>, so re-firing on a
         /// rebaseline cycle does not duplicate columns.
         /// </summary>

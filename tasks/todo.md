@@ -1,3 +1,114 @@
+# Value Template v2: UDP target + {Udp:...} source + pipe functions (2026-07-19) - DONE + LIVE-VERIFIED
+
+## Live verification result (2026-07-19, MetaRepoTmp+Zeynep, config 1012)
+- [x] Kural A (UDP target + funcs + related source): column 'Xyz' ->
+      [TEMPLATE-APPLY] Attribute.Physical.TemplateTargetTest='TABL_xyz'.
+- [x] Kural B ({Udp:Application|upper|left:3}): with Application model UDP set
+      -> 'UYG'; with it empty -> [TEMPLATE-SKIP] (never-write-empty contract).
+- [x] Applied at NAME-COMMIT moment (editor still open) - value visible without
+      closing the Column Editor (user requirement).
+- [x] CRASH FIX: writing at editor-CLOSE raced GDM teardown -> fatal AV in
+      EM_GDM!GDMActionSummary::GraftPostState (dump erwin.exe.51960.dmp). Moved
+      the apply into the pending-name drain (proven-safe editor-open window, same
+      as required-UDP prompt); editor-close heartbeat stays as idempotent catch-up.
+      Added [TEMPLATE-WRITE] pre-write marker so a future native death is traceable.
+- [x] Seed rules + test UDP defs REMOVED from both DBs after the test.
+
+
+## Request (user, 2026-07-19)
+Admin side done, migration 9 live (verified on ALL 9 MetaRepo* DBs: TARGET_UDP_ID
+column + CK_MC_NAMING_TARGET_XOR + MC_UDP_DEFINITION present). Extend the add-in
+Template resolver:
+1. New token source {Udp:Name} - read a UDP of the SAME object (name may contain ':').
+2. Per-token pipe function chain, left to right: trim, upper, lower, left:n,
+   right:n, substr:start:len, replace:a:b.
+3. If rule has TARGET_UDP_ID -> write rendered value into that UDP instead of a
+   property. XOR with PROPERTY_DEF_ID (DB CK enforces).
+4. PRESERVE contract: FillMode (OnlyIfEmpty/Always), ApplyOn (Create/Update/Both),
+   AND/OR condition gating, "error out, never write empty". Same pipeline, no
+   separate "UDP formula" path.
+
+## Current state (explored 2026-07-19)
+- Grammar lives in pure NamingTemplateEngine.Render (Services/NamingTemplateEngine.cs:69).
+  Sources today: {Prop} (no dot) + {Alias.Prop} (first dot). NO pipe, NO Udp:.
+- Apply sites: ApplyColumnTemplateRules (ValidationCoordinatorService.cs:5427) and
+  ApplyPrimaryKeyRules (:5679). Write = obj.Properties(rule.PropertyCode).Value.
+  TABLE-object template rules have NO apply site today (unchanged by this work).
+- Loader GetQuery/LoadStandards (NamingStandardService.cs:565/322) does NOT read
+  TARGET_UDP_ID; rule model has no TargetUdp fields.
+- UDP read for conditions: NamingValidationEngine.ReadUdpValue (:742) - owner class
+  from objectType + "{Owner}.Physical.{name}" + Model.Physical fallback (private).
+- UDP value write canonical: UdpRuntimeService.TrySetUdpProperty (:681) - set, on
+  reject Properties.Add then retry. Currently private instance (uses no state).
+- Live DB: MC_UDP_DEFINITION.OBJECT_TYPE in {MODEL, TABLE, COLUMN}. Rule 1167 =
+  the only live Template (PK_{Table.Physical_Name}, PK, property target).
+
+## Status (2026-07-19)
+- [x] Steps 1-7 done: engine v2 + loader + apply sites + 38 new tests.
+      736/736 green; both flavors 0 warn / 0 err. Loader SQL verbatim-verified
+      on MetaRepoZeynep (rule 1176 resolves TARGET_UDP_NAME/OBJECT_TYPE; 1167
+      untouched).
+- [ ] Step 8 in-erwin part: seeded UDP 2040 'TemplateTargetTest' (COLUMN) +
+      rule 1176 '{Udp:Application|upper|left:3}_{Physical_Name|lower}' ->
+      TARGET_UDP_ID 2040, APPLY_ON=Create, Always, AUTO_APPLY=1, config 1012.
+      erwin was RUNNING at install time - awaiting user OK to restart, then:
+      new column in a 1012 model (e.g. SQL/1_DEV/EK_KART) -> expect
+      [TEMPLATE-APPLY] ... Attribute.Physical.TemplateTargetTest='APP_<col>'.
+      Cleanup after test: DELETE the two seeded rows (script in scratchpad).
+
+## Plan
+- [ ] 1. NamingTemplateEngine grammar v2 (pure, all unit-testable):
+      token = SOURCE ("|" FUNC(":"ARG)*)*. Split inner token on '|': seg0=SOURCE,
+      rest=funcs. SOURCE dispatch ORDER: "Udp:" prefix (OrdinalIgnoreCase) FIRST
+      (rest = UDP name, may contain ':' and '.'), else first-dot Alias.Prop, else
+      own Prop. New optional 4th delegate udpReader; {Udp:X} with null reader =
+      TemplateResolutionException (no silent skip).
+- [ ] 2. Function chain evaluator in the engine: 7 funcs, left to right.
+      Malformed = TemplateResolutionException (unknown name, wrong arg count,
+      non-int/negative n). After the full chain the FINAL value must be non-empty,
+      else throw (extends the never-write-empty contract).
+- [ ] 3. Self-ref guards pipe-aware: ReferencesOwnProperty must compare the SOURCE
+      (strip |chain) - {Physical_Name|upper} targeting Physical_Name IS self-ref.
+      New ReferencesOwnUdp(template, udpName) for UDP-target rules (runaway guard,
+      same rationale as PK_ '+Always' runaway).
+- [ ] 4. Rule model + loader: NamingStandardRule += TargetUdpId(int?),
+      TargetUdpName, TargetUdpObjectType. All 3 SQL dialects: select
+      ns.TARGET_UDP_ID + LEFT JOIN MC_UDP_DEFINITION tudp -> NAME/OBJECT_TYPE.
+      Reader maps; both-set rows (CK-violating) skip+log like condition XOR skip.
+      GetTemplateRules filter: ValueTemplate + (PropertyCode OR TargetUdpName).
+- [ ] 5. Apply sites (Column + PK), shared flow unchanged (ApplyOn -> conditions ->
+      self-ref -> Render -> FillMode -> idempotent -> AutoApply prompt -> write):
+      if TargetUdpId set -> target path "{OwnerClass}.Physical.{TargetUdpName}",
+      current-value read sparse-safe, write via TrySetUdpProperty (make it
+      internal static in UdpRuntimeService - it uses no instance state - and
+      reuse, no duplicate). Guard: TargetUdpObjectType must equal the rule's
+      object type (COLUMN rule -> COLUMN UDP), mismatch = skip + [TEMPLATE-SKIP]
+      log, never silent. udpReader delegate = public wrapper over
+      NamingValidationEngine.ReadUdpValue (keeps Model.Physical fallback so
+      {Udp:ApplicationCode} on a column reads the MODEL UDP).
+- [ ] 6. Tests (NamingTemplateEngineTests + new): each func, chaining order,
+      malformed funcs, empty-after-chain, {Udp:name-with-colon-and-dot}, no
+      udpReader, back-compat (pipeless templates byte-identical), pipe-aware
+      self-ref, loader filter. Full suite green.
+- [ ] 7. Build both flavors 0 warn / 0 err.
+- [ ] 8. LIVE verification on real model (build-and-run): (a) rule 1167 PK
+      property template unchanged; (b) new COLUMN rule with TARGET_UDP_ID +
+      {Udp:...} source + function chain writes expected UDP value; seed test rule
+      in MetaRepoZeynep config 1012, then remove it.
+
+## Assumptions (flagged for user)
+- A1 upper/lower = ToUpperInvariant/ToLowerInvariant (NOT tr-TR; DB-identifier
+  context, consistent with glossary CASE_INSENSITIVE=OrdinalIgnoreCase decision).
+- A2 Func names case-insensitive; replace args used verbatim (no trim), 'a'
+  non-empty, args cannot contain ':' or '|' (grammar separators); numeric args
+  int >= 0.
+- A3 left:n / right:n with n >= length -> whole string; substr start beyond end ->
+  empty (then the final-empty error applies if nothing else remains).
+- A4 UDP-target only meaningful for COLUMN/TABLE-object rules today (PK has no
+  matching UDP OBJECT_TYPE); mismatch guarded+logged. TABLE template rules still
+  have no apply site (pre-existing, out of scope).
+
+
 # DDLGENERATOR build flavor: dedicated DDL-generation add-in (2026-07-11) - PLAN APPROVED 2026-07-12
 
 ## Phase 7 - Unattended robustness (2026-07-13, live-test findings)
@@ -674,3 +785,19 @@ the column-add-via-Model-Explorer bug.
 - RESOLVED: Key_Group.Physical_Name IS writable via SCAPI (the PK constraint name) - unlike Views which have no Physical_Name. The earlier ship-blocker uncertainty is cleared.
 - Self-referential guard LIVE-VERIFIED: with the old 'PK_{Physical_Name}' it logged [PK-TEMPLATE-SKIP] once, 0 APPLY, flicker gone.
 - Status: all PK work + self-ref guard done. Build 0/0, tests 395/395. Generic over PropertyCode (admin can target Name instead of Physical_Name if a visible-name rename is ever wanted - no code change). NOT committed.
+
+# WP#280 review (2026-07-18) - Predefined columns: single "When UDP" -> ordered AND/OR list
+
+Done (add-in side; admin backend/web/migration already shipped):
+- Shared evaluator: extracted `NamingValidationEngine.AreConditionsSatisfied(list, objectType, obj, pk?)` from `IsRuleApplicable` (which now delegates). Both naming rules and predefined columns fold through it - one engine, no duplicated logic.
+- `PredefinedColumn`: dropped `DependsOnUdp*`; added `List<NamingRuleCondition> Conditions` (reuses the naming row type); `IsUnconditional => Conditions.Count == 0`.
+- Loader: main `PREDEFINED_COLUMN` query no longer selects the dropped columns/UDP join; new `LoadColumnConditions` reads `MC_PREDEFINED_COLUMN_CONDITION` - a faithful clone of `NamingStandardService.LoadRuleConditions` (XOR-skip, ORDER_INDEX sort, fails the load on error).
+- Applicability: `GetApplicableNames` + `FindApplicableLockedRule` go through the shared fold; removed `GetByUdpCondition`/`GetByUdpName`/`AddPredefinedColumnsForUdp`.
+- Reactive: `ReevaluateConditionalPredefinedColumns` re-evaluates every conditional column's full list; the two per-UDP call sites (required-UDP prompt after WriteUdpValues, and the UDP-change `anyChanged` block) now call it once each.
+- Hardening (from adversarial review): a term whose source FK is set but resolved name is empty (dangling UDP - gating UDP deleted) previously hit the evaluator's vacuous-true fallback -> single-term column applied to EVERY table. Now returns false (gate cannot hold). Restores old predefined fail-safe AND hardens naming (shared path).
+
+Verified:
+- Build 0/0. Tests 687/687 (rewrote `PredefinedColumnApplicabilityTests` for unconditional / single-migrated / AND / OR / left-to-right-fold / dangling-FK; fakes MUST be `public` for cross-assembly dynamic dispatch).
+- Live schema (MetaRepoZeynep): child-table columns match the loader exactly; flat `DEPENDS_ON_UDP_*` gone from PREDEFINED_COLUMN; the exact loader JOIN query runs and resolves UDP_NAME.
+- Live data across all 9 MetaRepo* DBs: 146 condition terms, ALL at ORDER_INDEX=0 (regression guarantee: migrated single conditions fold identically), 0 comma-bearing values (CSV-split concern inert), 0 dangling UDP FKs.
+- REMAINING: in-erwin UI runtime test (create Log/Parametre tables, watch the columns land) - not driven here to avoid disrupting the live erwin session. NOT committed.

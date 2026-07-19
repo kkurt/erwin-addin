@@ -455,6 +455,14 @@ namespace EliteSoft.Erwin.AddIn.Services
         private readonly Dictionary<string, (string pick, DateTime when)> _allowedDatatypeUserPicks
             = new Dictionary<string, (string, DateTime)>(StringComparer.OrdinalIgnoreCase);
 
+        // Object ids of NEW columns already prompted by the DATATYPE_LIBRARY_ALWAYS_ASK picker.
+        // The column editor runs the new-attribute validation twice for one column (real-name
+        // commit AND editor close), which without this popped the picker a second time on close
+        // (WP 317 bug 2). Session-long like _allowedDatatypeUserPicks: a NEW column always gets a
+        // fresh objId, and existing columns never reach the always-ask path, so no cross-model
+        // objId reuse can wrongly suppress a legitimate ask.
+        private readonly HashSet<string> _alwaysAskPrompted = new HashSet<string>(StringComparer.Ordinal);
+
         // Snapshot of Key_Group (Index) names for naming standard checks
         private Dictionary<string, string> _keyGroupSnapshots;
 
@@ -3972,7 +3980,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                                         // creation. prev=null -> forces an allowed type when the default is
                                         // disallowed. (New-column path only - existing columns are never
                                         // retroactively re-typed; see feedback_rules_new_objects_only.)
-                                        EnforceAllowedDatatypeWhitelist(attr, null, snapshot, isNew: true);
+                                        EnforceAllowedDatatypeWhitelist(attr, null, snapshot, isNew: true, predefinedColumnNames: predefined);
                                         // Enforce COLUMN-level required UDPs now that the column has its
                                         // real name + committed type (WP 281). Cancel deletes the new
                                         // column, the same contract as the Required-field Cancel above.
@@ -3989,6 +3997,15 @@ namespace EliteSoft.Erwin.AddIn.Services
                                             // nothing else watching - schedule the targeted recheck
                                             // (2026-07-09, 'Pre_Abc__1070').
                                             ScheduleAttributeRecheck(snapshot);
+                                            // Apply Template naming rules NOW, at the name-commit
+                                            // moment while the Column Editor is still open - the
+                                            // same proven-safe write window the required-UDP prompt
+                                            // uses. Writing instead at editor-close raced erwin's
+                                            // teardown: 2026-07-19 GDM-13 warnings escalated to a
+                                            // fatal AV in EM_GDM!GDMActionSummary::GraftPostState
+                                            // (crash dump erwin.exe.51960.dmp). The heartbeat path
+                                            // stays as an idempotent catch-up.
+                                            ApplyColumnTemplateRules(entity, attr, aid, currentName, treatAsNew: true);
                                         }
                                     }
                                     else
@@ -4009,6 +4026,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     _attributeSnapshots[aid] = snapshot;
                                     ProcessNewAttribute(attr, snapshot, predefined);
                                     ScheduleAttributeRecheck(snapshot); // late auto-uniquify safety net (2026-07-09)
+                                    // Name-commit-moment template apply (see the sibling branch
+                                    // above): editor-open write window, editor-close write raced
+                                    // GDM teardown (2026-07-19 GraftPostState AV).
+                                    ApplyColumnTemplateRules(entity, attr, aid, currentName, treatAsNew: true);
                                 }
 
                                 pendSet.Remove(aid);
@@ -5333,7 +5354,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                             // through. Enforce it now (dedup makes this a no-op if the inline-edit
                             // close path already handled the same column). New-column only.
                             if (IsPlaceholderColumnName(previousState.PhysicalName) && !IsPlaceholderColumnName(currentState.PhysicalName))
-                                EnforceAllowedDatatypeWhitelist(attr, null, currentState, isNew: true);
+                                EnforceAllowedDatatypeWhitelist(attr, null, currentState, isNew: true, predefinedColumnNames: predefinedColumnNames);
 
                             _attributeSnapshots[objectId] = currentState;
                             ScheduleAttributeRecheck(currentState); // late auto-uniquify safety net (2026-07-09)
@@ -5409,7 +5430,9 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         /// <summary>
         /// Applies active Template naming rules for a column: renders the target
-        /// property value from the rule's template and writes it via SCAPI.
+        /// value from the rule's template and writes it via SCAPI. The target is
+        /// EITHER an erwin property (PROPERTY_DEF_ID -> PropertyCode) OR, since
+        /// migration 9, a UDP (TARGET_UDP_ID -> "Attribute.Physical.{Name}").
         /// Gated per rule by APPLY_ON (<paramref name="treatAsNew"/>) and
         /// DEPENDS_ON, reusing the exact predicates from the validate-only path.
         /// NO-FALLBACK: any token that cannot resolve aborts that rule's write
@@ -5464,15 +5487,38 @@ namespace EliteSoft.Erwin.AddIn.Services
                         continue;
                     }
 
-                    string targetCode = rule.PropertyCode;
+                    // Target dispatch (migration 9): PROPERTY_DEF_ID XOR TARGET_UDP_ID
+                    // (DB CK enforces the XOR; the loader skips violating rows).
+                    bool udpTarget = rule.TargetUdpId.HasValue;
+                    string targetCode;
+                    if (udpTarget)
+                    {
+                        // A COLUMN rule may only fill a COLUMN UDP - writing e.g. a
+                        // MODEL UDP from a per-column pass would re-write the model
+                        // value on every column change. Mismatch = admin data error;
+                        // skip loudly, never write to a differently-scoped object.
+                        if (!string.Equals(rule.TargetUdpObjectType, rule.ObjectType, StringComparison.OrdinalIgnoreCase))
+                        {
+                            Log($"[TEMPLATE-SKIP] column='{columnName}' rule#{rule.Id}: target UDP '{rule.TargetUdpName}' is defined for object type '{rule.TargetUdpObjectType}' but the rule is for '{rule.ObjectType}'; skipping.");
+                            continue;
+                        }
+                        targetCode = $"Attribute.Physical.{rule.TargetUdpName}";
+                    }
+                    else
+                    {
+                        targetCode = rule.PropertyCode;
+                    }
 
                     // Self-referential template guard (see ApplyPrimaryKeyRules): a
-                    // template that reads its own target property would grow without
-                    // bound under FILL_MODE=Always. Refuse it - a related token like
-                    // {Table.Physical_Name} is the correct way to seed the value.
-                    if (NamingTemplateEngine.ReferencesOwnProperty(rule.ValueTemplate, targetCode))
+                    // template that reads its own target (property or UDP) would grow
+                    // without bound under FILL_MODE=Always. Refuse it - a related token
+                    // like {Table.Physical_Name} is the correct way to seed the value.
+                    bool selfReferential = udpTarget
+                        ? NamingTemplateEngine.ReferencesOwnUdp(rule.ValueTemplate, rule.TargetUdpName)
+                        : NamingTemplateEngine.ReferencesOwnProperty(rule.ValueTemplate, targetCode);
+                    if (selfReferential)
                     {
-                        Log($"[TEMPLATE-SKIP] column='{columnName}' rule#{rule.Id}: template '{rule.ValueTemplate}' references its own target property '{targetCode}' (self-referential - would loop); skipping. Use a related token like {{Table.Physical_Name}} instead.");
+                        Log($"[TEMPLATE-SKIP] column='{columnName}' rule#{rule.Id}: template '{rule.ValueTemplate}' references its own target '{(udpTarget ? rule.TargetUdpName : targetCode)}' (self-referential - would loop); skipping. Use a related token like {{Table.Physical_Name}} instead.");
                         continue;
                     }
 
@@ -5482,7 +5528,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                         rendered = NamingTemplateEngine.Render(
                             rule.ValueTemplate,
                             ownCode => ReadScapiProperty(attr, ownCode),
-                            (alias, code) => ResolveColumnRelatedProperty(entity, alias, code));
+                            (alias, code) => ResolveColumnRelatedProperty(entity, alias, code),
+                            udpName => NamingValidationEngine.ReadUdpValueForRule(attr, "Column", udpName));
                     }
                     catch (TemplateResolutionException tex)
                     {
@@ -5515,18 +5562,33 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // ERROR_MESSAGE (which may be Turkish) goes only to the log.
                     if (!rule.AutoApply)
                     {
+                        string targetLabel = udpTarget ? $"UDP '{rule.TargetUdpName}'" : targetCode;
                         var answer = AddinMessageDialog.Show(
-                            $"Apply naming template to column '{columnName}'?\n\nSet {targetCode} to:\n{rendered}",
+                            $"Apply naming template to column '{columnName}'?\n\nSet {targetLabel} to:\n{rendered}",
                             "Apply Naming Template",
                             MessageBoxButtons.YesNo,
                             MessageBoxIcon.Question);
                         if (answer != DialogResult.Yes) continue;
                     }
 
+                    // Pre-write marker: [TEMPLATE-APPLY] only logs AFTER commit, so a
+                    // native failure inside the SCAPI write (2026-07-19 GraftPostState
+                    // AV died with zero template lines) leaves no trace without this.
+                    Log($"[TEMPLATE-WRITE] column='{columnName}' rule#{rule.Id} -> {targetCode}='{rendered}'");
                     int transId = _session.BeginNamedTransaction("ApplyColumnTemplate");
                     try
                     {
-                        attr.Properties(targetCode).Value = rendered;
+                        if (udpTarget)
+                        {
+                            // UDP values are stored sparsely; reuse the canonical
+                            // materialise-then-set write (Properties.Add on first touch).
+                            if (!UdpRuntimeService.TrySetUdpProperty((object)attr, targetCode, rendered, out Exception setEx, Log))
+                                throw setEx ?? new InvalidOperationException($"UDP set '{targetCode}' was rejected by SCAPI");
+                        }
+                        else
+                        {
+                            attr.Properties(targetCode).Value = rendered;
+                        }
                         _session.CommitTransaction(transId);
                         Log($"[TEMPLATE-APPLY] column='{columnName}' rule#{rule.Id} {targetCode}='{rendered}'");
                     }
@@ -5746,18 +5808,40 @@ namespace EliteSoft.Erwin.AddIn.Services
                         continue;
                     }
 
-                    string targetCode = rule.PropertyCode;
+                    // Target dispatch (migration 9): PROPERTY_DEF_ID XOR TARGET_UDP_ID.
+                    // Admin currently defines UDPs only for MODEL/TABLE/COLUMN, so a
+                    // PRIMARY KEY rule with a UDP target always hits the mismatch guard
+                    // below - kept generic anyway so a future PK-scoped UDP just works.
+                    bool udpTarget = rule.TargetUdpId.HasValue;
+                    string targetCode;
+                    if (udpTarget)
+                    {
+                        if (!string.Equals(rule.TargetUdpObjectType, rule.ObjectType, StringComparison.OrdinalIgnoreCase))
+                        {
+                            _pkTemplateWriteFailed.Add(failKey);
+                            Log($"[PK-TEMPLATE-SKIP] table='{tableName}' rule#{rule.Id}: target UDP '{rule.TargetUdpName}' is defined for object type '{rule.TargetUdpObjectType}' but the rule is for '{rule.ObjectType}'; suppressing.");
+                            continue;
+                        }
+                        targetCode = $"Key_Group.Physical.{rule.TargetUdpName}";
+                    }
+                    else
+                    {
+                        targetCode = rule.PropertyCode;
+                    }
 
                     // Self-referential template guard: a template that reads its own
-                    // target property (e.g. value 'PK_{Physical_Name}' targeting
-                    // Physical_Name) feeds its previous output back in every render,
-                    // so under FILL_MODE=Always it grows without bound and writes a
-                    // transaction every heartbeat (cursor flicker). Refuse it once,
-                    // suppress further attempts, and tell the admin the fix.
-                    if (NamingTemplateEngine.ReferencesOwnProperty(rule.ValueTemplate, targetCode))
+                    // target (e.g. value 'PK_{Physical_Name}' targeting Physical_Name)
+                    // feeds its previous output back in every render, so under
+                    // FILL_MODE=Always it grows without bound and writes a transaction
+                    // every heartbeat (cursor flicker). Refuse it once, suppress
+                    // further attempts, and tell the admin the fix.
+                    bool selfReferential = udpTarget
+                        ? NamingTemplateEngine.ReferencesOwnUdp(rule.ValueTemplate, rule.TargetUdpName)
+                        : NamingTemplateEngine.ReferencesOwnProperty(rule.ValueTemplate, targetCode);
+                    if (selfReferential)
                     {
                         _pkTemplateWriteFailed.Add(failKey);
-                        Log($"[PK-TEMPLATE-SKIP] table='{tableName}' rule#{rule.Id}: template '{rule.ValueTemplate}' references its own target property '{targetCode}' (self-referential - would loop); suppressing. Use a related token like {{Table.Physical_Name}} instead.");
+                        Log($"[PK-TEMPLATE-SKIP] table='{tableName}' rule#{rule.Id}: template '{rule.ValueTemplate}' references its own target '{(udpTarget ? rule.TargetUdpName : targetCode)}' (self-referential - would loop); suppressing. Use a related token like {{Table.Physical_Name}} instead.");
                         continue;
                     }
 
@@ -5767,7 +5851,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                         rendered = NamingTemplateEngine.Render(
                             rule.ValueTemplate,
                             ownCode => ReadScapiProperty(pkKg, ownCode),
-                            (alias, code) => ResolvePrimaryKeyRelatedProperty(entity, alias, code));
+                            (alias, code) => ResolvePrimaryKeyRelatedProperty(entity, alias, code),
+                            udpName => NamingValidationEngine.ReadUdpValueForRule(pkKg, "PRIMARY KEY", udpName));
                     }
                     catch (TemplateResolutionException tex)
                     {
@@ -5790,18 +5875,31 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                     if (!rule.AutoApply)
                     {
+                        string targetLabel = udpTarget ? $"UDP '{rule.TargetUdpName}'" : targetCode;
                         var answer = AddinMessageDialog.Show(
-                            $"Apply naming template to the primary key of '{tableName}'?\n\nSet {targetCode} to:\n{rendered}",
+                            $"Apply naming template to the primary key of '{tableName}'?\n\nSet {targetLabel} to:\n{rendered}",
                             "Apply Naming Template",
                             MessageBoxButtons.YesNo,
                             MessageBoxIcon.Question);
                         if (answer != DialogResult.Yes) continue;
                     }
 
+                    // Pre-write marker (see ApplyColumnTemplateRules): attribute a
+                    // native write failure to the exact rule when no APPLY line lands.
+                    Log($"[PK-TEMPLATE-WRITE] table='{tableName}' rule#{rule.Id} -> {targetCode}='{rendered}'");
                     int transId = _session.BeginNamedTransaction("ApplyPrimaryKeyTemplate");
                     try
                     {
-                        pkKg.Properties(targetCode).Value = rendered;
+                        if (udpTarget)
+                        {
+                            // Sparse UDP storage: reuse the canonical materialise-then-set.
+                            if (!UdpRuntimeService.TrySetUdpProperty((object)pkKg, targetCode, rendered, out Exception setEx, Log))
+                                throw setEx ?? new InvalidOperationException($"UDP set '{targetCode}' was rejected by SCAPI");
+                        }
+                        else
+                        {
+                            pkKg.Properties(targetCode).Value = rendered;
+                        }
                         _session.CommitTransaction(transId);
                         Log($"[PK-TEMPLATE-APPLY] table='{tableName}' rule#{rule.Id} {targetCode}='{rendered}'");
                     }
@@ -6841,7 +6939,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // disallowed erwin default (e.g. char(18)) is caught at creation, not only on a
                 // later type edit. EnforceAllowedDatatypeWhitelist self-skips the '<default>'
                 // placeholder, so the check effectively waits for the real name.
-                EnforceAllowedDatatypeWhitelist(attr, null, currentState, isNew: true);
+                EnforceAllowedDatatypeWhitelist(attr, null, currentState, isNew: true, predefinedColumnNames: predefinedColumnNames);
 
                 // Enforce COLUMN-level required UDPs (WP 281), unless the naming Required-field
                 // Cancel just above already deleted the column. Cancel here deletes the new column
@@ -6949,7 +7047,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // EXISTING column (rename path handled separately); ValidateColumnNamingStandard
                     // just below re-checks the picked value too, so the picker gate + that re-run
                     // both cover this site.
-                    EnforceAllowedDatatypeWhitelist(attr, previousState, currentState, isNew: false);
+                    EnforceAllowedDatatypeWhitelist(attr, previousState, currentState, isNew: false, predefinedColumnNames: predefinedColumnNames);
 
                     // C3 polymorphic-condition replay (2026-05-17): a naming rule can
                     // condition on the live Physical_Data_Type value (e.g. "DateTime
@@ -7462,6 +7560,20 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             if (curr == null) return;
 
+            string objId = null;
+            try { objId = attr?.ObjectId?.ToString(); } catch { /* transient COM state */ }
+
+            // WP 317 bug 2: ask AT MOST ONCE per new column. The column editor runs the
+            // new-attribute validation both when the column's real name is committed AND again when
+            // the editor is closed, so without this guard the ALWAYS_ASK picker pops a second time on
+            // close. Recorded whether or not the user changed the type, so a Cancel/keep on the first
+            // ask still suppresses the duplicate.
+            if (!string.IsNullOrEmpty(objId) && !_alwaysAskPrompted.Add(objId))
+            {
+                Log($"AllowedDatatype always-ask: {curr.TableName}.{curr.PhysicalName} already prompted this session (objId={objId}) - skipping duplicate ask.");
+                return;
+            }
+
             // Re-read the live type: the caller's term-policy absorb pass just above may have
             // adjusted it, and we want to preselect exactly what the model holds now.
             string liveType = currentType;
@@ -7479,9 +7591,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                 Log($"AllowedDatatype always-ask: {curr.TableName}.{curr.PhysicalName} is term-locked - skipping (type fixed to '{liveType}').");
                 return;
             }
-
-            string objId = null;
-            try { objId = attr?.ObjectId?.ToString(); } catch { /* transient COM state */ }
 
             // The live type already carries the authoritative base + length, so a partial lock just
             // pins the current value's half (combo when base locked, param when length locked).
@@ -7543,7 +7652,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             ScheduleAttributeRecheck(curr);
         }
 
-        private void EnforceAllowedDatatypeWhitelist(dynamic attr, AttributeValidationSnapshot prev, AttributeValidationSnapshot curr, bool isNew = false)
+        private void EnforceAllowedDatatypeWhitelist(dynamic attr, AttributeValidationSnapshot prev, AttributeValidationSnapshot curr, bool isNew = false, HashSet<string> predefinedColumnNames = null)
         {
             // DATATYPE_LIBRARY_ENABLED (config-scoped, default OFF / opt-in) is the master switch:
             // no enforcement unless the admin turned it on, even when the whitelist is non-empty.
@@ -7612,8 +7721,18 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // DATATYPE_LIBRARY_ALWAYS_ASK: a valid type on a NEW column must still be explicitly
                 // confirmed via the picker (current type preselected; Cancel keeps it - no fallback,
                 // no forced change). Existing-column edits are never re-asked.
-                if (isNew && AllowedDatatypeService.Instance.AlwaysAsk)
+                // WP 317 bug 1: predefined columns are admin-defined - their datatype comes from the
+                // predefined-column set (auto-added on TABLE_TYPE / UDP selection), so the picker must
+                // NOT prompt for them. Mirror the glossary skip (predefinedColumnNames = entity-scoped
+                // applicable names, GetApplicableNames).
+                bool isPredefinedColumn = predefinedColumnNames != null
+                    && curr != null
+                    && !string.IsNullOrEmpty(curr.PhysicalName)
+                    && predefinedColumnNames.Contains(curr.PhysicalName);
+                if (isNew && AllowedDatatypeService.Instance.AlwaysAsk && !isPredefinedColumn)
                     PromptAlwaysAskDatatype(attr, curr, attempted, isNew);
+                else if (isNew && isPredefinedColumn && AllowedDatatypeService.Instance.AlwaysAsk)
+                    Log($"[DT-ENFORCE] {curr?.TableName}.{curr?.PhysicalName}: ALWAYS_ASK skipped (predefined column - admin-defined datatype)");
 
                 return; // permitted (possibly just re-corrected by the term policy)
             }
