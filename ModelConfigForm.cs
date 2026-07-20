@@ -1120,6 +1120,8 @@ namespace EliteSoft.Erwin.AddIn
 
         private void ReconnectTimer_Tick(object sender, EventArgs e)
         {
+            // black-rect Test 1: zero add-in timer work while the alter wizard renders.
+            if (Services.AlterWizardGate.IsOpen) return;
             // Unified model-state monitor (2026-05-14). The timer is kept alive
             // in every state (disconnected, degraded, connected) and reacts
             // when an open PU's locator diverges from what we last successfully
@@ -4019,6 +4021,8 @@ namespace EliteSoft.Erwin.AddIn
 
         private void GlossaryRefreshTimer_Tick(object sender, EventArgs e)
         {
+            // black-rect Test 1: zero add-in timer work while the alter wizard renders.
+            if (Services.AlterWizardGate.IsOpen) return;
             // DDL-dedicated instance: the glossary is never consumed (all
             // validation surfaces are off), so skip the periodic DB reload.
             if (IsDdlDedicatedInstance) return;
@@ -6622,6 +6626,8 @@ namespace EliteSoft.Erwin.AddIn
 
         private void PUWatcher_Tick(object sender, EventArgs e)
         {
+            // black-rect Test 1: zero add-in timer work while the alter wizard renders.
+            if (Services.AlterWizardGate.IsOpen) return;
             try
             {
                 int currentCount = _scapi.PersistenceUnits.Count;

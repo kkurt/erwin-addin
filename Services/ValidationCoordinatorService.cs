@@ -1224,6 +1224,8 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         private void MonitorTimer_Tick(object sender, EventArgs e)
         {
+            // black-rect fix: no SCAPI reentrancy under the wizard modal pump.
+            if (AlterWizardGate.IsOpen) return;
             if (_sessionLost || !_isMonitoring || _disposed || _isProcessingChange || _validationSuspended || _isCheckingForChanges || _columnNamingCheckInProgress || _scopedCheckInProgress || _validationModalShowing) return;
             // 2026-05-25: while a locked-column dialog is up, skip the
             // entire heartbeat. SCAPI walks during the dialog's nested
@@ -2938,6 +2940,9 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         private void WindowMonitorTimer_Tick(object sender, EventArgs e)
         {
+            // black-rect fix: 100 ms tick = the highest reentrancy pressure
+            // under the wizard modal pump; fully silent while it renders.
+            if (AlterWizardGate.IsOpen) return;
             if (_sessionLost || !_isMonitoring || _disposed || _validationSuspended) return;
             // 2026-05-25: skip window-state polling while a locked-column
             // dialog is up. Same reason as MonitorTimer_Tick - SCAPI
