@@ -2148,3 +2148,17 @@ the 2026-06-23 "positive confirmation before destructive action" lesson.
 - **Two enforcement machines over the same property MUST share the constraint model.** Term policy and whitelist enforcement each "owned" Physical_Data_Type; the second one's UI (picker) could undo the first one's decision because it did not know the constraint existed. Any corrective UI must be gated by ALL constraints on the value, not just its own.
 - **A corrective modal that lets the user choose is itself a write path.** Auditing writes for policy compliance must include values coming back from dialogs (the pick write was unconditional).
 - **"Reverted + snapshot advanced" hides later overrides.** Advancing the baseline to the picker's value made the term policy permanently blind to the override. When one machine advances a shared baseline, ask which OTHER machine loses its trigger.
+
+## 2026-07-20: Aylik siyahlik (black-rectangle) sagasinin dersi
+- KOK NEDEN: add-in timer'lari (100ms window-monitor, heartbeat, PU watcher'lar)
+  alter wizard'in MODAL pump'i icinde WM_TIMER ile dispatch olup erwin render'inin
+  ortasinda SCAPI/Win32 kosuyordu -> olasiliksal GDI bozulmasi. FIX: AlterWizardGate
+  (wizard acikken 5 tick'in tamami sessiz). Es-fix: UdpSync NormalizeForErwinListCompare
+  g/G/s/S katlamasi (her connect'te gereksiz metamodel-dirty yaziyordu).
+- DERS 1: Nondeterministik, "addin yokken olmayan" bir bozulmada ilk suphe addin'in
+  PERIYODIK isinin host'un modal loop'una reentrancy'si olmali; operasyonun kendisi
+  (wizard/hide/compositor) degil.
+- DERS 2: "X yaptim gecti" tek-kosu gozlemleri yazi-tura olabilir - olasiliksal bug'da
+  her hipotez 4-5 tekrarla test edilmeli.
+- DERS 3: Ayni anda tek degisken degistir; kanit hiyerarsisi: server-side capture >
+  scroll testi > GDI sayaci > log korelasyonu > varsayim.
