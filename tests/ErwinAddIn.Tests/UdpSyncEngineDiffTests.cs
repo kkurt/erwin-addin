@@ -227,6 +227,35 @@ public class UdpSyncEngineDiffTests
     }
 
     [Fact]
+    public void List_options_differing_only_by_erwin_Turkish_folding_emit_no_change()
+    {
+        // ROOT CAUSE of the RDP black-rectangle saga (found 2026-07-20). erwin
+        // narrows tag_Udp_Values_List to Windows-1252/Latin-1 on store: the six
+        // Turkish letters absent from that code page (ı İ ğ Ğ ş Ş) transliterate
+        // to nearest ASCII, while ç/ö/ü survive. Admin keeps the real Turkish
+        // spelling; the model tag comes back folded. Before the normalizer
+        // covered ğ/ş, an Ordinal compare diffed EVERY connect (admin 'Çağrı'
+        // vs stored 'Çagri') -> perpetual "List options changed" -> a needless
+        // OwnerUnit/Application metamodel write dirtied the model each open ->
+        // Generate DDL saw an empty schema diff -> the empty-diff alter wizard
+        // leaked black rectangles process-wide. The folded value must diff to
+        // NOTHING. (ç/ö/ü included to prove they are NOT over-folded.)
+        var snapshot = new List<UdpDefinitionSnapshot>
+        {
+            AdminUdp(1, "Application", objectType: "Model", udpType: "List",
+                listOptions: new[] { "Çağrı Merkezi", "İşbirlikleri", "Bankacılığı Görünmez" }),
+        };
+        var model = AsMap(ModelUdp(
+            "Model.Physical.Application",
+            dataTypeId: 6, // List
+            currentListValues: "Çagri Merkezi,Isbirlikleri,Bankaciligi Görünmez"));
+
+        var diff = UdpSyncEngine.ComputeDiff(snapshot, model);
+
+        diff.IsEmpty.Should().BeTrue();
+    }
+
+    [Fact]
     public void List_admin_with_zero_options_skips_ListValues_diff_when_model_has_values()
     {
         // Runtime-managed list guard (regression for the "Sync UDP definitions

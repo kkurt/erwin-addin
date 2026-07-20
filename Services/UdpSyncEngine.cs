@@ -1061,11 +1061,28 @@ namespace EliteSoft.Erwin.AddIn.Services
         internal static string NormalizeForErwinListCompare(string? s)
         {
             if (string.IsNullOrEmpty(s)) return "";
-            // String.Replace(char, char) is O(n) on a fresh char array, so
-            // two passes is still ~n cost; cheap relative to the SCAPI
-            // reads that produced the string in the first place.
-            return s!.Replace('İ', 'I')   // İ -> I
-                     .Replace('ı', 'i');  // ı -> i
+            // erwin's tag_Udp_Values_List / tag_Udp_Default_Value setter narrows
+            // the stored string to Windows-1252/Latin-1: the six Turkish letters
+            // that DON'T exist in that code page are transliterated to their
+            // nearest ASCII on store, while ç/ö/ü (and caps) survive because
+            // Latin-1 has them. Verified 2026-07-20 by hex-diffing the repo DB
+            // options against the live model tag: admin 'Kurumsal IBMB - App' +
+            // 'Bankacılığı' / 'Çağrı Merkezi' / 'Müşteri' / 'İşbirlikleri' stored
+            // as 'Bankaciligi' / 'Çagri Merkezi' / 'Müsteri' / 'Isbirlikleri'.
+            // A byte-identical Ordinal compare therefore diffed on EVERY connect
+            // (admin ğ/ş/ı vs stored g/s/i) -> a perpetual "List options changed"
+            // -> a needless metamodel-dirty write of OwnerUnit + Application each
+            // open -> Generate DDL saw an empty schema diff -> the empty-diff
+            // alter wizard leaked the RDP black rectangles. Folding BOTH sides
+            // through erwin's own narrowing converges the diff. Only these six
+            // are Latin-1-absent; do NOT fold ç/ö/ü (erwin keeps them, so both
+            // sides already match).
+            return s!.Replace('İ', 'I')   // U+0130 -> I
+                     .Replace('ı', 'i')   // U+0131 -> i
+                     .Replace('Ğ', 'G')   // U+011E -> G
+                     .Replace('ğ', 'g')   // U+011F -> g
+                     .Replace('Ş', 'S')   // U+015E -> S
+                     .Replace('ş', 's');  // U+015F -> s
         }
 
         #endregion
