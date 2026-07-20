@@ -739,19 +739,6 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// lets a model-level condition (e.g. the model's Application) gate a table
         /// rule model-wide.</para>
         /// </summary>
-        /// <summary>
-        /// Public wrapper over <see cref="ReadUdpValue"/> for the Template
-        /// applier's <c>{Udp:Name}</c> token source (migration 9). Reuses the
-        /// exact condition-read semantics on purpose: owner class derived from
-        /// the rule's object type, and the <c>Model.Physical</c> fallback so a
-        /// column template can read a MODEL-scoped UDP (most admin UDPs are
-        /// model-scoped, e.g. ApplicationCode). Returns "" when the UDP is
-        /// absent; the renderer's empty-token check turns that into a
-        /// <see cref="TemplateResolutionException"/> (never a silent blank).
-        /// </summary>
-        public static string ReadUdpValueForRule(dynamic scapiObject, string objectType, string udpName)
-            => ReadUdpValue(scapiObject, objectType, udpName);
-
         private static string ReadUdpValue(dynamic scapiObject, string objectType, string udpName)
         {
             string ownerClass = objectType?.ToLower() switch
