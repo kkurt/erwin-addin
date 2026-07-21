@@ -1,3 +1,160 @@
+# Version Promotion (Release Management) - PLAN, awaiting user approval (2026-07-22)
+
+Authoritative spec: C:\Users\Kursat\Repos\erwin-admin\docs\erwin-addin-release-management-prompt.md
+(admin web + live DB schema done 2026-07-21; schema/contracts are FIXED, do not change).
+Companions: erwin-admin tasks/specs/release-management.md (6 signed-off decisions),
+migrations/20260721_release_management_promotion.sql (exact DDL).
+
+## Recon conclusions (2026-07-22, 9 parallel explore agents + critic)
+
+- Queue write today: DdlApprovalService.Submit (Services/DdlApprovalService.cs:43), raw ADO,
+  3 dialect INSERTs, exactly 10 columns, NO REQUEST_TYPE, no transaction, identity read-back OK.
+  SUBMITTED_BY = Environment.UserName (Windows), NOT the Mart login the spec requires.
+- MetaShared (project-referenced, erwin-addin.csproj:82) already ships everything schema-side:
+  DdlApprovalQueue entity with REQUEST_TYPE/SOURCE_ENVIRONMENT_ID/TARGET_ENVIRONMENT_ID/
+  MODEL_VERSION/LOCK_TYPE + RequestTypes.Promotion + Statuses constants; ModelEnvironmentVersion;
+  EnvironmentDef; EnvironmentRelation; EnvironmentRelationApprover; RepoDbContext has DbSets for
+  ALL of them (RepoDbContext.cs:30-89). EF route gives the auto-approve transaction for free.
+- Canonical path: ConfigContextService.MartPath (ParseMartPath, ConfigContextService.cs:206) is
+  byte-identical to MODEL_CONFIG_MAPPING.MART_PATH. Promotion MODEL_LOCATOR must use THIS,
+  NOT _lastConnectedLocator (which is a mart:// locator; that stays for DDL rows only).
+- Settings: GetEffectiveBool / GetEffectiveEnum (ConfigContextService.cs:411) already implement
+  CONFIG_PROPERTY > CORPORATE_PROPERTY > builtin default. Keys + lock codes exist as constants in
+  MetaCore/Constants.cs (VERSION_PROMOTION_ENABLED :37, PROMOTION_LOCK_TYPE :46,
+  PromotionLockTypes :194-200).
+- Env readers: IntegrationEnvironmentService.GetEnvironments/GetRelations exist (dialect ADO).
+  ENVIRONMENT_RELATION_APPROVER and MODEL_ENVIRONMENT_VERSION have ZERO add-in references today.
+- Version number: no C_Version symbol anywhere; version is parsed from the PU locator
+  ([?&](VNO|version)=N, ExtractLocatorVersion ModelConfigForm.cs:909). The version being created
+  by the Mart save is visible in the Description dialog title "Description for '<model>'
+  Version <N>" which MartSaveAutomation already hooks (title prefix const :59). Capture it there.
+- Poller template: SessionTrackingService (System.Timers.Timer, threadpool, DB-only,
+  Interlocked tick guard, best-effort catch). Off-UI-thread, so no AlterWizardGate needed.
+  Any UI-thread tick MUST start with `if (AlterWizardGate.IsOpen) return;` (black-rect rule,
+  5 existing sites, commits 2bfb80d/e363f15).
+- No startup reconciliation pattern exists anywhere; the missed-unlock recovery pass is net-new.
+- Tests: xUnit + FluentAssertions, pure-extraction convention. Templates:
+  IntegrationPlannerTests (derivation/approval), DdlWorkerConfigTests (startup decision),
+  UdpSyncEngineDiffTests (flag outcomes).
+- BLOCKER FINDING: SCAPI r10.10 has NO lock API. Proven twice: live ISCPersistenceUnit
+  IDispatch dump (29 methods, none lock-related) + API-ref Disposition token list (no lock
+  token; only open-time "read-only / ignore locks" requests). Applying Existence/Shared/
+  Update/Exclusive locks needs either a UI-automation spike (Mart catalog lock UI RECON,
+  fresh cmd-id capture) or deferral. Direct Mart-repo-DB lock writes: no schema documented,
+  no connection exists, server holds lock state; treat as NOT an option.
+- Interactive add-in has NO current-Mart-user reader (DdlWorkerConfig.UserName is the headless
+  worker service account; DDL_GENERATION_CONF MART_USER is a shared credential).
+- Working tree has uncommitted, live-verified changes (black-rect gate, ORA-01745 binds,
+  ghost-PU gate, DDL tab Designer re-flow). New DDL-tab UI must build on the NEW coordinates.
+
+## Open decisions - ASK USER, do not implement before answers
+
+- [ ] D1 Mart lock mechanism. No SCAPI path exists. Options:
+      (a) core feature first, lock as separate later phase; until then a non-UNLOCKED effective
+          PROMOTION_LOCK_TYPE hard-blocks Send with a clear error (no silent fallback),
+          deployments set PROMOTION_LOCK_TYPE=UNLOCKED to go live;
+      (b) UI-automation spike FIRST (live RECON of erwin Mart catalog lock commands), then build;
+      (c) direct Mart repo DB writes - recommend AGAINST (unproven, server-side lock state).
+      Recommendation: (a) then (b) as its own phase.
+- [ ] D2 SUBMITTED_BY = Mart login. Where does the interactive add-in get it?
+      If the Marts are Windows-auth, Environment.UserName is correct as-is. If Server-auth,
+      options: capture from the Mart Connect automation, or live RECON for a SCAPI/UI source.
+      Which auth do the target deployments use?
+- [ ] D3 UI anchor for "Send to Approval". Two candidates (lesson 2026-07-19: name both):
+      the review dialog DdlApprovalDialog (recommended: add target-environment picker there,
+      shown only when VERSION_PROMOTION_ENABLED) or a separate button on the Generate DDL tab.
+      Also confirm: when promotion is enabled, does the send write ONE row
+      (REQUEST_TYPE='PROMOTION', replacing the normal DDL row for that send) - my reading of
+      the spec - or a PROMOTION row IN ADDITION to the normal DDL row?
+- [ ] D4 Poll cadence. Spec says "same cadence as existing polling infra" but the two precedents
+      differ (heartbeat 5 min vs DDL worker 2 s). Recommendation: 30 s threadpool DB-only
+      watcher (SessionTrackingService clone), active only while this user has Pending
+      promotion rows; terminal handling marshalled to UI thread via BeginInvoke.
+- [ ] D5 Commit the current uncommitted working-tree changes first (they are live-verified)?
+      Recommended yes, promotion work then starts from a clean tree.
+- [ ] D6 OpenProject WP id for this feature (start_work_package needs it). Is there one?
+
+## Phases (wait for approval between phases; each phase = small commits)
+
+### Phase 1 - Data layer + pure decision logic + tests (no UI, no erwin)
+- [ ] PromotionPlanner (new, pure static, Services/PromotionPlanner.cs):
+      - ReachableTargets(envs, relations, envVersions, promotedVersion): targets that have a
+        defined transition from at least one candidate source; no transition = not offered.
+      - DeriveSource(envs, relations, envVersions, promotedVersion, targetId): spec 3-step rule
+        (1 env holding VERSION with transition to target; 2 else first env by SORT_ORDER,
+        first env never has a DB row; 3 multiple candidates -> return all, UI asks user).
+      - DecideApproval(relation, approvers): RequiresApproval && approvers.Count > 0 -> Pending
+        else AutoApprove. NO fallback to config APPROVAL_APPROVER list (deliberate).
+      - SelectMissedUnlocks(rows, currentUser): SUBMITTED_BY == user (match rule per D2),
+        REQUEST_TYPE == PROMOTION, LOCK_TYPE not UNLOCKED/null, STATUS terminal.
+- [ ] PromotionService (new, Services/PromotionService.cs), EF via RepoDbContext:
+      - Readers: relation approvers by relation ids; MODEL_ENVIRONMENT_VERSION by MART_PATH;
+        pending PROMOTION rows by MART_PATH; reject reason from DDL_APPROVAL_VOTE by QUEUE_ID.
+      - SubmitPromotion(...): one transaction. Insert DdlApprovalQueue row: REQUEST_TYPE =
+        RequestTypes.Promotion, MODEL_LOCATOR = canonical MartPath, MODEL_NAME/DBMS_TYPE/
+        DDL_TEXT/NOTE/CONFIG_ID/SOURCE_MODE filled exactly like DDL push, SOURCE/TARGET env ids,
+        MODEL_VERSION, LOCK_TYPE code, STATUS + NOTE per approval decision
+        ('Auto-approved (no approval required for this transition)' verbatim on auto path),
+        SUBMITTED_AT = UtcNow. Auto path additionally upserts ModelEnvironmentVersion
+        (target env, MART_PATH, VERSION, QUEUE_ID, PROMOTED_BY = SUBMITTED_BY, UtcNow) in the
+        SAME transaction. Approver path NEVER touches MODEL_ENVIRONMENT_VERSION.
+      - Existing DdlApprovalService raw-ADO path stays UNTOUCHED (spec: do not touch DDL push).
+- [ ] IMartVersionLockService abstraction + UnlockedLockService implementation (v1):
+      resolves effective PROMOTION_LOCK_TYPE; UNLOCKED -> no-op + LOCK_TYPE='UNLOCKED';
+      any other code -> hard error dialog before insert (until D1 phase lands).
+- [ ] Unit tests (templates per recon): ReachableTargets/DeriveSource matrix incl. multi-candidate,
+      DecideApproval branches (REQUIRES_APPROVAL=1+empty approvers -> auto), SelectMissedUnlocks
+      boundary cases, lock-code resolve/parse, canonical-path invariants.
+
+### Phase 2 - Send to Approval flow (Generate DDL side)
+- [ ] MartSaveAutomation: capture "Version <N>" from the Description dialog title during the
+      existing save hook; surface it to the caller. Send hard-blocks when version unknown.
+- [ ] Target picker UI per D3 (env names + COLOR_HEX swatch; source auto-derived, picker only
+      when multiple candidates), gated by VERSION_PROMOTION_ENABLED + IsMartModel +
+      ActiveConfigId > 0 (IsIntegrateEnabled pattern). AddinMessageDialog only; UI English.
+- [ ] Wire submit: preconditions (spec Akis 1), lock step (v1 = UnlockedLockService),
+      SubmitPromotion, user feedback incl. auto-approve outcome.
+- [ ] DDLGENERATOR dedicated build: promotion UI + watcher fully excluded.
+
+### Phase 3 - Status watcher + missed-unlock recovery
+- [ ] PromotionStatusWatcher (SessionTrackingService clone: System.Timers.Timer, singleton,
+      Interlocked tick guard, best-effort): polls own Pending PROMOTION rows; on Approved ->
+      unlock (v1 no-op), notify, refresh General tab; on Rejected -> unlock, notify with
+      DDL_APPROVAL_VOTE reason when available. Version row is written by the SERVER on the
+      approver path; add-in never writes it there.
+- [ ] Startup recovery: once per connect (InitializeModelServices seam), SelectMissedUnlocks
+      over own rows -> release leftover locks (v1: log-only since UNLOCKED). Errors surface.
+- [ ] Any UI-thread touch goes through BeginInvoke and respects AlterWizardGate rule.
+
+### Phase 4 - General tab: environment x version card
+- [ ] New "Environments" section card after Glossary card (CreateSectionCard/AddCardRow chrome,
+      ListView Details idiom like listValidationResults; COLOR_HEX swatch via TryParseHex).
+      Columns: Environment / Version / Promoted By / Promoted At. First env = "Current v<N>"
+      (open model's latest saved version); others from MODEL_ENVIRONMENT_VERSION by MART_PATH,
+      '-' when absent; "Pending v<N>" badge for in-flight promotion.
+- [ ] footerY + form/tab height re-derived (Designer.cs:120-129 regression note!). Refresh from
+      connect seam (:2153-2161), HandleModelChanged, after submit and on watcher terminal.
+- [ ] Hidden entirely when VERSION_PROMOTION_ENABLED is off.
+
+### Phase 5 - Mart lock (pending D1; separate phase, own RECON)
+- [ ] Live RECON of erwin Mart lock surface (catalog/Open-from-Mart lock commands, cmd ids,
+      dialog map) with the established WmCommandLogger/WinEvent patterns.
+- [ ] Real IMartVersionLockService implementation + LOCK_TYPE wiring + unlock on terminal +
+      startup recovery doing real unlocks. Re-run Phase 1 recovery tests against real codes.
+
+### Phase 6 - Verification + docs
+- [ ] Live E2E on MetaRepo test DB: auto-approve path (version row + note), approver path
+      (Pending -> web approve -> watcher unlock + server-written version row), reject path
+      (reason shown), restart-during-Pending (missed-unlock recovery), transition-less target
+      blocked, VERSION_PROMOTION_ENABLED off -> zero UI.
+- [ ] Both build flavors 0 warn / 0 err; full test suite green; docs/ARCHITECTURE.md + README
+      updated; OpenProject WP comment (Turkish, short).
+
+## Review
+(to be filled after implementation)
+
+---
+
 # Value Template v2: UDP target + {Udp:...} source + pipe functions (2026-07-19) - DONE + LIVE-VERIFIED
 
 ## Live verification result (2026-07-19, MetaRepoTmp+Zeynep, config 1012)
