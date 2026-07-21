@@ -3481,9 +3481,25 @@ namespace EliteSoft.Erwin.AddIn.Services
             // of the (fixed-size) pane keeps this DPI-stable. X is ~55px in from
             // the pane's left edge (over the left-aligned label - X was correct,
             // the 442 click registered as a nav row, just the wrong one).
-            int clickX = (int)pane.Left + 55;
-            int clickY = (int)pane.Top + (int)(pane.Height * 0.375);
-            log?.Invoke($"  [WPT] pane=({(int)pane.Left},{(int)pane.Top} {(int)pane.Width}x{(int)pane.Height}) -> Preview click=({clickX},{clickY})");
+            // The 6 nav labels (Overview..Preview) are TOP-anchored in the pane at a
+            // fixed pixel layout - they do NOT scale with the pane HEIGHT (a taller
+            // wizard window just grows the pane's empty bottom). Multiplying by
+            // pane.Height therefore overshoots on a taller pane: field 2026-07-21,
+            // Damla's pane was h592 vs the h393 this was calibrated on (same DPI -
+            // width 185 on both), so the click landed ~75px BELOW Preview in empty
+            // space, no Preview page rendered, and EVERY Generate DDL failed with
+            // "did not produce DDL". Anchor to the pane TOP instead and scale the
+            // fixed offset by the pane WIDTH (which DOES track DPI, unlike height) so
+            // it holds across DPIs. Reference (width 185): Preview center ~top+147
+            // (== the old 0.375*393 on the calibration pane, so no change there),
+            // label X ~left+55.
+            const double RefPaneWidth = 185.0;
+            const double RefPreviewYOffset = 147.0; // 0.375 * 393 (calibration pane)
+            const double RefXOffset = 55.0;
+            double navScale = pane.Width > 10 ? pane.Width / RefPaneWidth : 1.0;
+            int clickX = (int)pane.Left + (int)(RefXOffset * navScale);
+            int clickY = (int)pane.Top + (int)(RefPreviewYOffset * navScale);
+            log?.Invoke($"  [WPT] pane=({(int)pane.Left},{(int)pane.Top} {(int)pane.Width}x{(int)pane.Height}) navScale={navScale:0.00} -> Preview click=({clickX},{clickY})");
 
             // Production: make the addin form click-through (WS_EX_TRANSPARENT)
             // + hide the "please wait" popup so the mouse-sim reaches the wizard
@@ -3517,22 +3533,26 @@ namespace EliteSoft.Erwin.AddIn.Services
                     ShowCursor(true);
                 }
 
-                // Step 4: poll for the auto-generated DDL (the GA hook fires when
-                // the Preview page renders). No Next-loop fallback by design - if
-                // the jump does not produce DDL we surface the failure honestly.
-                for (int i = 0; i < 20; i++)
+                // Step 4: poll for the auto-generated DDL (the GA hook fires when the
+                // Preview page finishes rendering the alter script). 12s, not 4s: a
+                // large cross-version diff (e.g. the Core Banking model) legitimately
+                // takes several seconds to generate, so the old 4s window could time
+                // out on a correct click. No Next-loop fallback by design - if the
+                // jump still produces no DDL we surface the failure honestly.
+                const int pollMs = 200, maxPolls = 60; // 12s
+                for (int i = 0; i < maxPolls; i++)
                 {
-                    Thread.Sleep(200);
+                    Thread.Sleep(pollMs);
                     string ddl = NativeBridgeService.ConsumeLastCapturedDdl();
                     if (!string.IsNullOrEmpty(ddl))
                     {
-                        log?.Invoke($"  [WPT] DDL captured after Preview jump ({ddl.Length} chars) at {(i + 1) * 200}ms");
+                        log?.Invoke($"  [WPT] DDL captured after Preview jump ({ddl.Length} chars) at {(i + 1) * pollMs}ms");
                         LastCapturedWizardDdl = ddl;
                         return true;
                     }
                 }
 
-                log?.Invoke("  [WPT] Preview jump did not produce DDL within 4s");
+                log?.Invoke($"  [WPT] Preview jump did not produce DDL within {maxPolls * pollMs / 1000}s");
                 return false;
             }
             finally
@@ -4789,6 +4809,15 @@ namespace EliteSoft.Erwin.AddIn.Services
             });
         }
 
+        // Throttle + bounded-retry state for DismissBlockingStartupDialog. Without
+        // it an un-dismissable startup modal both infinite-loops AND re-logs the
+        // same line every ~3s forever - a 679MB debug.log was produced 2026-07-21
+        // on a '#32770 erwin Data Modeler' box the OK/Tamam-only dismiss + WM_CLOSE
+        // could not close.
+        private static IntPtr _lastStartupModal = IntPtr.Zero;
+        private static int _startupModalAttempts;
+        private const int MaxStartupModalAttempts = 6;
+
         /// <summary>
         /// Closes the startup Welcome / Start Page modal that erwin shows on a
         /// cold launch. That modal DISABLES erwin's main window
@@ -4799,13 +4828,21 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// it finds is the startup Welcome, never our own Connect dialog. Uses
         /// GW_ENABLEDPOPUP to get exactly the enabled pop-up that owns the
         /// main's disabled state, and skips our own WinForms add-in window.
-        /// Returns true when a close was posted.
+        /// Logs once per distinct modal and gives up after
+        /// <see cref="MaxStartupModalAttempts"/> so a modal it cannot close never
+        /// loops or floods the log. Returns true while actively trying to dismiss.
         /// </summary>
         internal static bool DismissBlockingStartupDialog(Action<string> log)
         {
             IntPtr main = FindErwinMain();
             if (main == IntPtr.Zero) return false;
-            if (IsWindowEnabled(main)) return false; // not blocked
+            if (IsWindowEnabled(main))
+            {
+                // Not blocked - clear per-modal tracking for the next one.
+                _lastStartupModal = IntPtr.Zero;
+                _startupModalAttempts = 0;
+                return false;
+            }
 
             IntPtr modal = GetWindow(main, GW_ENABLEDPOPUP);
             if (modal == IntPtr.Zero || modal == main || !IsWindow(modal)) return false;
@@ -4816,13 +4853,48 @@ namespace EliteSoft.Erwin.AddIn.Services
             GetClassName(modal, cls, cls.Capacity);
             if (cls.ToString().StartsWith("WindowsForms", StringComparison.OrdinalIgnoreCase)) return false;
 
-            log?.Invoke($"[DDL-WELCOME] main window blocked by startup modal 0x{modal.ToInt64():X} (cls='{cls}', title='{GetTitle(modal)}') - closing it so the worker can proceed.");
-            // Prefer clicking OK/Tamam by its REAL control id (erwin's popups
-            // give OK non-standard ids, e.g. 2; a fixed IDOK is a no-op - dump
-            // 2026-07-13). Fall back to WM_CLOSE for a Start Page with no OK.
-            if (!ClickDialogButtonByTextWin32(modal, new[] { "OK", "Tamam" }, log))
+            // First sight of THIS modal: log once + reset the attempt counter.
+            // (Re-logging every tick is what produced the 679MB flood.)
+            if (modal != _lastStartupModal)
+            {
+                _lastStartupModal = modal;
+                _startupModalAttempts = 0;
+                log?.Invoke($"[DDL-WELCOME] main window blocked by startup modal 0x{modal.ToInt64():X} (cls='{cls}', title='{GetTitle(modal)}') - closing it so the worker can proceed.");
+            }
+
+            // Bounded retries: after MaxStartupModalAttempts we cannot dismiss this
+            // modal (unknown button layout, or it ignores WM_CLOSE). Give up - return
+            // false so the tick's modal-blocked guard idles instead of looping. A
+            // human or the periodic erwin restart clears a truly stuck modal. Log the
+            // give-up exactly once.
+            if (_startupModalAttempts >= MaxStartupModalAttempts)
+            {
+                if (_startupModalAttempts == MaxStartupModalAttempts)
+                {
+                    _startupModalAttempts++;
+                    log?.Invoke($"[DDL-WELCOME] modal 0x{modal.ToInt64():X} still up after {MaxStartupModalAttempts} attempts - leaving it for a human/restart (no more retries, no log spam).");
+                }
+                return false;
+            }
+            _startupModalAttempts++;
+
+            // Prefer clicking a button by its REAL control id (erwin's popups give
+            // OK non-standard ids, e.g. 2; a fixed IDOK is a no-op - dump 2026-07-13).
+            // OK/Tamam covers info boxes; Yes/Evet covers the single-session takeover
+            // confirm ('User "X" is logged into server ... disconnect and continue?',
+            // Yes/No/Help - NO OK button) that can appear at startup when the server
+            // holds a stale session, plus generic confirmations. Fall back to WM_CLOSE
+            // for a Start Page with no button. (Never a "Don't show again" checkbox -
+            // feedback_no_user_pref_changes.)
+            if (!ClickDialogButtonByTextWin32(modal, new[] { "OK", "Tamam", "Yes", "Evet" }, log))
                 PostMessage(modal, WM_CLOSE_MSG, IntPtr.Zero, IntPtr.Zero);
             WaitForWindowGone(modal, 3000);
+            if (!IsWindow(modal))
+            {
+                // Dismissed - clear tracking so a genuinely new modal logs afresh.
+                _lastStartupModal = IntPtr.Zero;
+                _startupModalAttempts = 0;
+            }
             return true;
         }
 
@@ -5332,6 +5404,33 @@ namespace EliteSoft.Erwin.AddIn.Services
                         continue;
 
                     string text = CollectDialogStaticText(h);
+
+                    // Single-session takeover confirm (field report 2026-07-21):
+                    // when the SERVER still holds a session for this user (stale
+                    // after a crash/restart cycle, or an interval-triggered
+                    // re-login), clicking Connect raises
+                    //   'User "X" is logged into server "Y".
+                    //    Do you want to disconnect and continue?'
+                    // with Yes/No/Help - no OK button, so the generic
+                    // success/error classification below could neither dismiss
+                    // nor pass it, and the unattended login hung here. Answer
+                    // YES (take over the stale session and continue the login),
+                    // then KEEP waiting for the real outcome. Yes button only -
+                    // NEVER the "Don't show this again" checkbox
+                    // (feedback_no_user_pref_changes).
+                    if (text.IndexOf("logged into", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                        text.IndexOf("disconnect", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        log?.Invoke($"[MART-LOGIN] single-session confirm '{text.Trim()}' - answering YES (take over stale session).");
+                        if (!ClickDialogButtonByTextWin32(h, new[] { "Yes", "Evet" }, log))
+                        {
+                            PostMessage(h, WM_COMMAND, MakeWParam(IDYES, 0), GetDlgItem(h, IDYES));
+                            log?.Invoke("[MART-LOGIN] Yes not matched by text - posted WM_COMMAND IDYES as fallback.");
+                        }
+                        before.Add(h); // handled - never reclassify this box as success/error below
+                        continue;
+                    }
+
                     bool connectDlgGone = connectClosed || !IsWindow(dlg) || !IsWindowVisible(dlg);
                     bool looksSuccess =
                         text.IndexOf("Connected", StringComparison.OrdinalIgnoreCase) >= 0 ||

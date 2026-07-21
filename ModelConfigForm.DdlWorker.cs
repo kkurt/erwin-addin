@@ -57,6 +57,12 @@ namespace EliteSoft.Erwin.AddIn
         private DdlQueueJob _currentDdlJob;
         private DateTime _ddlAdoptDeadlineUtc;
         private bool _ddlWorkerLoggedModelOpen; // log "waiting (model open)" once, not every tick
+        // Last claim-query error already logged, so a persistent failure (e.g. a bad
+        // SQL/DB condition) is logged once instead of every ~2s tick. Cleared on the
+        // next successful claim call so a recurrence is logged again. (Declared here,
+        // outside #if DDLGENERATOR, because the claim block that uses it compiles in
+        // every flavor even though the worker timer only runs in the DDL-generator build.)
+        private string _lastClaimErrorLogged;
 
         /// <summary>
         /// True for the WHOLE lifetime of a worker job (claim -> open -> adopt ->
@@ -556,20 +562,53 @@ namespace EliteSoft.Erwin.AddIn
             // disturbs a model a human (or a prior job) left open. (On the dedicated
             // console worker, erwin sits model-less; close any open model to let the
             // worker pick up jobs.)
+            //
+            // Ground truth is the LIVE MDI hierarchy, NOT _isConnected/_currentModel:
+            // in-process SCAPI keeps reporting the adopted PU after its window is gone
+            // (the same ghost the reconnect stale-PU guard handles, see
+            // ReconnectTimer_Tick). The worker adopts the bootstrap model at startup
+            // (_isConnected=true, _currentModel set), then closes it - but SCAPI still
+            // reports that PU with the same locator, so the reconnect tick never flips
+            // us back to disconnected and this gate blocked FOREVER: erwin idle,
+            // title 'erwin DM' (model-less), worker stuck at "a model is open" and no
+            // job ever claimed (field 2026-07-21). Trust the window hierarchy: when we
+            // are marked connected but erwin has NO open model window, the PU is a
+            // ghost - reset our state to match reality and proceed to claim.
             if (_isConnected || _currentModel != null)
             {
-                if (!_ddlWorkerLoggedModelOpen)
+                if (Services.MartMartAutomation.HasActiveModelWindow())
                 {
-                    _ddlWorkerLoggedModelOpen = true;
-                    Log("[DDLWORKER] enabled but a model is open - worker runs only on a model-less erwin. Close the model to let it claim jobs. Waiting...");
+                    if (!_ddlWorkerLoggedModelOpen)
+                    {
+                        _ddlWorkerLoggedModelOpen = true;
+                        Log("[DDLWORKER] enabled but a model is open - worker runs only on a model-less erwin. Close the model to let it claim jobs. Waiting...");
+                    }
+                    return;
                 }
-                return;
+                Log("[DDLWORKER] marked connected but erwin has NO open model window (stale/ghost PU after bootstrap or job close) - clearing connection state so jobs can be claimed.");
+                _currentModel = null;
+                _isConnected = false;
             }
             _ddlWorkerLoggedModelOpen = false;
 
             DdlQueueJob job;
             try { job = DdlQueueService.Instance.TryClaimNextPending(Log); }
-            catch (Exception ex) { Log($"[DDLWORKER] claim failed (queue table missing?): {ex.Message}"); return; }
+            catch (Exception ex)
+            {
+                // The tick runs every ~2s, so a persistent claim error (bad SQL,
+                // permissions, unreachable DB) would flood the log with the SAME
+                // line forever. Log a distinct message once and suppress identical
+                // repeats until it clears or changes. The old text wrongly guessed
+                // "queue table missing?" - the real prod failure was ORA-01745 on a
+                // reserved-word bind, with the table present (2026-07-21).
+                if (!string.Equals(_lastClaimErrorLogged, ex.Message, StringComparison.Ordinal))
+                {
+                    _lastClaimErrorLogged = ex.Message;
+                    Log($"[DDLWORKER] claim query failed (table exists - check the SQL/DB, e.g. ORA-01745 reserved bind): {ex.Message}");
+                }
+                return;
+            }
+            _lastClaimErrorLogged = null; // claim call succeeded - re-arm error logging
             if (job == null) return; // queue empty
 
             _currentDdlJob = job;

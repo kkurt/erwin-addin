@@ -71,11 +71,17 @@ namespace EliteSoft.Erwin.AddIn.Services
                 "ORACLE"     => @"SELECT ID, MODEL_PATH, LEFT_VERSION, RIGHT_VERSION, RETRY_COUNT FROM DDL_GENERATION_QUEUE WHERE STATUS='PENDING' ORDER BY CREATED_AT ASC, ID ASC FETCH FIRST 1 ROWS ONLY",
                 _            => @"SELECT TOP 1 [ID],[MODEL_PATH],[LEFT_VERSION],[RIGHT_VERSION],[RETRY_COUNT] FROM [dbo].[DDL_GENERATION_QUEUE] WHERE [STATUS]='PENDING' ORDER BY [CREATED_AT] ASC, [ID] ASC",
             };
+            // Bind variable names must NOT be Oracle reserved words. BY and AT are
+            // reserved, so ':by' / ':at' made Oracle reject the claim UPDATE at PARSE
+            // time with ORA-01745 ("invalid host/bind variable name"). The claim never
+            // ran and the worker looped a misleading "queue table missing?" every tick
+            // on the prod Oracle DB even though DDL_GENERATION_QUEUE exists (field
+            // 2026-07-21). Renamed to non-reserved names across all dialects.
             string claimSql = dbType?.ToUpper() switch
             {
-                "POSTGRESQL" => @"UPDATE ""DDL_GENERATION_QUEUE"" SET ""STATUS""='RUNNING', ""CLAIMED_BY""=@by, ""STARTED_AT""=@at WHERE ""ID""=@id AND ""STATUS""='PENDING'",
-                "ORACLE"     => @"UPDATE DDL_GENERATION_QUEUE SET STATUS='RUNNING', CLAIMED_BY=:by, STARTED_AT=:at WHERE ID=:id AND STATUS='PENDING'",
-                _            => @"UPDATE [dbo].[DDL_GENERATION_QUEUE] SET [STATUS]='RUNNING', [CLAIMED_BY]=@by, [STARTED_AT]=@at WHERE [ID]=@id AND [STATUS]='PENDING'",
+                "POSTGRESQL" => @"UPDATE ""DDL_GENERATION_QUEUE"" SET ""STATUS""='RUNNING', ""CLAIMED_BY""=@claimedby, ""STARTED_AT""=@startedat WHERE ""ID""=@id AND ""STATUS""='PENDING'",
+                "ORACLE"     => @"UPDATE DDL_GENERATION_QUEUE SET STATUS='RUNNING', CLAIMED_BY=:claimedby, STARTED_AT=:startedat WHERE ID=:id AND STATUS='PENDING'",
+                _            => @"UPDATE [dbo].[DDL_GENERATION_QUEUE] SET [STATUS]='RUNNING', [CLAIMED_BY]=@claimedby, [STARTED_AT]=@startedat WHERE [ID]=@id AND [STATUS]='PENDING'",
             };
 
             using (var conn = DatabaseService.Instance.CreateConnection())
@@ -100,8 +106,8 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                 using (var upd = DatabaseService.Instance.CreateCommand(claimSql, conn))
                 {
-                    AddParam(upd, p("by"), DbType.String, (object)SafeUserName() ?? DBNull.Value);
-                    AddParam(upd, p("at"), DbType.DateTime, DateTime.UtcNow);
+                    AddParam(upd, p("claimedby"), DbType.String, (object)SafeUserName() ?? DBNull.Value);
+                    AddParam(upd, p("startedat"), DbType.DateTime, DateTime.UtcNow);
                     AddParam(upd, p("id"), DbType.Int32, id);
                     int rows = upd.ExecuteNonQuery();
                     if (rows != 1)
@@ -169,17 +175,18 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             string dbType = DatabaseService.Instance.GetDbType();
             // resultColumn==true writes RESULT_DDL (success), false writes ERROR_MESSAGE.
+            // ':at' would hit the same ORA-01745 as the claim query (AT is reserved).
             return dbType?.ToUpper() switch
             {
                 "POSTGRESQL" => resultColumn
-                    ? @"UPDATE ""DDL_GENERATION_QUEUE"" SET ""STATUS""=@st, ""RESULT_DDL""=@val, ""FINISHED_AT""=@at WHERE ""ID""=@id"
-                    : @"UPDATE ""DDL_GENERATION_QUEUE"" SET ""STATUS""=@st, ""ERROR_MESSAGE""=@val, ""FINISHED_AT""=@at WHERE ""ID""=@id",
+                    ? @"UPDATE ""DDL_GENERATION_QUEUE"" SET ""STATUS""=@st, ""RESULT_DDL""=@val, ""FINISHED_AT""=@finishedat WHERE ""ID""=@id"
+                    : @"UPDATE ""DDL_GENERATION_QUEUE"" SET ""STATUS""=@st, ""ERROR_MESSAGE""=@val, ""FINISHED_AT""=@finishedat WHERE ""ID""=@id",
                 "ORACLE" => resultColumn
-                    ? @"UPDATE DDL_GENERATION_QUEUE SET STATUS=:st, RESULT_DDL=:val, FINISHED_AT=:at WHERE ID=:id"
-                    : @"UPDATE DDL_GENERATION_QUEUE SET STATUS=:st, ERROR_MESSAGE=:val, FINISHED_AT=:at WHERE ID=:id",
+                    ? @"UPDATE DDL_GENERATION_QUEUE SET STATUS=:st, RESULT_DDL=:val, FINISHED_AT=:finishedat WHERE ID=:id"
+                    : @"UPDATE DDL_GENERATION_QUEUE SET STATUS=:st, ERROR_MESSAGE=:val, FINISHED_AT=:finishedat WHERE ID=:id",
                 _ => resultColumn
-                    ? @"UPDATE [dbo].[DDL_GENERATION_QUEUE] SET [STATUS]=@st, [RESULT_DDL]=@val, [FINISHED_AT]=@at WHERE [ID]=@id"
-                    : @"UPDATE [dbo].[DDL_GENERATION_QUEUE] SET [STATUS]=@st, [ERROR_MESSAGE]=@val, [FINISHED_AT]=@at WHERE [ID]=@id",
+                    ? @"UPDATE [dbo].[DDL_GENERATION_QUEUE] SET [STATUS]=@st, [RESULT_DDL]=@val, [FINISHED_AT]=@finishedat WHERE [ID]=@id"
+                    : @"UPDATE [dbo].[DDL_GENERATION_QUEUE] SET [STATUS]=@st, [ERROR_MESSAGE]=@val, [FINISHED_AT]=@finishedat WHERE [ID]=@id",
             };
         }
 
@@ -197,7 +204,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 using var cmd = DatabaseService.Instance.CreateCommand(sql, conn);
                 AddParam(cmd, p("st"),  DbType.String,   status);
                 AddParam(cmd, p("val"), DbType.String,   string.IsNullOrEmpty(ddlOrError) ? (object)DBNull.Value : ddlOrError);
-                AddParam(cmd, p("at"),  DbType.DateTime, DateTime.UtcNow);
+                AddParam(cmd, p("finishedat"),  DbType.DateTime, DateTime.UtcNow);
                 AddParam(cmd, p("id"),  DbType.Int32,    id);
                 cmd.ExecuteNonQuery();
             }
