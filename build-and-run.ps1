@@ -602,6 +602,16 @@ if ($null -eq $existingCmdId) {
 # DDL-generator mode watcher config (Phase 6): when built with -DdlGenerator,
 # tell the watcher to launch erwin itself with the bootstrap model. Cleared
 # (DdlGeneratorMode=0) on a normal build so switching back disables it.
+#
+# Snapshot the PREVIOUS mode first: the watcher reads DdlGeneratorMode ONCE at
+# process start, so flipping the value here does nothing to an already-running
+# watcher. The recycle decision below must treat a mode flip like a script
+# change (field bug 2026-07-21: -DdlGenerator install left a week-old watcher
+# running in interactive mode - it kept "Waiting for model" instead of
+# launching erwin with the bootstrap, and the addin never auto-loaded).
+$oldDdlGenMode = (Get-ItemProperty -Path $watcherRegPath -Name 'DdlGeneratorMode' -ErrorAction SilentlyContinue).DdlGeneratorMode
+if ($null -eq $oldDdlGenMode) { $oldDdlGenMode = 0 }
+$newDdlGenMode = if ($DdlGenerator) { 1 } else { 0 }
 if ($DdlGenerator) {
     $bootstrapSrc = Join-Path $scriptDir 'installer\assets\ddlgen-bootstrap.erwin'
     $bootstrapDst = Join-Path $installDir 'ddlgen-bootstrap.erwin'
@@ -775,7 +785,13 @@ if (-not $task) {
     # watcher had moved. PowerShell loads a script into memory once at
     # process start; if the file on disk is byte-identical to what the
     # running process loaded, the recycle is pure cost with zero benefit.
-    $watcherChanged = ($watcherSrcHash -ne $watcherOldHash)
+    # A DdlGeneratorMode flip also forces the recycle: the watcher reads that
+    # registry value once at startup, so a running watcher keeps its OLD mode
+    # until restarted no matter what the registry says now.
+    $watcherChanged = ($watcherSrcHash -ne $watcherOldHash) -or ($oldDdlGenMode -ne $newDdlGenMode)
+    if ($oldDdlGenMode -ne $newDdlGenMode) {
+        Write-Host "  DdlGeneratorMode changed ($oldDdlGenMode -> $newDdlGenMode) - watcher recycle forced" -ForegroundColor Yellow
+    }
     $existingWatchers = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -match 'autostart-watcher' })
 
