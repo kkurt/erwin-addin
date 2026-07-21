@@ -17,6 +17,10 @@ namespace EliteSoft.Erwin.AddIn
 
         private void InitializeComponent()
         {
+            // Component container so IDisposable components (ToolTip) are
+            // disposed with the form (see Dispose above).
+            this.components = new System.ComponentModel.Container();
+
             // === Design System Colors ===
             var clrPrimary = System.Drawing.Color.FromArgb(0, 102, 204);
             var clrPrimaryDark = System.Drawing.Color.FromArgb(0, 76, 153);
@@ -382,7 +386,9 @@ namespace EliteSoft.Erwin.AddIn
             // ----- Group: Source (left model = active model) -----
             this.grpDdlSource = new System.Windows.Forms.GroupBox();
             this.grpDdlSource.Location = new System.Drawing.Point(12, 12);
-            this.grpDdlSource.Size = new System.Drawing.Size(380, 88);
+            // Height 88 -> 104 (WP 312): the source label needs two text lines
+            // for long Mart model names; the Review button moved down with it.
+            this.grpDdlSource.Size = new System.Drawing.Size(380, 104);
             this.grpDdlSource.Text = "Source (Left)";
             this.grpDdlSource.Font = fontCaption;
             this.grpDdlSource.ForeColor = clrTextSecondary;
@@ -398,15 +404,28 @@ namespace EliteSoft.Erwin.AddIn
             // (OnLeftModelChanged / LeftIsActiveModel / ParseLeftVersion).
             // RebuildRightCombo is now called DIRECTLY from PopulateVersionCombos
             // rather than via a cmbLeftModel.SelectedIndex = 0 -> SIC cascade.
+            // WP 312: long Mart model names ("CORE BANKING CASH MANAGEMENT ...")
+            // overflowed the old single-line 360x22 bounds and the wrapped second
+            // line was clipped. Two text lines now fit (height 38); anything even
+            // longer ends in an ellipsis, and the full name is always available
+            // via the tooltip (wired to TextChanged below so every assignment
+            // site keeps it in sync automatically).
             this.lblOpenedModel = new System.Windows.Forms.Label();
             this.lblOpenedModel.Location = new System.Drawing.Point(12, 22);
-            this.lblOpenedModel.Size = new System.Drawing.Size(360, 22);
+            this.lblOpenedModel.Size = new System.Drawing.Size(356, 38);
             this.lblOpenedModel.Text = "(no model loaded)";
             this.lblOpenedModel.Font = fontBodyBold;
             this.lblOpenedModel.ForeColor = clrTextPrimary;
-            this.lblOpenedModel.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
+            this.lblOpenedModel.TextAlign = System.Drawing.ContentAlignment.TopLeft;
+            this.lblOpenedModel.AutoEllipsis = true;
             this.lblOpenedModel.Visible = true;
             this.grpDdlSource.Controls.Add(this.lblOpenedModel);
+
+            // Full-text tooltip for both truncatable model labels. TextChanged
+            // wiring keeps the tooltip correct no matter where Text is set.
+            this.tipDdl = new System.Windows.Forms.ToolTip(this.components);
+            this.lblOpenedModel.TextChanged += (s, ev) =>
+                this.tipDdl.SetToolTip(this.lblOpenedModel, this.lblOpenedModel.Text);
 
             // Restored 2026-05-07 per user request. Triggers erwin's native
             // "Review" toolbar button via Win32 (Win32Helper.InvokeToolbarButton)
@@ -415,7 +434,7 @@ namespace EliteSoft.Erwin.AddIn
             // button does NOT make this obsolete - native Review opens erwin's
             // own diff UI rather than emitting alter DDL.
             this.btnMartReview = new System.Windows.Forms.Button();
-            this.btnMartReview.Location = new System.Drawing.Point(12, 48);
+            this.btnMartReview.Location = new System.Drawing.Point(12, 66);
             this.btnMartReview.Size = new System.Drawing.Size(110, 24);
             this.btnMartReview.Text = "Review";
             this.btnMartReview.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
@@ -430,7 +449,9 @@ namespace EliteSoft.Erwin.AddIn
             // ----- Group: Target (right side = Mart version OR DB) -----
             this.grpDdlTarget = new System.Windows.Forms.GroupBox();
             this.grpDdlTarget.Location = new System.Drawing.Point(400, 12);
-            this.grpDdlTarget.Size = new System.Drawing.Size(444, 88);
+            // Height matches grpDdlSource (88 -> 104, WP 312) so the two group
+            // boxes stay visually aligned.
+            this.grpDdlTarget.Size = new System.Drawing.Size(444, 104);
             this.grpDdlTarget.Text = "Target (Right)";
             this.grpDdlTarget.Font = fontCaption;
             this.grpDdlTarget.ForeColor = clrTextSecondary;
@@ -468,6 +489,12 @@ namespace EliteSoft.Erwin.AddIn
             this.lblRightModel.Font = fontBodyBold;
             this.lblRightModel.ForeColor = clrTextPrimary;
             this.lblRightModel.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
+            // WP 312: same clipping risk as lblOpenedModel. This label must stay
+            // single-line (it sits on the combo row), so overflow gets an
+            // ellipsis and the tooltip carries the full text.
+            this.lblRightModel.AutoEllipsis = true;
+            this.lblRightModel.TextChanged += (s, ev) =>
+                this.tipDdl.SetToolTip(this.lblRightModel, this.lblRightModel.Text);
             this.lblRightModel.Visible = false;
             this.grpDdlTarget.Controls.Add(this.lblRightModel);
 
@@ -502,7 +529,7 @@ namespace EliteSoft.Erwin.AddIn
 
             // ----- Group: Options -----
             this.grpDdlOptions = new System.Windows.Forms.GroupBox();
-            this.grpDdlOptions.Location = new System.Drawing.Point(12, 106);
+            this.grpDdlOptions.Location = new System.Drawing.Point(12, 122);
             this.grpDdlOptions.Size = new System.Drawing.Size(832, 56);
             this.grpDdlOptions.Text = "Options";
             this.grpDdlOptions.Font = fontCaption;
@@ -531,7 +558,7 @@ namespace EliteSoft.Erwin.AddIn
             // via AddinMessageDialog; the status label below stays as the
             // one-line summary.
             this.btnAlterWizardProd = new System.Windows.Forms.Button();
-            this.btnAlterWizardProd.Location = new System.Drawing.Point(12, 172);
+            this.btnAlterWizardProd.Location = new System.Drawing.Point(12, 188);
             this.btnAlterWizardProd.Size = new System.Drawing.Size(175, 32);
             this.btnAlterWizardProd.Text = "Generate DDL";
             this.btnAlterWizardProd.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
@@ -549,7 +576,7 @@ namespace EliteSoft.Erwin.AddIn
             // transition. Hidden in packaged builds via #if !PACKAGED so
             // shipping users never see it.
             this.btnAlterWizardProdDebug = new System.Windows.Forms.Button();
-            this.btnAlterWizardProdDebug.Location = new System.Drawing.Point(193, 172);
+            this.btnAlterWizardProdDebug.Location = new System.Drawing.Point(193, 188);
             this.btnAlterWizardProdDebug.Size = new System.Drawing.Size(175, 32);
             this.btnAlterWizardProdDebug.Text = "Generate DDL (debug)";
             this.btnAlterWizardProdDebug.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
@@ -569,7 +596,7 @@ namespace EliteSoft.Erwin.AddIn
             // builds it is visible by default. Replaces the old Ctrl+Alt+S hotkey
             // (collided with erwin's Scheduler shortcut).
             this.btnStepMode = new System.Windows.Forms.Button();
-            this.btnStepMode.Location = new System.Drawing.Point(12, 210);
+            this.btnStepMode.Location = new System.Drawing.Point(12, 226);
             this.btnStepMode.Size = new System.Drawing.Size(175, 26);
             this.btnStepMode.Text = "Step Mode: OFF";
             this.btnStepMode.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
@@ -587,10 +614,10 @@ namespace EliteSoft.Erwin.AddIn
 #if !PACKAGED
             // Debug button sits to the right of the production button; status
             // label starts after it (12 + 175 + 6 gap + 175 + 12 gap = 380).
-            this.lblDDLStatus.Location = new System.Drawing.Point(380, 180);
+            this.lblDDLStatus.Location = new System.Drawing.Point(380, 196);
             this.lblDDLStatus.Size = new System.Drawing.Size(465, 20);
 #else
-            this.lblDDLStatus.Location = new System.Drawing.Point(200, 180);
+            this.lblDDLStatus.Location = new System.Drawing.Point(200, 196);
             this.lblDDLStatus.Size = new System.Drawing.Size(645, 20);
 #endif
             this.lblDDLStatus.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
@@ -698,6 +725,8 @@ namespace EliteSoft.Erwin.AddIn
         private System.Windows.Forms.TabPage tabDdlGeneration;
         private System.Windows.Forms.TabPage tabIntegrate;
         private System.Windows.Forms.Label lblOpenedModel;
+        // Full-text tooltip for the truncatable DDL-tab model labels (WP 312).
+        private System.Windows.Forms.ToolTip tipDdl;
         private System.Windows.Forms.Button btnMartReview;
         private System.Windows.Forms.Button btnAlterWizardProd;
 #if !PACKAGED
