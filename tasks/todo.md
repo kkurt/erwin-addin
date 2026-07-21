@@ -1,4 +1,31 @@
-# Version Promotion (Release Management) - PLAN, awaiting user approval (2026-07-22)
+# Version Promotion (Release Management) - Phase 1 DONE, Phase 2 awaiting approval (2026-07-22)
+
+OpenProject WP: 322 (In progress). Decisions (user, 2026-07-22):
+- D1: lock later ("tamam sonra") -> Phase 1 ships UnlockedOnly service; non-UNLOCKED
+  effective PROMOTION_LOCK_TYPE throws before insert (no silent fallback).
+- D2: Marts are Windows-auth -> Environment.UserName IS the Mart login (SUBMITTED_BY).
+- D3: single row per send: REQUEST_TYPE='PROMOTION' replaces the DDL row for that send.
+- D4: watcher cadence 30 s proposed (explained to user; Phase 3 topic, no objection yet).
+- D5: pre-existing working-tree fixes committed (f144735, e5a70f9, 8c8423c).
+- D6: no WP existed; Feature WP 322 created + started.
+
+## Phase 1 result (2026-07-22)
+- [x] Services/PromotionPlanner.cs: BuildRoutes (3-step source rule; first env NEVER a
+      target), TargetsOf/RoutesForTarget, RequiresApprovalVote, SelectMissedUnlocks.
+- [x] Services/MartVersionLockService.cs: PromotionLockType enum + exact codes +
+      IMartVersionLockService + UnlockedOnlyMartVersionLockService (non-UNLOCKED throws).
+- [x] Services/PromotionService.cs: EF via RepoDbContext; SubmitPromotion single
+      transaction (insert + auto-approve MEV upsert), readers (approvers, env versions,
+      pending promotions, own lock rows, reject reason), ComposeNote, ResolveSubmitter.
+- [x] tests/PromotionPlannerTests.cs: 25 tests. Suite 776/776 green; both flavors 0/0.
+- [x] Adversarial review (3 lenses + verifiers): 9 findings, 3 confirmed, both fixed:
+      (1) first env offered as target -> forbidden MEV row (BuildRoutes now skips);
+      (2) GetPendingPromotions equality on MODEL_LOCATOR = NCLOB on Oracle (ORA-00932)
+      -> SQL filters bounded cols (CONFIG_ID/STATUS/REQUEST_TYPE), path match in memory.
+
+---
+
+# Version Promotion (Release Management) - PLAN (2026-07-22)
 
 Authoritative spec: C:\Users\Kursat\Repos\erwin-admin\docs\erwin-addin-release-management-prompt.md
 (admin web + live DB schema done 2026-07-21; schema/contracts are FIXED, do not change).
