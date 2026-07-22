@@ -1,4 +1,44 @@
-# Version Promotion (Release Management) - Phase 1 DONE, Phase 2 awaiting approval (2026-07-22)
+# Version Promotion (Release Management) - Phase 2 CODE-DONE (awaiting live test), 2026-07-22
+
+## Phase 2 result (2026-07-22, commits 1525ede + this one)
+- [x] MartSaveAutomation.SaveWithDescriptionCaptureAsync: MartSaveOutcome(success,
+      dialogSeen, capturedVersion); version read off the description dialog title.
+- [x] PromotionPlanner: ParseVersionFromSaveDialogTitle (end-anchored),
+      CandidatePlanningVersion (positive title-clean -> plan on CURRENT version,
+      else fresh; SCAPI dirty probes are inert on r10.10).
+- [x] PromotionFlow: IsPromotionEnabled gate, ResolveEffectiveLockType (default
+      EXCLUSIVE), BuildSendContext (envs + relations + routes + preloaded
+      per-relation approvers). PromotionSaveOutcome contract.
+- [x] ModelConfigForm.SavePromotionModelWithDescription: clean model promotes the
+      open version WITHOUT a save (second-hop scenario); dirty saves + captures
+      the minted version (dialog title, then post-save window-title poll);
+      unknown version = hard block, never guessed.
+- [x] DdlApprovalDialog promotion mode (user-approved sketch): "Promote to" combo
+      with COLOR_HEX dots above the Note row, derived "From" label (combo when
+      rule-3 multi-candidate), "Approval required"/"Auto-approve" indicator,
+      "Send to Approval" button; RunPromotionSendAsync = lock gate BEFORE save ->
+      version-capturing save -> send-time route re-derivation -> approval
+      decision -> single-transaction PROMOTION insert (+MEV upsert on auto) ->
+      lock release on failed insert -> model close -> outcome modal.
+- [x] ShowDdlForApproval wiring: enabled-but-unconfigured = warn + standard flow;
+      context-build error = error + ask (continue standard / abort). Classic DDL
+      branch untouched when promotion off.
+- [x] Adversarial review round 2 (7 findings, 2 confirmed, both fixed):
+      (1) clean-to-clean version drift behind the dialog now also triggers route
+      re-derivation (stale rule-1 source was possible); (2) promotion combos
+      freeze during the async send (mid-send selection could diverge from the
+      submitted route).
+- [x] 791/791 tests green; both flavors 0 warn / 0 err.
+- [ ] LIVE E2E (user): auto-approve path, approver path (web inbox), clean-model
+      second hop, transition-less target absent from picker, lock gate error
+      when PROMOTION_LOCK_TYPE != UNLOCKED.
+
+Phase 3 (status watcher + missed-unlock recovery) and Phase 4 (General tab env x
+version card) await user approval after the live test.
+
+---
+
+# Version Promotion (Release Management) - Phase 1 DONE (2026-07-22)
 
 OpenProject WP: 322 (In progress). Decisions (user, 2026-07-22):
 - D1: lock later ("tamam sonra") -> Phase 1 ships UnlockedOnly service; non-UNLOCKED
