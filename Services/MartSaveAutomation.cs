@@ -8,6 +8,22 @@ using System.Threading.Tasks;
 namespace EliteSoft.Erwin.AddIn.Services
 {
     /// <summary>
+    /// Result of one automated Mart Save run.
+    /// </summary>
+    /// <param name="Success">The UI automation chain completed (same semantics
+    /// as the legacy bool return; the caller still verifies the commit via the
+    /// post-save dirty re-probe).</param>
+    /// <param name="DialogSeen">The description dialog was actually caught and
+    /// driven. False when erwin skipped it ("Don't show this again" pref) - the
+    /// commit may still have happened, but nothing could be read off the
+    /// dialog.</param>
+    /// <param name="CapturedVersion">The Mart version number parsed from the
+    /// dialog title "Description for '&lt;model&gt;' Version &lt;N&gt;" - the
+    /// version this save CREATES. Null when the dialog was not seen or the
+    /// title did not parse. Version Promotion uses this as MODEL_VERSION.</param>
+    internal readonly record struct MartSaveOutcome(bool Success, bool DialogSeen, int? CapturedVersion);
+
+    /// <summary>
     /// Drives erwin's own native Mart Save flow from inside the addin
     /// without showing any UI to the user. Replaces the SCAPI
     /// pu.Save(martUri, "OVM=Yes") path that is rejected in-process by
@@ -147,7 +163,23 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// the manual flow's worst case (cold Mart connection + lazy
         /// SCAPI init); production normal is &lt;500ms.</param>
         /// <param name="log">Diagnostic logger.</param>
-        public static Task<bool> SaveWithDescriptionAsync(
+        public static async Task<bool> SaveWithDescriptionAsync(
+            IntPtr erwinMainHwnd,
+            string description,
+            int timeoutMs,
+            Action<string> log)
+        {
+            return (await SaveWithDescriptionCaptureAsync(erwinMainHwnd, description, timeoutMs, log)
+                .ConfigureAwait(false)).Success;
+        }
+
+        /// <summary>
+        /// Same automation as <see cref="SaveWithDescriptionAsync"/> but returns
+        /// the full <see cref="MartSaveOutcome"/> including the version number
+        /// captured from the description dialog title. Version Promotion needs
+        /// that number as MODEL_VERSION (the save mints exactly that version).
+        /// </summary>
+        public static Task<MartSaveOutcome> SaveWithDescriptionCaptureAsync(
             IntPtr erwinMainHwnd,
             string description,
             int timeoutMs,
@@ -168,7 +200,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             // pump messages via Application.DoEvents while waiting,
             // and report the result through a TaskCompletionSource so
             // the rest of the addin's async code keeps working.
-            var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var tcs = new TaskCompletionSource<MartSaveOutcome>(TaskCreationOptions.RunContinuationsAsynchronously);
             var t = new Thread(() =>
             {
                 try { tcs.SetResult(SaveWithDescriptionCore(erwinMainHwnd, description, timeoutMs, log)); }
@@ -199,7 +231,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
         }
 
-        private static bool SaveWithDescriptionCore(
+        private static MartSaveOutcome SaveWithDescriptionCore(
             IntPtr erwinMainHwnd,
             string description,
             int timeoutMs,
@@ -210,7 +242,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             if (erwinMainHwnd == IntPtr.Zero)
             {
                 safeLog("MartSaveAutomation: erwin main HWND is zero - aborting.");
-                return false;
+                return new MartSaveOutcome(false, false, null);
             }
 
             // Snapshot the erwin process id - we use it both for filtering
@@ -225,6 +257,10 @@ namespace EliteSoft.Erwin.AddIn.Services
             IntPtr capturedDialog = IntPtr.Zero;
             int captureRc = 0;       // 1 = handled, -1 = handler exception, -2 = edit / IDOK miss
             string captureNote = "";
+            // Version number parsed off the dialog title ("... Version <N>").
+            // 0 = not captured. Written once inside the callback (same
+            // once-only guard as capturedDialog), read after the wait.
+            int capturedVersion = 0;
 
             // Diagnostics: WinEvent callback fire counts. Without these we
             // cannot tell "hook never installed" apart from "hook installed
@@ -276,6 +312,21 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                     Interlocked.Exchange(ref capturedDialog, hwnd);
                     safeLog($"MartSaveAutomation: caught description dialog hwnd=0x{hwnd.ToInt64():X} title='{t}' (evt=0x{evt:X})");
+
+                    // The title names the version this save CREATES
+                    // ("Description for '<model>' Version <N>") - capture it
+                    // for Version Promotion's MODEL_VERSION before the dialog
+                    // is IDOK'd away.
+                    int? titleVersion = PromotionPlanner.ParseVersionFromSaveDialogTitle(t);
+                    if (titleVersion.HasValue)
+                    {
+                        Interlocked.Exchange(ref capturedVersion, titleVersion.Value);
+                        safeLog($"MartSaveAutomation: dialog title names Version {titleVersion.Value} (the version this save creates).");
+                    }
+                    else
+                    {
+                        safeLog("MartSaveAutomation: dialog title did not yield a version number.");
+                    }
 
                     // a. Hide before any paint pass. SW_HIDE flips the
                     //    WS_VISIBLE bit before the first WM_PAINT runs;
@@ -374,7 +425,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 if (createHook == IntPtr.Zero)
                 {
                     safeLog("MartSaveAutomation: SetWinEventHook(create) returned NULL - aborting.");
-                    return false;
+                    return new MartSaveOutcome(false, false, null);
                 }
 
                 // Post the ribbon Mart Save command to erwin's main window.
@@ -385,7 +436,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 if (!posted)
                 {
                     safeLog("MartSaveAutomation: PostMessage returned false (queue full / invalid hwnd?) - aborting.");
-                    return false;
+                    return new MartSaveOutcome(false, false, null);
                 }
 
                 // Wait for the dialog to appear + be handled. Use the
@@ -417,14 +468,18 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // commit-verification signal (dirty -> True after =
                     // commit failed; dirty -> False after = commit OK).
                     safeLog($"MartSaveAutomation: description dialog did not appear within {timeoutMs}ms after ribbon Save - probably 'Don't show this again' is on (erwin commits silently with empty description). Returning true so caller can confirm via post-save dirty re-probe.");
-                    return true;
+                    return new MartSaveOutcome(true, false, null);
                 }
 
                 if (captureRc < 0)
                 {
                     safeLog($"MartSaveAutomation: dialog handler reported failure (rc={captureRc}, note='{captureNote}').");
-                    return false;
+                    return new MartSaveOutcome(false, true, null);
                 }
+
+                // Version captured off the dialog title (0 = not parsed).
+                int capturedV = Interlocked.CompareExchange(ref capturedVersion, 0, 0);
+                int? versionOrNull = capturedV > 0 ? capturedV : (int?)null;
 
                 // Wait for the dialog to actually close (= commit finished
                 // and dialog DestroyWindow ran). Cap this separately - if
@@ -436,16 +491,16 @@ namespace EliteSoft.Erwin.AddIn.Services
                     safeLog($"MartSaveAutomation: dialog did not close within {timeoutMs}ms after IDOK - proceeding anyway, caller will re-probe dirty bit.");
                     // Not a hard failure - the IDOK may have queued and the
                     // commit may still be in progress when the caller probes.
-                    return true;
+                    return new MartSaveOutcome(true, true, versionOrNull);
                 }
 
                 safeLog("MartSaveAutomation: description dialog closed cleanly after IDOK - commit chain completed.");
-                return true;
+                return new MartSaveOutcome(true, true, versionOrNull);
             }
             catch (Exception ex)
             {
                 safeLog($"MartSaveAutomation: top-level threw {ex.GetType().Name}: {ex.Message}");
-                return false;
+                return new MartSaveOutcome(false, false, null);
             }
             finally
             {

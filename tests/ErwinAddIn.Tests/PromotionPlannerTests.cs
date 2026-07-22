@@ -295,6 +295,53 @@ public class PromotionPlannerTests
         PromotionPlanner.SelectMissedUnlocks(null!, "kursat").Should().BeEmpty();
     }
 
+    // ---- ParseVersionFromSaveDialogTitle ----------------------------------
+
+    [Theory]
+    [InlineData("Description for 'MetaRepo' Version 12", 12)]
+    [InlineData("Description for 'M' Version 1", 1)]
+    // A model name containing the word "Version" must not confuse the parse:
+    // only the TRAILING "Version <N>" names the version the save creates.
+    [InlineData("Description for 'Core Version 2 Model' Version 7", 7)]
+    [InlineData("Description for 'X' Version 12  ", 12)] // trailing spaces tolerated
+    public void ParseVersionFromSaveDialogTitle_reads_the_trailing_version(string title, int expected)
+    {
+        PromotionPlanner.ParseVersionFromSaveDialogTitle(title).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("Description for 'MetaRepo'")]
+    [InlineData("Description for 'X' Version")]
+    [InlineData("Description for 'X' Version 0")]   // versions are 1-based
+    [InlineData("Version 5 of something else")]      // not trailing
+    public void ParseVersionFromSaveDialogTitle_returns_null_when_shape_does_not_match(string? title)
+    {
+        PromotionPlanner.ParseVersionFromSaveDialogTitle(title).Should().BeNull();
+    }
+
+    // ---- CandidatePlanningVersion -----------------------------------------
+
+    [Fact]
+    public void CandidatePlanningVersion_uses_current_version_only_on_a_positive_clean_reading()
+    {
+        // Clean model: the send skips the Mart save, so the open version is
+        // promoted and its holders can be rule-1 sources (second-hop case).
+        PromotionPlanner.CandidatePlanningVersion(titleDirty: false, currentLocatorVersion: 5).Should().Be(5);
+    }
+
+    [Theory]
+    [InlineData(true, 5)]    // dirty: the save will mint a NEW version
+    [InlineData(null, 5)]    // unknown reading: treated as dirty (save runs)
+    [InlineData(false, -1)]  // clean but version unreadable: cannot plan on it
+    [InlineData(false, 0)]
+    public void CandidatePlanningVersion_returns_null_when_a_fresh_or_unknown_version_will_be_promoted(
+        bool? titleDirty, int currentVersion)
+    {
+        PromotionPlanner.CandidatePlanningVersion(titleDirty, currentVersion).Should().BeNull();
+    }
+
     // ---- PromotionLockType codes ------------------------------------------
 
     [Theory]

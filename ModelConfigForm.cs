@@ -6404,6 +6404,104 @@ namespace EliteSoft.Erwin.AddIn
         }
 
         /// <summary>
+        /// Promotion-aware variant of <see cref="SaveCurrentModelWithDescription"/>.
+        /// A promotion MUST record the exact Mart version it promotes
+        /// (MODEL_VERSION is a spec precondition), so this flow differs from
+        /// the plain DDL push save in two ways:
+        ///   1. The dirty gate is the TITLE-ASTERISK probe, not
+        ///      VersionCompareService.ProbeDirty - the SCAPI probe is inert on
+        ///      r10.10 (always "assume dirty"), which would force a pointless
+        ///      save on clean models and break the second-hop scenario
+        ///      (promoting the SAME version Test to Prod relies on skipping
+        ///      the save so the version number stays put).
+        ///   2. The version number is captured: clean model = the open
+        ///      locator version; dirty model = the version named by the save
+        ///      description dialog title, with a post-save window-title
+        ///      re-read as fallback (the dialog is skipped entirely when the
+        ///      user has erwin's "Don't show this again" pref on). If the
+        ///      number cannot be determined the outcome is a HARD failure -
+        ///      the caller aborts the send, never guesses.
+        /// </summary>
+        private System.Threading.Tasks.Task<Services.PromotionSaveOutcome> SavePromotionModelWithDescription(string description)
+        {
+            return System.Threading.Tasks.Task.Run(async () =>
+            {
+                if (_currentModel == null)
+                {
+                    Log("SavePromotionModelWithDescription: no _currentModel; aborting.");
+                    return new Services.PromotionSaveOutcome(false, null, false, "No bound model.");
+                }
+
+                bool? titleDirty = Services.MartMartAutomation.IsActiveMdiChildDirtyByTitle((Action<string>)Log);
+                Log($"SavePromotionModelWithDescription: title-dirty probe = {(titleDirty == null ? "unknown (will save)" : titleDirty.Value ? "dirty" : "clean")}");
+
+                if (titleDirty == false)
+                {
+                    // Positive clean: nothing to commit, promote the open version.
+                    int current = ParseActivePuVersion();
+                    if (current > 0)
+                    {
+                        Log($"SavePromotionModelWithDescription: clean model - promoting the open version v{current} without a save.");
+                        return new Services.PromotionSaveOutcome(true, current, false, null);
+                    }
+                    return new Services.PromotionSaveOutcome(false, null, false,
+                        "The model is clean but its open Mart version number could not be read from the locator. Promotion requires a known version.");
+                }
+
+                IntPtr erwinMain = IntPtr.Zero;
+                try { erwinMain = Services.Win32Helper.GetErwinMainWindow(); }
+                catch (Exception ex) { Log($"SavePromotionModelWithDescription: GetErwinMainWindow threw {ex.GetType().Name}: {ex.Message}"); }
+                if (erwinMain == IntPtr.Zero)
+                    return new Services.PromotionSaveOutcome(false, null, false, "erwin main window not resolvable.");
+
+                var save = await Services.MartSaveAutomation.SaveWithDescriptionCaptureAsync(
+                    erwinMain, description ?? string.Empty, timeoutMs: 15000, (Action<string>)Log)
+                    .ConfigureAwait(false);
+                Log($"SavePromotionModelWithDescription: save automation => success={save.Success}, dialogSeen={save.DialogSeen}, capturedVersion={(save.CapturedVersion?.ToString() ?? "-")}");
+                if (!save.Success)
+                    return new Services.PromotionSaveOutcome(false, null, false, "Mart save failed - see Debug Log.");
+
+                // Same positive commit proof as the DDL push save: a PU still
+                // dirty (with a readable source) after a successful UI flow
+                // means the commit did not flush.
+                try
+                {
+                    var postProbe = new Services.VersionCompareService(_currentModel, (Action<string>)Log);
+                    var afterDirty = postProbe.ProbeDirty();
+                    Log($"SavePromotionModelWithDescription: dirty after save = {afterDirty.IsDirty} (source={afterDirty.Source})");
+                    if (afterDirty.IsDirty && afterDirty.Source != "(unknown)" && afterDirty.Source != "(post-probe-error)")
+                        return new Services.PromotionSaveOutcome(false, null, true, "Mart save completed but the model is still dirty - commit did not flush.");
+                }
+                catch (Exception ex)
+                {
+                    Log($"SavePromotionModelWithDescription: post-save ProbeDirty threw {ex.GetType().Name}: {ex.Message} - trusting the automation result.");
+                }
+
+                int? promoted = save.CapturedVersion;
+                if (promoted == null)
+                {
+                    // Dialog skipped ("Don't show this again") or title did not
+                    // parse: erwin's MDI title shows the NEW version (?VNO=N)
+                    // once the commit lands - poll it briefly.
+                    for (int attempt = 0; attempt < 6 && promoted == null; attempt++)
+                    {
+                        string titleLocator = Services.PuLocatorReader.ReadFromWindowTitle();
+                        int v = ExtractLocatorVersion(titleLocator);
+                        if (v > 0) promoted = v;
+                        else await System.Threading.Tasks.Task.Delay(500).ConfigureAwait(false);
+                    }
+                    Log($"SavePromotionModelWithDescription: post-save title fallback version = {(promoted?.ToString() ?? "unknown")}");
+                }
+
+                if (promoted == null)
+                    return new Services.PromotionSaveOutcome(false, null, true,
+                        "The model was saved but the new Mart version number could not be determined. Promotion requires a known version.");
+
+                return new Services.PromotionSaveOutcome(true, promoted, true, null);
+            });
+        }
+
+        /// <summary>
         /// Reads the active model's target DBMS for the approval popup header
         /// and DDL_APPROVAL_QUEUE.DBMS_TYPE column.
         ///

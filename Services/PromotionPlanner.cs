@@ -206,6 +206,44 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// Extracts the Mart version number from erwin's incremental-save
+        /// description dialog title, e.g.
+        /// "Description for 'MetaRepo' Version 12" -> 12. That title names the
+        /// version the save is about to CREATE, which is exactly the version a
+        /// promotion must record as MODEL_VERSION. Anchored at the end so a
+        /// model name containing the word "Version" cannot confuse the parse.
+        /// Returns null when the shape does not match.
+        /// </summary>
+        public static int? ParseVersionFromSaveDialogTitle(string? title)
+        {
+            if (string.IsNullOrWhiteSpace(title)) return null;
+            var m = System.Text.RegularExpressions.Regex.Match(
+                title, @"Version\s+(\d+)\s*$", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+            return m.Success && int.TryParse(m.Groups[1].Value, out int v) && v > 0 ? v : null;
+        }
+
+        /// <summary>
+        /// The version number route planning should assume BEFORE the send-time
+        /// Mart save runs. A POSITIVE clean reading of erwin's title-asterisk
+        /// probe means the save will be skipped and the promoted version is the
+        /// currently open one (so MODEL_ENVIRONMENT_VERSION holders of that
+        /// version can be rule-1 sources, e.g. the second hop of Test to Prod).
+        /// Dirty or unknown means the save will MINT A NEW version that no
+        /// environment can possibly hold yet - returns null, which makes
+        /// <see cref="BuildRoutes"/> fall through to the first-environment rule.
+        /// (SCAPI dirty probes are inert on r10.10; the title asterisk is the
+        /// only trustworthy clean signal, see ProbeActiveModelDirtyForReview.)
+        /// </summary>
+        /// <param name="titleDirty">MartMartAutomation.IsActiveMdiChildDirtyByTitle result.</param>
+        /// <param name="currentLocatorVersion">ParseActivePuVersion result (-1 when unknown).</param>
+        public static int? CandidatePlanningVersion(bool? titleDirty, int currentLocatorVersion)
+        {
+            return titleDirty == false && currentLocatorVersion > 0
+                ? currentLocatorVersion
+                : (int?)null;
+        }
+
+        /// <summary>
         /// Startup missed-unlock recovery filter: from the caller's own queue
         /// rows, the PROMOTION rows that still carry a real lock
         /// (LOCK_TYPE present and not 'UNLOCKED') but already reached a
