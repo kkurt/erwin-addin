@@ -278,7 +278,9 @@ namespace EliteSoft.Erwin.AddIn.Forms
             return path;
         }
 
-        private static Color? TryParseHex(string? hex)
+        // Internal (not private): DdlApprovalDialog's promotion target picker
+        // renders the same COLOR_HEX dots and must not duplicate the parser.
+        internal static Color? TryParseHex(string? hex)
         {
             if (string.IsNullOrWhiteSpace(hex)) return null;
             string s = hex.Trim().TrimStart('#');

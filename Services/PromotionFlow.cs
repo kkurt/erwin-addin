@@ -18,6 +18,7 @@ namespace EliteSoft.Erwin.AddIn.Services
     /// <param name="Routes">Candidate promotion routes per <see cref="PromotionPlanner.BuildRoutes"/>; empty = nothing to offer.</param>
     /// <param name="PlanningVersion">The version routes were planned for; null = the send-time save will mint a fresh version (no environment can hold it).</param>
     /// <param name="ModelCleanByTitle">True when the title-asterisk probe read a POSITIVE clean (the send will skip the Mart save and promote the open version).</param>
+    /// <param name="ApproversByRelationId">Per-transition approver names (ENVIRONMENT_RELATION_APPROVER, SORT_ORDER order) for every relation appearing in <see cref="Routes"/> - preloaded so the dialog needs no DB read to show the approval/auto-approve indicator.</param>
     public sealed record PromotionSendContext(
         int ConfigId,
         string MartPath,
@@ -25,7 +26,8 @@ namespace EliteSoft.Erwin.AddIn.Services
         IReadOnlyList<IntegrationRelation> Relations,
         IReadOnlyList<PromotionRoute> Routes,
         int? PlanningVersion,
-        bool ModelCleanByTitle);
+        bool ModelCleanByTitle,
+        IReadOnlyDictionary<int, IReadOnlyList<string>> ApproversByRelationId);
 
     /// <summary>
     /// Result of the promotion-aware Mart save step. Unlike the plain DDL push
@@ -121,12 +123,22 @@ namespace EliteSoft.Erwin.AddIn.Services
             var routes = PromotionPlanner.BuildRoutes(
                 planningVersion ?? -1, environments, relations, versions);
 
+            // Preload the per-transition approver lists of every offered route
+            // so the dialog can show the approval/auto-approve indicator
+            // without further DB reads.
+            var approvers = new Dictionary<int, IReadOnlyList<string>>();
+            foreach (var route in routes)
+            {
+                if (!approvers.ContainsKey(route.Relation.Id))
+                    approvers[route.Relation.Id] = PromotionService.Instance.GetRelationApprovers(route.Relation.Id);
+            }
+
             log?.Invoke($"PromotionFlow: context built - config={configId}, path='{martPath}', " +
                         $"cleanByTitle={clean}, planningVersion={(planningVersion?.ToString() ?? "(new)")}, " +
                         $"envs={environments.Count}, relations={relations.Count}, routes={routes.Count}");
 
             return new PromotionSendContext(
-                configId, martPath, environments, relations, routes, planningVersion, clean);
+                configId, martPath, environments, relations, routes, planningVersion, clean, approvers);
         }
     }
 }

@@ -6263,6 +6263,44 @@ namespace EliteSoft.Erwin.AddIn
                 approvalEnabled = true;
             }
 
+            // Version Promotion (WP 322): when the feature is enabled for this
+            // config the send becomes a promotion request - ONE
+            // REQUEST_TYPE='PROMOTION' row targeting an environment (decision
+            // D3). The context (topology + candidate routes + approvers) is
+            // built here so the dialog opens with everything it needs.
+            Services.PromotionSendContext promotionContext = null;
+            try
+            {
+                if (Services.PromotionFlow.IsPromotionEnabled())
+                {
+                    bool? titleDirty = Services.MartMartAutomation.IsActiveMdiChildDirtyByTitle((Action<string>)Log);
+                    var built = Services.PromotionFlow.BuildSendContext(
+                        titleDirty, ParseActivePuVersion(), (Action<string>)Log);
+                    if (built.Routes.Count == 0)
+                    {
+                        // Enabled but unusable (no environments/transitions):
+                        // tell the user and continue with the standard flow -
+                        // never a silent fallback.
+                        Log("ShowDdlForApproval: VERSION_PROMOTION_ENABLED but no usable routes; standard DDL flow.");
+                        Forms.AddinMessageDialog.Show(this,
+                            "Version Promotion is enabled but this configuration has no usable environments or transitions.\n\nThe DDL will be sent through the standard approval flow.",
+                            "Version Promotion", System.Windows.Forms.MessageBoxButtons.OK, System.Windows.Forms.MessageBoxIcon.Warning);
+                    }
+                    else
+                    {
+                        promotionContext = built;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"ShowDdlForApproval: promotion context build failed: {ex.GetType().Name}: {ex.Message}");
+                var choice = Forms.AddinMessageDialog.Show(this,
+                    $"Version Promotion data could not be loaded:\n{ex.Message}\n\nContinue with the standard DDL approval flow instead?",
+                    "Version Promotion", System.Windows.Forms.MessageBoxButtons.YesNo, System.Windows.Forms.MessageBoxIcon.Error);
+                if (choice != System.Windows.Forms.DialogResult.Yes) return;
+            }
+
             using var dlg = new Forms.DdlApprovalDialog(
                 ddlText:           ddl,
                 configId:          ctx.ActiveConfigId,
@@ -6272,7 +6310,9 @@ namespace EliteSoft.Erwin.AddIn
                 dbmsType:          dbmsType,
                 approvalEnabled:   approvalEnabled,
                 log:               (Action<string>)Log,
-                martSaveCallback:  SaveCurrentModelWithDescription);
+                martSaveCallback:  SaveCurrentModelWithDescription,
+                promotionContext:  promotionContext,
+                promotionSaveCallback: SavePromotionModelWithDescription);
             dlg.ShowDialog(this);
         }
 
