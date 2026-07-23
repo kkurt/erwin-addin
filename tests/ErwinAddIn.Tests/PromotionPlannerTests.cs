@@ -379,6 +379,79 @@ public class PromotionPlannerTests
             .Should().Be(PromotionLockType.Exclusive);
     }
 
+    // ---- PromotionFlow.DecideLock -----------------------------------------
+
+    // A lock service that supports every type - stands in for the future
+    // lock-capable build so the unset->EXCLUSIVE forward path can be tested.
+    private sealed class AllLocksService : IMartVersionLockService
+    {
+        public bool Supports(PromotionLockType lockType) => true;
+        public void ApplyLock(string martPath, int version, PromotionLockType lockType, System.Action<string>? log) { }
+        public void ReleaseLock(string martPath, int version, PromotionLockType lockType, System.Action<string>? log) { }
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void DecideLock_unset_maps_to_unlocked_when_the_build_cannot_lock(string? raw)
+    {
+        // Deferred-lock phase (D1): an unconfigured setting is NOT a lock
+        // request, so it must not block - it resolves to UNLOCKED and the send
+        // proceeds. This is the bug the live test hit (unset -> EXCLUSIVE ->
+        // blocked, 2026-07-22).
+        var (effective, explicitly) = PromotionFlow.DecideLock(raw, new UnlockedOnlyMartVersionLockService());
+        effective.Should().Be(PromotionLockType.Unlocked);
+        explicitly.Should().BeFalse();
+    }
+
+    [Fact]
+    public void DecideLock_unset_maps_to_exclusive_once_a_lock_capable_build_ships()
+    {
+        // Forward-compat: when the service can apply EXCLUSIVE, an unset
+        // setting resolves to the admin contract default (EXCLUSIVE) with no
+        // code change - the same DecideLock adapts to the service.
+        var (effective, explicitly) = PromotionFlow.DecideLock(null, new AllLocksService());
+        effective.Should().Be(PromotionLockType.Exclusive);
+        explicitly.Should().BeFalse();
+    }
+
+    [Fact]
+    public void DecideLock_explicit_unlocked_proceeds()
+    {
+        var (effective, explicitly) = PromotionFlow.DecideLock("UNLOCKED", new UnlockedOnlyMartVersionLockService());
+        effective.Should().Be(PromotionLockType.Unlocked);
+        explicitly.Should().BeTrue();
+    }
+
+    [Theory]
+    [InlineData("EXCLUSIVE", PromotionLockType.Exclusive)]
+    [InlineData("exclusive", PromotionLockType.Exclusive)]
+    [InlineData("SHARED", PromotionLockType.Shared)]
+    [InlineData("UPDATE", PromotionLockType.Update)]
+    [InlineData("EXISTENCE", PromotionLockType.Existence)]
+    public void DecideLock_explicit_non_unlocked_is_flagged_explicit_so_the_gate_can_reject_it(
+        string raw, PromotionLockType expected)
+    {
+        // Explicit request the deferred build cannot honor: flagged explicit so
+        // the send gate rejects it loudly instead of silently proceeding.
+        var (effective, explicitly) = PromotionFlow.DecideLock(raw, new UnlockedOnlyMartVersionLockService());
+        effective.Should().Be(expected);
+        explicitly.Should().BeTrue();
+        new UnlockedOnlyMartVersionLockService().Supports(effective).Should().BeFalse();
+    }
+
+    [Fact]
+    public void DecideLock_explicit_unparseable_defaults_to_exclusive_and_blocks()
+    {
+        // A typo'd explicit value must not silently proceed unlocked; it
+        // resolves to the contract default (EXCLUSIVE), stays flagged explicit,
+        // and the gate rejects it so the admin notices.
+        var (effective, explicitly) = PromotionFlow.DecideLock("BOGUS", new UnlockedOnlyMartVersionLockService());
+        effective.Should().Be(PromotionLockType.Exclusive);
+        explicitly.Should().BeTrue();
+    }
+
     // ---- UnlockedOnlyMartVersionLockService --------------------------------
 
     [Fact]

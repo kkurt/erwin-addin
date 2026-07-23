@@ -74,15 +74,54 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// Effective PROMOTION_LOCK_TYPE of the open model. Built-in default is
-        /// EXCLUSIVE (admin contract), so a deployment that never configured
-        /// the key gets the strictest lock - and, until the lock-capable phase
-        /// ships, a loud <see cref="NotSupportedException"/> from
-        /// <see cref="UnlockedOnlyMartVersionLockService"/> instead of a
-        /// silently unprotected promotion.
+        /// The lock a send should apply, and whether the admin EXPLICITLY
+        /// requested it. Pure and testable (the live read is in
+        /// <see cref="ResolveLockDecision"/>).
+        ///
+        /// Rule: an EXPLICIT value (config or corporate) is honored as-is and
+        /// flagged explicit, so the send gate can reject a real lock this build
+        /// cannot apply yet (decision D1: locks deferred). An UNSET setting is
+        /// NOT a lock request - it maps to the strictest lock the current build
+        /// can actually apply. Today that is UNLOCKED (the UnlockedOnly service
+        /// supports nothing else), so an unconfigured deployment promotes
+        /// without a lock instead of being dead-locked by the EXCLUSIVE contract
+        /// default it could never honor anyway. When a lock-capable service
+        /// ships and Supports(Exclusive) becomes true, the same code maps unset
+        /// to EXCLUSIVE automatically - no behavior guess, no silent downgrade
+        /// of an explicit request.
         /// </summary>
-        public static PromotionLockType ResolveEffectiveLockType()
-            => ConfigContextService.Instance.GetEffectiveEnum(LockTypeKey, PromotionLockType.Exclusive);
+        /// <param name="rawSetting">Raw two-level value (ConfigContextService.GetEffective); null/blank = unset.</param>
+        /// <param name="lockService">The lock implementation whose capabilities decide the unset fallback.</param>
+        public static (PromotionLockType effective, bool explicitlyRequested) DecideLock(
+            string rawSetting, IMartVersionLockService lockService)
+        {
+            if (lockService == null) throw new ArgumentNullException(nameof(lockService));
+
+            if (!string.IsNullOrWhiteSpace(rawSetting))
+            {
+                // Explicit request. Unparseable -> UNLOCKED (safe, non-blocking)
+                // but still flagged explicit is wrong; an unparseable admin
+                // value should surface, so keep it explicit and let the parse
+                // default to the contract default so the gate rejects it loudly
+                // rather than silently proceeding unlocked.
+                var parsed = ConfigContextService.ParseEffectiveEnum(rawSetting, PromotionLockType.Exclusive);
+                return (parsed, true);
+            }
+
+            // Unset: strictest lock this build can actually apply.
+            var contractDefault = PromotionLockType.Exclusive;
+            return lockService.Supports(contractDefault)
+                ? (contractDefault, false)
+                : (PromotionLockType.Unlocked, false);
+        }
+
+        /// <summary>
+        /// Live lock decision for the open model: resolves the two-level
+        /// PROMOTION_LOCK_TYPE setting and defers to <see cref="DecideLock"/>.
+        /// </summary>
+        public static (PromotionLockType effective, bool explicitlyRequested) ResolveLockDecision(
+            IMartVersionLockService lockService)
+            => DecideLock(ConfigContextService.Instance.GetEffective(LockTypeKey), lockService);
 
         /// <summary>
         /// Builds the send context for the open model. Routes are planned with

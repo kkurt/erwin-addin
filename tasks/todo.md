@@ -1,3 +1,48 @@
+# WP 323: STRUCTURED Parametrization (add-in side) - CODE-DONE (awaiting live test), 2026-07-23
+
+Spec: tasks/wp323-structured-parametrization.md (admin side + DB migration already live).
+
+## Result
+- [x] AllowedDatatypeService: `Structured` enum value + `StructuredPartMode` enum,
+      7 new entry properties + GetSuffixValueList, SELECT lists (3 dialects),
+      DBNull-safe reader (mode NULL -> NONE; out-of-int-range bound neutralized
+      ROW-LOCALLY to null + log, never fail-open the whole whitelist),
+      ParseParametrization STRUCTURED, DescribeEntry + public DescribeStructuredRules
+      (also used by the ModelConfigForm load log).
+- [x] New Services/StructuredParamParser.cs: paren-content grammar `p[,s][ suffix]`,
+      Int32 overflow = parse failure. NOT the DataTypeParser paren-OUTSIDE suffix.
+- [x] ValidateAgainstEntry STRUCTURED branch (single source, used by model
+      validation AND the picker): bare via AllowNonParametrized; unparseable =
+      generated message (REGEX_ERROR never used); p/scale bounds with one-sided
+      texts; suffix mode + OrdinalIgnoreCase list match; every Invalid tagged with
+      StructuredParamPart (Length/Scale/Suffix) for picker focus routing;
+      OPTIONAL/REQUIRED suffix with EMPTY SUFFIX_VALUES = unenforceable rule ->
+      accept + log on BOTH present- and absent-suffix paths.
+- [x] GetFallbackDatatype synthesis: p=PARAM_MIN??1, ",SCALE_MIN??0" when scale
+      REQUIRED, " first-suffix" when suffix REQUIRED; null seeds clamp to the
+      opposite bound (SCALE_MAX=-1 -> seed -1) so the token always round-trips.
+- [x] Picker: structured surface (Length/Scale boxes + Semantics combo) in one
+      _paramRow container; OPTIONAL combo = empty first item (default), REQUIRED
+      preselects only a single unambiguous value; lossless carry-over (raw text
+      stashed on entering structured mode, restored verbatim unless the user
+      edited the fields - "max"/"200 CHAR" survive browsing); deliberate OPTIONAL
+      suffix composes alone so validation explains the incomplete combination;
+      Esc/Enter guarded while a dropdown is open (fixes whole-dialog cancel, also
+      pre-existing on the type combo); scale '-' filter is replacement-aware;
+      error focus lands on the offending field via StructuredParamPart. Term-lock
+      keeps the pinned single box. Compose unchanged.
+- [x] Tests 851 -> 855, all green (parser grammar matrix, bounds/scale/suffix
+      matrix, defensive empty-SUFFIX_VALUES, fallback round-trips incl. clamp,
+      part tagging, picker composition).
+- [x] Adversarial review workflow: 34 agents, 10 confirmed findings (1 major:
+      dropdown Esc; 9 minor incl. 3 duplicates of the empty-SUFFIX_VALUES dead
+      end), ALL fixed + re-verified by the new tests. Spec-compliance auditor: 0
+      deviations.
+- [ ] LIVE test (user): structured entry in the picker on a real model; DB read
+      of the 7 new columns against a migrated MetaRepo.
+
+---
+
 # Version Promotion (Release Management) - Phase 2 CODE-DONE (awaiting live test), 2026-07-22
 
 ## Phase 2 result (2026-07-22, commits 1525ede + this one)
@@ -29,9 +74,24 @@
       freeze during the async send (mid-send selection could diverge from the
       submitted route).
 - [x] 791/791 tests green; both flavors 0 warn / 0 err.
-- [ ] LIVE E2E (user): auto-approve path, approver path (web inbox), clean-model
-      second hop, transition-less target absent from picker, lock gate error
-      when PROMOTION_LOCK_TYPE != UNLOCKED.
+- [x] LIVE E2E round 1 (user, 2026-07-22, config 2012 CORE BANKING @ MetaRepoTmp):
+      auto-approve happy path worked earlier on config 1012 (queue ID 7, log). Two
+      findings reported; verified against live DB:
+      - "Auto-approve shown despite approver" = NOT a code bug. config 2012 has
+        ZERO approvers anywhere (ENVIRONMENT_RELATION_APPROVER empty in all 9
+        MetaRepo DBs; APPROVAL_APPROVER only has rows for 1010/1012). Per spec an
+        empty approver list auto-approves even with REQUIRES_APPROVAL=1. FIX:
+        label now reads "Auto-approve (no approvers set)" when the flag is on but
+        no approvers exist, so it does not read as a bug. To test the approver
+        path, add a per-transition approver to config 2012.
+      - "Unset lock type still errors with EXCLUSIVE" = real UX bug. PROMOTION_
+        LOCK_TYPE unset -> built-in default EXCLUSIVE -> blocked every send. FIX:
+        PromotionFlow.DecideLock - unset resolves to the strictest lock the build
+        can ACTUALLY apply (UNLOCKED today, auto-upgrades to EXCLUSIVE when a
+        lock-capable service ships); only an EXPLICIT non-UNLOCKED value blocks.
+- [ ] LIVE E2E round 2 (user): re-test CORE BANKING (unset lock now proceeds
+      UNLOCKED, auto-approve), then add an approver to a transition and confirm
+      the approver path shows "Approval required" and inserts Pending.
 
 Phase 3 (status watcher + missed-unlock recovery) and Phase 4 (General tab env x
 version card) await user approval after the live test.

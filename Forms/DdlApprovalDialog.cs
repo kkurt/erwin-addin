@@ -1,5 +1,6 @@
 using System;
 using System.Drawing;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using EliteSoft.Erwin.AddIn.Services;
@@ -571,12 +572,24 @@ namespace EliteSoft.Erwin.AddIn.Forms
             var route = SelectedPromotionRoute();
             if (route == null) { _lblPromoteDecision.Text = string.Empty; return; }
 
-            bool requiresVote = PromotionPlanner.RequiresApprovalVote(
-                route.Relation, LookupPromotionApprovers(route.Relation.Id));
-            _lblPromoteDecision.Text = requiresVote ? "Approval required" : "Auto-approve";
-            _lblPromoteDecision.ForeColor = requiresVote
-                ? Color.FromArgb(202, 138, 4)
-                : Color.FromArgb(46, 125, 50);
+            var approvers = LookupPromotionApprovers(route.Relation.Id);
+            bool requiresVote = PromotionPlanner.RequiresApprovalVote(route.Relation, approvers);
+            if (requiresVote)
+            {
+                _lblPromoteDecision.Text = "Approval required";
+                _lblPromoteDecision.ForeColor = Color.FromArgb(202, 138, 4);
+            }
+            else
+            {
+                // A transition flagged REQUIRES_APPROVAL but with no approver
+                // names auto-approves by spec (empty approver list = no gate).
+                // Spell that out so it does not read as a bug when the admin
+                // set the flag but never added approvers.
+                bool flaggedButNoApprovers = route.Relation.RequiresApproval
+                    && (approvers == null || !approvers.Any(a => !string.IsNullOrWhiteSpace(a)));
+                _lblPromoteDecision.Text = flaggedButNoApprovers ? "Auto-approve (no approvers set)" : "Auto-approve";
+                _lblPromoteDecision.ForeColor = Color.FromArgb(46, 125, 50);
+            }
         }
 
         private PromotionRoute SelectedPromotionRoute()
@@ -1032,16 +1045,18 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 return;
             }
 
-            // Lock-support gate BEFORE the Mart save: when the effective
-            // PROMOTION_LOCK_TYPE is one this build cannot apply (all
-            // non-UNLOCKED codes until the lock phase ships), fail loudly and
-            // do NOT mint a Mart version for a send that cannot proceed.
+            // Lock-support gate BEFORE the Mart save. An UNSET PROMOTION_LOCK_TYPE
+            // is not a lock request: it resolves to UNLOCKED here (the deferred
+            // lock phase, D1) and the send proceeds. Only an admin who
+            // EXPLICITLY configured a lock this build cannot apply yet is
+            // rejected - loudly, and before any Mart version is minted.
             PromotionLockType lockType;
+            bool lockExplicit;
             var lockService = new UnlockedOnlyMartVersionLockService();
             try
             {
-                lockType = PromotionFlow.ResolveEffectiveLockType();
-                if (!lockService.Supports(lockType))
+                (lockType, lockExplicit) = PromotionFlow.ResolveLockDecision(lockService);
+                if (lockExplicit && !lockService.Supports(lockType))
                     throw new NotSupportedException(
                         $"Mart lock '{PromotionLockTypeCodes.ToCode(lockType)}' is not supported by this add-in build yet. " +
                         "Set PROMOTION_LOCK_TYPE to UNLOCKED in the admin settings, or wait for the lock-capable release.");
