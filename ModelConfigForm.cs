@@ -1121,7 +1121,7 @@ namespace EliteSoft.Erwin.AddIn
         private void ReconnectTimer_Tick(object sender, EventArgs e)
         {
             // black-rect Test 1: zero add-in timer work while the alter wizard renders.
-            if (Services.AlterWizardGate.IsOpen) return;
+            if (Services.AlterWizardGate.IsOpen || Services.MartSaveGate.IsActive) return;
             // Unified model-state monitor (2026-05-14). The timer is kept alive
             // in every state (disconnected, degraded, connected) and reacts
             // when an open PU's locator diverges from what we last successfully
@@ -4022,7 +4022,7 @@ namespace EliteSoft.Erwin.AddIn
         private void GlossaryRefreshTimer_Tick(object sender, EventArgs e)
         {
             // black-rect Test 1: zero add-in timer work while the alter wizard renders.
-            if (Services.AlterWizardGate.IsOpen) return;
+            if (Services.AlterWizardGate.IsOpen || Services.MartSaveGate.IsActive) return;
             // DDL-dedicated instance: the glossary is never consumed (all
             // validation surfaces are off), so skip the periodic DB reload.
             if (IsDdlDedicatedInstance) return;
@@ -6398,6 +6398,17 @@ namespace EliteSoft.Erwin.AddIn
                 }
                 Log($"SaveCurrentModelWithDescription: erwin main HWND = 0x{erwinMain.ToInt64():X}");
 
+                // Pause every add-in UI-thread timer for the whole Mart commit
+                // window. erwin's cold Mart commit pumps messages (its progress
+                // dialog plus the modal DDL-review + description-dialog loops), so
+                // an ungated tick would make live SCAPI/COM reads that reenter the
+                // in-progress commit and freeze erwin (2026-07-23: the description
+                // dialog was IDOK'd then never closed). The DDL generation pipeline
+                // already suspends these timers for its duration; the Mart Save
+                // path did not, so gate it the same way here. Scoped to include the
+                // post-save dirty re-probe.
+                using var martSaveGate = Services.MartSaveGate.Enter();
+
                 // Step 3: drive the native Mart Save flow. 15s timeout
                 // covers cold Mart connections (manual flow ground-truth
                 // 2026-05-31: ~10s end-to-end including SCAPI init).
@@ -6493,6 +6504,13 @@ namespace EliteSoft.Erwin.AddIn
                 catch (Exception ex) { Log($"SavePromotionModelWithDescription: GetErwinMainWindow threw {ex.GetType().Name}: {ex.Message}"); }
                 if (erwinMain == IntPtr.Zero)
                     return new Services.PromotionSaveOutcome(false, null, false, "erwin main window not resolvable.");
+
+                // Same reentrancy gate as the classic DDL push save: pause all
+                // add-in UI-thread timers for the whole Mart commit window so a
+                // periodic SCAPI/COM tick cannot reenter erwin's in-progress
+                // commit and freeze it (see SaveCurrentModelWithDescription).
+                // Scoped to include the post-save dirty re-probe + version poll.
+                using var martSaveGate = Services.MartSaveGate.Enter();
 
                 var save = await Services.MartSaveAutomation.SaveWithDescriptionCaptureAsync(
                     erwinMain, description ?? string.Empty, timeoutMs: 15000, (Action<string>)Log)
@@ -6765,7 +6783,7 @@ namespace EliteSoft.Erwin.AddIn
         private void PUWatcher_Tick(object sender, EventArgs e)
         {
             // black-rect Test 1: zero add-in timer work while the alter wizard renders.
-            if (Services.AlterWizardGate.IsOpen) return;
+            if (Services.AlterWizardGate.IsOpen || Services.MartSaveGate.IsActive) return;
             try
             {
                 int currentCount = _scapi.PersistenceUnits.Count;
