@@ -603,15 +603,17 @@ namespace EliteSoft.Erwin.AddIn.Forms
         }
 
         /// <summary>
-        /// Approver names of a transition: preloaded in the context for every
-        /// offered route; a live read covers a route re-derived at send time
-        /// (its relation may not be among the preloaded ones).
+        /// Effective approver names of a transition for THIS model: preloaded in
+        /// the context for every offered route; a live read covers a route
+        /// re-derived at send time (its relation may not be among the preloaded
+        /// ones). The live read is scoped to the open model's MART_PATH so it
+        /// honours the per-model override list exactly as the context preload did.
         /// </summary>
         private System.Collections.Generic.IReadOnlyList<string> LookupPromotionApprovers(int relationId)
         {
             if (_promotion.ApproversByRelationId.TryGetValue(relationId, out var preloaded))
                 return preloaded;
-            return PromotionService.Instance.GetRelationApprovers(relationId);
+            return PromotionService.Instance.GetRelationApprovers(relationId, _promotion.MartPath);
         }
 
         private void DdlApprovalDialog_KeyDown(object sender, KeyEventArgs e)

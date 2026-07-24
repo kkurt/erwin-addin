@@ -236,6 +236,59 @@ public class PromotionPlannerTests
         PromotionPlanner.RequiresApprovalVote(rel, new List<string?> { "alice" }).Should().BeFalse();
     }
 
+    // ---- ResolveEffectiveApprovers ----------------------------------------
+    // Mirrors the server rule (PromotionEndpoints): a per-model override list
+    // REPLACES the transition default; the two never merge; no fallback beyond.
+
+    [Fact]
+    public void ResolveEffectiveApprovers_model_override_replaces_transition_default()
+    {
+        // The live bug: transition default was empty but a per-model override
+        // ('Emre') existed - the override MUST be the effective list.
+        var eff = PromotionPlanner.ResolveEffectiveApprovers(
+            modelOverride: new List<string> { "Emre" },
+            transitionDefault: new List<string>());
+        eff.Should().ContainSingle().Which.Should().Be("Emre");
+    }
+
+    [Fact]
+    public void ResolveEffectiveApprovers_override_wins_even_when_default_also_has_names()
+    {
+        // An override REPLACES (does not extend) the default.
+        var eff = PromotionPlanner.ResolveEffectiveApprovers(
+            modelOverride: new List<string> { "Emre" },
+            transitionDefault: new List<string> { "alice", "bob" });
+        eff.Should().Equal("Emre");
+    }
+
+    [Fact]
+    public void ResolveEffectiveApprovers_falls_back_to_default_when_override_empty()
+    {
+        var eff = PromotionPlanner.ResolveEffectiveApprovers(
+            modelOverride: new List<string>(),
+            transitionDefault: new List<string> { "alice", "bob" });
+        eff.Should().Equal("alice", "bob");
+    }
+
+    [Fact]
+    public void ResolveEffectiveApprovers_empty_when_both_lists_empty_or_null()
+    {
+        PromotionPlanner.ResolveEffectiveApprovers(new List<string>(), new List<string>()).Should().BeEmpty();
+        PromotionPlanner.ResolveEffectiveApprovers(null, null).Should().BeEmpty();
+        PromotionPlanner.ResolveEffectiveApprovers(null, new List<string> { "alice" }).Should().Equal("alice");
+    }
+
+    [Fact]
+    public void ResolveEffectiveApprovers_feeds_RequiresApprovalVote_for_model_scoped_gate()
+    {
+        // End-to-end of the fix: model override present -> approval required.
+        var rel = Rel(1, 1, 2, approval: true);
+        var eff = PromotionPlanner.ResolveEffectiveApprovers(
+            modelOverride: new List<string> { "Emre" },
+            transitionDefault: new List<string>());
+        PromotionPlanner.RequiresApprovalVote(rel, eff).Should().BeTrue();
+    }
+
     // ---- SelectMissedUnlocks ----------------------------------------------
 
     [Fact]

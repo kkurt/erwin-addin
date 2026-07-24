@@ -169,7 +169,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             foreach (var route in routes)
             {
                 if (!approvers.ContainsKey(route.Relation.Id))
-                    approvers[route.Relation.Id] = PromotionService.Instance.GetRelationApprovers(route.Relation.Id);
+                    approvers[route.Relation.Id] = PromotionService.Instance.GetRelationApprovers(route.Relation.Id, martPath);
             }
 
             log?.Invoke($"PromotionFlow: context built - config={configId}, path='{martPath}', " +

@@ -112,18 +112,38 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// Approver names of one transition, ordered by SORT_ORDER. Empty list
-        /// = no approvers = auto-approve (never falls back to the config-wide
-        /// APPROVAL_APPROVER list, by spec).
+        /// The EFFECTIVE promotion approver names of one transition for the model
+        /// at <paramref name="martPath"/>, ordered by SORT_ORDER. Resolution
+        /// mirrors the server (PromotionEndpoints): the per-model override list
+        /// (ENVIRONMENT_RELATION_MODEL_APPROVER for this MART_PATH) wins when it
+        /// has any row; otherwise the transition's default PROMOTION list
+        /// (ENVIRONMENT_RELATION_APPROVER, FLOW='PROMOTION'). An override REPLACES
+        /// the default - the two never merge. Empty result = no approvers =
+        /// auto-approve (never falls back to the config-wide APPROVAL_APPROVER
+        /// list, by spec). MART_PATH is nvarchar(500) (not a LOB), so the
+        /// equality predicate is safe on all three dialects.
         /// </summary>
-        public IReadOnlyList<string> GetRelationApprovers(int relationId)
+        public IReadOnlyList<string> GetRelationApprovers(int relationId, string martPath)
         {
+            if (string.IsNullOrWhiteSpace(martPath))
+                throw new ArgumentException("martPath must be the canonical Mart path", nameof(martPath));
+
             using var ctx = CreateContext();
-            return ctx.EnvironmentRelationApprovers
-                .Where(a => a.RelationId == relationId)
+
+            var modelOverride = ctx.EnvironmentRelationModelApprovers
+                .Where(a => a.RelationId == relationId && a.MartPath == martPath)
                 .OrderBy(a => a.SortOrder)
                 .Select(a => a.Approver)
                 .ToList();
+
+            var transitionDefault = ctx.EnvironmentRelationApprovers
+                .Where(a => a.RelationId == relationId
+                         && a.Flow == EnvironmentRelationApprover.Flows.Promotion)
+                .OrderBy(a => a.SortOrder)
+                .Select(a => a.Approver)
+                .ToList();
+
+            return PromotionPlanner.ResolveEffectiveApprovers(modelOverride, transitionDefault);
         }
 
         /// <summary>

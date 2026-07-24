@@ -190,14 +190,33 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// The EFFECTIVE promotion approver list of a transition for ONE model,
+        /// matching the server's resolution (PromotionEndpoints): the per-model
+        /// override list (ENVIRONMENT_RELATION_MODEL_APPROVER for the model's
+        /// MART_PATH) wins whenever it has any row; otherwise the transition's
+        /// default PROMOTION list (ENVIRONMENT_RELATION_APPROVER, FLOW='PROMOTION')
+        /// applies. The two lists never merge - an override REPLACES the default.
+        /// There is deliberately NO fallback to the config-wide APPROVAL_APPROVER
+        /// list (project rule: no fallbacks).
+        /// </summary>
+        /// <param name="modelOverride">Per-model override names for (relation, MART_PATH), SORT_ORDER order.</param>
+        /// <param name="transitionDefault">Transition-default PROMOTION names, SORT_ORDER order.</param>
+        public static IReadOnlyList<string> ResolveEffectiveApprovers(
+            IReadOnlyList<string>? modelOverride, IReadOnlyList<string>? transitionDefault)
+        {
+            if (modelOverride != null && modelOverride.Count > 0) return modelOverride;
+            return transitionDefault ?? Array.Empty<string>();
+        }
+
+        /// <summary>
         /// The approval decision of the spec: a submit goes to voting
         /// (STATUS='Pending') only when the chosen transition has
-        /// REQUIRES_APPROVAL=1 AND its own approver list is non-empty (blank
+        /// REQUIRES_APPROVAL=1 AND its EFFECTIVE approver list is non-empty (blank
         /// entries do not count). Everything else auto-approves. There is
         /// deliberately NO fallback to the config-wide APPROVAL_APPROVER list.
         /// </summary>
         /// <param name="relation">The chosen transition.</param>
-        /// <param name="approvers">ENVIRONMENT_RELATION_APPROVER names of that transition.</param>
+        /// <param name="approvers">The EFFECTIVE approver names of that transition for the model (see <see cref="ResolveEffectiveApprovers"/>).</param>
         public static bool RequiresApprovalVote(
             IntegrationRelation relation, IReadOnlyList<string?>? approvers)
         {
