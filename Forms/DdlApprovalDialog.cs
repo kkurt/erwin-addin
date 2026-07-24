@@ -427,8 +427,47 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 promoRow.Controls.Add(_cmbPromoteSource);
                 promoRow.Controls.Add(_lblPromoteDecision);
 
-                foreach (var target in PromotionPlanner.TargetsOf(_promotion.Routes))
+                var targets = PromotionPlanner.TargetsOf(_promotion.Routes);
+                foreach (var target in targets)
                     _cmbPromoteTarget.Items.Add(new PromotionTargetItem(target));
+
+                // A linear pipeline only ever exposes ONE reachable target (the
+                // next environment), so a dropdown to "choose" it is noise: show
+                // the fixed destination read-only instead. The combo stays created
+                // and selected below so SelectedPromotionRoute() and the whole
+                // send/re-derivation pipeline are unchanged; a genuine multi-target
+                // config (a Test->Prod second hop offered alongside a Dev->Test
+                // re-promote) still gets the real dropdown.
+                if (targets.Count == 1)
+                {
+                    _cmbPromoteTarget.Visible = false;
+                    var fixedTarget = targets[0];
+                    var lblTargetStatic = new Label
+                    {
+                        Text = string.Empty,
+                        Font = fontBodyBold,
+                        ForeColor = clrTextDark,
+                        AutoSize = false,
+                        Location = new Point(90, 6),
+                        Size = new Size(210, 24),
+                        TextAlign = ContentAlignment.MiddleLeft,
+                    };
+                    // Mirror the dropdown's owner-drawn COLOR_HEX dot + name so the
+                    // read-only destination looks identical to a selected item.
+                    lblTargetStatic.Paint += (s, pe) =>
+                    {
+                        var lbl = (Label)s;
+                        var dot = EnvironmentPipelineDiagram.TryParseHex(fixedTarget.ColorHex)
+                                  ?? Color.FromArgb(148, 163, 184);
+                        using (var b = new SolidBrush(dot))
+                            pe.Graphics.FillEllipse(b, 2, (lbl.Height - 10) / 2, 10, 10);
+                        using (var tb = new SolidBrush(lbl.ForeColor))
+                            pe.Graphics.DrawString(fixedTarget.Name, lbl.Font, tb,
+                                18, (lbl.Height - lbl.Font.Height) / 2f);
+                    };
+                    promoRow.Controls.Add(lblTargetStatic);
+                }
+
                 if (_cmbPromoteTarget.Items.Count > 0)
                     _cmbPromoteTarget.SelectedIndex = 0; // preselect; UpdatePromotionRouteInfo fires
             }
