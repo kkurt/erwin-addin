@@ -41,6 +41,38 @@ namespace EliteSoft.Erwin.AddIn.Services
         private const string DefaultPropertyCode = "Physical_Name";
 
         /// <summary>
+        /// Whether a violated rule must be FORCED through the modal input popup
+        /// (the user cannot proceed until it is fixed) as opposed to being
+        /// surfaced as a warn-only message the user may dismiss and continue.
+        /// <para>
+        /// Per WP #332 this decision is per-RULE, not per-property: a rule forces
+        /// only when it is itself required. That is any of
+        /// (1) its own <see cref="NamingStandardRule.IsRequired"/> flag,
+        /// (2) the dedicated <see cref="NamingRuleKind.Required"/> type, or
+        /// (3) a <see cref="NamingRuleKind.Length"/> rule (Length is required by
+        /// design: the admin auto-sets IS_REQUIRED for it and the addin honours
+        /// the type even on legacy rows saved before that change).
+        /// Every other violation (Regexp / Prefix / Suffix with IS_REQUIRED=false)
+        /// is warn-only so the user can continue. This replaces the former
+        /// property-level "promotion" where any required rule on a property forced
+        /// ALL of that property's rules, which wrongly forced Required=No rules.
+        /// </para>
+        /// </summary>
+        public static bool RuleForcesInput(NamingValidationResult failure)
+        {
+            if (failure == null) return false;
+            // The RuleType==Required check factory tags its result "Required";
+            // keep the string check so a synthetic result with a null Rule still
+            // forces (e.g. the object-existence Required rule).
+            if (string.Equals(failure.RuleName, "Required", StringComparison.Ordinal)) return true;
+            var rule = failure.Rule;
+            return rule != null
+                && (rule.IsRequired
+                    || rule.RuleType == NamingRuleKind.Required
+                    || rule.RuleType == NamingRuleKind.Length);
+        }
+
+        /// <summary>
         /// Validate an object name against naming standard rules.
         /// Rules with DEPENDS_ON_UDP_ID are only applied if the object's UDP value matches.
         /// </summary>

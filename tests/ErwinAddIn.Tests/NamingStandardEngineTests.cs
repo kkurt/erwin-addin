@@ -465,6 +465,71 @@ public class NamingStandardEngineTests
         else results.Should().ContainSingle().Which.RuleName.Should().Be("Suffix");
     }
 
+    // ---------- RuleForcesInput: per-rule force-vs-warn (WP #332) ----------
+
+    // Feeds the ENGINE's own violation into RuleForcesInput so the decision is
+    // exercised end-to-end (RuleName + Rule reference are the real ones).
+    private static NamingValidationResult FirstFailure(NamingStandardRule rule, string value)
+        => NamingValidationEngine.EvaluateRule(rule, value).Should().ContainSingle().Which;
+
+    [Fact]
+    public void RuleForcesInput_null_failure_does_not_force()
+        => NamingValidationEngine.RuleForcesInput(null).Should().BeFalse();
+
+    [Fact]
+    public void RuleForcesInput_Regexp_not_required_is_warn_only()
+    {
+        // The bug: an uppercase Regexp with Required=No must NOT force even
+        // when its property carries sibling required rules.
+        var fail = FirstFailure(Rule(NamingRuleKind.Regexp, regex: "^[A-Z]+$", isRequired: false), "abc");
+        NamingValidationEngine.RuleForcesInput(fail).Should().BeFalse();
+    }
+
+    [Fact]
+    public void RuleForcesInput_Regexp_required_forces()
+    {
+        var fail = FirstFailure(Rule(NamingRuleKind.Regexp, regex: "^[A-Z]+$", isRequired: true), "abc");
+        NamingValidationEngine.RuleForcesInput(fail).Should().BeTrue();
+    }
+
+    [Fact]
+    public void RuleForcesInput_Prefix_not_required_is_warn_only()
+    {
+        var fail = FirstFailure(Rule(NamingRuleKind.Prefix, prefix: "DM_", isRequired: false), "CUSTOMER");
+        NamingValidationEngine.RuleForcesInput(fail).Should().BeFalse();
+    }
+
+    [Fact]
+    public void RuleForcesInput_Suffix_required_forces()
+    {
+        var fail = FirstFailure(Rule(NamingRuleKind.Suffix, suffix: "_T", isRequired: true), "CUSTOMER");
+        NamingValidationEngine.RuleForcesInput(fail).Should().BeTrue();
+    }
+
+    [Fact]
+    public void RuleForcesInput_Length_forces_even_when_flag_false()
+    {
+        // WP #332 addition: Length is required by design, so a Length violation
+        // forces regardless of the IS_REQUIRED flag stored on the row.
+        var fail = FirstFailure(Rule(NamingRuleKind.Length, lenOp: ">", lenVal: 10, isRequired: false), "abc");
+        fail.RuleName.Should().Be("Length");
+        NamingValidationEngine.RuleForcesInput(fail).Should().BeTrue();
+    }
+
+    [Fact]
+    public void RuleForcesInput_Required_type_forces()
+    {
+        var fail = FirstFailure(Rule(NamingRuleKind.Required, isRequired: false), "");
+        fail.RuleName.Should().Be("Required");
+        NamingValidationEngine.RuleForcesInput(fail).Should().BeTrue();
+    }
+
+    [Fact]
+    public void RuleForcesInput_Required_rulename_forces_when_rule_reference_missing()
+        => NamingValidationEngine.RuleForcesInput(
+               NamingValidationResult.Invalid("Required", "an object must exist", null))
+           .Should().BeTrue();
+
     // ---------- ApplyNamingStandards: AutoApply x ApplyOn x isNew matrix --------
 
     [Fact]

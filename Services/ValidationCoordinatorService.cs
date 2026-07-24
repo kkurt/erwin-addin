@@ -3657,7 +3657,6 @@ namespace EliteSoft.Erwin.AddIn.Services
             _columnNamingCheckInProgress = true;
             try
             {
-                var requiredProps = NamingStandardService.Instance.GetRequiredPropertyCodes("Model");
                 string modelName;
                 try { modelName = root.Name?.ToString() ?? ""; } catch { modelName = ""; }
 
@@ -3671,21 +3670,23 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                     string value = ReadVal(code);
                     var res = NamingValidationEngine.ValidateObjectName("Model", value, rootBoxed, code, isNew: false);
-                    var fail = res?.FirstOrDefault(r => !r.IsValid);
-                    if (fail == null) continue;
+                    var invalids = res?.Where(r => !r.IsValid).ToList();
+                    if (invalids == null || invalids.Count == 0) continue;
 
-                    Log($"NamingValidate: 'Model.{code}' on '{modelName}' liveValue='{value}' -> rule#{fail.Rule?.Id} ({fail.RuleName})");
-
-                    bool isRequired = string.Equals(fail.RuleName, "Required", StringComparison.Ordinal)
-                                      || (requiredProps != null && requiredProps.Contains(code));
-                    if (!isRequired)
+                    // WP #332: force only when a violation's OWN rule is required
+                    // (IS_REQUIRED / Required type / Length). Any other violation
+                    // (Regexp / Prefix / Suffix with Required=No) is warn-only, even
+                    // when the property also carries required rules - the user may
+                    // proceed. Pick a forcing violation to drive the input loop.
+                    var fail = invalids.FirstOrDefault(NamingValidationEngine.RuleForcesInput);
+                    if (fail == null)
                     {
-                        // No current MODEL rule is non-required, but stay honest: a
-                        // non-required violation is a warning, not a forced input.
-                        AddinMessageDialog.Show(fail.ErrorMessage, "Model Validation",
+                        AddinMessageDialog.Show(invalids[0].ErrorMessage, "Model Validation",
                             MessageBoxButtons.OK, MessageBoxIcon.Warning);
                         continue;
                     }
+
+                    Log($"NamingValidate: 'Model.{code}' on '{modelName}' liveValue='{value}' -> rule#{fail.Rule?.Id} ({fail.RuleName})");
 
                     // Show the OBJECT NAME (the model) + a friendly property label,
                     // e.g. "Fiba_SQLEmred (Comment)" instead of raw "Model.Definition".
@@ -3746,7 +3747,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                             // never trap the user in the re-prompt loop.
                             try { revertRes = NamingValidationEngine.ValidateObjectName("Model", afterRevert, rootBoxed, code, isNew: false); }
                             catch (Exception rvEx) { Log($"Model post-revert re-validation error for {fieldLabel}, treating as valid: {rvEx.Message}"); revertRes = null; }
-                            var revertStillFail = revertRes?.FirstOrDefault(r => !r.IsValid);
+                            var revertStillFail = revertRes?.FirstOrDefault(NamingValidationEngine.RuleForcesInput);
                             if (revertStillFail != null)
                             {
                                 Log($"Model required re-prompt after Cancel (post-revert still invalid): {fieldLabel}");
@@ -3790,7 +3791,17 @@ namespace EliteSoft.Erwin.AddIn.Services
                         // the property clears all its rules or the user cancels.
                         string after = ReadVal(code);
                         var freshRes = NamingValidationEngine.ValidateObjectName("Model", after, rootBoxed, code, isNew: false);
-                        currentFail = freshRes?.FirstOrDefault(r => !r.IsValid);
+                        currentFail = freshRes?.FirstOrDefault(NamingValidationEngine.RuleForcesInput);
+                        // WP #332: forcing rules satisfied but a warn-only rule
+                        // (Regexp Required=No) still fails - surface it once as a
+                        // warning instead of forcing a value.
+                        if (currentFail == null)
+                        {
+                            var leftover = freshRes?.FirstOrDefault(r => !r.IsValid);
+                            if (leftover != null)
+                                AddinMessageDialog.Show(leftover.ErrorMessage, "Model Validation",
+                                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        }
                     }
                 }
             }
@@ -8569,18 +8580,16 @@ namespace EliteSoft.Erwin.AddIn.Services
             bool requiredCancelHandled = false;
             if (attr != null && failures.Count > 0)
             {
-                // Same Required-property-promotion rule as the Table path
-                // (2026-05-24): any non-Required failure (Length / Regexp /
-                // non-AutoApply Prefix-Suffix) on a column property that
-                // also carries IS_REQUIRED=true goes through the modal
-                // input popup with the re-prompt loop instead of the
-                // consolidated warning.
-                var requiredProps = NamingStandardService.Instance.GetRequiredPropertyCodes("Column");
+                // WP #332: force is decided per-RULE, not per-property. A failure
+                // enters the modal input loop only when its OWN rule is required
+                // (IS_REQUIRED / Required type / Length, via RuleForcesInput). A
+                // Regexp/Prefix/Suffix with Required=No is warn-only even when the
+                // property also carries a required rule - it falls through to the
+                // consolidated warning below.
                 var requiredFailures = failures
                     .Where(f => f.Rule != null
                                 && !string.IsNullOrEmpty(f.Rule.PropertyCode)
-                                && (string.Equals(f.RuleName, "Required", StringComparison.Ordinal)
-                                    || (requiredProps != null && requiredProps.Contains(f.Rule.PropertyCode))))
+                                && NamingValidationEngine.RuleForcesInput(f))
                     .GroupBy(f => f.Rule.PropertyCode, StringComparer.OrdinalIgnoreCase)
                     .Select(g => g.FirstOrDefault(x => string.Equals(x.RuleName, "Required", StringComparison.Ordinal)) ?? g.First())
                     .ToList();
@@ -8685,7 +8694,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                         // so a re-validation fault can never trap the user in the loop.
                         try { revertFresh = NamingValidationEngine.ValidateObjectName("Column", afterRevert, attrBoxed, rf.Rule.PropertyCode, isNew: treatAsNew); }
                         catch (Exception rvEx) { Log($"Post-revert re-validation error for {fieldLabel}, treating as valid: {rvEx.Message}"); revertFresh = null; }
-                        var revertStillFail = revertFresh?.FirstOrDefault(r => !r.IsValid);
+                        var revertStillFail = revertFresh?.FirstOrDefault(NamingValidationEngine.RuleForcesInput);
                         if (revertStillFail != null)
                         {
                             Log($"Required field re-prompt after Cancel (post-revert still invalid): {fieldLabel}");
@@ -8767,11 +8776,18 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                             var freshResults = NamingValidationEngine.ValidateObjectName(
                                 "Column", liveValue, attrBoxed, rf.Rule.PropertyCode, isNew: revalidateAsNew);
-                            var freshFailure = freshResults?.FirstOrDefault(r => !r.IsValid);
+                            var freshFailure = freshResults?.FirstOrDefault(NamingValidationEngine.RuleForcesInput);
                             if (freshFailure == null)
                             {
+                                // WP #332: forcing rules satisfied. Replace this
+                                // property's stale failures with the warn-only ones
+                                // still failing at the settled value so the
+                                // consolidated warning is accurate and never
+                                // re-forces them.
                                 failures.RemoveAll(f => f.Rule != null
                                     && string.Equals(f.Rule.PropertyCode, rf.Rule.PropertyCode, StringComparison.OrdinalIgnoreCase));
+                                if (freshResults != null)
+                                    failures.AddRange(freshResults.Where(r => !r.IsValid));
                                 break;
                             }
 
@@ -8831,8 +8847,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 List<NamingValidationResult> revertFresh2;
                                 try { revertFresh2 = NamingValidationEngine.ValidateObjectName("Column", afterRevert2, attrBoxed, rf.Rule.PropertyCode, isNew: treatAsNew); }
                                 catch (Exception rvEx2) { Log($"Post-revert re-validation error for {fieldLabel}, treating as valid: {rvEx2.Message}"); revertFresh2 = null; }
-                                if (revertFresh2?.Any(r => !r.IsValid) == true)
-                                    continue; // still invalid -> loop top re-prompts
+                                if (revertFresh2?.Any(NamingValidationEngine.RuleForcesInput) == true)
+                                    continue; // still forcing -> loop top re-prompts
 
                                 if (!string.IsNullOrEmpty(snapshotId))
                                 {

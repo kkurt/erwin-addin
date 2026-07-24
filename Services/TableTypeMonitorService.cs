@@ -3001,25 +3001,22 @@ namespace EliteSoft.Erwin.AddIn.Services
             bool requiredCancelHandled = false;
             if (scapiObject != null && failures.Count > 0)
             {
-                // Pattern violations (Length / Regexp / non-AutoApply Prefix /
-                // non-AutoApply Suffix) on a property that ALSO carries an
-                // IS_REQUIRED=true rule must be enforced through the modal
-                // input popup, not the OK-and-forget warning. Admin signalled
-                // "user must fill this field" by setting Required; "ddd"
-                // satisfying Required but failing Length>10 has to keep
-                // prompting until the value clears all rules. We keep one
-                // entry per PropertyCode so a property with multiple failures
-                // gets a single chain of popups (Required first if present,
-                // then the re-prompt loop drains the rest).
-                var requiredProps = NamingStandardService.Instance.GetRequiredPropertyCodes(objectType);
+                // WP #332: force is decided per-RULE, not per-property. A pattern
+                // violation enters the modal input loop only when its OWN rule is
+                // required - IS_REQUIRED, the Required type, or a Length rule
+                // (Length is required by design), via RuleForcesInput. A
+                // Regexp/Prefix/Suffix with Required=No is warn-only even when the
+                // property also carries a required rule and falls through to the
+                // consolidated warning. A forcing Length that a longer-but-still-
+                // non-matching value fails keeps prompting through the re-prompt
+                // loop below. One entry per PropertyCode (Required seed first).
                 var requiredFailures = failures
                     .Where(f => f.Rule != null
                                 && !string.IsNullOrEmpty(f.Rule.PropertyCode)
-                                && (string.Equals(f.RuleName, "Required", StringComparison.Ordinal)
-                                    || (requiredProps != null && requiredProps.Contains(f.Rule.PropertyCode))))
+                                && NamingValidationEngine.RuleForcesInput(f))
                     .GroupBy(f => f.Rule.PropertyCode, StringComparer.OrdinalIgnoreCase)
                     // Prefer a Required entry as the seed; otherwise take the first
-                    // failure (typically Length / Regexp) - the re-prompt loop will
+                    // forcing failure (typically Length) - the re-prompt loop will
                     // surface the remaining ones with the right error message anyway.
                     .Select(g => g.FirstOrDefault(x => string.Equals(x.RuleName, "Required", StringComparison.Ordinal)) ?? g.First())
                     .ToList();
@@ -3287,15 +3284,18 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                             var freshResults = NamingValidationEngine.ValidateObjectName(
                                 objectType, liveValue, scapiBoxed, rf.Rule.PropertyCode, isNew: revalidateAsNew);
-                            var freshFailure = freshResults?.FirstOrDefault(r => !r.IsValid);
+                            var freshFailure = freshResults?.FirstOrDefault(NamingValidationEngine.RuleForcesInput);
                             if (freshFailure == null)
                             {
-                                // Property clears every rule now - drop
-                                // any non-Required failures for this
-                                // PropertyCode from the consolidated batch
-                                // so they are not shown twice.
+                                // WP #332: forcing rules satisfied. Replace this
+                                // property's stale failures with the warn-only ones
+                                // still failing at the settled value so the
+                                // consolidated warning is accurate and never
+                                // re-forces them.
                                 failures.RemoveAll(f => f.Rule != null
                                     && string.Equals(f.Rule.PropertyCode, rf.Rule.PropertyCode, StringComparison.OrdinalIgnoreCase));
+                                if (freshResults != null)
+                                    failures.AddRange(freshResults.Where(r => !r.IsValid));
                                 break;
                             }
 
@@ -3708,9 +3708,16 @@ namespace EliteSoft.Erwin.AddIn.Services
                 if (freshResults == null) return true;
 
                 var freshFailures = freshResults.Where(r => !r.IsValid).ToList();
-                if (freshFailures.Count == 0)
+                // WP #332: only a FORCING violation (Required / Length / IS_REQUIRED)
+                // keeps the user in the modal loop. Warn-only leftovers (Regexp /
+                // Prefix / Suffix with Required=No) are re-attached so the
+                // consolidated warning reflects the reverted value, but they do NOT
+                // re-fire the input popup.
+                var forcingFailures = freshFailures.Where(NamingValidationEngine.RuleForcesInput).ToList();
+                if (forcingFailures.Count == 0)
                 {
-                    Log($"Post-revert re-validation: {objectType}.{propertyCode}='{postRevertValue}' satisfies all rules");
+                    if (freshFailures.Count > 0) failures.AddRange(freshFailures);
+                    Log($"Post-revert re-validation: {objectType}.{propertyCode}='{postRevertValue}' satisfies all required rules");
                     return true;
                 }
 
