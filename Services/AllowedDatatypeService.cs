@@ -17,17 +17,61 @@ namespace EliteSoft.Erwin.AddIn.Services
         Standard,
         /// <summary>Parameter must match DATATYPE_LIBRARY.REGEX_PATTERN; on failure show REGEX_ERROR.</summary>
         Regex,
+        /// <summary>Structured parameter (WP 323): required length/precision bounded by
+        /// PARAM_MIN/PARAM_MAX, a per-entry scale rule (SCALE_MODE + SCALE_MIN/SCALE_MAX) and a
+        /// per-entry length-semantics suffix rule (SUFFIX_MODE + SUFFIX_VALUES). Composition:
+        /// <c>BASE(p[,s][ suffix])</c>, e.g. NUMBER(22,5) or VARCHAR2(15 CHAR).</summary>
+        Structured,
+    }
+
+    /// <summary>
+    /// How a STRUCTURED entry treats one of its optional parts (the scale / the length-semantics
+    /// suffix): the DATATYPE_LIBRARY SCALE_MODE and SUFFIX_MODE columns (NONE | OPTIONAL |
+    /// REQUIRED; a NULL column is read as NONE, defensively - the columns are only populated on
+    /// STRUCTURED rows).
+    /// </summary>
+    public enum StructuredPartMode
+    {
+        /// <summary>The part must NOT be present.</summary>
+        None,
+        /// <summary>The part may be present.</summary>
+        Optional,
+        /// <summary>The part must be present.</summary>
+        Required,
+    }
+
+    /// <summary>Which sub-part of a STRUCTURED parameter a validation failure points at - lets
+    /// the datatype picker focus the offending field (length box / scale box / semantics combo)
+    /// instead of always parking the caret on the length.</summary>
+    public enum StructuredParamPart
+    {
+        /// <summary>Not attributable to a single structured part (valid results, non-structured
+        /// failures, admin naming-rule failures).</summary>
+        None,
+        /// <summary>The length/precision p (also whole-parameter failures: missing/unparseable).</summary>
+        Length,
+        /// <summary>The scale s.</summary>
+        Scale,
+        /// <summary>The length-semantics suffix.</summary>
+        Suffix,
     }
 
     /// <summary>Result of validating a Physical_Data_Type against the config whitelist.
-    /// Message is null when valid; on failure it is the reason to surface to the user.</summary>
+    /// Message is null when valid; on failure it is the reason to surface to the user.
+    /// <see cref="Part"/> names the structured sub-field at fault (WP 323), None otherwise.</summary>
     public readonly struct DatatypeValidationResult
     {
         public bool IsValid { get; }
         public string Message { get; }
-        private DatatypeValidationResult(bool ok, string message) { IsValid = ok; Message = message; }
-        public static readonly DatatypeValidationResult Valid = new DatatypeValidationResult(true, null);
-        public static DatatypeValidationResult Invalid(string message) => new DatatypeValidationResult(false, message);
+        /// <summary>The structured parameter part an Invalid verdict points at; None when valid,
+        /// non-structured, or not attributable to a single part.</summary>
+        public StructuredParamPart Part { get; }
+        private DatatypeValidationResult(bool ok, string message, StructuredParamPart part)
+        { IsValid = ok; Message = message; Part = part; }
+        public static readonly DatatypeValidationResult Valid =
+            new DatatypeValidationResult(true, null, StructuredParamPart.None);
+        public static DatatypeValidationResult Invalid(string message, StructuredParamPart part = StructuredParamPart.None)
+            => new DatatypeValidationResult(false, message, part);
     }
 
     /// <summary>
@@ -64,6 +108,48 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// rows with the SAME base datatype but different rules (e.g. an "nvarchar(max)" row and an
         /// "nvarchar &lt;= 4000" row) are distinguishable. Blank/null -&gt; fall back to the base token.</summary>
         public string Label { get; set; }
+
+        /// <summary>DATATYPE_LIBRARY.PARAM_MIN (Structured only, nullable): inclusive lower bound
+        /// of the length/precision p. Null = unbounded (the admin guarantees &gt;= 1 when set).</summary>
+        public int? ParamMin { get; set; }
+
+        /// <summary>DATATYPE_LIBRARY.PARAM_MAX (Structured only, nullable): inclusive upper bound
+        /// of the length/precision p. Null = unbounded.</summary>
+        public int? ParamMax { get; set; }
+
+        /// <summary>DATATYPE_LIBRARY.SCALE_MODE (Structured only): whether the comma-scale part is
+        /// forbidden / optional / required. NULL is read as NONE.</summary>
+        public StructuredPartMode ScaleMode { get; set; }
+
+        /// <summary>DATATYPE_LIBRARY.SCALE_MIN (Structured only, nullable): inclusive lower bound
+        /// of the scale s. May be negative (e.g. Oracle -84). Null = unbounded.</summary>
+        public int? ScaleMin { get; set; }
+
+        /// <summary>DATATYPE_LIBRARY.SCALE_MAX (Structured only, nullable): inclusive upper bound
+        /// of the scale s. Null = unbounded.</summary>
+        public int? ScaleMax { get; set; }
+
+        /// <summary>DATATYPE_LIBRARY.SUFFIX_MODE (Structured only): whether the length-semantics
+        /// suffix part is forbidden / optional / required. NULL is read as NONE.</summary>
+        public StructuredPartMode SuffixMode { get; set; }
+
+        /// <summary>DATATYPE_LIBRARY.SUFFIX_VALUES (Structured only, nullable): the allowed
+        /// length-semantics suffix tokens as CSV ("BYTE,CHAR"). Tokens may contain inner spaces,
+        /// never parentheses, and are never digits-only; the server dedupes them
+        /// case-insensitively. Matching is OrdinalIgnoreCase; composition uses the admin casing
+        /// (<see cref="GetSuffixValueList"/>).</summary>
+        public string SuffixValues { get; set; }
+
+        /// <summary><see cref="SuffixValues"/> split into trimmed tokens, admin casing preserved;
+        /// empty when the CSV is null/blank.</summary>
+        public IReadOnlyList<string> GetSuffixValueList()
+        {
+            if (string.IsNullOrWhiteSpace(SuffixValues)) return Array.Empty<string>();
+            return SuffixValues.Split(',')
+                .Select(t => t.Trim())
+                .Where(t => t.Length > 0)
+                .ToArray();
+        }
     }
 
     /// <summary>
@@ -79,10 +165,11 @@ namespace EliteSoft.Erwin.AddIn.Services
     /// <para>2026-07-02: DATATYPE_LIBRARY became config-scoped (admin migration applied to the
     /// live MetaRepo DBs); the old DBMS_ID column, the DATATYPE_VERSION and ALLOWED_DATATYPE
     /// tables, and the DBMS_VERSION join are all gone. 2026-07-08: the boolean IS_PARAMETERIZED was
-    /// DROPPED and replaced by PARAMETRIZATION_TYPE (NONE|STANDARD|REGEX) + ALLOW_NON_PARAMETRIZED +
-    /// REGEX_PATTERN + REGEX_ERROR. Columns read: DATATYPE, PARAMETRIZATION_TYPE,
-    /// ALLOW_NON_PARAMETRIZED, REGEX_PATTERN, REGEX_ERROR (filtered by CONFIG_ID). DBMS_VERSION /
-    /// DBMS_LIBRARY remain only for CONFIG.DBMS_VERSION_ID + the DBMS-mismatch check.</para>
+    /// DROPPED and replaced by PARAMETRIZATION_TYPE (NONE|STANDARD|REGEX|STRUCTURED) +
+    /// ALLOW_NON_PARAMETRIZED + REGEX_PATTERN + REGEX_ERROR. 2026-07-23 (WP 323): STRUCTURED rows
+    /// add PARAM_MIN/PARAM_MAX + SCALE_MODE/SCALE_MIN/SCALE_MAX + SUFFIX_MODE/SUFFIX_VALUES (all
+    /// nullable; the server nulls them on non-STRUCTURED rows). DBMS_VERSION / DBMS_LIBRARY remain
+    /// only for CONFIG.DBMS_VERSION_ID + the DBMS-mismatch check.</para>
     /// </summary>
     public class AllowedDatatypeService
     {
@@ -203,6 +290,22 @@ namespace EliteSoft.Erwin.AddIn.Services
                                 string label = reader["LABEL"] == DBNull.Value
                                     ? null : reader["LABEL"]?.ToString();
 
+                                // STRUCTURED columns (WP 323): populated only on STRUCTURED rows,
+                                // the server nulls them for every other parametrization type. All
+                                // reads are DBNull-safe; a NULL mode is read as NONE (defensive).
+                                int? paramMin = ReadNullableInt(reader["PARAM_MIN"], name, "PARAM_MIN");
+                                int? paramMax = ReadNullableInt(reader["PARAM_MAX"], name, "PARAM_MAX");
+                                var scaleMode = ParseStructuredMode(
+                                    reader["SCALE_MODE"] == DBNull.Value ? null : reader["SCALE_MODE"]?.ToString(),
+                                    name, "SCALE_MODE");
+                                int? scaleMin = ReadNullableInt(reader["SCALE_MIN"], name, "SCALE_MIN");
+                                int? scaleMax = ReadNullableInt(reader["SCALE_MAX"], name, "SCALE_MAX");
+                                var suffixMode = ParseStructuredMode(
+                                    reader["SUFFIX_MODE"] == DBNull.Value ? null : reader["SUFFIX_MODE"]?.ToString(),
+                                    name, "SUFFIX_MODE");
+                                string suffixValues = reader["SUFFIX_VALUES"] == DBNull.Value
+                                    ? null : reader["SUFFIX_VALUES"]?.ToString();
+
                                 // Validate a REGEX pattern's compilability at load so the matcher
                                 // never throws on a malformed admin pattern; a broken pattern is
                                 // neutralized (logged, treated as "any parameter allowed") rather
@@ -227,6 +330,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                                     RegexError = regexError,
                                     Description = description,
                                     Label = label,
+                                    ParamMin = paramMin,
+                                    ParamMax = paramMax,
+                                    ScaleMode = scaleMode,
+                                    ScaleMin = scaleMin,
+                                    ScaleMax = scaleMax,
+                                    SuffixMode = suffixMode,
+                                    SuffixValues = suffixValues,
                                 });
                             }
                         }
@@ -266,29 +376,30 @@ namespace EliteSoft.Erwin.AddIn.Services
             switch (dbType?.ToUpper())
             {
                 case "POSTGRESQL":
-                    return @"SELECT ""DATATYPE"", ""PARAMETRIZATION_TYPE"", ""ALLOW_NON_PARAMETRIZED"", ""REGEX_PATTERN"", ""REGEX_ERROR"", ""DESCRIPTION"", ""LABEL""
+                    return @"SELECT ""DATATYPE"", ""PARAMETRIZATION_TYPE"", ""ALLOW_NON_PARAMETRIZED"", ""REGEX_PATTERN"", ""REGEX_ERROR"", ""DESCRIPTION"", ""LABEL"", ""PARAM_MIN"", ""PARAM_MAX"", ""SCALE_MODE"", ""SCALE_MIN"", ""SCALE_MAX"", ""SUFFIX_MODE"", ""SUFFIX_VALUES""
                             FROM ""DATATYPE_LIBRARY""
                             WHERE ""CONFIG_ID"" = @configId
                             ORDER BY ""DATATYPE""";
 
                 case "ORACLE":
-                    return @"SELECT DATATYPE, PARAMETRIZATION_TYPE, ALLOW_NON_PARAMETRIZED, REGEX_PATTERN, REGEX_ERROR, DESCRIPTION, LABEL
+                    return @"SELECT DATATYPE, PARAMETRIZATION_TYPE, ALLOW_NON_PARAMETRIZED, REGEX_PATTERN, REGEX_ERROR, DESCRIPTION, LABEL, PARAM_MIN, PARAM_MAX, SCALE_MODE, SCALE_MIN, SCALE_MAX, SUFFIX_MODE, SUFFIX_VALUES
                             FROM DATATYPE_LIBRARY
                             WHERE CONFIG_ID = :configId
                             ORDER BY DATATYPE";
 
                 case "MSSQL":
                 default:
-                    return @"SELECT [DATATYPE], [PARAMETRIZATION_TYPE], [ALLOW_NON_PARAMETRIZED], [REGEX_PATTERN], [REGEX_ERROR], [DESCRIPTION], [LABEL]
+                    return @"SELECT [DATATYPE], [PARAMETRIZATION_TYPE], [ALLOW_NON_PARAMETRIZED], [REGEX_PATTERN], [REGEX_ERROR], [DESCRIPTION], [LABEL], [PARAM_MIN], [PARAM_MAX], [SCALE_MODE], [SCALE_MIN], [SCALE_MAX], [SUFFIX_MODE], [SUFFIX_VALUES]
                             FROM [dbo].[DATATYPE_LIBRARY]
                             WHERE [CONFIG_ID] = @configId
                             ORDER BY [DATATYPE]";
             }
         }
 
-        /// <summary>Parse PARAMETRIZATION_TYPE (STANDARD | REGEX | NONE, case-insensitive).
-        /// An unrecognized/blank value defaults to Standard (permissive: a parameter is accepted)
-        /// and is logged - the migration always writes a known value, so this is defensive.</summary>
+        /// <summary>Parse PARAMETRIZATION_TYPE (STANDARD | REGEX | STRUCTURED | NONE,
+        /// case-insensitive). An unrecognized/blank value defaults to Standard (permissive: a
+        /// parameter is accepted) and is logged - the migration always writes a known value, so
+        /// this is defensive.</summary>
         private static DatatypeParametrization ParseParametrization(string raw, string typeName)
         {
             switch ((raw ?? string.Empty).Trim().ToUpperInvariant())
@@ -296,10 +407,50 @@ namespace EliteSoft.Erwin.AddIn.Services
                 case "NONE": return DatatypeParametrization.None;
                 case "STANDARD": return DatatypeParametrization.Standard;
                 case "REGEX": return DatatypeParametrization.Regex;
+                case "STRUCTURED": return DatatypeParametrization.Structured;
                 default:
                     System.Diagnostics.Debug.WriteLine(
                         $"AllowedDatatypeService: DATATYPE_LIBRARY '{typeName}' has unrecognized PARAMETRIZATION_TYPE '{raw}' - defaulting to STANDARD.");
                     return DatatypeParametrization.Standard;
+            }
+        }
+
+        /// <summary>Parse a SCALE_MODE / SUFFIX_MODE column value (NONE | OPTIONAL | REQUIRED,
+        /// case-insensitive). NULL/blank is NONE by contract (the columns are only populated on
+        /// STRUCTURED rows); an unrecognized value is logged and read as NONE (defensive - the
+        /// admin always writes a known value).</summary>
+        private static StructuredPartMode ParseStructuredMode(string raw, string typeName, string columnName)
+        {
+            switch ((raw ?? string.Empty).Trim().ToUpperInvariant())
+            {
+                case "":
+                case "NONE": return StructuredPartMode.None;
+                case "OPTIONAL": return StructuredPartMode.Optional;
+                case "REQUIRED": return StructuredPartMode.Required;
+                default:
+                    System.Diagnostics.Debug.WriteLine(
+                        $"AllowedDatatypeService: DATATYPE_LIBRARY '{typeName}' has unrecognized {columnName} '{raw}' - reading as NONE.");
+                    return StructuredPartMode.None;
+            }
+        }
+
+        /// <summary>DBNull-safe nullable-int read: the provider may surface the value as int
+        /// (MSSQL/PostgreSQL) or decimal (Oracle NUMBER), so convert rather than cast. A value
+        /// outside Int32 range (or otherwise non-convertible) is neutralized ROW-LOCALLY to null
+        /// (= unbounded) + log, matching how every other malformed per-row field is handled -
+        /// one bad bound must never fail-open the whole whitelist via Load()'s outer catch.</summary>
+        private static int? ReadNullableInt(object value, string typeName, string columnName)
+        {
+            if (value == null || value == DBNull.Value) return null;
+            try
+            {
+                return Convert.ToInt32(value);
+            }
+            catch (Exception ex) when (ex is OverflowException || ex is FormatException || ex is InvalidCastException)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"AllowedDatatypeService: DATATYPE_LIBRARY '{typeName}' has an out-of-range/non-numeric {columnName} '{value}' - reading as NULL (unbounded): {ex.Message}");
+                return null;
             }
         }
 
@@ -310,8 +461,31 @@ namespace EliteSoft.Erwin.AddIn.Services
             {
                 case DatatypeParametrization.None: return a.Datatype;
                 case DatatypeParametrization.Regex: return a.Datatype + (a.AllowNonParametrized ? "(re?)" : "(re)");
+                case DatatypeParametrization.Structured:
+                    return a.Datatype + (a.AllowNonParametrized ? "(st? " : "(st ") + DescribeStructuredRules(a) + ")";
                 default: return a.Datatype + (a.AllowNonParametrized ? "(n?)" : "(n)");
             }
+        }
+
+        /// <summary>
+        /// Compact human-readable summary of a STRUCTURED entry's rules for diagnostics/logs,
+        /// e.g. "p 1..38, s? -84..127, sfx! BYTE|CHAR" ("?" = optional part, "!" = required part,
+        /// "*" = unbounded). Empty for non-structured entries. Shared by
+        /// <see cref="DescribeEntry"/> and the ModelConfigForm datatype-library load log.
+        /// </summary>
+        public static string DescribeStructuredRules(AllowedDatatypeEntry a)
+        {
+            if (a == null || a.ParametrizationType != DatatypeParametrization.Structured) return "";
+
+            string Bound(int? b) => b?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "*";
+            string ModeMark(StructuredPartMode m) => m == StructuredPartMode.Required ? "!" : "?";
+
+            var parts = new List<string> { $"p {Bound(a.ParamMin)}..{Bound(a.ParamMax)}" };
+            if (a.ScaleMode != StructuredPartMode.None)
+                parts.Add($"s{ModeMark(a.ScaleMode)} {Bound(a.ScaleMin)}..{Bound(a.ScaleMax)}");
+            if (a.SuffixMode != StructuredPartMode.None)
+                parts.Add($"sfx{ModeMark(a.SuffixMode)} {string.Join("|", a.GetSuffixValueList())}");
+            return string.Join(", ", parts);
         }
 
         /// <summary>
@@ -340,12 +514,41 @@ namespace EliteSoft.Erwin.AddIn.Services
             // on its own): None (bare-only), or Standard/Regex that also allow the bare form.
             var bare = _allowed.FirstOrDefault(a => a != null && !string.IsNullOrEmpty(a.Datatype) && CanBeBare(a));
             if (bare != null) return bare.Datatype;
-            // Every allowed type REQUIRES a parameter (unusual). Synthesize a minimal length. "(1)"
-            // is valid for a Standard entry (format is DB-standard, not checked here); for a Regex
-            // entry it is best-effort (may not match REGEX_PATTERN) - the enforce path logs a
-            // warning and offers the picker if the fallback does not round-trip.
+            // Every allowed type REQUIRES a parameter (unusual). Synthesize a minimal parameter.
+            // "(1)" is valid for a Standard entry (format is DB-standard, not checked here); for a
+            // Regex entry it is best-effort (may not match REGEX_PATTERN) - the enforce path logs
+            // a warning and offers the picker if the fallback does not round-trip. A Structured
+            // entry gets a full synthesis that satisfies its own rules (SynthesizeMinimalParam).
             var first = _allowed.FirstOrDefault(a => a != null && !string.IsNullOrEmpty(a.Datatype));
-            return first == null ? null : first.Datatype + "(1)";
+            return first == null ? null : first.Datatype + "(" + SynthesizeMinimalParam(first) + ")";
+        }
+
+        /// <summary>
+        /// Minimal parameter text for a param-required fallback. Standard/Regex: "1" (unchanged
+        /// best-effort). Structured: p = PARAM_MIN ?? 1, plus ",SCALE_MIN ?? 0" when the scale is
+        /// REQUIRED, plus " first-allowed-suffix" when the suffix is REQUIRED - OPTIONAL parts are
+        /// never added, so the synthesized token round-trips through the entry's own rules. The
+        /// null-bound defaults are clamped to the OPPOSITE bound when one exists (e.g. SCALE_MIN
+        /// null + SCALE_MAX -1 must seed -1, not 0) so the round-trip holds for one-sided bounds.
+        /// </summary>
+        private static string SynthesizeMinimalParam(AllowedDatatypeEntry a)
+        {
+            if (a.ParametrizationType != DatatypeParametrization.Structured) return "1";
+
+            var sb = new System.Text.StringBuilder();
+            int p = a.ParamMin ?? Math.Min(1, a.ParamMax ?? 1);
+            sb.Append(p.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            if (a.ScaleMode == StructuredPartMode.Required)
+            {
+                int scale = a.ScaleMin ?? Math.Min(0, a.ScaleMax ?? 0);
+                sb.Append(',').Append(scale.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            }
+            if (a.SuffixMode == StructuredPartMode.Required)
+            {
+                var suffixes = a.GetSuffixValueList();
+                if (suffixes.Count > 0) sb.Append(' ').Append(suffixes[0]);
+            }
+            return sb.ToString();
         }
 
         /// <summary>An entry may be used with no parameter: None is bare-only; Standard/Regex are
@@ -458,6 +661,17 @@ namespace EliteSoft.Erwin.AddIn.Services
                         ? DatatypeValidationResult.Valid
                         : DatatypeValidationResult.Invalid($"Type '{type}' requires a parameter.");
 
+                case DatatypeParametrization.Structured:
+                    // Same bare-form rule as STANDARD/REGEX; a present parameter must satisfy the
+                    // structured grammar + per-entry bounds/modes (REGEX_ERROR is NOT used here -
+                    // every STRUCTURED failure message is generated).
+                    if (!hasParam)
+                        return entry.AllowNonParametrized
+                            ? DatatypeValidationResult.Valid
+                            : DatatypeValidationResult.Invalid(
+                                $"Type '{type}' requires a parameter.", StructuredParamPart.Length);
+                    return ValidateStructuredParam(entry, paramValue);
+
                 case DatatypeParametrization.Standard:
                 default:
                     // Standard length/precision - format is the DB/erwin standard, not re-checked here.
@@ -466,6 +680,95 @@ namespace EliteSoft.Erwin.AddIn.Services
                         ? DatatypeValidationResult.Valid
                         : DatatypeValidationResult.Invalid($"Type '{type}' requires a parameter.");
             }
+        }
+
+        /// <summary>
+        /// Validate a present parameter against a STRUCTURED entry: parse the paren content with
+        /// <see cref="StructuredParamParser"/>, then check the length/precision bounds
+        /// (PARAM_MIN/MAX, null = unbounded), the scale rule (SCALE_MODE + SCALE_MIN/MAX) and the
+        /// length-semantics suffix rule (SUFFIX_MODE + SUFFIX_VALUES, matched OrdinalIgnoreCase),
+        /// in that order.
+        /// </summary>
+        private static DatatypeValidationResult ValidateStructuredParam(AllowedDatatypeEntry entry, string paramValue)
+        {
+            string type = entry.Datatype;
+
+            if (!StructuredParamParser.TryParse(paramValue, out int p, out int? s, out string suffix))
+                return DatatypeValidationResult.Invalid(
+                    $"Parameter '{paramValue}' is not valid for type '{type}'. Expected format: length[,scale][ semantics].",
+                    StructuredParamPart.Length);
+
+            if ((entry.ParamMin.HasValue && p < entry.ParamMin.Value)
+                || (entry.ParamMax.HasValue && p > entry.ParamMax.Value))
+                return DatatypeValidationResult.Invalid(
+                    RangeMessage("Length/precision", entry.ParamMin, entry.ParamMax),
+                    StructuredParamPart.Length);
+
+            if (s.HasValue)
+            {
+                if (entry.ScaleMode == StructuredPartMode.None)
+                    return DatatypeValidationResult.Invalid(
+                        $"Type '{type}' does not take a scale.", StructuredParamPart.Scale);
+                if ((entry.ScaleMin.HasValue && s.Value < entry.ScaleMin.Value)
+                    || (entry.ScaleMax.HasValue && s.Value > entry.ScaleMax.Value))
+                    return DatatypeValidationResult.Invalid(
+                        RangeMessage("Scale", entry.ScaleMin, entry.ScaleMax), StructuredParamPart.Scale);
+            }
+            else if (entry.ScaleMode == StructuredPartMode.Required)
+            {
+                return DatatypeValidationResult.Invalid(
+                    $"Type '{type}' requires a scale.", StructuredParamPart.Scale);
+            }
+
+            // Defensive for BOTH suffix branches below: OPTIONAL/REQUIRED with an empty
+            // SUFFIX_VALUES is inconsistent admin data (the admin UI enforces a non-empty list).
+            // The rule is unenforceable - nothing could ever satisfy it and the picker cannot even
+            // offer a choice - so accept + log instead of trapping the user or breaking the
+            // fallback synthesis round-trip. Never swallow silently.
+            var allowedSuffixes = entry.GetSuffixValueList();
+            bool suffixListEmpty = allowedSuffixes.Count == 0;
+            if (suffix.Length > 0)
+            {
+                if (entry.SuffixMode == StructuredPartMode.None)
+                    return DatatypeValidationResult.Invalid(
+                        $"Type '{type}' does not take a length semantics suffix.", StructuredParamPart.Suffix);
+                if (suffixListEmpty)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"AllowedDatatypeService: DATATYPE_LIBRARY '{type}' has SUFFIX_MODE {entry.SuffixMode} but empty SUFFIX_VALUES - accepting suffix '{suffix}'.");
+                }
+                else if (!allowedSuffixes.Any(v => string.Equals(v, suffix, StringComparison.OrdinalIgnoreCase)))
+                {
+                    return DatatypeValidationResult.Invalid(
+                        $"Length semantics must be one of: {string.Join(", ", allowedSuffixes)}.",
+                        StructuredParamPart.Suffix);
+                }
+            }
+            else if (entry.SuffixMode == StructuredPartMode.Required)
+            {
+                if (suffixListEmpty)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"AllowedDatatypeService: DATATYPE_LIBRARY '{type}' has SUFFIX_MODE Required but empty SUFFIX_VALUES - suffix rule unenforceable, accepting '{paramValue}'.");
+                }
+                else
+                {
+                    return DatatypeValidationResult.Invalid(
+                        $"Type '{type}' requires a length semantics suffix ({string.Join(", ", allowedSuffixes)}).",
+                        StructuredParamPart.Suffix);
+                }
+            }
+
+            return DatatypeValidationResult.Valid;
+        }
+
+        /// <summary>Bound-violation message with one-sided wording when only one bound is set.
+        /// Only called after a violation, so at least one bound is non-null.</summary>
+        private static string RangeMessage(string what, int? min, int? max)
+        {
+            if (min.HasValue && max.HasValue) return $"{what} must be between {min.Value} and {max.Value}.";
+            if (min.HasValue) return $"{what} must be at least {min.Value}.";
+            return $"{what} must be at most {max.Value}.";
         }
 
         public void Reload() => Load();

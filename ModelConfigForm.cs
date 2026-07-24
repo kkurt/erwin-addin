@@ -4518,7 +4518,7 @@ namespace EliteSoft.Erwin.AddIn
                 // ValidationCoordinatorService.
                 var dtSvc = AllowedDatatypeService.Instance;
                 if (dtSvc.Load())
-                    Log($"Datatype library loaded: {(dtSvc.HasRestriction ? dtSvc.Allowed.Count + " allowed type(s) - " + string.Join(", ", dtSvc.Allowed.Select(a => a.Datatype + " [" + a.ParametrizationType + (a.AllowNonParametrized ? "/bare" : "") + "]")) : "no restriction (config whitelist empty)")}");
+                    Log($"Datatype library loaded: {(dtSvc.HasRestriction ? dtSvc.Allowed.Count + " allowed type(s) - " + string.Join(", ", dtSvc.Allowed.Select(a => a.Datatype + " [" + a.ParametrizationType + (a.ParametrizationType == DatatypeParametrization.Structured ? " " + AllowedDatatypeService.DescribeStructuredRules(a) : "") + (a.AllowNonParametrized ? "/bare" : "") + "]")) : "no restriction (config whitelist empty)")}");
                 else
                     Log($"Datatype library not loaded: {dtSvc.LastError}");
             }
