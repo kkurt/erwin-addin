@@ -1,3 +1,65 @@
+# Bug #332: naming rule "Required=Hayir" force yerine warn olmali, 2026-07-24 (Developed)
+
+OpenProject #332 (Furkan). Rule Management'ta bir kuralin Required alani "Hayir"
+olsa bile ihlalde kullanici force ediliyordu; beklenen: sadece uyari + devam.
+
+## Root cause (DB ile dogrulandi)
+- Force-vs-warn karari PROPERTY seviyesindeydi (2026-05-24 "Required-property-
+  promotion"): bir property'de tek bir required kural varsa, o property'deki TUM
+  kurallar (Required=Hayir Regexp/Prefix/Suffix dahil) force ediliyordu.
+- MC_NAMING_STANDARD sorgusu: Model.Name'de birden fazla Required-tip kural var
+  (1064/1084/1130/1131), o yuzden "Name" hep required sayilip tum Regexp'ler force
+  ediliyordu. Zeynep DB'sinde rule#1082 IS_REQUIRED=0 iken bile force = kanit.
+- Admin persist DOGRU calisiyor (Zeynep=0, Fiba/MetaRepo/Damla=1). Yani addin bug'i.
+
+## Fix (per-rule, Kursat onayli)
+- NamingValidationEngine.RuleForcesInput (tek kaynak): force ancak kuralin KENDISI
+  required ise (IS_REQUIRED || RuleType==Required || RuleType==Length). Length tip
+  geregi hep force (admin flag'i otomatik true yazacak; addin legacy satirda da tipe
+  gore davranir). Regexp/Prefix/Suffix + Required=Hayir = warn-only.
+- 3 karar noktasi property-level yerine per-rule: Model + Column (Validation
+  CoordinatorService), Table/entity (TableTypeMonitorService).
+- Re-prompt donguleri + RevalidatePropertyAfterRevert: yalniz FORCING ihlallerde
+  yeniden sorar; forcing bitince kalan warn-only ihlaller settled degere gore
+  yeniden dogrulanip consolidated warning'e birakilir (stale mesaj yok).
+- 8 yeni unit test (RuleForcesInput). Tam paket: 879 passed / 0 failed. Ana proje
+  0 warning / 0 error. WP #332 -> "Developed".
+- [ ] LIVE test (user): Required=Hayir ihlalinde warn + devam; Required=Evet ve
+  Length hala force.
+
+---
+
+# Version Promotion Phase 2 - single-target picker simplification, 2026-07-24
+
+User: linear pipelines only ever expose ONE reachable target (the next env), so the
+"Promote to" dropdown in the DDL Review dialog is pointless there. Approach = Variant 1
+(conditional): read-only destination when single target, keep the dropdown when a
+config genuinely offers several targets.
+
+## Plan
+- [x] Detect single target via PromotionPlanner.TargetsOf(routes).Count == 1.
+- [x] Single target: hide the combo, show a read-only destination label instead.
+- [x] Keep the combo created + selected so the send path is untouched.
+- [x] Multi-target: keep the real dropdown (defensive; user's pipelines are linear).
+- [x] Build clean.
+
+## Result
+- [x] DdlApprovalDialog.BuildUi: when TargetsOf(routes).Count == 1, hide the target
+      combo and render a read-only destination label (owner-painted COLOR_HEX dot +
+      target name, mirroring CmbPromoteTarget_DrawItem). The combo stays created +
+      SelectedIndex=0 so SelectedPromotionRoute() and the whole send/re-derivation
+      pipeline are UNCHANGED (single source of truth for the picked route). The
+      "From: <source> (current)" + auto-approve/approval-required indicator stay
+      visible so the user still confirms the destination before Send.
+- [x] Multi-target configs (a Test->Prod second hop offered alongside a Dev->Test
+      re-promote) still get the real dropdown - kept as a defensive path even
+      though the user's pipelines are linear.
+- [x] Build: 0 warnings / 0 errors (TreatWarningsAsErrors).
+- [ ] LIVE test (user): confirm the read-only destination renders and Send targets
+      the correct env.
+
+---
+
 # WP 323: STRUCTURED Parametrization (add-in side) - CODE-DONE (awaiting live test), 2026-07-23
 
 Spec: tasks/wp323-structured-parametrization.md (admin side + DB migration already live).
@@ -1085,3 +1147,18 @@ Verified:
 - Live schema (MetaRepoZeynep): child-table columns match the loader exactly; flat `DEPENDS_ON_UDP_*` gone from PREDEFINED_COLUMN; the exact loader JOIN query runs and resolves UDP_NAME.
 - Live data across all 9 MetaRepo* DBs: 146 condition terms, ALL at ORDER_INDEX=0 (regression guarantee: migrated single conditions fold identically), 0 comma-bearing values (CSV-split concern inert), 0 dangling UDP FKs.
 - REMAINING: in-erwin UI runtime test (create Log/Parametre tables, watch the columns land) - not driven here to avoid disrupting the live erwin session. NOT committed.
+
+# Version Promotion (WP 322) - Live-test round 2 finding: per-model approvers ignored (2026-07-23)
+
+User report: "onayci tanimli ama Auto-approve yaziyor" on CORE BANKING (config 2012, DB=MetaRepoTmp). My earlier close ("data state, no approvers, spec-correct") was WRONG - the user was right.
+
+Root cause (REAL add-in bug):
+- Log's DevDatabaseSelector line proves the test ran on MetaRepoTmp (not the DBs I checked). MetaRepoTmp config 2012 has approver 'Emre' in ENVIRONMENT_RELATION_MODEL_APPROVER for RELATION_ID 3 (TEST->UAT) and 4 (UAT->PROD), keyed by MART_PATH='Kursat/CORE BANKING ACCOUNTING_ACCOUNTING'. The transition-wide ENVIRONMENT_RELATION_APPROVER is empty.
+- Approver resolution is TWO-TIER (per the LIVE server, MetaWeb.Api/Governance/PromotionEndpoints.cs, added 2026-07-23 via migration 20260722_approver_catalog_model_approvers.sql - AFTER the 2026-07-21 spec freeze): per-model override (RELATION_ID+MART_PATH) REPLACES the transition default; the default itself is FLOW='PROMOTION' filtered. Add-in's GetRelationApprovers read only the transition table, FLOW-blind and martPath-blind -> the override never surfaced -> wrong Auto-approve on BOTH the label AND the send-time insert decision.
+
+Fix:
+- PromotionPlanner.ResolveEffectiveApprovers(modelOverride, transitionDefault) - pure precedence (override wins when non-empty; else default; never merge; no APPROVAL_APPROVER fallback). Mirrors the server.
+- PromotionService.GetRelationApprovers(relationId, martPath) - reads MODEL_APPROVER (RELATION_ID+MART_PATH) + transition default (RELATION_ID+FLOW='PROMOTION'), folds through the planner. MART_PATH is nvarchar(500) (not a LOB) so equality is safe on all three dialects.
+- Call sites updated to pass martPath: PromotionFlow.BuildSendContext (context preload), DdlApprovalDialog.LookupPromotionApprovers (send-time live read fallback).
+
+Verified: build 0/0 both flavors; tests 871/871 (+5 ResolveEffectiveApprovers: override-replaces-default, override-wins-over-non-empty-default, empty-override-falls-back, both-empty, end-to-end feeds RequiresApprovalVote). NOT committed (awaiting user OK). Awaiting live re-test round 2 on CORE BANKING: expect "Approval required" now, Pending row on send.

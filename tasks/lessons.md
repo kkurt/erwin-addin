@@ -2162,3 +2162,50 @@ the 2026-06-23 "positive confirmation before destructive action" lesson.
   her hipotez 4-5 tekrarla test edilmeli.
 - DERS 3: Ayni anda tek degisken degistir; kanit hiyerarsisi: server-side capture >
   scroll testi > GDI sayaci > log korelasyonu > varsayim.
+
+## 2026-07-23: "Onayci var ama Auto-approve" - yanlis DB + yanlis tablo teshisi
+- KOK NEDEN: promotion approver cozumlemesi IKI katmanli: (1) per-model override
+  ENVIRONMENT_RELATION_MODEL_APPROVER (RELATION_ID + MART_PATH), varsa transition
+  default'u REPLACE eder; (2) bos ise ENVIRONMENT_RELATION_APPROVER (RELATION_ID +
+  FLOW='PROMOTION'). Bu model-override tablosu + FLOW kolonu spec dondurulduktan
+  (2026-07-21) BIR GUN SONRA admin'e eklenmis (migration 20260722_approver_catalog_model_approvers.sql).
+  Add-in'in GetRelationApprovers'i sadece transition tablosunu (FLOW filtresiz,
+  martPath'siz) okuyordu -> Emre model-override onaycisi gorunmedi -> yanlis Auto-approve.
+- DERS 1: Bir bug'i "veri durumu, kod dogru" diye kapatmadan ONCE logdan HANGI DB
+  kullanildigini oku (DevDatabaseSelector satiri) ve O DB'de sorgula. Ben "9 DB'nin
+  hepsi bos" deyip kullanicinin gercekten kullandigi MetaRepoTmp'yi dogru tabloda
+  sorgulamadim. Kullanici "logu okumadin mi, hangi DB yaziyor" diye hakli cikti.
+- DERS 2: Bir okuma metodu bir sunucu kararini AYNALIYORSA (PromotionEndpoints),
+  once sunucu kaynagini bul ve BIREBIR ayni cozumlemeyi uygula; spec dokumani
+  dondurulmus olabilir ama kod ondan sonra evrilmis olabilir. Spec != canli kod.
+- DERS 3: Spec "ENVIRONMENT_RELATION_APPROVER oku" diyordu; ama canli sema FLOW +
+  MODEL_APPROVER ile genislemisti. Sadece spec'e guvenip DB semasini/kaynak kodu
+  dogrulamamak = eksik implementasyon. Paylasilan MetaShared entity'leri (DbSet,
+  Flows sabitleri) tek dogruluk kaynagi.
+
+## 2026-07-23: Ayni timer-reentrancy sinifi Mart Save commit'inde de var (freeze) - AlterWizardGate kapsamiyordu, MartSaveGate eklendi
+- SEMPTOM (Tarik): DDL pipeline sonrasi "Save and Submit" -> add-in erwin'in
+  "Description for..." dialog'unu yakalayip IDOK'ladi ama Mart commit 15sn kapanmadi ->
+  erwin freeze (debug log "dialog did not close within 15000ms after IDOK").
+- KOK NEDEN: SaveCurrentModelWithDescription / SavePromotionModelWithDescription
+  Mart Save (WM_COMMAND 1061) boyunca HICBIR timer suspend etmiyordu. erwin'in cold
+  commit'i uzun + mesaj-pompalayan progress dialog gosterir, ustelik modal
+  DdlApprovalDialog + description-dialog loop'lari altinda kosar; bu pompalama sirasinda
+  5 UI-thread timer (100ms WindowMonitor, 250ms MonitorTimer, 500ms Reconnect, PUWatcher)
+  canli SCAPI/COM okumasi yapip devam eden commit transaction'ina reenter edip
+  donduruyordu. Reconnect ayrica save'in mint ettigi yeni version locator'ini "yeni model"
+  sanip adopt path'ini commit ortasinda tetikleyebiliyor.
+- ASIMETRI: DDL generation pipeline'i her seyi suspend ediyordu (SuspendValidation +
+  StopMonitoring + StopReconnectTimer + _martMartPipelineActive); Mart Save yolu hicbir
+  seyi suspend etmiyordu. Tek koruma AlterWizardGate title-probe'a bagli, Mart Save'de
+  o wizard acik degil -> gate false -> timer'lar serbest.
+- FIX: Services/MartSaveGate.cs (Interlocked ref-counted flag; description dialog
+  SW_HIDE'li oldugu icin title-probe yerine flag). Iki save call-site
+  `using var _ = MartSaveGate.Enter()` ile sarildi (post-save probe dahil); 5 tick'in
+  bail-out kosulu `AlterWizardGate.IsOpen || MartSaveGate.IsActive`. Log:
+  [MARTSAVE-GATE] active/done.
+- DERS: erwin'in mesaj-pompalayan HER modal/uzun islemi (alter wizard, Mart commit,
+  ileride baska pump'lar) add-in timer reentrancy'sine acik. Yeni bir "erwin'i pompalatan"
+  otomasyon eklerken o pencere icin timer'lari gate'le/suspend et - AlterWizardGate tek
+  basina yeni pump'lari KAPSAMAZ (title'a bagli). 2026-07-20 black-rectangle dersinin
+  freeze-versiyonu.
