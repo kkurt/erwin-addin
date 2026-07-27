@@ -231,6 +231,12 @@ namespace EliteSoft.Erwin.AddIn.Services
             return wasEnabled;
         }
 
+        /// <summary>Whether a window currently accepts input. Public so
+        /// <see cref="ErwinInputBlock"/> can reconcile its own block against the frame's
+        /// real state instead of trusting its bookkeeping.</summary>
+        public static bool IsWindowEnabledPublic(IntPtr hWnd)
+            => hWnd != IntPtr.Zero && IsWindowEnabled(hWnd);
+
         /// <summary>
         /// Returns true when erwin's main window is currently disabled by a
         /// modal child dialog (Mart Save, Mart Open, Print, Properties, ...).
@@ -247,18 +253,68 @@ namespace EliteSoft.Erwin.AddIn.Services
         {
             IntPtr main = GetErwinMainWindow();
             if (main == IntPtr.Zero) return false; // Can't determine; let caller proceed.
-            return !IsWindowEnabled(main);
+
+            // PRIMARY signal, independent of who disabled the frame: a real modal is an
+            // ENABLED POPUP owned by the frame. GW_ENABLEDPOPUP is immune to the add-in's own
+            // input block (WP 329), so this keeps detecting erwin's dialogs while the block is
+            // applied - the frame's enabled bit alone cannot distinguish the two.
+            IntPtr popup = GetWindow(main, GW_ENABLEDPOPUP);
+            if (popup != IntPtr.Zero && popup != main) return true;
+
+            if (IsWindowEnabled(main)) return false;
+
+            // Disabled with no enabled popup: either the add-in's own block (WP 329) - not a
+            // modal, and reporting it as one would make every timer tick and the Generate DDL /
+            // Review guards bail out for as long as the add-in window is open - or a modal that
+            // has not created its window yet, which the popup probe above catches on the next call.
+            return !ErwinInputBlock.IsApplied;
+        }
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+
+        // The frame's owned popup that is currently enabled = the active modal dialog.
+        private const uint GW_ENABLEDPOPUP = 6;
+
+        /// <summary>
+        /// True when <paramref name="hWnd"/> currently owns an ENABLED popup, i.e. a live modal
+        /// dialog belongs to it. Unlike the window's own enabled bit this is unaffected by the
+        /// add-in's input block (WP 329), so it is the safe way to ask "is a real erwin dialog
+        /// up?" - and the guard that stops the block's release from re-enabling a frame
+        /// underneath erwin's own modal loop.
+        /// </summary>
+        public static bool HasEnabledOwnedPopup(IntPtr hWnd)
+        {
+            if (hWnd == IntPtr.Zero) return false;
+            IntPtr popup = GetWindow(hWnd, GW_ENABLEDPOPUP);
+            return popup != IntPtr.Zero && popup != hWnd;
         }
 
         public static IntPtr GetErwinMainWindow()
         {
-            IntPtr result = IntPtr.Zero;
             var erwinProcesses = Process.GetProcessesByName("erwin");
             if (erwinProcesses.Length == 0) return IntPtr.Zero;
 
             var erwinPids = new HashSet<uint>();
             foreach (var p in erwinProcesses)
                 erwinPids.Add((uint)p.Id);
+
+            // Pass 1: identify the frame by its WINDOW CLASS.
+            //
+            // Class, visibility and owning pid are read from the window manager without
+            // sending anything, so this pass works from ANY thread and cannot time out.
+            // The title cannot make that claim: GetWindowTextNoHang is a cross-thread
+            // WM_GETTEXT with a 100 ms SMTO_ABORTIFHUNG budget, and callers that run off
+            // the UI thread lose that race whenever erwin's UI thread is busy - which is
+            // exactly when they need the handle. That is how a Mart save failed on
+            // 2026-07-26 22:42 ("XTPMainFrame HWND not resolvable") after succeeding with
+            // the identical user action 26 minutes earlier: a coin flip, not a state.
+            //
+            // The title is still consulted, but only to DISAMBIGUATE between candidates
+            // and never as the sole means of finding one. Enumeration order is Z-order, so
+            // the window picked is the same one the old title-only scan would have picked.
+            IntPtr byClassAndTitle = IntPtr.Zero;
+            IntPtr byClassOnly = IntPtr.Zero;
 
             EnumWindows((hWnd, lParam) =>
             {
@@ -267,27 +323,42 @@ namespace EliteSoft.Erwin.AddIn.Services
                 GetWindowThreadProcessId(hWnd, out uint pid);
                 if (!erwinPids.Contains(pid)) return true;
 
-                // Timeout-bounded read: after a version-compare teardown a leftover
-                // visible #32770 dialog can be parked on a non-pumping worker thread
-                // (stuck on a Mart socket). A plain GetWindowText (synchronous
-                // WM_GETTEXT) to it blocks this enum - and thus the UI-thread caller
-                // (monitor heartbeat / reconnect modal-check) - forever (hang dump
-                // 2026-06-03, frozen on HWND 0xC304DE, a #32770 on a stuck thread).
-                // SMTO_ABORTIFHUNG returns "" for such a window so the enum skips it
-                // and still reaches erwin's real "erwin DM" main frame.
-                string title = GetWindowTextNoHang(hWnd);
+                var cls = new StringBuilder(64);
+                GetClassName(hWnd, cls, cls.Capacity);
+                if (!string.Equals(cls.ToString(), "XTPMainFrame", StringComparison.Ordinal)) return true;
 
-                // erwin's main window title starts with "erwin DM"
-                if (title.IndexOf("erwin DM", StringComparison.OrdinalIgnoreCase) >= 0)
+                if (byClassOnly == IntPtr.Zero) byClassOnly = hWnd;
+
+                // Only frames get probed, so a stuck #32770 parked on a non-pumping
+                // worker thread never costs this enum anything (hang dump 2026-06-03).
+                if (GetWindowTextNoHang(hWnd).IndexOf("erwin DM", StringComparison.OrdinalIgnoreCase) >= 0)
                 {
-                    result = hWnd;
-                    return false; // Stop enumeration
+                    byClassAndTitle = hWnd;
+                    return false; // best possible match - stop
                 }
-
                 return true;
             }, IntPtr.Zero);
 
-            return result;
+            if (byClassAndTitle != IntPtr.Zero) return byClassAndTitle;
+            if (byClassOnly != IntPtr.Zero) return byClassOnly;
+
+            // Pass 2: no XTPMainFrame at all. Fall back to the historical title-only scan
+            // so a future erwin that reframes its main window is not silently unreachable.
+            IntPtr byTitle = IntPtr.Zero;
+            EnumWindows((hWnd, lParam) =>
+            {
+                if (!IsWindowVisible(hWnd)) return true;
+                GetWindowThreadProcessId(hWnd, out uint pid);
+                if (!erwinPids.Contains(pid)) return true;
+                if (GetWindowTextNoHang(hWnd).IndexOf("erwin DM", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    byTitle = hWnd;
+                    return false;
+                }
+                return true;
+            }, IntPtr.Zero);
+
+            return byTitle;
         }
 
         /// <summary>
