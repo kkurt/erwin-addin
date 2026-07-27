@@ -354,6 +354,349 @@ config genuinely offers several targets.
 
 ---
 
+# Approval gate walk took 46 MINUTES - timer reentrancy - CODE-DONE 2026-07-27
+
+## The measurement
+
+First live run of the approval blocking-rule gate with a rule actually flagged
+(`MetaRepoTmp`, `CORPORATE_PROPERTY.ENFORCE_APPROVAL_BLOCKING_RULES=True` at corp=4, rule
+#1081 `COLUMN.Physical_Data_Type` Regexp rejecting `nvarchar(>4000)`), model
+`Mart://TestRoot/Kursat/SQL_BUYUKMODEL`:
+
+```
+18:04:44.065  [DDL-GATE] blocking rules for config 1012: 1 flagged, 1 resolved (#1081)
+18:50:40.840  [APPROVAL-GATE] rule#1081 ... checked 8401 object(s), 8401 applicable,
+                              0 unreadable -> 0 violation(s).
+```
+
+| | |
+|---|---|
+| Elapsed | 2,756,771 ms = **45 m 56 s** |
+| Objects | 8,401 columns / 286 entities |
+| Per column | **328 ms** |
+| Rules | 1 |
+| Violations | 0 |
+
+All 66 previously logged gate runs had early-returned at "no evaluable blocking rule is
+defined", so this walk had never actually run before.
+
+## Root cause
+
+The walk is synchronous on the UI thread and sets **no suspension flag**, unlike every other
+whole-model walk in this codebase. A synchronous walk does NOT stop the message loop: the
+outbound SCAPI/COM calls pump it themselves, so `WM_TIMER` keeps being dispatched and the
+seven periodic ticks each run their own SCAPI work in the middle of the walk.
+
+Proof, verified directly in the log: between the walk's first and last line exactly 139 lines
+were written, and they are **46 glossary refresh cycles at exactly 60 s apart** - nothing
+else. `_glossaryRefreshTimer` is a `System.Windows.Forms.Timer` (ModelConfigForm.cs:224, file
+has `using System.Windows.Forms;` and no alias), whose `Tick` can only be delivered by a
+pumping loop. A blocked thread would have coalesced all 46 into one burst at the end.
+
+Calibration from the SAME session and model, 41 minutes earlier: `BaselineDiagramHeartbeat`
+walked ~10,000 SCAPI properties in **734 ms**, and `UdpSyncEngine` walked 1,507 UDPs in
+958 ms. The gate's own work is ~51,800 IDispatch ops, i.e. seconds. So ~99% of the wall time
+was not the gate's work.
+
+The comment at ModelConfigForm.cs:5612-5617 asserted the opposite ("ShowBusyOverlay is
+deliberately NOT used because it calls DoEvents, which would let the validation timers
+re-enter SCAPI mid-walk"). Not calling `DoEvents` does not stop the pump. Comment corrected.
+
+This is the THIRD occurrence of this defect class: black-rectangle wizard reentrancy ->
+`AlterWizardGate`; Mart Save 15 s freeze -> `MartSaveGate`; now the approval gate.
+
+**Not yet proven:** that the reentrant tick work accounts for the missing ~2,750 s. The
+100/250/500/2000 ms ticks do not log on a stable tick, so they are invisible in the log. One
+of three adversarial review lenses refuted exactly this attribution. The skipped-tick census
+below is what settles it.
+
+## What was implemented
+
+- [x] `Services/ModelWalkGate.cs` - ref-counted gate (the `MartSaveGate` pattern) raised
+      around a whole-model walk. Carries a per-site **skipped-tick census** and a stopwatch;
+      on the outermost dispose it logs
+      `[WALK-GATE] <reason> done in <N> ms - add-in timer ticks resumed; <T> tick(s)
+      suspended [site=count, ...]`. That single line is the measurement that either confirms
+      or refutes the attribution above.
+- [x] `Services/AddinTickGate.cs` - the condition now lives in ONE place. All seven
+      UI-thread ticks previously carried their own copy of
+      `if (AlterWizardGate.IsOpen || MartSaveGate.IsActive) return;`, which is exactly why a
+      third source could be (and was) missed. Sites: `ModelConfigForm.Reconnect`,
+      `ModelConfigForm.GlossaryRefresh`, `ModelConfigForm.PuWatcher`,
+      `ColumnValidation.Monitor`, `ColumnValidation.WindowMonitor`, `Validation.Monitor`,
+      `Validation.WindowMonitor`.
+- [x] `ErwinInputBlock.cs:143` deliberately NOT routed through the new gate: it consumes
+      `AlterWizardGate.IsOpen` / `MartSaveGate.IsActive` as inputs to erwin's input-block
+      policy, so feeding a model walk in would re-enable erwin's frame mid-walk.
+- [x] `ModelConfigForm.CheckApprovalBlockingRules` wraps `Evaluate` in
+      `using (ModelWalkGate.Enter(...))`, inside the existing `UseWaitCursor` try/finally.
+- [x] Gate instrumentation: collect phase timed and logged
+      (`collected N COLUMN object(s) in X ms`), per-rule summary line now carries elapsed,
+      and coarse progress lines during collect (every 50 tables / 2000 objects) so a slow
+      walk can never again be indistinguishable from a hang. Interval is coarse on purpose -
+      `AddinLogger` opens/appends/closes the file per line under a global lock.
+- [x] `tests/ErwinAddIn.Tests/ModelWalkGateTests.cs` - 8 tests: ref counting, nested scopes,
+      double dispose, concurrent census, and `AddinTickGate` skip behaviour.
+- [x] Build 0 warnings / 0 errors (TreatWarningsAsErrors). Tests 987/987 green.
+
+- [ ] **LIVE retest (user):** open `SQL_BUYUKMODEL` from `MetaRepoTmp`, Generate DDL, press
+      the green button, then read the `[WALK-GATE]` line. Expected: seconds instead of
+      46 minutes, and a large suspended-tick count. If the time does NOT drop, the census
+      tells us where it actually goes instead.
+
+## Retest 1 (2026-07-27 20:30) - gate works, but it was NOT the dominant cost
+
+New binary loaded (`[WALK-GATE]` and collect-progress lines present). Same model.
+
+```
+20:30:11.880  [WALK-GATE] Approval blocking gate (Send to Approval) - timer ticks paused
+20:31:12.631  collecting COLUMN objects -  50 table(s), 1470 column(s)   (+60.7 s)
+20:32:20.908  collecting COLUMN objects - 100 table(s), 2970 column(s)   (+68.3 s)
+20:33:28.329  collecting COLUMN objects - 150 table(s), 4470 column(s)   (+67.4 s)
+20:34:41.690  collecting COLUMN objects - 200 table(s), 5970 column(s)   (+73.4 s)
+20:35:51.401  collecting COLUMN objects - 250 table(s), 7470 column(s)   (+69.7 s)
+```
+
+Run was killed by the user before it finished, so there is no evaluate-phase number yet.
+
+- **The gate works.** Zero glossary ticks landed inside the 5.5 minutes of walk; the previous
+  run took 46 of them. Timer reentrancy is closed.
+- **The attribution was wrong in magnitude.** 328 ms/column before, ~45 ms/column for the
+  COLLECT PHASE ALONE now. Roughly 7x, not the 100x-750x the diagnosis claimed. One of the
+  three adversarial review lenses refuted exactly this attribution and was right.
+- **Dead linear** at ~68 s per 50 tables / 1500 columns. Linear per-object cost, not a
+  pathological loop.
+- The collect phase's ONLY per-column work was two NAMED property reads
+  (`.Name` and `Properties("Physical_Name")`), both purely for the report label. That is
+  ~22 ms per named read. The 0.07 ms/op calibration came from `BaselineDiagramHeartbeat`,
+  which reads `ObjectId` (a direct member) and `Collect` - NOT named-property lookups. That
+  is why it failed to predict this.
+
+## Fix applied after retest 1: the report label is resolved on demand
+
+`GateObject.Display` is now a memoised `Func<string>` instead of an eagerly built string
+(ApprovalBlockingRuleGate.cs, `#region Model walk`). The table half of a column label is a
+`Lazy<string>` shared by all columns of that entity, so it is read at most once per table and
+only if one of its columns reaches the report. At most `MaxReportedIssues` labels can ever be
+shown; the walk used to build 8,401 of them. All three construction sites (MODEL root, COLUMN,
+generic) are lazy. A resolve failure degrades to `<name unavailable>` rather than an empty
+string, so it cannot masquerade as a real object name.
+
+After this change the collect phase does only the enumerator step per column, which makes the
+next run a clean split:
+
+| Log line | What it now measures |
+|---|---|
+| `collected N COLUMN object(s) in X ms` | pure enumeration + one Collect per entity |
+| `rule#1081 ... in Y ms` | exactly 8,401 named `Physical_Data_Type` reads |
+| `[WALK-GATE] ... T tick(s) suspended` | how many ticks the gate stopped |
+
+If Y is still ~22 ms per column, a named SCAPI property read is inherently that expensive on
+this model and no amount of tidying the walk will help - the feature then needs a different
+shape, not a faster loop. If Y is small, the cost was specific to `ReadDisplayName`.
+
+- [x] Build 0 warnings / 0 errors. Tests 987/987 green.
+- [ ] **LIVE retest 2 (user):** same steps; read the three lines above.
+
+## Retest 2 (2026-07-27 20:54) - full run, 5.9x faster, and a hard contradiction
+
+```
+20:54:34.588  [WALK-GATE] paused
+20:57:34.231  collected 8401 COLUMN object(s) in 179403 ms
+21:02:21.901  rule#1081 ... 8401 applicable, 0 unreadable -> 0 violation(s) in 287667 ms
+21:02:21.920  [WALK-GATE] done in 467325 ms; 7008 tick(s) suspended
+              [Validation.WindowMonitor=4207, Validation.Monitor=1865,
+               ModelConfigForm.Reconnect=935, ModelConfigForm.GlossaryRefresh=1]
+```
+
+| | before | after |
+|---|---|---|
+| Total | 2,756,771 ms (45 m 57 s) | **467,325 ms (7 m 47 s)** = 5.9x |
+| Collect | - | 179,403 ms = 21.4 ms/column |
+| Evaluate | - | 287,667 ms = 34.2 ms/column |
+
+- Both fixes are real. 7,008 ticks suspended; `Validation.WindowMonitor` alone would have
+  fired ~4,673 times at 100 ms over 467 s and 4,207 were caught, so the ticks really were
+  being delivered at ~90% of nominal rate straight through the old walk.
+- The lazy label halved the collect phase (45.3 -> 21.4 ms/column), which prices one named
+  `Properties(name)` read at ~12 ms.
+- Per-object cost is FLAT across the run (+28.0, +34.4, +31.9, +32.5, +32.2 s per 50 tables),
+  so nothing degrades as retained RCWs accumulate. That argues against the RCW-cache theory.
+
+**The contradiction that must be resolved before any further change.**
+`ValidationCoordinatorService.BaselineDiagramHeartbeat` (:1440-1502) walks the SAME model with
+the SAME shape - `Collect(root,"Entity")`, then `Collect(entity,"Attribute")` per entity
+(:1482), then a property read on all 8,400 attributes (:1488) - and finishes in **734 ms**.
+The gate's collect phase now does STRICTLY LESS COM work than that (no property read at all,
+just enumeration) and takes **179,403 ms**. That is 244x slower for less work.
+
+So the remaining cost is NOT explained by anything in the gate's own COM shape. Known
+differences between the two contexts, none yet tested:
+
+1. The heartbeat calls `ReleaseCom(entityAttrs)` in a `finally` (:1495) and retains nothing.
+   The gate has ZERO `Marshal.ReleaseComObject` in 1,235 lines and retains 8,401 Attribute
+   RCWs in a `List` for the whole run. (Weakened by the flat per-object cost above.)
+2. The heartbeat reads `ObjectId`, a direct member. The gate reads named properties via
+   `Properties(name)`, a lookup over the model's ~1,500 Property_Types.
+3. **Context**: the heartbeat runs from a plain timer tick. The gate runs from
+   `BtnSend_Click` INSIDE `DdlApprovalDialog.ShowDialog()`'s modal message loop, with erwin's
+   main frame disabled by `ErwinInputBlock`. Every COM call pumps that modal loop.
+
+Note: the heartbeat's 734 ms ALSO includes 286 named `Properties("Physical_Name")` reads
+(ValidationCoordinatorService.cs:1509), so a named read costs at most ~2.5 ms in that context
+against the ~12 ms and ~34 ms derived inside the gate. That leans towards (3), the context.
+
+## Probe added: Services/ScapiCalibration.cs (DEV builds only)
+
+Two wrong attributions is enough; the next step is a measurement. `ScapiCalibration.RunOnce`
+times each access shape over the same sample of objects and reports ms/op:
+
+- `Collect(root,"Entity")`, `Collect(entity,"Attribute")` per call, attribute enumeration per step
+- `.ObjectId` (direct member) vs `Properties("Physical_Data_Type")` vs `Properties("Physical_Name")`
+  (named lookups), each with a THROW COUNT - "every read threw" would itself be the answer,
+  and that is the cost the walk's silent catches were hiding
+
+Bounded: 150 objects, 4 s ceiling per shape, once per process per context, never throws.
+
+Wired at two call sites so one session yields the comparison:
+
+| Call site | Context |
+|---|---|
+| `ValidationCoordinatorService.BaselineDiagramHeartbeat` (after its own log line) | `connect (no modal loop)` |
+| `ApprovalBlockingRuleGate.Evaluate` (before the walk) | `approval gate (modal loop)` |
+
+Reading it: same per-shape costs in both blocks means the SHAPE is the problem (named lookup
+per object). The same shape orders of magnitude slower in the modal block means the CONTEXT is
+the problem - every SCAPI call pumps that loop and erwin's frame is disabled while it runs.
+
+### Calibration result (2026-07-27 22:05 / 22:06) - it is the CONTEXT, not the shape
+
+Same 150 objects, same code, same process, zero throws in either block.
+
+| shape | connect (no modal) | approval gate (modal) | ratio |
+|---|---|---|---|
+| `Collect(root,"Entity")` | 1.8 ms | 0.6 ms | - |
+| `Collect(entity,"Attribute")` | 0.067 ms/call | 1.592 ms/call | 24x |
+| enumerate attribute | 0.523 ms/step | 15.824 ms/step | 30x |
+| read `.ObjectId` (direct member) | 0.017 ms/read | 7.268 ms/read | **427x** |
+| read `Properties("Physical_Data_Type")` | 0.071 ms/read | 11.120 ms/read | 157x |
+| read `Properties("Physical_Name")` | 0.037 ms/read | 12.921 ms/read | 349x |
+
+- **The named-lookup theory is dead.** `.ObjectId` is a direct member and is the WORST
+  offender at 427x. Named vs direct makes no difference; the context makes all of it.
+- **Our timers are not the remaining cause.** The gate block ran INSIDE
+  `ModelWalkGate.Enter`, so all seven ticks were already suspended, and it was still 400x.
+- **0 threw** in both blocks, so the exception-storm theory is dead too.
+- At connect the whole walk would cost 8,401 x ~0.6 ms = **~5 seconds**. The COM shape the
+  gate uses is fine. It is where it runs from that is broken.
+
+Per-call costs of 7-16 ms with no work to justify them are the signature of a call that is
+not a direct in-apartment dispatch: it is being marshalled and/or delayed. Two mechanisms fit
+and both are testable with one more line of output (added):
+
+1. The walk runs on a DIFFERENT thread/apartment from the one that owns the SCAPI objects, so
+   every call is marshalled to the owning STA.
+2. Same apartment, but the outgoing call is subject to erwin's OLE message filter, which can
+   retry-with-delay while the application is "busy" - which is exactly what a modal dialog
+   makes it.
+
+`ScapiCalibration` now logs `thread=#N apartment=STA/MTA name=... isThreadPool=...` as its
+first line in both contexts. If the two differ, it is (1) and the fix is to run the walk on
+erwin's UI thread. If they match, it is (2).
+
+### ROOT CAUSE (2026-07-27 22:28) - the walk ran in the WRONG COM APARTMENT
+
+```
+[SCAPI-CAL] context=connect (no modal loop)     thread=#2 apartment=STA name='(unnamed)' isThreadPool=False
+[SCAPI-CAL] context=approval gate (modal loop)  thread=#8 apartment=MTA name='.NET TP...' isThreadPool=True
+```
+
+The DDL review dialog is shown and pumped on a **thread-pool MTA thread**, so `BtnSend_Click`
+and everything it calls runs there. Every SCAPI call from an MTA thread to erwin's STA-owned
+objects is marshalled through a proxy and serviced by the owning apartment - a direct dispatch
+becomes a cross-apartment round trip. `.ObjectId` does no real work and shows the worst ratio
+(over 400x), which is what proves it is apartment cost and not the properties being read.
+
+Note `BtnSend_Click` calls the gate as its FIRST statement, before any `await`
+(DdlApprovalDialog.cs:790-798), so the thread switch is NOT an async continuation - the whole
+dialog lives on that thread.
+
+## Fix: marshal the walk onto the owning STA
+
+`ModelConfigForm.CheckApprovalBlockingRules` now runs `Evaluate` through
+`Invoke` when `InvokeRequired`. Only the WALK is marshalled; the report dialog stays on the
+calling thread because its owner window lives there. `ModelWalkGate.Enter` now logs
+`thread #N APARTMENT` permanently, so a walk that lands in the wrong apartment again is one
+line away from being noticed instead of invisible.
+
+Expected: 467 s -> ~5 s (8,401 objects at the measured STA rate).
+
+### CONFIRMED (2026-07-27 22:53) - 45 m 57 s -> 12.5 s
+
+```
+collected 8401 COLUMN object(s) in 4339 ms
+rule#1081 ... 8401 applicable, 0 unreadable -> 0 violation(s) in 7617 ms
+[WALK-GATE] done in 12475 ms - timer ticks resumed; 4 tick(s) suspended
+```
+
+| | first measurement | now | gain |
+|---|---|---|---|
+| Total | 2,756,771 ms | **12,475 ms** | **221x** |
+| Collect | 179,403 ms | 4,339 ms | 41x |
+| Evaluate | 287,667 ms | 7,617 ms | 38x |
+| Per column | 328 ms | 1.49 ms | 220x |
+
+In-walk calibration now reports STA rates: `.ObjectId` 7.268 -> **0.003** ms,
+`Properties(...)` 11.120 -> **0.040** ms, enumerate 15.824 -> **0.536** ms/step.
+
+The cost model closes exactly: 8,401 steps x 0.536 ms = 4,503 ms predicted collect vs 4,339 ms
+measured. Nothing unexplained is left.
+
+The `ModelWalkGate.Enter` scope was then moved INSIDE the marshalled delegate, because raised
+around the `Invoke` it logged the caller's MTA thread while the walk ran on the STA - the exact
+confusion that line exists to prevent.
+
+- [x] Build 0 warnings / 0 errors. Tests 987/987 green.
+
+### Remaining headroom (not needed, recorded for later)
+
+- Evaluate is 7,617 ms for 8,401 named reads that calibrate at 0.040 ms (336 ms expected), so
+  ~0.87 ms/object goes to `EvaluateRuleAgainstObject` and the engine, not to COM.
+- Collect is now purely the per-attribute enumerator (fully accounted for). A single
+  `Collect(root,"Attribute")` might enumerate cheaper than 286 per-entity collections.
+- The label reads, the missing `ReleaseComObject` and the uncapped issue log are all still
+  outstanding from the list below and are now worth far less than they were.
+
+### Open, wider than this diff
+
+- [ ] The whole review dialog is shown and pumped on a thread-pool **MTA** thread, so every
+      OTHER SCAPI call it makes (Mart save, promotion save, version capture) pays the same
+      cross-apartment cost this walk was paying. Audit those paths.
+- [ ] Decide whether `ScapiCalibration` stays. Now that every shape is sub-millisecond the
+      probe costs ~0.2 s at connect instead of ~15 s, so keeping it is nearly free and it is
+      the only tool that can attribute a future slow walk. USER DECISION.
+
+## Known remaining waste in the walk (verified by code read, NOT yet fixed)
+
+Deliberately left out of this diff to keep it reviewable; all are rounding errors next to the
+gate above, and should be revisited after the live retest confirms the new baseline.
+
+- 2 of the 3 per-column property reads exist only to build the report label
+  (`ReadDisplayName` at collect time, ApprovalBlockingRuleGate.cs:1012), although at most
+  `MaxReportedIssues` labels can ever be shown. ~57% of the walk's intrinsic COM traffic.
+- 287 `Collect` round trips (one per entity) where one `Collect(root, "Attribute")` would do -
+  the fast path `ValidationCoordinatorService.cs:1450` already uses. Needs the per-entity path
+  kept for PK-membership rules.
+- Zero `Marshal.ReleaseComObject` in the whole file: 8,401 Attribute RCWs retained for the
+  run, 16,802 transient Property RCWs dropped. Every sibling walk releases.
+- `Finish` logs the full deduped issue set one `File.AppendAllText` per line (:1227), uncapped.
+  Today's run had 0 violations; on a violating model this is the next multi-minute wall.
+- REJECTED: moving the walk to a background thread. SCAPI is STA-bound; calls would marshal
+  back to the owning STA, which must pump to service them, reopening the identical window and
+  adding proxy/stub cost.
+
+---
+
 # WP 310 - datatype dialog appeared TWICE per new column - FIXED 2026-07-27
 
 Report (WP 310 comment 2026-07-24, status "Test failed"): in Model Explorer a new column is

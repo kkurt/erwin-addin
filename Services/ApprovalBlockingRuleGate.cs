@@ -214,6 +214,13 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// </summary>
         public const int MaxReportedIssues = 200;
 
+        // Progress-line intervals for the collect phase. Coarse on purpose: AddinLogger
+        // opens/appends/closes the log file per line under a global lock, so a tight
+        // interval would make the diagnostics the bottleneck. These give roughly a handful
+        // of lines on a real model - enough to tell a slow walk from a hung one.
+        private const int ProgressEveryTables = 50;
+        private const int ProgressEveryObjects = 2000;
+
         // Pseudo "SCAPI class" for MODEL rules: the target is the model root itself, not
         // a Collect result. ScapiCollectTypeForExistence returns null for MODEL because a
         // model always exists, so the gate resolves it before consulting that map.
@@ -535,6 +542,14 @@ namespace EliteSoft.Erwin.AddIn.Services
                 object modelObjectsRef = modelObjects;
                 object rootRef = root;
 
+#if DEV
+                // Same probe, same process, different CONTEXT: this runs inside the review
+                // dialog's modal message loop with erwin's frame disabled, whereas the connect
+                // run does not. Comparing the two output blocks is what attributes the walk's
+                // cost to a shape or to the context. Once per process.
+                ScapiCalibration.RunOnce(modelObjectsRef, rootRef, "approval gate (modal loop)", Write);
+#endif
+
                 // MODEL-scoped UDP conditions resolve through NamingValidationEngine's
                 // ModelRootProvider. Production assigns it in ValidationCoordinatorService
                 // .StartMonitoring - which the DDL-generator flavor NEVER runs (it skips
@@ -590,9 +605,10 @@ namespace EliteSoft.Erwin.AddIn.Services
             var propertyRules = rules.Where(r => !string.IsNullOrEmpty(r.PropertyCode)).ToList();
 
             List<GateObject> objects;
+            var collectClock = System.Diagnostics.Stopwatch.StartNew();
             try
             {
-                objects = CollectObjects(modelObjects, root, normalizedObjectType, propertyRules);
+                objects = CollectObjects(modelObjects, root, normalizedObjectType, propertyRules, write);
             }
             catch (Exception ex)
             {
@@ -606,6 +622,9 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
                 return 0;
             }
+
+            collectClock.Stop();
+            write($"collected {objects.Count} {normalizedObjectType} object(s) in {collectClock.ElapsedMilliseconds} ms.");
 
             foreach (var rule in existenceRules)
                 EvaluateExistenceRule(modelObjects, root, rule, normalizedObjectType, objects, issues, write);
@@ -648,7 +667,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 List<GateObject> entities;
                 try
                 {
-                    entities = CollectObjects(modelObjects, root, "TABLE", new List<NamingStandardRule>());
+                    entities = CollectObjects(modelObjects, root, "TABLE", new List<NamingStandardRule>(), write);
                 }
                 catch (Exception ex)
                 {
@@ -704,6 +723,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             int violations = 0;
             int applicable = 0;
             int propertyReadFailures = 0;
+            var ruleClock = System.Diagnostics.Stopwatch.StartNew();
 
             foreach (var target in objects)
             {
@@ -756,9 +776,13 @@ namespace EliteSoft.Erwin.AddIn.Services
             // Applicable count is logged separately from the object count: without it
             // "checked 250 object(s) -> 0 violation(s)" reads identically whether 250
             // objects were verified clean or the rule's condition matched none of them.
+            // Elapsed is on the same line because per-object cost is the number that
+            // distinguishes "big model" from "something is stealing the thread".
+            ruleClock.Stop();
             write($"rule#{rule.Id} [{DescribeRule(rule)}] {rule.ObjectType}.{rule.PropertyCode} " +
                   $"checked {objects.Count} object(s), {applicable} applicable, " +
-                  $"{propertyReadFailures} unreadable -> {violations} violation(s).");
+                  $"{propertyReadFailures} unreadable -> {violations} violation(s) " +
+                  $"in {ruleClock.ElapsedMilliseconds} ms.");
         }
 
         /// <summary>
@@ -928,10 +952,13 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <summary>One inspectable model object plus the context the report needs.</summary>
         private sealed class GateObject
         {
-            public GateObject(object instance, string display, bool? pkMembership)
+            private readonly Func<string> _resolveDisplay;
+            private string? _display;
+
+            public GateObject(object instance, Func<string> resolveDisplay, bool? pkMembership)
             {
                 Instance = instance;
-                Display = display ?? "";
+                _resolveDisplay = resolveDisplay ?? (() => "");
                 PkMembership = pkMembership;
             }
 
@@ -945,8 +972,37 @@ namespace EliteSoft.Erwin.AddIn.Services
             /// </summary>
             public object Instance { get; }
 
-            /// <summary>Human identity in the report: "CUSTOMER", "CUSTOMER.ID", view name, ...</summary>
-            public string Display { get; }
+            /// <summary>
+            /// Human identity in the report: "CUSTOMER", "CUSTOMER.ID", view name, ...
+            ///
+            /// <para><b>Resolved on demand, not at collect time</b> (2026-07-27). Building this
+            /// label costs two NAMED SCAPI property reads per object (<c>.Name</c> and
+            /// <c>Properties("Physical_Name")</c>), and the collect phase used to pay them for
+            /// EVERY object in the model while at most <see cref="MaxReportedIssues"/> labels
+            /// can ever be shown. Measured on 8,401 columns: the collect phase alone ran at
+            /// ~45 ms per column and its ONLY per-column work was these two reads. The rule
+            /// itself never looks at the label.</para>
+            /// </summary>
+            public string Display
+            {
+                get
+                {
+                    if (_display != null) return _display;
+                    try
+                    {
+                        _display = _resolveDisplay() ?? "";
+                    }
+                    catch (Exception ex)
+                    {
+                        // A label is diagnostic text, not a verdict. Late resolution must never
+                        // turn a correctly-detected violation into a crash on the report path -
+                        // but it must not read as a real object name either, hence the marker.
+                        _display = "<name unavailable>";
+                        System.Diagnostics.Debug.WriteLine($"{LogPrefix} display name resolve failed: {ex.Message}");
+                    }
+                    return _display;
+                }
+            }
 
             /// <summary>Resolved PK membership for columns whose rules condition on it; null otherwise.</summary>
             public bool? PkMembership { get; }
@@ -959,9 +1015,17 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// across evaluation is the shape that wedges when erwin mutates the model.
         /// Throws on an enumeration failure so the caller can report it - a class we could
         /// not walk must never read as "clean".
+        ///
+        /// <para>Emits a coarse progress line so a slow collect is diagnosable while it is
+        /// still running. Before this existed, a 46-minute walk looked byte-for-byte
+        /// identical to a hang in the Debug Log (measured 2026-07-27, see ModelWalkGate).
+        /// The interval is deliberately coarse: AddinLogger opens, appends and closes the
+        /// log file per line under a global lock, so per-object logging would become its
+        /// own bottleneck.</para>
         /// </summary>
         private static List<GateObject> CollectObjects(
-            dynamic modelObjects, dynamic root, string normalizedObjectType, List<NamingStandardRule> propertyRules)
+            dynamic modelObjects, dynamic root, string normalizedObjectType,
+            List<NamingStandardRule> propertyRules, Action<string> write)
         {
             var result = new List<GateObject>();
             // Boxed alias for calls into the sibling helpers, so they bind statically
@@ -971,7 +1035,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             if (normalizedObjectType == "MODEL")
             {
                 object rootRef = root;
-                result.Add(new GateObject(rootRef, ReadDisplayName(rootRef, preferPhysical: false), null));
+                result.Add(new GateObject(rootRef, () => ReadDisplayName(rootRef, preferPhysical: false), null));
                 return result;
             }
 
@@ -984,11 +1048,17 @@ namespace EliteSoft.Erwin.AddIn.Services
                 dynamic entities = modelObjects.Collect(root, "Entity");
                 if (entities == null) return result;
 
+                int tablesWalked = 0;
                 foreach (dynamic entity in entities)
                 {
                     if (entity == null) continue;
+                    if (++tablesWalked % ProgressEveryTables == 0)
+                        write($"collecting COLUMN objects - {tablesWalked} table(s), {result.Count} column(s) so far.");
                     object entityRef = entity;
-                    string tableName = ReadDisplayName(entityRef, preferPhysical: true);
+                    // One lazy per entity, SHARED by all of its columns: the table half of the
+                    // label is then read at most once per table, and only when a column of that
+                    // table actually reaches the report.
+                    var tableName = new Lazy<string>(() => ReadDisplayName(entityRef, preferPhysical: true));
 
                     HashSet<string> pkMembers = needPk
                         ? ReadPrimaryKeyMemberIds(modelObjectsRef, entityRef)
@@ -1001,7 +1071,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     try { attrs = modelObjects.Collect(entity, "Attribute"); }
                     catch (Exception ex)
                     {
-                        throw new InvalidOperationException($"columns of table '{tableName}' could not be read: {ex.Message}", ex);
+                        throw new InvalidOperationException($"columns of table '{tableName.Value}' could not be read: {ex.Message}", ex);
                     }
                     if (attrs == null) continue;
 
@@ -1009,12 +1079,14 @@ namespace EliteSoft.Erwin.AddIn.Services
                     {
                         if (attr == null) continue;
                         object attrRef = attr;
-                        string columnName = ReadDisplayName(attrRef, preferPhysical: true);
                         // ObjectId is read WITHOUT a swallow when PK membership matters: an
                         // unreadable id silently misses every member and reads as "not a PK
                         // column", de-applying the rule. Propagates to the walk-level catch.
                         bool? pk = needPk ? pkMembers.Contains(ReadObjectIdOrThrow(attrRef)) : (bool?)null;
-                        result.Add(new GateObject(attrRef, $"{tableName}.{columnName}", pk));
+                        result.Add(new GateObject(
+                            attrRef,
+                            () => $"{tableName.Value}.{ReadDisplayName(attrRef, preferPhysical: true)}",
+                            pk));
                     }
                 }
                 return result;
@@ -1035,12 +1107,15 @@ namespace EliteSoft.Erwin.AddIn.Services
             dynamic collection = modelObjects.Collect(root, scapiClass);
             if (collection == null) return result;
 
+            int walked = 0;
             foreach (dynamic obj in collection)
             {
                 if (obj == null) continue;
+                if (++walked % ProgressEveryObjects == 0)
+                    write($"collecting {normalizedObjectType} objects - {walked} seen, {result.Count} kept.");
                 object objRef = obj;
                 if (pkOnly && !IsPrimaryKeyGroup(objRef)) continue;
-                result.Add(new GateObject(objRef, ReadDisplayName(objRef, preferPhysical), null));
+                result.Add(new GateObject(objRef, () => ReadDisplayName(objRef, preferPhysical), null));
             }
             return result;
         }

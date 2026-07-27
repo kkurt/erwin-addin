@@ -1161,8 +1161,9 @@ namespace EliteSoft.Erwin.AddIn
 
         private void ReconnectTimer_Tick(object sender, EventArgs e)
         {
-            // black-rect Test 1: zero add-in timer work while the alter wizard renders.
-            if (Services.AlterWizardGate.IsOpen || Services.MartSaveGate.IsActive) return;
+            // black-rect Test 1: zero add-in timer work while the alter wizard renders,
+            // and none while a whole-model walk holds the UI thread.
+            if (Services.AddinTickGate.ShouldSkip("ModelConfigForm.Reconnect")) return;
 
             // WP 329 self-heal: this tick runs in EVERY state (disconnected, degraded,
             // connected), which makes it the one place that can repair a stale input block -
@@ -4082,8 +4083,10 @@ namespace EliteSoft.Erwin.AddIn
 
         private void GlossaryRefreshTimer_Tick(object sender, EventArgs e)
         {
-            // black-rect Test 1: zero add-in timer work while the alter wizard renders.
-            if (Services.AlterWizardGate.IsOpen || Services.MartSaveGate.IsActive) return;
+            // black-rect Test 1: zero add-in timer work while the alter wizard renders,
+            // and none while a whole-model walk holds the UI thread. This is the tick whose
+            // 46 log lines proved the walk pumps (see ModelWalkGate).
+            if (Services.AddinTickGate.ShouldSkip("ModelConfigForm.GlossaryRefresh")) return;
             // DDL-dedicated instance: the glossary is never consumed (all
             // validation surfaces are off), so skip the periodic DB reload.
             if (IsDdlDedicatedInstance) return;
@@ -5609,13 +5612,59 @@ namespace EliteSoft.Erwin.AddIn
                 // binder, which additionally cannot accept the Log method group.
                 object session = _session;
                 Action<string> gateLog = Log;
-                // The walk enumerates every object of every blocking rule's type over COM
-                // and can run for seconds on a large model. UseWaitCursor says so without
-                // pumping the message loop - ShowBusyOverlay is deliberately NOT used here
-                // because it calls DoEvents, which would let the validation timers
-                // re-enter SCAPI mid-walk.
+                // The walk enumerates every object of every blocking rule's type over COM.
+                //
+                // ModelWalkGate is what makes that affordable. An earlier version of this
+                // comment claimed that avoiding ShowBusyOverlay (which calls DoEvents) was
+                // enough to keep the validation timers from re-entering SCAPI mid-walk.
+                // That was FALSE and it cost 46 minutes on a real model: a synchronous walk
+                // does not stop the message loop, because the outbound SCAPI/COM calls pump
+                // it themselves. Measured 2026-07-27 on 8,401 columns / 286 entities with
+                // ONE Regexp rule: 45 m 56 s, i.e. 328 ms per column, while the same session
+                // had walked ~10,000 SCAPI properties in 734 ms. The log proves the pump ran
+                // throughout - 46 glossary WinForms-Timer ticks landed INSIDE the walk.
+                //
+                // ShowBusyOverlay still must not be used here: its DoEvents would pump even
+                // with the ticks gated, and an overlay cannot repaint on a thread that is
+                // busy anyway. UseWaitCursor is the honest amount of feedback available.
+                // MARSHAL THE WALK ONTO THE THREAD THAT OWNS THE SCAPI OBJECTS.
+                //
+                // The DDL review dialog is shown and pumped on a thread-pool MTA thread, so
+                // BtnSend_Click - and therefore this method - runs there too. Every SCAPI call
+                // made from an MTA thread to erwin's STA-owned objects is marshalled through a
+                // proxy and serviced by the owning apartment, which turns a direct dispatch
+                // into a cross-apartment round trip.
+                //
+                // Measured 2026-07-27, same 150 objects, same process, zero exceptions:
+                //
+                //                                    STA (connect)   MTA (this dialog)
+                //   read .ObjectId                      0.014 ms          4.6-7.3 ms
+                //   read Properties("Physical_Name")    0.043 ms         11.5-12.9 ms
+                //   enumerate one attribute             0.444 ms         15.5-15.8 ms
+                //
+                // .ObjectId does no real work and is the worst ratio (over 400x), which is why
+                // this is apartment cost and not anything about the properties being read. At
+                // the STA rate the whole 8,401-column walk is ~5 s; on the pool thread it took
+                // 467 s. Only the walk is marshalled - the report dialog below stays on the
+                // calling thread, because its owner window lives there.
+                // The gate scope is raised INSIDE the marshalled delegate, not around the
+                // Invoke: ModelWalkGate logs the thread and apartment it was entered on, and
+                // that line only earns its keep if it names the thread the walk actually runs
+                // on. Raised outside, it would have reported the caller's MTA pool thread while
+                // the walk ran on the STA - the exact confusion the line exists to prevent.
+                Func<Services.ApprovalBlockingGateResult> walk = () =>
+                {
+                    using (Services.ModelWalkGate.Enter($"Approval blocking gate ({actionName})"))
+                        return Services.ApprovalBlockingRuleGate.Evaluate(session, gateLog);
+                };
+
                 UseWaitCursor = true;
-                try { result = Services.ApprovalBlockingRuleGate.Evaluate(session, gateLog); }
+                try
+                {
+                    result = InvokeRequired
+                        ? (Services.ApprovalBlockingGateResult)Invoke(walk)
+                        : walk();
+                }
                 finally { UseWaitCursor = false; }
             }
             catch (Exception ex)
@@ -7386,8 +7435,9 @@ namespace EliteSoft.Erwin.AddIn
 
         private void PUWatcher_Tick(object sender, EventArgs e)
         {
-            // black-rect Test 1: zero add-in timer work while the alter wizard renders.
-            if (Services.AlterWizardGate.IsOpen || Services.MartSaveGate.IsActive) return;
+            // black-rect Test 1: zero add-in timer work while the alter wizard renders,
+            // and none while a whole-model walk holds the UI thread.
+            if (Services.AddinTickGate.ShouldSkip("ModelConfigForm.PuWatcher")) return;
             try
             {
                 int currentCount = _scapi.PersistenceUnits.Count;

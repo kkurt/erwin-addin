@@ -169,8 +169,9 @@ namespace EliteSoft.Erwin.AddIn.Services
             // erwin's rendering - the documented GDI-corruption path. These two timers
             // were the last pair outside the gates (found 2026-07-26 while fixing the
             // integrate flow); CheckForChanges also DELETES columns, so reentering here
-            // is worse than a repaint artifact.
-            if (AlterWizardGate.IsOpen || MartSaveGate.IsActive) return;
+            // is worse than a repaint artifact. A whole-model walk holding the UI thread is
+            // the same hazard from a different source, so the check is now one shared gate.
+            if (AddinTickGate.ShouldSkip("ColumnValidation.Monitor")) return;
             CheckForChanges();
         }
 
@@ -179,7 +180,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// </summary>
         private void OnWindowMonitorTick(object sender, EventArgs e)
         {
-            if (AlterWizardGate.IsOpen || MartSaveGate.IsActive) return;
+            if (AddinTickGate.ShouldSkip("ColumnValidation.WindowMonitor")) return;
 
             bool editorIsOpen = IsColumnEditorOpen();
 

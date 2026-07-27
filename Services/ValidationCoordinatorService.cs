@@ -1234,8 +1234,9 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         private void MonitorTimer_Tick(object sender, EventArgs e)
         {
-            // black-rect fix: no SCAPI reentrancy under the wizard modal pump.
-            if (AlterWizardGate.IsOpen || MartSaveGate.IsActive) return;
+            // black-rect fix: no SCAPI reentrancy under the wizard modal pump, nor under a
+            // whole-model walk that is pumping while it holds the UI thread.
+            if (AddinTickGate.ShouldSkip("Validation.Monitor")) return;
             if (_sessionLost || !_isMonitoring || _disposed || _isProcessingChange || _validationSuspended || _isCheckingForChanges || _columnNamingCheckInProgress || _scopedCheckInProgress || _validationModalShowing) return;
             // 2026-05-25: while a locked-column dialog is up, skip the
             // entire heartbeat. SCAPI walks during the dialog's nested
@@ -1518,6 +1519,20 @@ namespace EliteSoft.Erwin.AddIn.Services
                 _lastTotalEntityCount = (long)entityCollection.Count;
                 _lastTotalAttributeCount = attrCollection != null ? (long)attrCollection.Count : 0;
                 Log($"DiagramHeartbeat: connect-time baseline captured ({_lastTotalEntityCount} entities, {_lastTotalAttributeCount} attrs); post-connect additions will be detected");
+
+#if DEV
+                // Deliberately AFTER the baseline's own log line: this walk's duration is the
+                // reference the calibration is compared against, so the probe must not be
+                // inside the window being measured. Runs once per process per context.
+                // Boxed so the call binds STATICALLY: with dynamic arguments the whole
+                // invocation routes through the runtime binder, which cannot accept the Log
+                // method group (CS1976) - the same reason ApprovalBlockingRuleGate.Evaluate
+                // boxes its session before calling helpers.
+                object calModelObjects = modelObjects;
+                object calRoot = root;
+                Action<string> calLog = Log;
+                ScapiCalibration.RunOnce(calModelObjects, calRoot, "connect (no modal loop)", calLog);
+#endif
             }
             catch (Exception ex)
             {
@@ -2950,9 +2965,10 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         private void WindowMonitorTimer_Tick(object sender, EventArgs e)
         {
-            // black-rect fix: 100 ms tick = the highest reentrancy pressure
-            // under the wizard modal pump; fully silent while it renders.
-            if (AlterWizardGate.IsOpen || MartSaveGate.IsActive) return;
+            // black-rect fix: 100 ms tick = the highest reentrancy pressure under the wizard
+            // modal pump; fully silent while it renders, and while a model walk runs (at
+            // 100 ms this is the single biggest thief of a pumping walk's throughput).
+            if (AddinTickGate.ShouldSkip("Validation.WindowMonitor")) return;
             if (_sessionLost || !_isMonitoring || _disposed || _validationSuspended) return;
             // 2026-05-25: skip window-state polling while a locked-column
             // dialog is up. Same reason as MonitorTimer_Tick - SCAPI
