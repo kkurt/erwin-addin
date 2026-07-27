@@ -455,13 +455,23 @@ namespace EliteSoft.Erwin.AddIn.Services
         private readonly Dictionary<string, (string pick, DateTime when)> _allowedDatatypeUserPicks
             = new Dictionary<string, (string, DateTime)>(StringComparer.OrdinalIgnoreCase);
 
-        // Object ids of NEW columns already prompted by the DATATYPE_LIBRARY_ALWAYS_ASK picker.
-        // The column editor runs the new-attribute validation twice for one column (real-name
-        // commit AND editor close), which without this popped the picker a second time on close
-        // (WP 317 bug 2). Session-long like _allowedDatatypeUserPicks: a NEW column always gets a
-        // fresh objId, and existing columns never reach the always-ask path, so no cross-model
-        // objId reuse can wrongly suppress a legitimate ask.
-        private readonly HashSet<string> _alwaysAskPrompted = new HashSet<string>(StringComparer.Ordinal);
+        // Object ids of NEW columns whose datatype has ALREADY been put to the user this session -
+        // by the DATATYPE_LIBRARY_ALWAYS_ASK confirm picker, by the not-allowed enforcement picker,
+        // or by the term-mapping "datatype is fixed" warning. Any of the three means the user has
+        // just decided (or been told) what this column's datatype is, so the ALWAYS_ASK confirm
+        // must not ask again.
+        // Two distinct duplicates this closes:
+        //   * WP 317 bug 2 - the column editor runs the new-attribute validation twice for one
+        //     column (real-name commit AND editor close), which popped the confirm twice.
+        //   * WP 310 (2026-07-24 report) - a new column whose default type is NOT allowed shows the
+        //     enforcement picker, and the editor-close pass then found the (now allowed) type still
+        //     isNew and popped the ALWAYS_ASK confirm on top of it: two datatype dialogs for one
+        //     column. Log 17:04:13 "user picked 'VARCHAR2(55 CHAR)'" -> 17:04:16 "always-ask ...
+        //     kept 'VARCHAR2(55 CHAR)'".
+        // Session-long like _allowedDatatypeUserPicks: a NEW column always gets a fresh objId, and
+        // existing columns never reach the always-ask path, so no cross-model objId reuse can
+        // wrongly suppress a legitimate ask.
+        private readonly HashSet<string> _datatypePromptShown = new HashSet<string>(StringComparer.Ordinal);
 
         // Snapshot of Key_Group (Index) names for naming standard checks
         private Dictionary<string, string> _keyGroupSnapshots;
@@ -7579,14 +7589,15 @@ namespace EliteSoft.Erwin.AddIn.Services
             string objId = null;
             try { objId = attr?.ObjectId?.ToString(); } catch { /* transient COM state */ }
 
-            // WP 317 bug 2: ask AT MOST ONCE per new column. The column editor runs the
-            // new-attribute validation both when the column's real name is committed AND again when
-            // the editor is closed, so without this guard the ALWAYS_ASK picker pops a second time on
-            // close. Recorded whether or not the user changed the type, so a Cancel/keep on the first
-            // ask still suppresses the duplicate.
-            if (!string.IsNullOrEmpty(objId) && !_alwaysAskPrompted.Add(objId))
+            // Ask AT MOST ONCE per new column, and never when the column's datatype was ALREADY
+            // put to the user by the not-allowed enforcement picker or the term-mapping warning
+            // (they record into the same set). Two duplicates this closes: the column editor
+            // running the new-attribute validation twice (WP 317 bug 2), and the
+            // enforcement-picker-then-confirm double dialog (WP 310). Recorded whether or not the
+            // user changed the type, so a Cancel/keep on the first ask still suppresses the second.
+            if (!string.IsNullOrEmpty(objId) && !_datatypePromptShown.Add(objId))
             {
-                Log($"AllowedDatatype always-ask: {curr.TableName}.{curr.PhysicalName} already prompted this session (objId={objId}) - skipping duplicate ask.");
+                Log($"AllowedDatatype always-ask: {curr.TableName}.{curr.PhysicalName} datatype already put to the user this session (objId={objId}) - skipping duplicate ask.");
                 return;
             }
 
@@ -7911,6 +7922,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                     {
                         _allowedDatatypeUserPicks[objId] = (liveAfterWrite, DateTime.UtcNow);
                         _allowedDatatypeRecentAttempts[objId] = (attempted, DateTime.UtcNow);
+                        // The user was just told this column's datatype is FIXED by the term
+                        // mapping; following that with the ALWAYS_ASK "choose the datatype" picker
+                        // would contradict the message that is still on their screen.
+                        _datatypePromptShown.Add(objId);
                     }
 
                     // The warn modal pumps like the picker does - catch a rename that landed
@@ -7988,6 +8003,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                             lockParam: pickerLockParam);
                     }
                     finally { _validationModalShowing = false; }
+
+                    // The user has now explicitly chosen this column's datatype in the picker, so
+                    // the ALWAYS_ASK confirm has nothing left to confirm: record it BEFORE any
+                    // early exit below, whether they picked or cancelled (WP 310 - the editor-close
+                    // pass used to find the freshly-picked type allowed + still isNew and popped a
+                    // second datatype dialog straight after this one).
+                    if (!string.IsNullOrEmpty(objId)) _datatypePromptShown.Add(objId);
 
                     // A rename can land while the picker pumps (57 s dwell in the 2026-07-09
                     // repro: 'Pre_Abc' -> 'Pre_Abc__1070' committed mid-modal and, with both

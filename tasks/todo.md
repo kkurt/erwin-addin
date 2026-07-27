@@ -354,6 +354,47 @@ config genuinely offers several targets.
 
 ---
 
+# WP 310 - datatype dialog appeared TWICE per new column - FIXED 2026-07-27
+
+Report (WP 310 comment 2026-07-24, status "Test failed"): in Model Explorer a new column is
+fine, but from the Column Properties / Column Editor screen the datatype picker comes back a
+second time after the user already picked one.
+
+Root cause, proved by the attached `erwin-addin-debug.log` (column MSL):
+```
+17:04:09  [DT-ENFORCE] DIM_DML.MSL: attempted='CHAR(18)' isNew=True allowed=False
+17:04:09  AllowedDatatype: ... 'CHAR(18)' not in whitelist - forced to 'CLOB'
+17:04:13  AllowedDatatype: ... user picked 'VARCHAR2(55 CHAR)'          <- picker #1 (enforcement)
+17:04:14  Column Editor closed - final validation pass
+17:04:15  [DT-ENFORCE] DIM_DML.MSL: attempted='VARCHAR2(55 CHAR)' isNew=True allowed=True
+17:04:16  AllowedDatatype always-ask: ... kept 'VARCHAR2(55 CHAR)'      <- picker #2 (ALWAYS_ASK)
+```
+The `_alwaysAskPrompted` latch (WP 317 bug 2) was populated ONLY by
+`PromptAlwaysAskDatatype` itself, so the NOT-ALLOWED enforcement picker never marked the
+column. The editor-close pass then saw the freshly picked type as allowed AND still
+`isNew=True`, and the ALWAYS_ASK confirm fired on top of the picker the user had just used.
+(The memory claim that the post-`ProcessNewAttribute` baseline makes later passes
+`isNew=false` does NOT hold on the Column Editor path - the heartbeat re-detects the new attr
+and re-validates it as new.)
+
+Fix: the latch now means "this column's datatype has ALREADY been put to the user this
+session", renamed `_datatypePromptShown`, and is recorded by ALL THREE surfaces - the
+ALWAYS_ASK confirm, the not-allowed enforcement picker (recorded right after Show, whether the
+user picked or cancelled), and the term-mapping "datatype is fixed" warning (following that
+message with a "choose the datatype" picker contradicted the message still on screen).
+Verified there are exactly two `AllowedDatatypePickerForm.Show` sites and one
+`PromptAlwaysAskDatatype` call site, so the set is complete. Both paths key on the identical
+string (`attr.ObjectId.ToString()`; `CreateSnapshot` fills the snapshot's `ObjectId` from the
+same expression, and it is the same key the already-working double-combo-commit dedupe uses).
+Net behaviour: exactly ONE datatype dialog per new column, on every path. 979/979 tests green,
+0 warnings. No unit test added - the latch lives inside the COM/SCAPI-driven enforcement
+method with no seam; verification is the log trace above plus the call-site enumeration.
+
+- [ ] LIVE retest (user): new column in Column Properties with a NOT-allowed default type -
+      expect ONE picker; and in Model Explorer with an allowed type - expect ONE confirm.
+
+---
+
 # Bug batch WP 334 / 331 / 324 / 329 - CODE-DONE (awaiting live test), 2026-07-25
 
 - [x] **WP 334** locked predefined column was deletable via "Discard New Column" on the
