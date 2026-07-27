@@ -21,14 +21,21 @@ namespace EliteSoft.Erwin.AddIn.Forms
     {
         private TextBox _txtDescription;
 
-        // Mirrors USE_APPROVEMENT_MECHANISM. When false there is no approval
+        // Mirrors "this model has an approver chain". When false there is no approval
         // queue: the review button just saves the model, so this confirmation
         // reads as a save ("Save the model") rather than a submit.
         private readonly bool _approvalEnabled;
 
+        // INTEGRATE mode: the send drives erwin's Mart > Merge onto the next
+        // environment, so TWO Mart versions get stamped and the dialog collects a
+        // comment for each. Mutually exclusive with the approval path by construction -
+        // integrate is only offered when the model has no approver chain.
+        private readonly bool _integrateMode;
+        private readonly string _targetEnvironmentName;
+
         /// <summary>
-        /// The Mart version description the user typed. Empty string when
-        /// the user left the field blank.
+        /// The Mart version description. Empty string when the user left the field blank.
+        /// In integrate mode this is the comment stamped on the TARGET model.
         /// </summary>
         public string Description => _txtDescription?.Text ?? string.Empty;
 
@@ -36,15 +43,22 @@ namespace EliteSoft.Erwin.AddIn.Forms
         /// When false the dialog reflects a direct save instead of a submit
         /// (no approval queue). See <see cref="_approvalEnabled"/>.
         /// </param>
-        public ConfirmSubmitDialog(bool approvalEnabled)
+        /// <param name="integrateMode">Confirm an Integrate: the comment goes to the target model.</param>
+        /// <param name="targetEnvironmentName">Environment being merged into; shown in the body text.</param>
+        public ConfirmSubmitDialog(bool approvalEnabled, bool integrateMode = false, string targetEnvironmentName = null)
         {
             _approvalEnabled = approvalEnabled;
+            _integrateMode = integrateMode;
+            _targetEnvironmentName = string.IsNullOrWhiteSpace(targetEnvironmentName)
+                ? "the next environment"
+                : targetEnvironmentName;
             BuildUi();
         }
 
         private void BuildUi()
         {
-            Text             = _approvalEnabled ? "Submit for Approval" : "Save the model";
+            Text             = _integrateMode ? "Integrate"
+                             : _approvalEnabled ? "Submit for Approval" : "Save the model";
             FormBorderStyle  = FormBorderStyle.FixedDialog;
             StartPosition    = FormStartPosition.CenterParent;
             MaximizeBox      = false;
@@ -68,9 +82,11 @@ namespace EliteSoft.Erwin.AddIn.Forms
 
             var lblHeading = new Label
             {
-                Text = _approvalEnabled
-                    ? "Submitting will save the model, bump its version, then close it."
-                    : "Saving will bump the model version, then close the model.",
+                Text = _integrateMode
+                    ? $"Integrating will merge this model into {_targetEnvironmentName}."
+                    : _approvalEnabled
+                        ? "Submitting will save the model, bump its version, then close it."
+                        : "Saving will bump the model version, then close the model.",
                 Font = new Font("Segoe UI", 11f, FontStyle.Bold),
                 ForeColor = Color.FromArgb(40, 40, 40),
                 AutoSize = false,
@@ -81,12 +97,16 @@ namespace EliteSoft.Erwin.AddIn.Forms
 
             var lblBody = new Label
             {
-                Text =
-                    "When you click the button below, the model will be saved to " +
-                    "the Mart repository, its version will be incremented, and then " +
-                    "the model will be closed. The text below is stamped on the new " +
-                    "Mart version (separate from the optional admin note on the " +
-                    "previous screen).",
+                Text = _integrateMode
+                    ? "erwin's Mart > Merge opens with " + _targetEnvironmentName + "'s copy of this " +
+                      "model on the right. Resolve the differences and click Finish - the add-in " +
+                      "drives everything before and after that, then saves and closes BOTH models. " +
+                      "Each comment below is stamped on its own new Mart version."
+                    : "When you click the button below, the model will be saved to " +
+                      "the Mart repository, its version will be incremented, and then " +
+                      "the model will be closed. The text below is stamped on the new " +
+                      "Mart version (separate from the optional admin note on the " +
+                      "previous screen).",
                 Font = fontBody,
                 ForeColor = Color.FromArgb(70, 70, 70),
                 AutoSize = false,
@@ -97,9 +117,16 @@ namespace EliteSoft.Erwin.AddIn.Forms
 
             // Version description input (multi-line, mandatory-ish - empty
             // is allowed since erwin itself permits an empty description).
+            // Integrate mode renames the box for the TARGET model. Only one comment
+            // is collected (user 2026-07-26): the working model is required to be clean
+            // before Integrate starts, so the merge gives it nothing new to describe.
+            const int boxHeight = 130;
+
             var lblDesc = new Label
             {
-                Text = "Version description:",
+                Text = _integrateMode
+                    ? $"Version comment for {_targetEnvironmentName}:"
+                    : "Version description:",
                 Font = fontBodyBold,
                 ForeColor = Color.FromArgb(80, 80, 80),
                 AutoSize = true,
@@ -111,7 +138,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
             {
                 Font = fontBody,
                 Location = new Point(20, 160),
-                Size = new Size(ClientSize.Width - 40, 130),
+                Size = new Size(ClientSize.Width - 40, boxHeight),
                 Multiline = true,
                 AcceptsReturn = true,
                 ScrollBars = ScrollBars.Vertical,
@@ -120,13 +147,15 @@ namespace EliteSoft.Erwin.AddIn.Forms
             };
             Controls.Add(_txtDescription);
 
+
             // Bottom-right button row: [Cancel] [OK].
             var btnOk = new Button
             {
-                Text = _approvalEnabled ? "Submit and Close" : "Save and Close",
+                Text = _integrateMode ? "Integrate and Close"
+                     : _approvalEnabled ? "Submit and Close" : "Save and Close",
                 DialogResult = DialogResult.OK,
-                Size = new Size(150, 32),
-                Location = new Point(ClientSize.Width - 170, ClientSize.Height - 50),
+                Size = new Size(_integrateMode ? 170 : 150, 32),
+                Location = new Point(ClientSize.Width - 20 - (_integrateMode ? 170 : 150), ClientSize.Height - 50),
                 FlatStyle = FlatStyle.Flat,
                 BackColor = Color.FromArgb(46, 125, 50),
                 ForeColor = Color.White,
@@ -143,7 +172,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 Text = "Cancel",
                 DialogResult = DialogResult.Cancel,
                 Size = new Size(100, 32),
-                Location = new Point(ClientSize.Width - 280, ClientSize.Height - 50),
+                Location = new Point(ClientSize.Width - 20 - (_integrateMode ? 170 : 150) - 110, ClientSize.Height - 50),
                 FlatStyle = FlatStyle.Flat,
                 BackColor = Color.White,
                 ForeColor = Color.FromArgb(60, 60, 60),

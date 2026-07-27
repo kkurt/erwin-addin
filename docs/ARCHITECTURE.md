@@ -252,6 +252,112 @@ returns, because pure type changes have no inline-edit close edge to
 ride - the user just Tab'd away from a combo and the warning needs to
 land on the same gesture.
 
+### Approval-blocking rules (hard gate on Integrate / Promote)
+
+A rule can additionally act as a **hard gate on entry to the approval
+queue**. Two independent switches must both be on:
+
+| Switch | Where | Default |
+|--------|-------|---------|
+| `MC_NAMING_STANDARD.BLOCKS_DDL_APPROVEMENT` (bit) | per rule, Rule Management checkbox "Blocks DDL Approvement" | 0 |
+| `ENFORCE_APPROVAL_BLOCKING_RULES` (two-level bool) | per config, Approval Workflow screen; CONFIG_PROPERTY override -> CORPORATE_PROPERTY default -> built-in `false` | off |
+
+**DDL generation is NOT gated.** A modeler may generate and review DDL
+for a violating model all day; what they cannot do is push it into the
+governance queue. (This supersedes the earlier `BLOCKS_DDL_GENERATION` /
+`ENFORCE_DDL_BLOCKING_RULES` design, which gated generation itself.)
+
+`ModelConfigForm.CheckApprovalBlockingRules` runs
+`ApprovalBlockingRuleGate.Evaluate` at every submit point:
+
+- `DdlApprovalDialog.BtnSend_Click` - step 0, BEFORE the confirm dialog,
+  so the user is not asked for a version description and only then
+  refused. Covers both the plain approval-queue insert and the
+  `REQUEST_TYPE='PROMOTION'` send.
+- `ModelConfigForm.OnIntegrateClicked` - the Integrate tab's single
+  button, after the dirty gate and before the version comments are
+  collected. A merge hands the model to the next environment, so it is
+  gated even though no queue row is written.
+
+The gate never consults `USE_APPROVEMENT_MECHANISM` (a flag being
+retired): every submission is checked, whether it ends up Pending,
+auto-approved or as a promotion request. It also never runs for the
+unattended DDL queue worker, which writes its DDL straight to its own
+queue row and never opens the review dialog.
+
+Design points worth knowing before changing it:
+
+- **`BLOCKS_DDL_APPROVEMENT` is NOT in the main `LoadStandards` SELECT.**
+  It is read by a separate, isolated ID query
+  (`NamingStandardService.LoadApprovalBlockingRules`). The admin
+  migration for the column is SQL-Server-only; naming it in the main
+  SELECT would make the whole ruleset fail to load on an unmigrated
+  PostgreSQL/Oracle repo, and `ValidateObjectName` then returns an empty
+  list for every object - silently disabling ALL naming enforcement.
+  Isolating the read keeps that blast radius inside the gate.
+- **No silent pass.** Every path that cannot reach a verdict blocks and
+  is reported: unreadable toggle, ruleset that will not load, a rule the
+  DB flags as blocking that the loader never surfaced, a malformed rule
+  payload (uncompilable regex, empty affix, missing/unsupported length
+  operand, an unknown future rule kind), a `Template` rule flagged as
+  blocking (Templates generate values and can never be validated), a
+  condition whose gating UDP/property was deleted in admin (dangling FK -
+  it could never match anything), an object type with no SCAPI class, a
+  primary-key graph that cannot be read, and a failed model walk. The
+  single deliberate exception is a failed read of a rule's *target*
+  property on ONE object: that is treated as an empty value exactly as
+  `ReadBuiltinPropertyValue` does, so a property erwin has not
+  materialised yet (a new table's `Name_Qualifier`) cannot fabricate a
+  block - the rule's own Required semantics then decide. When the same
+  read fails on EVERY object the cause is categorically different (a
+  `PROPERTY_CODE` that is not valid for the class at all) and one
+  unevaluatable issue is raised for the rule.
+- **Known residual.** A condition UDP that exists in admin but is simply
+  not populated on an object reads empty, and the shared engine cannot
+  distinguish that from "the value does not match". Treating it as a hard
+  failure would refuse every submission for models where a gating UDP is
+  unset, so it is left as a non-match - matching the engine's documented
+  semantics. The deterministic causes are handled instead: dangling FKs
+  fail the preflight, and the gate supplies
+  `NamingValidationEngine.ModelRootProvider` when it is unset (the
+  DDL-generator flavor never assigns it, which would otherwise make
+  MODEL-scoped UDP conditions silently never match in exactly the
+  unattended build). The per-rule log line reports how many objects a
+  rule was *applicable* to, so "matched nothing" is visible rather than
+  hidden behind "0 violations".
+- **`APPLY_ON` is ignored** (decision 2026-07-25). A submission check is a
+  whole-model assertion with no per-object create/update event, so there
+  is no honest `isNew` to pass. Passing `false` would make an
+  `APPLY_ON='Create'` blocking rule incapable of ever blocking - a
+  permanent silent pass wearing the appearance of enforcement. Same
+  reasoning as the model-wide object-existence check. Cost: a
+  Create-scoped blocking rule also gates legacy objects that predate it,
+  which is accepted because the gate is opt-in twice.
+  <br>Watch out: the canonical-affix false-positive suppression must only
+  trust a canonical form that actually INCLUDED the rule -
+  `ApplyNamingStandards` filters by `MatchesApplyOn` and resolves
+  conditions without PK membership, so an unguarded suppression silently
+  swallowed every non-`Both` and every PK-conditioned affix violation.
+- **Config-scoped cache.** `NamingStandardService` records
+  `LoadedConfigId`; the gate calls `EnsureLoadedForConfig`. The DDL queue
+  worker never loads naming standards at connect and processes
+  back-to-back jobs against different models, so without this it would
+  gate model B with model A's rules.
+- **Rule subset, shared engine.** The gate evaluates ONLY the blocking
+  rules (`ValidateObjectName` would report every rule on the property),
+  but reuses `IsRuleApplicable` + `EvaluateRule` + the canonical-affix
+  suppression, so a gate verdict and an interactive verdict cannot drift.
+- **Threading.** Fully synchronous, no message pump during the walk, so
+  the validation timers cannot re-enter SCAPI mid-walk. Never move it to
+  `Task.Run` - SCAPI is STA-bound.
+
+The report is `Forms/ApprovalBlockingRulesDialog` (ListView, one row per
+failing rule/object, English chrome, admin `ERROR_MESSAGE` verbatim). It
+is titled with the action that was refused ("Send to Approve blocked",
+"Integrate to 2_TEST blocked") so a blocked promote is not mistaken for a
+blocked save.
+
+
 ### Adding a Platform Property (DBMS-specific)
 
 If a property is only meaningful on one DBMS (e.g. `Oracle_Entity_Partition_Type`),

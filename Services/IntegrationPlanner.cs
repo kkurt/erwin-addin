@@ -66,6 +66,49 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// The catalog path the ADMIN stores this model's approver chain under.
+        ///
+        /// <para>An Integrate pipeline holds the SAME logical model in every environment
+        /// folder (<c>{base}/1_DEV/M</c>, <c>{base}/2_TEST/M</c>, ...), and admin keys the
+        /// approver chain on the ENVIRONMENT-LESS path <c>{base}/{model}</c> - one chain
+        /// governs the whole pipeline (the web composes exactly
+        /// <c>`${baseDirectory}/${model}`</c> in IntegratePopup, and INTEGRATE_BASE stores
+        /// only the base because "integrate stores no per-model state by design").
+        /// The add-in, however, knows the model by its environment-SPECIFIC Mart path, so
+        /// looking the chain up with that path can never match and every submission reads
+        /// as "no approver defined" (verified live 2026-07-25: approvers registered under
+        /// <c>Kursat/Integrate Test/MetaRepo</c>, model opened as
+        /// <c>Kursat/Integrate Test/1_DEV/MetaRepo</c>, chain resolved empty and the row
+        /// went in as ApprovedBySystem).</para>
+        ///
+        /// <para>So: when the parent folder IS one of the config's environments, drop that
+        /// one segment. Otherwise the path is returned unchanged - a model outside a
+        /// managed environment keys on its own path exactly as before.</para>
+        /// </summary>
+        /// <param name="martPath">The open model's Mart path stem.</param>
+        /// <param name="environments">All environments of the model's config.</param>
+        public static string? ResolveApproverCatalogPath(
+            string? martPath, IReadOnlyList<IntegrationEnvironment> environments)
+        {
+            if (string.IsNullOrWhiteSpace(martPath)) return martPath;
+
+            var current = ResolveCurrentEnvironment(martPath, environments);
+            if (current == null) return martPath;
+
+            var segments = martPath.Split(
+                new[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries);
+            // ResolveCurrentEnvironment already proved segments.Length >= 2 and that the
+            // second-to-last segment is this environment's name; remove just that one.
+            var kept = new List<string>(segments.Length - 1);
+            for (int i = 0; i < segments.Length; i++)
+            {
+                if (i == segments.Length - 2) continue;
+                kept.Add(segments[i]);
+            }
+            return string.Join("/", kept);
+        }
+
+        /// <summary>
         /// Builds the ordered list of promotion targets reachable from the
         /// current environment: every relation whose source is the current
         /// environment, paired with its destination environment, ordered by the

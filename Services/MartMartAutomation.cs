@@ -356,23 +356,878 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// Seam for the Integrate-tab promotion: this is where erwin's Mart &gt;
-        /// Merge will be driven to move the current-environment model onto the
-        /// selected target environment, reusing the same WM_COMMAND dispatch as
-        /// <see cref="PostMartReviewCommand"/>. The native Merge command-id
-        /// discovery and dialog automation are a later step; this iteration only
-        /// reserves the call site and logs, performing NO destructive action.
-        /// Returns false to signal the merge has not been executed yet.
+        /// Drives the INTEGRATE flow: erwin's Mart &gt; Merge of the open model onto the
+        /// next environment's copy, then saves and closes BOTH models with their own
+        /// version comments.
+        ///
+        /// <para><b>The user owns the middle.</b> Everything up to "Compare" is driven,
+        /// then Resolve Differences is handed over UNTOUCHED - resolving a merge is a
+        /// human decision. The automation resumes when RD closes.</para>
+        ///
+        /// <para>Modelled on <see cref="DriveCCToResolveDifferencesVisible"/> - Merge enters
+        /// the SAME wizard (verified 2026-07-26: WM_COMMAND 1402 -&gt; ShowERwinCCWiz), so
+        /// its Back-to-Overview + Next x2 navigation, From-Mart radio / Load button and
+        /// pure-Win32 Mart picker all apply. NOTE that sibling is NOT proven: it has zero
+        /// callers (the cross-version path it served was disabled 2026-05-28,
+        /// LegacyCrossVersionEnabled=false), so its step timing had never run against a
+        /// live wizard. Two failed live runs here came from exactly that - see the Compare
+        /// wait below. Treat any further step copied from it as unverified.</para>
+        ///
+        /// <para>The wizard is kept VISIBLE (unlike the silent DDL paths) because the user
+        /// has to work in it.</para>
+        ///
+        /// <para>Comment routing (user contract 2026-07-26): the FIRST description
+        /// dialog belongs to the TARGET model erwin closes first and gets
+        /// <paramref name="integrateComment"/>; the SECOND belongs to the working model
+        /// and gets <paramref name="baseComment"/>.</para>
+        ///
+        /// <para>Returns false on any step that could not be driven; the caller surfaces
+        /// it. NEVER swallows a failure into a partial merge silently.</para>
         /// </summary>
-        /// <param name="sourceEnvironment">Name of the environment the model is currently in.</param>
-        /// <param name="targetEnvironment">Name of the environment the model is being promoted to.</param>
+        /// <param name="targetCatalogPath">Mart path of the target model, <c>{base}/{targetEnv}/{model}</c>.</param>
+        /// <param name="versionComment">Version comment stamped on every model erwin asks about.</param>
+        /// <param name="userWorkTimeoutMs">How long the user may spend in Resolve Differences.</param>
         /// <param name="log">Diagnostic sink.</param>
-        internal static bool PromoteViaMartMerge(string sourceEnvironment, string targetEnvironment, Action<string> log)
+        internal static bool RunIntegrateMerge(
+            string targetCatalogPath,
+            string versionComment,
+            int userWorkTimeoutMs,
+            Action<string> log,
+            Action<Action> runOnUiThread = null)
         {
-            log?.Invoke(
-                $"Integrate: Merge will run here (steps pending). " +
-                $"Source environment '{sourceEnvironment}' -> target environment '{targetEnvironment}'. " +
-                $"No action taken this iteration.");
+            // SINGLE-FLIGHT, process-wide. The cascade answers erwin's dialogs BY TITLE,
+            // so it cannot tell its own dialog from another run's - two concurrent runs
+            // adopt each other's. That is not hypothetical: on 2026-07-26 a first run was
+            // still polling when the user hit Reload Config (which rebuilds the Integrate
+            // tab with a fresh ENABLED button) and started a second. Both loops ticked the
+            // same 'Close Model' checkboxes - every click is a TOGGLE, so the passes
+            // cancelled out - and both posted Save to the same description dialog 13 ms
+            // apart. erwin deadlocked in 'Saving in progress....' (0 CPU, not responding)
+            // and had to be killed. Button state is NOT a guard: the button is disposed
+            // and recreated on every tab rebuild.
+            if (Interlocked.CompareExchange(ref _integrateRunning, 1, 0) != 0)
+            {
+                log?.Invoke("[INTEGRATE] REFUSED - an integrate run is already in progress.");
+                return false;
+            }
+            try
+            {
+                return RunIntegrateMergeCore(
+                    targetCatalogPath, versionComment, userWorkTimeoutMs, log, runOnUiThread);
+            }
+            finally
+            {
+                Volatile.Write(ref _integrateRunning, 0);
+            }
+        }
+
+        // 0 = idle, 1 = a merge is being driven. See RunIntegrateMerge for why.
+        private static int _integrateRunning;
+
+        /// <summary>
+        /// True while <see cref="RunIntegrateMerge"/> is driving erwin. Advisory: callers
+        /// use it to explain the refusal BEFORE prompting the user, but the authoritative
+        /// guard is the atomic claim inside <see cref="RunIntegrateMerge"/> itself.
+        /// </summary>
+        internal static bool IsIntegrateRunning => Volatile.Read(ref _integrateRunning) != 0;
+
+        private static bool RunIntegrateMergeCore(
+            string targetCatalogPath,
+            string versionComment,
+            int userWorkTimeoutMs,
+            Action<string> log,
+            Action<Action> runOnUiThread)
+        {
+            if (string.IsNullOrWhiteSpace(targetCatalogPath))
+            {
+                log?.Invoke("[INTEGRATE] no target catalog path - aborted.");
+                return false;
+            }
+
+            IntPtr erwinMain = FindErwinMain();
+            if (erwinMain == IntPtr.Zero) { log?.Invoke("[INTEGRATE] erwin main window not found."); return false; }
+
+            log?.Invoke($"[INTEGRATE] target='{targetCatalogPath}'");
+
+            // Baseline for the cascade's completion test. The merge ends with the working
+            // model AND the target closed, so "back to baseline - 1" is what done looks
+            // like - whether or not the user has other models open, and regardless of how
+            // many description dialogs erwin decides to raise. (The target becomes an MDI
+            // child of its own while the merge runs, so the count goes up before it drops.)
+            int modelsBefore = CountOpenModelWindows();
+            log?.Invoke($"[INTEGRATE] model windows open before the merge = {modelsBefore}");
+
+            // The model the user is integrating FROM. Captured now, by handle, because
+            // erwin's own post-merge dialogs never mention it: the "Close Model" grid
+            // lists exactly one row, the model erwin opened from the Mart (confirmed on
+            // screen 2026-07-26). Closing the working model is the add-in's job, and it
+            // has to be THIS window - "whatever is active later" could be any model the
+            // user has open.
+            IntPtr workingChild = IntPtr.Zero;
+            {
+                IntPtr mdi = FindMdiClientOf(erwinMain);
+                if (mdi != IntPtr.Zero) workingChild = GetActiveMdiChild(mdi);
+            }
+            log?.Invoke($"[INTEGRATE] working model MDI child = 0x{workingChild.ToInt64():X} '{(workingChild == IntPtr.Zero ? "(none)" : GetTitle(workingChild))}'");
+
+            var dialogsBefore = EnumerateVisibleDialogs();
+            ForceForeground(erwinMain);
+            log?.Invoke($"[INTEGRATE] [1] posting Mart > Merge (WM_COMMAND {CMD_MART_MERGE})");
+            PostMessage(erwinMain, WM_COMMAND, MakeWParam(CMD_MART_MERGE, 0), IntPtr.Zero);
+
+            IntPtr wizard = WaitForNewDialog(dialogsBefore, "Merge wizard", 15000, log);
+            if (wizard == IntPtr.Zero) { log?.Invoke("[INTEGRATE] merge wizard did not open."); return false; }
+            log?.Invoke($"[INTEGRATE] wizard = 0x{wizard.ToInt64():X} (kept VISIBLE - the user works in it)");
+
+            // Rewind to Overview, then forward to the Right Model page. The wizard can
+            // open on whichever page it last used, so this normalises the starting point
+            // instead of assuming one.
+            for (int i = 0; i < 12; i++)
+            {
+                string t = GetTitle(wizard);
+                if (t.StartsWith("Wizard Overview", StringComparison.OrdinalIgnoreCase)
+                    || t.StartsWith("Overview", StringComparison.OrdinalIgnoreCase)) break;
+                PostMessage(wizard, WM_COMMAND, MakeWParam(CC_BACK, 0), IntPtr.Zero);
+                Thread.Sleep(100);
+            }
+            log?.Invoke("[INTEGRATE] [2] Overview + Next x2 -> Right Model page");
+            PostMessage(wizard, WM_COMMAND, MakeWParam(CC_NEXT, 0), IntPtr.Zero); Thread.Sleep(250);
+            PostMessage(wizard, WM_COMMAND, MakeWParam(CC_NEXT, 0), IntPtr.Zero); Thread.Sleep(500);
+
+            log?.Invoke("[INTEGRATE] [3] From Mart + Load...");
+            PostMessage(wizard, WM_COMMAND, MakeWParam(CMD_FROM_MART_RADIO, 0), IntPtr.Zero); Thread.Sleep(250);
+
+            // "Open Models in Memory" (id=1083) row count BEFORE the load. erwin adds the
+            // freshly opened right model as a new row, which is the only in-process signal
+            // that the LOAD actually finished - see the Compare wait below.
+            IntPtr openList = FindListViewById(wizard, 1083, log: null);
+            int rowsBefore = openList == IntPtr.Zero
+                ? -1
+                : SendMessage(openList, LVM_GETITEMCOUNT, IntPtr.Zero, IntPtr.Zero).ToInt32();
+            log?.Invoke($"[INTEGRATE] 'Open Models in Memory' (id=1083) rows before load = {rowsBefore}" +
+                        (openList == IntPtr.Zero ? " (list NOT found - will fall back to a fixed settle)" : ""));
+
+            var dialogsBeforeLoad = EnumerateVisibleDialogs();
+            PostMessage(wizard, WM_COMMAND, MakeWParam(CMD_LOAD_BUTTON, 0), IntPtr.Zero);
+
+            IntPtr martDlg = WaitForNewDialog(dialogsBeforeLoad, "Mart picker", 8000, log);
+            if (martDlg == IntPtr.Zero) { log?.Invoke("[INTEGRATE] Mart picker did not open."); return false; }
+
+            // The target model opens at its LATEST version (user requirement). The combo
+            // IS populated and enabled on this path - the first live run listed 18
+            // entries with "(Current Version) Version 18 ..." at index 0 - so the pick is
+            // explicit, not left to a default. (The recon dump's DISABLED combo was a
+            // different model with a single version.)
+            if (!SelectMartVersionInPicker(martDlg, version: 0, targetCatalogPath, out string pickErr, out _, log,
+                                           useLatestVersion: true))
+            {
+                log?.Invoke($"[INTEGRATE] could not select '{targetCatalogPath}' in the Mart picker: {pickErr}");
+                PostMessage(martDlg, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero);
+                PostMessage(wizard, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero);
+                return false;
+            }
+
+            // WAIT for the right model to actually LOAD before pressing Compare.
+            //
+            // Two live runs proved this is the hard part. 14:48: Compare was posted 600 ms
+            // after the picker's Open, but erwin only registered the loaded model set 3 s
+            // later ([EDR-REG] in the bridge log) - the click landed on a wizard that had
+            // no right model yet and was ignored. 15:00: waiting for the Compare BUTTON to
+            // become enabled did nothing, because it is enabled from the start - the
+            // wizard's own Overview says "You can click on the Compare/Finish button at any
+            // time". So the button carries NO readiness information.
+            //
+            // The signal that does: erwin appends the freshly opened model to the Right
+            // Model page's "Open Models in Memory" list. Poll for that row to appear.
+            IntPtr compareBtn = GetDlgItem(wizard, CC_COMPARE);
+            if (compareBtn == IntPtr.Zero) compareBtn = FindDescendantById(wizard, CC_COMPARE);
+            if (compareBtn == IntPtr.Zero)
+            {
+                log?.Invoke($"[INTEGRATE] Compare button (id={CC_COMPARE}) not found on the wizard - aborting.");
+                return false;
+            }
+
+            const int LoadTimeoutMs = 120000;
+            if (rowsBefore >= 0)
+            {
+                if (openList == IntPtr.Zero) openList = FindListViewById(wizard, 1083, log: null);
+                uint loadDeadline = unchecked((uint)Environment.TickCount) + LoadTimeoutMs;
+                bool loaded = false;
+                int rowsNow = rowsBefore;
+                while (unchecked((int)((uint)Environment.TickCount - loadDeadline)) < 0)
+                {
+                    Thread.Sleep(250);
+                    if (openList == IntPtr.Zero) break;
+                    rowsNow = SendMessage(openList, LVM_GETITEMCOUNT, IntPtr.Zero, IntPtr.Zero).ToInt32();
+                    if (rowsNow > rowsBefore) { loaded = true; break; }
+                }
+                if (!loaded)
+                {
+                    log?.Invoke($"[INTEGRATE] the right model never appeared in 'Open Models in Memory' " +
+                                $"({rowsBefore} -> {rowsNow} row(s) after {LoadTimeoutMs / 1000}s). " +
+                                "Wizard left open, nothing saved or closed.");
+                    return false;
+                }
+                log?.Invoke($"[INTEGRATE] right model loaded ('Open Models in Memory' {rowsBefore} -> {rowsNow} rows).");
+                // erwin populates the list as the load COMPLETES, but the wizard still has
+                // to bind it to the right side; give it a beat before the click.
+                Thread.Sleep(1500);
+            }
+            else
+            {
+                // No list to watch - fall back to a settle long enough for the slowest
+                // load observed so far (~3.4 s), and say so rather than pretending.
+                log?.Invoke("[INTEGRATE] cannot observe the load (id=1083 missing) - falling back to a 6 s settle.");
+                Thread.Sleep(6000);
+            }
+
+            log?.Invoke("[INTEGRATE] [4] Compare");
+            // lParam = the button HWND. These XTP dialogs ignore a WM_COMMAND with
+            // lParam=0; the picker's Open post already relies on this same form.
+            PostMessage(wizard, WM_COMMAND, MakeWParam(CC_COMPARE, 0), compareBtn);
+            Thread.Sleep(800);
+
+            IntPtr rd = WaitForResolveDifferencesHandlingTypeResolution(20000, log);
+            if (rd == IntPtr.Zero) { log?.Invoke("[INTEGRATE] Resolve Differences did not open."); return false; }
+
+            // ---- HAND-OVER: the user resolves and clicks Finish. -------------------
+            log?.Invoke($"[INTEGRATE] [5] Resolve Differences 0x{rd.ToInt64():X} handed to the USER - waiting for Finish/Cancel.");
+            if (!WaitForWindowGone(rd, userWorkTimeoutMs))
+            {
+                log?.Invoke($"[INTEGRATE] user did not finish Resolve Differences within {userWorkTimeoutMs / 1000}s - aborting the automation " +
+                            "(the wizard is left open; nothing was saved or closed).");
+                return false;
+            }
+            log?.Invoke("[INTEGRATE] Resolve Differences closed - resuming.");
+            Thread.Sleep(800);
+
+            // ---- Close the wizard, then drive the save/close cascade. -------------
+            IntPtr wizardNow = IsWindow(wizard) ? wizard : FindVisibleOwnTopLevel("Model Selection");
+            if (wizardNow != IntPtr.Zero)
+            {
+                log?.Invoke("[INTEGRATE] [6] wizard Close");
+                PostMessage(wizardNow, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero);
+                Thread.Sleep(600);
+            }
+
+            return DriveIntegrateSaveCloseChain(versionComment, modelsBefore, workingChild, log, runOnUiThread);
+        }
+
+        /// <summary>
+        /// The post-merge cascade: erwin raises a fixed sequence of dialogs and this
+        /// answers each by TITLE until both models are saved and closed.
+        ///
+        /// <para>Unlike <see cref="HandleCloseModelDialogChain"/> - which UNCHECKS rows to
+        /// DISCARD a throwaway compare model - integrate must KEEP both models: every
+        /// checkbox on the row is ticked so erwin saves AND closes it.</para>
+        ///
+        /// <para>ONE comment, stamped on every description dialog erwin raises (user
+        /// 2026-07-26). In practice that is a single dialog: the Integrate tab refuses a
+        /// dirty model, so the merge leaves the working model unchanged and erwin has
+        /// nothing to ask about when it closes it. Telling the dialogs apart by arrival
+        /// order is therefore pointless - and the old "wait for TWO descriptions"
+        /// completion rule is what left the 17:23 run polling for 85 s on a dialog erwin
+        /// was never going to raise.</para>
+        /// </summary>
+        private static bool DriveIntegrateSaveCloseChain(string versionComment, int modelsBefore, IntPtr workingChild,
+                                                        Action<string> log, Action<Action> runOnUiThread)
+        {
+            int descriptionsSeen = 0;
+            int handled = 0;
+
+            // Nothing at all happened for this long: stop polling. A cascade that keeps
+            // scanning after it has stalled is not harmless - it is what let a stale run
+            // adopt the NEXT run's dialogs (2026-07-26).
+            const int IdleTimeoutMs = 60000;
+            // How long the Mart write behind erwin's progress window may take.
+            const int SaveSettleTimeoutMs = 120000;
+
+            uint deadline = unchecked((uint)Environment.TickCount) + 240000;  // whole cascade
+            uint lastActivity = unchecked((uint)Environment.TickCount);
+
+            // Dialogs already answered: HWND -> the caption it carried when we answered it.
+            //
+            // This is what stops the loop re-ticking a dialog. Every checkbox click is a
+            // TOGGLE, so a second pass silently UNDOES the first and the model comes back
+            // unsaved.
+            //
+            // It replaces an earlier "block until the answered dialog disappears" guard,
+            // which fixed the toggle but broke the cascade in a worse way: erwin raises
+            // the "Description for ..." modal ON TOP of a still-open "Close Model", so
+            // blocking on Close Model's disappearance meant the loop never looked for the
+            // description at all - the user had to type the version comment by hand
+            // (2026-07-26 18:10, cascade ended with 0 comments stamped). A ledger keeps
+            // the loop live while still refusing to touch the same dialog twice.
+            //
+            // Keyed by caption as well as handle because MFC recycles HWNDs: a recycled
+            // handle carrying a different caption is a DIFFERENT dialog and must be
+            // answered.
+            var answered = new Dictionary<IntPtr, string>();
+            var dead = new List<IntPtr>();
+            bool workingCloseRequested = false;
+
+            // Any cascade dialog on screen, answered or not.
+            bool AnyCascadeDialogOnScreen() =>
+                FindVisibleOwnTopLevel("Close Model") != IntPtr.Zero
+                || FindVisibleOwnTopLevel("Save Models") != IntPtr.Zero
+                || FindVisibleOwnTopLevel("Description for ") != IntPtr.Zero
+                || FindVisibleOwnTopLevel("Mart Offline") != IntPtr.Zero;
+
+            // Returns a matching dialog only if it has not been answered already.
+            IntPtr TakeUnanswered(string titlePrefix, out string caption)
+            {
+                caption = null;
+                IntPtr h = FindVisibleOwnTopLevel(titlePrefix);
+                if (h == IntPtr.Zero) return IntPtr.Zero;
+                string live = GetTitle(h) ?? string.Empty;
+                if (answered.TryGetValue(h, out string was) && string.Equals(was, live, StringComparison.Ordinal))
+                    return IntPtr.Zero;
+                caption = live;
+                return h;
+            }
+
+            while (unchecked((int)((uint)Environment.TickCount - deadline)) < 0)
+            {
+                Thread.Sleep(250);
+
+                // Forget dialogs erwin has destroyed, so a recycled HWND is never
+                // mistaken for one we already answered.
+                if (answered.Count > 0)
+                {
+                    dead.Clear();
+                    foreach (var kv in answered) if (!IsWindow(kv.Key)) dead.Add(kv.Key);
+                    foreach (var h in dead) answered.Remove(h);
+                }
+
+                IntPtr dlg = TakeUnanswered("Close Model", out string caption);
+                if (dlg != IntPtr.Zero)
+                {
+                    log?.Invoke($"[INTEGRATE] 'Close Model' 0x{dlg.ToInt64():X} - setting save + close on the row");
+                    answered[dlg] = caption;
+                    if (!SetAllRowCheckboxes(dlg, on: true, log, runOnUiThread))
+                    {
+                        log?.Invoke("[INTEGRATE] 'Close Model' checkbox state could not be VERIFIED - OK deliberately NOT posted. " +
+                                    "Tick Save and Close by hand and press OK; the cascade stops here rather than risk " +
+                                    "discarding the merge.");
+                        return false;
+                    }
+                    PostMessage(dlg, WM_COMMAND, MakeWParam(IDOK, 0), IntPtr.Zero);
+                    handled++;
+                    lastActivity = unchecked((uint)Environment.TickCount);
+                    Thread.Sleep(600);
+                    continue;
+                }
+
+                dlg = TakeUnanswered("Save Models", out caption);
+                if (dlg != IntPtr.Zero)
+                {
+                    log?.Invoke($"[INTEGRATE] 'Save Models' 0x{dlg.ToInt64():X} - setting save on the row");
+                    answered[dlg] = caption;
+                    if (!SetAllRowCheckboxes(dlg, on: true, log, runOnUiThread))
+                    {
+                        log?.Invoke("[INTEGRATE] 'Save Models' checkbox state could not be VERIFIED - OK deliberately NOT posted. " +
+                                    "Tick Save by hand and press OK; the cascade stops here rather than risk losing the model.");
+                        return false;
+                    }
+                    PostMessage(dlg, WM_COMMAND, MakeWParam(IDOK, 0), IntPtr.Zero);
+                    handled++;
+                    lastActivity = unchecked((uint)Environment.TickCount);
+                    Thread.Sleep(600);
+                    continue;
+                }
+
+                dlg = TakeUnanswered("Description for ", out caption);
+                if (dlg != IntPtr.Zero)
+                {
+                    answered[dlg] = caption;
+                    descriptionsSeen++;
+                    IntPtr edit = GetDlgItem(dlg, DESC_EDIT_ID);
+                    if (edit != IntPtr.Zero)
+                    {
+                        SendMessageSetText(edit, WM_SETTEXT, IntPtr.Zero, versionComment ?? string.Empty);
+                        log?.Invoke($"[INTEGRATE] description #{descriptionsSeen} filled ({(versionComment ?? "").Length} chars) on '{caption}'");
+                        // An unstamped Mart version is a governance gap, so say it out
+                        // loud rather than let a blank comment pass unnoticed.
+                        if (string.IsNullOrWhiteSpace(versionComment))
+                            log?.Invoke("[INTEGRATE] WARNING - the version comment is EMPTY; this Mart version will carry no description.");
+                    }
+                    else
+                    {
+                        // Fail loudly: an unstamped version is a governance gap, not a nit.
+                        log?.Invoke($"[INTEGRATE] description #{descriptionsSeen}: edit id={DESC_EDIT_ID} NOT FOUND - saving with an EMPTY comment.");
+                    }
+                    PostMessage(dlg, WM_COMMAND, MakeWParam(DESC_SAVE_ID, 0), IntPtr.Zero);
+                    handled++;
+                    lastActivity = unchecked((uint)Environment.TickCount);
+                    Thread.Sleep(600);
+                    continue;
+                }
+
+                dlg = TakeUnanswered("Mart Offline", out caption);
+                if (dlg != IntPtr.Zero)
+                {
+                    answered[dlg] = caption;
+                    // Reuses the PURE-WIN32 dismisser (it sets Save-to=Close via the
+                    // toolbar and clicks OK itself). Deliberately not the UIA variant:
+                    // AutomationElement on this XTP dialog leaves an IAccessible RCW that
+                    // crashes erwin's finalizer when the dialog is destroyed.
+                    log?.Invoke($"[INTEGRATE] 'Mart Offline' 0x{dlg.ToInt64():X} - Save-to=Close + OK");
+                    DismissMartOfflineDialogWin32(dlg, log);
+                    handled++;
+                    lastActivity = unchecked((uint)Environment.TickCount);
+                    Thread.Sleep(600);
+                    continue;
+                }
+
+                // The merge's dialogs are all about the TARGET model. Nothing ever offers
+                // to close the WORKING model, so ask for it explicitly once erwin has gone
+                // quiet - erwin then raises its own Save Models / Description / Mart
+                // Offline dialogs, which the branches above answer like any other.
+                //
+                // "Quiet" means no cascade dialog ON SCREEN (not merely none unanswered:
+                // erwin keeps 'Close Model' up for half a minute while it saves) plus a
+                // settle, so this cannot fire in a gap mid-cascade.
+                if (!workingCloseRequested
+                    && handled >= 1
+                    && workingChild != IntPtr.Zero && IsWindow(workingChild)
+                    && unchecked((int)((uint)Environment.TickCount - lastActivity)) > 3000
+                    && !AnyCascadeDialogOnScreen())
+                {
+                    workingCloseRequested = true;
+                    log?.Invoke($"[INTEGRATE] target handled - closing the working model 0x{workingChild.ToInt64():X} " +
+                                $"'{GetTitle(workingChild)}'.");
+                    PostMessage(workingChild, WM_CLOSE_MSG, IntPtr.Zero, IntPtr.Zero);
+                    lastActivity = unchecked((uint)Environment.TickCount);
+                    Thread.Sleep(800);
+                    continue;
+                }
+
+                // Nothing pending. Completion is measured by the WORLD, not by a dialog
+                // count: the cascade ends with the working model AND the target closed, so
+                // the model-window count dropping below its pre-merge baseline is the
+                // signal. Counting descriptions was wrong - how many erwin raises depends
+                // on which models are dirty, and "expect two" left the loop polling for a
+                // dialog that was never coming. A baseline of 0 or an unreadable count
+                // (-1) never satisfies this: an erwin we cannot read must not report done.
+                int modelsNow = CountOpenModelWindows();
+                if (descriptionsSeen >= 1 && modelsNow >= 0 && modelsBefore > 0 && modelsNow <= modelsBefore - 1)
+                {
+                    // Both models are CLOSED, but erwin may still be writing the last one
+                    // to the Mart behind its own progress window. Returning here would
+                    // hand control back while that is in flight, and the caller's result
+                    // popup then lands on a busy erwin - 2026-07-26 21:20 froze exactly
+                    // there, with the user watching a save that never reached 100%.
+                    WaitForErwinDialogsToClear(SaveSettleTimeoutMs, log);
+
+                    log?.Invoke($"[INTEGRATE] cascade complete ({handled} dialog(s) handled, " +
+                                $"{descriptionsSeen} version comment(s) stamped, model windows {modelsBefore} -> {modelsNow}).");
+                    return true;
+                }
+
+                if (unchecked((int)((uint)Environment.TickCount - lastActivity)) > IdleTimeoutMs)
+                {
+                    log?.Invoke($"[INTEGRATE] cascade IDLE for {IdleTimeoutMs / 1000}s after {handled} dialog(s) and " +
+                                $"{descriptionsSeen} version comment(s); model windows {modelsBefore} -> {modelsNow}. " +
+                                "erwin raised no further dialog - check the model state manually.");
+                    return false;
+                }
+            }
+
+            log?.Invoke($"[INTEGRATE] cascade TIMED OUT after {handled} dialog(s), {descriptionsSeen}/2 version comment(s) stamped - " +
+                        "erwin may still be showing a dialog. Check the model state manually.");
+            return false;
+        }
+
+        /// <summary>
+        /// Blocks until erwin has no visible dialog left, so the caller does not resume
+        /// while erwin is still busy.
+        ///
+        /// <para>The one that matters is the Mart save progress window: the models are
+        /// already closed and gone from the MDI client by the time erwin finishes writing
+        /// the last version, so "no model window left" is NOT the same as "erwin is
+        /// done". On 2026-07-26 21:20 the cascade reported success into that gap, the
+        /// add-in put its result popup up on the still-busy UI thread, and erwin
+        /// deadlocked with the save stuck short of 100%.</para>
+        ///
+        /// <para>Matched by CLASS, not by title, because the progress window's caption is
+        /// not something to hard-code - anything erwin puts up counts. The titles being
+        /// waited on are logged, so an unexpected one is visible rather than mysterious.
+        /// Returns false on timeout (and says so) rather than blocking for ever.</para>
+        /// </summary>
+        private static bool WaitForErwinDialogsToClear(int timeoutMs, Action<string> log)
+        {
+            uint deadline = unchecked((uint)Environment.TickCount) + (uint)timeoutMs;
+            string lastReported = null;
+
+            while (true)
+            {
+                string busy = FirstVisibleErwinDialogTitle();
+                if (busy == null)
+                {
+                    if (lastReported != null) log?.Invoke("[INTEGRATE] erwin is idle again - cascade may finish.");
+                    return true;
+                }
+
+                if (!string.Equals(busy, lastReported, StringComparison.Ordinal))
+                {
+                    log?.Invoke($"[INTEGRATE] waiting for erwin to finish - dialog still up: '{busy}'");
+                    lastReported = busy;
+                }
+
+                if (unchecked((int)((uint)Environment.TickCount - deadline)) >= 0)
+                {
+                    log?.Invoke($"[INTEGRATE] erwin STILL has '{busy}' open after {timeoutMs / 1000}s - " +
+                                "continuing anyway, but treat the model state as unconfirmed.");
+                    return false;
+                }
+                Thread.Sleep(250);
+            }
+        }
+
+        /// <summary>
+        /// Caption of the first visible dialog-class window in this process, or null when
+        /// there is none. The add-in's own windows are WinForms classes and so never
+        /// match; only erwin's <c>#32770</c> dialogs do.
+        ///
+        /// <para>Also the "is it safe to open a WinForms modal" test: erwin and the add-in
+        /// share a UI thread, so a WinForms modal raised over one of erwin's own modal
+        /// loops deadlocks it.</para>
+        /// </summary>
+        internal static string FirstVisibleErwinDialogTitle()
+        {
+            string found = null;
+            uint myPid = (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
+            var cls = new StringBuilder(64);
+            EnumWindows((hWnd, lp) =>
+            {
+                if (!IsWindowVisible(hWnd)) return true;
+                GetWindowThreadProcessId(hWnd, out uint pid);
+                if (pid != myPid) return true;
+                cls.Clear();
+                GetClassName(hWnd, cls, cls.Capacity);
+                if (!string.Equals(cls.ToString(), "#32770", StringComparison.Ordinal)) return true;
+                found = GetTitle(hWnd) ?? string.Empty;
+                return false;
+            }, IntPtr.Zero);
+            return found;
+        }
+
+        /// <summary>
+        /// Number of model windows erwin currently has open (MDI children of the frame).
+        ///
+        /// <para>This is the integrate cascade's completion signal. The flow ends with the
+        /// target AND the working model closed, so "no MDI child left" says the cascade is
+        /// done in a way no dialog count can: how many description/save dialogs erwin
+        /// raises depends on which models happen to be dirty.</para>
+        ///
+        /// <para>Returns -1 when the frame or its MDI client cannot be found, which is
+        /// deliberately NOT zero - an unreadable erwin must never read as "all closed".</para>
+        /// </summary>
+        private static int CountOpenModelWindows()
+        {
+            IntPtr main = FindErwinMain();
+            if (main == IntPtr.Zero) return -1;
+            IntPtr mdiClient = FindMdiClientOf(main);
+            if (mdiClient == IntPtr.Zero) return -1;
+
+            int n = 0;
+            IntPtr child = GetWindow(mdiClient, GW_CHILD);
+            while (child != IntPtr.Zero)
+            {
+                if (IsWindowVisible(child)) n++;
+                child = GetWindow(child, GW_HWNDNEXT);
+            }
+            return n;
+        }
+
+        /// <summary>
+        /// Puts BOTH checkbox columns of the checklist's single row into the wanted state
+        /// and PROVES it, returning false if it could not.
+        ///
+        /// <para><b>Read before clicking.</b> erwin remembers how this dialog was last
+        /// left (user-confirmed 2026-07-26: it opened with Close ticked and Save clear),
+        /// so a click is a TOGGLE onto an unknown state - the reason a merge came back
+        /// unsaved. The state is read off the SCREEN with <see cref="ReadCheckbox"/>
+        /// because an XTPReport cell answers no Win32 message, and UI Automation is
+        /// banned here (an abandoned IAccessible RCW crashes erwin's finalizer - live
+        /// crash 2026-07-26 15:12, OLEACC.dll 0xc0000005).</para>
+        ///
+        /// <para>One row is all there is: the grid lists exactly the model erwin opened
+        /// from the Mart (screenshot 2026-07-26).</para>
+        ///
+        /// <para>The NUMBER of checkbox columns is discovered, not assumed: "Close Model"
+        /// has two (close + save), "Save Models" has one (save). Assuming two made the
+        /// 19:15 run abort on Save Models, because +36 there is the model-name cell.</para>
+        ///
+        /// <para>A column that does not change after its click is NOT retried - it means
+        /// the offset is not on a checkbox, and the caller must not press OK on a state
+        /// nobody can vouch for.</para>
+        /// </summary>
+        private static bool SetAllRowCheckboxes(IntPtr dlg, bool on, Action<string> log, Action<Action> runOnUiThread)
+        {
+            // runOnUiThread is no longer needed (no COM/UIA is created here); kept in the
+            // signature so the call sites stay put if a UI-thread step is ever required.
+            _ = runOnUiThread;
+
+            try
+            {
+                IntPtr grid = GetDlgItem(dlg, 2050);
+                if (grid == IntPtr.Zero) grid = FindDescendantById(dlg, 2050);
+                if (grid == IntPtr.Zero)
+                {
+                    log?.Invoke("  [INTEGRATE] checklist grid (id=2050) not found - NOT clicking blind.");
+                    return false;
+                }
+
+                // The toolbar ids differ per dialog and one of them is very likely a
+                // check-all; capturing them here is how that gets confirmed without
+                // another manual recon session.
+                DumpDialogToolbar(dlg, log);
+
+                if (!GetWindowRect(grid, out RECT gr))
+                {
+                    log?.Invoke("  [INTEGRATE] GetWindowRect(grid) failed - NOT clicking blind.");
+                    return false;
+                }
+
+                int rowY = gr.top + 31;
+                string want = on ? "CHECKED" : "unchecked";
+                log?.Invoke($"  [INTEGRATE] grid rect=({gr.left},{gr.top},{gr.right},{gr.bottom}), row y={rowY}");
+
+                ForceForeground(dlg);
+                Thread.Sleep(300);
+
+                var columns = FindCheckboxColumns(gr.left, rowY, log);
+                if (columns.Count == 0)
+                {
+                    log?.Invoke("  [INTEGRATE] no checkbox cell could be located on the row - ABORT (no blind click).");
+                    return false;
+                }
+
+                foreach (int dx in columns)
+                {
+                    int cx = gr.left + dx;
+
+                    // The point MUST still resolve to this dialog. If anything covers it,
+                    // abort rather than click into another window.
+                    IntPtr under = WindowFromPoint(new POINT { X = cx, Y = rowY });
+                    IntPtr underTop = under == IntPtr.Zero ? IntPtr.Zero : GetAncestor(under, GA_ROOT);
+                    if (underTop != dlg)
+                    {
+                        log?.Invoke($"  [INTEGRATE] point ({cx},{rowY}) resolves to 0x{underTop.ToInt64():X}, not the checklist " +
+                                    $"0x{dlg.ToInt64():X} - ABORT (no blind click).");
+                        return false;
+                    }
+
+                    bool? before = ReadCheckbox(cx, rowY, log, $"col+{dx} before");
+                    if (before == null)
+                    {
+                        log?.Invoke($"  [INTEGRATE] could not read column +{dx} - ABORT (no blind click).");
+                        return false;
+                    }
+                    if (before.Value == on)
+                    {
+                        log?.Invoke($"  [INTEGRATE] column +{dx} is already {want} - no click needed.");
+                        continue;
+                    }
+
+                    SendMouseClickAt(cx, rowY, log);
+                    Thread.Sleep(300);
+
+                    bool? after = ReadCheckbox(cx, rowY, log, $"col+{dx} after");
+                    if (after == null || after.Value != on)
+                    {
+                        log?.Invoke($"  [INTEGRATE] column +{dx} did NOT become {want} " +
+                                    $"(read {(after == null ? "unreadable" : (after.Value ? "CHECKED" : "unchecked"))}) - " +
+                                    "that x is not on a checkbox. ABORT: the caller will not press OK. " +
+                                    "See the [checkbox] gutter trace above to re-calibrate the column offsets.");
+                        return false;
+                    }
+                }
+
+                log?.Invoke($"  [INTEGRATE] both checkbox columns VERIFIED {want} on the row.");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"  [INTEGRATE] checklist toggle failed: {ex.GetType().Name}: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Finds the checkbox cells in a classified gutter strip and returns their centre
+        /// offsets. Pure, so the rule that separates a checkbox from the model-name text
+        /// can be tested against real captures instead of only against a live erwin.
+        /// </summary>
+        /// <param name="gutter">One character per pixel: 'W' light, '#' dark, anything else background.</param>
+        /// <param name="minRun">Shortest run that can be a checkbox (rejects stray glyph pixels).</param>
+        /// <param name="maxRun">Longest run that can be a checkbox (rejects runs of text).</param>
+        internal static List<int> LocateCheckboxCentres(string gutter, int minRun = 4, int maxRun = 14)
+        {
+            var centres = new List<int>();
+            if (string.IsNullOrEmpty(gutter)) return centres;
+
+            int runStart = -1;
+            for (int i = 0; i <= gutter.Length; i++)
+            {
+                bool inCell = i < gutter.Length && (gutter[i] == 'W' || gutter[i] == '#');
+                if (inCell)
+                {
+                    if (runStart < 0) runStart = i;
+                    continue;
+                }
+                if (runStart >= 0)
+                {
+                    int len = i - runStart;
+                    if (len >= minRun && len <= maxRun) centres.Add(runStart + len / 2);
+                    runStart = -1;
+                }
+            }
+            return centres;
+        }
+
+        /// <summary>
+        /// Reads one checkbox cell's state by sampling screen pixels at its centre.
+        /// Returns null when nothing could be sampled.
+        ///
+        /// <para>The row is normally SELECTED, so the cell sits on the selection blue with
+        /// a white box on it and the tick is a dark glyph through the middle. The "dark"
+        /// test is strict enough to reject that blue (0,120,215) - a looser one would read
+        /// every unchecked box on a selected row as ticked.</para>
+        /// </summary>
+        private static bool? ReadCheckbox(int screenX, int screenY, Action<string> log, string what)
+        {
+            IntPtr hdc = GetDC(IntPtr.Zero);
+            if (hdc == IntPtr.Zero)
+            {
+                log?.Invoke($"    [checkbox] {what}: GetDC(screen) failed.");
+                return null;
+            }
+            try
+            {
+                int dark = 0, sampled = 0;
+                for (int dy = -2; dy <= 2; dy++)
+                {
+                    for (int dx = -2; dx <= 2; dx++)
+                    {
+                        uint c = GetPixel(hdc, screenX + dx, screenY + dy);
+                        if (c == CLR_INVALID) continue;
+                        sampled++;
+                        int r = (int)(c & 0xFF), g = (int)((c >> 8) & 0xFF), b = (int)((c >> 16) & 0xFF);
+                        if (r < 110 && g < 110 && b < 110) dark++;
+                    }
+                }
+                if (sampled == 0)
+                {
+                    log?.Invoke($"    [checkbox] {what}: no pixel could be sampled at ({screenX},{screenY}).");
+                    return null;
+                }
+                bool isChecked = dark >= 3;
+                log?.Invoke($"    [checkbox] {what} @({screenX},{screenY}): {dark}/{sampled} dark -> {(isChecked ? "CHECKED" : "unchecked")}");
+                return isChecked;
+            }
+            finally
+            {
+                ReleaseDC(IntPtr.Zero, hdc);
+            }
+        }
+
+        /// <summary>
+        /// Locates the checkbox cells on a checklist row by reading the pixels across the
+        /// row's left gutter, and returns their centre offsets from the grid's left edge.
+        ///
+        /// <para>Discovery rather than arithmetic, because the column count differs per
+        /// dialog: "Close Model" has two boxes (close + save) and "Save Models" has one.
+        /// Assuming two is what made the 19:15 run abort - on Save Models the second
+        /// offset lands in the model-name cell.</para>
+        ///
+        /// <para>How it reads: the row is normally SELECTED, so the gutter is the
+        /// selection colour ('.') and a checkbox stands out as a bounded run of light
+        /// interior ('W') and dark border/tick ('#'). The model name further right is
+        /// drawn in white on the selection too, but as scattered glyph strokes - hence the
+        /// run-length window, which admits a ~7-9 px box and rejects both stray pixels and
+        /// long text runs. The classified strip is logged verbatim, so a layout this
+        /// misreads can be diagnosed from the log alone.</para>
+        /// </summary>
+        private static List<int> FindCheckboxColumns(int gridLeft, int rowY, Action<string> log)
+        {
+            var centres = new List<int>();
+            const int ScanWidth = 72;   // the gutter; the first text column starts well after this
+            const int MinRun = 4;
+            const int MaxRun = 14;
+
+            IntPtr hdc = GetDC(IntPtr.Zero);
+            if (hdc == IntPtr.Zero)
+            {
+                log?.Invoke("    [checkbox] GetDC(screen) failed - cannot locate the checkbox columns.");
+                return centres;
+            }
+
+            var strip = new StringBuilder(ScanWidth);
+            try
+            {
+                for (int dx = 0; dx < ScanWidth; dx++)
+                {
+                    uint c = GetPixel(hdc, gridLeft + dx, rowY);
+                    if (c == CLR_INVALID) { strip.Append('?'); continue; }
+                    int r = (int)(c & 0xFF), g = (int)((c >> 8) & 0xFF), b = (int)((c >> 16) & 0xFF);
+                    strip.Append(r > 190 && g > 190 && b > 190 ? 'W' : (r < 110 && g < 110 && b < 110 ? '#' : '.'));
+                }
+            }
+            finally
+            {
+                ReleaseDC(IntPtr.Zero, hdc);
+            }
+
+            string g2 = strip.ToString();
+            centres.AddRange(LocateCheckboxCentres(g2, MinRun, MaxRun));
+
+            log?.Invoke($"    [checkbox] gutter x=+0..+{ScanWidth - 1} at y={rowY}: {g2}");
+            log?.Invoke(centres.Count == 0
+                ? "    [checkbox] no checkbox cell found in the gutter."
+                : $"    [checkbox] {centres.Count} checkbox column(s) at +{string.Join(", +", centres)}");
+            return centres;
+        }
+
+        /// <summary>
+        /// Logs a dialog's XTP toolbar (id 59392) button ids and states. Diagnostic only -
+        /// the ids differ per dialog and are how the "check all" command is identified.
+        /// </summary>
+        private static void DumpDialogToolbar(IntPtr dlg, Action<string> log)
+        {
+            try
+            {
+                IntPtr tb = FindDescendantById(dlg, 59392);
+                if (tb == IntPtr.Zero) { log?.Invoke("  [INTEGRATE] no toolbar (id=59392) on this dialog."); return; }
+                int count = SendMessage(tb, TB_BUTTONCOUNT, IntPtr.Zero, IntPtr.Zero).ToInt32();
+                log?.Invoke($"  [INTEGRATE] toolbar 0x{tb.ToInt64():X} TB_BUTTONCOUNT={count}");
+                for (int i = 0; i < count; i++)
+                {
+                    var tbb = new TBBUTTON();
+                    SendMessageTbButton(tb, TB_GETBUTTON, new IntPtr(i), ref tbb);
+                    bool isSep = (tbb.fsStyle & 0x01) != 0;
+                    bool isHidden = (tbb.fsState & 0x08) != 0;
+                    bool isDisabled = (tbb.fsState & 0x04) == 0;
+                    log?.Invoke($"    [INTEGRATE] btn[{i}] cmdId={tbb.idCommand} state=0x{tbb.fsState:X2} " +
+                                $"style=0x{tbb.fsStyle:X2}{(isSep ? " SEP" : "")}{(isHidden ? " HIDDEN" : "")}{(isDisabled ? " DISABLED" : "")}");
+                }
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"  [INTEGRATE] toolbar dump failed: {ex.Message}");
+            }
+        }
+
+        /// <summary>Blocks until <paramref name="hWnd"/> is destroyed or hidden, or the timeout expires.</summary>
+        private static bool WaitForWindowGone(IntPtr hWnd, int timeoutMs)
+        {
+            uint deadline = unchecked((uint)Environment.TickCount) + (uint)timeoutMs;
+            while (unchecked((int)((uint)Environment.TickCount - deadline)) < 0)
+            {
+                if (!IsWindow(hWnd) || !IsWindowVisible(hWnd)) return true;
+                Thread.Sleep(250);
+            }
             return false;
         }
 
@@ -403,6 +1258,14 @@ namespace EliteSoft.Erwin.AddIn.Services
         private const uint WM_MDIGETACTIVE = 0x0229;
         private const uint WM_MDIACTIVATE_MSG = 0x0222;
         private const uint WM_CLOSE_MSG = 0x0010;
+
+        // Screen pixel reads. The ONLY way to learn an XTPReport checkbox's state:
+        // there is no Win32 message for it and UI Automation is banned on these
+        // dialogs (an abandoned IAccessible RCW crashes erwin's finalizer).
+        [DllImport("user32.dll")] private static extern IntPtr GetDC(IntPtr hWnd);
+        [DllImport("user32.dll")] private static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
+        [DllImport("gdi32.dll")] private static extern uint GetPixel(IntPtr hdc, int nXPos, int nYPos);
+        private const uint CLR_INVALID = 0xFFFFFFFF;
         [DllImport("user32.dll")]
         private static extern bool ClientToScreen(IntPtr hWnd, ref POINT lpPoint);
         [DllImport("user32.dll")]
@@ -616,6 +1479,14 @@ namespace EliteSoft.Erwin.AddIn.Services
         private const int CMD_MART_OPEN_VERSION = 1060;
         private const int CMD_MART_REVIEW       = 1168;
         private const int CMD_MART_CONNECT      = 1059;  // ribbon Mart > Connect (RECON capture 2026-07-12)
+        // Ribbon Mart > Merge (RECON capture 2026-07-26). Confirmed in the same run to
+        // enter ShowERwinCCWiz - Merge is the Complete Compare wizard in merge mode, not
+        // a separate engine, so every CC_* id below applies to it unchanged.
+        private const int CMD_MART_MERGE        = 1402;
+        // "Description for '<model>' Version N" dialog (RECON 2026-07-26; the same ids
+        // MartSaveAutomation already cites): the multiline comment edit and Save.
+        private const int DESC_EDIT_ID = 1081;
+        private const int DESC_SAVE_ID = 1;
         private const int IDCANCEL = 2;
         private const int IDOK     = 1;
 
@@ -2886,7 +3757,8 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         // ── UIA helpers ─────────────────────────────────────────────────────
 
-        private static bool SelectMartVersionInPicker(IntPtr martDlg, int version, string catalogPath, out string error, out bool dataError, Action<string> log)
+        private static bool SelectMartVersionInPicker(IntPtr martDlg, int version, string catalogPath, out string error, out bool dataError, Action<string> log,
+            bool useLatestVersion = false)
         {
             error = null;
             // dataError=true means the model/version genuinely is not in the Mart
@@ -3003,11 +3875,38 @@ namespace EliteSoft.Erwin.AddIn.Services
                 int cnt = SendMessageCb(combo, CB_GETCOUNT, IntPtr.Zero, IntPtr.Zero).ToInt32();
                 int sel = -1;
                 string vs = version.ToString();
+                // LATEST is an EXPLICIT opt-in, never inferred from the number. A
+                // version<=0 sentinel would silently turn a queue row carrying
+                // LEFT_VERSION/RIGHT_VERSION = 0 into "open the newest" for the DDL
+                // worker, which today fails that row loudly instead - a governance
+                // change nobody asked for. Only the integrate flow passes true.
+                // erwin marks the newest entry "(Current Version) Version N ...";
+                // the highest N is the fallback when that marker is absent.
+                bool wantLatest = useLatestVersion;
+                int bestVer = int.MinValue;
                 for (int i = 0; i < cnt; i++)
                 {
                     string it = GetComboItemText(combo, i).Trim();
                     log?.Invoke($"    [PICK] version combo[{i}] = '{it}'");
                     if (string.IsNullOrEmpty(it)) continue;
+
+                    if (wantLatest)
+                    {
+                        if (it.IndexOf("(Current Version)", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            sel = i;
+                            log?.Invoke($"    [PICK] latest wanted - '(Current Version)' marker at index {i}.");
+                            break;
+                        }
+                        var vm = System.Text.RegularExpressions.Regex.Match(it, @"(?i)\bversion\s+(\d+)\b");
+                        if (vm.Success && int.TryParse(vm.Groups[1].Value, out int vnum) && vnum > bestVer)
+                        {
+                            bestVer = vnum;
+                            sel = i;
+                        }
+                        continue;
+                    }
+
                     bool match = System.Text.RegularExpressions.Regex.IsMatch(it, @"(?i)\bversion\s+" + System.Text.RegularExpressions.Regex.Escape(vs) + @"\b")
                         || it.Equals(vs, StringComparison.OrdinalIgnoreCase)
                         || it.StartsWith($"v{vs}", StringComparison.OrdinalIgnoreCase);
@@ -3015,7 +3914,9 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
                 if (sel < 0)
                 {
-                    error = $"version v{vs} not found for model '{wantModel}' (the picker listed {cnt} version(s)) - check the job's LEFT_VERSION/RIGHT_VERSION.";
+                    error = wantLatest
+                        ? $"no version could be identified for model '{wantModel}' (the picker listed {cnt} version(s))."
+                        : $"version v{vs} not found for model '{wantModel}' (the picker listed {cnt} version(s)) - check the job's LEFT_VERSION/RIGHT_VERSION.";
                     dataError = true; // permanent: retrying will not make a missing version appear
                     log?.Invoke($"    [PICK] {error} ABORT (IDCANCEL, refusing wrong version).");
                     PostMessage(martDlg, WM_COMMAND, MakeWParam(IDCANCEL, 0), IntPtr.Zero);
@@ -3023,7 +3924,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
                 SendMessageCb(combo, CB_SETCURSEL, new IntPtr(sel), IntPtr.Zero);
                 PostMessage(martDlg, WM_COMMAND, MakeWParam(2111, CBN_SELCHANGE), combo);
-                log?.Invoke($"    [PICK] version combo set to index {sel} (v{vs}) via CB_SETCURSEL + CBN_SELCHANGE.");
+                log?.Invoke($"    [PICK] version combo set to index {sel} " +
+                            $"({(wantLatest ? "LATEST" : "v" + vs)}) via CB_SETCURSEL + CBN_SELCHANGE.");
                 Thread.Sleep(200);
 
                 // Step 3: Open (id=2059).

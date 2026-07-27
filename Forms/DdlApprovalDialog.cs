@@ -26,12 +26,14 @@ namespace EliteSoft.Erwin.AddIn.Forms
         private readonly string _modelLocator;
         private readonly string _sourceMode;
         private readonly string _dbmsType;
-        // Driven by the admin USE_APPROVEMENT_MECHANISM flag (NOT the approver
-        // count). Controls both the button text ("Send to Approve" vs "Send") and
-        // the post-submit flow: when ON the row goes in as 'Pending' and the admin
-        // fires the REST callback on approve; when OFF the add-in inserts it as
-        // 'ApprovedBySystem' and fires the REST callback itself (same logic, shared
-        // ApprovalCallbackInvoker). (2026-06-06)
+        // TRUE when this MODEL has an approver chain (MODEL_PROMOTION_APPROVER for
+        // CONFIG_ID + MART_PATH). Resolved by the owner; the old
+        // USE_APPROVEMENT_MECHANISM flag is retired and no longer consulted anywhere
+        // (2026-07-25). Controls both the button text ("Send to Approve" vs "Save
+        // Model") and the post-submit flow: with a chain the row goes in as 'Pending'
+        // and the admin fires the REST callback on approve; without one there is no
+        // gate, so the add-in inserts 'ApprovedBySystem' and fires the REST callback
+        // itself (same logic, shared ApprovalCallbackInvoker).
         private readonly bool _approvalEnabled;
         private readonly Action<string> _log;
         // Callback supplied by the owner (ModelConfigForm). Invoked AFTER
@@ -52,6 +54,14 @@ namespace EliteSoft.Erwin.AddIn.Forms
         private readonly PromotionSendContext _promotion;
         private readonly Func<string, System.Threading.Tasks.Task<PromotionSaveOutcome>> _promotionSaveCallback;
         private readonly int _promotionFirstEnvId;
+
+        // Naming-rule gate on ENTRY to the approval queue (admin
+        // ENFORCE_APPROVAL_BLOCKING_RULES, 2026-07-25). Owned by the form because the
+        // check needs the live SCAPI session; the dialog just asks "may I submit?" and
+        // passes itself as the owner so the report is modal to THIS window. Returns true
+        // to proceed. Null = no gate wired (defensive; the form always supplies it).
+        private readonly Func<IWin32Window, bool> _approvalBlockingGate;
+
 
         private RichTextBox _rtb;
         private TextBox _txtNote;
@@ -77,7 +87,8 @@ namespace EliteSoft.Erwin.AddIn.Forms
             Action<string> log,
             Func<string, System.Threading.Tasks.Task<bool>> martSaveCallback = null,
             PromotionSendContext promotionContext = null,
-            Func<string, System.Threading.Tasks.Task<PromotionSaveOutcome>> promotionSaveCallback = null)
+            Func<string, System.Threading.Tasks.Task<PromotionSaveOutcome>> promotionSaveCallback = null,
+            Func<IWin32Window, bool> approvalBlockingGate = null)
         {
             _ddlText           = ddlText ?? string.Empty;
             _configId          = configId;
@@ -90,6 +101,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
             _martSaveCallback  = martSaveCallback;
             _promotion         = (promotionContext != null && promotionContext.Routes.Count > 0) ? promotionContext : null;
             _promotionSaveCallback = promotionSaveCallback;
+            _approvalBlockingGate  = approvalBlockingGate;
             if (_promotion != null)
             {
                 if (_promotionSaveCallback == null)
@@ -136,7 +148,16 @@ namespace EliteSoft.Erwin.AddIn.Forms
             FormBorderStyle  = FormBorderStyle.Sizable;
             MinimizeBox      = false;
             MaximizeBox      = true;
-            ShowInTaskbar    = false;
+            // Own a taskbar button (WP 324). erwin's main window is TopMost, and if the user
+            // switches to another app (e.g. Chrome) while the DDL pipeline runs, this review
+            // window opens but the foreground lock stops it stealing focus, so it lands behind
+            // erwin. Without a taskbar button it was reachable only via Alt+Tab and erwin looked
+            // frozen (the modal loop runs on erwin's UI thread). A taskbar button makes it
+            // findable AND makes Windows auto-flash it when it cannot come to the front, so the
+            // user is alerted and one click brings it forward. This is deliberately preferred
+            // over persistent TopMost, which could cover erwin's own "Save Models" dialog that
+            // the background From-DB/Review teardown dismisses via mouse-sim (see OnShown).
+            ShowInTaskbar    = true;
             ClientSize       = new Size(1100, 780);
             MinimumSize      = new Size(720, 480);
             BackColor        = Color.White;
@@ -174,10 +195,10 @@ namespace EliteSoft.Erwin.AddIn.Forms
 
             var lblTitle = new Label
             {
-                // USE_APPROVEMENT_MECHANISM off -> there is no approval queue and the
+                // No approver chain -> there is no approval queue and the
                 // action button reads "Save Model", so the header must describe the
                 // save rather than "sending to approval queue". Promotion mode always
-                // sends to the (promotion) approval queue regardless of that flag.
+                // sends to the (promotion) approval queue regardless.
                 Text = (_approvalEnabled || PromotionMode)
                     ? "Review DDL before sending to approval queue"
                     : "Review DDL before saving the model",
@@ -253,11 +274,13 @@ namespace EliteSoft.Erwin.AddIn.Forms
             {
                 // Promotion mode: the send targets an environment ("Send to
                 // Approval" per the release-management spec wording).
-                // Otherwise: USE_APPROVEMENT_MECHANISM off -> there is no
+                // Otherwise: no approver chain -> there is no
                 // approval queue; the add-in commits the model to the Mart
                 // itself, so the verb is "Save Model" rather than
                 // "Send to Approve".
-                Text = PromotionMode ? "Send to Approval" : (_approvalEnabled ? "Send to Approve" : "Save Model"),
+                Text = PromotionMode ? "Send to Approval"
+                     : _approvalEnabled ? "Send to Approve"
+                     : "Save and Close",
                 Size = new Size(160, 32),
                 FlatStyle = FlatStyle.Flat,
                 BackColor = Color.FromArgb(46, 125, 50),
@@ -611,7 +634,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
             var route = SelectedPromotionRoute();
             if (route == null) { _lblPromoteDecision.Text = string.Empty; return; }
 
-            var approvers = LookupPromotionApprovers(route.Relation.Id);
+            var approvers = LookupPromotionApprovers();
             bool requiresVote = PromotionPlanner.RequiresApprovalVote(route.Relation, approvers);
             if (requiresVote)
             {
@@ -620,13 +643,12 @@ namespace EliteSoft.Erwin.AddIn.Forms
             }
             else
             {
-                // A transition flagged REQUIRES_APPROVAL but with no approver
-                // names auto-approves by spec (empty approver list = no gate).
-                // Spell that out so it does not read as a bug when the admin
-                // set the flag but never added approvers.
-                bool flaggedButNoApprovers = route.Relation.RequiresApproval
-                    && (approvers == null || !approvers.Any(a => !string.IsNullOrWhiteSpace(a)));
-                _lblPromoteDecision.Text = flaggedButNoApprovers ? "Auto-approve (no approvers set)" : "Auto-approve";
+                // Reaching here means the model's approver catalog is empty - since admin
+                // 1795ce3 that is the ONLY reason a promotion auto-approves (the transition's
+                // REQUIRES_APPROVAL flag no longer participates, see
+                // PromotionPlanner.RequiresApprovalVote). Naming the reason keeps it from
+                // reading as a bug when the admin expected an approval step.
+                _lblPromoteDecision.Text = "Auto-approve (no approvers set for this model)";
                 _lblPromoteDecision.ForeColor = Color.FromArgb(46, 125, 50);
             }
         }
@@ -642,18 +664,14 @@ namespace EliteSoft.Erwin.AddIn.Forms
         }
 
         /// <summary>
-        /// Effective approver names of a transition for THIS model: preloaded in
-        /// the context for every offered route; a live read covers a route
-        /// re-derived at send time (its relation may not be among the preloaded
-        /// ones). The live read is scoped to the open model's MART_PATH so it
-        /// honours the per-model override list exactly as the context preload did.
+        /// The approver chain that gates THIS model's promotion, preloaded once into the
+        /// send context. Since admin 1795ce3 the chain is scoped to the MODEL
+        /// (CONFIG_ID + MART_PATH) and governs every transition, so - unlike the former
+        /// per-transition lists - a route re-derived at send time can never miss its
+        /// entry and no live per-relation read is needed.
         /// </summary>
-        private System.Collections.Generic.IReadOnlyList<string> LookupPromotionApprovers(int relationId)
-        {
-            if (_promotion.ApproversByRelationId.TryGetValue(relationId, out var preloaded))
-                return preloaded;
-            return PromotionService.Instance.GetRelationApprovers(relationId, _promotion.MartPath);
-        }
+        private System.Collections.Generic.IReadOnlyList<string> LookupPromotionApprovers()
+            => _promotion.Approvers ?? (System.Collections.Generic.IReadOnlyList<string>)System.Array.Empty<string>();
 
         private void DdlApprovalDialog_KeyDown(object sender, KeyEventArgs e)
         {
@@ -771,16 +789,27 @@ namespace EliteSoft.Erwin.AddIn.Forms
 
         private async void BtnSend_Click(object sender, EventArgs e)
         {
+            // Step 0: naming-rule gate on ENTRY to the approval queue (admin
+            // ENFORCE_APPROVAL_BLOCKING_RULES). Runs BEFORE the confirm dialog on purpose -
+            // asking the user for a version description and only then refusing the
+            // submission would waste their input. Independent of the approval mechanism:
+            // whether this send ends up Pending, auto-approved or as a promotion request,
+            // a rule the admin marked as blocking must block it.
+            if (_approvalBlockingGate != null && !_approvalBlockingGate(this))
+            {
+                _log("DdlApprovalDialog: submission blocked by naming rules; nothing was saved or queued.");
+                return;
+            }
+
             // Step 1: confirm with the user and collect the version
             // description they want stamped on the Mart commit. The
             // description is what erwin's own MCXIncrementalSave_VersionDescriptionDialog
             // would have asked for - we route it programmatically via the
             // native bridge instead so no extra dialog appears.
             string versionDescription;
-            // Promotion mode always submits a request (never a plain save), so
-            // the confirm step must use the "Submit for Approval" wording even
-            // when USE_APPROVEMENT_MECHANISM is off - the two flags are
-            // independent by spec.
+            // Promotion mode always submits a request (never a plain save), so the
+            // confirm step uses the "Submit for Approval" wording even when the model
+            // has no approver chain - a promotion is a request either way.
             using (var confirm = new ConfirmSubmitDialog(_approvalEnabled || PromotionMode))
             {
                 if (confirm.ShowDialog(this) != DialogResult.OK)
@@ -809,6 +838,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 await RunPromotionSendAsync(versionDescription);
                 return;
             }
+
 
             // Step 3: commit the model to Mart programmatically. The callback
             // pushes our description through
@@ -849,9 +879,10 @@ namespace EliteSoft.Erwin.AddIn.Forms
             // lives on the new Mart commit and does not need duplicating
             // in our DB).
             string note = _txtNote.Text;
-            // With approvers the row waits for the admin ('Pending'); without, there
-            // is no gate so it is auto-approved by the system and the add-in fires
-            // the REST callback itself.
+            // With an approver chain the row waits for the admin ('Pending'); without
+            // one there is no gate, so it is auto-approved by the system and the add-in
+            // fires the REST callback itself. (The server refuses to resolve a quorum
+            // for a model with an empty catalog, so Pending here would be unresolvable.)
             string status = _approvalEnabled ? "Pending" : "ApprovedBySystem";
 
             _lblStatus.Text = _approvalEnabled ? "Submitting to approval queue..." : "Saving...";
@@ -962,9 +993,16 @@ namespace EliteSoft.Erwin.AddIn.Forms
             {
                 _lblStatus.Text = "Closing the model...";
                 Application.DoEvents();
-                modelClosed = await System.Threading.Tasks.Task
-                    .Run(() => MartMartAutomation.CloseActiveModelFast(_log))
-                    .ConfigureAwait(true);
+                // Gate every add-in timer for the close cascade. "Save Models" and
+                // "Mart Offline" are message-pumping modals, so an ungated tick does
+                // SCAPI work inside erwin's pump - the same reentrancy class the alter
+                // wizard and the Mart commit are already gated for (found 2026-07-26).
+                using (Services.AlterWizardGate.Enter("model close cascade"))
+                {
+                    modelClosed = await System.Threading.Tasks.Task
+                        .Run(() => MartMartAutomation.CloseActiveModelFast(_log))
+                        .ConfigureAwait(true);
+                }
             }
             catch (Exception ex)
             {
@@ -1198,7 +1236,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
             try
             {
                 bool requiresVote = PromotionPlanner.RequiresApprovalVote(
-                    route.Relation, LookupPromotionApprovers(route.Relation.Id));
+                    route.Relation, LookupPromotionApprovers());
 
                 lockService.ApplyLock(_promotion.MartPath, promotedVersion, lockType, _log);
                 lockApplied = true;
@@ -1246,9 +1284,16 @@ namespace EliteSoft.Erwin.AddIn.Forms
             {
                 _lblStatus.Text = "Closing the model...";
                 Application.DoEvents();
-                modelClosed = await System.Threading.Tasks.Task
-                    .Run(() => MartMartAutomation.CloseActiveModelFast(_log))
-                    .ConfigureAwait(true);
+                // Gate every add-in timer for the close cascade. "Save Models" and
+                // "Mart Offline" are message-pumping modals, so an ungated tick does
+                // SCAPI work inside erwin's pump - the same reentrancy class the alter
+                // wizard and the Mart commit are already gated for (found 2026-07-26).
+                using (Services.AlterWizardGate.Enter("model close cascade"))
+                {
+                    modelClosed = await System.Threading.Tasks.Task
+                        .Run(() => MartMartAutomation.CloseActiveModelFast(_log))
+                        .ConfigureAwait(true);
+                }
             }
             catch (Exception ex)
             {

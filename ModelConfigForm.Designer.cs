@@ -695,10 +695,10 @@ namespace EliteSoft.Erwin.AddIn
 
             // ================================================================
             // TAB: INTEGRATE (environment promotion)
-            // Shell only - deliberately NOT added to tabControl here. The tab is
-            // shown at runtime solely for configs with INTEGRATE_ENABLED (via
-            // SetIntegrateTabVisible) and its body is built by RebuildIntegrateTab,
-            // so it never flashes for models that do not have it enabled.
+            // Shell only - deliberately NOT added to tabControl here. The tab is shown at
+            // runtime solely for configs with INTEGRATE_ENABLED whose model sits in an
+            // environment that has a NEXT one (SetIntegrateTabVisible), and its body is
+            // built by RebuildIntegrateTab, so it never flashes for models without it.
             // ================================================================
             this.tabIntegrate.Name = "tabIntegrate";
             this.tabIntegrate.Text = "Integrate";

@@ -53,6 +53,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
 
         private readonly ToolTip _tip = new ToolTip();
         private readonly List<Button> _actionButtons = new List<Button>();
+        private bool _showPromoteButtons = true;
         private readonly Dictionary<int, Rectangle> _rects = new Dictionary<int, Rectangle>();
         private readonly Dictionary<int, int> _index = new Dictionary<int, int>();
 
@@ -75,11 +76,17 @@ namespace EliteSoft.Erwin.AddIn.Forms
         /// currently sits in, then lays out nodes/arrows and (re)creates the
         /// promote buttons. Safe to call repeatedly (model switch / reconnect).
         /// </summary>
+        /// <param name="showPromoteButtons">False renders the topology READ-ONLY (no
+        /// per-transition buttons). The Integrate tab uses that: it offers ONE explicit
+        /// Integrate button below the diagram, so per-arrow buttons would be a second,
+        /// competing way to trigger the same thing.</param>
         public void SetData(
             IReadOnlyList<IntegrationEnvironment> environments,
             IReadOnlyList<IntegrationRelation> relations,
-            int currentEnvironmentId)
+            int currentEnvironmentId,
+            bool showPromoteButtons = true)
         {
+            _showPromoteButtons = showPromoteButtons;
             _envs = (environments ?? new List<IntegrationEnvironment>())
                 .OrderBy(e => e.SortOrder).ThenBy(e => e.Id).ToList();
             _relations = relations ?? new List<IntegrationRelation>();
@@ -123,6 +130,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 _rects[_envs[i].Id] = new Rectangle(LeftMargin + i * (NodeW + HGap), laneTop, NodeW, NodeH);
 
             // A promote button per allowed (non-approval) transition out of current.
+            if (!_showPromoteButtons) return;
             string currentName = _envs.FirstOrDefault(e => e.Id == _currentId)?.Name ?? "current";
             foreach (var r in _relations)
             {

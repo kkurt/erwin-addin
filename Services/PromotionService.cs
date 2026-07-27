@@ -6,6 +6,7 @@ using System.Linq;
 
 using EliteSoft.MetaAdmin.Shared.Data;
 using EliteSoft.MetaAdmin.Shared.Data.Entities;
+using EliteSoft.MetaAdmin.Shared.Services;
 
 using Microsoft.EntityFrameworkCore;
 
@@ -112,38 +113,44 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// The EFFECTIVE promotion approver names of one transition for the model
-        /// at <paramref name="martPath"/>, ordered by SORT_ORDER. Resolution
-        /// mirrors the server (PromotionEndpoints): the per-model override list
-        /// (ENVIRONMENT_RELATION_MODEL_APPROVER for this MART_PATH) wins when it
-        /// has any row; otherwise the transition's default PROMOTION list
-        /// (ENVIRONMENT_RELATION_APPROVER, FLOW='PROMOTION'). An override REPLACES
-        /// the default - the two never merge. Empty result = no approvers =
-        /// auto-approve (never falls back to the config-wide APPROVAL_APPROVER
-        /// list, by spec). MART_PATH is nvarchar(500) (not a LOB), so the
-        /// equality predicate is safe on all three dialects.
+        /// The PRIMARY approver names of the model's promotion chain, in SEQ order.
+        /// <para>
+        /// Since the admin governance rework (erwin-admin 1795ce3) approvers are scoped to
+        /// the MODEL - one ordered chain per (CONFIG_ID, MART_PATH) - and that single chain
+        /// governs every DDL step and every promote step. The former per-transition model
+        /// override (ENVIRONMENT_RELATION_MODEL_APPROVER) is gone, and there is deliberately
+        /// NO fallback to the transition list: the server treats "no rows" as "no quorum"
+        /// rather than silently using some other list (see
+        /// <c>DdlApprovalService.ResolveSlots</c>), and ENVIRONMENT_RELATION_APPROVER now
+        /// serves the INTEGRATE flow only. Consequently the result no longer depends on the
+        /// chosen transition - every route of a model shares this one list.
+        /// </para>
+        /// <para>
+        /// Resolution is delegated to the server's own reader,
+        /// <see cref="ApprovalConfigService.GetModelPromotionApprovers(RepoDbContext, int, string)"/>,
+        /// so the add-in cannot drift from the web on ordering or shape. Each slot may carry
+        /// up to three BACKUP approvers (the slot is satisfied when its primary OR any backup
+        /// approves); backups are not returned here because the add-in only needs to know
+        /// WHETHER an approval gate exists, and the web owns who satisfies it.
+        /// </para>
+        /// <para>
+        /// An empty result means no gate, i.e. auto-approve. That is also what keeps the
+        /// queue consistent: the server REFUSES to resolve a quorum for a model with an empty
+        /// catalog, so a Pending row must never be inserted for one.
+        /// </para>
         /// </summary>
-        public IReadOnlyList<string> GetRelationApprovers(int relationId, string martPath)
+        public IReadOnlyList<string> GetModelPromotionApprovers(int configId, string martPath)
         {
+            if (configId <= 0)
+                throw new ArgumentException("configId must be a resolved CONFIG.ID", nameof(configId));
             if (string.IsNullOrWhiteSpace(martPath))
                 throw new ArgumentException("martPath must be the canonical Mart path", nameof(martPath));
 
             using var ctx = CreateContext();
-
-            var modelOverride = ctx.EnvironmentRelationModelApprovers
-                .Where(a => a.RelationId == relationId && a.MartPath == martPath)
-                .OrderBy(a => a.SortOrder)
-                .Select(a => a.Approver)
+            return ApprovalConfigService.GetModelPromotionApprovers(ctx, configId, martPath)
+                .Select(s => s.Approver)
+                .Where(a => !string.IsNullOrWhiteSpace(a))
                 .ToList();
-
-            var transitionDefault = ctx.EnvironmentRelationApprovers
-                .Where(a => a.RelationId == relationId
-                         && a.Flow == EnvironmentRelationApprover.Flows.Promotion)
-                .OrderBy(a => a.SortOrder)
-                .Select(a => a.Approver)
-                .ToList();
-
-            return PromotionPlanner.ResolveEffectiveApprovers(modelOverride, transitionDefault);
         }
 
         /// <summary>
@@ -313,7 +320,16 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
                 else
                 {
-                    existing.Version = request.ModelVersion;
+                    // Subsequent promotion: advance the TARGET's own version by one. The target
+                    // environment's version is a monotonic per-environment counter, decoupled
+                    // from the source Mart version - byte-for-byte the rule of the server's
+                    // single writer (DdlApprovalService.UpsertModelEnvironmentVersion, shared by
+                    // the vote path, the two-stage PromoteVersion action and the web promote
+                    // endpoint). Writing request.ModelVersion here instead made the add-in and
+                    // the web disagree about what a target holds, which (a) 409s the web
+                    // Release Management promote of the next hop and (b) breaks this add-in's
+                    // own rule-1 source derivation, whose match is `Version == promotedVersion`.
+                    existing.Version += 1;
                     existing.QueueId = row.Id;
                     existing.PromotedBy = submittedBy;
                     existing.PromotedAt = nowUtc;

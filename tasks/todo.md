@@ -1,3 +1,297 @@
+# Integrate YUZEYI addin'den tamamen kaldirildi, 2026-07-25 (Developed)
+
+Kullanici sirasiyla: (1) "Integrate tabina gerek yok, karta tasi", (2) kart yanlis
+konumlanmisti - duzeltildi, (3) "General tabindaki Integrate kartini da kaldir".
+Sonuc: addin'de artik HICBIR ortam-promosyon yuzeyi yok.
+
+- [x] `#region Integrate card` (318 satir) silindi: `_integrateCard`, `IsIntegrateEnabled`,
+      `RefreshIntegrateCard`, `RemoveIntegrateCard`, `LayoutGeneralFooter`,
+      `BuildIntegrateCard`, `ResizeIntegrateCard`, `BuildIntegrateMessage`,
+      `OnIntegrateClicked` + tema sabitleri.
+- [x] General tab layout'u HEAD'deki haline geri donduruldu (cardX/cardW local const,
+      footer sabit Y, copyright/Close-erwin Bottom anchor, AutoScroll yok).
+      `git diff` bu bolgede SIFIR fark gosteriyor.
+- [x] Connect'teki `RemoveIntegrateCard()` / `RefreshIntegrateCard()` cagrilari kalkti.
+
+## KORUNAN (silinmedi - onaya gonderim buna bagimli!)
+`IntegrationPlanner.ResolveApproverCatalogPath` + `ResolveCurrentEnvironment` +
+`IntegrationEnvironmentService.GetEnvironments/GetRelations` HALA KULLANILIYOR:
+approver zincirinin ortamsiz catalog path'ini bunlar cozuyor
+(`ShowDdlForApproval` ve `PromotionFlow.BuildSendContext`). Silinirse Integrate
+modellerinde onay yonlendirmesi tekrar bozulur.
+
+## Artik sahipsiz kalan (committed kod - SILINMEDI, kullaniciya soruldu)
+- `MartMartAutomation.PromoteViaMartMerge` - merge seam'i; zaten hicbir zaman
+  implemente edilmemisti (sadece log atip `false` donuyor, "NO destructive action").
+- `IntegrationPlanner.BuildTargets` + `PromotionTarget` - production'da cagiran yok
+  (testleri duruyor).
+- `Forms/EnvironmentPipelineDiagram` - Panel olarak artik cizilmiyor, ama
+  `TryParseHex` yardimcisi `DdlApprovalDialog` tarafindan hala kullaniliyor.
+- `INTEGRATE_ENABLED` addin'de artik hic okunmuyor.
+
+---
+
+# (ARSIV) Integrate tab -> General tab karti, 2026-07-25
+
+Kullanici: "Integrate tab'ina gerek yok tamamen kaldir, grafiksel gosterim General
+tabindaki Integrate kartina tasinsin; kart sadece INTEGRATE_ENABLED modellerde gorunsun."
+
+- [x] `tabIntegrate` TAMAMEN kaldirildi (Designer'dan alan + kurulum + declaration).
+- [x] `SetIntegrateTabVisible` / `RefreshIntegrateTab` / `RebuildIntegrateTab` ->
+      `RemoveIntegrateCard` / `RefreshIntegrateCard` / `BuildIntegrateCard`.
+- [x] Kart General tabinda Glossary kartinin altinda, `CreateSectionCard("Integrate")`
+      ile; icinde ayni `EnvironmentPipelineDiagram` + legend + hint.
+- [x] Kart yuksekligi topolojiye gore; `IntegrateCardMaxBodyH`(300) asilirsa kart
+      buyumek yerine GOVDE scroll eder (footer ekran disina itilmesin).
+- [x] Footer (copyright + Close erwin) artik sabit Y degil: `LayoutGeneralFooter()`
+      kart varsa altina alir. Iki kontrolun Anchor'i Bottom -> Top yapildi, cunku
+      AutoScroll'lu panelde Bottom anchor kontrolu viewport'a cakiyor, akmiyor.
+- [x] Connect basinda `RemoveIntegrateCard()` - onceki modelin topolojisi kalmasin.
+- [x] FIX (kullanici ekran goruntusu): kart HIC konumlandirilmiyordu, `y=0`'da kalip
+      sayfa basligi + Repository/Model kartlarinin uzerine biniyordu. `BuildIntegrateCard`
+      karti sadece OLCUYOR (yukseklik topoloji cizildikten sonra belli oluyor);
+      `RefreshIntegrateCard` artik `_generalCardsBottom + 16`'ya yerlestiriyor -
+      kolonun EN ALTI, Glossary'nin altinda (kullanici istegi). Log satiri eklendi:
+      kartin y/height'i ve footer'in yeni y'si yaziliyor.
+- [x] 3 flavor 0 warning/0 error, 939 test yesil.
+- [ ] LIVE test (kullanici): INTEGRATE_ENABLED acik modelde kart gorunuyor ve
+      diyagram/Promote calisiyor; kapali modelde kart hic yok ve footer yerinde.
+
+---
+
+# Onay yonlendirmesi: bayrak yerine MODEL'in approver zinciri, 2026-07-25 (Developed)
+
+Kullanici: "Integrate icin ayarli modelde yine ApprovedBySystem yapti, oysa
+degerlendirmeci tanimladim." Logdan (20:16-20:17 kosusu) iki AYRI sebep cikti.
+
+## Sebep A - kod: karar hala bayraga bakiyordu
+`status = _approvalEnabled ? "Pending" : "ApprovedBySystem"` ve `_approvalEnabled` =
+`USE_APPROVEMENT_MECHANISM` (= False). Approver tanimlansa bile standart DDL yolu
+ApprovedBySystem yaziyordu; approver listesine hic bakilmiyordu.
+
+- [x] `ShowDdlForApproval` artik `USE_APPROVEMENT_MECHANISM` OKUMUYOR. Karar:
+      `PromotionService.GetModelPromotionApprovers(configId, martPath)` bos mu?
+      Zincir varsa Pending, yoksa ApprovedBySystem.
+- [x] Promotion modunda zincir zaten `PromotionSendContext.Approvers` icinde yuklu -
+      yeniden okumak yerine o kullaniliyor (tek dogruluk kaynagi; buton metni ile
+      yazilan status'un ayrisma ihtimali yok).
+- [x] Okuma HATASINDA "kapi var" varsayiliyor (Pending) ve kullaniciya modal ile
+      soyleniyor: iki tahminden kurtarilabilir olan bu. "Kapi yok" tahmini hem
+      oto-onaylar hem REST callback'i atesler - geri donusu yok.
+- [x] `USE_APPROVEMENT_MECHANISM` addin'de HICBIR yerde okunmuyor artik (kalan 3
+      referans sadece "bu bayrak emekli" diyen yorumlar).
+
+## Sebep B - KOD (ilk teshiste "veri" sanmistim, DEGIL): anahtar uyusmazligi
+`MODEL_PROMOTION_APPROVER` (MetaRepoTmp):
+    1012 | Kursat/MetaRepo                  | kursat
+    1012 | Kursat/Integrate Test/MetaRepo   | kursat
+Acik modelin path'i ise `Kursat/Integrate Test/1_DEV/MetaRepo` (ORTAM KLASORU var).
+
+Ilk bakista "kullanici yanlis path'e tanimlamis" gibi gorundu; admin kaynagini
+okuyunca DOGRUSUNUN admin oldugu cikti:
+- `IntegratePopup.tsx:97`: `catalogPath = ${data.baseDirectory}/${model}`
+- `INTEGRATE_BASE` config 1012 icin `Kursat/Integrate Test` tutuyor
+- `IntegrateFlowEndpoints.cs`: ortam klasorleri TURETILMIS (`{base}/{ENV.NAME}`),
+  "integrate stores no per-model state by design"; merge lineage
+  `{base}/{srcEnv}/{model} -> {base}/{tgtEnv}/{model}`
+Yani admin bilerek ORTAMSIZ anahtar kullaniyor: bir pipeline'daki mantiksal model
+icin TEK approver zinciri, tum ortamlari yonetiyor. Hata add-in'de: ortama OZEL
+path ile ariyordu, hicbir zaman eslesemezdi.
+
+- [x] `IntegrationPlanner.ResolveApproverCatalogPath(martPath, environments)` - saf:
+      parent klasor config'in bir ENVIRONMENT'i ise o TEK segmenti dusurur, degilse
+      path'i aynen dondurur (yonetilen ortamda olmayan model eskisi gibi calisir).
+      Mevcut `ResolveCurrentEnvironment` yeniden kullaniliyor, 4. bir eslestirme yok.
+- [x] Iki cagri yeri de bu cozucuden geciyor: `ShowDdlForApproval` (standart yol) ve
+      `PromotionFlow.BuildSendContext` (promotion yolu) - ikisi ayni anahtari kullansin.
+- [x] Log satiri artik hem model path'ini hem catalog path'ini yaziyor.
+- [x] 10 yeni test (3 ortam ayni catalog'a collapse, case-insensitive, backslash,
+      yonetilmeyen model degismez, null/blank/ortamsiz-config).
+
+---
+
+# Onaya-gonderim engelleme kurallari (ENFORCE_APPROVAL_BLOCKING_RULES), 2026-07-25 (Developed)
+
+Admin sozlesmesi ayni gun ~18:01'de DEGISTI ve addin YENI sozlesmeye tasindi:
+- `BLOCKS_DDL_GENERATION` -> **`BLOCKS_DDL_APPROVEMENT`**
+- `ENFORCE_DDL_BLOCKING_RULES` -> **`ENFORCE_APPROVAL_BLOCKING_RULES`** (Approval Workflow ekrani)
+- Kapi artik **DDL URETIMINDE DEGIL, ONAYA GONDERIMDE**. Ihlalli model DDL uretip
+  inceleyebilir; yapamayacagi sey governance kuyruguna girmek.
+
+## Tasima
+- [x] `DdlBlockingRuleGate` -> `ApprovalBlockingRuleGate` (+ Issue/Kind/Result/Verdict/RuleSet
+      tipleri), `DdlBlockingRulesDialog` -> `ApprovalBlockingRulesDialog`, log prefix
+      `[DDL-GATE]` -> `[APPROVAL-GATE]`, dosyalar yeniden adlandirildi.
+- [x] `NamingStandardRule.BlocksDdlGeneration` -> `BlocksDdlApprovement`; izole sorgu
+      kolonu `BLOCKS_DDL_APPROVEMENT` (3 lehce); `LoadDdlBlockingRules` ->
+      `LoadApprovalBlockingRules`, `GetDdlBlockingRules` -> `GetApprovalBlockingRules`.
+- [x] Kapi `BtnAlterWizardProd_Click`'ten KALDIRILDI (yerine neden orada olmadigini
+      anlatan yorum). Yeni cagri noktalari:
+      - `DdlApprovalDialog.BtnSend_Click` **Step 0** - confirm dialogundan ONCE, cunku
+        once versiyon aciklamasi isteyip sonra reddetmek kullanicinin emegini cope atar.
+        Hem duz approval-queue insert'ini hem `REQUEST_TYPE='PROMOTION'` send'ini kapsar.
+      - `ModelConfigForm.OnIntegrateClicked` - Integrate kartindaki Promote butonu.
+- [x] `USE_APPROVEMENT_MECHANISM` HIC dikkate alinmiyor (kaldirilacak bayrak): gonderim
+      Pending de olsa, oto-onayli da olsa, promotion da olsa kontrol ediliyor.
+- [x] Rapor dialogu reddedilen AKSIYONU basliga yaziyor ("Send to Approve blocked",
+      "Integrate to 2_TEST blocked") - bloklanan promote, bloklanan save sanilmasin.
+- [x] DDL queue worker'da kapi YOK ve gerekmiyor: worker onaya gondermiyor, DDL'i dogrudan
+      kendi kuyruk satirina yaziyor ve review dialogu `_ddlQueueActive` iken aciliyor bile
+      degil. Dolayisiyla eski "worker kilitlenir" riski bu noktada mevcut degil.
+- [x] 3 flavor 0 warning/0 error, 939 test yesil. `docs/ARCHITECTURE.md` yeniden yazildi.
+- [ ] LIVE test (kullanici): ihlalli modelde Generate DDL CALISMALI; "Send to Approve" /
+      "Send to Approval" / Integrate Promote ise rapor gosterip HICBIR SEY kaydetmemeli.
+
+## Not
+Asagidaki eski plan/inceleme kaydi motorun kendisi icin hala gecerli (kural yukleme,
+preflight, model walk, degerlendirme, no-silent-pass kararlari); yalnizca iki isim ve
+tetikleme noktasi degisti.
+
+---
+
+# (ESKI SOZLESME - kayit icin) DDL-blocking naming rules, 2026-07-25 - PLAN
+
+Kaynak: `erwin-admin/docs/erwin-addin-ddl-blocking-rules-prompt.md`. Admin tarafi bitti
+(MC_NAMING_STANDARD.BLOCKS_DDL_GENERATION bit + config-level ENFORCE_DDL_BLOCKING_RULES
+iki seviyeli bool). Addin ENFORCEMENT yapacak: DDL uretmeden once blocking kurallari
+modele karsi dogrula, ihlal varsa HIC DDL uretme.
+
+## Recon bulgulari (6 paralel ajan + kritik, hepsi file:line dogrulandi)
+- Tek choke point: `ModelConfigForm.BtnAlterWizardProd_Click` (ModelConfigForm.cs:5136).
+  4 cagirani var: yesil buton, dev debug butonu, dev spike, DDL queue worker
+  (DdlWorker.cs:704). 6 mevcut guard'in hepsi `btnAlterWizardProd.Enabled = false`
+  (:5233) ve `HideFormForAutomation` (:5245) ONCESINDE return ediyor -> 5231/5233
+  arasi tek dogru ekleme noktasi.
+- KRITIK: `_ddlQueueActive == true` iken erken return edilirse worker SONSUZA KADAR
+  kilitleniyor (`DdlWorkerTimer_Tick` ilk satiri `if (_ddlQueueActive) return;`,
+  Running state'inin timeout'u YOK) ve queue satiri sonsuza dek 'RUNNING' kaliyor
+  (reaper yok). Yeni guard blokladiginda `FailAndResetCurrentJob(...)` cagirmak ZORUNDA.
+- KRITIK: worker (DDLGENERATOR flavor) connect'te naming standard YUKLEMIYOR
+  (ModelConfigForm.cs:1968-1970 "[DDL-ONLY] ... skipping ... naming standards"), yani
+  `NamingStandardService.Instance.IsLoaded == false`. Ustelik worker her job'da FARKLI
+  config'li model aciyor -> servis config-scope'lu degil (glossary'deki stale-config
+  bug'inin ayni sinifi).
+- KRITIK (blast radius): `BLOCKS_DDL_GENERATION` kolonunu ana `LoadStandards()`
+  SELECT'ine eklemek, kolonu olmayan repoda (migration MSSQL-only) TUM naming
+  yuklemesini patlatir -> `IsLoaded=false` -> `ValidateObjectName` her nesne icin BOS
+  liste -> tum naming enforcement sessizce kapanir. Bu yuzden kolon ANA sorguya
+  EKLENMEYECEK; ayri/izole bir sorguyla sadece gate calisirken okunacak.
+- `NamingValidationEngine`'de her "degerlendiremedim" yolu sessizce false/"" donuyor
+  (:602, :636, :820, :867, :1023). Gate bunlara guvenemez, kendi preflight'ini yapmali.
+- Template kural bir GENERATOR; `EvaluateRule` onu no-op ediyor (:1030) -> blocking
+  isaretli bir Template kurali sonsuza dek sessiz PASS olurdu.
+- Object-existence kurallari (PropertyCode == "") `ValidateObjectName`'e gorunmez
+  (`GetByObjectTypeAndProperty` bos propertyCode'da kisa devre, :673).
+- View'da `Physical_Name` YOK (r10) -> `view.Name`. `Physical_Name` bazen `%macro`
+  doner -> mevcut okuyucular gibi `.Name`'e dus.
+- SCAPI STA/UI-thread'e bagli. Walk senkron olacak (timer'lar preempt edemez), walk
+  ICINDE DoEvents/modal YOK.
+- Build/test: `dotnet build ErwinAddIn.csproj -c Release` +
+  `dotnet test tests\ErwinAddIn.Tests\ErwinAddIn.Tests.csproj -c Release` (880 test
+  yesil). `dotnet test erwin-addin.sln` SIFIR test kosar - kullanma.
+
+## Karar noktalari (onay bekleyen 1 tanesi isaretli)
+- **[ONAY GEREKIYOR] APPLY_ON x BLOCKS_DDL_GENERATION**: DDL uretimi model geneli bir
+  denetim; "yeni nesne" kavrami yok. Onerim: gate APPLY_ON'u YOK SAYAR (Create/Update/
+  Both farketmez, hepsi degerlendirilir). Gerekce: (a) prompt "load ALL rules where
+  BLOCKS_DDL_GENERATION=1" diyor, lifecycle filtresi yok; (b) `isNew=false` gecersem
+  `ApplyOn=Create` + blocking kural HICBIR ZAMAN bloklayamaz = tam olarak yasaklanan
+  "sessiz pass"; (c) mevcut model-seviyesi precedent ayni seyi yapiyor
+  (`CheckRequiredObjectTypesExist`, TableTypeMonitorService.cs:483-488). Bedeli:
+  `ApplyOn=Create` blocking kural, kural yazilmadan once olusmus eski nesneler icin de
+  DDL'i bloklar ("kurallar sadece YENI nesnelere" proje kuraliyla gerilim). Iki kez
+  opt-in gerektigi icin (kural bayragi + config toggle) kabul edilebilir buluyorum.
+  ALTERNATIF: `isNew=false` gecip Create-scoped kurallari atla (o zaman admin'de
+  Template gibi bir uyari sart).
+- Toggle okuma hatasi (`GetEffectiveBool` throw) = HARD BLOCK (fail-closed), sessiz
+  "false" degil. `[DDL-GATES]`'in fail-open davranisini KOPYALAMIYORUM: orada risk
+  sadece radio gorunurlugu, burada admin'in acikca istedigi kapiyi atlamak olurdu.
+- "Degerlendirilemez" = HARD FAIL sayilacak durumlar (yapisal, SCAPI'siz preflight):
+  Template tipli blocking kural / derlenmeyen veya bos REGEXP / bos PREFIX-SUFFIX /
+  eksik veya taninmayan LENGTH_OPERATOR-LENGTH_VALUE / SCAPI sinifina eslenmeyen
+  OBJECT_TYPE / Required disi bos PropertyCode. Ayrica: kural yuklenemedi, blocking-id
+  sorgusu patladi, `Collect` patladi.
+- Hedef property okuma hatasi = MEVCUT semantik (bos kabul et, `EvaluateRule` karar
+  versin). Boylece yeni tabloda henuz olmayan `Name_Qualifier` yanlislikla bloklamaz.
+- Prefix/Suffix icin `ValidateObjectName`'deki canonical-affix bastirmasi AYNEN
+  uygulanacak (yigilmis prefix'lerde yanlis blok olmasin).
+
+## Plan
+- [x] `NamingStandardRule.BlocksDdlGeneration` property (yalniz gate yolu doldurur).
+- [x] `NamingStandardService`: `_loadedConfigId` + `LoadedConfigId`, `SeedForTesting`
+      opsiyonel configId parametresi, `EnsureLoadedForConfig(int)`, IZOLE
+      `LoadDdlBlockingRules(int configId)` (3 lehce ID sorgusu, hata FIRLATIR) ve
+      `GetDdlBlockingRules()`.
+- [x] `TableTypeMonitorService.ScapiCollectTypeForExistence` private -> internal
+      (reflection testi NonPublic kullandigi icin bozulmaz), 4. bir harita eklemedik.
+- [x] `Services/DdlBlockingRuleGate.cs`: saf/testlenebilir parca
+      (`DescribeRule`, `GetUnevaluatableReason`, `EvaluateRuleAgainstObject`, `Dedupe`)
+      + SCAPI walk (`Evaluate(session, log)` -> `DdlBlockingGateResult`).
+- [x] `Forms/DdlBlockingRulesDialog.cs`: UdpSyncDialog kalibi (ListView Details,
+      accent strip, `ShowFor` static giris, Copy butonu). Chrome INGILIZCE, satirdaki
+      ERROR_MESSAGE admin DB'den AYNEN.
+- [x] `BtnAlterWizardProd_Click` icine 7. guard: senkron, modal yalniz
+      `!_ddlQueueActive` iken, worker'da `FailAndResetCurrentJob(...)`.
+- [x] 30 unit test (xUnit + FluentAssertions, `[Collection("NamingStandardSingleton")]`).
+- [x] 3 flavor da (default / PackagedBuild / DdlGenerator) 0 warning 0 error;
+      939 test yesil (oncesi 933). `docs/ARCHITECTURE.md` guncellendi.
+- [ ] LIVE test (kullanici): toggle KAPALI iken davranis degismiyor; toggle ACIK +
+      ihlalli model -> DDL uretilmiyor, rapor aciliyor; ihlal duzeltilince uretiliyor;
+      DDL worker'da bloklanan job FAILED yaziyor ve worker bir sonraki job'a geciyor.
+
+## Review (adversarial, 5 boyut x bagimsiz curutucu)
+27 bulgu kaldirildi, 22'si curutuldu, 5'i DOGRULANDI ve duzeltildi. Hepsi ayni kok
+nedendi: **motor kendi okuma hatalarini yutuyor, gate bunu "eslesmedi"den ayirt edemiyor.**
+
+1. **(critical) Affix bastirmasi APPLY_ON'u geri sokuyordu.** `ApplyNamingStandards`
+   affix kume'sini `MatchesApplyOn(rule, isNew)` ile suzuyor; uyusmayan cerceve altinda
+   kural apply'dan dusuyor, canonical == deger cikiyor ve ihlal yutulyordu. Sonuc:
+   `Both` olmayan HER Prefix/Suffix blocking kurali sessizce bloklamayi birakiyordu -
+   tam olarak "ApplyOn'u yok say" kararinin engellemek icin var oldugu sey.
+2. **(critical) Ayni bastirma pkMembership'i tasimiyordu.** Gate PK uyeligini Key_Group
+   grafiginden cozup veriyor, `ApplyNamingStandards` ise 3-arg overload ile yeniden
+   cozuyor (PK'yi okuyamiyor) -> kural dusuyor -> PK kosullu affix kurali hic bloklamiyor.
+   -> Tek kavramla ikisi de cozuldu: **bastirma ancak bu kuralin GERCEKTEN dahil oldugu
+   bir canonical hesap uzerinden kanit sayilir** (`MatchesApplyOn` + 3-arg
+   `IsRuleApplicable` on-kontrolu). 3 regresyon testi eklendi.
+3. **(high) PK cozumleme hatalari yutuluyordu** (`ReadPrimaryKeyMemberIds`,
+   `ReadObjectId`, `IsPrimaryKeyGroup`). Bos uye kumesi -> her kolon "PK degil" ->
+   PK kapsamli kural hicbir seye uygulanmiyor -> PASS. Artik hepsi FIRLATIYOR, mevcut
+   walk-level catch bunu Unevaluatable'a ceviriyor.
+4. **(high) Hedef property TUM nesnelerde okunamazsa** (admin'in PROPERTY_CODE'u o sinif
+   icin gecersiz) her kontrol bos degerde kisa devre yapip "temiz" raporluyordu. Nesne
+   basina musamaha korundu, ama "hepsinde basarisiz" artik kural basina tek Unevaluatable.
+5. **(critical, curutucudan ek bulgu) DDL-worker flavor'inda `ModelRootProvider` hic
+   atanmiyor** (`ValidationCoordinatorService.StartMonitoring` orada calismiyor), bu
+   yuzden MODEL-scoped UDP kosullu bir blocking kural SADECE gozetimsiz build'de
+   sessizce hic uygulanmiyordu. Gate artik bos ise kendi saglayicisini veriyor ve
+   finally'de geri aliyor.
+   Ayrica: dangling kosul FK'si (admin'de silinmis UDP/property) artik preflight'ta
+   hard-fail; bilinmeyen kural tipi icin default arm; kural basina "applicable" sayaci
+   loglaniyor.
+
+Curutulen dikkat cekici iddialar: "gate iyi cache'i bozabilir" (EnsureLoadedForConfig
+yalniz cache bos/yanlis config iken yukler), "IsActive filtresi eksik" (izole sorgunun
+WHERE'inde var), "Collect null = sessiz pass" (koddaki her walker null'i bos sayiyor;
+zorla bloklamak yanlis-blok uretirdi).
+
+Kucuk kalite duzeltmeleri: dedup anahtari ayirici karakterle (farkli ihlaller
+carpisip rapordan dusuyordu), overflow artik Debug Log'a TAM yaziliyor (dialog oraya
+yonlendiriyor), clipboard export'ta tab/newline normalizasyonu, Reason sutunu gercek
+client genisliginden, hucre uzerinde HitTest tooltip, sayac Font'u tek instance,
+footer tab sirasi gorsel sira ile, walk sirasinda `UseWaitCursor`, ve durum etiketi
+artik "kural ihlali" ile "kural kontrol edilemedi"yi ayiriyor.
+
+## Riskler / admin tarafina bildirilecek
+- Migration MSSQL-only (`migrations/20260725_naming_rule_blocks_ddl.sql`); PG/Oracle
+  scripti YOK. Gate'in izole sorgusu bu yuzden sadece toggle ACIKKEN calisir ve
+  patlarsa yalniz DDL'i bloklar, naming enforcement'i degil.
+- `ENFORCE_DDL_BLOCKING_RULES` API'de kayitli sabit degil, sadece DdlGeneration.tsx:41
+  icinde string literal; yazim hatasi sessizce "kapali" demek olur.
+- Admin tarafi henuz COMMIT EDILMEMIS (erwin-admin working tree).
+
+---
+
 # Bug #332: naming rule "Required=Hayir" force yerine warn olmali, 2026-07-24 (Developed)
 
 OpenProject #332 (Furkan). Rule Management'ta bir kuralin Required alani "Hayir"
@@ -57,6 +351,125 @@ config genuinely offers several targets.
 - [x] Build: 0 warnings / 0 errors (TreatWarningsAsErrors).
 - [ ] LIVE test (user): confirm the read-only destination renders and Send targets
       the correct env.
+
+---
+
+# Bug batch WP 334 / 331 / 324 / 329 - CODE-DONE (awaiting live test), 2026-07-25
+
+- [x] **WP 334** locked predefined column was deletable via "Discard New Column" on the
+      Required Properties dialog. Root cause: the restore path
+      (`RestoreDeletedLockedColumns`) needs the heartbeat's consecutive-snapshot diff, but a
+      column created and discarded in the same breath was never in a prior snapshot AND
+      `TryDeleteNewAttribute` drops its snapshot, so the locked-column protection was fully
+      bypassed. Fix at the single delete primitive: `TryWarnLockedColumnDiscard` keeps the
+      column and shows the SAME LockedColumnDialog the Column-tab delete shows. Covers every
+      discard-of-new-column site; no delete-then-recreate (which would re-open the very
+      Required prompt the user just cancelled). Conditional locks whose condition no longer
+      holds still allow the discard (lock released by design).
+- [x] **WP 331** DDL Generation tab kept the closed model's Source label / Target version /
+      "Alter DDL: N lines" status after every model was closed. `ResetDdlTab()` added and
+      called from `HandleSessionLost` (where General already reset); a later connect
+      repopulates via `PopulateVersionCombos`.
+- [x] **WP 324** the DDL Review ("Save Model") window got `ShowInTaskbar = true`. It is a
+      modal on erwin's UI thread, so with no taskbar button it was reachable only via Alt+Tab
+      and erwin looked frozen. A taskbar button also makes Windows auto-flash it when the
+      foreground lock stops it surfacing. Deliberately NOT persistent TopMost: that could
+      cover erwin's own "Save Models" dialog which the background teardown dismisses by
+      mouse-sim.
+- [x] **WP 329** add-in window now blocks erwin input while it is on screen (user
+      clarification 2026-07-25: minimize the add-in to work in erwin).
+      `Services/ErwinInputBlock.cs` = ref-counted block over
+      `EnableWindow(erwinMainFrame, false)` - the same primitive WinForms already applies to
+      erwin when the add-in opens a modal. Wiring: `SyncErwinInputBlock()` from
+      Shown/VisibleChanged/Resize/Activated + `ReconnectTimer_Tick` (self-heal, runs in every
+      state), release on FormClosing/FormClosed/HandleDestroyed.
+      Two conflicts that HAD to be solved, not just the EnableWindow call:
+        1. `Win32Helper.IsErwinMainWindowBlockedByModal()` is `!IsWindowEnabled(main)` and
+           guards 6 tick/pipeline paths - our own block would have read as "erwin is modal"
+           forever. It now subtracts `ErwinInputBlock.IsApplied`.
+        2. The pipelines synthesize mouse input onto erwin windows BEHIND the add-in form
+           (the `ToggleBusyOverlay` WS_EX_TRANSPARENT pass-through), and a disabled frame
+           swallows synthetic input. `ShowBusyOverlay` therefore takes a `Suspend()` scope
+           released on the overlay's `Disposed` - one choke point covering DDL, compare,
+           From-DB, UDP sync and config reload. DebugMode + the wizard/Mart-Save gates also
+           force release.
+      Fail-safe direction is always "erwin usable"; `Sync` reconciles against the frame's
+      REAL enabled state, which also repairs WinForms re-enabling it after an add-in modal.
+- [x] FORCED promotion-approver refactor (was blocking the whole build; user chose "I adapt
+      it", 2026-07-25). erwin-admin 1795ce3 deleted `EnvironmentRelationModelApprover`.
+      Server semantics derived from the admin code, not guessed: PROMOTION and DDL rows share
+      ONE per-model catalog `ModelPromotionApprover` keyed (CONFIG_ID, MART_PATH) with SEQ
+      order and up to 3 backups per slot (slot satisfied by primary OR any backup), and
+      `DdlApprovalService` treats an empty catalog as a HARD ERROR - "they are hard errors
+      rather than a silent fall back to some other list" - so the per-transition list is gone
+      from the promotion path (`ENVIRONMENT_RELATION_APPROVER` now serves FLOW='INTEGRATE'
+      only). Add-in: `GetRelationApprovers(relationId, martPath)` ->
+      `GetModelPromotionApprovers(configId, martPath)` DELEGATING to the server's own reader
+      `ApprovalConfigService.GetModelPromotionApprovers` (in MetaShared, already referenced -
+      so the add-in cannot drift from the web); `PromotionSendContext.ApproversByRelationId`
+      dictionary -> single `Approvers` list (one read per context instead of one per route, and
+      a send-time route re-derivation can no longer miss its entry);
+      `LookupPromotionApprovers()` loses its relationId. Empty catalog still means
+      auto-approve add-in side, which is exactly what keeps a Pending row from being inserted
+      for a model the server would refuse to resolve a quorum for.
+      `PromotionPlanner.ResolveEffectiveApprovers` is now unused but LEFT IN PLACE (project
+      rule: ask before deleting working code); its tests still pass. DECISION NEEDED: remove it?
+- [x] Build green, 0 warnings; **880/880 tests pass**.
+- [x] Adversarial review (19 agents, 3 dimensions, 2 skeptics per critical/major, both must
+      agree): 7 confirmed (#1 and #7 are the same defect found twice), 1 refuted, 1 unverified
+      minor. SIX fixed, one deferred:
+      * **CRITICAL - ErwinInputBlock adopted a disable it did not perform.** `Sync` set
+        `_blockedHwnd` even when the frame was ALREADY disabled, which happens routinely: the
+        user minimizes the add-in (the sanctioned way to use erwin), opens Mart Save / Properties
+        / Print by hand, then clicks back to the add-in. We then claimed erwin's OWN modal
+        disable, so `IsErwinMainWindowBlockedByModal()` reported "no modal" while one was up -
+        blinding all six guards, including the two the repo treats as invariants (the verified
+        2026-05-29 STA deadlock on `_scapi.PersistenceUnits` and the 2026-05-07 0xC0000005 in
+        coreclr.dll) - and a later release re-enabled the frame UNDER a live MFC modal loop.
+        Self-inflicting even with no user gesture, because the tick's Sync runs before the tick's
+        own probe. FIX: ownership is claimed ONLY on a transition we performed; the probe now
+        detects real modals with `GW_ENABLEDPOPUP` (an enabled owned popup, immune to our own
+        EnableWindow); both release paths refuse to re-enable while such a popup exists.
+      * **MAJOR - block target was not pinned to our own process.** `GetErwinMainWindow` is
+        process-agnostic and Z-order dependent; with two erwin instances (the add-in is HKCU, so
+        every instance loads it) we could disable ANOTHER instance's frame and then orphan it
+        disabled forever when the resolved HWND changed. FIX: `ResolveOwnErwinFrame` pins to our
+        own PID, and a changed/vanished HWND is re-enabled before the new one is claimed.
+      * **MAJOR - a disabled frame can still be RAISED** (taskbar / Alt+Tab activation is not
+        input), burying the only window that can release the block, with no dialog for Windows to
+        flash: indistinguishable from the freeze this repo has burned days on. FIX: `OnDeactivate`
+        brings the add-in back to front when the blocked frame takes the foreground (gated on
+        `IsApplied`, so the pipelines are never fought).
+      * **CRITICAL - the promotion GATE rule was stale.** The same admin commit that moved the
+        approver source ALSO dropped per-transition `REQUIRES_APPROVAL` from the promotion path:
+        server gates on the catalog alone (`PromotionEndpoints`: "per-transition RequiresApproval
+        is no longer used for promotion", `approvalRequired = approverCount > 0`;
+        `DdlApprovalService`: `requiresVote = slots.Count > 0`; the flag survives only for
+        INTEGRATE - all verified first-hand). The add-in still ANDed the flag, so a model WITH
+        alice+bob would AUTO-APPROVE a production promotion whenever the transition's flag was
+        off - silent bypass, and the stale test asserted exactly that. FIXED + test rewritten.
+      * **MAJOR - MODEL_ENVIRONMENT_VERSION write drifted.** Server's single writer advances the
+        TARGET's own counter (`state.Version += 1`, "monotonic per-environment counter, decoupled
+        from the source's version"); the add-in wrote the source Mart version, which 409s the web
+        promote of the next hop and breaks the add-in's own rule-1 source match. FIXED.
+      * MINOR - `ResetDdlTab` left the Target area fully blank when the closed model had a single
+        version (`ApplyRightTargetSingleChoiceDisplay` had hidden the combo). FIXED.
+      * REFUTED (both skeptics): "busy-overlay Disposed re-applies the block mid-pipeline".
+- [ ] **DEFERRED, needs your call (finding #6, MAJOR, pre-existing - not caused by this batch):**
+      the add-in's auto-approve branch never continues the promotion chain, while EVERY server
+      finalisation pairs `UpsertModelEnvironmentVersion` with `ContinuePromotionChain`
+      (DdlApprovalService :173+182 vote, :321+326 two-stage, PromotionEndpoints :272+285 web).
+      So an add-in auto-approve on a Dev->Test->Prod topology lands only the first row: Prod never
+      advances and, with TWO_STAGE_PROMOTION_ENABLED, the terminal DDL-only step is never
+      enqueued, stalling the queue chain with no visible reason. The identical submission DOES
+      advance when it is vote-gated (the server's decision path continues it). Fixing needs an
+      architecture decision: `ContinuePromotionChain` is `MetaCore`, which ErwinAddIn does NOT
+      reference - either add the reference, move the writer next to `ApprovalConfigService` in
+      MetaShared, or have the add-in stop auto-approving locally and let the server finalise.
+- [ ] LIVE test (user): 334 discard on a locked column; 331 close all models; 324 switch to
+      Chrome during Generate DDL; 329 click erwin while the add-in is up, minimize, then run
+      a full Generate DDL to confirm the block suspends and re-applies; promotion send on a
+      model WITH an approver chain and one WITHOUT (auto-approve).
 
 ---
 
@@ -1162,3 +1575,202 @@ Fix:
 - Call sites updated to pass martPath: PromotionFlow.BuildSendContext (context preload), DdlApprovalDialog.LookupPromotionApprovers (send-time live read fallback).
 
 Verified: build 0/0 both flavors; tests 871/871 (+5 ResolveEffectiveApprovers: override-replaces-default, override-wins-over-non-empty-default, empty-override-falls-back, both-empty, end-to-end feeds RequiresApprovalVote). NOT committed (awaiting user OK). Awaiting live re-test round 2 on CORE BANKING: expect "Approval required" now, Pending row on send.
+
+# Integrate redesign (2026-07-26) - merge moves from DDL Review to its own tab
+
+User change of design: the merge chain must NOT hang off Generate DDL. DDL Review
+goes back to behaving exactly like promote; Integrate gets its own tab with one button.
+
+Done:
+- `Integrate` tab restored (`ModelConfigForm.Designer.cs` + `#region Integrate tab`).
+  Shown only for mart-hosted models whose config has `INTEGRATE_ENABLED`; body is
+  rebuilt on every connect so stale topology cannot linger.
+- Tab body: READ-ONLY pipeline diagram (`EnvironmentPipelineDiagram.SetData(...,
+  showPromoteButtons: false)` - new parameter), the `1_DEV -> 2_TEST` route, and ONE
+  `Integrate into <env>` button. Per-arrow buttons were wrong here: the merge always
+  targets the next environment, so a choice was being offered that does not exist.
+- Button flow: dirty gate -> approval-blocking rules -> two version comments ->
+  `RunIntegrateMergeAsync`. The dirty gate only lets a POSITIVE clean reading through;
+  `null` (title unreadable) refuses, because a merge stamps versions on BOTH models and
+  unsaved edits would ride into the next environment with DDL nobody reviewed.
+- DDL Review reverted to promote-like: `IntegrateMode`, `_integrateTarget`,
+  `_integrateCallback`, `RunIntegrateSendAsync` and the `BtnSend_Click` integrate branch
+  removed; the no-approver button now reads `Save and Close` (was `Save Model`); the
+  confirm dialog is back to a single comment there.
+- Dead code removed with the path that used it: `IntegrateFlow.ShouldOfferIntegrate`
+  (approver-based button switching) + its 2 tests. `ConfirmSubmitDialog`'s integrate
+  mode stays - the Integrate tab still needs both comments, because erwin raises two
+  description dialogs during the merge chain.
+
+Verified: build 0 warnings / 0 errors on all three flavors (default, PackagedBuild,
+DdlGenerator); tests 960/960. NOT committed.
+
+Open / carried over:
+- Black rectangles after the right model loads - user deferred ("sonra bakalim"),
+  candidate causes noted in `tasks/integrate-flow.md`.
+- "Close Model" second checkbox column offset (+24px) is still a measured guess; the
+  toolbar dump added earlier should reveal a proper check-all command id on the next run.
+- `BLOCKS_DDL_APPROVEMENT` migration exists for SQL Server only (no PG/Oracle script).
+
+# Integrate: tek yorum + dogru tamamlanma sarti (2026-07-26, ikinci tur)
+
+Kullanici: "integrate'de 2 tane comment aliniyor hala, gerek yok - ilk modelde
+degisiklik olmayacagi icin sadece integrate edilen 2. model icin comment yeterli."
+
+Yapilanlar:
+- `ConfirmSubmitDialog` integrate modu artik TEK kutu: "Version comment for <env>:".
+  Ikinci TextBox, `IntegrateDescription` property'si ve 470px ozel yukseklik gitti.
+- `RunIntegrateMerge` / `DriveIntegrateSaveCloseChain` tek `versionComment` aliyor;
+  erwin hangi description dialogunu acarsa ona yaziliyor.
+- **Bunu incelerken 17:23 kosusundaki takilmanin kok nedeni cikti**: dongu bitis
+  sarti "IKI description gorulsun"du. Integrate tabi kirli modeli reddettigi icin
+  calisilan model temiz; erwin onun icin aciklama sormuyor. Yani kosu, hic gelmeyecek
+  bir dialogu 85 saniye bekledi ve o sirada bir sonraki kosunun dialoglarini kapti.
+- Tamamlanma sarti artik dunya durumu: `CountOpenModelWindows()` merge oncesi
+  baseline'in ALTINA duserse (>=1 damga sarti ile) tamam. Baseline farki kullanildi,
+  mutlak sifir degil - kullanicinin baska modelleri acik olabilir. Okunamayan erwin
+  -1 donuyor ve asla "tamam" saymiyor.
+
+Verified: 3 flavor build 0/0, testler 963/963. NOT committed.
+CANLI TEST BEKLIYOR - tamamlanma sartinin gercek kosuda dogru tetiklendigi
+gorulmeli (log satiri: "cascade complete (... model windows N -> M)").
+
+# Integrate 18:10 kosusu - 2 duzeltme (2026-07-26)
+
+1. **Description doldurulmadi**: `Answered()` bloke beklemesi, erwin'in `Close Model`
+   USTUNE actigi `Description for ...` modalini gormemize engel oluyordu. Bloke bekleme
+   kaldirildi; yerine cevaplanmis-dialog defteri (HWND+caption) geldi - dongu canli
+   kalirken ayni dialog iki kez tiklanmiyor.
+2. **Sonuc mesaj kutusu erwin'i kilitledi**: mesaj kutusunun ic ice mesaj dongusune
+   WM_TIMER dagitiliyor, gate dusmustu, reconnect tick'i modal pump icinde calisti.
+   `AlterWizardGate` scope'u artik sonuc dialogunu de kapsiyor.
+
+Verified: 3 flavor build 0/0, testler 963/963. NOT committed.
+BLOKE: `Close Model` grid'inin satir sayisi ve kutucuk varsayilani bilinmiyor;
+manuel kesif kosusu gerekiyor (bkz. tasks/integrate-flow.md "HALA BILINMEYEN").
+
+# Integrate - kullanici ekran goruntuleriyle gelen 2 duzeltme (2026-07-26)
+
+1. **Kutucuklar artik okunuyor, kor tiklanmiyor.** Durum yapiskan (erwin son
+   birakilan hali hatirliyor), yani toggle guvenli degildi. `ReadCheckbox` ekran
+   pikselinden okuyor (XTPReport Win32'ye kapali, UIA yasak), gerekirse tikliyor,
+   sonra DOGRULUYOR. Dogrulanamazsa `SetAllRowCheckboxes` false donuyor ve cagiran
+   OK'a basmiyor - merge'i kaybetmektense dialog kullaniciya birakiliyor.
+   Kalibrasyon icin her cagride `[checkbox] gutter` izi loglaniyor.
+2. **Calisilan model artik kapatiliyor.** "Close Model" sadece hedefi listeliyor
+   (tek satir, ekran goruntusuyle kanitli); calisilan model icin erwin hic bir sey
+   sormuyor. Merge oncesi aktif MDI child yakalanip, ekranda hicbir cascade dialogu
+   kalmayinca WM_CLOSE gonderiliyor.
+
+Verified: 3 flavor build 0/0, testler 963/963. NOT committed.
+CANLI TEST BEKLIYOR.
+
+# Integrate 19:15 kosusu - 2 duzeltme (2026-07-26)
+
+Piksel okuma+dogrulama CALISTI: Close Model'de +12 zaten dogruydu (tiklanmadi),
++36 tiklanip dogrulandi, aciklama otomatik yazildi, calisilan modele WM_CLOSE gitti.
+
+1. **Kolon sayisi diyaloga gore degisiyor** (Close Model 2, Save Models 1).
+   Sabit iki-kolon varsayimi Save Models'ta abort etti. Kolonlar artik gutter
+   taramasindan KESFEDILIYOR. Ayirici mantik saf fonksiyona cikarildi
+   (`LocateCheckboxCentres`) ve loglardan alinan IKI GERCEK iz ile test edildi
+   (`CheckboxColumnLocatorTests`, 6 test).
+2. **Basarisizlik mesaji erwin'i kilitliyordu**: erwin'in kendi modali acikken
+   WinForms modal = ayni UI thread'de iki modal dongu -> deadlock
+   (`Save Models (Not Responding)`, 0 CPU). Artik native `ShowTopMostMessage`.
+
+Verified: 3 flavor build 0/0, testler 971/971. NOT committed.
+
+# Integrate 21:20 kosusu - zincir tamam, zamanlama duzeltildi (2026-07-26)
+
+Zincir bastan sona calisti: kolon kesfi (Close Model 2 / Save Models 1), kutucuk
+oku-tikla-dogrula, aciklama otomatik, calisilan model kapandi, cascade complete.
+
+Kalan sorun ZAMANLAMA idi: modeller MDI'dan cikinca `model windows 1 -> 0` sarti
+saglaniyor, ama erwin son versiyonu Mart'a hala YAZIYOR (yuzde penceresi). Cascade o
+bosluga "complete" dedi ve popup mesgul erwin'in ustune dustu -> deadlock.
+
+1. `WaitForErwinDialogsToClear` - complete demeden once erwin'in gorunur `#32770`
+   dialoglari temizlenene kadar bekliyor (120sn siniri, bekledigi baslik loglaniyor).
+   Sinif bazli arama; ilerleme penceresinin basligi hardcode edilmedi.
+2. BASARI popup'i da native `ShowTopMostMessage`. Onceki turda sadece basarisizlik
+   yolunu cevirmistim; basari yolu daha guvenli degil.
+
+Verified: 3 flavor build 0/0, testler 971/971. NOT committed.
+
+# Integrate - AKIS TAMAMLANDI + input block politikasi (2026-07-26)
+
+21:33 kosusu bastan sona basarili: merge, kutucuk oku-dogrula, aciklama otomatik,
+her iki model kapandi, `cascade complete`, native mesaj kutusu ile deadlock YOK.
+
+Kalan tek sorun input block'tu ve teshis ONCE OLCULEREK yapildi:
+`Responding=True` + `XTPMainFrame enabled=False` -> donma DEGIL, devre disi birakilma.
+
+Duzeltme: `ErwinInputBlock.ShouldBlock` saf politika fonksiyonu + `hasOpenModel` sarti.
+Model yokken bloklamak koruyacak bir sey olmadigi gibi kullaniciyi erwin'in
+menulerinden de ediyordu (yeni model acamiyor, kapatamiyor).
+`hasOpenModel` = `Win32Helper.GetActiveMdiChild(main) != Zero`, timeout'lu,
+"bilemiyorum" -> bloklama.
+
+Verified: 3 flavor build 0/0, testler 979/979 (+8 `ErwinInputBlockPolicyTests`).
+Kullanicinin acik erwin'i (pid 32588) `EnableWindow` ile kurtarildi, oldurulmedi.
+NOT committed.
+
+# "Mart save failed" - GetErwinMainWindow yaris kosulu (2026-07-26)
+
+Belirti: Generate DDL -> DDL Review -> comment -> gonder -> "Mart save failed.
+Approval not submitted". Ayni islem 26 dakika once calismisti.
+
+Log:
+    22:42:36.508 SaveCurrentModelWithDescription: dirty before save = True
+    22:42:36.617 SaveCurrentModelWithDescription: erwin XTPMainFrame HWND not resolvable - aborting.
+    22:42:36.709 DdlApprovalDialog: Mart save callback returned false; aborting queue insert.
+
+Kok neden: `SaveCurrentModelWithDescription` `Task.Run` icinde, yani ARKA PLAN
+thread'inde calisiyor. `GetErwinMainWindow` ana pencereyi BASLIKTAN buluyordu ve
+baslik okuma cross-thread `WM_GETTEXT` + 100ms `SMTO_ABORTIFHUNG`. erwin'in UI
+thread'i mesgulse yaris kaybediliyor, fonksiyon Zero donuyor, save iptal oluyor.
+Durum degil kura - bu yuzden "bazen oluyor".
+
+Duzeltme: pencere kimligi artik PENCERE SINIFINDAN (`XTPMainFrame`) kuruluyor.
+`GetClassName` / `IsWindowVisible` / `GetWindowThreadProcessId` window manager'dan
+mesajsiz okunur, thread durumuna bagimli degildir. Baslik yalnizca adaylar arasinda
+ayrim icin; hic `XTPMainFrame` yoksa eski baslik taramasi ikinci gecis olarak duruyor
+(davranis supersetı, daralma yok). Ayrica sadece frame adaylari baslik icin
+sorgulaniyor, yani takilmis bir `#32770` artik enum'a hic maliyet cikarmiyor.
+
+Verified: 3 flavor build 0/0, testler 979/979. NOT committed.
+
+# Integrate: dirty kapisi kaldirildi (2026-07-26, kullanici karari)
+
+`OnIntegrateClicked` artik modelin kirli olup olmadigina bakmiyor. Kaldirilan blok
+dirty (veya durumu okunamayan) modelde uyari verip zinciri kesiyordu.
+
+Etkisi: kaydedilmemis degisiklikler de merge'e dahil oluyor (compare ekraninda
+kullaniciya zaten gosteriliyor) ve erwin kapanis zincirinde calisilan model icin de
+kendi save/description dialoglarini aciyor. Cascade her description dialoguna AYNI
+tek yorumu yazdigi icin bu ek dialog kendiliginden isleniyor - kod degisikligi
+gerekmedi.
+
+`MartMartAutomation.IsActiveMdiChildDirtyByTitle` duruyor: promotion akisi ve DDL
+review yollari (3 cagiran) hala kullaniyor.
+
+Verified: 3 flavor build 0/0, testler 979/979. NOT committed.
+
+# Integrate sonuc popup'i: add-in dialogu geri, guvenlik korundu (2026-07-26)
+
+Kullanici native Windows popup yerine add-in'in kendi (daha guzel) dialogunu istedi.
+Native'e gecmemin sebebi gercek bir deadlock'ti (ayni gun IKI kez oturum kaybi), o
+yuzden kosulsuz geri almak yerine `ShowIntegrateResult` eklendi:
+
+- erwin'de gorunur bir `#32770` YOKSA -> `Forms.AddinMessageDialog` (guzel olan).
+- VARSA -> native `ShowTopMostMessage`.
+- Prob'un kendisi patlarsa "erwin mesgul" sayiliyor (guvenli yon).
+
+Cascade zaten `WaitForErwinDialogsToClear` ile erwin susana kadar bekliyor, yani
+normal akista kullanici hep add-in dialogunu gorecek. Bu kontrol istisnanin oturuma
+mal olmasini engelleyen kisim.
+
+`MartMartAutomation.FirstVisibleErwinDialogTitle` private -> internal.
+
+Verified: 3 flavor build 0/0, testler 979/979. NOT committed.

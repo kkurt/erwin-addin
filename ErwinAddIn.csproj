@@ -50,6 +50,12 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- The test project verifies internal automation invariants (e.g. the integrate
+         single-flight token is released on every exit path). -->
+    <InternalsVisibleTo Include="ErwinAddIn.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- ADO.NET providers for multi-database support -->
     <PackageReference Include="ExcelDataReader" Version="3.7.0" />
     <PackageReference Include="ExcelDataReader.DataSet" Version="3.7.0" />

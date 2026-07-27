@@ -2209,3 +2209,72 @@ the 2026-06-23 "positive confirmation before destructive action" lesson.
   otomasyon eklerken o pencere icin timer'lari gate'le/suspend et - AlterWizardGate tek
   basina yeni pump'lari KAPSAMAZ (title'a bagli). 2026-07-20 black-rectangle dersinin
   freeze-versiyonu.
+
+## Buton Enabled state'i re-entrancy korumasi DEGILDIR (2026-07-26)
+
+`OnIntegrateClicked` uzun suren isi `btn.Enabled=false` ile korudu sandim. Ama o buton
+`RebuildIntegrateTab` tarafindan dispose edilip YENIDEN yaratiliyor (reconnect /
+Reload Config). Kullanici Reload Config'e basinca taze ve ENABLED bir buton olustu,
+ikinci kosu basladi ve iki otomasyon dongusu ayni erwin dialoglarini paylasip erwin'i
+Mart save icinde kilitledi.
+
+Kural: **bir otomasyon kosusunun tekligi, o kosuyu calistiran katmanda tutulmali**
+(static Interlocked claim + finally release), UI kontrolunun state'inde degil. UI
+kontrolu sadece aciklayici; otorite otomasyonun kendisinde.
+
+## Dialog otomasyonunda "tekrar dene" sessizce geri alabilir (2026-07-26)
+
+Checkbox tiklamasi TOGGLE'dir. Dongunun "dialog hala duruyor -> tekrar isle" davranisi
+ilk pass'i geri aliyordu; sonuc: kaydedilmesi gereken model kaydedilmeden kapandi.
+Kural: bir dialogu cevapladiktan sonra **kapanmasini bekle**; kapanmiyorsa tekrar
+tiklama, birak ve net logla. Idempotent olmayan bir eylemi asla dongude tekrarlama.
+
+## Ekran otomasyonunda "durum" varsayilmaz, OKUNUR (2026-07-26)
+
+erwin'in checklist kutucuklari YAPISKAN geliyor (son birakildigi hali hatirliyor).
+Tik bir toggle oldugu icin kor tiklamak sonucu kumara ceviriyordu: model kaydedilip
+kapatilmiyor ya da tam tersi. XTPReport Win32'ye kapali, UIA bu dialoglarda erwin'i
+cokertiyor - geriye EKRAN PIKSELI kaldi. Kural: oku -> gerekirse tikla -> TEKRAR OKU.
+Dogrulanamiyorsa devam etme, kullaniciya birak.
+
+Ikinci yari: gecerli olan sey de VARSAYILMAZ. Kolon sayisi diyaloga gore degisiyordu
+(Close Model 2, Save Models 1); aritmetik yerine kesif + saf, test edilebilir bir
+ayirici fonksiyon.
+
+## erwin'in modali acikken WinForms modal ACMA (2026-07-26)
+
+erwin ve add-in ayni UI thread'i paylasiyor. erwin'in kendi modal dongusu acikken
+(`XTPMainFrame enabled=False` bunun isareti) add-in'den WinForms modal acmak thread'i
+kilitliyor: `Save Models (Not Responding)`, erwin 0 CPU. Native `MessageBoxW`
+(`ErwinAddIn.ShowTopMostMessage`) WinForms'un modal makinesini tasimadigi icin guvenli.
+Otomasyonun BASARISIZLIK yollarinda varsayilan bu olmali - zaten erwin'de bir dialog
+acik oldugu icin basarisiz olmustur.
+
+## "Donmus" ile "devre disi" ayrimini OLCMEDEN teshis koyma (2026-07-26)
+
+Kullanici "erwin kilitlendi" dedigi bes durumun dordu gercek deadlock'ti
+(`Responding=False`, 0 CPU), biri ise tamamen farkliydi: `Responding=True` +
+`IsWindowEnabled=False`. Devre disi pencere normal gorunur, "(Not Responding)"
+yazmaz, ama her tiklamayi yutar - kullaniciya donmus gibi gelir.
+
+Kural: "kilitlendi" raporunda ONCE olc:
+  Get-Process -> Responding + CPU ornegi (donma mi?)
+  EnumWindows -> IsWindowEnabled (devre disi mi?)
+Ikisi farkli kok neden, farkli duzeltme, ve devre disi olan process OLDURULMEZ -
+`EnableWindow(h, true)` oturumu kurtarir.
+
+## Arka plan thread'inden pencere bulurken MESAJ GONDERME (2026-07-26)
+
+`Win32Helper.GetErwinMainWindow` erwin'in ana penceresini BASLIKTAN buluyordu.
+Baslik okuma = cross-thread `WM_GETTEXT` + 100ms `SMTO_ABORTIFHUNG`. Cagiran
+`Task.Run` icindeyse ve erwin'in UI thread'i o an mesgulse yaris kaybediliyor ve
+fonksiyon Zero donuyor -> "XTPMainFrame HWND not resolvable" -> Mart save iptal.
+
+Belirtisi ihanet edici: AYNI kullanici islemi 22:16'da calisti, 22:42'de calismadi.
+Durum degil, KURA. "Bazen oluyor" diyen bir hata gordugumde ilk sorum artik: bu yolda
+cross-thread SendMessage var mi?
+
+Kural: pencere kimligini MESAJSIZ okunabilen seylerden kur - `GetClassName`,
+`IsWindowVisible`, `GetWindowThreadProcessId` window manager'dan direkt okunur, hicbir
+thread'e bagimli degildir. Baslik sadece ADAYLAR ARASINDA AYRIM icin kullanilir,
+bulmanin TEK yolu olarak degil.

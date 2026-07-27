@@ -18,7 +18,7 @@ namespace EliteSoft.Erwin.AddIn.Services
     /// <param name="Routes">Candidate promotion routes per <see cref="PromotionPlanner.BuildRoutes"/>; empty = nothing to offer.</param>
     /// <param name="PlanningVersion">The version routes were planned for; null = the send-time save will mint a fresh version (no environment can hold it).</param>
     /// <param name="ModelCleanByTitle">True when the title-asterisk probe read a POSITIVE clean (the send will skip the Mart save and promote the open version).</param>
-    /// <param name="ApproversByRelationId">Per-transition approver names (ENVIRONMENT_RELATION_APPROVER, SORT_ORDER order) for every relation appearing in <see cref="Routes"/> - preloaded so the dialog needs no DB read to show the approval/auto-approve indicator.</param>
+    /// <param name="Approvers">The MODEL's promotion approver chain (primary slot names, SEQ order) - preloaded so the dialog needs no DB read to show the approval/auto-approve indicator. One list per model, NOT per transition: since admin 1795ce3 the chain is scoped to (CONFIG_ID, MART_PATH) and governs every route, so a send-time route re-derivation can never land on an unpreloaded transition. Empty = no gate = auto-approve.</param>
     public sealed record PromotionSendContext(
         int ConfigId,
         string MartPath,
@@ -27,7 +27,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         IReadOnlyList<PromotionRoute> Routes,
         int? PlanningVersion,
         bool ModelCleanByTitle,
-        IReadOnlyDictionary<int, IReadOnlyList<string>> ApproversByRelationId);
+        IReadOnlyList<string> Approvers);
 
     /// <summary>
     /// Result of the promotion-aware Mart save step. Unlike the plain DDL push
@@ -162,15 +162,16 @@ namespace EliteSoft.Erwin.AddIn.Services
             var routes = PromotionPlanner.BuildRoutes(
                 planningVersion ?? -1, environments, relations, versions);
 
-            // Preload the per-transition approver lists of every offered route
-            // so the dialog can show the approval/auto-approve indicator
-            // without further DB reads.
-            var approvers = new Dictionary<int, IReadOnlyList<string>>();
-            foreach (var route in routes)
-            {
-                if (!approvers.ContainsKey(route.Relation.Id))
-                    approvers[route.Relation.Id] = PromotionService.Instance.GetRelationApprovers(route.Relation.Id, martPath);
-            }
+            // Preload the model's approver chain so the dialog can show the
+            // approval/auto-approve indicator without further DB reads. ONE read per
+            // context (not one per route): the chain is scoped to the model, so every
+            // offered transition shares it.
+            // The lookup key is the ENVIRONMENT-LESS catalog path admin stores the chain
+            // under, not the open model's environment-specific path - see
+            // IntegrationPlanner.ResolveApproverCatalogPath.
+            string approverPath = IntegrationPlanner.ResolveApproverCatalogPath(martPath, environments) ?? martPath;
+            IReadOnlyList<string> approvers =
+                PromotionService.Instance.GetModelPromotionApprovers(configId, approverPath);
 
             log?.Invoke($"PromotionFlow: context built - config={configId}, path='{martPath}', " +
                         $"cleanByTitle={clean}, planningVersion={(planningVersion?.ToString() ?? "(new)")}, " +

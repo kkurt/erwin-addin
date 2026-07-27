@@ -9048,6 +9048,20 @@ namespace EliteSoft.Erwin.AddIn.Services
         private bool TryDeleteNewAttribute(dynamic attr, string tableName, string columnName)
         {
             if (attr == null) return false;
+
+            // A locked predefined column must ALWAYS exist. The Column-tab delete path
+            // (RestoreDeletedLockedColumns) re-adds one that was deleted, but that path
+            // relies on the heartbeat's consecutive-snapshot diff - a column that is
+            // created and immediately discarded (Required Properties / Required field
+            // Cancel) was never in a prior snapshot AND its snapshot is dropped here, so
+            // the restore never fires and the locked column vanishes (WP 334). Intercept
+            // at the single delete primitive while the column is still present: keep it
+            // and show the SAME locked-column warning, rather than delete-then-recreate
+            // (which would re-open the very Required prompt the user just cancelled). This
+            // covers every discard-of-new-column site uniformly.
+            if (TryWarnLockedColumnDiscard(attr, tableName, columnName))
+                return false; // not deleted - caller keeps processing the retained column
+
             string objectId = "";
             try { objectId = attr.ObjectId?.ToString() ?? ""; }
             catch (Exception ex) { Log($"TryDeleteNewAttribute: ObjectId read failed for '{tableName}.{columnName}': {ex.Message}"); }
@@ -9081,6 +9095,52 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
                 return false;
             }
+        }
+
+        /// <summary>
+        /// If <paramref name="columnName"/> on <paramref name="tableName"/> is a locked
+        /// predefined column whose rule currently APPLIES to the entity, refuse the discard:
+        /// show the same <see cref="Forms.LockedColumnDialog"/> warning the Column-tab delete
+        /// path uses and return true so <see cref="TryDeleteNewAttribute"/> keeps the column.
+        /// Returns false (discard allowed) when nothing is locked, the entity cannot be
+        /// resolved, or a CONDITIONAL lock's condition no longer holds (lock released by design,
+        /// see <see cref="PredefinedColumnService.FindApplicableLockedRule"/>). Cheap in-memory
+        /// name pre-filter runs before any SCAPI entity resolution. New-column discard only.
+        /// </summary>
+        private bool TryWarnLockedColumnDiscard(dynamic attr, string tableName, string columnName)
+        {
+            if (string.IsNullOrEmpty(columnName) || string.IsNullOrEmpty(tableName)) return false;
+            if (!PredefinedColumnService.Instance.IsLoaded) return false;
+            // Name pre-filter: no locked rule bears this name -> allow discard with zero SCAPI cost.
+            if (!PredefinedColumnService.Instance.IsLockedColumnName(columnName)) return false;
+
+            dynamic entity;
+            try { entity = ResolveEntityByName(tableName); }
+            catch (Exception ex)
+            {
+                Log($"TryWarnLockedColumnDiscard: entity resolve failed for '{tableName}.{columnName}': {ex.Message}");
+                return false; // cannot confirm applicability - do not block the discard
+            }
+            if (entity == null) return false;
+
+            // Conditional locks release when their gating condition no longer holds; only an
+            // APPLICABLE rule blocks the discard.
+            dynamic rule;
+            try { rule = PredefinedColumnService.Instance.FindApplicableLockedRule(entity, columnName); }
+            catch (Exception ex)
+            {
+                Log($"TryWarnLockedColumnDiscard: rule lookup failed for '{tableName}.{columnName}': {ex.Message}");
+                return false;
+            }
+            if (rule == null) return false;
+
+            string detail = $"Datatype: {rule.DataType}\nNullable: {(rule.Nullable ? "yes" : "no")}"
+                + (string.IsNullOrEmpty(rule.DefaultValue) ? "" : $"\nDefault: \"{rule.DefaultValue}\"")
+                + (rule.IsPrimaryKey ? "\nPK: yes" : "");
+            string dedupe = $"discard|{tableName}|{columnName}";
+            Log($"Locked predefined-column discard intercepted: '{tableName}.{columnName}' (locked rule#{rule.Id}) - keeping column");
+            EnqueueLockedColumnDialogAndApply(columnName, tableName, Forms.LockedColumnAction.Delete, detail, dedupe, null);
+            return true;
         }
 
         /// <summary>

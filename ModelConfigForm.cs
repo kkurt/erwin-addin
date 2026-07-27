@@ -136,6 +136,33 @@ namespace EliteSoft.Erwin.AddIn
         // dialog - no silent state).
         private readonly HashSet<string> _pipelineOwnedLocators = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+        // Mart path STEMS of models the Integrate flow told erwin to open (the next
+        // environment's copy, e.g. "Kursat/Integrate Test/2_TEST/MetaRepo").
+        //
+        // Separate from _pipelineOwnedLocators because that set matches on stem+VERSION of
+        // the SAME model the add-in is bound to; an integrate target is a DIFFERENT model
+        // in a DIFFERENT folder, so only the stem is known up front.
+        //
+        // Why it has to exist: the merge opens that model as a real PU. While the
+        // automation runs the wizard gate pauses every tick, but if the run ends (or
+        // fails) with the target still open, the reconnect tick would adopt it on the next
+        // pass and run the FULL connect flow against it - UDP sync, naming standards,
+        // validation - dirtying and re-versioning a model the user never opened. Observed
+        // as a live risk 2026-07-26 when a failed merge left the 2_TEST copy open.
+        private readonly HashSet<string> _integrateOwnedStems = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// True when <paramref name="locator"/> points at a model the Integrate flow
+        /// opened. Compared on the Mart stem alone, which is all the flow knows (and is
+        /// enough: the target is a distinct model, not another version of ours).
+        /// </summary>
+        private bool IsIntegrateOwnedLocator(string locator)
+        {
+            if (_integrateOwnedStems.Count == 0 || string.IsNullOrEmpty(locator)) return false;
+            string stem = ExtractMartStem(locator);
+            return !string.IsNullOrEmpty(stem) && _integrateOwnedStems.Contains(stem);
+        }
+
         // User-opened Mart-version copies of the BOUND model (Complete Compare
         // right side, Mart version browse) the reconnect gates refused to
         // adopt. Purely a log latch: membership only suppresses repeat logging
@@ -303,6 +330,9 @@ namespace EliteSoft.Erwin.AddIn
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
             base.OnFormClosed(e);
+            // Covers the close paths that bypass OnFormClosing (ForceClose already ran it,
+            // but a host-driven close can land here first).
+            try { Services.ErwinInputBlock.ReleaseNow("add-in closed"); } catch { /* best effort */ }
             try { StopDdlWorker(); } catch (Exception ex) { Log($"[DDLWORKER] stop on close err: {ex.Message}"); }
             CleanupResources();
         }
@@ -463,6 +493,12 @@ namespace EliteSoft.Erwin.AddIn
                     Log($"ConnectToModel REFUSED: PU[{modelIndex}] locator '{candidateLoc}' is a pipeline-owned version copy. Close that tab WITHOUT saving; staying in the current state.");
                     return;
                 }
+                if (IsIntegrateOwnedLocator(candidateLoc))
+                {
+                    Log($"ConnectToModel REFUSED: PU[{modelIndex}] locator '{candidateLoc}' is an INTEGRATE target the add-in opened for a Mart Merge. " +
+                        "Adopting it would UDP-sync and re-version a model the user never opened.");
+                    return;
+                }
                 // erwin's ephemeral Review copy is equally forbidden: it dies
                 // with the Review wizard and a binding to it dangles (native
                 // AV on the next dispatch - erwin crash 2026-06-10 10:47).
@@ -522,9 +558,9 @@ namespace EliteSoft.Erwin.AddIn
                 UpdateConnectionStatus(StatusConnecting, Color.Gray);
 
                 // Every connect starts with the Integrate tab hidden; only the
-                // config-driven success path re-shows it (when the resolved
-                // config has INTEGRATE_ENABLED). This single reset covers the
-                // mismatch / config-less / not-enabled exits uniformly.
+                // config-driven success path re-shows it. Covers the mismatch /
+                // config-less / not-enabled exits uniformly, so a previous model's
+                // topology can never linger.
                 SetIntegrateTabVisible(false);
 
                 Application.DoEvents();
@@ -615,7 +651,7 @@ namespace EliteSoft.Erwin.AddIn
                         // the known set and the count baseline below means a
                         // surviving leftover can never skew the tick's
                         // count-drop arithmetic.
-                        if (_pipelineOwnedLocators.Contains(loc))
+                        if (_pipelineOwnedLocators.Contains(loc) || IsIntegrateOwnedLocator(loc))
                         {
                             pipelineOwnedOpen++;
                             continue;
@@ -822,6 +858,11 @@ namespace EliteSoft.Erwin.AddIn
                 if (_pipelineOwnedLocators.Contains(puLoc))
                 {
                     Log($"TabSwitch: PU[{i}] skipped (pipeline-owned version copy)");
+                    continue;
+                }
+                if (IsIntegrateOwnedLocator(puLoc))
+                {
+                    Log($"TabSwitch: PU[{i}] skipped (Integrate target opened by the add-in)");
                     continue;
                 }
 
@@ -1122,6 +1163,15 @@ namespace EliteSoft.Erwin.AddIn
         {
             // black-rect Test 1: zero add-in timer work while the alter wizard renders.
             if (Services.AlterWizardGate.IsOpen || Services.MartSaveGate.IsActive) return;
+
+            // WP 329 self-heal: this tick runs in EVERY state (disconnected, degraded,
+            // connected), which makes it the one place that can repair a stale input block -
+            // e.g. an automation path that never took a busy overlay, or WinForms re-enabling
+            // erwin behind our back. Deliberately AFTER the wizard/Mart-Save bail-out above:
+            // the block is already suspended for those runs, so nothing has to be touched
+            // while erwin renders (the black-rectangle reentrancy rule).
+            SyncErwinInputBlock();
+
             // Unified model-state monitor (2026-05-14). The timer is kept alive
             // in every state (disconnected, degraded, connected) and reacts
             // when an open PU's locator diverges from what we last successfully
@@ -1179,20 +1229,31 @@ namespace EliteSoft.Erwin.AddIn
                 // Costs one locator read per PU per tick, and only while a
                 // guard entry exists at all.
                 int openGuardedCount = 0;
-                if (_pipelineOwnedLocators.Count > 0)
+                if (_pipelineOwnedLocators.Count > 0 || _integrateOwnedStems.Count > 0)
                 {
                     var openLocs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    var openStems = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                     for (int i = 0; i < count; i++)
                     {
                         string loc = Services.PuLocatorReader.Read(
                             persistenceUnits.Item(i),
                             allowWindowTitleFallback: false) ?? string.Empty;
                         openLocs.Add(loc);
-                        if (_pipelineOwnedLocators.Contains(loc)) openGuardedCount++;
+                        string stem = ExtractMartStem(loc);
+                        if (!string.IsNullOrEmpty(stem)) openStems.Add(stem);
+                        if (_pipelineOwnedLocators.Contains(loc) || IsIntegrateOwnedLocator(loc)) openGuardedCount++;
                     }
                     int pruned = _pipelineOwnedLocators.RemoveWhere(l => !openLocs.Contains(l));
                     if (pruned > 0)
                         Log($"Reconnect guard: pruned {pruned} pipeline-owned locator(s) - the version copy is closed; normal model-switch handling restored.");
+
+                    // Same lifetime rule for the Integrate target: the guard drops only
+                    // once the model is really gone, so a merge that failed with the
+                    // target still open keeps it un-adoptable instead of handing the
+                    // add-in a model the user never opened.
+                    int prunedIntegrate = _integrateOwnedStems.RemoveWhere(st => !openStems.Contains(st));
+                    if (prunedIntegrate > 0)
+                        Log($"Reconnect guard: pruned {prunedIntegrate} Integrate target stem(s) - that model is closed; normal handling restored.");
                 }
                 int effectiveCount = count - openGuardedCount;
 
@@ -2155,8 +2216,8 @@ namespace EliteSoft.Erwin.AddIn
                 PopulateVersionCombos();
 
             // Config-driven success path: this is reached only with a resolved,
-            // DBMS-matched config, so it is the one place the Integrate tab may
-            // appear (gated again on INTEGRATE_ENABLED inside RefreshIntegrateTab).
+            // DBMS-matched config, so it is the one place the Integrate tab may appear
+            // (gated again inside RefreshIntegrateTab).
             using (AddinLogger.BeginScope("RefreshIntegrateTab"))
                 RefreshIntegrateTab();
 
@@ -5011,6 +5072,39 @@ namespace EliteSoft.Erwin.AddIn
             catch (Exception ex) { Log($"[RECON] RegisterHotKey threw: {ex.Message}"); }
         }
 
+        /// <summary>
+        /// WP 329 recoverability: a DISABLED window can still be RAISED by the taskbar or
+        /// Alt+Tab (activation is not input), so erwin's maximized frame could come to the
+        /// front and bury this window - the only one that can release the block. The user
+        /// then sees an erwin that ignores every click with no dialog to flash and no visible
+        /// cue: indistinguishable from the freeze this codebase has burned days on before.
+        /// A real modal cannot get into that state because Windows keeps an owned dialog above
+        /// its owner; we reproduce just that guarantee by coming back to the front whenever
+        /// the frame we blocked takes the foreground. Strictly gated on
+        /// <see cref="Services.ErwinInputBlock.IsApplied"/>, so it can never fight the
+        /// pipelines (they suspend the block and legitimately activate erwin's windows).
+        /// </summary>
+        protected override void OnDeactivate(EventArgs e)
+        {
+            base.OnDeactivate(e);
+            try
+            {
+                IntPtr blocked = Services.ErwinInputBlock.BlockedWindow;
+                if (blocked == IntPtr.Zero) return;
+                if (IsDisposed || !IsHandleCreated || !Visible
+                    || WindowState == FormWindowState.Minimized) return;
+                if (Services.Win32Helper.GetForegroundWindowPublic() != blocked) return;
+
+                Log("[ERWIN-BLOCK] blocked erwin frame was raised over the add-in - bringing the add-in back to front");
+                BringToFront();
+                Activate();
+            }
+            catch (Exception ex)
+            {
+                Log($"[ERWIN-BLOCK] re-raise on deactivate failed: {ex.Message}");
+            }
+        }
+
         protected override void OnHandleDestroyed(EventArgs e)
         {
             try { UnregisterHotKey(this.Handle, ReconHotkeyId); } catch { /* best-effort */ }
@@ -5020,6 +5114,9 @@ namespace EliteSoft.Erwin.AddIn
             try { UnregisterHotKey(this.Handle, SpikeCloseHotkeyId); } catch { /* best-effort */ }
             try { UnregisterHotKey(this.Handle, SpikeColdFireHotkeyId); } catch { /* best-effort */ }
             try { UnregisterHotKey(this.Handle, SpikeColdArmHotkeyId); } catch { /* best-effort */ }
+            // WP 329 last-ditch release: never leave the user with an erwin frame that
+            // refuses input because our window went away without a proper close.
+            try { Services.ErwinInputBlock.ReleaseNow("add-in window destroyed"); } catch { /* best-effort */ }
             base.OnHandleDestroyed(e);
         }
 
@@ -5083,6 +5180,467 @@ namespace EliteSoft.Erwin.AddIn
                     "Kapatmak icin butona tekrar bas.",
                     "Step Mode");
             }
+        }
+
+        /// <summary>
+        /// Runs the INTEGRATE automation (erwin Mart &gt; Merge onto the next environment)
+        /// off the UI thread and returns whether it completed.
+        ///
+        /// <para>Background thread on purpose, and safe: the automation is PURE WIN32
+        /// (PostMessage / dialog walks) with no SCAPI, so it is not STA-bound - and it
+        /// must not block the UI thread, because the middle of the run is the user working
+        /// in erwin's Resolve Differences window for as long as they need.</para>
+        ///
+        /// </summary>
+        #region Integrate tab (environment promotion)
+
+        // Body of the Integrate tab; replaced wholesale on every rebuild (model switch /
+        // reconnect) so stale environment data never lingers.
+        private Panel _integrateContentPanel;
+
+        // Theme tokens mirrored from the General tab so the Integrate tab matches the
+        // rest of the add-in (accent blue, neutral text, error red).
+        private static readonly Color IntegrateAccent = Color.FromArgb(0, 102, 204);
+        private static readonly Color IntegrateTextSecondary = Color.FromArgb(120, 120, 120);
+        private static readonly Color IntegrateError = Color.FromArgb(204, 0, 0);
+
+        /// <summary>
+        /// True when the active model's config has the Integrate feature switched on,
+        /// resolved exactly like the admin side (CONFIG_PROPERTY -&gt; CORPORATE_PROPERTY
+        /// -&gt; false). Requires a resolved config on a MART-HOSTED model: config-less /
+        /// mismatch / local-file models never qualify.
+        /// </summary>
+        private bool IsIntegrateEnabled()
+        {
+            var ctx = ConfigContextService.Instance;
+            if (!ctx.IsInitialized || !ctx.IsMartModel || ctx.ActiveConfigId <= 0) return false;
+            return ctx.GetEffectiveBool("INTEGRATE_ENABLED", false);
+        }
+
+        /// <summary>
+        /// Shows or hides the Integrate tab. WinForms TabPage has no usable Visible, so a
+        /// conditional tab is toggled by membership in tabControl.TabPages. Appended last
+        /// to preserve tab order; idempotent.
+        /// </summary>
+        private void SetIntegrateTabVisible(bool show)
+        {
+            if (tabControl == null || tabIntegrate == null) return;
+            bool present = tabControl.TabPages.Contains(tabIntegrate);
+            if (show && !present) tabControl.TabPages.Add(tabIntegrate);
+            else if (!show && present) tabControl.TabPages.Remove(tabIntegrate);
+        }
+
+        /// <summary>
+        /// Connect-time entry point: shows and (re)builds the Integrate tab only for
+        /// configs with INTEGRATE_ENABLED; otherwise leaves it hidden. A failure to read
+        /// the flag is surfaced to the log and the tab stays hidden rather than breaking
+        /// the model connect.
+        /// </summary>
+        private void RefreshIntegrateTab()
+        {
+            bool enabled;
+            try
+            {
+                enabled = IsIntegrateEnabled();
+            }
+            catch (Exception ex)
+            {
+                Log($"Integrate: enabled-flag read failed, tab hidden: {ex.Message}");
+                SetIntegrateTabVisible(false);
+                return;
+            }
+
+            if (!enabled) { SetIntegrateTabVisible(false); return; }
+
+            SetIntegrateTabVisible(true);
+            RebuildIntegrateTab();
+        }
+
+        /// <summary>
+        /// Builds the Integrate tab: the pipeline topology (READ-ONLY - no per-arrow
+        /// buttons) plus ONE explicit "Integrate" button for the next environment.
+        ///
+        /// <para>Single button by design (user 2026-07-26): the merge always targets the
+        /// NEXT environment, so per-transition buttons offered a choice that does not
+        /// exist and a second way to trigger the same thing.</para>
+        ///
+        /// <para>A MetaRepo read failure is rendered IN the tab, never swallowed.</para>
+        /// </summary>
+        private void RebuildIntegrateTab()
+        {
+            if (_integrateContentPanel != null)
+            {
+                tabIntegrate.Controls.Remove(_integrateContentPanel);
+                _integrateContentPanel.Dispose();
+                _integrateContentPanel = null;
+            }
+
+            var content = new Panel { Dock = DockStyle.Fill, BackColor = Color.White, AutoScroll = true };
+            _integrateContentPanel = content;
+            tabIntegrate.Controls.Add(content);
+
+            content.Controls.Add(new Label
+            {
+                Text = "Integrate",
+                Font = new Font("Segoe UI", 16f, FontStyle.Bold),
+                ForeColor = IntegrateAccent,
+                AutoSize = true,
+                Location = new Point(12, 12),
+            });
+            content.Controls.Add(new Label
+            {
+                Text = "Merge this model into the next deployment environment.",
+                Font = new Font("Segoe UI", 9f),
+                ForeColor = IntegrateTextSecondary,
+                AutoSize = true,
+                Location = new Point(14, 44),
+            });
+            content.Controls.Add(new Panel
+            {
+                Location = new Point(14, 66),
+                Size = new Size(60, 3),
+                BackColor = IntegrateAccent,
+            });
+
+            const int bodyTop = 96;
+
+            IReadOnlyList<IntegrationEnvironment> environments;
+            IReadOnlyList<IntegrationRelation> relations;
+            try
+            {
+                var ctx = ConfigContextService.Instance;
+                environments = IntegrationEnvironmentService.GetEnvironments(ctx.ActiveConfigId);
+                relations = IntegrationEnvironmentService.GetRelations(ctx.ActiveConfigId);
+            }
+            catch (Exception ex)
+            {
+                Log($"Integrate: failed to read the environment topology: {ex.Message}");
+                content.Controls.Add(BuildIntegrateMessage(
+                    "Could not read deployment environments from the repository:" + Environment.NewLine + ex.Message,
+                    IntegrateError, bodyTop));
+                return;
+            }
+
+            var target = Services.IntegrateFlow.ResolveTarget(
+                ConfigContextService.Instance.MartPath, environments, relations);
+
+            if (target == null)
+            {
+                var current = IntegrationPlanner.ResolveCurrentEnvironment(
+                    ConfigContextService.Instance.MartPath, environments);
+                content.Controls.Add(BuildIntegrateMessage(
+                    current == null
+                        ? "This model is not in a managed environment."
+                        : $"{current.Name} is the last environment in the pipeline - there is nothing to integrate into.",
+                    IntegrateTextSecondary, bodyTop));
+                return;
+            }
+
+            // Topology, read-only: the single button below is the only trigger.
+            var diagram = new EnvironmentPipelineDiagram { Location = new Point(14, bodyTop) };
+            diagram.SetData(environments, relations, target.CurrentEnvironment.Id, showPromoteButtons: false);
+            content.Controls.Add(diagram);
+
+            int routeTop = bodyTop + diagram.Height + 16;
+            content.Controls.Add(new Label
+            {
+                Text = target.CurrentEnvironment.Name + "  →  " + target.TargetEnvironment.Name,
+                Font = new Font("Segoe UI", 12f, FontStyle.Bold),
+                ForeColor = Color.FromArgb(40, 40, 40),
+                AutoSize = true,
+                Location = new Point(16, routeTop),
+            });
+            content.Controls.Add(new Label
+            {
+                Text = "The merge opens the " + target.TargetEnvironment.Name +
+                       " copy of this model as the right side.",
+                Font = new Font("Segoe UI", 9f),
+                ForeColor = IntegrateTextSecondary,
+                AutoSize = true,
+                Location = new Point(16, routeTop + 26),
+            });
+
+            var btnIntegrate = new Button
+            {
+                Text = "Integrate into " + target.TargetEnvironment.Name,
+                Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+                Size = new Size(220, 34),
+                Location = new Point(16, routeTop + 56),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(46, 125, 50),
+                ForeColor = Color.White,
+                Cursor = Cursors.Hand,
+            };
+            btnIntegrate.FlatAppearance.BorderSize = 0;
+            btnIntegrate.Click += async (s, e) => await OnIntegrateClicked(btnIntegrate, target);
+            content.Controls.Add(btnIntegrate);
+
+            // Centre the diagram horizontally; the text block stays left-aligned.
+            void Centre()
+            {
+                int avail = content.ClientSize.Width;
+                int x = diagram.Width < avail ? Math.Max(14, (avail - diagram.Width) / 2) : 14;
+                diagram.Left = x;
+            }
+            Centre();
+            content.SizeChanged += (s, e) => Centre();
+        }
+
+        /// <summary>
+        /// Shows the end-of-Integrate result in the add-in's own dialog, which matches the
+        /// rest of the UI - but drops to a native <c>MessageBoxW</c> whenever erwin still
+        /// has a dialog of its own on screen.
+        ///
+        /// <para>erwin and the add-in share one UI thread, and a WinForms modal stacked on
+        /// erwin's own modal loop deadlocks that thread. It happened twice on 2026-07-26
+        /// and cost the session both times: once with "Save Models (Not Responding)"
+        /// behind this very popup, once with the final Mart write frozen short of 100%.
+        /// WinForms brings owner-disabling and <c>IsDialogMessage</c> with it;
+        /// <c>MessageBoxW</c> brings neither and survives any nesting.</para>
+        ///
+        /// <para>The cascade already waits for erwin to go quiet before it reports, so the
+        /// pretty dialog is what the user normally sees. This is the check that keeps the
+        /// exception from costing a session, and a probe that itself fails counts as
+        /// "erwin is busy" - the safe direction.</para>
+        /// </summary>
+        private void ShowIntegrateResult(string text, MessageBoxIcon icon)
+        {
+            string erwinDialog;
+            try
+            {
+                erwinDialog = Services.MartMartAutomation.FirstVisibleErwinDialogTitle();
+            }
+            catch (Exception ex)
+            {
+                Log($"Integrate: erwin-dialog probe threw {ex.GetType().Name}: {ex.Message} - using the native popup.");
+                erwinDialog = "(probe failed)";
+            }
+
+            if (erwinDialog == null)
+            {
+                Forms.AddinMessageDialog.Show(this, text, "Integrate", MessageBoxButtons.OK, icon);
+                return;
+            }
+
+            Log($"Integrate: erwin still shows '{erwinDialog}' - using the native popup so the shared UI thread cannot deadlock.");
+            ErwinAddIn.ShowTopMostMessage(text, "Integrate", isError: false);
+        }
+
+        /// <summary>Builds a single informational/empty-state label for the tab body.</summary>
+        private Label BuildIntegrateMessage(string text, Color color, int top) => new Label
+        {
+            Text = text,
+            Font = new Font("Segoe UI", 10f),
+            ForeColor = color,
+            AutoSize = true,
+            MaximumSize = new Size(820, 0),
+            Location = new Point(14, top),
+        };
+
+        /// <summary>
+        /// The single Integrate button: refuse a DIRTY model, collect the two version
+        /// comments, then run the Mart &gt; Merge chain.
+        ///
+        /// <para>The dirty gate is the important half. A merge stamps new Mart versions on
+        /// BOTH models, so unsaved edits would either be silently carried into the target
+        /// or lost - and their DDL was never reviewed. Generate DDL is where review and
+        /// save belong, so the user is sent back there.</para>
+        /// </summary>
+        private async System.Threading.Tasks.Task OnIntegrateClicked(
+            Button btn, Services.IntegrateSendContext target)
+        {
+            // Re-entrancy: NOT guarded by btn.Enabled. RebuildIntegrateTab disposes this
+            // button and creates a fresh ENABLED one on every reconnect / Reload Config,
+            // so a run in flight leaves nothing disabled behind. Ask the automation
+            // instead. (The authoritative claim is the atomic one inside
+            // RunIntegrateMerge; this check exists so the user is refused BEFORE being
+            // asked for version comments.)
+            if (Services.MartMartAutomation.IsIntegrateRunning)
+            {
+                Log("Integrate: refused - a run is already in progress.");
+                Forms.AddinMessageDialog.Show(this,
+                    "An Integrate run is already in progress." + Environment.NewLine + Environment.NewLine +
+                    "Wait for it to finish before starting another one. The Debug Log shows which step it is on.",
+                    "Integrate", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            // NO dirty gate (user 2026-07-26). An earlier version refused a dirty model and
+            // sent the user back to Generate DDL first; unsaved edits are now simply part
+            // of what gets merged, which is what the compare shows them anyway. erwin then
+            // raises its own save/description dialogs for the working model during the
+            // close cascade, and those are answered like any other.
+
+            // Approval-blocking rules: a merge delivers this model INTO the next
+            // environment, which is exactly the hand-off the gate exists to refuse. Runs
+            // before the comment dialog so a blocked model is not asked for descriptions.
+            if (!CheckApprovalBlockingRules(this, $"Integrate to {target.TargetEnvironment.Name}"))
+                return;
+
+            // ONE comment (user 2026-07-26), stamped on every description dialog erwin
+            // raises - the target's for certain, and the working model's too when it turns
+            // out to be dirty.
+            string versionComment;
+            using (var confirm = new Forms.ConfirmSubmitDialog(
+                       approvalEnabled: false,
+                       integrateMode: true,
+                       targetEnvironmentName: target.TargetEnvironment.Name))
+            {
+                if (confirm.ShowDialog(this) != DialogResult.OK) return;
+                versionComment = confirm.Description;
+            }
+
+            btn.Enabled = false;
+            // The gate stays up ACROSS the result dialog, not just the merge.
+            //
+            // A message box runs a nested message loop, and WM_TIMER is dispatched into
+            // it - so the add-in's own reconnect/validation ticks fire while the user is
+            // still looking at the result. On 2026-07-26 18:11 that is exactly what
+            // happened: the merge gate dropped, the result box went up, the reconnect
+            // tick ran INSIDE its modal pump against a model erwin had just finished
+            // merging, and erwin deadlocked (0 CPU, not responding; the tick's log line
+            // is the last thing in the log). Ticks resume once the user clicks OK, by
+            // which time nothing is mid-flight. AlterWizardGate is ref-counted, so this
+            // scope simply extends the one RunIntegrateMergeAsync opens.
+            using var resultGate = Services.AlterWizardGate.Enter("Integrate (result dialog)");
+            try
+            {
+                bool ok = await RunIntegrateMergeAsync(target, versionComment);
+                if (ok)
+                {
+                    ShowIntegrateResult(
+                        "This model was merged into " + target.TargetEnvironment.Name + "." +
+                        Environment.NewLine + Environment.NewLine +
+                        "Both models were closed and " + target.TargetEnvironment.Name +
+                        " was saved with your version comment.",
+                        MessageBoxIcon.Information);
+                }
+                else
+                {
+                    ShowIntegrateResult(
+                        "The integrate into " + target.TargetEnvironment.Name + " did not complete." +
+                        Environment.NewLine + Environment.NewLine +
+                        "erwin may still have a dialog open - finish it by hand. The Debug Log names the step that stopped.",
+                        MessageBoxIcon.Warning);
+                }
+            }
+            finally
+            {
+                if (!btn.IsDisposed) btn.Enabled = true;
+            }
+        }
+
+        #endregion
+
+        private async System.Threading.Tasks.Task<bool> RunIntegrateMergeAsync(
+            Services.IntegrateSendContext target, string versionComment)
+        {
+            // The user may sit in Resolve Differences for a long time; this is a
+            // give-up bound, not an expectation.
+            const int UserWorkTimeoutMs = 60 * 60 * 1000;   // 1 hour
+
+            Action<string> log = msg =>
+            {
+                if (InvokeRequired) BeginInvoke(new Action(() => Log(msg)));
+                else Log(msg);
+            };
+
+            // Gate every add-in timer for the whole run. Mart > Merge opens the Complete
+            // Compare wizard, whose modal pump dispatches WM_TIMER - so an ungated tick
+            // does SCAPI/Win32 work IN THE MIDDLE of erwin's wizard rendering. That is
+            // the documented GDI-corruption path, and skipping the gate reproduced it on
+            // the first live run (2026-07-26: the add-in's own window came back
+            // mis-painted). AlterWizardGate cannot see this wizard by title, hence the
+            // explicit scope.
+            //
+            // The form is deliberately NOT hidden: unlike the DDL pipelines this flow
+            // synthesizes no mouse input (PostMessage + pure-Win32 dialog walks only), and
+            // hiding the OWNER of the still-open modal review dialog is its own hazard.
+            // Guard the target BEFORE erwin opens it: while the gate is up no tick runs,
+            // but a failed run can leave the target open, and the first tick after the
+            // gate drops would otherwise adopt it (full connect: UDP sync, naming
+            // standards, validation) on a model the user never opened.
+            _integrateOwnedStems.Add(target.TargetMartPath);
+            Log($"[INTEGRATE] adoption guard armed for '{target.TargetMartPath}'.");
+
+            using (Services.AlterWizardGate.Enter("Integrate (Mart Merge)"))
+            {
+                return await System.Threading.Tasks.Task.Run(() =>
+                    Services.MartMartAutomation.RunIntegrateMerge(
+                        target.TargetMartPath, versionComment, UserWorkTimeoutMs, log,
+                        // UIA is apartment-sensitive and this body runs on an MTA
+                        // threadpool thread; the checklist walk is marshalled back here.
+                        runOnUiThread: action =>
+                        {
+                            if (InvokeRequired) Invoke(action);
+                            else action();
+                        }));
+            }
+        }
+
+        /// <summary>
+        /// Runs <see cref="Services.ApprovalBlockingRuleGate"/> for one APPROVAL SUBMISSION
+        /// (Send to Approve / promotion send / Integrate promote) and returns true when the
+        /// submission may proceed. On a block it shows the report and returns false.
+        ///
+        /// <para>Deliberately NOT wired to Generate DDL: per the admin contract
+        /// (2026-07-25) a violating model may still be generated and reviewed - what it
+        /// cannot do is enter the governance queue. Every submit path therefore calls
+        /// THIS, and Generate DDL calls nothing.</para>
+        ///
+        /// <para>Also not wired to the unattended DDL queue worker: that worker never
+        /// submits for approval (it writes its DDL straight to its own queue row and the
+        /// review dialog is skipped while <c>_ddlQueueActive</c>), so there is no
+        /// unattended caller here and no modal-with-nobody-to-dismiss hazard.</para>
+        ///
+        /// <para>SYNCHRONOUS and on the UI thread: SCAPI is STA-bound, and running the walk
+        /// without pumping the message loop is what keeps the validation timers from
+        /// re-entering SCAPI mid-walk.</para>
+        /// </summary>
+        /// <param name="owner">Window the report is modal to (the caller's own dialog).</param>
+        /// <param name="actionName">User-facing name of the action being gated, e.g. "Send to Approve".</param>
+        internal bool CheckApprovalBlockingRules(IWin32Window owner, string actionName)
+        {
+            Services.ApprovalBlockingGateResult result;
+            try
+            {
+                // Box the session so the call binds STATICALLY. Passing the dynamic field
+                // straight through would route the whole invocation via the runtime
+                // binder, which additionally cannot accept the Log method group.
+                object session = _session;
+                Action<string> gateLog = Log;
+                // The walk enumerates every object of every blocking rule's type over COM
+                // and can run for seconds on a large model. UseWaitCursor says so without
+                // pumping the message loop - ShowBusyOverlay is deliberately NOT used here
+                // because it calls DoEvents, which would let the validation timers
+                // re-enter SCAPI mid-walk.
+                UseWaitCursor = true;
+                try { result = Services.ApprovalBlockingRuleGate.Evaluate(session, gateLog); }
+                finally { UseWaitCursor = false; }
+            }
+            catch (Exception ex)
+            {
+                // Evaluate() is written not to throw; if it ever does, the gate has failed
+                // to prove the model clean and the request must NOT be submitted.
+                Log($"[APPROVAL-GATE] {actionName} aborted - gate threw: {ex}");
+                Forms.AddinMessageDialog.Show(owner ?? this,
+                    $"The blocking rules could not be checked ({ex.Message}).\n\n" +
+                    $"{actionName} was not submitted.",
+                    actionName, MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return false;
+            }
+
+            if (!result.Blocked)
+            {
+                if (result.Enforced)
+                    Log($"[APPROVAL-GATE] {actionName} allowed ({result.RulesChecked} rule(s), " +
+                        $"{result.ObjectsInspected} object(s) checked).");
+                return true;
+            }
+
+            Log($"[APPROVAL-GATE] {actionName} BLOCKED - {result.Issues.Count} issue(s).");
+            Forms.ApprovalBlockingRulesDialog.ShowFor(result, owner ?? this, actionName);
+            return false;
         }
 
         private async void BtnAlterWizardProd_Click(object sender, EventArgs e)
@@ -5181,6 +5739,12 @@ namespace EliteSoft.Erwin.AddIn
                 Log("[ROUTE] Aborted: erwin main window is blocked by a modal dialog.");
                 return;
             }
+
+            // NOTE: the naming-rule blocking gate is deliberately NOT here. The admin
+            // contract (2026-07-25) gates ENTRY TO THE APPROVAL QUEUE, not generation: a
+            // model that violates a "Blocks DDL Approvement" rule may still be generated
+            // and reviewed, it just cannot be submitted. See
+            // CheckApprovalBlockingRules and its callers.
 
             btnAlterWizardProd.Enabled = false;
             lblDDLStatus.Text = "Generating DDL...";
@@ -6241,28 +6805,6 @@ namespace EliteSoft.Erwin.AddIn
             // execute against, which is what the approval reviewer needs.
             string dbmsType = ReadActivePuTargetServer();
 
-            // Approval routing is driven by the admin "Use Approvement Mechanism"
-            // FLAG (USE_APPROVEMENT_MECHANISM, two-level corporate -> model), NOT by
-            // whether approvers happen to be configured. Flag ON -> "Send to Approve"
-            // (the row stays Pending; the admin approves and fires the REST callback
-            // afterwards). Flag OFF -> "Send": the add-in saves the row as
-            // 'ApprovedBySystem' and fires the REST callback itself. On a read error,
-            // fail toward the SAFE path (approval, no auto-REST) and surface it -
-            // never silently auto-send. (Default when unset = false, per the admin
-            // seed.)
-            bool approvalEnabled;
-            try
-            {
-                approvalEnabled = Services.ConfigContextService.Instance
-                    .GetEffectiveBool("USE_APPROVEMENT_MECHANISM", false);
-                Log($"ShowDdlForApproval: config {ctx.ActiveConfigId} USE_APPROVEMENT_MECHANISM={approvalEnabled}");
-            }
-            catch (Exception ex)
-            {
-                Log($"ShowDdlForApproval: USE_APPROVEMENT_MECHANISM read failed ({ex.Message}); defaulting to approval path (Send to Approve, no auto-REST).");
-                approvalEnabled = true;
-            }
-
             // Version Promotion (WP 322): when the feature is enabled for this
             // config the send becomes a promotion request - ONE
             // REQUEST_TYPE='PROMOTION' row targeting an environment (decision
@@ -6301,6 +6843,63 @@ namespace EliteSoft.Erwin.AddIn
                 if (choice != System.Windows.Forms.DialogResult.Yes) return;
             }
 
+            // Approval routing is driven by WHETHER THIS MODEL HAS AN APPROVER CHAIN
+            // (MODEL_PROMOTION_APPROVER keyed on CONFIG_ID + MART_PATH), not by a config
+            // flag: USE_APPROVEMENT_MECHANISM is being retired (user 2026-07-25) and is no
+            // longer consulted anywhere in the add-in.
+            //   chain present -> the row waits as 'Pending'; the admin approves and fires
+            //                    the REST callback afterwards.
+            //   chain empty   -> there is no gate at all, so the row is 'ApprovedBySystem'
+            //                    and the add-in fires the REST callback itself. This is not
+            //                    a shortcut: the server REFUSES to resolve a quorum for a
+            //                    model with an empty catalog, so a Pending row must never
+            //                    be inserted for one.
+            // Promotion mode already preloaded the SAME chain into the send context, so it
+            // is reused rather than re-read - one source of truth, no chance of the button
+            // and the inserted status disagreeing.
+            bool approvalEnabled;
+            try
+            {
+                // The chain is stored under the ENVIRONMENT-LESS catalog path (one chain
+                // per logical model governs every environment of an Integrate pipeline) -
+                // see IntegrationPlanner.ResolveApproverCatalogPath. Looking it up with
+                // the open model's environment-specific path never matched.
+                string approverPath = ctx.MartPath;
+                IReadOnlyList<string> approvers;
+                if (promotionContext != null)
+                {
+                    approvers = promotionContext.Approvers;
+                }
+                else
+                {
+                    var environments = Services.IntegrationEnvironmentService.GetEnvironments(ctx.ActiveConfigId);
+                    approverPath = Services.IntegrationPlanner.ResolveApproverCatalogPath(ctx.MartPath, environments)
+                                   ?? ctx.MartPath;
+                    approvers = Services.PromotionService.Instance.GetModelPromotionApprovers(
+                        ctx.ActiveConfigId, approverPath);
+                }
+                approvalEnabled = approvers.Count > 0;
+                Log($"ShowDdlForApproval: config {ctx.ActiveConfigId} model '{ctx.MartPath}' " +
+                    $"(approver catalog '{approverPath}') chain = " +
+                    $"{approvers.Count} slot(s) [{string.Join(", ", approvers)}] -> " +
+                    $"{(approvalEnabled ? "Pending (approval required)" : "ApprovedBySystem (no approver defined for this model)")}");
+            }
+            catch (Exception ex)
+            {
+                // Unknown catalog, not known-empty. Of the two guesses, "there is a gate"
+                // is the recoverable one: it inserts a Pending row that a human can see and
+                // fix, whereas guessing "no gate" auto-approves AND fires the REST callback
+                // - unrecoverable. Surfaced, never silent.
+                Log($"ShowDdlForApproval: approver chain read failed ({ex.GetType().Name}: {ex.Message}); " +
+                    "assuming approval is required (Pending, no auto-REST).");
+                Forms.AddinMessageDialog.Show(this,
+                    $"The approver list for this model could not be read:\n{ex.Message}\n\n" +
+                    "The request will be submitted as PENDING approval rather than auto-approved.",
+                    "Approval routing", System.Windows.Forms.MessageBoxButtons.OK,
+                    System.Windows.Forms.MessageBoxIcon.Warning);
+                approvalEnabled = true;
+            }
+
             using var dlg = new Forms.DdlApprovalDialog(
                 ddlText:           ddl,
                 configId:          ctx.ActiveConfigId,
@@ -6312,7 +6911,12 @@ namespace EliteSoft.Erwin.AddIn
                 log:               (Action<string>)Log,
                 martSaveCallback:  SaveCurrentModelWithDescription,
                 promotionContext:  promotionContext,
-                promotionSaveCallback: SavePromotionModelWithDescription);
+                promotionSaveCallback: SavePromotionModelWithDescription,
+                // Naming-rule gate on ENTRY to the approval queue. Lives here (not in the
+                // dialog) because it needs the live SCAPI session; the dialog passes
+                // itself as the owner so the report is modal to the review window.
+                approvalBlockingGate: owner => CheckApprovalBlockingRules(
+                    owner, promotionContext != null ? "Send to Approval" : "Send to Approve"));
             dlg.ShowDialog(this);
         }
 
@@ -8283,6 +8887,50 @@ namespace EliteSoft.Erwin.AddIn
             }
         }
 
+        /// <summary>
+        /// Clears the DDL Generation tab to its no-model state: the Source (Left) model
+        /// label, the Target (Right) version combo + single-choice label, and the status
+        /// line. Called from the model-closed path (<see cref="HandleSessionLost"/>) so the
+        /// tab does not keep showing the just-closed model and its last "Alter DDL: N lines"
+        /// status after every model is closed - the General tab already reset there, but the
+        /// DDL tab was missed (WP 331). A later connect repopulates everything via
+        /// <see cref="PopulateVersionCombos"/>.
+        /// </summary>
+        private void ResetDdlTab()
+        {
+            try
+            {
+                _martLocator = null;
+                _martVersion = 0;
+
+                if (lblOpenedModel != null) lblOpenedModel.Text = "(no model open)";
+                if (cmbRightModel != null)
+                {
+                    cmbRightModel.Items.Clear();
+                    cmbRightModel.Enabled = false;
+                    // ApplyRightTargetSingleChoiceDisplay HIDES the combo whenever the closed
+                    // model had exactly one target version (the label stood in for it). Without
+                    // restoring visibility here the whole Target (Right) area would render
+                    // blank - combo hidden AND label hidden - instead of an empty, disabled combo.
+                    cmbRightModel.Visible = true;
+                }
+                if (lblRightModel != null)
+                {
+                    lblRightModel.Text = "";
+                    lblRightModel.Visible = false;
+                }
+                if (lblDDLStatus != null)
+                {
+                    lblDDLStatus.Text = "";
+                    lblDDLStatus.ForeColor = Color.FromArgb(120, 120, 120);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"ResetDdlTab error: {ex.Message}");
+            }
+        }
+
         private void PopulateVersionCombos()
         {
             cmbRightModel.Items.Clear();
@@ -8458,268 +9106,6 @@ namespace EliteSoft.Erwin.AddIn
         /// </summary>
         private void LogDebug(string message) => AddinLogger.LogDebug(message);
 
-        #region Integrate tab (environment promotion)
-
-        // Current body of the Integrate tab; replaced wholesale on every rebuild
-        // (model switch / reconnect) so stale environment data never lingers.
-        private Panel _integrateContentPanel;
-
-        // Theme tokens mirrored from the General tab so the Integrate tab matches
-        // the rest of the add-in (accent blue, neutral text, error red).
-        private static readonly Color IntegrateAccent = Color.FromArgb(0, 102, 204);
-        private static readonly Color IntegrateTextSecondary = Color.FromArgb(120, 120, 120);
-        private static readonly Color IntegrateError = Color.FromArgb(204, 0, 0);
-
-        /// <summary>
-        /// True when the active model's config has the Integrate feature switched
-        /// on, resolved exactly like the admin side (CONFIG_PROPERTY -&gt;
-        /// CORPORATE_PROPERTY -&gt; false). Requires a resolved config on a
-        /// MART-HOSTED model: config-less / mismatch / local-file models never
-        /// qualify. The IsMartModel guard matters because a local .erwin can be
-        /// config-initialized (2026-06-13) with MartPath set to its file path,
-        /// whose parent folder could coincidentally match an environment name;
-        /// every other Mart-driven feature in this form guards the same way.
-        /// </summary>
-        private bool IsIntegrateEnabled()
-        {
-            var ctx = ConfigContextService.Instance;
-            if (!ctx.IsInitialized || !ctx.IsMartModel || ctx.ActiveConfigId <= 0) return false;
-            return ctx.GetEffectiveBool("INTEGRATE_ENABLED", false);
-        }
-
-        /// <summary>
-        /// Shows or hides the Integrate tab. WinForms TabPage has no usable
-        /// Visible, so a conditional tab is toggled by membership in
-        /// tabControl.TabPages. Appended last to preserve tab order; idempotent.
-        /// </summary>
-        private void SetIntegrateTabVisible(bool show)
-        {
-            if (tabControl == null || tabIntegrate == null) return;
-            bool present = tabControl.TabPages.Contains(tabIntegrate);
-            if (show && !present) tabControl.TabPages.Add(tabIntegrate);
-            else if (!show && present) tabControl.TabPages.Remove(tabIntegrate);
-        }
-
-        /// <summary>
-        /// Connect-time entry point: shows and (re)builds the Integrate tab only
-        /// for configs with INTEGRATE_ENABLED; otherwise leaves it hidden. A
-        /// failure to read the enabled flag is surfaced to the log and the tab
-        /// stays hidden rather than breaking the model connect.
-        /// </summary>
-        private void RefreshIntegrateTab()
-        {
-            bool enabled;
-            try
-            {
-                enabled = IsIntegrateEnabled();
-            }
-            catch (Exception ex)
-            {
-                Log($"Integrate: enabled-flag read failed, tab hidden: {ex.Message}");
-                SetIntegrateTabVisible(false);
-                return;
-            }
-
-            if (!enabled)
-            {
-                SetIntegrateTabVisible(false);
-                return;
-            }
-
-            SetIntegrateTabVisible(true);
-            RebuildIntegrateTab();
-        }
-
-        /// <summary>
-        /// Builds the Integrate tab body from the admin ENVIRONMENT /
-        /// ENVIRONMENT_RELATION contract for the active config and the model's
-        /// current environment (its Mart parent folder). States: not in a managed
-        /// environment / no promotions / a single static target / a target combo,
-        /// each with a per-target Integrate button or an approval notice. A
-        /// MetaRepo read failure is rendered in the tab, never swallowed.
-        /// </summary>
-        private void RebuildIntegrateTab()
-        {
-            // Replace any previous body (a model switch / reconnect rebuilds this).
-            if (_integrateContentPanel != null)
-            {
-                tabIntegrate.Controls.Remove(_integrateContentPanel);
-                _integrateContentPanel.Dispose();
-                _integrateContentPanel = null;
-            }
-
-            var content = new Panel { Dock = DockStyle.Fill, BackColor = Color.White };
-            _integrateContentPanel = content;
-            tabIntegrate.Controls.Add(content);
-
-            var lblTitle = new Label
-            {
-                Text = "Integrate",
-                Font = new Font("Segoe UI", 16f, FontStyle.Bold),
-                ForeColor = IntegrateAccent,
-                AutoSize = true,
-                Location = new Point(12, 12)
-            };
-            content.Controls.Add(lblTitle);
-
-            var lblSubtitle = new Label
-            {
-                Text = "Promote this model between deployment environments.",
-                Font = new Font("Segoe UI", 9f),
-                ForeColor = IntegrateTextSecondary,
-                AutoSize = true,
-                Location = new Point(14, 44)
-            };
-            content.Controls.Add(lblSubtitle);
-
-            content.Controls.Add(new Panel
-            {
-                Location = new Point(14, 66),
-                Size = new Size(60, 3),
-                BackColor = IntegrateAccent
-            });
-
-            const int bodyTop = 96;
-
-            IReadOnlyList<IntegrationEnvironment> environments;
-            IntegrationEnvironment current;
-            try
-            {
-                var ctx = ConfigContextService.Instance;
-                environments = IntegrationEnvironmentService.GetEnvironments(ctx.ActiveConfigId);
-                current = IntegrationPlanner.ResolveCurrentEnvironment(ctx.MartPath, environments);
-            }
-            catch (Exception ex)
-            {
-                Log($"Integrate: failed to read environments: {ex.Message}");
-                content.Controls.Add(BuildIntegrateMessage(
-                    $"Could not read deployment environments from the repository:\n{ex.Message}",
-                    IntegrateError, bodyTop));
-                return;
-            }
-
-            if (current == null)
-            {
-                content.Controls.Add(BuildIntegrateMessage(
-                    "This model is not in a managed environment.", IntegrateTextSecondary, bodyTop));
-                return;
-            }
-
-            // Surface an admin data anomaly rather than resolving it silently:
-            // duplicate environment names within a config collapse to the same
-            // Mart folder and cannot be told apart from the path, so the lowest
-            // SORT_ORDER won the match above.
-            int sameNameCount = 0;
-            foreach (var e in environments)
-                if (string.Equals(e.Name, current.Name, StringComparison.OrdinalIgnoreCase)) sameNameCount++;
-            if (sameNameCount > 1)
-                Log($"Integrate: {sameNameCount} environments share the name '{current.Name}' in config " +
-                    $"{ConfigContextService.Instance.ActiveConfigId}; resolved to the lowest SORT_ORDER. " +
-                    $"Environment names should be unique per config.");
-
-            IReadOnlyList<IntegrationRelation> relations;
-            IReadOnlyList<PromotionTarget> targets;
-            try
-            {
-                var ctx = ConfigContextService.Instance;
-                relations = IntegrationEnvironmentService.GetRelations(ctx.ActiveConfigId);
-                targets = IntegrationPlanner.BuildTargets(current.Id, relations, environments);
-            }
-            catch (Exception ex)
-            {
-                Log($"Integrate: failed to read promotion transitions: {ex.Message}");
-                content.Controls.Add(BuildIntegrateMessage(
-                    $"Could not read promotion transitions from the repository:\n{ex.Message}",
-                    IntegrateError, bodyTop));
-                return;
-            }
-
-            // Full topology diagram (mirrors the admin Integrate screen): every
-            // environment + transition, the current environment highlighted, a
-            // promote button on each allowed (non-approval) transition out of it.
-            // Hosted on an auto-scroll surface so wide / deep pipelines stay reachable.
-            content.AutoScroll = true;
-            var diagram = new EnvironmentPipelineDiagram { Location = new Point(14, bodyTop) };
-            diagram.IntegrateRequested += target => OnIntegrateClicked(current, target);
-            diagram.SetData(environments, relations, current.Id);
-            content.Controls.Add(diagram);
-
-            int legendTop = bodyTop + diagram.Height + 12;
-            var legend = new Label
-            {
-                Text = "▶  Promote        ⚠  Requires approval",
-                Font = new Font("Segoe UI", 8.5f),
-                ForeColor = IntegrateTextSecondary,
-                AutoSize = true,
-                Location = new Point(16, legendTop)
-            };
-            content.Controls.Add(legend);
-
-            int actionable = 0;
-            foreach (var t in targets) if (!t.RequiresApproval) actionable++;
-
-            string hintText = "";
-            if (targets.Count == 0) hintText = $"No promotions available from {current.Name}.";
-            else if (actionable == 0) hintText = $"All promotions from {current.Name} require approval.";
-
-            Label hint = null;
-            if (hintText.Length > 0)
-            {
-                hint = new Label
-                {
-                    Text = hintText,
-                    Font = new Font("Segoe UI", 9.5f),
-                    ForeColor = IntegrateTextSecondary,
-                    AutoSize = true,
-                    Location = new Point(16, legendTop + 22)
-                };
-                content.Controls.Add(hint);
-            }
-
-            // Center the diagram horizontally and keep the legend/hint aligned to
-            // its left edge, re-centering when the tab is resized. Falls back to
-            // left when the diagram is wider than the visible area so horizontal
-            // scrolling starts at the first environment.
-            void CenterIntegrateDiagram()
-            {
-                int avail = content.ClientSize.Width;
-                int x = diagram.Width < avail ? Math.Max(14, (avail - diagram.Width) / 2) : 14;
-                diagram.Left = x;
-                legend.Left = x + 2;
-                if (hint != null) hint.Left = x + 2;
-            }
-            CenterIntegrateDiagram();
-            content.SizeChanged += (s, e) => CenterIntegrateDiagram();
-        }
-
-        /// <summary>Builds a single-line informational/empty-state label for the tab body.</summary>
-        private Label BuildIntegrateMessage(string text, Color color, int top) => new Label
-        {
-            Text = text,
-            Font = new Font("Segoe UI", 10f),
-            ForeColor = color,
-            AutoSize = true,
-            MaximumSize = new Size(820, 0),
-            Location = new Point(14, top)
-        };
-
-        /// <summary>
-        /// Integrate button handler. SEAM: this iteration does NOT run the merge.
-        /// It reserves the call site (<see cref="Services.MartMartAutomation.PromoteViaMartMerge"/>),
-        /// logs, and tells the user the execution steps are pending. No destructive action.
-        /// </summary>
-        private void OnIntegrateClicked(IntegrationEnvironment current, IntegrationEnvironment target)
-        {
-            Services.MartMartAutomation.PromoteViaMartMerge(current.Name, target.Name, Log);
-            AddinMessageDialog.Show(
-                this,
-                $"Promotion of this model from {current.Name} to {target.Name} via Mart Merge will run here.\n\nThe execution steps are not implemented yet.",
-                "Integrate (steps pending)",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Information);
-        }
-
-        #endregion
 
         /// <summary>
         /// Parses the right-side Mart version number from the cmbRightModel
@@ -8784,6 +9170,58 @@ namespace EliteSoft.Erwin.AddIn
             this.WindowState = FormWindowState.Minimized;
         }
 
+        /// <summary>
+        /// WP 329: while this window is on screen the user must not be able to click into
+        /// erwin behind it - minimizing the add-in is the way to work in erwin. Recomputes
+        /// the desired state and hands it to <see cref="Services.ErwinInputBlock"/>, which
+        /// owns the Win32 side and reconciles against erwin's real enabled state.
+        /// <para>
+        /// "On screen" = created, not disposed, visible and not minimized. That covers the
+        /// DDL-generator flavor for free: it keeps the form hidden for every automated run,
+        /// so <c>Visible</c> is false and the block never applies to the unattended worker.
+        /// </para>
+        /// </summary>
+        private void SyncErwinInputBlock()
+        {
+            bool onScreen;
+            try
+            {
+                onScreen = !IsDisposed && IsHandleCreated && Visible
+                           && WindowState != FormWindowState.Minimized;
+            }
+            catch (ObjectDisposedException) { onScreen = false; }
+            Services.ErwinInputBlock.Sync(onScreen);
+        }
+
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            SyncErwinInputBlock();
+        }
+
+        protected override void OnVisibleChanged(EventArgs e)
+        {
+            base.OnVisibleChanged(e);
+            SyncErwinInputBlock();
+        }
+
+        /// <summary>Minimize / restore arrive here as a resize, so this is where the block
+        /// is released and re-applied for the user's minimize gesture.</summary>
+        protected override void OnResize(EventArgs e)
+        {
+            base.OnResize(e);
+            SyncErwinInputBlock();
+        }
+
+        /// <summary>Re-assert the block after one of the add-in's OWN modal dialogs closed:
+        /// WinForms re-enables every top-level window of the process on that path (erwin's
+        /// frame included), silently clearing the block while this window stays open.</summary>
+        protected override void OnActivated(EventArgs e)
+        {
+            base.OnActivated(e);
+            SyncErwinInputBlock();
+        }
+
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
             // Only block user-initiated close (X button, Alt+F4).
@@ -8794,6 +9232,11 @@ namespace EliteSoft.Erwin.AddIn
                 this.WindowState = FormWindowState.Minimized;
                 return;
             }
+
+            // The add-in is genuinely closing now: release erwin BEFORE any of the
+            // closing work runs, so a failure later in this handler cannot strand the
+            // user with a dead-to-input erwin frame (WP 329).
+            Services.ErwinInputBlock.ReleaseNow("add-in closing");
 
             // The add-in is genuinely closing now (erwin/Windows shutdown,
             // TaskKill, or our ForceClose). Stamp the session END_TIME from this
@@ -9107,6 +9550,20 @@ namespace EliteSoft.Erwin.AddIn
             };
             f.FormClosed += (s, e) => timer.Stop();
             timer.Start();
+
+            // WP 329: an overlay means the add-in is about to drive erwin itself, and the
+            // pipelines synthesize mouse input onto erwin windows BEHIND this form (see the
+            // WS_EX_TRANSPARENT pass-through in ToggleBusyOverlay). A disabled frame swallows
+            // synthetic input, so the user-input block must be off for the whole run. Hung on
+            // the overlay's Disposed event rather than on each pipeline's finally: every
+            // caller closes (and thus disposes) its overlay, including the error paths, and a
+            // leaked overlay fails safe (erwin stays usable).
+            var blockSuspension = Services.ErwinInputBlock.Suspend();
+            f.Disposed += (s, e) =>
+            {
+                blockSuspension.Dispose();
+                SyncErwinInputBlock(); // re-apply immediately if this window is still up
+            };
 
             f.Show(this);
             f.BringToFront();
@@ -9532,6 +9989,12 @@ namespace EliteSoft.Erwin.AddIn
                 btnValidateAll.Enabled = false;
                 lblPlatformStatus.Text = "";
                 UpdateStatus("Model closed. Waiting for a model to open...", Color.Gray);
+
+                // The DDL Generation tab keeps the just-closed model's Source label,
+                // Target version and "Alter DDL: N lines" status unless cleared here -
+                // the General tab reset above but DDL was missed (WP 331). A later
+                // connect repopulates it via PopulateVersionCombos.
+                ResetDdlTab();
 
                 // Start reconnect timer to poll for new models
                 InitializeGlossaryRefreshTimer();

@@ -206,7 +206,7 @@ public class PromotionPlannerTests
     // ---- RequiresApprovalVote ---------------------------------------------
 
     [Fact]
-    public void RequiresApprovalVote_true_only_when_flag_set_and_approvers_exist()
+    public void RequiresApprovalVote_true_when_the_model_catalog_has_a_name()
     {
         var rel = Rel(1, 1, 2, approval: true);
         PromotionPlanner.RequiresApprovalVote(rel, new List<string?> { "alice" }).Should().BeTrue();
@@ -215,8 +215,10 @@ public class PromotionPlannerTests
     [Fact]
     public void RequiresApprovalVote_false_when_approver_list_is_empty_even_if_flag_set()
     {
-        // Spec: REQUIRES_APPROVAL=1 with an empty approver list auto-approves;
-        // there is deliberately NO fallback to the config APPROVAL_APPROVER list.
+        // An empty catalog auto-approves; there is deliberately NO fallback to the transition
+        // list or the config APPROVAL_APPROVER list. It is also what keeps the queue consistent:
+        // the server REFUSES to resolve a quorum for a model with an empty catalog, so a Pending
+        // row must never be inserted for one.
         var rel = Rel(1, 1, 2, approval: true);
         PromotionPlanner.RequiresApprovalVote(rel, new List<string?>()).Should().BeFalse();
         PromotionPlanner.RequiresApprovalVote(rel, null).Should().BeFalse();
@@ -230,10 +232,26 @@ public class PromotionPlannerTests
     }
 
     [Fact]
-    public void RequiresApprovalVote_false_when_transition_does_not_require_approval()
+    public void RequiresApprovalVote_ignores_the_transitions_requires_approval_flag()
     {
-        var rel = Rel(1, 1, 2, approval: false);
-        PromotionPlanner.RequiresApprovalVote(rel, new List<string?> { "alice" }).Should().BeFalse();
+        // Admin 1795ce3 dropped per-transition REQUIRES_APPROVAL from the PROMOTION path: the
+        // server gates on the model catalog ALONE (PromotionEndpoints: "per-transition
+        // RequiresApproval is no longer used for promotion", approvalRequired = approverCount > 0;
+        // DdlApprovalService: requiresVote = slots.Count > 0). The flag survives only for
+        // INTEGRATE. Honouring it here would SILENTLY BYPASS a configured approver chain
+        // whenever the transition's flag is off - a production promotion with zero votes - so a
+        // flag-off transition with approvers MUST still require the vote.
+        var flagOff = Rel(1, 1, 2, approval: false);
+        PromotionPlanner.RequiresApprovalVote(flagOff, new List<string?> { "alice" }).Should().BeTrue();
+        // ...and a flag-off transition with no approvers still auto-approves.
+        PromotionPlanner.RequiresApprovalVote(flagOff, new List<string?>()).Should().BeFalse();
+    }
+
+    [Fact]
+    public void RequiresApprovalVote_false_without_a_resolved_transition()
+    {
+        // No transition = nothing to promote; never claim a vote is pending for it.
+        PromotionPlanner.RequiresApprovalVote(null!, new List<string?> { "alice" }).Should().BeFalse();
     }
 
     // ---- ResolveEffectiveApprovers ----------------------------------------

@@ -124,6 +124,30 @@ namespace EliteSoft.Erwin.AddIn.Services
         public string RegexpPattern { get; set; }
         public string ErrorMessage { get; set; }
         public bool AutoApply { get; set; }
+
+        /// <summary>
+        /// <c>BLOCKS_DDL_APPROVEMENT</c> (admin 2026-07-25): the rule is a HARD gate on
+        /// ENTRY TO THE APPROVAL QUEUE. When the config-level
+        /// <c>ENFORCE_APPROVAL_BLOCKING_RULES</c> toggle is on,
+        /// <see cref="ApprovalBlockingRuleGate"/> checks this rule against the open model
+        /// before an Integrate or Promote request is submitted and refuses the submission
+        /// while it is violated. DDL GENERATION ITSELF IS NOT GATED - the modeler may
+        /// still generate and review DDL for a violating model. Independent of
+        /// <see cref="RuleType"/>, <see cref="IsRequired"/> and <see cref="AutoApply"/>.
+        /// <para>
+        /// NOT populated by <see cref="NamingStandardService.LoadStandards"/>: the flag is
+        /// read by the ISOLATED <see cref="NamingStandardService.LoadApprovalBlockingRules"/>
+        /// query and stamped onto the cached rules there. Reason: the admin migration for
+        /// the column is SQL-Server-only, so putting it in the main SELECT would make the
+        /// whole ruleset fail to load on an unmigrated PostgreSQL/Oracle repo - which
+        /// silently disables ALL naming enforcement (empty rule set reads as "clean"),
+        /// the exact opposite of this feature's intent. Isolating the read keeps that
+        /// blast radius inside the gate: a missing column blocks DDL (loudly) and leaves
+        /// validation untouched.
+        /// </para>
+        /// </summary>
+        public bool BlocksDdlApprovement { get; set; }
+
         public bool IsActive { get; set; }
         public int SortOrder { get; set; }
         public int ConfigId { get; set; }
@@ -234,6 +258,29 @@ namespace EliteSoft.Erwin.AddIn.Services
     }
 
     /// <summary>
+    /// Outcome of <see cref="NamingStandardService.LoadApprovalBlockingRules"/>: the rules the
+    /// admin flagged <c>BLOCKS_DDL_APPROVEMENT=1</c> that the loader could resolve, plus
+    /// the IDs it could NOT. An unresolved ID means the DB says "this rule gates DDL" but
+    /// the add-in never loaded it (inactive, DBMS-version-scoped property, unparseable
+    /// RULE_TYPE, target-XOR violation) - i.e. a blocking rule that can never be checked.
+    /// The gate treats that as a hard failure rather than a silent pass.
+    /// </summary>
+    public sealed class ApprovalBlockingRuleSet
+    {
+        public ApprovalBlockingRuleSet(IReadOnlyList<NamingStandardRule> rules, IReadOnlyList<int> unresolvedRuleIds)
+        {
+            Rules = rules ?? new List<NamingStandardRule>();
+            UnresolvedRuleIds = unresolvedRuleIds ?? new List<int>();
+        }
+
+        /// <summary>Blocking rules the add-in holds in full and can evaluate.</summary>
+        public IReadOnlyList<NamingStandardRule> Rules { get; }
+
+        /// <summary>MC_NAMING_STANDARD.ID values flagged as blocking but absent from the loaded set.</summary>
+        public IReadOnlyList<int> UnresolvedRuleIds { get; }
+    }
+
+    /// <summary>
     /// Service for loading and caching naming standard rules from MC_NAMING_STANDARD.
     /// Uses DatabaseService for multi-database support (MSSQL, PostgreSQL, Oracle).
     /// </summary>
@@ -247,6 +294,13 @@ namespace EliteSoft.Erwin.AddIn.Services
         private Dictionary<(string objectType, string propertyCode), List<NamingStandardRule>> _byKey;
         private bool _isLoaded;
         private string _lastError;
+        // CONFIG.ID the cached rules belong to; -1 when nothing is loaded. The cache is
+        // config-scoped data with no config stamp of its own, so a consumer that switches
+        // models (the DDL queue worker runs job after job against DIFFERENT models, and an
+        // MDI tab switch does the same interactively) would otherwise validate model B
+        // against model A's rules. Same failure mode the glossary hit in 2026-07 - see
+        // EnsureLoadedForConfig.
+        private int _loadedConfigId = -1;
 
         public static NamingStandardService Instance
         {
@@ -288,6 +342,13 @@ namespace EliteSoft.Erwin.AddIn.Services
         public bool IsLoaded => _isLoaded;
         public string LastError => _lastError;
         public int Count => _allRules.Count;
+
+        /// <summary>
+        /// CONFIG.ID the cached rules were loaded for; -1 when nothing is loaded.
+        /// Callers that can be handed a DIFFERENT model than the one the cache was
+        /// filled from must gate on this via <see cref="EnsureLoadedForConfig"/>.
+        /// </summary>
+        public int LoadedConfigId => _loadedConfigId;
 
         /// <summary>
         /// Read-only view of every active rule the service is holding. Used
@@ -445,16 +506,134 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
 
                 _isLoaded = true;
+                _loadedConfigId = ctx.ActiveConfigId;
                 var typeSummary = string.Join(", ", _byKey.Select(kv => $"{kv.Key.objectType}.{kv.Key.propertyCode}={kv.Value.Count}"));
-                System.Diagnostics.Debug.WriteLine($"NamingStandardService: Loaded {_allRules.Count} active rules ({typeSummary})");
+                System.Diagnostics.Debug.WriteLine($"NamingStandardService: Loaded {_allRules.Count} active rules for config {_loadedConfigId} ({typeSummary})");
                 return true;
             }
             catch (Exception ex)
             {
                 _lastError = ex.Message;
                 _isLoaded = false;
+                _loadedConfigId = -1;
                 System.Diagnostics.Debug.WriteLine($"NamingStandardService.LoadStandards error: {ex.Message}");
                 return false;
+            }
+        }
+
+        /// <summary>
+        /// Guarantees the cache holds the rules of <paramref name="configId"/>, loading
+        /// them when the cache is empty or belongs to a DIFFERENT config. Returns false
+        /// (with <see cref="LastError"/> set) when the load fails.
+        /// <para>
+        /// Two consumers need this. (1) The DDL-generator build flavor never calls
+        /// <c>LoadNamingStandards</c> at connect (it deliberately skips every validation
+        /// surface), so the cache is empty there. (2) The DDL queue worker processes jobs
+        /// against different models back-to-back, so a cache filled for job 1's config
+        /// must not be reused for job 2's. The interactive build reloads per connect
+        /// anyway, so for it this is a cheap no-op.
+        /// </para>
+        /// </summary>
+        public bool EnsureLoadedForConfig(int configId)
+        {
+            if (_isLoaded && _loadedConfigId == configId) return true;
+            return LoadStandards();
+        }
+
+        /// <summary>
+        /// The DDL-blocking subset of the active config's rules, resolved through an
+        /// ISOLATED query against <c>MC_NAMING_STANDARD.BLOCKS_DDL_APPROVEMENT</c>.
+        /// <para>
+        /// Why a second query instead of one more column on <see cref="GetQuery"/>: the
+        /// admin migration that adds the column is SQL-Server-only. Naming it in the main
+        /// SELECT would make <see cref="LoadStandards"/> throw on an unmigrated
+        /// PostgreSQL/Oracle repo, and its catch leaves <see cref="IsLoaded"/> false -
+        /// at which point <c>NamingValidationEngine.ValidateObjectName</c> returns an
+        /// empty list for every object and ALL naming enforcement is silently off. Here
+        /// the same missing column throws out of THIS method only, the caller turns that
+        /// into a visible "DDL blocked" error, and validation keeps working.
+        /// </para>
+        /// <para>
+        /// Also reports rules the DB flags as blocking that are NOT in the loaded active
+        /// set (dropped by the loader as inactive, DBMS-version-scoped, unparseable
+        /// RULE_TYPE or target-XOR violating). Those cannot be evaluated at all, and the
+        /// gate's contract is that an unevaluatable blocking rule is a hard failure -
+        /// never a silent pass - so they are surfaced rather than dropped.
+        /// </para>
+        /// </summary>
+        /// <exception cref="InvalidOperationException">The base ruleset could not be loaded.</exception>
+        /// <exception cref="DbException">The blocking-flag query failed (e.g. the column does not exist).</exception>
+        public ApprovalBlockingRuleSet LoadApprovalBlockingRules(int configId)
+        {
+            if (!EnsureLoadedForConfig(configId))
+                throw new InvalidOperationException(
+                    $"Naming standards could not be loaded for config {configId}: {_lastError ?? "unknown error"}");
+
+            string dbType = DatabaseService.Instance.GetDbType();
+            var flagged = new HashSet<int>();
+
+            using (var connection = DatabaseService.Instance.CreateConnection())
+            {
+                connection.Open();
+                using (var command = DatabaseService.Instance.CreateCommand(GetApprovalBlockingIdsQuery(dbType), connection))
+                {
+                    var pCfg = command.CreateParameter();
+                    pCfg.ParameterName = SqlDialect.Param(dbType, "cfgId");
+                    pCfg.Value = configId;
+                    command.Parameters.Add(pCfg);
+
+                    using (var reader = command.ExecuteReader())
+                        while (reader.Read())
+                            flagged.Add(Convert.ToInt32(reader["ID"]));
+                }
+            }
+
+            // Stamp every cached rule so the flag is readable off the rule object itself
+            // (and so a rule that LOST the flag in admin is cleared on the next gate run).
+            foreach (var rule in _allRules)
+                rule.BlocksDdlApprovement = flagged.Contains(rule.Id);
+
+            var resolved = _allRules.Where(r => r.BlocksDdlApprovement).ToList();
+            var unresolved = flagged.Where(id => !_allRules.Any(r => r.Id == id)).OrderBy(id => id).ToList();
+
+            AddinLogger.Log($"[DDL-GATE] blocking rules for config {configId}: {flagged.Count} flagged, " +
+                            $"{resolved.Count} resolved ({string.Join(", ", resolved.Select(r => "#" + r.Id))}), " +
+                            $"{unresolved.Count} unresolved ({string.Join(", ", unresolved.Select(id => "#" + id))})");
+
+            return new ApprovalBlockingRuleSet(resolved, unresolved);
+        }
+
+        /// <summary>
+        /// The blocking subset already stamped by the last
+        /// <see cref="LoadApprovalBlockingRules"/> call. Empty before the first call - it is
+        /// NOT a substitute for it (the flag never comes off the main loader).
+        /// </summary>
+        public IReadOnlyList<NamingStandardRule> GetApprovalBlockingRules()
+            => _allRules.Where(r => r != null && r.IsActive && r.BlocksDdlApprovement).ToList();
+
+        // Deliberately narrow: IDs only. The rule PAYLOAD already lives in the cache from
+        // LoadStandards; this query exists solely to answer "which of them gate DDL", so a
+        // repo missing the column fails here and nowhere else.
+        private static string GetApprovalBlockingIdsQuery(string dbType)
+        {
+            switch (dbType?.ToUpper())
+            {
+                case "POSTGRESQL":
+                    return @"SELECT ns.""ID"" FROM ""MC_NAMING_STANDARD"" ns
+                            WHERE ns.""CONFIG_ID"" = @cfgId
+                              AND ns.""IS_ACTIVE"" = true
+                              AND ns.""BLOCKS_DDL_APPROVEMENT"" = true";
+                case "ORACLE":
+                    return @"SELECT ns.ID FROM MC_NAMING_STANDARD ns
+                            WHERE ns.CONFIG_ID = :cfgId
+                              AND ns.IS_ACTIVE = 1
+                              AND ns.BLOCKS_DDL_APPROVEMENT = 1";
+                case "MSSQL":
+                default:
+                    return @"SELECT ns.[ID] FROM [dbo].[MC_NAMING_STANDARD] ns
+                            WHERE ns.[CONFIG_ID] = @cfgId
+                              AND ns.[IS_ACTIVE] = 1
+                              AND ns.[BLOCKS_DDL_APPROVEMENT] = 1";
             }
         }
 
@@ -687,11 +866,17 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// identically to a DB-loaded one. Production code paths never call
         /// this; only the test project (<c>tests/ErwinAddIn.Tests</c>) does.
         /// </summary>
-        public void SeedForTesting(IEnumerable<NamingStandardRule> rules)
+        /// <param name="rules">The rules to place in the cache.</param>
+        /// <param name="configId">CONFIG.ID the seeded set stands for. Defaults to -1,
+        /// which is what <c>ConfigContextService.ActiveConfigId</c> reports when no model
+        /// is bound, so <see cref="EnsureLoadedForConfig"/> treats a seeded cache as
+        /// already-current and does not try to reach a database from a unit test.</param>
+        public void SeedForTesting(IEnumerable<NamingStandardRule> rules, int configId = -1)
         {
             _allRules.Clear();
             _byKey.Clear();
             _lastError = null;
+            _loadedConfigId = configId;
             if (rules != null)
             {
                 foreach (var r in rules)

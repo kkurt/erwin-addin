@@ -23,6 +23,53 @@ public class IntegrationPlannerTests
     private static IntegrationRelation Rel(int id, int fromId, int toId, bool approval) =>
         new(id, ConfigId: 7, fromId, toId, approval);
 
+    // ---- ResolveApproverCatalogPath ---------------------------------------
+
+    private static readonly IReadOnlyList<IntegrationEnvironment> Pipeline = new[]
+    {
+        Env(1, "1_DEV", 1), Env(2, "2_TEST", 2), Env(3, "3_PROD", 3),
+    };
+
+    [Theory]
+    // Every environment of one pipeline collapses to the SAME catalog path: admin
+    // stores ONE approver chain per logical model ({base}/{model}), not one per
+    // environment, and the add-in previously looked it up with the environment-specific
+    // path - so the chain always resolved empty and every submission auto-approved.
+    [InlineData("Kursat/Integrate Test/1_DEV/MetaRepo", "Kursat/Integrate Test/MetaRepo")]
+    [InlineData("Kursat/Integrate Test/2_TEST/MetaRepo", "Kursat/Integrate Test/MetaRepo")]
+    [InlineData("Kursat/Integrate Test/3_PROD/MetaRepo", "Kursat/Integrate Test/MetaRepo")]
+    // Case-insensitive, matching ResolveCurrentEnvironment (Mart folders are not
+    // case-sensitive in practice).
+    [InlineData("Kursat/Integrate Test/1_dev/MetaRepo", "Kursat/Integrate Test/MetaRepo")]
+    // A one-level base still yields {base}/{model}.
+    [InlineData("Base/2_TEST/M", "Base/M")]
+    // Backslash separators normalise to forward slashes.
+    [InlineData(@"Kursat\Integrate Test\1_DEV\MetaRepo", "Kursat/Integrate Test/MetaRepo")]
+    public void ResolveApproverCatalogPath_drops_the_environment_segment(string martPath, string expected)
+    {
+        IntegrationPlanner.ResolveApproverCatalogPath(martPath, Pipeline).Should().Be(expected);
+    }
+
+    [Theory]
+    // Not in a managed environment -> the model keys on its own path, unchanged.
+    [InlineData("Kursat/MetaRepo")]
+    [InlineData("Kursat/Some Folder/MetaRepo")]
+    [InlineData("MetaRepo")]
+    public void ResolveApproverCatalogPath_leaves_non_pipeline_models_alone(string martPath)
+    {
+        IntegrationPlanner.ResolveApproverCatalogPath(martPath, Pipeline).Should().Be(martPath);
+    }
+
+    [Fact]
+    public void ResolveApproverCatalogPath_is_null_and_blank_safe()
+    {
+        IntegrationPlanner.ResolveApproverCatalogPath(null, Pipeline).Should().BeNull();
+        IntegrationPlanner.ResolveApproverCatalogPath("", Pipeline).Should().Be("");
+        // No environments configured = nothing to strip.
+        IntegrationPlanner.ResolveApproverCatalogPath("A/1_DEV/M", new List<IntegrationEnvironment>())
+            .Should().Be("A/1_DEV/M");
+    }
+
     // ---- ParseParentFolder ------------------------------------------------
 
     [Theory]

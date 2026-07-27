@@ -163,6 +163,14 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         private void OnMonitorTick(object sender, EventArgs e)
         {
+            // Same reentrancy bail-out every other add-in tick takes. erwin's modal
+            // wizards (alter script, Complete Compare / Mart Merge) and the Mart commit
+            // pump WM_TIMER, so an ungated tick runs this SCAPI walk IN THE MIDDLE of
+            // erwin's rendering - the documented GDI-corruption path. These two timers
+            // were the last pair outside the gates (found 2026-07-26 while fixing the
+            // integrate flow); CheckForChanges also DELETES columns, so reentering here
+            // is worse than a repaint artifact.
+            if (AlterWizardGate.IsOpen || MartSaveGate.IsActive) return;
             CheckForChanges();
         }
 
@@ -171,6 +179,8 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// </summary>
         private void OnWindowMonitorTick(object sender, EventArgs e)
         {
+            if (AlterWizardGate.IsOpen || MartSaveGate.IsActive) return;
+
             bool editorIsOpen = IsColumnEditorOpen();
 
             // If editor was open and now closed, delete "PLEASE CHANGE IT" columns

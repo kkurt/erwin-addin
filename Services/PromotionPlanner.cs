@@ -209,18 +209,32 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// The approval decision of the spec: a submit goes to voting
-        /// (STATUS='Pending') only when the chosen transition has
-        /// REQUIRES_APPROVAL=1 AND its EFFECTIVE approver list is non-empty (blank
-        /// entries do not count). Everything else auto-approves. There is
-        /// deliberately NO fallback to the config-wide APPROVAL_APPROVER list.
+        /// The promotion approval decision: a submit goes to voting (STATUS='Pending') exactly
+        /// when the MODEL's approver catalog is non-empty (blank entries do not count);
+        /// otherwise it auto-approves. There is deliberately NO fallback to the transition list
+        /// or the config-wide APPROVAL_APPROVER list.
+        /// <para>
+        /// The per-transition REQUIRES_APPROVAL flag is deliberately NOT consulted: the admin
+        /// governance rework (erwin-admin 1795ce3) dropped it from the promotion path, and the
+        /// server now gates on the catalog alone - <c>PromotionEndpoints</c>
+        /// ("per-transition RequiresApproval is no longer used for promotion",
+        /// <c>approvalRequired = approverCount &gt; 0</c>) and <c>DdlApprovalService</c>
+        /// (<c>requiresVote = slots.Count &gt; 0</c>) for both the chain hop and the terminal
+        /// step. The flag survives only in the INTEGRATE flow. Keeping the AND here would
+        /// SILENTLY BYPASS a configured approver chain whenever the transition's flag happens
+        /// to be off - a production promotion auto-approved with zero votes - so the flag must
+        /// stay out of this decision.
+        /// </para>
         /// </summary>
-        /// <param name="relation">The chosen transition.</param>
-        /// <param name="approvers">The EFFECTIVE approver names of that transition for the model (see <see cref="ResolveEffectiveApprovers"/>).</param>
+        /// <param name="relation">The chosen transition. Kept in the signature (and null-checked)
+        /// because a submit without a resolved transition has nothing to promote; its
+        /// REQUIRES_APPROVAL flag is intentionally ignored, see above.</param>
+        /// <param name="approvers">The model's approver chain (see
+        /// <see cref="PromotionService.GetModelPromotionApprovers"/>).</param>
         public static bool RequiresApprovalVote(
             IntegrationRelation relation, IReadOnlyList<string?>? approvers)
         {
-            if (relation == null || !relation.RequiresApproval) return false;
+            if (relation == null) return false;
             return approvers != null && approvers.Any(a => !string.IsNullOrWhiteSpace(a));
         }
 

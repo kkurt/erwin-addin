@@ -455,8 +455,14 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// MODEL is the root itself (always present) and any unmapped/unknown
         /// type is logged-and-skipped rather than warned. Mirrors the owner-class
         /// switch in <see cref="NamingValidationEngine"/> (table->Entity etc.).
+        /// <para>
+        /// internal (not private) since 2026-07-25 so <see cref="ApprovalBlockingRuleGate"/>
+        /// reuses this exact map instead of adding a fourth admin-OBJECT_TYPE mapping to
+        /// the three that already exist and disagree with each other. Still NonPublic, so
+        /// the reflection-based test in ExistenceRuleTests keeps resolving it.
+        /// </para>
         /// </summary>
-        private static string ScapiCollectTypeForExistence(string objectType)
+        internal static string ScapiCollectTypeForExistence(string objectType)
         {
             if (string.IsNullOrEmpty(objectType)) return null;
             // Normalise admin's "SUBJECT AREA" / "SUBJECT_AREA" and casing.
