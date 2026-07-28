@@ -1487,6 +1487,18 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
                 string ddl = Marshal.PtrToStringAnsi(ptr);
                 log?.Invoke($"NativeBridge: direct-invoke returned {ddl?.Length ?? 0} chars.");
+
+                // Harvest the Object Filter selection while the hidden wizard is still open.
+                //
+                // This route (OnFE fast path, same version both sides) never navigates the
+                // wizard's pages - it opens the wizard hidden and calls straight into it - so
+                // the harvest in MartMartAutomation.WalkNextLoopToPreview never runs here. That
+                // is why the first scoped live test walked all 8,402 columns: the checkbox was
+                // ticked and the bridge answered the popup YES, but nothing read the page.
+                // The wizard IS constructed, only hidden, so its controls exist and answer
+                // TVM_GETITEM the same as when visible.
+                MartMartAutomation.TryHarvestObjectFilterSelectionFrom(_hiddenWizardHwnd, log);
+
                 return ddl;
             }
             catch (Exception ex)

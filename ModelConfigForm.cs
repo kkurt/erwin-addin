@@ -6171,6 +6171,12 @@ namespace EliteSoft.Erwin.AddIn
             Services.NativeBridgeService.SetUseDiagramSelection(
                 chkFilterObjects.Enabled && chkFilterObjects.Checked, log);
 
+            // Clear the previous run's harvested selection HERE, not in one route's branch:
+            // every DDL route passes through this line, but only the page-walking route reaches
+            // the wizard walk. A stale selection would scope this run's rule check to another
+            // generation's tables and report a model it never looked at.
+            Services.MartMartAutomation.ResetObjectFilterSelection();
+
             // FE option warm-up: write the admin XML_OPTION TYPE='DDL' into the
             // active model's FE-options state (FEModel_DDL retains the option
             // path; the Alter Script Wizard re-reads it on open). ALL three
@@ -6644,11 +6650,6 @@ namespace EliteSoft.Erwin.AddIn
                                                 // user did not enable the filter, keep using the
                                                 // faster jump.
                                                 bool onlySelected = chkFilterObjects.Enabled && chkFilterObjects.Checked;
-                                                // Clear the previous run's harvest FIRST: a stale
-                                                // selection would scope this run's rule check to
-                                                // the tables of a different generation, and the
-                                                // gate would report a clean model it never looked at.
-                                                Services.MartMartAutomation.ResetObjectFilterSelection();
                                                 bool previewOk = await Services.MartMartAutomation
                                                     .ClickWizardPreviewTabAsync(capturedWizard, (Action<string>)log,
                                                         overlayToggle: null,

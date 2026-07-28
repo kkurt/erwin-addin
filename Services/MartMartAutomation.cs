@@ -4283,13 +4283,30 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// </summary>
         public static System.Collections.Generic.List<string> LastObjectFilterSelection { get; private set; }
 
+        private static bool _objFilterMissLogged;
+
         /// <summary>Clears the stash so a stale selection cannot leak into the next run.</summary>
-        public static void ResetObjectFilterSelection() => LastObjectFilterSelection = null;
+        public static void ResetObjectFilterSelection()
+        {
+            LastObjectFilterSelection = null;
+            _objFilterMissLogged = false;
+        }
 
         /// <summary>
         /// Reads the checked leaf items out of the Object Filter page's tree, if that page is
         /// currently showing. Returns true when something was harvested.
         /// </summary>
+        /// <summary>
+        /// Public entry for callers that hold the wizard handle but never navigate its pages -
+        /// the OnFE fast path opens the wizard hidden and invokes it directly, so it has to
+        /// harvest explicitly. No-op when already harvested for this run.
+        /// </summary>
+        public static bool TryHarvestObjectFilterSelectionFrom(IntPtr wizardHwnd, Action<string> log)
+        {
+            if (LastObjectFilterSelection != null) return true;
+            return TryHarvestObjectFilterSelection(wizardHwnd, log);
+        }
+
         private static bool TryHarvestObjectFilterSelection(IntPtr wizardHwnd, Action<string> log)
         {
             if (wizardHwnd == IntPtr.Zero) return false;
@@ -4307,7 +4324,28 @@ namespace EliteSoft.Erwin.AddIn.Services
                 return true;
             }, IntPtr.Zero);
 
-            if (tree == IntPtr.Zero) return false;
+            if (tree == IntPtr.Zero)
+            {
+                // Say WHY, once per run. A silent miss here is what made the first scoped live
+                // test look like the feature simply did nothing: the checkbox was ticked, the
+                // bridge answered the popup YES, and the walk still covered all 8,402 columns.
+                if (!_objFilterMissLogged)
+                {
+                    _objFilterMissLogged = true;
+                    var classes = new System.Collections.Generic.List<string>();
+                    EnumChildWindows(wizardHwnd, (h, _) =>
+                    {
+                        var c = new StringBuilder(64);
+                        GetClassName(h, c, c.Capacity);
+                        string s = c.ToString();
+                        if (s.Length > 0 && !classes.Contains(s)) classes.Add(s);
+                        return classes.Count < 40;
+                    }, IntPtr.Zero);
+                    log?.Invoke($"  [OBJFILTER] no SysTreeView32 under wizard 0x{wizardHwnd.ToInt64():X}; " +
+                                $"child classes seen: {string.Join(", ", classes)}");
+                }
+                return false;
+            }
 
             var checkedNames = new System.Collections.Generic.List<string>();
             int scanned = 0;
