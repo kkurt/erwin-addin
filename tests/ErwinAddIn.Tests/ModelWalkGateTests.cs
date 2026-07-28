@@ -112,22 +112,32 @@ namespace ErwinAddIn.Tests
             ModelWalkGate.IsActive.Should().BeFalse();
         }
 
+        // NOTE on what these can and cannot assert.
+        // AddinTickGate.ShouldSkip ORs in AlterWizardGate.IsOpen, which runs a live
+        // FindWindowW probe for erwin's wizard titles. On a developer machine with erwin open
+        // that can be true, so asserting a bare "false" here made the suite depend on which
+        // windows happened to exist - it failed exactly that way on 2026-07-28. These now pin
+        // ModelWalkGate's CONTRIBUTION, which is the part this file owns and the part that is
+        // deterministic.
+
         [Fact]
-        public void AddinTickGate_DoesNotSkip_WhenNothingIsSuspended()
+        public void AddinTickGate_OutsideAWalk_AddsNothingOfItsOwn()
         {
-            AddinTickGate.ShouldSkip("test.site").Should().BeFalse();
+            ModelWalkGate.IsActive.Should().BeFalse();
+
+            AddinTickGate.ShouldSkip("test.site")
+                .Should().Be(AlterWizardGate.IsOpen || MartSaveGate.IsActive,
+                    "with no walk in flight the decision belongs entirely to the other two gates");
         }
 
         [Fact]
-        public void AddinTickGate_Skips_WhileAWalkIsRunning()
+        public void AddinTickGate_Skips_WhileAWalkIsRunning_RegardlessOfTheOtherGates()
         {
             using (ModelWalkGate.Enter("walk"))
             {
                 AddinTickGate.ShouldSkip("Validation.WindowMonitor").Should().BeTrue(
                     "a tick that runs during a walk re-enters SCAPI mid-walk");
             }
-
-            AddinTickGate.ShouldSkip("Validation.WindowMonitor").Should().BeFalse();
         }
     }
 }

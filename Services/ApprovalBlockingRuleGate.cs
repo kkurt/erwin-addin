@@ -821,6 +821,36 @@ namespace EliteSoft.Erwin.AddIn.Services
             collectClock.Stop();
             write($"collected {objects.Count} {normalizedObjectType} object(s) in {collectClock.ElapsedMilliseconds} ms.");
 
+            try
+            {
+                return EvaluateGroupRules(
+                    modelObjects, root, normalizedObjectType,
+                    existenceRules, propertyRules, objects, issues, outcomes, write, progress);
+            }
+            finally
+            {
+                // Hand the RCWs back instead of leaving tens of thousands to the finalizer.
+                // Safe here and only here: every label the report will ever show was
+                // materialised into an ApprovalBlockingIssue during the rules above, so nothing
+                // downstream touches these objects again. This walk now runs on EVERY DDL Review
+                // open, so what used to be one leak per submit is one per review.
+                foreach (var target in objects) ReleaseCom(target.Instance);
+            }
+        }
+
+        /// <summary>Runs one object type's rules over the already-collected objects.</summary>
+        private static int EvaluateGroupRules(
+            object modelObjects,
+            object root,
+            string normalizedObjectType,
+            List<NamingStandardRule> existenceRules,
+            List<NamingStandardRule> propertyRules,
+            List<GateObject> objects,
+            List<ApprovalBlockingIssue> issues,
+            List<RuleOutcome> outcomes,
+            Action<string> write,
+            Action<string> progress)
+        {
             foreach (var rule in existenceRules)
                 outcomes.Add(EvaluateExistenceRule(
                     modelObjects, root, rule, normalizedObjectType, objects, issues, write, progress));
@@ -1324,6 +1354,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                     }
                     if (attrs == null) continue;
 
+                    try
+                    {
                     foreach (dynamic attr in attrs)
                     {
                         if (attr == null) continue;
@@ -1337,7 +1369,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                             () => $"{tableName.Value}.{ReadDisplayName(attrRef, preferPhysical: true)}",
                             pk));
                     }
+                    }
+                    // The COLLECTION wrapper only, never the attributes inside it - those are
+                    // still needed by the rules. Mirrors ValidationCoordinatorService's own
+                    // per-entity attribute walk.
+                    finally { ReleaseCom(attrs); }
                 }
+                ReleaseCom(entities);
                 return result;
             }
 
@@ -1580,6 +1618,26 @@ namespace EliteSoft.Erwin.AddIn.Services
         public static ApprovalBlockingGateResult Failed(string reason)
             => new ApprovalBlockingGateResult(
                 true, new List<ApprovalBlockingIssue> { Rule0(reason) }, 0, 0, 0);
+
+        /// <summary>
+        /// Releases a COM wrapper, ignoring anything that is not one. Every other whole-model
+        /// walk in this codebase does this (see <c>ValidationCoordinatorService</c>); this file
+        /// did not, and left ~25,000 RCWs per run to the finalizer.
+        /// </summary>
+        private static void ReleaseCom(object? com)
+        {
+            try
+            {
+                if (com != null && System.Runtime.InteropServices.Marshal.IsComObject(com))
+                    System.Runtime.InteropServices.Marshal.ReleaseComObject(com);
+            }
+            catch (Exception ex)
+            {
+                // A failed release leaks one wrapper; throwing from here would abort a walk that
+                // has already produced its verdict.
+                System.Diagnostics.Debug.WriteLine($"{LogPrefix} ReleaseComObject failed: {ex.Message}");
+            }
+        }
 
         /// <summary>An issue that belongs to the gate itself rather than to one rule.</summary>
         private static ApprovalBlockingIssue Rule0(string reason)
