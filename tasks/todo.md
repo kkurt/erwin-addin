@@ -498,6 +498,35 @@ Acceptance bar for any candidate: it must return ALL selected entities, not just
 one - that single-item failure mode is what already sank the Overview-pane approach - and it
 must not require a wizard to be open.
 
+### RESULT (2026-07-28): erwin exposes no readable selection. Pure-COM route CLOSED.
+
+- **SCAPI interfaces: nothing.** Full enumeration of the type library in `EAL.dll` (71
+  typeinfos) - no Selection member anywhere.
+- **Metamodel: 2471 property pages**, the only selection-shaped names being
+  `Selection_Grips_Color` (a theme colour) and SQL `Select_Top_*` clauses.
+- **`Current_Selection` exists as a property CLASS but is dormant.** Probed live on BOTH the
+  Model root and every ER_Diagram: *"Property Current_Selection class cannot be assigned to
+  object of X class"*, and the same for its metamodel neighbours `Current_Tool` /
+  `Current_Zoom_Level`. **Controls proved the probe sound**: `Current_ER_Diagram_Ref` returned a
+  real GUID on Model and `Selection_Grips_Color` returned 16750848 on ER_Diagram, so we were
+  addressing the right objects and the failure is the property, not the target.
+- Worth remembering for any future property probe: *"cannot be assigned to object of X class"*
+  means the class exists but is not carried here, whereas *"not a valid class id, class name or
+  object property"* (what `Selection` and `Selected_Objects` returned) means the name does not
+  exist at all.
+
+Remaining route, verified by binary export grep but NOT tried: `EM_ERD.dll`
+`?GetSelectedModelObjectIds@ERD@@` + `?IsDiagramSelection@ERD@@` with
+`?CurrentModelSet@ECX@@` - statically imported by erwin.exe, returns `std::set<unsigned int>`
+so N-safe, and the bridge already has the identical CSV machinery. Unsolved: those are 32-bit
+GDMIds while SCAPI speaks GUID ObjectIds.
+
+- [ ] **DECISION NEEDED:** native EM_ERD route, or the add-in's own table picker. Recommended:
+      the picker - 100% reliable, no undocumented export, no mangled name to break on the next
+      erwin build, and the checked set becomes explicit and auditable, which is what a
+      governance gate wants. Adding a reverse-engineered native call into a governance path is a
+      poor risk trade in a process this add-in has already killed twice this week.
+
 ### WON'T-DO: scoping the gate walk to "Only Selected Objects" (SUPERSEDED 2026-07-28)
 
 The reasoning below stands on the facts but NOT on the conclusion: the user has since asked
