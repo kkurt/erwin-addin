@@ -4256,6 +4256,119 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// for the bridge's SetUseDiagramSelection toggle ("Only Selected
         /// Objects") to take effect.
         /// </summary>
+        // ---- Object Filter page: the diagram selection, resolved by erwin into names ----
+
+        private const uint TVIF_STATE = 0x0008;
+        private const uint TVIS_STATEIMAGEMASK = 0xF000;
+        private const int TVGN_ROOT_ITEM = 0x0000;
+        private const int TVGN_NEXT_ITEM = 0x0001;
+        private const int TVGN_CHILD_ITEM = 0x0004;
+
+        /// <summary>
+        /// Tables the user had selected on the diagram, as erwin itself resolved them, or null
+        /// when the Object Filter page was never reached or held no checked item.
+        ///
+        /// <para><b>Why this is the answer.</b> erwin exposes no readable diagram selection:
+        /// SCAPI's interfaces have none, the metamodel's <c>Current_Selection</c> class is
+        /// dormant, the Overview pane degrades to a count for 2+, and the generated DDL misses
+        /// selected-but-unchanged tables (all evidenced 2026-07-28). But on the Object Filter
+        /// page erwin has already resolved the selection into a NAMED, CHECKED tree - the very
+        /// list it is about to filter by. Reading it needs no reverse engineering and no
+        /// undocumented export.</para>
+        ///
+        /// <para>Costs nothing extra: the pipeline already opens this wizard to produce the DDL,
+        /// and with "Only Selected Objects" ticked it already walks every page so this one fires
+        /// its popup. This harvests a page we were passing through anyway, passively - a tree
+        /// read, no clicks, no synthesised input.</para>
+        /// </summary>
+        public static System.Collections.Generic.List<string> LastObjectFilterSelection { get; private set; }
+
+        /// <summary>Clears the stash so a stale selection cannot leak into the next run.</summary>
+        public static void ResetObjectFilterSelection() => LastObjectFilterSelection = null;
+
+        /// <summary>
+        /// Reads the checked leaf items out of the Object Filter page's tree, if that page is
+        /// currently showing. Returns true when something was harvested.
+        /// </summary>
+        private static bool TryHarvestObjectFilterSelection(IntPtr wizardHwnd, Action<string> log)
+        {
+            if (wizardHwnd == IntPtr.Zero) return false;
+
+            IntPtr tree = IntPtr.Zero;
+            EnumChildWindows(wizardHwnd, (h, _) =>
+            {
+                var cls = new StringBuilder(64);
+                GetClassName(h, cls, cls.Capacity);
+                if (cls.ToString().IndexOf("SysTreeView32", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    tree = h;
+                    return false; // first tree wins - the Object Filter page has exactly one
+                }
+                return true;
+            }, IntPtr.Zero);
+
+            if (tree == IntPtr.Zero) return false;
+
+            var checkedNames = new System.Collections.Generic.List<string>();
+            int scanned = 0;
+            CollectCheckedItems(tree, SendMessage(tree, TVM_GETNEXTITEM, new IntPtr(TVGN_ROOT_ITEM), IntPtr.Zero),
+                                checkedNames, ref scanned, 0);
+
+            if (checkedNames.Count == 0)
+            {
+                // Not an error: on any page other than Object Filter there is no such tree, and
+                // on Object Filter with nothing checked erwin will not filter either.
+                return false;
+            }
+
+            LastObjectFilterSelection = checkedNames;
+            log?.Invoke($"  [OBJFILTER] harvested {checkedNames.Count} checked table(s) of {scanned} scanned: " +
+                        string.Join(", ", checkedNames));
+            return true;
+        }
+
+        /// <summary>
+        /// Depth-first walk collecting the text of every CHECKED item. Checkbox state lives in
+        /// the item's state-image index: 1 = unchecked, 2 = checked. Group rows (the "Table"
+        /// parent) are skipped by only taking items with no children.
+        /// </summary>
+        private static void CollectCheckedItems(
+            IntPtr tree, IntPtr item, System.Collections.Generic.List<string> into, ref int scanned, int depth)
+        {
+            // The tree is flat-ish (one group node over the tables); the bound stops a
+            // pathological structure from spinning a UI-thread walk.
+            if (depth > 8) return;
+
+            while (item != IntPtr.Zero && scanned < 20000)
+            {
+                scanned++;
+
+                var ti = new TVITEM
+                {
+                    mask = TVIF_STATE | TVIF_HANDLE,
+                    hItem = item,
+                    stateMask = TVIS_STATEIMAGEMASK
+                };
+                SendMessageTvItem(tree, TVM_GETITEMW, IntPtr.Zero, ref ti);
+                bool isChecked = ((ti.state & TVIS_STATEIMAGEMASK) >> 12) == 2;
+
+                IntPtr child = SendMessage(tree, TVM_GETNEXTITEM, new IntPtr(TVGN_CHILD_ITEM), item);
+                if (child != IntPtr.Zero)
+                {
+                    // A parent's checkbox is a tri-state roll-up of its children, so only leaves
+                    // are trustworthy - taking the group row would add a name that is not a table.
+                    CollectCheckedItems(tree, child, into, ref scanned, depth + 1);
+                }
+                else if (isChecked)
+                {
+                    string text = GetTreeItemText(tree, item);
+                    if (!string.IsNullOrWhiteSpace(text)) into.Add(text.Trim());
+                }
+
+                item = SendMessage(tree, TVM_GETNEXTITEM, new IntPtr(TVGN_NEXT_ITEM), item);
+            }
+        }
+
         private static bool WalkNextLoopToPreview(IntPtr wizardHwnd, Action<string> log, Action<bool> overlayToggle)
         {
             // overlayToggle (production only): make the addin form click-through
@@ -4280,6 +4393,14 @@ namespace EliteSoft.Erwin.AddIn.Services
                     // option to the built-in default to avoid the "XML not
                     // compatible" error that brings back the DWM black rectangles.
                     if (page == 2) { EnsureCompatibleOptionSet(wizardHwnd, log); Thread.Sleep(150); }
+
+                    // Harvest the Object Filter page's checked tables BEFORE advancing past it.
+                    // Attempted on every page rather than a hard-coded page number: the page
+                    // count shifts with the option set, and the probe is a no-op on pages that
+                    // have no tree. Passive - a tree read, no clicks. Once harvested, stop
+                    // looking, so a later page cannot overwrite the answer with an empty one.
+                    if (LastObjectFilterSelection == null) TryHarvestObjectFilterSelection(wizardHwnd, log);
+
                     log?.Invoke($"  [WPT] page {page}: posting CMD_FE_WIZARD_NEXT (1766)");
                     PostMessage(wizardHwnd, WM_COMMAND, MakeWParam(CMD_FE_WIZARD_NEXT, 0), IntPtr.Zero);
                 }

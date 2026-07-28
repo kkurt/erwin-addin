@@ -5745,26 +5745,48 @@ namespace EliteSoft.Erwin.AddIn
         internal Services.ApprovalBlockingGateResult EvaluateApprovalBlockingRules(
             string actionName, string ddlForScope = null)
         {
-            // "Only Selected Objects": erwin's own Alter Script Wizard already scoped the DDL to
-            // the entities selected on the diagram, and the rules are checked over the same set.
+            // "Only Selected Objects": check the rules over the tables the user selected.
             //
-            // The scope is derived from the DDL TEXT, not from the selection, because the
-            // selection is not readable: SCAPI exposes no selection API, and erwin's Overview
-            // pane - the only surface that shows it - reports a COUNT ("2 objects") instead of
-            // names as soon as more than one entity is selected. The DDL names exactly the
-            // tables that were scoped, and it is also the thing being submitted, so it is the
-            // better source anyway.
+            // The scope comes from erwin's OWN Object Filter page, harvested while the alter
+            // wizard was already open (MartMartAutomation.LastObjectFilterSelection). That page
+            // holds the diagram selection already resolved into a named, checked list - which is
+            // the only place it is readable. Everything else was tried and evidenced closed on
+            // 2026-07-28: SCAPI's interfaces have no selection member (71 typeinfos enumerated),
+            // the metamodel's Current_Selection class is dormant (probed live on Model and
+            // ER_Diagram, with controls proving the probe sound), and erwin's Overview pane
+            // degrades to a COUNT ("2 objects") for two or more.
             //
-            // An unparseable script yields an EMPTY set, which is passed as null: "I could not
-            // work out the scope" must mean the whole model, never "check nothing".
+            // NOT derived from the DDL text any more: a table can be SELECTED but UNCHANGED, so
+            // it never appears in the alter script, and scoping to the script silently skipped
+            // it - found by live test 2026-07-28 (3 selected, 1 changed, only 1 checked).
+            //
+            // No harvest means NO scope, which means the whole model. "I could not work out what
+            // was selected" must never collapse into "check nothing".
             System.Collections.Generic.IReadOnlyCollection<string> tableScope = null;
-            if (chkFilterObjects != null && chkFilterObjects.Enabled && chkFilterObjects.Checked
-                && !string.IsNullOrWhiteSpace(ddlForScope))
+            if (chkFilterObjects != null && chkFilterObjects.Enabled && chkFilterObjects.Checked)
             {
-                var names = Services.DdlTableScope.Extract(ddlForScope);
-                if (names.Count > 0) tableScope = names;
-                else Log("[APPROVAL-GATE] 'Only Selected Objects' is on but the DDL named no table - " +
-                        "checking the whole model rather than nothing.");
+                var selected = Services.MartMartAutomation.LastObjectFilterSelection;
+                if (selected != null && selected.Count > 0)
+                {
+                    // erwin lists tables as "dbo.TEST_DATA_TAB_1" on the Object Filter page while
+                    // the model knows them as "TEST_DATA_TAB_1", so carry both forms and let the
+                    // walk match on either.
+                    var names = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (string raw in selected)
+                    {
+                        if (string.IsNullOrWhiteSpace(raw)) continue;
+                        string name = raw.Trim();
+                        names.Add(name);
+                        int dot = name.LastIndexOf('.');
+                        if (dot > 0 && dot < name.Length - 1) names.Add(name.Substring(dot + 1));
+                    }
+                    if (names.Count > 0) tableScope = names;
+                }
+
+                if (tableScope == null)
+                    Log("[APPROVAL-GATE] 'Only Selected Objects' is on but no selection was harvested " +
+                        "from the wizard's Object Filter page - checking the WHOLE MODEL rather than " +
+                        "a partial set.");
             }
 
             try
@@ -6622,6 +6644,11 @@ namespace EliteSoft.Erwin.AddIn
                                                 // user did not enable the filter, keep using the
                                                 // faster jump.
                                                 bool onlySelected = chkFilterObjects.Enabled && chkFilterObjects.Checked;
+                                                // Clear the previous run's harvest FIRST: a stale
+                                                // selection would scope this run's rule check to
+                                                // the tables of a different generation, and the
+                                                // gate would report a clean model it never looked at.
+                                                Services.MartMartAutomation.ResetObjectFilterSelection();
                                                 bool previewOk = await Services.MartMartAutomation
                                                     .ClickWizardPreviewTabAsync(capturedWizard, (Action<string>)log,
                                                         overlayToggle: null,

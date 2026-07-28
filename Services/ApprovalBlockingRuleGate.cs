@@ -735,11 +735,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // run does not. Comparing the two output blocks is what attributes the walk's
                 // cost to a shape or to the context. Once per process.
                 ScapiCalibration.RunOnce(modelObjectsRef, rootRef, "approval gate (modal loop)", Write);
-
-                // Does the live model expose the diagram selection as a property? Triggered from
-                // here because it is the one moment we KNOW the user has just made a selection
-                // and pressed Generate DDL - no new UI, no hotkey, no extra run.
-                SelectionProbe.RunOnce(modelObjectsRef, rootRef, Write);
 #endif
 
                 // MODEL-scoped UDP conditions resolve through NamingValidationEngine's
