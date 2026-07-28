@@ -464,7 +464,45 @@ Window split, pane rendered, no violations, submit button enabled. 16.2 s at ope
 - [ ] Live-check the fallback path too (it has never run): it is the one thing standing between
       a future pane bug and another dead erwin.
 
-### WON'T-DO: scoping the gate walk to "Only Selected Objects" (decided 2026-07-28)
+### KNOWN-INCORRECT INTERIM STATE - do not ship (2026-07-28)
+
+`0c31f0f` scopes the blocking-rule check to the tables named by the generated DDL when
+"Only Selected Objects" is ticked. **That is narrower than the selection and therefore
+under-checks.** A table can be SELECTED but UNCHANGED, in which case it never appears in the
+alter script and its rules are never evaluated - a silent governance pass, which is the exact
+failure class this gate exists to prevent. Found by live test: 3 tables selected, 1 changed,
+only the changed one was checked.
+
+Left in place deliberately (user decision 2026-07-28) while the research below runs, rather
+than reverting to the whole-model walk. **Must be either fixed by a real selection mechanism or
+reverted before this ships.**
+
+Reverting is `git revert 0c31f0f`; that restores the whole-model walk, which is correct but
+broad and costs ~16 s per DDL Review open.
+
+### RESEARCH IN FLIGHT: how to enumerate the diagram selection
+
+The DDL is the wrong source; we need the SELECTION itself. What is already ruled out:
+
+- `Win32Helper.GetDiagramSelectedEntities` / `ParseSelectedEntityFromOverviewText` read erwin's
+  Overview-pane Static text, which is `"MODEL (ENTITY)"` for ONE selection but a COUNT
+  ("2 objects") for multi-select - they return null/empty for 2+, by design and by comment.
+- The generated alter DDL, for the reason above.
+
+Being investigated in parallel: the SCAPI object model (display/placement classes and any
+Selected-shaped property), the live metamodel's ~1,500 property types, erwin's own UI surfaces
+readable via Win32 (Model Explorer tree multi-selection, Properties pane, status bar), and side
+channels (the Object Filter wizard page after "Yes", the native bridge, temp/registry artefacts).
+
+Acceptance bar for any candidate: it must return ALL selected entities, not just the focused
+one - that single-item failure mode is what already sank the Overview-pane approach - and it
+must not require a wizard to be open.
+
+### WON'T-DO: scoping the gate walk to "Only Selected Objects" (SUPERSEDED 2026-07-28)
+
+The reasoning below stands on the facts but NOT on the conclusion: the user has since asked
+twice for the scoping and accepted the consequence, so the question is now "how", not "whether".
+Kept for the API constraints it records.
 
 Asked for, investigated, dropped. How the checkbox actually works:
 
