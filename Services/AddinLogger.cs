@@ -51,7 +51,33 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
-        /// Append a single line. Adds wall-clock timestamp and elapsed
+        /// This process's id, stamped on every line.
+        ///
+        /// <para>EVERY erwin instance on the machine appends to the SAME file, so without this
+        /// the log is an unattributable interleaving. On 2026-07-28 four erwin processes were
+        /// running - three of them windowless leftovers from earlier crashes - and a
+        /// "Generate DDL did nothing" report could not be diagnosed because there was no way to
+        /// tell which instance had written which line, or even that one of them was connected to
+        /// a different model. Three separate performance and crash analyses that day had been
+        /// read off this file without knowing that.</para>
+        ///
+        /// <para>Cached once: <c>Process.GetCurrentProcess()</c> allocates, and this runs on
+        /// every log line including inside model walks.</para>
+        /// </summary>
+        private static readonly int ProcessId = ResolveProcessId();
+
+        private static int ResolveProcessId()
+        {
+            try { return Environment.ProcessId; }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"AddinLogger could not resolve the process id: {ex.Message}");
+                return 0;
+            }
+        }
+
+        /// <summary>
+        /// Append a single line. Adds wall-clock timestamp, the process id and elapsed
         /// milliseconds since <see cref="StartSession"/>; safe to call
         /// before <c>StartSession</c> (elapsed reads as 0).
         /// </summary>
@@ -62,7 +88,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 lock (_gate)
                 {
                     long elapsed = _swSession.IsRunning ? _swSession.ElapsedMilliseconds : 0;
-                    var line = $"[{DateTime.Now:HH:mm:ss.fff}] [+{elapsed,6}ms] {message}\r\n";
+                    var line = $"[{DateTime.Now:HH:mm:ss.fff}] [pid {ProcessId}] [+{elapsed,6}ms] {message}\r\n";
                     File.AppendAllText(FilePath, line);
                 }
             }
