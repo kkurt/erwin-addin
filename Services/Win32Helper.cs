@@ -999,12 +999,46 @@ namespace EliteSoft.Erwin.AddIn.Services
         [DllImport("user32.dll", SetLastError = true)]
         private static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam, uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
 
+        /// <summary>
+        /// Window text, or <c>""</c> when it could not be read.
+        ///
+        /// <para><b>Hazard: "" is AMBIGUOUS.</b> It means either "the window really has no text"
+        /// or "the read timed out". Callers that only ask "does this title contain X" are safe -
+        /// a timeout answers no, which is the conservative answer. Callers whose EMPTY case is a
+        /// meaningful state ("nothing is selected", "no model is open") must NOT use this: a
+        /// timeout would be read as that state. Measured 2026-07-28 on the Overview selection
+        /// Static, 250 reads: 60 timeouts at the 100 ms budget (24 percent), 0 at 500 ms.
+        /// Use <see cref="TryGetWindowTextNoHang"/> there instead.</para>
+        /// </summary>
         public static string GetWindowTextNoHang(IntPtr hWnd, int timeoutMs = 100)
+            => TryGetWindowTextNoHang(hWnd, out string text, timeoutMs) ? text : "";
+
+        /// <summary>
+        /// Window text with the timeout distinguished from genuine empty text.
+        /// </summary>
+        /// <param name="text">The text on success; <c>""</c> when this returns false.</param>
+        /// <returns>
+        /// False when the read timed out or the window did not answer - i.e. UNKNOWN. Callers
+        /// must treat that as "cannot tell", never as the empty state.
+        /// </returns>
+        /// <remarks>
+        /// The default budget stays at 100 ms because the enumeration-heavy monitor scans call
+        /// this once per window on a 100 ms UI-thread tick, and a longer budget there would let
+        /// one busy window stall the tick. Raise it deliberately, per call, for a SINGLE known
+        /// window whose value has to be right.
+        /// </remarks>
+        public static bool TryGetWindowTextNoHang(IntPtr hWnd, out string text, int timeoutMs = 100)
         {
+            text = "";
+            if (hWnd == IntPtr.Zero) return false;
+
             var sb = new StringBuilder(512);
             // 0x000D = WM_GETTEXT, 0x0002 = SMTO_ABORTIFHUNG.
             IntPtr ok = SendMessageTimeout(hWnd, 0x000D, (IntPtr)512, sb, 0x0002, (uint)timeoutMs, out _);
-            return ok == IntPtr.Zero ? "" : sb.ToString();
+            if (ok == IntPtr.Zero) return false;
+
+            text = sb.ToString();
+            return true;
         }
 
         [DllImport("user32.dll", CharSet = CharSet.Auto)]

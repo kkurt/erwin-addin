@@ -5109,9 +5109,19 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // Re-read the cached Overview Static (one cheap WM_GETTEXT). When nothing is
                 // selected the Static still shows just "MODELNAME" (model-prefixed, no parens), so
                 // the common cases - stable selection AND nothing selected - never re-enumerate.
-                string selText = Win32Helper.IsWindowValid(_overviewSelectionStatic)
-                    ? Win32Helper.GetWindowTextNoHang(_overviewSelectionStatic)
-                    : null;
+                // TryGetWindowTextNoHang, not GetWindowTextNoHang: here the EMPTY case is a
+                // meaningful state ("nothing is selected"), so a timeout returning "" would be
+                // read as a real deselection. Measured on this very Static: 60 of 250 reads timed
+                // out at the 100 ms budget and 0 at 500 ms, so the old code silently reported
+                // "nothing selected" about a quarter of the time. A single known window justifies
+                // the longer budget; the enumeration scans keep the 100 ms default.
+                string selText = null;
+                if (Win32Helper.IsWindowValid(_overviewSelectionStatic)
+                    && !Win32Helper.TryGetWindowTextNoHang(_overviewSelectionStatic, out selText, timeoutMs: 500))
+                {
+                    Log("[SEL-SCOPE] selection Static did not answer in 500 ms - selection UNKNOWN this tick (not treated as 'nothing selected').");
+                    return null;
+                }
                 bool cachedUsable = !string.IsNullOrEmpty(selText)
                     && selText.TrimStart().StartsWith(modelName, StringComparison.OrdinalIgnoreCase);
 
@@ -5124,7 +5134,11 @@ namespace EliteSoft.Erwin.AddIn.Services
                         _selectionStaticRetryTicks = SelectionStaticRetryHeartbeats;
                         return null;
                     }
-                    selText = Win32Helper.GetWindowTextNoHang(_overviewSelectionStatic);
+                    if (!Win32Helper.TryGetWindowTextNoHang(_overviewSelectionStatic, out selText, timeoutMs: 500))
+                    {
+                        Log("[SEL-SCOPE] freshly located selection Static did not answer in 500 ms - selection UNKNOWN this tick.");
+                        return null;
+                    }
                 }
                 return Win32Helper.ParseSelectedEntityFromOverviewText(selText);
             }

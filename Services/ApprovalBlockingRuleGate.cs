@@ -739,7 +739,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // Does the live model expose the diagram selection as a property? Triggered from
                 // here because it is the one moment we KNOW the user has just made a selection
                 // and pressed Generate DDL - no new UI, no hotkey, no extra run.
-                SelectionProbe.RunOnce(rootRef, Write);
+                SelectionProbe.RunOnce(modelObjectsRef, rootRef, Write);
 #endif
 
                 // MODEL-scoped UDP conditions resolve through NamingValidationEngine's

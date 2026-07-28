@@ -58,7 +58,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// Once per process: the answer does not change within a session.
         /// </summary>
         /// <param name="modelRoot">The model root object (boxed; cast to dynamic inside).</param>
-        public static void RunOnce(object? modelRoot, Action<string>? log)
+        public static void RunOnce(object? modelObjects, object? modelRoot, Action<string>? log)
         {
             void Write(string message)
             {
@@ -73,28 +73,79 @@ namespace EliteSoft.Erwin.AddIn.Services
             Write("reading selection-shaped properties off the model root " +
                   "(select 2+ entities on the diagram before triggering this to make the result meaningful)");
 
-            foreach (string name in Candidates)
-            {
-                try
-                {
-                    dynamic root = modelRoot;
-                    object? raw = root.Properties(name).Value;
-                    if (raw == null)
-                    {
-                        Write($"  {name,-24} = <null>");
-                        continue;
-                    }
+            Write("on MODEL root:");
+            ReadCandidates(modelRoot, Write);
 
-                    Write($"  {name,-24} = [{raw.GetType().Name}] '{Describe(raw)}'");
-                }
-                catch (Exception ex)
+            // Round 2, and the reason this probe was worth extending rather than abandoning.
+            // On the model root erwin answered Current_Selection with "Property Current_Selection
+            // class cannot be assigned to object of Model class" - a DIFFERENT error from the
+            // "not a valid class id, class name or object property" it gave for the invented
+            // names Selection / Selected_Objects. So the property CLASS exists and erwin knows
+            // the name; it is simply not carried by the Model class. A selection is a property of
+            // a DIAGRAM, so ask the diagrams.
+            if (modelObjects == null) return;
+            try
+            {
+                dynamic mo = modelObjects;
+                dynamic diagrams = mo.Collect(modelRoot, "ER_Diagram", -1);
+                if (diagrams == null) { Write("no ER_Diagram objects collected."); return; }
+
+                int index = 0;
+                foreach (dynamic diagram in diagrams)
                 {
-                    // Expected for a property the class does not carry - erwin says "does not use
-                    // a property of X type or the property failed to satisfy a property collection
-                    // filter conditions". Logged, never swallowed: which properties FAIL is half
-                    // the answer.
-                    Write($"  {name,-24} ! {ex.Message}");
+                    if (diagram == null) continue;
+                    object diagramRef = diagram;
+
+                    string id = "";
+                    string name = "";
+                    try { id = diagram.ObjectId?.ToString() ?? ""; } catch { /* logged via the read below */ }
+                    try { name = diagram.Name?.ToString() ?? ""; } catch { /* ditto */ }
+
+                    Write($"on ER_Diagram[{index++}] '{name}' {id}:");
+                    ReadCandidates(diagramRef, Write);
+
+                    // Control on THIS class: the metamodel documents Selection_Grips_Color on
+                    // ER_Diagram, so a successful read proves we are addressing the right object
+                    // and that a failure above is about the property, not the target.
+                    ReadOne(diagramRef, "Selection_Grips_Color", Write);
+
+                    if (index >= 3) { Write("(stopping after 3 diagrams)"); break; }
                 }
+            }
+            catch (Exception ex)
+            {
+                Write($"ER_Diagram walk failed: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        private static void ReadCandidates(object? target, Action<string> write)
+        {
+            if (target == null) return;
+            foreach (string name in Candidates) ReadOne(target, name, write);
+        }
+
+        private static void ReadOne(object target, string name, Action<string> write)
+        {
+            try
+            {
+                dynamic obj = target;
+                object? raw = obj.Properties(name).Value;
+                if (raw == null)
+                {
+                    write($"  {name,-24} = <null>");
+                    return;
+                }
+
+                write($"  {name,-24} = [{raw.GetType().Name}] '{Describe(raw)}'");
+            }
+            catch (Exception ex)
+            {
+                // Which properties FAIL is half the answer, and HOW they fail is the other half:
+                // "cannot be assigned to object of X class" means the property class exists but
+                // is not carried here, whereas "not a valid class id, class name or object
+                // property" means the name does not exist at all. Logged verbatim, never
+                // swallowed.
+                write($"  {name,-24} ! {ex.Message}");
             }
         }
 

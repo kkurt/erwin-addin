@@ -107,3 +107,7 @@ Bir Bugı çözerken öncelikle bu Bug'ın gerçekten var olduğundan emin ol, g
 Bir iş paketine başlarken İLK İŞ olarak `start_work_package` çağır (WP'yi "In progress"e alır).
 Bitince `add_comment` ile özet ekle; uygunsa `update_work_package_status` ile ilerlet.
 WP'lere not/açıklama eklerken Türkçe, kısa ve öz olsun. Notlar/Açıklamalar teknik detay içermemeli.
+
+## DB 
+DB tasarımı/değişikliği/ekleme yaparken profesyönelce yap. Çöp oluşturma.Var olan yapıyı sorgula, ona entegre etmeye çalış.
+Ama edilemiyorsa zorlama!
