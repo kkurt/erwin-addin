@@ -62,6 +62,17 @@ namespace EliteSoft.Erwin.AddIn.Forms
         // to proceed. Null = no gate wired (defensive; the form always supplies it).
         private readonly Func<IWin32Window, bool> _approvalBlockingGate;
 
+        // Blocking-rule verdict computed BEFORE this window opened (the walk needs the live
+        // SCAPI session and the owning STA, neither of which this dialog has). Non-null with at
+        // least one rule = the window splits and shows the report pane. Null = enforcement off,
+        // no rules defined, or a caller that does not gate.
+        private readonly Services.ApprovalBlockingGateResult _blockingReport;
+
+        // Latch, not a transient state. ReenableForRetry re-enables the submit button on every
+        // failure path, so without this a rule-blocked model would become submittable again the
+        // first time anything else went wrong.
+        private bool _blockedByRules;
+
 
         private RichTextBox _rtb;
         private TextBox _txtNote;
@@ -88,7 +99,8 @@ namespace EliteSoft.Erwin.AddIn.Forms
             Func<string, System.Threading.Tasks.Task<bool>> martSaveCallback = null,
             PromotionSendContext promotionContext = null,
             Func<string, System.Threading.Tasks.Task<PromotionSaveOutcome>> promotionSaveCallback = null,
-            Func<IWin32Window, bool> approvalBlockingGate = null)
+            Func<IWin32Window, bool> approvalBlockingGate = null,
+            Services.ApprovalBlockingGateResult blockingReport = null)
         {
             _ddlText           = ddlText ?? string.Empty;
             _configId          = configId;
@@ -102,6 +114,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
             _promotion         = (promotionContext != null && promotionContext.Routes.Count > 0) ? promotionContext : null;
             _promotionSaveCallback = promotionSaveCallback;
             _approvalBlockingGate  = approvalBlockingGate;
+            _blockingReport        = (blockingReport != null && blockingReport.HasReport) ? blockingReport : null;
             if (_promotion != null)
             {
                 if (_promotionSaveCallback == null)
@@ -272,14 +285,13 @@ namespace EliteSoft.Erwin.AddIn.Forms
 
             _btnSend = new Button
             {
-                // Promotion mode: the send targets an environment ("Send to
-                // Approval" per the release-management spec wording).
-                // Otherwise: no approver chain -> there is no
-                // approval queue; the add-in commits the model to the Mart
-                // itself, so the verb is "Save Model" rather than
-                // "Send to Approve".
-                Text = PromotionMode ? "Send to Approval"
-                     : _approvalEnabled ? "Send to Approve"
+                // One caption for both queue-entering paths (user decision 2026-07-27): a
+                // promotion request and an approval request are the same act to the reviewer,
+                // and the earlier split wording ("Send to Approval" vs "Send to Approve") only
+                // invited the question of which one the rules apply to. Both, always.
+                // With no approver chain there is no queue at all - the add-in commits to the
+                // Mart itself - so that state keeps its own verb.
+                Text = (PromotionMode || _approvalEnabled) ? "Send to Approve"
                      : "Save and Close",
                 Size = new Size(160, 32),
                 FlatStyle = FlatStyle.Flat,
@@ -530,11 +542,102 @@ namespace EliteSoft.Erwin.AddIn.Forms
             // docks (added AFTER) get their slice first and the Fill takes the
             // remainder. Within each dock direction, REVERSE add order
             // determines stacking, so the LAST-added Top is the topmost.
-            Controls.Add(_rtb);
+            //
+            // The blocking-rule report replaces _rtb as the Fill control by wrapping it in a
+            // splitter. Deliberately ONE conditional swap here rather than adding the pane
+            // later and re-parenting: the reverse-add-order rule above is load-bearing, and
+            // Controls.SetChildIndex games against it are how docking layouts break.
+            Controls.Add(BuildCenterRegion());
             Controls.Add(bottomDivider);
             Controls.Add(bottomPanel);
             Controls.Add(headerDivider);
             Controls.Add(headerPanel);
+
+            ApplyBlockingRuleVerdict();
+        }
+
+        /// <summary>
+        /// The DDL viewer alone, or the viewer beside the blocking-rule report when the config
+        /// defines any blocking rule. Split even when nothing is violated: a reviewer being let
+        /// through still needs to see WHAT was checked (user decision 2026-07-27).
+        /// </summary>
+        private Control BuildCenterRegion()
+        {
+            if (_blockingReport == null) return _rtb;
+
+            var split = new SplitContainer
+            {
+                Dock = DockStyle.Fill,
+                Orientation = Orientation.Vertical,
+                SplitterWidth = 6,
+                BackColor = Color.FromArgb(208, 208, 208),
+                // The DDL is the primary content and must keep the space when the user resizes
+                // the window; the report is a fixed-width sidebar.
+                FixedPanel = FixedPanel.Panel2,
+                Panel1MinSize = 320,
+                Panel2MinSize = 300,
+            };
+            split.Panel1.Controls.Add(_rtb);
+            split.Panel2.Controls.Add(new ApprovalReportPane(_blockingReport));
+
+            // Widen for the pane, then clamp to the working area. Without the clamp a
+            // CenterParent window that grew past the screen pushes its own right-docked button
+            // strip off-view on a 1366 px laptop or a 1024 px RDP session.
+            var workArea = (Screen.FromControl(this) ?? Screen.PrimaryScreen).WorkingArea;
+            int wanted = Math.Min(ClientSize.Width + ReportPaneWidth, workArea.Width - 40);
+            ClientSize = new Size(Math.Max(wanted, ClientSize.Width), ClientSize.Height);
+            MinimumSize = new Size(Math.Min(1040, workArea.Width - 40), MinimumSize.Height);
+
+            // Set AFTER the width so the distance is measured against the final size; Panel2 is
+            // the fixed one, so this is what pins the sidebar.
+            split.SplitterDistance = Math.Max(split.Panel1MinSize, ClientSize.Width - ReportPaneWidth);
+            return split;
+        }
+
+        private const int ReportPaneWidth = 440;
+
+        /// <summary>
+        /// Applies the verdict to the submit button. A violated rule, or one that could not be
+        /// checked at all, disables it - in EVERY caption state, including "Save and Close",
+        /// because that one also writes a governance row and the click-time check refuses it
+        /// too; leaving it green would make the button lie.
+        ///
+        /// <para>The disabled button is an EXPLANATION, never the authority. The check inside
+        /// <see cref="BtnSend_Click"/> stays exactly as it was and remains what actually refuses
+        /// a submission.</para>
+        /// </summary>
+        private void ApplyBlockingRuleVerdict()
+        {
+            if (_blockingReport == null) return;
+
+            _blockedByRules = _blockingReport.Blocked;
+            var pane = FindReportPane();
+
+            if (_blockedByRules)
+            {
+                _btnSend.Enabled = false;
+                _btnSend.BackColor = Color.FromArgb(158, 158, 158);
+                _lblStatus.ForeColor = Color.FromArgb(192, 57, 43);
+            }
+            else
+            {
+                _lblStatus.ForeColor = Color.FromArgb(102, 102, 102);
+            }
+
+            if (pane != null) _lblStatus.Text = pane.Summary;
+        }
+
+        private ApprovalReportPane FindReportPane()
+        {
+            foreach (Control top in Controls)
+            {
+                if (top is SplitContainer split)
+                {
+                    foreach (Control child in split.Panel2.Controls)
+                        if (child is ApprovalReportPane pane) return pane;
+                }
+            }
+            return null;
         }
 
         private string BuildMetaLine()
@@ -1345,7 +1448,11 @@ namespace EliteSoft.Erwin.AddIn.Forms
 
         private void ReenableForRetry()
         {
-            _btnSend.Enabled = true;
+            // The blocking-rule verdict is NOT a transient failure and must survive every retry
+            // path: the model still violates the rule that refused it, and nothing the user can
+            // do in THIS window changes that (fixing it means Cancel, fix, regenerate). Restoring
+            // the button here would hand them a green button that the click-time check refuses.
+            _btnSend.Enabled = !_blockedByRules;
             _btnCancel.Enabled = true;
             _btnCopy.Enabled = true;
             _txtNote.Enabled = true;

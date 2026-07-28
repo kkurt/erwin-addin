@@ -5670,9 +5670,80 @@ namespace EliteSoft.Erwin.AddIn
         /// </summary>
         /// <param name="owner">Window the report is modal to (the caller's own dialog).</param>
         /// <param name="actionName">User-facing name of the action being gated, e.g. "Send to Approve".</param>
-        internal bool CheckApprovalBlockingRules(IWin32Window owner, string actionName)
+        /// <summary>
+        /// Progress readout for a whole-model walk, painted WITHOUT pumping the message loop.
+        ///
+        /// <para>The walk holds the UI thread for seconds and cannot yield it: pumping is what
+        /// let the add-in's own timers re-enter SCAPI mid-walk and turned a 12-second walk into
+        /// a 46-minute one. So this deliberately does NOT use <c>ShowBusyOverlay</c> (which
+        /// calls <c>DoEvents</c>) and does NOT animate. <c>Update()</c> sends WM_PAINT straight
+        /// to the control and dispatches nothing else, which is exactly the amount of feedback
+        /// that is safe here.</para>
+        /// </summary>
+        private sealed class WalkProgressOverlay : IDisposable
         {
-            Services.ApprovalBlockingGateResult result;
+            private readonly Label _label;
+            private readonly Control _host;
+
+            public WalkProgressOverlay(Control host)
+            {
+                _host = host;
+                _label = new Label
+                {
+                    Text = "Checking blocking rules...",
+                    Font = new Font("Segoe UI", 10F),
+                    ForeColor = Color.FromArgb(26, 26, 26),
+                    BackColor = Color.FromArgb(255, 248, 220),
+                    BorderStyle = BorderStyle.FixedSingle,
+                    TextAlign = ContentAlignment.MiddleCenter,
+                    AutoSize = false,
+                    Size = new Size(Math.Min(420, Math.Max(240, host.ClientSize.Width - 40)), 48),
+                    UseMnemonic = false
+                };
+                _label.Location = new Point(
+                    Math.Max(0, (host.ClientSize.Width - _label.Width) / 2),
+                    Math.Max(0, (host.ClientSize.Height - _label.Height) / 2));
+
+                host.Controls.Add(_label);
+                _label.BringToFront();
+                _label.Update();
+            }
+
+            public void Report(string message)
+            {
+                if (_label.IsDisposed || string.IsNullOrEmpty(message)) return;
+                _label.Text = message;
+                // Paint only. Refresh() would invalidate and repaint too, but Update() after a
+                // direct text set is the narrowest thing that puts pixels on screen.
+                _label.Invalidate();
+                _label.Update();
+            }
+
+            public void Dispose()
+            {
+                try
+                {
+                    _host.Controls.Remove(_label);
+                    _label.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"WalkProgressOverlay dispose failed: {ex.Message}");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Runs the blocking-rule walk and returns its verdict, WITHOUT deciding anything or
+        /// telling the user. Two callers need the same walk for different purposes: the DDL
+        /// review window wants a report to render before it opens, and
+        /// <see cref="CheckApprovalBlockingRules"/> wants a go/no-go at submit time.
+        ///
+        /// <para>Never throws: a gate that failed to prove the model clean returns a BLOCKING
+        /// result, because the alternative is a silent pass.</para>
+        /// </summary>
+        internal Services.ApprovalBlockingGateResult EvaluateApprovalBlockingRules(string actionName)
+        {
             try
             {
                 // Box the session so the call binds STATICALLY. Passing the dynamic field
@@ -5722,14 +5793,17 @@ namespace EliteSoft.Erwin.AddIn
                 // the walk ran on the STA - the exact confusion the line exists to prevent.
                 Func<Services.ApprovalBlockingGateResult> walk = () =>
                 {
+                    // Created INSIDE the marshalled delegate: this body runs on the UI thread, and
+                    // a WinForms control may only be created and painted there.
+                    using var progress = new WalkProgressOverlay(this);
                     using (Services.ModelWalkGate.Enter($"Approval blocking gate ({actionName})"))
-                        return Services.ApprovalBlockingRuleGate.Evaluate(session, gateLog);
+                        return Services.ApprovalBlockingRuleGate.Evaluate(session, gateLog, progress.Report);
                 };
 
                 UseWaitCursor = true;
                 try
                 {
-                    result = InvokeRequired
+                    return InvokeRequired
                         ? (Services.ApprovalBlockingGateResult)Invoke(walk)
                         : walk();
                 }
@@ -5738,14 +5812,32 @@ namespace EliteSoft.Erwin.AddIn
             catch (Exception ex)
             {
                 // Evaluate() is written not to throw; if it ever does, the gate has failed
-                // to prove the model clean and the request must NOT be submitted.
+                // to prove the model clean and the request must NOT be submitted. Surfaced as a
+                // BLOCKING result rather than a rethrow so both callers - the report pane and
+                // the submit check - land on "refused, and here is why" instead of one of them
+                // crashing and the other silently passing.
                 Log($"[APPROVAL-GATE] {actionName} aborted - gate threw: {ex}");
-                Forms.AddinMessageDialog.Show(owner ?? this,
-                    $"The blocking rules could not be checked ({ex.Message}).\n\n" +
-                    $"{actionName} was not submitted.",
-                    actionName, MessageBoxButtons.OK, MessageBoxIcon.Error);
-                return false;
+                return Services.ApprovalBlockingRuleGate.Failed(
+                    $"The blocking rules could not be checked ({ex.Message}). " +
+                    "Submission is blocked until they can be evaluated.");
             }
+        }
+
+        /// <summary>
+        /// Submit-time gate: TRUE to let the caller proceed. This is the authority - the review
+        /// window's disabled button only explains the refusal (tasks/lessons.md: uniqueness and
+        /// authority belong to the layer that performs the operation, never to a control's
+        /// enabled state).
+        ///
+        /// <para>No longer opens a report dialog. The rule-level report lives in the DDL review
+        /// window's own pane now, so popping a second modal over it would report the same verdict
+        /// twice (user decision 2026-07-27).</para>
+        /// </summary>
+        /// <param name="owner">Window any message is modal to (the caller's own dialog).</param>
+        /// <param name="actionName">User-facing name of the action being gated.</param>
+        internal bool CheckApprovalBlockingRules(IWin32Window owner, string actionName)
+        {
+            var result = EvaluateApprovalBlockingRules(actionName);
 
             if (!result.Blocked)
             {
@@ -5756,8 +5848,41 @@ namespace EliteSoft.Erwin.AddIn
             }
 
             Log($"[APPROVAL-GATE] {actionName} BLOCKED - {result.Issues.Count} issue(s).");
-            Forms.ApprovalBlockingRulesDialog.ShowFor(result, owner ?? this, actionName);
+            Forms.AddinMessageDialog.Show(owner ?? this,
+                BuildBlockedMessage(result, actionName),
+                actionName, MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return false;
+        }
+
+        /// <summary>
+        /// Short refusal text. Deliberately NOT a rule-by-rule listing: on the DDL path the pane
+        /// beside the DDL already shows every rule, and on the Integrate path (which has no DDL
+        /// and therefore no pane) the honest move is to name the count and send the user to the
+        /// surface that can show them, rather than reproduce a report in a message box.
+        /// </summary>
+        private static string BuildBlockedMessage(Services.ApprovalBlockingGateResult result, string actionName)
+        {
+            var gateIssues = result.GateIssues;
+            if (gateIssues.Count > 0)
+            {
+                return $"{actionName} was refused.\n\n" + gateIssues[0].Reason;
+            }
+
+            int failed = 0, notChecked = 0;
+            foreach (var row in result.RuleReport)
+            {
+                if (row.Status == Services.ApprovalRuleStatus.Failed) failed++;
+                else if (row.Status == Services.ApprovalRuleStatus.NotChecked) notChecked++;
+            }
+
+            var reasons = new System.Collections.Generic.List<string>();
+            if (failed > 0) reasons.Add($"{failed} blocking rule(s) are violated");
+            if (notChecked > 0) reasons.Add($"{notChecked} blocking rule(s) could not be checked");
+            if (reasons.Count == 0) reasons.Add($"{result.Issues.Count} blocking rule issue(s) were found");
+
+            return $"{actionName} was refused because " + string.Join(" and ", reasons) + ".\n\n" +
+                   "Nothing was saved or submitted. Use Generate DDL to see the full rule report " +
+                   "beside the DDL, fix the model, then try again.";
         }
 
         private async void BtnAlterWizardProd_Click(object sender, EventArgs e)
@@ -7017,6 +7142,20 @@ namespace EliteSoft.Erwin.AddIn
                 approvalEnabled = true;
             }
 
+            // Blocking-rule verdict for the review pane, computed BEFORE the window opens
+            // because the pane must be populated the moment it appears (user decision
+            // 2026-07-27: the pane shows whenever any blocking rule exists, and says "no
+            // violations" when there are none, so there is no lazy variant).
+            //
+            // This is a SNAPSHOT for display. The authoritative check is still the one inside
+            // BtnSend_Click - a disabled control explains a refusal, it never enforces one
+            // (tasks/lessons.md). So a successful submit walks the model twice, and that is
+            // deliberate: erwin's frame is disabled while the add-in is on screen, but the user
+            // is explicitly allowed to minimise the add-in and edit, so this snapshot cannot be
+            // assumed still true at click time.
+            var blockingReport = EvaluateApprovalBlockingRules(
+                promotionContext != null ? "Send to Approve" : "Send to Approve");
+
             using var dlg = new Forms.DdlApprovalDialog(
                 ddlText:           ddl,
                 configId:          ctx.ActiveConfigId,
@@ -7032,8 +7171,8 @@ namespace EliteSoft.Erwin.AddIn
                 // Naming-rule gate on ENTRY to the approval queue. Lives here (not in the
                 // dialog) because it needs the live SCAPI session; the dialog passes
                 // itself as the owner so the report is modal to the review window.
-                approvalBlockingGate: owner => CheckApprovalBlockingRules(
-                    owner, promotionContext != null ? "Send to Approval" : "Send to Approve"));
+                approvalBlockingGate: owner => CheckApprovalBlockingRules(owner, "Send to Approve"),
+                blockingReport:        blockingReport);
             dlg.ShowDialog(this);
         }
 

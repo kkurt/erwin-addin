@@ -574,12 +574,26 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// </summary>
         /// <param name="session">The add-in's live SCAPI session.</param>
         /// <param name="log">Debug-log sink; may be null.</param>
-        public static ApprovalBlockingGateResult Evaluate(dynamic session, Action<string>? log)
+        /// <param name="progress">
+        /// Optional coarse progress sink, invoked on THIS thread between rules and every N
+        /// objects of the collect phase. The walk holds the UI thread and does not pump, so a
+        /// consumer must repaint with <c>Control.Update()</c> (paint only) and never
+        /// <c>DoEvents</c> - pumping here is what let the validation timers re-enter SCAPI
+        /// mid-walk and cost 46 minutes (see <see cref="ModelWalkGate"/>).
+        /// </param>
+        public static ApprovalBlockingGateResult Evaluate(
+            dynamic session, Action<string>? log, Action<string>? progress = null)
         {
             void Write(string message)
             {
                 try { log?.Invoke($"{LogPrefix} {message}"); }
                 catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"{LogPrefix} log sink threw: {ex.Message}"); }
+            }
+
+            void Progress(string message)
+            {
+                try { progress?.Invoke(message); }
+                catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"{LogPrefix} progress sink threw: {ex.Message}"); }
             }
 
             var ctx = ConfigContextService.Instance;
@@ -724,10 +738,14 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                 try
                 {
-                    foreach (var group in evaluable.GroupBy(r => NormalizeObjectType(r.ObjectType)))
+                    int groupsDone = 0;
+                    var groups = evaluable.GroupBy(r => NormalizeObjectType(r.ObjectType)).ToList();
+                    foreach (var group in groups)
                     {
+                        Progress($"Checking {group.Key} rules ({++groupsDone} of {groups.Count})...");
                         objectsInspected += EvaluateObjectTypeGroup(
-                            modelObjectsRef, rootRef, group.Key, group.ToList(), issues, outcomes, Write);
+                            modelObjectsRef, rootRef, group.Key, group.ToList(), issues, outcomes,
+                            Write, Progress);
                     }
                 }
                 finally
@@ -769,7 +787,8 @@ namespace EliteSoft.Erwin.AddIn.Services
             List<NamingStandardRule> rules,
             List<ApprovalBlockingIssue> issues,
             List<RuleOutcome> outcomes,
-            Action<string> write)
+            Action<string> write,
+            Action<string> progress)
         {
             // Existence rules ("an object of this type must exist") carry no property and
             // are invisible to the per-property path, so they are handled first.
@@ -780,7 +799,8 @@ namespace EliteSoft.Erwin.AddIn.Services
             var collectClock = System.Diagnostics.Stopwatch.StartNew();
             try
             {
-                objects = CollectObjects(modelObjects, root, normalizedObjectType, propertyRules, write);
+                objects = CollectObjects(
+                    modelObjects, root, normalizedObjectType, propertyRules, write, progress);
             }
             catch (Exception ex)
             {
@@ -803,7 +823,7 @@ namespace EliteSoft.Erwin.AddIn.Services
 
             foreach (var rule in existenceRules)
                 outcomes.Add(EvaluateExistenceRule(
-                    modelObjects, root, rule, normalizedObjectType, objects, issues, write));
+                    modelObjects, root, rule, normalizedObjectType, objects, issues, write, progress));
 
             foreach (var rule in propertyRules)
                 outcomes.Add(EvaluatePropertyRule(rule, objects, issues, write));
@@ -826,7 +846,8 @@ namespace EliteSoft.Erwin.AddIn.Services
             string normalizedObjectType,
             List<GateObject> collected,
             List<ApprovalBlockingIssue> issues,
-            Action<string> write)
+            Action<string> write,
+            Action<string> progress)
         {
             string message = !string.IsNullOrEmpty(rule.ErrorMessage)
                 ? rule.ErrorMessage
@@ -857,7 +878,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                 List<GateObject> entities;
                 try
                 {
-                    entities = CollectObjects(modelObjects, root, "TABLE", new List<NamingStandardRule>(), write);
+                    entities = CollectObjects(
+                        modelObjects, root, "TABLE", new List<NamingStandardRule>(), write, progress);
                 }
                 catch (Exception ex)
                 {
@@ -1249,7 +1271,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// </summary>
         private static List<GateObject> CollectObjects(
             dynamic modelObjects, dynamic root, string normalizedObjectType,
-            List<NamingStandardRule> propertyRules, Action<string> write)
+            List<NamingStandardRule> propertyRules, Action<string> write, Action<string> progress)
         {
             var result = new List<GateObject>();
             // Boxed alias for calls into the sibling helpers, so they bind statically
@@ -1277,7 +1299,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                 {
                     if (entity == null) continue;
                     if (++tablesWalked % ProgressEveryTables == 0)
+                    {
                         write($"collecting COLUMN objects - {tablesWalked} table(s), {result.Count} column(s) so far.");
+                        progress($"Reading model: {tablesWalked:N0} table(s), {result.Count:N0} column(s)...");
+                    }
                     object entityRef = entity;
                     // One lazy per entity, SHARED by all of its columns: the table half of the
                     // label is then read at most once per table, and only when a column of that
@@ -1336,7 +1361,10 @@ namespace EliteSoft.Erwin.AddIn.Services
             {
                 if (obj == null) continue;
                 if (++walked % ProgressEveryObjects == 0)
+                {
                     write($"collecting {normalizedObjectType} objects - {walked} seen, {result.Count} kept.");
+                    progress($"Reading model: {walked:N0} {normalizedObjectType} object(s)...");
+                }
                 object objRef = obj;
                 if (pkOnly && !IsPrimaryKeyGroup(objRef)) continue;
                 result.Add(new GateObject(objRef, () => ReadDisplayName(objRef, preferPhysical), null));
@@ -1543,6 +1571,15 @@ namespace EliteSoft.Erwin.AddIn.Services
                 else Status = ApprovalRuleStatus.Passed;
             }
         }
+
+        /// <summary>
+        /// A gate-level refusal for a caller that could not even run the walk. Exposed because
+        /// the alternative at those call sites is to invent a "clean" result, which is exactly
+        /// the silent pass this class exists to prevent.
+        /// </summary>
+        public static ApprovalBlockingGateResult Failed(string reason)
+            => new ApprovalBlockingGateResult(
+                true, new List<ApprovalBlockingIssue> { Rule0(reason) }, 0, 0, 0);
 
         /// <summary>An issue that belongs to the gate itself rather than to one rule.</summary>
         private static ApprovalBlockingIssue Rule0(string reason)

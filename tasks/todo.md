@@ -400,15 +400,53 @@ Open-time evaluation is only affordable because of the 221x perf work below: 12.
       25 violations with an EMPTY reported slice must still render Failed with count 25.
 - [x] Build 0 warnings / 0 errors. Tests 1001/1001 green.
 
-## Layer 2 - TODO (UI)
+## Layer 2 - CODE-DONE (awaiting live test)
 
-- [ ] Evaluate at dialog-open time, marshalled onto the owning STA, with a non-pumping progress
-      indicator (paint-only `Update()`, never `DoEvents` - see the perf section below).
-- [ ] `DdlApprovalDialog`: `SplitContainer`, report pane (counter pills, failures first,
-      per-rule detail), latch-disabled submit button (`ReenableForRetry` currently re-enables
-      unconditionally), unified caption, widen-on-show clamped to the working area.
-- [ ] Delete `Forms/ApprovalBlockingRulesDialog.cs`; Integrate gets a short message instead.
-- [ ] Live test.
+- [x] `Forms/ApprovalReportPane.cs` - the right-hand pane. Count chips (violated / not checked /
+      not applicable / passed) in a WRAPPING flow panel because the splitter makes the width
+      user-controlled; rule list ordered failures-first; per-rule detail in an in-pane read-only
+      wrapping TextBox rather than a nested dialog (stacking a modal over an already-modal review
+      window is hostile, and long Turkish admin ERROR_MESSAGE text would clip in a cell). A
+      `Panel` subclass, matching `EnvironmentPipelineDiagram` - this codebase has no UserControl.
+      The subtitle states the verdict is model-wide, because the DDL beside it is an ALTER script
+      over a different object set and letting a reviewer assume otherwise makes a violation on an
+      untouched legacy table look like a bug.
+- [x] `DdlApprovalDialog` takes the precomputed verdict and swaps its Fill control for a
+      `SplitContainer` in ONE conditional line at the existing composition point. `FixedPanel =
+      Panel2` so the DDL keeps the space on resize. Widens by 440 px, clamped to the working area
+      (a CenterParent window that grew past the screen would push its own right-docked button
+      strip off-view on a 1366 px laptop or a 1024 px RDP session).
+- [x] Submit button disabled in ALL THREE caption states, and `ReenableForRetry` now respects the
+      latch - it used to re-enable unconditionally, which would have handed back a green button
+      the click-time check refuses. The disabled button EXPLAINS; the check inside
+      `BtnSend_Click` is untouched and remains the authority.
+- [x] Promotion caption "Send to Approval" unified to "Send to Approve".
+- [x] Open-time evaluation via `ModelConfigForm.EvaluateApprovalBlockingRules`, which
+      `CheckApprovalBlockingRules` now also uses, so both paths share one marshalled walk. A gate
+      that throws returns a BLOCKING result (`ApprovalBlockingRuleGate.Failed`) rather than
+      rethrowing, so neither caller can end up silently passing.
+- [x] Non-pumping progress: `WalkProgressOverlay` is created INSIDE the marshalled delegate (it
+      runs on the UI thread, where controls may be created) and repaints with `Invalidate()` +
+      `Update()`. No `DoEvents`, no animation - pumping here is what cost 46 minutes.
+      `Evaluate` gained an optional `progress` sink, called between rule groups and every
+      50 tables / 2000 objects.
+- [x] `Forms/ApprovalBlockingRulesDialog.cs` DELETED. A blocked Integrate now gets a short
+      message naming the counts and pointing at Generate DDL, where the pane can actually show
+      them. Reproducing a rule report inside a message box for the one path with no DDL would
+      have been the worse half of both options.
+- [x] Build 0 warnings / 0 errors. Tests 1005/1005 green.
+
+### Cost of open-time evaluation, stated plainly
+
+A successful submit now walks the model TWICE - once for the pane, once for the authoritative
+check - so roughly 25 s on the 8,401-column model. Deliberate: erwin's frame is disabled while
+the add-in is on screen, but the user is explicitly allowed to minimise the add-in and edit, so
+the open-time snapshot cannot be assumed still true at click time. Cancelling costs one walk.
+
+- [ ] **LIVE test (user):** `MetaRepoTmp` + `SQL_BUYUKMODEL`, Generate DDL. Expect the progress
+      overlay, then a split window with the pane listing 20 rules (rule #1081 among them),
+      "no violations" and an ENABLED button - that model has no `nvarchar(>4000)` column. To see
+      the blocked state, add such a column first.
 
 ---
 
