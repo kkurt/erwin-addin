@@ -23,14 +23,18 @@ namespace EliteSoft.Erwin.AddIn.Services
     /// <summary>One reason the Integrate / Promote submission is refused.</summary>
     public sealed class ApprovalBlockingIssue
     {
+        // Every string parameter is nullable BY CONTRACT - they are normalised to "" below.
+        // Callers feed them from NamingStandardRule, which lives in a null-oblivious file, so
+        // declaring them non-nullable made the flow analysis warn at call sites that were
+        // always safe.
         public ApprovalBlockingIssue(
             ApprovalBlockingIssueKind kind,
             int ruleId,
-            string objectType,
-            string objectName,
-            string propertyLabel,
-            string ruleSummary,
-            string reason)
+            string? objectType,
+            string? objectName,
+            string? propertyLabel,
+            string? ruleSummary,
+            string? reason)
         {
             Kind = kind;
             RuleId = ruleId;
@@ -110,6 +114,117 @@ namespace EliteSoft.Erwin.AddIn.Services
             => new ApprovalRuleObjectVerdict(true, new List<string>(), error);
     }
 
+    /// <summary>Verdict of ONE blocking rule over the whole model.</summary>
+    public enum ApprovalRuleStatus
+    {
+        /// <summary>Every applicable object satisfied the rule.</summary>
+        Passed,
+
+        /// <summary>At least one applicable object violated the rule.</summary>
+        Failed,
+
+        /// <summary>
+        /// The rule is structurally sound but matched NO object: its DEPENDS_ON condition was
+        /// satisfied by nothing, or the model holds no object of its type. A distinct state on
+        /// purpose - reporting this as "Passed" tells a reviewer the rule verified their model
+        /// when in fact it inspected nothing. Before this existed the distinction was visible
+        /// only in a Debug Log line.
+        /// </summary>
+        NotApplicable,
+
+        /// <summary>
+        /// The rule could not be evaluated at all - an uncompilable regex, an empty affix, a
+        /// PROPERTY_CODE invalid for the object class, a rule the DB flags as blocking that the
+        /// add-in never loaded. An ADMIN data problem, not something the modeller can fix, and
+        /// it still blocks: a rule that cannot be checked must never read as clean.
+        /// </summary>
+        NotChecked
+    }
+
+    /// <summary>
+    /// One row of the rule-level report: what a single blocking rule concluded about the model.
+    ///
+    /// <para><b>Counts are PRE-CAP.</b> <see cref="ApprovalBlockingGateResult.Issues"/> is
+    /// truncated at <see cref="ApprovalBlockingRuleGate.MaxReportedIssues"/> for the UI, but
+    /// <see cref="ViolationCount"/> and <see cref="Status"/> are computed from the full set.
+    /// Deriving status from the reported slice instead would let a rule whose violations all
+    /// fell past the cap render as "Passed" next to a genuinely failing model.</para>
+    /// </summary>
+    public sealed class ApprovalRuleReportRow
+    {
+        internal ApprovalRuleReportRow(
+            int ruleId,
+            string ruleName,
+            string ruleDescription,
+            string ruleSummary,
+            string objectType,
+            string propertyLabel,
+            ApprovalRuleStatus status,
+            int objectsChecked,
+            int applicableCount,
+            int violationCount,
+            IReadOnlyList<ApprovalBlockingIssue> reportedIssues)
+        {
+            RuleId = ruleId;
+            RuleName = ruleName ?? "";
+            RuleDescription = ruleDescription ?? "";
+            RuleSummary = ruleSummary ?? "";
+            ObjectType = objectType ?? "";
+            PropertyLabel = propertyLabel ?? "";
+            Status = status;
+            ObjectsChecked = objectsChecked;
+            ApplicableCount = applicableCount;
+            ViolationCount = violationCount;
+            ReportedIssues = reportedIssues ?? new List<ApprovalBlockingIssue>();
+        }
+
+        /// <summary><c>MC_NAMING_STANDARD.ID</c>.</summary>
+        public int RuleId { get; }
+
+        /// <summary>Admin's <c>NAME</c>; frequently empty - see <see cref="DisplayName"/>.</summary>
+        public string RuleName { get; }
+
+        /// <summary>Admin's <c>DESCRIPTION</c>; frequently empty.</summary>
+        public string RuleDescription { get; }
+
+        /// <summary>Code-built summary of the rule's payload, e.g. "Prefix 'VP_'".</summary>
+        public string RuleSummary { get; }
+
+        public string ObjectType { get; }
+        public string PropertyLabel { get; }
+        public ApprovalRuleStatus Status { get; }
+
+        /// <summary>Objects of this rule's type that were walked.</summary>
+        public int ObjectsChecked { get; }
+
+        /// <summary>Of those, how many the rule actually applied to (conditions satisfied).</summary>
+        public int ApplicableCount { get; }
+
+        /// <summary>TRUE violation count, before the report cap.</summary>
+        public int ViolationCount { get; }
+
+        /// <summary>
+        /// This rule's slice of the CAPPED <see cref="ApprovalBlockingGateResult.Issues"/>, for
+        /// a detail view. May hold fewer entries than <see cref="ViolationCount"/> - that gap is
+        /// the cap, and it is reported rather than hidden.
+        /// </summary>
+        public IReadOnlyList<ApprovalBlockingIssue> ReportedIssues { get; }
+
+        /// <summary>
+        /// What to put in front of a reviewer: the admin's own label when they wrote one, and a
+        /// generated one otherwise. Never blank, because a report row with no identity is
+        /// useless and the NAME column is unpopulated in most repos.
+        /// </summary>
+        public string DisplayName
+            => !string.IsNullOrWhiteSpace(RuleName)
+                ? RuleName
+                : $"#{RuleId} {RuleSummary}".TrimEnd();
+
+        /// <summary>Where the rule applies, e.g. "COLUMN.Physical Data Type".</summary>
+        public string Scope
+            => string.IsNullOrEmpty(PropertyLabel) ? ObjectType : $"{ObjectType}.{PropertyLabel}";
+    }
+
     /// <summary>Outcome of one <see cref="ApprovalBlockingRuleGate.Evaluate"/> run.</summary>
     public sealed class ApprovalBlockingGateResult
     {
@@ -118,14 +233,35 @@ namespace EliteSoft.Erwin.AddIn.Services
             IReadOnlyList<ApprovalBlockingIssue> issues,
             int rulesChecked,
             int objectsInspected,
-            int suppressedIssueCount)
+            int suppressedIssueCount,
+            IReadOnlyList<ApprovalRuleReportRow>? ruleReport = null)
         {
             Enforced = enforced;
             Issues = issues ?? new List<ApprovalBlockingIssue>();
             RulesChecked = rulesChecked;
             ObjectsInspected = objectsInspected;
             SuppressedIssueCount = suppressedIssueCount;
+            RuleReport = ruleReport ?? new List<ApprovalRuleReportRow>();
         }
+
+        /// <summary>
+        /// One row per blocking rule the gate knew about, PASSING ONES INCLUDED, ordered
+        /// failures first. This is what the DDL review pane renders; it cannot be derived from
+        /// <see cref="Issues"/> after the fact, because a rule rejected by the structural
+        /// preflight appears in Issues while being absent from <see cref="RulesChecked"/>, and
+        /// the cap can drop a failing rule's issues entirely.
+        /// </summary>
+        public IReadOnlyList<ApprovalRuleReportRow> RuleReport { get; }
+
+        /// <summary>
+        /// Issues that belong to the GATE rather than to any one rule (<c>RuleId == 0</c>): no
+        /// resolved configuration, an unreadable toggle, an unreadable model. They have no rule
+        /// row to sit under, so a report surface must render them as a banner instead of hiding
+        /// them among the rules.
+        /// </summary>
+        public IReadOnlyList<ApprovalBlockingIssue> GateIssues
+            => System.Linq.Enumerable.ToList(
+                System.Linq.Enumerable.Where(Issues, i => i.RuleId == 0));
 
         /// <summary>False when ENFORCE_APPROVAL_BLOCKING_RULES resolved to off - the gate did nothing.</summary>
         public bool Enforced { get; }
@@ -145,6 +281,13 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// the cap is surfaced in the log and the dialog, never silently applied.
         /// </summary>
         public int SuppressedIssueCount { get; }
+
+        /// <summary>
+        /// True when there is something worth showing a reviewer: enforcement is on and at
+        /// least one blocking rule was known. Drives whether the DDL review window splits at
+        /// all - with no rules there is nothing to report, passing or otherwise.
+        /// </summary>
+        public bool HasReport => Enforced && RuleReport.Count > 0;
 
         internal static ApprovalBlockingGateResult NotEnforced()
             => new ApprovalBlockingGateResult(false, new List<ApprovalBlockingIssue>(), 0, 0, 0);
@@ -212,7 +355,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// in the log. The overflow count is reported (never silently dropped) via
         /// <see cref="ApprovalBlockingGateResult.SuppressedIssueCount"/>.
         /// </summary>
-        public const int MaxReportedIssues = 200;
+        public const int MaxReportedIssues = 20;
 
         // Progress-line intervals for the collect phase. Coarse on purpose: AddinLogger
         // opens/appends/closes the log file per line under a global lock, so a tight
@@ -485,6 +628,10 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
 
             var issues = new List<ApprovalBlockingIssue>();
+            // One entry per rule the gate knew about, PASSING ONES INCLUDED. Built alongside the
+            // issue list rather than derived from it afterwards, because a rule can be absent
+            // from both `evaluable` and the reported issue slice yet still need a report row.
+            var outcomes = new List<RuleOutcome>();
 
             // A rule the DB flags as blocking but the add-in never loaded can never be
             // checked - report it rather than quietly generating DDL past it.
@@ -494,12 +641,16 @@ namespace EliteSoft.Erwin.AddIn.Services
                     ApprovalBlockingIssueKind.Unevaluatable, unresolvedId, "", "", "", "",
                     "This rule is marked as blocking approval submission but the add-in could not load it " +
                     "(it may be inactive, scoped to another DBMS version, or reference a deleted property)."));
+                // Nothing but the id is known - the rule was never loaded, so there is no name,
+                // type or payload to show. The row still has to exist, or a rule the admin
+                // flagged would be missing from a report that claims to list them all.
+                outcomes.Add(RuleOutcome.NotCheckedRule(unresolvedId, "", "", "", "", ""));
             }
 
             if (ruleSet.Rules.Count == 0)
             {
                 Write($"{SettingKey} is ON for config {ctx.ActiveConfigId} but no evaluable blocking rule is defined.");
-                return Finish(true, issues, 0, 0, Write);
+                return Finish(true, issues, 0, 0, Write, outcomes);
             }
 
             // 3. Structural preflight, once per rule, before any COM traffic.
@@ -513,6 +664,9 @@ namespace EliteSoft.Erwin.AddIn.Services
                     ApprovalBlockingIssueKind.Unevaluatable, rule.Id, rule.ObjectType, "",
                     NamingValidationEngine.FriendlyPropertyLabel(rule.PropertyCode),
                     DescribeRule(rule), reason));
+                outcomes.Add(RuleOutcome.NotCheckedRule(
+                    rule.Id, rule.Name ?? "", rule.Description ?? "", DescribeRule(rule),
+                    rule.ObjectType ?? "", NamingValidationEngine.FriendlyPropertyLabel(rule.PropertyCode)));
             }
 
             // 4. Walk the model once per object type, evaluating that type's rules.
@@ -529,13 +683,15 @@ namespace EliteSoft.Erwin.AddIn.Services
                 catch (Exception ex)
                 {
                     issues.Add(Rule0($"The open model could not be read ({ex.Message}); the blocking rules were not checked."));
-                    return Finish(true, issues, evaluable.Count, 0, Write);
+                    AddNotCheckedRows(evaluable, outcomes);
+                    return Finish(true, issues, evaluable.Count, 0, Write, outcomes);
                 }
 
                 if (root == null)
                 {
                     issues.Add(Rule0("The open model has no root object; the blocking rules were not checked."));
-                    return Finish(true, issues, evaluable.Count, 0, Write);
+                    AddNotCheckedRows(evaluable, outcomes);
+                    return Finish(true, issues, evaluable.Count, 0, Write, outcomes);
                 }
 
                 // Box once so every helper call below binds statically (see GateObject.Instance).
@@ -571,7 +727,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     foreach (var group in evaluable.GroupBy(r => NormalizeObjectType(r.ObjectType)))
                     {
                         objectsInspected += EvaluateObjectTypeGroup(
-                            modelObjectsRef, rootRef, group.Key, group.ToList(), issues, Write);
+                            modelObjectsRef, rootRef, group.Key, group.ToList(), issues, outcomes, Write);
                     }
                 }
                 finally
@@ -580,7 +736,22 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
             }
 
-            return Finish(true, issues, evaluable.Count, objectsInspected, Write);
+            return Finish(true, issues, evaluable.Count, objectsInspected, Write, outcomes);
+        }
+
+        /// <summary>
+        /// Marks every rule that was never reached as NotChecked. Used on the paths that abort
+        /// before the walk (unreadable model, no root): those rules produced no verdict, and a
+        /// report that silently omitted them would read as "these rules are fine".
+        /// </summary>
+        private static void AddNotCheckedRows(List<NamingStandardRule> rules, List<RuleOutcome> outcomes)
+        {
+            foreach (var rule in rules)
+            {
+                outcomes.Add(RuleOutcome.NotCheckedRule(
+                    rule.Id, rule.Name ?? "", rule.Description ?? "", DescribeRule(rule),
+                    rule.ObjectType ?? "", NamingValidationEngine.FriendlyPropertyLabel(rule.PropertyCode)));
+            }
         }
 
         #region Per-object-type evaluation
@@ -597,6 +768,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             string normalizedObjectType,
             List<NamingStandardRule> rules,
             List<ApprovalBlockingIssue> issues,
+            List<RuleOutcome> outcomes,
             Action<string> write)
         {
             // Existence rules ("an object of this type must exist") carry no property and
@@ -619,6 +791,9 @@ namespace EliteSoft.Erwin.AddIn.Services
                         NamingValidationEngine.FriendlyPropertyLabel(rule.PropertyCode),
                         DescribeRule(rule),
                         $"The model's {rule.ObjectType} objects could not be read ({ex.Message}), so this rule could not be checked."));
+                    outcomes.Add(RuleOutcome.NotCheckedRule(
+                        rule.Id, rule.Name ?? "", rule.Description ?? "", DescribeRule(rule),
+                        rule.ObjectType ?? "", NamingValidationEngine.FriendlyPropertyLabel(rule.PropertyCode)));
                 }
                 return 0;
             }
@@ -627,10 +802,11 @@ namespace EliteSoft.Erwin.AddIn.Services
             write($"collected {objects.Count} {normalizedObjectType} object(s) in {collectClock.ElapsedMilliseconds} ms.");
 
             foreach (var rule in existenceRules)
-                EvaluateExistenceRule(modelObjects, root, rule, normalizedObjectType, objects, issues, write);
+                outcomes.Add(EvaluateExistenceRule(
+                    modelObjects, root, rule, normalizedObjectType, objects, issues, write));
 
             foreach (var rule in propertyRules)
-                EvaluatePropertyRule(rule, objects, issues, write);
+                outcomes.Add(EvaluatePropertyRule(rule, objects, issues, write));
 
             return objects.Count;
         }
@@ -643,7 +819,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <c>TableTypeMonitorService.CheckTablePrimaryKeyRequired</c> already uses.
         /// MODEL always exists, so a MODEL existence rule is trivially satisfied.
         /// </summary>
-        private static void EvaluateExistenceRule(
+        private static RuleOutcome EvaluateExistenceRule(
             object modelObjects,
             object root,
             NamingStandardRule rule,
@@ -656,10 +832,24 @@ namespace EliteSoft.Erwin.AddIn.Services
                 ? rule.ErrorMessage
                 : $"At least one {rule.ObjectType} must exist in the model.";
 
+            var outcome = new RuleOutcome
+            {
+                RuleId = rule.Id,
+                RuleName = rule.Name ?? "",
+                RuleDescription = rule.Description ?? "",
+                Summary = DescribeRule(rule),
+                ObjectType = rule.ObjectType ?? "",
+                PropertyLabel = ""
+            };
+
             if (normalizedObjectType == "MODEL")
             {
                 write($"rule#{rule.Id} existence MODEL - always satisfied.");
-                return;
+                // A model always exists, so this is a genuine pass over exactly one object -
+                // not "matched nothing".
+                outcome.ObjectsChecked = outcome.Applicable = 1;
+                outcome.Resolve(unevaluatable: false);
+                return outcome;
             }
 
             if (normalizedObjectType == "PRIMARY_KEY")
@@ -674,9 +864,11 @@ namespace EliteSoft.Erwin.AddIn.Services
                     issues.Add(new ApprovalBlockingIssue(
                         ApprovalBlockingIssueKind.Unevaluatable, rule.Id, rule.ObjectType, "", "", DescribeRule(rule),
                         $"The model's tables could not be read ({ex.Message}), so the primary-key requirement could not be checked."));
-                    return;
+                    outcome.Resolve(unevaluatable: true);
+                    return outcome;
                 }
 
+                int unreadable = 0;
                 foreach (var entity in entities)
                 {
                     bool hasPk;
@@ -687,24 +879,38 @@ namespace EliteSoft.Erwin.AddIn.Services
                             ApprovalBlockingIssueKind.Unevaluatable, rule.Id, rule.ObjectType, entity.Display, "",
                             DescribeRule(rule),
                             $"The table's primary key could not be read ({ex.Message})."));
+                        unreadable++;
                         continue;
                     }
 
+                    outcome.Applicable++;
                     if (!hasPk)
                     {
                         issues.Add(new ApprovalBlockingIssue(
                             ApprovalBlockingIssueKind.Violation, rule.Id, rule.ObjectType, entity.Display, "",
                             DescribeRule(rule), message));
+                        outcome.Violations++;
                     }
                 }
-                return;
+
+                outcome.ObjectsChecked = entities.Count;
+                // Same rule as the property path: unreadable on EVERY table is a failure to
+                // evaluate, not a clean model.
+                outcome.Resolve(unevaluatable: entities.Count > 0 && unreadable == entities.Count);
+                return outcome;
             }
 
+            // "At least one must exist" is a single model-wide assertion, so it always inspects
+            // exactly one thing - the model - and is never NotApplicable.
+            outcome.ObjectsChecked = outcome.Applicable = 1;
             if (collected.Count == 0)
             {
                 issues.Add(new ApprovalBlockingIssue(
                     ApprovalBlockingIssueKind.Violation, rule.Id, rule.ObjectType, "", "", DescribeRule(rule), message));
+                outcome.Violations = 1;
             }
+            outcome.Resolve(unevaluatable: false);
+            return outcome;
         }
 
         /// <summary>
@@ -713,7 +919,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// false-positive suppression) so the gate's verdict matches interactive
         /// validation exactly; only the rule SUBSET differs.
         /// </summary>
-        private static void EvaluatePropertyRule(
+        private static RuleOutcome EvaluatePropertyRule(
             NamingStandardRule rule,
             List<GateObject> objects,
             List<ApprovalBlockingIssue> issues,
@@ -724,6 +930,15 @@ namespace EliteSoft.Erwin.AddIn.Services
             int applicable = 0;
             int propertyReadFailures = 0;
             var ruleClock = System.Diagnostics.Stopwatch.StartNew();
+            var outcome = new RuleOutcome
+            {
+                RuleId = rule.Id,
+                RuleName = rule.Name ?? "",
+                RuleDescription = rule.Description ?? "",
+                Summary = DescribeRule(rule),
+                ObjectType = rule.ObjectType ?? "",
+                PropertyLabel = propertyLabel
+            };
 
             foreach (var target in objects)
             {
@@ -783,6 +998,15 @@ namespace EliteSoft.Erwin.AddIn.Services
                   $"checked {objects.Count} object(s), {applicable} applicable, " +
                   $"{propertyReadFailures} unreadable -> {violations} violation(s) " +
                   $"in {ruleClock.ElapsedMilliseconds} ms.");
+
+            outcome.ObjectsChecked = objects.Count;
+            outcome.Applicable = applicable;
+            outcome.Violations = violations;
+            // "Unreadable on every object" is a rule-level failure to evaluate, not a pass:
+            // the same condition that raised the issue above decides the status here, so the
+            // report row and the issue list can never disagree.
+            outcome.Resolve(unevaluatable: objects.Count > 0 && propertyReadFailures == objects.Count);
+            return outcome;
         }
 
         /// <summary>
@@ -1269,15 +1493,67 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         #region Result assembly
 
+        /// <summary>
+        /// What one rule concluded, accumulated DURING the walk. Separate from
+        /// <see cref="ApprovalRuleReportRow"/> because the public row also carries this rule's
+        /// slice of the CAPPED issue list, which only exists once the cap has been applied in
+        /// <see cref="Finish"/>. Status and counts are decided here, pre-cap.
+        /// </summary>
+        // internal, not private: the status derivation and the report assembly are the part of
+        // this feature that is pure and therefore the part worth unit testing. Keeping them
+        // private would leave the one piece of decidable logic here reachable only through a
+        // live SCAPI session.
+        internal sealed class RuleOutcome
+        {
+            public int RuleId;
+            public string RuleName = "";
+            public string RuleDescription = "";
+            public string Summary = "";
+            public string ObjectType = "";
+            public string PropertyLabel = "";
+            public ApprovalRuleStatus Status;
+            public int ObjectsChecked;
+            public int Applicable;
+            public int Violations;
+
+            /// <summary>A rule the walk never reached (preflight-rejected, or DB-flagged but not loaded).</summary>
+            public static RuleOutcome NotCheckedRule(
+                int ruleId, string ruleName, string ruleDescription,
+                string summary, string objectType, string propertyLabel)
+                => new RuleOutcome
+                {
+                    RuleId = ruleId,
+                    RuleName = ruleName,
+                    RuleDescription = ruleDescription,
+                    Summary = summary,
+                    ObjectType = objectType,
+                    PropertyLabel = propertyLabel,
+                    Status = ApprovalRuleStatus.NotChecked
+                };
+
+            /// <summary>
+            /// Decides the verdict from the counts. Order matters: a violation outranks
+            /// everything, and "matched nothing" must not be reported as a clean pass.
+            /// </summary>
+            public void Resolve(bool unevaluatable)
+            {
+                if (unevaluatable) Status = ApprovalRuleStatus.NotChecked;
+                else if (Violations > 0) Status = ApprovalRuleStatus.Failed;
+                else if (Applicable == 0) Status = ApprovalRuleStatus.NotApplicable;
+                else Status = ApprovalRuleStatus.Passed;
+            }
+        }
+
         /// <summary>An issue that belongs to the gate itself rather than to one rule.</summary>
         private static ApprovalBlockingIssue Rule0(string reason)
             => new ApprovalBlockingIssue(ApprovalBlockingIssueKind.Unevaluatable, 0, "", "", "", "", reason);
 
         private static ApprovalBlockingGateResult Blocked(ApprovalBlockingIssue issue, Action<string> write)
-            => Finish(true, new List<ApprovalBlockingIssue> { issue }, 0, 0, write);
+            => Finish(true, new List<ApprovalBlockingIssue> { issue }, 0, 0, write, new List<RuleOutcome>());
 
         private static ApprovalBlockingGateResult Finish(
-            bool enforced, List<ApprovalBlockingIssue> issues, int rulesChecked, int objectsInspected, Action<string> write)
+            bool enforced, List<ApprovalBlockingIssue> issues, int rulesChecked, int objectsInspected,
+            Action<string> write, List<RuleOutcome> outcomes)
         {
             var deduped = Dedupe(issues);
 
@@ -1302,8 +1578,68 @@ namespace EliteSoft.Erwin.AddIn.Services
                 foreach (var issue in deduped) write("  " + issue.ToReportLine());
             }
 
-            return new ApprovalBlockingGateResult(enforced, reported, rulesChecked, objectsInspected, suppressed);
+            return new ApprovalBlockingGateResult(
+                enforced, reported, rulesChecked, objectsInspected, suppressed,
+                BuildRuleReport(outcomes, reported));
         }
+
+        /// <summary>
+        /// Turns the walk's per-rule outcomes into the public report, attaching each rule's slice
+        /// of the CAPPED issue list for a detail view.
+        ///
+        /// <para>Status and counts come from the outcome (pre-cap); only the detail rows come
+        /// from the reported slice. Deriving status from the slice instead is the one mistake
+        /// this shape exists to prevent: with a cap of
+        /// <see cref="MaxReportedIssues"/>, a rule whose violations all fell past it would have
+        /// no reported issues and would render as "Passed" beside a failing model.</para>
+        ///
+        /// <para>Ordered so a reviewer reads the actionable rows first: Failed, then NotChecked
+        /// (an admin data problem), then NotApplicable, then Passed - and by rule id inside each
+        /// group so the order is stable between runs.</para>
+        /// </summary>
+        internal static IReadOnlyList<ApprovalRuleReportRow> BuildRuleReport(
+            List<RuleOutcome> outcomes, IReadOnlyList<ApprovalBlockingIssue> reported)
+        {
+            if (outcomes == null || outcomes.Count == 0)
+                return new List<ApprovalRuleReportRow>();
+
+            var byRule = new Dictionary<int, List<ApprovalBlockingIssue>>();
+            foreach (var issue in reported)
+            {
+                if (issue.RuleId == 0) continue;  // gate-level, surfaced via GateIssues
+                if (!byRule.TryGetValue(issue.RuleId, out var list))
+                {
+                    list = new List<ApprovalBlockingIssue>();
+                    byRule[issue.RuleId] = list;
+                }
+                list.Add(issue);
+            }
+
+            var rows = new List<ApprovalRuleReportRow>(outcomes.Count);
+            foreach (var outcome in outcomes)
+            {
+                byRule.TryGetValue(outcome.RuleId, out var slice);
+                rows.Add(new ApprovalRuleReportRow(
+                    outcome.RuleId, outcome.RuleName, outcome.RuleDescription, outcome.Summary,
+                    outcome.ObjectType, outcome.PropertyLabel, outcome.Status,
+                    outcome.ObjectsChecked, outcome.Applicable, outcome.Violations,
+                    slice ?? new List<ApprovalBlockingIssue>()));
+            }
+
+            return rows
+                .OrderBy(r => StatusRank(r.Status))
+                .ThenBy(r => r.RuleId)
+                .ToList();
+        }
+
+        /// <summary>Reading order for the report: most actionable first.</summary>
+        private static int StatusRank(ApprovalRuleStatus status) => status switch
+        {
+            ApprovalRuleStatus.Failed => 0,
+            ApprovalRuleStatus.NotChecked => 1,
+            ApprovalRuleStatus.NotApplicable => 2,
+            _ => 3
+        };
 
         #endregion
     }

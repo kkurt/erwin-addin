@@ -108,6 +108,27 @@ namespace EliteSoft.Erwin.AddIn.Services
         // "an object of this type must exist"). Every other rule targets a
         // property. Admin enforces this (only Required may omit PROPERTY_DEF_ID).
         public int? PropertyDefId { get; set; }
+
+        /// <summary>
+        /// <c>MC_NAMING_STANDARD.NAME</c> - the admin's own label for this rule, e.g.
+        /// "Tablo Ad Standarti" or "TABLE_PHYSICAL_NAME_FORMAT". Admin-authored text, so it
+        /// may legitimately be Turkish and must be shown verbatim.
+        ///
+        /// <para>Frequently EMPTY: the column exists in every admin repo but population is
+        /// uneven (23/45 rules in one, 0/103 in another). Anything rendering a rule to a user
+        /// must fall back to <c>ApprovalBlockingRuleGate.DescribeRule</c> rather than showing
+        /// a blank, which is why this is not the only identity a rule has.</para>
+        /// </summary>
+        public string Name { get; set; } = "";
+
+        /// <summary>
+        /// <c>MC_NAMING_STANDARD.DESCRIPTION</c> - the admin's longer explanation of what the
+        /// rule enforces and why. Also admin-authored, also frequently empty. Distinct from
+        /// <see cref="ErrorMessage"/>: this describes the RULE, that one is the text shown to
+        /// a user who violated it.
+        /// </summary>
+        public string Description { get; set; } = "";
+
         public NamingRuleKind RuleType { get; set; }
         /// <summary>
         /// IS_REQUIRED gate (orthogonal to <see cref="RuleType"/>). When true,
@@ -430,6 +451,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                                         ? (int?)null
                                         : Convert.ToInt32(reader["PROPERTY_DEF_ID"]),
                                     RuleType = ruleKind,
+                                    // Admin's own label and explanation for the rule. Both are
+                                    // nullable in every dialect and frequently unpopulated, so
+                                    // they are normalised to "" and every consumer needs a
+                                    // fallback (see NamingStandardRule.Name).
+                                    Name = reader["RULE_NAME"] == DBNull.Value ? "" : reader["RULE_NAME"]?.ToString()?.Trim() ?? "",
+                                    Description = reader["RULE_DESCRIPTION"] == DBNull.Value ? "" : reader["RULE_DESCRIPTION"]?.ToString()?.Trim() ?? "",
                                     IsRequired = reader["IS_REQUIRED"] != DBNull.Value && Convert.ToBoolean(reader["IS_REQUIRED"]),
                                     Prefix = reader["PREFIX"] == DBNull.Value ? "" : reader["PREFIX"]?.ToString()?.Trim() ?? "",
                                     Suffix = reader["SUFFIX"] == DBNull.Value ? "" : reader["SUFFIX"]?.ToString()?.Trim() ?? "",
@@ -790,6 +817,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 case "POSTGRESQL":
                     return @"SELECT ns.""ID"", ot.""NAME"" AS ""OBJECT_TYPE"", pd.""PROPERTY_CODE"",
                             ns.""PROPERTY_DEF_ID"", ns.""RULE_TYPE"", ns.""IS_REQUIRED"",
+                            ns.""NAME"" AS ""RULE_NAME"", ns.""DESCRIPTION"" AS ""RULE_DESCRIPTION"",
                             ns.""PREFIX"", ns.""SUFFIX"", ns.""LENGTH_OPERATOR"", ns.""LENGTH_VALUE"",
                             ns.""REGEXP_PATTERN"", ns.""ERROR_MESSAGE"", ns.""AUTO_APPLY"", ns.""IS_ACTIVE"", ns.""SORT_ORDER"",
                             ns.""CONFIG_ID"", ns.""APPLY_ON"",
@@ -807,6 +835,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 case "ORACLE":
                     return @"SELECT ns.ID, ot.NAME AS OBJECT_TYPE, pd.PROPERTY_CODE,
                             ns.PROPERTY_DEF_ID, ns.RULE_TYPE, ns.IS_REQUIRED,
+                            ns.NAME AS RULE_NAME, ns.DESCRIPTION AS RULE_DESCRIPTION,
                             ns.PREFIX, ns.SUFFIX, ns.LENGTH_OPERATOR, ns.LENGTH_VALUE,
                             ns.REGEXP_PATTERN, ns.ERROR_MESSAGE, ns.AUTO_APPLY, ns.IS_ACTIVE, ns.SORT_ORDER,
                             ns.CONFIG_ID, ns.APPLY_ON,
@@ -825,6 +854,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 default:
                     return @"SELECT ns.[ID], ot.[NAME] AS [OBJECT_TYPE], pd.[PROPERTY_CODE],
                             ns.[PROPERTY_DEF_ID], ns.[RULE_TYPE], ns.[IS_REQUIRED],
+                            ns.[NAME] AS [RULE_NAME], ns.[DESCRIPTION] AS [RULE_DESCRIPTION],
                             ns.[PREFIX], ns.[SUFFIX], ns.[LENGTH_OPERATOR], ns.[LENGTH_VALUE],
                             ns.[REGEXP_PATTERN], ns.[ERROR_MESSAGE], ns.[AUTO_APPLY], ns.[IS_ACTIVE], ns.[SORT_ORDER],
                             ns.[CONFIG_ID], ns.[APPLY_ON],

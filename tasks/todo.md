@@ -354,6 +354,64 @@ config genuinely offers several targets.
 
 ---
 
+# DDL Review blocking-rule report pane - IN PROGRESS 2026-07-28
+
+Requirement (user): when `ENFORCE_APPROVAL_BLOCKING_RULES` is on, the DDL Review window splits
+in two - the existing DDL text on the left, a report of which blocking rules passed and which
+did not on the right - and the green submit button is disabled while any rule is violated.
+
+## Decisions (settled with the user 2026-07-27)
+
+| | |
+|---|---|
+| Pane shows | whenever at least ONE blocking rule exists; with no violations it says "N rules checked, no violations" |
+| Button | disabled in ALL THREE states; the promotion caption "Send to Approval" becomes "Send to Approve" |
+| Unevaluatable rule | its own "Not checked" state, and it STILL disables the button (admin data problem, fail-closed) |
+| Scope | whole model, and the pane says so; sorted so DDL-relevant objects surface first |
+| Rule label | admin `NAME` when present, generated fallback otherwise |
+| Issue cap | 200 -> **20** |
+| Existing modal | REMOVED; a blocked Integrate gets a short message pointing at Generate DDL |
+| Re-check button | none - the left pane's DDL would be stale, so it is Cancel, fix, regenerate |
+| Evaluation | at dialog OPEN (forced by the "always show the pane" decision), on the owning STA, with a non-pumping progress indicator |
+
+Open-time evaluation is only affordable because of the 221x perf work below: 12.5 s on a
+8,401-column model instead of 46 minutes.
+
+## Layer 1 - DONE, tested (no COM, no DB)
+
+- [x] `MC_NAMING_STANDARD.NAME` / `DESCRIPTION` now loaded into `NamingStandardRule.Name` /
+      `.Description`, in all three dialects, aliased `RULE_NAME` / `RULE_DESCRIPTION` to avoid
+      colliding with `ot.NAME AS OBJECT_TYPE`. The MSSQL form was run against the live
+      `MetaRepoTmp` before committing: valid, 20 rules for config 1012. The columns exist in
+      every admin repo but are unpopulated in most, so the fallback label is the normal path.
+- [x] `ApprovalRuleStatus` (Passed / Failed / NotApplicable / NotChecked) and
+      `ApprovalRuleReportRow`, plus `RuleReport`, `GateIssues` and `HasReport` on
+      `ApprovalBlockingGateResult`. `NotApplicable` is a first-class state: "the condition
+      matched nothing" previously existed only in a Debug Log line, and showing it as "Passed"
+      would tell a reviewer the rule verified their model when it inspected nothing.
+- [x] The walk accumulates one `RuleOutcome` per rule - passing ones included - including the
+      rules it never reached (preflight-rejected, DB-flagged but not loaded, aborted walk).
+      Status and counts are computed PRE-CAP; only the detail rows come from the capped slice.
+- [x] `MaxReportedIssues` 200 -> 20.
+- [x] `ApprovalBlockingIssue`'s string parameters are now `string?`, which is their actual
+      contract (the ctor normalises them). They were non-nullable, so feeding them from the
+      null-oblivious `NamingStandardRule` made the flow analysis warn at safe call sites.
+- [x] `tests/ErwinAddIn.Tests/ApprovalRuleReportTests.cs` - 14 tests. The load-bearing one:
+      25 violations with an EMPTY reported slice must still render Failed with count 25.
+- [x] Build 0 warnings / 0 errors. Tests 1001/1001 green.
+
+## Layer 2 - TODO (UI)
+
+- [ ] Evaluate at dialog-open time, marshalled onto the owning STA, with a non-pumping progress
+      indicator (paint-only `Update()`, never `DoEvents` - see the perf section below).
+- [ ] `DdlApprovalDialog`: `SplitContainer`, report pane (counter pills, failures first,
+      per-rule detail), latch-disabled submit button (`ReenableForRetry` currently re-enables
+      unconditionally), unified caption, widen-on-show clamped to the working area.
+- [ ] Delete `Forms/ApprovalBlockingRulesDialog.cs`; Integrate gets a short message instead.
+- [ ] Live test.
+
+---
+
 # Approval gate walk took 46 MINUTES - timer reentrancy - CODE-DONE 2026-07-27
 
 ## The measurement
