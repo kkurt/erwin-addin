@@ -443,10 +443,26 @@ check - so roughly 25 s on the 8,401-column model. Deliberate: erwin's frame is 
 the add-in is on screen, but the user is explicitly allowed to minimise the add-in and edit, so
 the open-time snapshot cannot be assumed still true at click time. Cancelling costs one walk.
 
-- [ ] **LIVE test (user):** `MetaRepoTmp` + `SQL_BUYUKMODEL`, Generate DDL. Expect the progress
-      overlay, then a split window with the pane listing 20 rules (rule #1081 among them),
-      "no violations" and an ENABLED button - that model has no `nvarchar(>4000)` column. To see
-      the blocked state, add such a column first.
+### Live test 1 - PASS state confirmed (2026-07-28 11:34)
+
+First attempt crashed erwin on a SplitContainer property order; fixed in a separate commit and
+recorded in `tasks/lessons.md`. Second attempt:
+
+```
+11:34:48  collected 8401 COLUMN object(s) in 5378 ms
+11:34:59  rule#1081 ... 8401 applicable, 0 unreadable -> 0 violation(s) in 10737 ms
+11:34:59  [WALK-GATE] done in 16223 ms
+```
+
+Window split, pane rendered, no violations, submit button enabled. 16.2 s at open time on the
+8,401-column model.
+
+- [ ] **LIVE test 2 - BLOCKED state:** add an `nvarchar(5000)` column to a table in
+      `SQL_BUYUKMODEL`, then Generate DDL. Expect rule #1081 as "Violated" with a red chip, the
+      submit button DISABLED, and the detail box showing the offending column plus the admin's
+      Turkish ERROR_MESSAGE verbatim.
+- [ ] Live-check the fallback path too (it has never run): it is the one thing standing between
+      a future pane bug and another dead erwin.
 
 ---
 
