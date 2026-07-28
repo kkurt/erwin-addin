@@ -283,6 +283,13 @@ namespace EliteSoft.Erwin.AddIn.Services
         public int SuppressedIssueCount { get; }
 
         /// <summary>
+        /// What the verdict covers, for the report subtitle: the whole model, or the tables the
+        /// generated DDL named. A reviewer must be able to tell the two apart - a scoped pass
+        /// says nothing about the rest of the model.
+        /// </summary>
+        public string ScopeDescription { get; internal set; } = "the whole model";
+
+        /// <summary>
         /// True when there is something worth showing a reviewer: enforcement is on and at
         /// least one blocking rule was known. Drives whether the DDL review window splits at
         /// all - with no rules there is nothing to report, passing or otherwise.
@@ -581,8 +588,18 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <c>DoEvents</c> - pumping here is what let the validation timers re-enter SCAPI
         /// mid-walk and cost 46 minutes (see <see cref="ModelWalkGate"/>).
         /// </param>
+        /// <param name="tableScope">
+        /// When non-null and non-empty, only objects belonging to a table whose name is in this
+        /// set are walked (compared case-insensitively against both Physical_Name and Name).
+        /// Used when "Only Selected Objects" scoped the DDL: the rules are then checked over the
+        /// same tables the script touches.
+        /// <para>An EMPTY set must never be passed to mean "check nothing" - the caller decides
+        /// between a scope and the whole model, and "I could not work out the scope" has to mean
+        /// the whole model. Passing null is that case.</para>
+        /// </param>
         public static ApprovalBlockingGateResult Evaluate(
-            dynamic session, Action<string>? log, Action<string>? progress = null)
+            dynamic session, Action<string>? log, Action<string>? progress = null,
+            IReadOnlyCollection<string>? tableScope = null)
         {
             void Write(string message)
             {
@@ -738,6 +755,13 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                 try
                 {
+                    var scope = (tableScope != null && tableScope.Count > 0)
+                        ? new HashSet<string>(tableScope, StringComparer.OrdinalIgnoreCase)
+                        : null;
+                    if (scope != null)
+                        Write($"scoped to {scope.Count} table(s) named by the generated DDL: " +
+                              string.Join(", ", scope.OrderBy(s => s, StringComparer.OrdinalIgnoreCase)));
+
                     int groupsDone = 0;
                     var groups = evaluable.GroupBy(r => NormalizeObjectType(r.ObjectType)).ToList();
                     foreach (var group in groups)
@@ -745,7 +769,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                         Progress($"Checking {group.Key} rules ({++groupsDone} of {groups.Count})...");
                         objectsInspected += EvaluateObjectTypeGroup(
                             modelObjectsRef, rootRef, group.Key, group.ToList(), issues, outcomes,
-                            Write, Progress);
+                            Write, Progress, scope);
                     }
                 }
                 finally
@@ -754,7 +778,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
             }
 
-            return Finish(true, issues, evaluable.Count, objectsInspected, Write, outcomes);
+            var finished = Finish(true, issues, evaluable.Count, objectsInspected, Write, outcomes);
+            if (tableScope != null && tableScope.Count > 0)
+                finished.ScopeDescription = $"the {tableScope.Count} table(s) in this DDL";
+            return finished;
         }
 
         /// <summary>
@@ -788,7 +815,8 @@ namespace EliteSoft.Erwin.AddIn.Services
             List<ApprovalBlockingIssue> issues,
             List<RuleOutcome> outcomes,
             Action<string> write,
-            Action<string> progress)
+            Action<string> progress,
+            HashSet<string>? tableScope)
         {
             // Existence rules ("an object of this type must exist") carry no property and
             // are invisible to the per-property path, so they are handled first.
@@ -800,7 +828,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             try
             {
                 objects = CollectObjects(
-                    modelObjects, root, normalizedObjectType, propertyRules, write, progress);
+                    modelObjects, root, normalizedObjectType, propertyRules, write, progress, tableScope);
             }
             catch (Exception ex)
             {
@@ -825,7 +853,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             {
                 return EvaluateGroupRules(
                     modelObjects, root, normalizedObjectType,
-                    existenceRules, propertyRules, objects, issues, outcomes, write, progress);
+                    existenceRules, propertyRules, objects, issues, outcomes, write, progress, tableScope);
             }
             finally
             {
@@ -849,11 +877,12 @@ namespace EliteSoft.Erwin.AddIn.Services
             List<ApprovalBlockingIssue> issues,
             List<RuleOutcome> outcomes,
             Action<string> write,
-            Action<string> progress)
+            Action<string> progress,
+            HashSet<string>? tableScope)
         {
             foreach (var rule in existenceRules)
                 outcomes.Add(EvaluateExistenceRule(
-                    modelObjects, root, rule, normalizedObjectType, objects, issues, write, progress));
+                    modelObjects, root, rule, normalizedObjectType, objects, issues, write, progress, tableScope));
 
             foreach (var rule in propertyRules)
                 outcomes.Add(EvaluatePropertyRule(rule, objects, issues, write));
@@ -877,7 +906,8 @@ namespace EliteSoft.Erwin.AddIn.Services
             List<GateObject> collected,
             List<ApprovalBlockingIssue> issues,
             Action<string> write,
-            Action<string> progress)
+            Action<string> progress,
+            HashSet<string>? tableScope)
         {
             string message = !string.IsNullOrEmpty(rule.ErrorMessage)
                 ? rule.ErrorMessage
@@ -909,7 +939,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 try
                 {
                     entities = CollectObjects(
-                        modelObjects, root, "TABLE", new List<NamingStandardRule>(), write, progress);
+                        modelObjects, root, "TABLE", new List<NamingStandardRule>(), write, progress, tableScope);
                 }
                 catch (Exception ex)
                 {
@@ -1301,7 +1331,8 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// </summary>
         private static List<GateObject> CollectObjects(
             dynamic modelObjects, dynamic root, string normalizedObjectType,
-            List<NamingStandardRule> propertyRules, Action<string> write, Action<string> progress)
+            List<NamingStandardRule> propertyRules, Action<string> write, Action<string> progress,
+            HashSet<string>? tableScope)
         {
             var result = new List<GateObject>();
             // Boxed alias for calls into the sibling helpers, so they bind statically
@@ -1325,9 +1356,18 @@ namespace EliteSoft.Erwin.AddIn.Services
                 if (entities == null) return result;
 
                 int tablesWalked = 0;
+                int tablesSkipped = 0;
                 foreach (dynamic entity in entities)
                 {
                     if (entity == null) continue;
+
+                    // Scope filter. Costs one name read per entity (286 on the test model, ~0.04 ms
+                    // each) and saves reading every column of every table outside the DDL.
+                    if (tableScope != null)
+                    {
+                        object scopeRef = entity;
+                        if (!IsInScope(scopeRef, tableScope)) { tablesSkipped++; continue; }
+                    }
                     if (++tablesWalked % ProgressEveryTables == 0)
                     {
                         write($"collecting COLUMN objects - {tablesWalked} table(s), {result.Count} column(s) so far.");
@@ -1376,6 +1416,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                     finally { ReleaseCom(attrs); }
                 }
                 ReleaseCom(entities);
+                if (tableScope != null)
+                    write($"scope filter kept {tablesWalked} table(s), skipped {tablesSkipped}.");
                 return result;
             }
 
@@ -1394,10 +1436,20 @@ namespace EliteSoft.Erwin.AddIn.Services
             dynamic collection = modelObjects.Collect(root, scapiClass);
             if (collection == null) return result;
 
+            // Only TABLE-shaped types can be matched against a DDL table scope. A VIEW, INDEX or
+            // MODEL rule has no table name to compare, so scoping must not silently drop it -
+            // those keep being walked in full.
+            bool scopeThisType = tableScope != null && normalizedObjectType == "TABLE";
+
             int walked = 0;
             foreach (dynamic obj in collection)
             {
                 if (obj == null) continue;
+                if (scopeThisType)
+                {
+                    object scopeRef = obj;
+                    if (!IsInScope(scopeRef, tableScope!)) continue;
+                }
                 if (++walked % ProgressEveryObjects == 0)
                 {
                     write($"collecting {normalizedObjectType} objects - {walked} seen, {result.Count} kept.");
@@ -1618,6 +1670,21 @@ namespace EliteSoft.Erwin.AddIn.Services
         public static ApprovalBlockingGateResult Failed(string reason)
             => new ApprovalBlockingGateResult(
                 true, new List<ApprovalBlockingIssue> { Rule0(reason) }, 0, 0, 0);
+
+        /// <summary>
+        /// True when this object's name is one the DDL named. Both Physical_Name and Name are
+        /// tried: a script names the PHYSICAL table, but a model whose physical name has not
+        /// materialised falls back to the logical one everywhere else in this file, so matching
+        /// on only one of them would drop tables the scope really does cover.
+        /// </summary>
+        private static bool IsInScope(object scapiObject, HashSet<string> tableScope)
+        {
+            string physical = ReadDisplayName(scapiObject, preferPhysical: true);
+            if (physical.Length > 0 && tableScope.Contains(physical)) return true;
+
+            string logical = ReadDisplayName(scapiObject, preferPhysical: false);
+            return logical.Length > 0 && tableScope.Contains(logical);
+        }
 
         /// <summary>
         /// Releases a COM wrapper, ignoring anything that is not one. Every other whole-model

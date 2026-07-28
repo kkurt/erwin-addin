@@ -5742,8 +5742,31 @@ namespace EliteSoft.Erwin.AddIn
         /// <para>Never throws: a gate that failed to prove the model clean returns a BLOCKING
         /// result, because the alternative is a silent pass.</para>
         /// </summary>
-        internal Services.ApprovalBlockingGateResult EvaluateApprovalBlockingRules(string actionName)
+        internal Services.ApprovalBlockingGateResult EvaluateApprovalBlockingRules(
+            string actionName, string ddlForScope = null)
         {
+            // "Only Selected Objects": erwin's own Alter Script Wizard already scoped the DDL to
+            // the entities selected on the diagram, and the rules are checked over the same set.
+            //
+            // The scope is derived from the DDL TEXT, not from the selection, because the
+            // selection is not readable: SCAPI exposes no selection API, and erwin's Overview
+            // pane - the only surface that shows it - reports a COUNT ("2 objects") instead of
+            // names as soon as more than one entity is selected. The DDL names exactly the
+            // tables that were scoped, and it is also the thing being submitted, so it is the
+            // better source anyway.
+            //
+            // An unparseable script yields an EMPTY set, which is passed as null: "I could not
+            // work out the scope" must mean the whole model, never "check nothing".
+            System.Collections.Generic.IReadOnlyCollection<string> tableScope = null;
+            if (chkFilterObjects != null && chkFilterObjects.Enabled && chkFilterObjects.Checked
+                && !string.IsNullOrWhiteSpace(ddlForScope))
+            {
+                var names = Services.DdlTableScope.Extract(ddlForScope);
+                if (names.Count > 0) tableScope = names;
+                else Log("[APPROVAL-GATE] 'Only Selected Objects' is on but the DDL named no table - " +
+                        "checking the whole model rather than nothing.");
+            }
+
             try
             {
                 // Box the session so the call binds STATICALLY. Passing the dynamic field
@@ -5797,7 +5820,8 @@ namespace EliteSoft.Erwin.AddIn
                     // a WinForms control may only be created and painted there.
                     using var progress = new WalkProgressOverlay(this);
                     using (Services.ModelWalkGate.Enter($"Approval blocking gate ({actionName})"))
-                        return Services.ApprovalBlockingRuleGate.Evaluate(session, gateLog, progress.Report);
+                        return Services.ApprovalBlockingRuleGate.Evaluate(
+                            session, gateLog, progress.Report, tableScope);
                 };
 
                 UseWaitCursor = true;
@@ -5835,9 +5859,12 @@ namespace EliteSoft.Erwin.AddIn
         /// </summary>
         /// <param name="owner">Window any message is modal to (the caller's own dialog).</param>
         /// <param name="actionName">User-facing name of the action being gated.</param>
-        internal bool CheckApprovalBlockingRules(IWin32Window owner, string actionName)
+        internal bool CheckApprovalBlockingRules(IWin32Window owner, string actionName, string ddlForScope = null)
         {
-            var result = EvaluateApprovalBlockingRules(actionName);
+            // The SAME scope the pane was built with. Without this the pane would report a
+            // scoped model as clean, enable the button, and the click-time check would then
+            // refuse it against the whole model - a button that lies in the other direction.
+            var result = EvaluateApprovalBlockingRules(actionName, ddlForScope);
 
             if (!result.Blocked)
             {
@@ -7153,8 +7180,7 @@ namespace EliteSoft.Erwin.AddIn
             // deliberate: erwin's frame is disabled while the add-in is on screen, but the user
             // is explicitly allowed to minimise the add-in and edit, so this snapshot cannot be
             // assumed still true at click time.
-            var blockingReport = EvaluateApprovalBlockingRules(
-                promotionContext != null ? "Send to Approve" : "Send to Approve");
+            var blockingReport = EvaluateApprovalBlockingRules("Send to Approve", ddl);
 
             using var dlg = new Forms.DdlApprovalDialog(
                 ddlText:           ddl,
@@ -7171,7 +7197,7 @@ namespace EliteSoft.Erwin.AddIn
                 // Naming-rule gate on ENTRY to the approval queue. Lives here (not in the
                 // dialog) because it needs the live SCAPI session; the dialog passes
                 // itself as the owner so the report is modal to the review window.
-                approvalBlockingGate: owner => CheckApprovalBlockingRules(owner, "Send to Approve"),
+                approvalBlockingGate: owner => CheckApprovalBlockingRules(owner, "Send to Approve", ddl),
                 blockingReport:        blockingReport);
             dlg.ShowDialog(this);
         }

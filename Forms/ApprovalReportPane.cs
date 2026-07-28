@@ -118,8 +118,10 @@ namespace EliteSoft.Erwin.AddIn.Forms
 
         private Control BuildSubtitle(Font font) => new Label
         {
-            // The scope warning is load-bearing, not decoration - see the class remarks.
-            Text = "Evaluated over the whole model, not only the objects in this DDL.",
+            // The scope line is load-bearing, not decoration - see the class remarks. It must
+            // name the ACTUAL scope: with "Only Selected Objects" the verdict covers just the
+            // tables in this DDL, and a scoped pass says nothing about the rest of the model.
+            Text = $"Evaluated over {_result.ScopeDescription}.",
             Font = font,
             ForeColor = ClrTextSecondary,
             Dock = DockStyle.Top,
