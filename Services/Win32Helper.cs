@@ -284,10 +284,19 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// underneath erwin's own modal loop.
         /// </summary>
         public static bool HasEnabledOwnedPopup(IntPtr hWnd)
+            => GetEnabledOwnedPopup(hWnd) != IntPtr.Zero;
+
+        /// <summary>
+        /// The live modal dialog owned by <paramref name="hWnd"/>, or <see cref="IntPtr.Zero"/>
+        /// when there is none. Same GW_ENABLEDPOPUP probe as <see cref="HasEnabledOwnedPopup"/>,
+        /// but it hands back the window: a disabled owner must never be activated in front of
+        /// its own dialog, so the caller needs something to raise INSTEAD of the owner.
+        /// </summary>
+        public static IntPtr GetEnabledOwnedPopup(IntPtr hWnd)
         {
-            if (hWnd == IntPtr.Zero) return false;
+            if (hWnd == IntPtr.Zero) return IntPtr.Zero;
             IntPtr popup = GetWindow(hWnd, GW_ENABLEDPOPUP);
-            return popup != IntPtr.Zero && popup != hWnd;
+            return popup != hWnd ? popup : IntPtr.Zero;
         }
 
         public static IntPtr GetErwinMainWindow()

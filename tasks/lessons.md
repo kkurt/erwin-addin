@@ -2278,3 +2278,23 @@ Kural: pencere kimligini MESAJSIZ okunabilen seylerden kur - `GetClassName`,
 `IsWindowVisible`, `GetWindowThreadProcessId` window manager'dan direkt okunur, hicbir
 thread'e bagimli degildir. Baslik sadece ADAYLAR ARASINDA AYRIM icin kullanilir,
 bulmanin TEK yolu olarak degil.
+
+## Form.Deactivate ile "pencere on plana geldi mi" olculmez (2026-07-28)
+
+WP 329'un modal taklidi eksik cikti: erwin'in devre disi cercevesi one geldiginde
+add-in'i geri kaldiran kod SADECE `Form.Deactivate` icindeydi. Bu olay pencerenin
+aktif -> pasif GECISINDE tetiklenir. Kullanici once baska bir uygulamaya (Chrome)
+gecerse add-in zaten pasiftir; sonra erwin gorev cubugundan kaldirilinca hicbir olay
+dogmaz. Sonuc: en ustte, devre disi, sessiz bir erwin - kullaniciya "erwin dondu"
+olarak gorunur, ki bu garanti tam da bunu onlemek icin vardi.
+
+Kural: "su pencere su anda on planda mi" bir DURUM sorusudur; olay tabanli
+(`Deactivate`, `Activated`) tek bir kaynakla cevaplanmaz. Durumu duzenli olarak
+(zaten calisan tick icinde) YENIDEN SOR; olay sadece hizli yoldur. Ayni sinif hata:
+aktivasyon sirasinda `GetForegroundWindow` henuz yeni pencereyi gostermeyebilir -
+poll bunu da kapatir.
+
+Ikinci kural (ayni duzeltmeden): devre disi bir pencereyi ASLA one alma. Kendi modal
+dialogumuz aciksa ana pencere Win32 seviyesinde disabled'dir; onu `Activate()` etmek
+onu kendi dialogunun ONUNE koyar ve bir seviye yukarida ayni kilitlenmeyi uretir.
+Windows'un yaptigini yap: `GW_ENABLEDPOPUP` ile dialogu bul ve ONU one al.

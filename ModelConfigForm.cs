@@ -1173,6 +1173,14 @@ namespace EliteSoft.Erwin.AddIn
             // while erwin renders (the black-rectangle reentrancy rule).
             SyncErwinInputBlock();
 
+            // ...and, for the same reason, keep the add-in in front of the frame it disabled.
+            // Form.Deactivate misses every path where this window was ALREADY inactive when
+            // erwin came up (user was in another application first) - see
+            // RaiseAddinOverBlockedFrame. No-op unless the blocked frame is the foreground
+            // window, so it costs one GetForegroundWindow per tick and never touches the
+            // Z-order while the user works elsewhere.
+            RaiseAddinOverBlockedFrame("reconnect tick");
+
             // Unified model-state monitor (2026-05-14). The timer is kept alive
             // in every state (disconnected, degraded, connected) and reacts
             // when an open PU's locator diverges from what we last successfully
@@ -5090,21 +5098,81 @@ namespace EliteSoft.Erwin.AddIn
         protected override void OnDeactivate(EventArgs e)
         {
             base.OnDeactivate(e);
+            RaiseAddinOverBlockedFrame("deactivate");
+        }
+
+        // Log latch for the polled re-raise: the reconnect tick asks 2x/second, so the line
+        // is written once per occurrence and re-armed as soon as the frame is no longer in
+        // front. Nothing else keys off it.
+        private bool _blockedFrameRaiseLogged;
+
+        /// <summary>
+        /// Brings the add-in back over the erwin frame it holds disabled (WP 329). See
+        /// <see cref="OnDeactivate"/> for why that guarantee exists at all.
+        /// <para>
+        /// <b>Why this is not a Deactivate-only concern (2026-07-28 field report).</b>
+        /// <c>Form.Deactivate</c> fires on the active -&gt; inactive TRANSITION of this window
+        /// only. Switch to another application first and this window is already inactive, so
+        /// bringing erwin up from the taskbar afterwards raises no event here at all: erwin
+        /// ends up on top, disabled and silent, which is precisely the "erwin froze" report.
+        /// The reconnect tick therefore re-asks the same question twice a second - it also
+        /// covers the activation orderings where the foreground window is not yet erwin's when
+        /// Deactivate runs.
+        /// </para>
+        /// <para>
+        /// The block itself is unchanged by any of this: erwin stays disabled until the user
+        /// minimizes the add-in, which is the rule WP 329 asked for. All this does is make
+        /// sure the window holding that rule is never the invisible one.
+        /// </para>
+        /// </summary>
+        /// <param name="trigger">Which path noticed it, for the log line.</param>
+        private void RaiseAddinOverBlockedFrame(string trigger)
+        {
             try
             {
+                bool onScreen = !IsDisposed && IsHandleCreated && Visible
+                                && WindowState != FormWindowState.Minimized;
                 IntPtr blocked = Services.ErwinInputBlock.BlockedWindow;
-                if (blocked == IntPtr.Zero) return;
-                if (IsDisposed || !IsHandleCreated || !Visible
-                    || WindowState == FormWindowState.Minimized) return;
-                if (Services.Win32Helper.GetForegroundWindowPublic() != blocked) return;
+                IntPtr foreground = Services.Win32Helper.GetForegroundWindowPublic();
+                if (!Services.ErwinInputBlock.ShouldRaiseAddinOverErwin(blocked, foreground, onScreen))
+                {
+                    // Either nothing is blocked, we are off screen, or the foreground belongs
+                    // to something else entirely - another application the user chose, or an
+                    // erwin dialog (a popup, never the frame). Leave the foreground alone and
+                    // re-arm the log latch for the next real occurrence.
+                    _blockedFrameRaiseLogged = false;
+                    return;
+                }
 
-                Log("[ERWIN-BLOCK] blocked erwin frame was raised over the add-in - bringing the add-in back to front");
+                // One of the add-in's OWN modal dialogs holds this window Win32-disabled while
+                // it is up. Activating a disabled window would put it in front of its own
+                // dialog and reproduce the same dead-to-input lockout one level up, so raise
+                // the dialog instead - what Windows itself does when a disabled owner is
+                // clicked in the taskbar.
+                if (!Services.Win32Helper.IsWindowEnabledPublic(Handle))
+                {
+                    IntPtr popup = Services.Win32Helper.GetEnabledOwnedPopup(Handle);
+                    if (popup != IntPtr.Zero) Services.Win32Helper.SetForegroundWindowPublic(popup);
+                    if (!_blockedFrameRaiseLogged)
+                    {
+                        _blockedFrameRaiseLogged = true;
+                        Log($"[ERWIN-BLOCK] blocked erwin frame is in front ({trigger}) - this window is modal-disabled, "
+                            + (popup != IntPtr.Zero ? "raised its own dialog instead" : "no dialog found to raise"));
+                    }
+                    return;
+                }
+
+                if (!_blockedFrameRaiseLogged)
+                {
+                    _blockedFrameRaiseLogged = true;
+                    Log($"[ERWIN-BLOCK] blocked erwin frame was raised over the add-in ({trigger}) - bringing the add-in back to front");
+                }
                 BringToFront();
                 Activate();
             }
             catch (Exception ex)
             {
-                Log($"[ERWIN-BLOCK] re-raise on deactivate failed: {ex.Message}");
+                Log($"[ERWIN-BLOCK] re-raise ({trigger}) failed: {ex.Message}");
             }
         }
 

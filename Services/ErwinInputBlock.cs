@@ -72,6 +72,23 @@ namespace EliteSoft.Erwin.AddIn.Services
             => addinOnScreen && hasOpenModel
                && !suspended && !debugMode && !wizardGateOpen && !martSaveActive;
 
+        /// <summary>
+        /// The second half of the modal illusion: may the add-in take the foreground back
+        /// right now? A disabled window can still be RAISED (taskbar / Alt+Tab activation is
+        /// not input), so the frame we hold disabled can end up on top of the only window that
+        /// can release it - an erwin that ignores every click with nothing on screen to
+        /// explain why. Windows keeps a real modal above its owner; this is where we say the
+        /// same thing.
+        ///
+        /// <para>Deliberately narrow: only when <paramref name="foreground"/> IS the frame we
+        /// disabled. That means our own process already owns the foreground (the add-in lives
+        /// inside erwin.exe), so the activation is allowed and, more importantly, we never
+        /// yank the foreground away from a third-party application the user switched to on
+        /// purpose - nor from an erwin dialog, which is a popup and not the frame.</para>
+        /// </summary>
+        internal static bool ShouldRaiseAddinOverErwin(IntPtr blockedFrame, IntPtr foreground, bool addinOnScreen)
+            => blockedFrame != IntPtr.Zero && addinOnScreen && foreground == blockedFrame;
+
         /// <summary>True while erwin's main frame is disabled BY THIS BLOCK. Set ONLY when this
         /// class performed the enabled-&gt;disabled transition itself, never when the frame was
         /// found already disabled (that disable belongs to an erwin modal).</summary>
