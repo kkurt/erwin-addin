@@ -141,6 +141,29 @@ namespace EliteSoft.Erwin.AddIn.Forms
         /// leaves this dialog buried behind erwin. The owner (ModelConfigForm)
         /// also re-asserts the front once teardown fully completes.
         /// </summary>
+        /// <summary>
+        /// Splitter constraints belong here, not in the constructor: by Load the container has
+        /// been docked and has its real width, which is what <c>SplitterDistance</c> is validated
+        /// against. See <see cref="ConfigureReportSplit"/>.
+        /// </summary>
+        protected override void OnLoad(EventArgs e)
+        {
+            base.OnLoad(e);
+            try
+            {
+                ConfigureReportSplit();
+            }
+            catch (Exception ex)
+            {
+                // Layout is cosmetic; the verdict and the button state are already applied. This
+                // runs on erwin's UI thread inside an async void handler, where an escaping
+                // exception terminates the erwin PROCESS - which is exactly what happened on
+                // 2026-07-28 before the constraints moved out of the constructor. Logged, never
+                // swallowed silently.
+                _log($"DdlApprovalDialog: report splitter layout failed ({ex.GetType().Name}: {ex.Message}) - pane left unconstrained.");
+            }
+        }
+
         protected override void OnShown(EventArgs e)
         {
             base.OnShown(e);
@@ -547,7 +570,7 @@ namespace EliteSoft.Erwin.AddIn.Forms
             // splitter. Deliberately ONE conditional swap here rather than adding the pane
             // later and re-parenting: the reverse-add-order rule above is load-bearing, and
             // Controls.SetChildIndex games against it are how docking layouts break.
-            Controls.Add(BuildCenterRegion());
+            Controls.Add(BuildCenterRegionSafely());
             Controls.Add(bottomDivider);
             Controls.Add(bottomPanel);
             Controls.Add(headerDivider);
@@ -555,6 +578,39 @@ namespace EliteSoft.Erwin.AddIn.Forms
 
             ApplyBlockingRuleVerdict();
         }
+
+        /// <summary>
+        /// <see cref="BuildCenterRegion"/> with the DDL view as a fallback.
+        ///
+        /// <para>This constructor runs on erwin's UI thread from an <c>async void</c> handler, so
+        /// an exception escaping it does not raise a dialog - it terminates the erwin PROCESS,
+        /// losing the user's unsaved model. That happened on 2026-07-28 over a SplitContainer
+        /// property order. The report pane is a REVIEW AID; degrading to the DDL alone is always
+        /// better than taking erwin down with it.</para>
+        ///
+        /// <para>Not a silent fallback: the failure is logged and shown in the status line, and
+        /// the submit button is still disabled by <see cref="ApplyBlockingRuleVerdict"/>, which
+        /// does not depend on the pane. A rendering failure can never turn a refusal into a
+        /// submission.</para>
+        /// </summary>
+        private Control BuildCenterRegionSafely()
+        {
+            try
+            {
+                return BuildCenterRegion();
+            }
+            catch (Exception ex)
+            {
+                _log($"DdlApprovalDialog: blocking-rule pane could not be built " +
+                     $"({ex.GetType().Name}: {ex.Message}) - showing the DDL alone. " +
+                     "The submit decision is unaffected.");
+                _reportSplit = null;
+                _paneBuildFailed = true;
+                return _rtb;
+            }
+        }
+
+        private bool _paneBuildFailed;
 
         /// <summary>
         /// The DDL viewer alone, or the viewer beside the blocking-rule report when the config
@@ -565,7 +621,16 @@ namespace EliteSoft.Erwin.AddIn.Forms
         {
             if (_blockingReport == null) return _rtb;
 
-            var split = new SplitContainer
+            // NO Panel1MinSize / Panel2MinSize / SplitterDistance here.
+            //
+            // A freshly constructed SplitContainer is 150 px wide. Setting a minimum re-validates
+            // SplitterDistance against `Width - Panel2MinSize`, so `Panel2MinSize = 300` on a
+            // 150 px control throws InvalidOperationException - and this runs on erwin's UI
+            // thread from an async void handler, where an unhandled exception takes the whole
+            // erwin process down. It did, on the first live run (2026-07-28 11:06:24). The
+            // constraints are applied in ConfigureReportSplit once docking has given the control
+            // its real width.
+            _reportSplit = new SplitContainer
             {
                 Dock = DockStyle.Fill,
                 Orientation = Orientation.Vertical,
@@ -574,9 +639,8 @@ namespace EliteSoft.Erwin.AddIn.Forms
                 // The DDL is the primary content and must keep the space when the user resizes
                 // the window; the report is a fixed-width sidebar.
                 FixedPanel = FixedPanel.Panel2,
-                Panel1MinSize = 320,
-                Panel2MinSize = 300,
             };
+            var split = _reportSplit;
             split.Panel1.Controls.Add(_rtb);
             split.Panel2.Controls.Add(new ApprovalReportPane(_blockingReport));
 
@@ -588,13 +652,56 @@ namespace EliteSoft.Erwin.AddIn.Forms
             ClientSize = new Size(Math.Max(wanted, ClientSize.Width), ClientSize.Height);
             MinimumSize = new Size(Math.Min(1040, workArea.Width - 40), MinimumSize.Height);
 
-            // Set AFTER the width so the distance is measured against the final size; Panel2 is
-            // the fixed one, so this is what pins the sidebar.
-            split.SplitterDistance = Math.Max(split.Panel1MinSize, ClientSize.Width - ReportPaneWidth);
             return split;
         }
 
         private const int ReportPaneWidth = 440;
+        private const int DdlPaneMinWidth = 320;
+        private const int ReportPaneMinWidth = 300;
+
+        private SplitContainer _reportSplit;
+
+        /// <summary>
+        /// Applies the splitter constraints once docking has given the container a real width.
+        /// Called from <c>Load</c>, not from the constructor: every one of these three properties
+        /// re-validates <c>SplitterDistance</c> against the CURRENT width, and a
+        /// not-yet-parented SplitContainer is 150 px wide, so setting a 300 px minimum there
+        /// throws. That exception, on erwin's UI thread inside an async void handler, killed the
+        /// erwin process on the first live run.
+        /// </summary>
+        private void ConfigureReportSplit()
+        {
+            var split = _reportSplit;
+            if (split == null || split.IsDisposed) return;
+
+            int width = split.Width;
+            // Too narrow to honour both minimums plus the splitter: leave the container
+            // unconstrained and centred rather than throw. A cramped splitter is a cosmetic
+            // problem; an exception here is a dead erwin.
+            if (width < DdlPaneMinWidth + ReportPaneMinWidth + split.SplitterWidth)
+            {
+                _log($"DdlApprovalDialog: report split too narrow ({width} px) for the minimums - left unconstrained.");
+                return;
+            }
+
+            split.Panel1MinSize = DdlPaneMinWidth;
+            split.Panel2MinSize = ReportPaneMinWidth;
+            split.SplitterDistance = ClampSplitterDistance(
+                width, split.SplitterWidth, DdlPaneMinWidth, ReportPaneMinWidth,
+                width - ReportPaneWidth);
+        }
+
+        /// <summary>
+        /// The legal <c>SplitterDistance</c> nearest to <paramref name="desired"/>. Pure so the
+        /// arithmetic that crashed erwin is covered by a unit test instead of only by a live run.
+        /// </summary>
+        internal static int ClampSplitterDistance(
+            int width, int splitterWidth, int panel1MinSize, int panel2MinSize, int desired)
+        {
+            int max = width - panel2MinSize - splitterWidth;
+            if (max < panel1MinSize) return panel1MinSize;   // caller must not have got here
+            return Math.Min(Math.Max(desired, panel1MinSize), max);
+        }
 
         /// <summary>
         /// Applies the verdict to the submit button. A violated rule, or one that could not be
@@ -625,6 +732,14 @@ namespace EliteSoft.Erwin.AddIn.Forms
             }
 
             if (pane != null) _lblStatus.Text = pane.Summary;
+            else if (_paneBuildFailed)
+            {
+                // The verdict still stands and the button still reflects it; only the report is
+                // missing. Say so, rather than leaving an unexplained disabled button.
+                _lblStatus.Text = _blockedByRules
+                    ? "Blocked by naming rules. The rule report could not be shown - see the Debug Log."
+                    : "Blocking rules checked. The rule report could not be shown - see the Debug Log.";
+            }
         }
 
         private ApprovalReportPane FindReportPane()

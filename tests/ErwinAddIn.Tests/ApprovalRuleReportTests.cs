@@ -220,6 +220,32 @@ namespace ErwinAddIn.Tests
                 new List<ApprovalBlockingIssue>()).Should().BeEmpty();
         }
 
+        // ---- SplitterDistance clamping ----
+        // These exist because getting this arithmetic wrong did not produce a layout glitch: on
+        // 2026-07-28 an out-of-range SplitterDistance threw on erwin's UI thread inside an
+        // async void handler and terminated the erwin PROCESS.
+
+        [Theory]
+        [InlineData(1540, 6, 320, 300, 1100, 1100)]  // desired is legal, used as-is
+        [InlineData(1540, 6, 320, 300, 100, 320)]    // below Panel1MinSize -> clamped up
+        [InlineData(1540, 6, 320, 300, 5000, 1234)]  // beyond Width-Panel2MinSize-Splitter -> clamped down
+        [InlineData(700, 6, 320, 300, 260, 320)]     // narrow but legal
+        public void ClampSplitterDistance_StaysInTheLegalRange(
+            int width, int splitterWidth, int p1Min, int p2Min, int desired, int expected)
+        {
+            EliteSoft.Erwin.AddIn.Forms.DdlApprovalDialog.ClampSplitterDistance(width, splitterWidth, p1Min, p2Min, desired)
+                .Should().Be(expected);
+        }
+
+        [Fact]
+        public void ClampSplitterDistance_OnAContainerTooNarrowForBothMinimums_DoesNotGoBelowPanel1()
+        {
+            // The caller refuses to constrain at all in this case, but the helper must still
+            // return something WinForms would accept rather than a negative distance.
+            EliteSoft.Erwin.AddIn.Forms.DdlApprovalDialog.ClampSplitterDistance(150, 6, 320, 300, 100)
+                .Should().Be(320);
+        }
+
         [Fact]
         public void ReportCap_IsTwenty()
         {

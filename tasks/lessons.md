@@ -2298,3 +2298,39 @@ Ikinci kural (ayni duzeltmeden): devre disi bir pencereyi ASLA one alma. Kendi m
 dialogumuz aciksa ana pencere Win32 seviyesinde disabled'dir; onu `Activate()` etmek
 onu kendi dialogunun ONUNE koyar ve bir seviye yukarida ayni kilitlenmeyi uretir.
 Windows'un yaptigini yap: `GW_ENABLEDPOPUP` ile dialogu bul ve ONU one al.
+
+---
+
+## WinForms kurulum sirasi: SplitContainer erwin'i oldurdu (2026-07-28)
+
+DDL Review'a rapor paneli eklerken `SplitContainer`'i su sekilde kurdum:
+
+```csharp
+var split = new SplitContainer { ..., Panel1MinSize = 320, Panel2MinSize = 300 };
+```
+
+Yeni kurulmus, henuz hicbir parent'a eklenmemis bir `SplitContainer` **150 px**
+genistir. `Panel2MinSize` set edilirken WinForms `SplitterDistance`'i o anki
+genislige gore YENIDEN DOGRULAR: `320 + 300 + 6 > 150` oldugu icin
+`InvalidOperationException` firlatti.
+
+Sonuc bir layout bozuklugu degildi. Bu kod erwin'in UI thread'inde, bir
+`async void` handler'in icinden calisiyor; oradan kacan exception dialog
+gostermez, **erwin surecini komple sonlandirir**. Kullanicinin kaydedilmemis
+modeli ile birlikte gitti (Event Id 1026, 11:06:24).
+
+Kurallar:
+
+1. `SplitContainer`'in `Panel1MinSize` / `Panel2MinSize` / `SplitterDistance`
+   degerlerini ctor'da VERME. Kontrol docking ile gercek genisligini aldiktan
+   sonra, `Load` icinde uygula. Ucu de mevcut genislige gore dogrulanir.
+2. Bir olcuyu set etmeden once "bu kontrolun su anki genisligi ne" diye sor.
+   Cevap "daha parent'i yok" ise, o set cagrisi bir bomba.
+3. erwin icinde calisan HER UI kurulum yolu, kendi basina surec olduren bir
+   yoldur. Kozmetik bir yardimci yuzey (rapor paneli, diyagram, onizleme) asla
+   erwin'i indirememeli: kurulumunu try/catch icine al, sade surume dus, ve
+   dususe LOG + kullaniciya gorunur bir not birak. Ama karar veren mantik
+   (buton disable, gate verdict) fallback'e BAGLI OLMAMALI - render hatasi bir
+   reddi onaya cevirememeli.
+4. Cokme avinda once Event Viewer: `Id=1026 .NET Runtime` managed stack'i
+   verir ve dosya + satir numarasina kadar goturur. Tahmin etmeden once oku.
