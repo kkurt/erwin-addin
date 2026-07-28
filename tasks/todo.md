@@ -464,6 +464,36 @@ Window split, pane rendered, no violations, submit button enabled. 16.2 s at ope
 - [ ] Live-check the fallback path too (it has never run): it is the one thing standing between
       a future pane bug and another dead erwin.
 
+### WON'T-DO: scoping the gate walk to "Only Selected Objects" (decided 2026-07-28)
+
+Asked for, investigated, dropped. How the checkbox actually works:
+
+- **From-Mart** (the path the review window uses): erwin's own Alter Script Wizard has an
+  Object Filter page that raises "Use current diagram selections? You have N entities
+  selected."; the bridge answers Yes via `NativeBridgeService.SetUseDiagramSelection`, and
+  **erwin scopes the script natively**. The add-in never learns which tables. When the box is
+  ticked the automation must WALK the wizard pages instead of jumping to Preview
+  (`requireObjectFilterPass`), or the Object Filter page is skipped and the filter silently
+  drops (regression verified 2026-05-30).
+- **From-DB**: that popup never appears, so the add-in post-filters the captured DDL TEXT by
+  regex against the `Physical_Name` of the entities read off the diagram.
+
+Why the gate is NOT scoped to it:
+
+1. **The selection cannot be read for more than one object.** SCAPI exposes no selection API,
+   so `Win32Helper.GetDiagramSelectedEntities` parses erwin's Overview pane Static text
+   (`"MODEL (ENTITY)"`). With several entities selected erwin shows a COUNT ("N objects") and
+   the method returns an EMPTY list. Scoping a walk to that list would check ZERO objects and
+   report "no violations" - precisely the silent pass this feature exists to prevent.
+2. **It would be a governance bypass.** The gate answers "may this MODEL enter the approval
+   queue". Scoped to the diagram selection, a modeller passes it by selecting clean tables.
+3. The performance motive is gone: 16 s, not 46 minutes, and the remaining optimisations
+   (single model-wide `Collect(root,"Attribute")`) do not weaken the gate at all.
+
+Consequence, by design: with the box ticked the DDL shows only the selected tables while the
+pane can still report - and block on - a violation in an untouched one. The pane's subtitle
+states the verdict is model-wide for exactly this reason.
+
 ---
 
 # Approval gate walk took 46 MINUTES - timer reentrancy - CODE-DONE 2026-07-27
