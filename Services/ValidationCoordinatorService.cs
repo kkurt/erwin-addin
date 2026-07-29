@@ -1320,6 +1320,11 @@ namespace EliteSoft.Erwin.AddIn.Services
                 // a drained entry simply no-ops on the already-advanced snapshot.
                 DrainAttributeRecheckQueue(modelObjects, root);
 
+                // Domain Like Glossary picker requested by the name-cell focus edge. Drained HERE
+                // rather than at the edge itself because opening the picker needs the live COM
+                // attribute, and modelObjects/root only exist on this path.
+                DrainDomainGlossaryPromptQueue(modelObjects, root);
+
                 // Phase-2D (2026-05-06): scoped per-table path is the ONLY path.
                 // When a Column Editor is open, scan that one entity. The first time
                 // the table is touched in this session, do a silent populate of just
@@ -3416,6 +3421,16 @@ namespace EliteSoft.Erwin.AddIn.Services
                 {
                     try { CaptureInlineEditCandidates(erwinHwnd); }
                     catch (Exception ex) { Log($"[INLINE-EDIT] open-edge capture err: {ex.Message}"); }
+                }
+
+                // Domain Like Glossary: the picker opens the MOMENT a column's name cell takes
+                // focus, not when the edit commits. The Column Editor's in-place cell editor turns
+                // out to be a plain "Edit" (verified from the focus probe log), so this rides the
+                // same open edge; it only has to work out WHICH cell, which the text does.
+                if (!_wasInlineEditOpen && inlineEditOpen)
+                {
+                    try { QueueDomainGlossaryPromptForFocusedCell(erwinHwnd); }
+                    catch (Exception ex) { Log($"[DOMAIN-GLOSSARY] focus-edge err: {ex.Message}"); }
                 }
 
                 if (_wasInlineEditOpen && !inlineEditOpen)
@@ -8256,6 +8271,18 @@ namespace EliteSoft.Erwin.AddIn.Services
                 return;
             }
 
+            // Domain Like Glossary mode: the row is CHOSEN in a picker popup (domain -> that
+            // domain's columns) instead of being matched by the erwin column name, so this mode
+            // replaces the name-match path entirely rather than layering on top of it. The two
+            // modes are mutually exclusive (admin refuses to arm both), hence the early return.
+            // IsModeArmed caches the effective flag per config: this gate runs for EVERY column,
+            // and ConfigContextService.GetEffective opens a RepoDbContext on every call.
+            if (DomainGlossaryService.Instance.IsModeArmed())
+            {
+                PromptDomainGlossary(attr, state);
+                return;
+            }
+
             var glossary = GlossaryService.Instance;
             if (!glossary.IsLoaded)
             {
@@ -9408,7 +9435,371 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// Target fields may have prefixes from admin: [UDP], [Erwin Property], [DB Property]
         /// Prefix-less targets are treated as UDPs for backward compatibility.
         /// </summary>
-        private void ApplyGlossaryUdpValues(dynamic attr, Dictionary<string, string> udpValues, string columnName)
+        // Domain Like Glossary re-prompt guard: objectId -> the physical name the picker last
+        // applied. The popup fires on every new column AND every column edit, and the picker's
+        // own rename + value writes ARE an edit, so without this the next tick would reopen the
+        // popup for the change we just made, forever. While the column still carries exactly
+        // what we wrote, the prompt is skipped; any later rename diverges and prompts again.
+        // Same technique as _allowedDatatypeUserPicks for the datatype picker.
+        private readonly Dictionary<string, string> _domainGlossaryApplied =
+            new Dictionary<string, string>(StringComparer.Ordinal);
+
+        // Columns whose name cell just took focus, waiting for the picker. objectId -> table.
+        private readonly Dictionary<string, string> _domainGlossaryPromptQueue =
+            new Dictionary<string, string>(StringComparer.Ordinal);
+
+        // Cell-editor texts the focus edge could not resolve to a column, already reported. Keeps
+        // the "ignored" diagnostic to one line per distinct value instead of one per gesture.
+        private readonly HashSet<string> _unmatchedFocusTexts = new HashSet<string>(StringComparer.Ordinal);
+
+        /// <summary>
+        /// Focus edge: an in-place cell editor just opened. When it is a COLUMN NAME cell, queue the
+        /// Domain Like Glossary picker so it appears immediately instead of waiting for the edit to
+        /// commit.
+        /// <para>Identifying the cell is the whole problem - erwin gives every grid cell the same
+        /// plain "Edit" window (confirmed by the focus probe: the Column Editor's in-place editor
+        /// reports class 'Edit', while the surrounding grid is 'XTPReport'). The editor's initial
+        /// text is the OLD value, so it is matched against what is already known: an exact hit on a
+        /// snapshot's physical name means an existing column is being renamed, and a placeholder
+        /// means a brand-new column is being named. A Domain Parent cell ('_default_'), a datatype
+        /// cell or a comment cell matches neither and is left alone.</para>
+        /// <para>Only queues: the picker needs the live COM attribute, which exists on the monitor
+        /// path (see <see cref="DrainDomainGlossaryPromptQueue"/>).</para>
+        /// </summary>
+        private void QueueDomainGlossaryPromptForFocusedCell(IntPtr erwinHwnd)
+        {
+            if (!DomainGlossaryService.Instance.IsModeArmed()) return;
+            if (_validationModalShowing || _validationSuspended) return;
+
+            string edited;
+            try { edited = (Win32Helper.GetFocusedInlineEditText(erwinHwnd) ?? "").Trim(); }
+            catch (Exception ex) { Log($"[DOMAIN-GLOSSARY] focused-cell read failed: {ex.Message}"); return; }
+            if (string.IsNullOrEmpty(edited)) return;
+
+            // Case 1: an existing column's name cell - the text IS its current physical name.
+            foreach (var kv in _attributeSnapshots)
+            {
+                var s = kv.Value;
+                if (s == null) continue;
+                if (!string.Equals(s.PhysicalName ?? "", edited, StringComparison.Ordinal)) continue;
+                _domainGlossaryPromptQueue[kv.Key] = s.TableName;
+                Log($"[DOMAIN-GLOSSARY] name cell focused on {s.TableName}.{edited} - picker queued.");
+                return;
+            }
+
+            // Case 2: a brand-new column - erwin seeds the cell with a placeholder and the object is
+            // still owned by the pending-name machinery rather than by a settled snapshot.
+            if (!IsNewColumnNamePlaceholder(edited))
+            {
+                // Not a name cell we recognise (datatype, comment, Domain Parent, ...). Logged once
+                // per distinct text: a SILENT no-match is exactly how the '_default_' vs '<default>'
+                // mismatch hid for a whole round trip.
+                if (_unmatchedFocusTexts.Add(edited))
+                    Log($"[DOMAIN-GLOSSARY] cell editor opened on '{edited}' - not a column name cell, ignored.");
+                return;
+            }
+
+            // Every pending attribute carries the same placeholder text, so the text cannot pick
+            // between them. The entity whose Column Editor is open is the one the user is typing
+            // in, so prefer it; fall back to any pending attribute when no editor is scoped.
+            string preferredTable = _activeColumnEditorTable;
+            foreach (bool preferredPass in new[] { true, false })
+            {
+                if (preferredPass && string.IsNullOrEmpty(preferredTable)) continue;
+
+                foreach (var pendSet in _pendingNamedAttrs.Values)
+                {
+                    foreach (var objectId in pendSet)
+                    {
+                        if (!_attributeSnapshots.TryGetValue(objectId, out var pending) || pending == null) continue;
+                        if (preferredPass
+                            && !string.Equals(pending.TableName, preferredTable, StringComparison.Ordinal))
+                        {
+                            continue;
+                        }
+
+                        _domainGlossaryPromptQueue[objectId] = pending.TableName;
+                        Log($"[DOMAIN-GLOSSARY] new-column name cell focused ('{edited}') on {pending.TableName} - picker queued.");
+                        return;
+                    }
+                }
+            }
+
+            Log($"[DOMAIN-GLOSSARY] new-column placeholder '{edited}' focused but no pending attribute is tracked yet - not prompting.");
+        }
+
+        /// <summary>
+        /// Whether a cell editor's initial text is the placeholder erwin shows for an unnamed new
+        /// column.
+        /// <para>Two spellings matter: SCAPI reports <c>&lt;default&gt;</c> while the grid/tree
+        /// EDITOR is seeded with <c>_default_</c>. Matching only the SCAPI form is why the picker
+        /// silently skipped every brand-new column - the case this predicate exists to pin.</para>
+        /// </summary>
+        internal static bool IsNewColumnNamePlaceholder(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return false;
+            string t = text.Trim();
+            return t.StartsWith("<default>", StringComparison.OrdinalIgnoreCase)
+                || t.Equals("_default_", StringComparison.OrdinalIgnoreCase)
+                || IsPleaseChangeItPlaceholder(t);
+        }
+
+        /// <summary>
+        /// Opens the picker for whatever <see cref="QueueDomainGlossaryPromptForFocusedCell"/>
+        /// queued. Resolves the live attribute by owning entity + ObjectId - bounded to one entity's
+        /// attribute list, never a model-wide walk.
+        /// </summary>
+        private void DrainDomainGlossaryPromptQueue(dynamic modelObjects, dynamic root)
+        {
+            if (_domainGlossaryPromptQueue.Count == 0) return;
+            if (_validationModalShowing || _validationSuspended) return;
+
+            var pendingPrompts = _domainGlossaryPromptQueue.ToList();
+            _domainGlossaryPromptQueue.Clear();
+
+            foreach (var entry in pendingPrompts)
+            {
+                string objectId = entry.Key;
+                string tableName = entry.Value;
+                if (!_attributeSnapshots.TryGetValue(objectId, out var state) || state == null) continue;
+
+                try
+                {
+                    dynamic entities = modelObjects.Collect(root, "Entity");
+                    if (entities == null) continue;
+                    foreach (dynamic entity in entities)
+                    {
+                        if (entity == null) continue;
+                        if (!string.Equals(GetTableName(entity), tableName, StringComparison.Ordinal)) continue;
+
+                        dynamic attrs = modelObjects.Collect(entity, "Attribute");
+                        if (attrs == null) break;
+                        foreach (dynamic attr in attrs)
+                        {
+                            if (attr == null) continue;
+                            string aid;
+                            try { aid = attr.ObjectId?.ToString(); }
+                            catch { continue; }
+                            if (!string.Equals(aid, objectId, StringComparison.Ordinal)) continue;
+
+                            PromptDomainGlossary(attr, state);
+                            break;
+                        }
+                        break;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log($"[DOMAIN-GLOSSARY] prompt drain failed for {tableName} attr {objectId}: {ex.Message}");
+                }
+            }
+        }
+
+        /// <summary>
+        /// The anti-reopen contract for the Domain Like Glossary picker, as a pure predicate so
+        /// the loop-prevention rule is pinned by tests.
+        /// <para>True (skip the prompt) only while the column still carries EXACTLY the name the
+        /// picker last applied - i.e. the pending "edit" is the one we ourselves made. A column
+        /// we never applied to (<paramref name="appliedName"/> null) always prompts, and any
+        /// later rename diverges and prompts again.</para>
+        /// </summary>
+        internal static bool ShouldSkipDomainGlossaryPrompt(string appliedName, string currentName)
+        {
+            if (string.IsNullOrEmpty(appliedName)) return false;
+            return string.Equals(appliedName, currentName, StringComparison.Ordinal);
+        }
+
+        /// <summary>
+        /// Domain Like Glossary flow: show the domain/column picker and apply the chosen row.
+        /// Replaces the name-match path when USE_DOMAIN_LIKE_GLOSSARY is on.
+        /// </summary>
+        private void PromptDomainGlossary(dynamic attr, AttributeValidationSnapshot state)
+        {
+            var dg = DomainGlossaryService.Instance;
+            if (!dg.IsLoaded) dg.LoadDomainGlossary();
+            if (!dg.IsLoaded)
+            {
+                // Not configured / unreachable / credentials unusable. LastError already carries
+                // the reason; do NOT fall back to the standard glossary (different definition).
+                Log($"DomainGlossary: not loaded ({dg.LastError ?? "unknown reason"}) - skipping {state?.TableName}.{state?.PhysicalName}");
+                return;
+            }
+
+            string objId = state?.ObjectId;
+            string appliedName = null;
+            if (!string.IsNullOrEmpty(objId)) _domainGlossaryApplied.TryGetValue(objId, out appliedName);
+            if (ShouldSkipDomainGlossaryPrompt(appliedName, state?.PhysicalName))
+            {
+                Log($"DomainGlossary: {state.TableName}.{state.PhysicalName} still matches the last applied pick - not re-prompting.");
+                return;
+            }
+
+            DialogResult rc;
+            DomainGlossaryRow picked;
+            string composedName;
+            _validationModalShowing = true;
+            try
+            {
+                rc = Forms.DomainGlossaryPickerForm.Show(
+                    "Choose glossary column",
+                    $"Column '{state.TableName}.{state.PhysicalName}': pick the domain and column type, "
+                        + "then enter the column name. Typing narrows each list.",
+                    dg,
+                    out picked,
+                    out composedName,
+                    currentName: state.PhysicalName);
+            }
+            finally { _validationModalShowing = false; }
+
+            // A rename can land while the picker pumps messages - re-read the live name so the
+            // apply below targets the column the user actually sees.
+            RefreshNameAfterModal(attr, state, "domain-like glossary picker");
+
+            if (rc != DialogResult.OK || picked == null)
+            {
+                HandleDomainGlossaryCancel(attr, state);
+                return;
+            }
+
+            ApplyDomainGlossaryRow(attr, state, picked, composedName);
+        }
+
+        /// <summary>
+        /// Cancel semantics mirror the standard glossary's no-match handling, driven by the same
+        /// effective GLOSSARY_REQUIRED_OPTION. Read from config directly: GlossaryService caches
+        /// it during ITS load, which never runs in this mode.
+        /// </summary>
+        private void HandleDomainGlossaryCancel(dynamic attr, AttributeValidationSnapshot state)
+        {
+            var option = ConfigContextService.Instance.GetEffectiveEnum(
+                "GLOSSARY_REQUIRED_OPTION", GlossaryRequiredOption.OPTIONAL_SILENT);
+
+            if (option == GlossaryRequiredOption.OPTIONAL_SILENT)
+            {
+                Log($"DomainGlossary pick cancelled (OPTIONAL_SILENT): {state.TableName}.{state.PhysicalName}");
+                return;
+            }
+
+            Log($"DomainGlossary pick cancelled ({option}): {state.TableName}.{state.PhysicalName}");
+            _pendingResults.Add(new CollectedValidationResult
+            {
+                ValidationType = CollectedValidationResultType.Glossary,
+                TableName = state.TableName,
+                ColumnName = state.PhysicalName,
+                Message = "No glossary column was chosen. Please pick a domain and column from the glossary.",
+                Attribute = attr,
+                ObjectId = state.ObjectId
+            });
+        }
+
+        /// <summary>
+        /// Applies a picked row: rename the column to the glossary's column name, then write the
+        /// mapped UDP / erwin-property values through the shared apply path, then check the name
+        /// against the row's naming standard.
+        /// </summary>
+        private void ApplyDomainGlossaryRow(
+            dynamic attr, AttributeValidationSnapshot state, DomainGlossaryRow row, string composedName)
+        {
+            var dg = DomainGlossaryService.Instance;
+
+            // The name comes from the PICKER, not from the glossary row: the row's column value is
+            // a human label ("ADRES TIPI" - 181 of 209 rows contain spaces), while the naming
+            // standard demands a modeler-chosen name plus a fixed tail. The picker composed and
+            // validated it, so it is already known to satisfy the standard.
+            if (!string.IsNullOrWhiteSpace(composedName)
+                && !string.Equals(composedName, state.PhysicalName, StringComparison.Ordinal))
+            {
+                int transId = _session.BeginNamedTransaction("ApplyDomainGlossaryName");
+                try
+                {
+                    attr.Properties("Physical_Name").Value = composedName;
+                    _session.CommitTransaction(transId);
+                    Log($"DomainGlossary: renamed {state.TableName}.{state.PhysicalName} -> {composedName}");
+                    state.PhysicalName = composedName;
+                }
+                catch (Exception ex)
+                {
+                    try { _session.RollbackTransaction(transId); }
+                    catch (Exception rb) { Log($"DomainGlossary rename rollback failed for {state.PhysicalName}: {rb.Message}"); }
+                    // Do NOT apply the row's values onto a column we failed to rename: they belong
+                    // to the glossary column, not to whatever this one still is.
+                    Log($"DomainGlossary rename failed for {state.TableName}.{state.PhysicalName}: {ex.Message}");
+                    return;
+                }
+            }
+
+            if (row.Values.Count > 0)
+            {
+                // Typed locals, not method groups: `attr` is dynamic, so the call is dispatched
+                // dynamically and a method group cannot be bound at that point (CS1976).
+                Func<string, string> targetTypeOf = dg.GetTargetType;
+                Func<string, bool> isLockedOf = dg.GetIsLocked;
+                ApplyGlossaryUdpValues(attr, row.Values, state.PhysicalName, targetTypeOf, isLockedOf);
+            }
+
+            ValidateDomainGlossaryNamingStandard(attr, state, row);
+
+            if (!string.IsNullOrEmpty(state.ObjectId))
+                _domainGlossaryApplied[state.ObjectId] = state.PhysicalName;
+        }
+
+        /// <summary>
+        /// Validates the applied column name against the row's naming standard.
+        /// <para>The _NAMING_STANDARD_ column carries the REGEX ITSELF (admin data, 2026-07-28 -
+        /// e.g. <c>^[A-Z0-9_]+_ADRES_TIP$</c>), not a key into MC_NAMING_STANDARD. It is used
+        /// verbatim as the pattern.</para>
+        /// <para>Matching is CASE-SENSITIVE, unlike DomainDefService's DOMAIN_DEF.REGEXP check:
+        /// these patterns spell out their own character classes (<c>[A-Z0-9_]</c>), so folding
+        /// case would silently accept the lowercase names the author wrote the class to reject.</para>
+        /// </summary>
+        private void ValidateDomainGlossaryNamingStandard(
+            dynamic attr, AttributeValidationSnapshot state, DomainGlossaryRow row)
+        {
+            if (string.IsNullOrWhiteSpace(row.NamingStandard)) return;
+
+            string pattern = row.NamingStandard.Trim();
+            bool isMatch;
+            try
+            {
+                isMatch = System.Text.RegularExpressions.Regex.IsMatch(state.PhysicalName ?? "", pattern);
+            }
+            catch (ArgumentException ex)
+            {
+                // A malformed admin-authored pattern must be visible, not swallowed into a pass.
+                Log($"DomainGlossary: naming standard pattern '{pattern}' is not a valid regex: {ex.Message} "
+                    + $"- name not checked for {state.TableName}.{state.PhysicalName}");
+                return;
+            }
+
+            if (isMatch)
+            {
+                Log($"DomainGlossary: '{state.PhysicalName}' matches naming standard /{pattern}/");
+                return;
+            }
+
+            Log($"DomainGlossary: '{state.PhysicalName}' violates naming standard /{pattern}/");
+            _pendingResults.Add(new CollectedValidationResult
+            {
+                ValidationType = CollectedValidationResultType.Glossary,
+                TableName = state.TableName,
+                ColumnName = state.PhysicalName,
+                Message = $"Column name '{state.PhysicalName}' does not match the naming standard '{pattern}'.",
+                Attribute = attr,
+                ObjectId = state.ObjectId
+            });
+        }
+
+        /// <summary>
+        /// Writes a matched glossary row's values onto the erwin column.
+        /// <para><paramref name="targetTypeOf"/> / <paramref name="isLockedOf"/> default to
+        /// <see cref="GlossaryService"/>, which is the standard-glossary behaviour. The
+        /// Domain Like Glossary mode passes its own resolvers because in that mode
+        /// GlossaryService is never loaded (the two modes are mutually exclusive), so its
+        /// lookups would return null and every mapping would silently fall through to the
+        /// "treat as UDP" default - losing ERWIN_PROPERTY targets.</para>
+        /// </summary>
+        private void ApplyGlossaryUdpValues(dynamic attr, Dictionary<string, string> udpValues, string columnName,
+            Func<string, string> targetTypeOf = null, Func<string, bool> isLockedOf = null)
         {
             try
             {
@@ -9416,6 +9807,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                 try
                 {
                     var glossary = GlossaryService.Instance;
+                    var resolveTargetType = targetTypeOf ?? glossary.GetTargetType;
+                    var resolveIsLocked = isLockedOf ?? glossary.GetIsLocked;
                     foreach (var kvp in udpValues)
                     {
                         if (string.IsNullOrEmpty(kvp.Value))
@@ -9423,13 +9816,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                             // Locked field with no glossary value for this term (miss): do not
                             // fabricate an empty value and do not fail the apply - just flag it
                             // (never swallow silently).
-                            if (glossary.GetIsLocked(kvp.Key))
+                            if (resolveIsLocked(kvp.Key))
                                 Log($"Glossary: locked field '{kvp.Key}' has no value for '{columnName}' - left unset (not fabricated).");
                             continue;
                         }
 
                         string targetField = kvp.Key;
-                        string targetType = glossary.GetTargetType(targetField);
+                        string targetType = resolveTargetType(targetField);
 
                         switch (targetType?.ToUpper())
                         {

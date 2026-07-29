@@ -222,6 +222,7 @@ namespace EliteSoft.Erwin.AddIn
 
         // State tracking
         private Timer _glossaryRefreshTimer;
+        private Timer _domainGlossaryRefreshTimer;
         private Timer _reconnectTimer;
         // Re-entrancy guard for ReconnectTimer_Tick. The tick handler ends up
         // calling ConnectToModel, whose splash Form.Show + COM Sessions.Open +
@@ -249,6 +250,7 @@ namespace EliteSoft.Erwin.AddIn
         private bool _dwmWarmedThisSession;
         private DateTime? _lastGlossaryRefreshTime;
         private volatile bool _isRefreshingGlossary;
+        private volatile bool _isRefreshingDomainGlossary;
 
         #endregion
 
@@ -2053,6 +2055,8 @@ namespace EliteSoft.Erwin.AddIn
             GlossaryService.Instance.OnLog += Log;
             using (AddinLogger.BeginScope("LoadGlossary"))
                 LoadGlossary();
+            using (AddinLogger.BeginScope("LoadDomainGlossary"))
+                LoadDomainGlossary();
             using (AddinLogger.BeginScope("LoadPredefinedColumns"))
                 LoadPredefinedColumns();
             using (AddinLogger.BeginScope("LoadDomainDefs"))
@@ -4065,6 +4069,73 @@ namespace EliteSoft.Erwin.AddIn
             _glossaryRefreshTimer.Tick += GlossaryRefreshTimer_Tick;
             _glossaryRefreshTimer.Start();
             Log($"Glossary auto-refresh timer started (every {intervalMinutes} minute(s))");
+
+            // Domain Like Glossary is a SEPARATE definition with its own interval key, so it gets
+            // its own timer rather than riding this one. Only one of the two modes is ever armed
+            // (they are mutually exclusive), and the disarmed one's Reload early-returns on its
+            // flag, so the idle cost of the second timer is a no-op call per interval.
+            int domainIntervalMinutes = GetDomainGlossaryLoadInterval();
+            _domainGlossaryRefreshTimer = new Timer { Interval = domainIntervalMinutes * 60 * 1000 };
+            _domainGlossaryRefreshTimer.Tick += DomainGlossaryRefreshTimer_Tick;
+            _domainGlossaryRefreshTimer.Start();
+            Log($"Domain like glossary auto-refresh timer started (every {domainIntervalMinutes} minute(s))");
+        }
+
+        private int GetDomainGlossaryLoadInterval()
+        {
+            // Effective DOMAIN_GLOSSARY_LOAD_INTERVAL, same two-level cascade and same
+            // surface-the-error discipline as GetGlossaryLoadInterval.
+            const int defaultInterval = 5;
+            try
+            {
+                int minutes = ConfigContextService.Instance.GetEffectiveInt(
+                    DomainGlossaryService.LoadIntervalKey, defaultInterval);
+                return minutes > 0 ? minutes : defaultInterval;
+            }
+            catch (Exception ex)
+            {
+                Log($"GetDomainGlossaryLoadInterval: DB read error (falling back to {defaultInterval} min): {ex.Message}");
+                return defaultInterval;
+            }
+        }
+
+        private void DomainGlossaryRefreshTimer_Tick(object sender, EventArgs e)
+        {
+            if (_isRefreshingDomainGlossary) return;
+            if (!DatabaseService.Instance.IsConfigured) return;
+
+            // OFF the UI thread on purpose. This read crosses the network to the external glossary
+            // DB; running it on the Timer's (UI) thread would freeze erwin for its whole duration
+            // every interval. Safe to background: DomainGlossaryService touches no COM/SCAPI, only
+            // ADO.NET, and it publishes its cache in one assignment at the end so a concurrent
+            // picker read sees either the old state or the new one, never a half-built one.
+            _isRefreshingDomainGlossary = true;
+            System.Threading.Tasks.Task.Run(() =>
+            {
+                try
+                {
+                    DomainGlossaryService.Instance.Reload();
+
+                    if (!IsDisposed && IsHandleCreated)
+                    {
+                        BeginInvoke(new Action(() =>
+                        {
+                            if (DomainGlossaryService.Instance.IsLoaded)
+                                Log($"Domain like glossary auto-refreshed: {DomainGlossaryService.Instance.Count} row(s)");
+                        }));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Never swallow: a refresh failure leaves the previous cache in place, which
+                    // the user must be able to see in the log.
+                    Log($"Domain like glossary auto-refresh failed: {ex.Message}");
+                }
+                finally
+                {
+                    _isRefreshingDomainGlossary = false;
+                }
+            });
         }
 
         private int GetGlossaryLoadInterval()
@@ -4165,6 +4236,35 @@ namespace EliteSoft.Erwin.AddIn
         // Glossary loading runs automatically when the model loads or when
         // DatabaseService.ClearCache is invoked elsewhere; manual reload is no
         // longer surfaced.
+
+        /// <summary>
+        /// Warms the Domain Like Glossary cache at connect time, exactly like
+        /// <see cref="LoadGlossary"/> does for the standard one.
+        /// <para>Without this the first new column pays for the whole read - repo queries plus a
+        /// network round trip to the external glossary DB - while the user waits for the picker to
+        /// appear. The load is a no-op when the mode is off (it early-returns on its flag).</para>
+        /// </summary>
+        private void LoadDomainGlossary()
+        {
+            try
+            {
+                if (!DatabaseService.Instance.IsConfigured) return;
+
+                var dg = DomainGlossaryService.Instance;
+                if (!dg.IsLoaded) dg.LoadDomainGlossary();
+
+                if (dg.IsEnabled && !dg.IsLoaded)
+                {
+                    // Armed but unusable: surface it at connect time instead of letting the first
+                    // column discover it.
+                    AddConnectWarning($"Domain like glossary: {dg.LastError}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"LoadDomainGlossary failed: {ex.Message}");
+            }
+        }
 
         private void LoadGlossary()
         {
@@ -10270,6 +10370,10 @@ namespace EliteSoft.Erwin.AddIn
                 _glossaryRefreshTimer?.Dispose();
                 _glossaryRefreshTimer = null;
 
+                _domainGlossaryRefreshTimer?.Stop();
+                _domainGlossaryRefreshTimer?.Dispose();
+                _domainGlossaryRefreshTimer = null;
+
                 DisposeServices();
                 _validationService = null;
                 _tableTypeMonitorService = null;
@@ -10323,6 +10427,10 @@ namespace EliteSoft.Erwin.AddIn
                 _glossaryRefreshTimer?.Stop();
                 _glossaryRefreshTimer?.Dispose();
                 _glossaryRefreshTimer = null;
+
+                _domainGlossaryRefreshTimer?.Stop();
+                _domainGlossaryRefreshTimer?.Dispose();
+                _domainGlossaryRefreshTimer = null;
 
                 DisposeServices();
                 _validationService = null;

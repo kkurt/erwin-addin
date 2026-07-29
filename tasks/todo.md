@@ -2367,3 +2367,57 @@ mal olmasini engelleyen kisim.
 `MartMartAutomation.FirstVisibleErwinDialogTitle` private -> internal.
 
 Verified: 3 flavor build 0/0, testler 979/979. NOT committed.
+
+# Domain Like Glossary: kolon picker popup'i (2026-07-28)
+
+Admin tarafi (erwin-admin) bitti; bu is paketi add-in yarisidir.
+Runtime kontrati: `erwin-admin/docs/specs/domain-like-glossary.md`.
+
+Bir config `USE_DOMAIN_LIKE_GLOSSARY` ile bu moda alindiginda, kolon adiyla eslestirme
+YOKTUR: kullanici satiri bir popup'tan secer (Domain -> o domainin kolonlari), secilen
+satirin maplenmis degerleri kolona uygulanir.
+
+Kullanici kararlari:
+- Popup HER yeni kolonda ve HER kolon edit'inde acilir (UX maliyetini sordum, teyit edildi).
+- Cancel `GLOSSARY_REQUIRED_OPTION`'a uyar (silent / warn / required).
+- Uygulanan: maplenen UDP + erwin property'ler VE kolonun fiziksel adi.
+- Naming standard degeri regex tasiyan bir standardi isaret eder; ad ona gore dogrulanir.
+
+## Yapilanlar
+
+- `Services/DomainGlossaryService.cs` (YENI). `GlossaryService`'in KARDESI, icine gomulmedi:
+  o servis `_MATCH_` etrafinda kurulu (satir yoksa hard failure) ve cache'i match degerine
+  gore anahtarli. Iki mod zaten karsilikli dislayici, yani ayni anda en fazla biri yuklu.
+  Sadece DG_DATA_SOURCE (named-SQL) yolu desteklenir; admin bu mapping icin TABLE_NAME
+  yazmiyor, DATA_SOURCE_ID yoksa sessizce sorgu uydurmak yerine yuksek sesle hata verir.
+- `Forms/DomainGlossaryPickerForm.cs` (YENI). Iki typeahead combo + uygulanacak degerlerin
+  onizlemesi. Repoda tek bir `AutoCompleteMode` kullanimi bile yoktu, o yuzden liste
+  daraltma TextChanged uzerinden elle yazildi; filtre `Filter` saf static olarak ayrildi.
+- `ValidateGlossary` icine erken dal: mod aciksa picker akisi calisir ve `return` eder.
+  Modal, `PromptAlwaysAskDatatype` desenini birebir izler (`_validationModalShowing`
+  try/finally + sonrasinda `RefreshNameAfterModal`).
+- `ApplyGlossaryUdpValues` iki opsiyonel resolver parametresi aldi. Sebep: bu modda
+  `GlossaryService` HIC yuklenmiyor, dolayisiyla `GetTargetType` null donup her mapping
+  `default:` koluna (UDP muamelesi) dusecek ve ERWIN_PROPERTY hedefleri kaybolacakti.
+- `ModelConfigForm`: `DOMAIN_GLOSSARY_LOAD_INTERVAL` icin ayri refresh timer.
+
+## Iki tuzak ve cozumleri
+
+1. **Sonsuz popup dongusu.** Popup her edit'te aciliyor, ama picker'in kendi rename +
+   UDP yazmalari da bir edit. Onlem: `_domainGlossaryApplied` (objectId -> uygulanan ad)
+   ve saf `ShouldSkipDomainGlossaryPrompt`. Kolon hala tam olarak bizim yazdigimizi
+   tasidigi surece prompt atlanir; sonraki her rename tekrar sorar.
+2. **Kolon basina DB sorgusu.** Mod gate'i her kolonda calisiyor, ama
+   `ConfigContextService.GetEffective` HER cagrida bir `RepoDbContext` acip iki sorgu
+   atiyor. Onlem: `IsModeArmed()` bayragi config basina cache'ler; `Reload()` cache'i
+   dusurur, boylece admin'deki toggle bir sonraki refresh'te yakalanir.
+
+## Kapsam disi
+
+- `Parent_Domain_Ref` yazimi (kolonu gercek erwin Domain nesnesine baglamak). Repoda bu
+  property SADECE okunuyor, hicbir yerde yazilmiyor; SCAPI'de yazilabilirligi kanitsiz.
+  Istenirse kendi spike'ini gerektirir.
+- Prefix/suffix/template naming kurallarindan ad URETMEK. Sadece Regexp turu uygulanir.
+
+Verified: build 0 warn / 0 err (TreatWarningsAsErrors acik), testler 1037/1037.
+Canli erwin testi HENUZ YAPILMADI. NOT committed.
