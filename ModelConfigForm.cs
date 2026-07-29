@@ -5182,6 +5182,13 @@ namespace EliteSoft.Erwin.AddIn
             }
             catch (Exception ex) { Log($"[RECON] RegisterHotKey threw: {ex.Message}"); }
         }
+#endif
+
+        // WP 329 (erwin input block) is PRODUCTION behaviour and must compile in every flavor.
+        // It sat inside the "#if !PACKAGED" debug-button region above, while
+        // RaiseAddinOverBlockedFrame is called unconditionally from the reconnect tick - so a
+        // packaged build did not compile at all (CS0103). Closed the region before it and
+        // reopened after, leaving the debug-only members either side untouched.
 
         /// <summary>
         /// WP 329 recoverability: a DISABLED window can still be RAISED by the taskbar or
@@ -5276,6 +5283,7 @@ namespace EliteSoft.Erwin.AddIn
             }
         }
 
+#if !PACKAGED
         protected override void OnHandleDestroyed(EventArgs e)
         {
             try { UnregisterHotKey(this.Handle, ReconHotkeyId); } catch { /* best-effort */ }
