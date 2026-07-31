@@ -11,6 +11,20 @@
 -- the addin worker: it CLAIMs (PENDING -> RUNNING) and finalizes (DONE/FAILED).
 -- The producer (admin tool / operator) INSERTs PENDING rows.
 --
+-- VERSION DIRECTION - RIGHT_VERSION MUST BE <= LEFT_VERSION.
+--   LEFT_VERSION  = the NEWER version. erwin opens it as the active model.
+--   RIGHT_VERSION = the OLDER, already-deployed version. It is the compare target.
+-- The alter script is produced by applying the OPEN model's differences INTO the
+-- target, i.e. it upgrades RIGHT to LEFT. So "script the move from deployed v7 to
+-- target v8" is LEFT_VERSION=8, RIGHT_VERSION=7 - NOT the other way round. The
+-- add-in's Target list is built from the open version DOWNWARDS, so an inverted row
+-- can never be satisfied; the worker now rejects it at claim time (STATUS=FAILED,
+-- ERROR_MESSAGE spells out the corrected pair) instead of opening the model first.
+-- RIGHT_VERSION = LEFT_VERSION is legal: that is the "dirty vs last saved" compare
+-- (requires the DDL_COMPARE_LAST_SAVED gate).
+-- Field incident 2026-07-30: ten consecutive jobs failed because the producer wrote
+-- LEFT=deployed / RIGHT=target.
+--
 -- STATUS lifecycle: PENDING -> RUNNING -> DONE | FAILED.
 -- No-diff contract: when the compared versions are identical the row is DONE
 -- with an EMPTY RESULT_DDL (no alter DDL to apply). The DONE status - not the

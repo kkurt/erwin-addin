@@ -507,6 +507,171 @@ namespace EliteSoft.Erwin.AddIn
             }
         }
 
+        #region Per-job diagnostic trace
+
+        // One worker job spreads across a dozen tag families ([DDLWORKER],
+        // [WORKER-OPEN], [PICK], [MDI-OPEN], [ROUTE], [REVIEW], [WORKER-CLOSE])
+        // and hundreds of interleaved lines, while the OPERATOR only ever sees a
+        // single ERROR_MESSAGE cell in the admin Auto-DDL grid. Diagnosing the
+        // 2026-07-30 field failure (ten consecutive jobs dead before the compare
+        // model was ever opened) meant hand-correlating timestamps to answer
+        // "which step died, on what data, after how long" - and the message the
+        // operator did see pointed at the wrong cause. The trace below stamps every
+        // job with ordered, timed stage lines under ONE grep-able tag
+        // ([DDLJOB <id>]) and closes it with a single SUMMARY line. Pure
+        // diagnostics: no control flow depends on it, and every helper swallows
+        // its own errors so a logging fault can never fail a job.
+
+        /// <summary>
+        /// The job the trace follows. Deliberately SEPARATE from
+        /// <see cref="_currentDdlJob"/>: that field is nulled the instant the outcome
+        /// is written to the row, but the SUMMARY is only emitted after the model
+        /// close completes and must still be able to name the model and versions.
+        /// </summary>
+        private DdlQueueJob _ddlTraceJob;
+        private readonly System.Diagnostics.Stopwatch _ddlJobClock = new System.Diagnostics.Stopwatch();
+        private readonly System.Diagnostics.Stopwatch _ddlStageClock = new System.Diagnostics.Stopwatch();
+        private string _ddlStageName;
+        private int _ddlStageNo;
+        private string _ddlTraceFailedStage;              // stage that produced the failure
+        private string _ddlTraceOutcome;                  // DONE | FAILED | REQUEUED | GAVE-UP
+        private string _ddlTraceReason;                   // error text, or the success note
+        private string _ddlTraceRoute;                    // pipeline route (FromMart-Same / -Cross / FromDB)
+        private int _ddlTraceDdlChars = -1;               // -1 = no DDL produced/attempted
+
+        /// <summary>Job-scoped log line. Works after <c>_currentDdlJob</c> is nulled.</summary>
+        private void DdlJobLog(string message)
+            => Log($"[DDLJOB {(_currentDdlJob ?? _ddlTraceJob)?.Id ?? 0}] {message}");
+
+        /// <summary>Opens the trace for a freshly claimed row.</summary>
+        private void DdlJobTraceStart(DdlQueueJob job)
+        {
+            try
+            {
+                _ddlTraceJob = job;
+                _ddlTraceOutcome = null;
+                _ddlTraceReason = null;
+                _ddlTraceRoute = null;
+                _ddlTraceFailedStage = null;
+                _ddlTraceDdlChars = -1;
+                _ddlStageName = null;
+                _ddlStageNo = 0;
+                _ddlJobClock.Restart();
+                DdlJobLog($"CLAIMED model='{job.ModelPath}' LEFT/open=v{job.LeftVersion} RIGHT/target=v{job.RightVersion} " +
+                          $"retry={job.RetryCount} (LEFT is opened as the active model, RIGHT is the compare target; " +
+                          "the alter script upgrades RIGHT to LEFT).");
+            }
+            catch (Exception ex) { Log($"[DDLJOB] trace start failed: {ex.Message}"); }
+        }
+
+        /// <summary>
+        /// Starts a numbered stage. An unclosed previous stage is closed as OK -
+        /// the lifecycle only advances on success, so that is the truthful reading.
+        /// </summary>
+        private void DdlJobBeginStage(string stage, string detail = null)
+        {
+            try
+            {
+                if (_ddlStageName != null) DdlJobEndStage("OK");
+                _ddlStageNo++;
+                _ddlStageName = stage;
+                _ddlStageClock.Restart();
+                DdlJobLog($"stage {_ddlStageNo} '{stage}' START" + (string.IsNullOrEmpty(detail) ? "" : " - " + detail));
+            }
+            catch (Exception ex) { Log($"[DDLJOB] begin-stage failed: {ex.Message}"); }
+        }
+
+        /// <summary>
+        /// Closes the open stage. <paramref name="result"/> is "OK" or "FAIL"; anything
+        /// other than "OK" is recorded as the job's failing stage for the SUMMARY.
+        /// </summary>
+        private void DdlJobEndStage(string result, string detail = null)
+        {
+            try
+            {
+                if (_ddlStageName == null) return;
+                string stage = _ddlStageName;
+                _ddlStageName = null;
+                _ddlStageClock.Stop();
+                if (!string.Equals(result, "OK", StringComparison.Ordinal)) _ddlTraceFailedStage = stage;
+                DdlJobLog($"stage {_ddlStageNo} '{stage}' {result} in {_ddlStageClock.ElapsedMilliseconds} ms" +
+                          (string.IsNullOrEmpty(detail) ? "" : " - " + detail));
+            }
+            catch (Exception ex) { Log($"[DDLJOB] end-stage failed: {ex.Message}"); }
+        }
+
+        /// <summary>
+        /// Records the outcome as soon as it is known (the row write happens here),
+        /// so the SUMMARY emitted later at close-complete is still accurate.
+        /// </summary>
+        private void DdlJobTraceOutcome(string outcome, string reason)
+        {
+            _ddlTraceOutcome = outcome;
+            _ddlTraceReason = reason;
+        }
+
+        /// <summary>
+        /// Emits the one-line job summary and resets the trace. Called once per job,
+        /// at the very end of its lifecycle (after the model close, or right away for
+        /// a row rejected before erwin was ever driven).
+        /// </summary>
+        private void DdlJobTraceEnd()
+        {
+            try
+            {
+                var job = _ddlTraceJob;
+                if (job == null) return;
+                if (_ddlStageName != null) DdlJobEndStage("OK");
+                _ddlJobClock.Stop();
+                DdlJobLog($"SUMMARY outcome={_ddlTraceOutcome ?? "UNKNOWN"} model='{job.ModelPath}' " +
+                          $"LEFT/open=v{job.LeftVersion} RIGHT/target=v{job.RightVersion} " +
+                          $"route={_ddlTraceRoute ?? "-"} " +
+                          $"ddl={(_ddlTraceDdlChars < 0 ? "none" : _ddlTraceDdlChars + " chars")} " +
+                          $"stages={_ddlStageNo} " +
+                          (_ddlTraceFailedStage == null ? "" : $"failedStage='{_ddlTraceFailedStage}' ") +
+                          $"total={_ddlJobClock.ElapsedMilliseconds / 1000.0:F1}s " +
+                          $"reason={_ddlTraceReason ?? "-"}");
+            }
+            catch (Exception ex) { Log($"[DDLJOB] summary failed: {ex.Message}"); }
+            finally
+            {
+                _ddlTraceJob = null;
+                _ddlStageName = null;
+            }
+        }
+
+        /// <summary>
+        /// Comma-separated contents of the Target (Right) combo - the list the job's
+        /// RIGHT_VERSION must appear in. Logged verbatim because "why is my version
+        /// missing" is only answerable against the actual list.
+        /// </summary>
+        private string RightComboItemsCsv()
+        {
+            try { return string.Join(", ", cmbRightModel.Items.Cast<object>().Select(x => x?.ToString() ?? "")); }
+            catch (Exception ex) { return "<unreadable: " + ex.Message + ">"; }
+        }
+
+        /// <summary>
+        /// Short shape description of a produced script - size plus a statement
+        /// breakdown, so the log answers "did it actually generate anything useful"
+        /// without dumping the DDL into the shared log file.
+        /// </summary>
+        private static string DescribeDdl(string script)
+        {
+            if (script == null) return "null (nothing captured)";
+            if (script.Length == 0) return "empty (no differences)";
+            try
+            {
+                int Count(string kw) => System.Text.RegularExpressions.Regex
+                    .Matches(script, @"(?im)^\s*" + kw + @"\b").Count;
+                int lines = script.Split('\n').Length;
+                return $"{script.Length} chars, {lines} lines, ALTER={Count("ALTER")}, CREATE={Count("CREATE")}, DROP={Count("DROP")}";
+            }
+            catch (Exception ex) { return $"{script.Length} chars (breakdown failed: {ex.Message})"; }
+        }
+
+        #endregion
+
         private void DdlWorkerTryStartNextJob()
         {
 #if DDLGENERATOR
@@ -613,6 +778,27 @@ namespace EliteSoft.Erwin.AddIn
 
             _currentDdlJob = job;
             _ddlCleanupAttempts = 0; // fresh cap per job lifecycle
+            DdlJobTraceStart(job);
+
+            // Contract pre-flight BEFORE erwin is touched: a row the pipeline can never
+            // satisfy (see DdlJobVersionContract) is failed here with the
+            // correction in ERROR_MESSAGE, instead of burning a ~20 s Mart open +
+            // adopt + close cycle to die at the version select. Nothing has been
+            // opened or hidden yet, so we simply go back to Idle - no cleanup pass
+            // is owed and the next tick claims the following row.
+            if (!DdlJobVersionContract.TryValidateRow(job.LeftVersion, job.RightVersion, out string contractErr))
+            {
+                _ddlTraceFailedStage = "pre-flight";
+                DdlJobLog($"REJECTED before opening erwin: {contractErr}");
+                try { DdlQueueService.Instance.WriteFailure(job.Id, contractErr, Log); }
+                catch (Exception ex) { Log($"[DDLWORKER] job {job.Id}: writing the rejection to the queue row FAILED: {ex.Message}"); }
+                DdlJobTraceOutcome("FAILED", contractErr);
+                DdlJobTraceEnd();
+                _currentDdlJob = null;
+                _ddlWorkerState = DdlWorkerState.Idle;
+                return;
+            }
+
             // Whole-job form hide: the pipeline AND the closing Save-Models
             // sweep use raw mouse clicks; the form must never sit under them.
             // Restored by OnDdlWorkerCloseComplete (success or give-up).
@@ -622,6 +808,7 @@ namespace EliteSoft.Erwin.AddIn
             // is set. Cleared when the job's model is closed (back to Idle).
             DdlWorkerActiveUnattended = true;
             _ddlWorkerState = DdlWorkerState.Opening; // background open in flight; tick must not re-enter
+            DdlJobBeginStage("open", $"Mart>Open '{job.ModelPath}' at v{job.LeftVersion} as the active/LEFT model (background thread; see [WORKER-OPEN]/[PICK]/[MDI-OPEN])");
             Log($"[DDLWORKER] job {job.Id}: opening '{job.ModelPath}' v{job.LeftVersion} as active/LEFT (background thread)...");
 
             var jobLocal = job;
@@ -656,15 +843,20 @@ namespace EliteSoft.Erwin.AddIn
             {
                 // transient=true -> requeue + backoff (e.g. erwin not Mart-connected).
                 // transient=false -> PERMANENT (model/version not in catalog): FAILED, no retry.
-                RequeueOrFailOpen(job, failReason ?? $"failed to open model '{job.ModelPath}' v{job.LeftVersion} (see Debug Log)", transient);
+                string openErr = failReason ?? $"failed to open model '{job.ModelPath}' v{job.LeftVersion} (see Debug Log)";
+                DdlJobEndStage("FAIL", (transient ? "transient" : "PERMANENT data error") + " - " + openErr);
+                RequeueOrFailOpen(job, openErr, transient);
                 _ddlWorkerState = DdlWorkerState.Cleanup;
                 return;
             }
+
+            DdlJobEndStage("OK", $"MDI child 0x{child.ToInt64():X}");
 
             // Opened. Let the add-in's reconnect timer adopt it
             // (sets _isConnected / _currentModel / ConfigContext).
             _ddlAdoptDeadlineUtc = DateTime.UtcNow.AddSeconds(DdlWorkerAdoptTimeoutSec);
             _ddlWorkerState = DdlWorkerState.Adopting;
+            DdlJobBeginStage("adopt", $"waiting up to {DdlWorkerAdoptTimeoutSec}s for the add-in to connect to the opened model (SCAPI PU + ConfigContext)");
             try { StartReconnectTimer(); } catch (Exception ex) { Log($"[DDLWORKER] StartReconnectTimer note: {ex.Message}"); }
         }
 
@@ -672,14 +864,26 @@ namespace EliteSoft.Erwin.AddIn
         {
             if (_isConnected && _currentModel != null && ConfigContextService.Instance.IsInitialized)
             {
+                DdlJobEndStage("OK", $"adopted '{_connectedModelName}' as v{_martVersion} " +
+                                     $"(config '{ConfigContextService.Instance.ActiveConfigName}' id={ConfigContextService.Instance.ActiveConfigId}, " +
+                                     $"corporate '{ConfigContextService.Instance.CorporateName}', mart '{ConfigContextService.Instance.MartPath}')");
                 Log($"[DDLWORKER] job {_currentDdlJob?.Id}: model adopted ('{_connectedModelName}'). Running pipeline (right v{_currentDdlJob?.RightVersion}).");
                 DdlWorkerRunPipeline();
                 return;
             }
             if (DateTime.UtcNow > _ddlAdoptDeadlineUtc)
             {
-                FailAndResetCurrentJob($"model opened but add-in did not adopt within {DdlWorkerAdoptTimeoutSec}s " +
-                    $"(isConnected={_isConnected}, currentModel={(_currentModel != null)}, configInit={ConfigContextService.Instance.IsInitialized})");
+                // Name the MISSING precondition first - the three flags are what
+                // separates "erwin never opened it" from "opened but not Mart-mapped".
+                string missing = string.Join(" + ", new[]
+                {
+                    _isConnected ? null : "SCAPI session (isConnected)",
+                    _currentModel != null ? null : "model object (currentModel)",
+                    ConfigContextService.Instance.IsInitialized ? null : "ConfigContext (model not mapped to an admin config?)",
+                }.Where(s => s != null));
+                string adoptErr = $"model opened but the add-in did not adopt it within {DdlWorkerAdoptTimeoutSec}s - still missing: {missing}.";
+                DdlJobEndStage("FAIL", adoptErr);
+                FailAndResetCurrentJob(adoptErr);
             }
         }
 
@@ -688,16 +892,31 @@ namespace EliteSoft.Erwin.AddIn
             var job = _currentDdlJob;
             if (job == null) { _ddlWorkerState = DdlWorkerState.Cleanup; return; }
 
+            // Everything the version select depends on, logged BEFORE it runs: the
+            // open model's version, the three admin gates and the verbatim Target
+            // combo. "Why is my version not in the list" is only answerable against
+            // the actual list, and the list is built from the open version downwards
+            // (RebuildRightCombo) - not from the Mart catalog the operator sees in
+            // erwin's Open dialog.
+            DdlJobBeginStage("prepare",
+                $"open/LEFT=v{_martVersion}, requested target/RIGHT=v{job.RightVersion}; " +
+                $"gates last-saved={_ddlAllowLastSaved} prev-versions={_ddlAllowPreviousVersions} from-db={_ddlAllowFromDb}; " +
+                $"target list=[{RightComboItemsCsv()}]");
+
             // Same guards a green-button click hits (mirrors the spike accepted-path).
-            if (!ConfigContextService.Instance.IsInitialized) { FailAndResetCurrentJob("config context not initialized (model not Mart-mapped)"); return; }
-            if (!ConfigContextService.Instance.IsMartModel)   { FailAndResetCurrentJob("adopted model is not Mart-hosted"); return; }
-            if (!(_ddlAllowLastSaved || _ddlAllowPreviousVersions)) { FailAndResetCurrentJob("From-Mart DDL source not enabled (admin gates DDL_COMPARE_LAST_SAVED + DDL_COMPARE_PREVIOUS_VERSIONS both off)"); return; }
+            if (!ConfigContextService.Instance.IsInitialized) { DdlJobEndStage("FAIL"); FailAndResetCurrentJob("config context not initialized (model not Mart-mapped)"); return; }
+            if (!ConfigContextService.Instance.IsMartModel)   { DdlJobEndStage("FAIL"); FailAndResetCurrentJob("adopted model is not Mart-hosted"); return; }
+            if (!(_ddlAllowLastSaved || _ddlAllowPreviousVersions)) { DdlJobEndStage("FAIL"); FailAndResetCurrentJob("From-Mart DDL source not enabled (admin gates DDL_COMPARE_LAST_SAVED + DDL_COMPARE_PREVIOUS_VERSIONS both off)"); return; }
             if (!rbFromMart.Checked) rbFromMart.Checked = true;
-            if (job.RightVersion <= 0) { FailAndResetCurrentJob($"invalid right version v{job.RightVersion}"); return; }
-            if (!TrySelectRightVersion(job.RightVersion, out string selErr)) { FailAndResetCurrentJob(selErr); return; }
+            if (job.RightVersion <= 0) { DdlJobEndStage("FAIL"); FailAndResetCurrentJob($"invalid right version v{job.RightVersion}"); return; }
+            if (!TrySelectRightVersion(job.RightVersion, out string selErr)) { DdlJobEndStage("FAIL", selErr); FailAndResetCurrentJob(selErr); return; }
 
             _ddlQueueActive = true;
             _ddlWorkerState = DdlWorkerState.Running;
+            DdlJobBeginStage("generate",
+                $"running the Generate-DDL pipeline: active v{_martVersion} vs target v{job.RightVersion} " +
+                $"({(_martVersion == job.RightVersion ? "same-version OnFE fast path" : "cross-version Review/Compare path")}); " +
+                "see [ROUTE]/[REVIEW]/[XV] for the wizard steps");
             Log($"[DDLWORKER] job {job.Id}: launching pipeline (right v{job.RightVersion}).");
             // Same handler the green button invokes. async void: returns immediately;
             // its tail calls FinishCurrentDdlJob with (script, err).
@@ -709,12 +928,19 @@ namespace EliteSoft.Erwin.AddIn
         /// this run's outcome to the claimed queue row, clears the active flag, and
         /// schedules model cleanup on the next tick.
         /// </summary>
-        private void FinishCurrentDdlJob(string script, string err)
+        private void FinishCurrentDdlJob(string script, string err, string route = null)
         {
             _ddlQueueActive = false;
             var job = _currentDdlJob;
             if (job == null) { Log("[DDLWORKER] FinishCurrentDdlJob: no current job (ignored)."); _ddlWorkerState = DdlWorkerState.Cleanup; return; }
 
+            _ddlTraceRoute = route;
+            _ddlTraceDdlChars = script?.Length ?? -1;
+            DdlJobEndStage(err == null ? "OK" : "FAIL",
+                $"route={route ?? "-"}, DDL={DescribeDdl(script)}" + (err == null ? "" : $", error={err}"));
+            DdlJobBeginStage("persist", $"writing the outcome to DDL_GENERATION_QUEUE row {job.Id}");
+
+            bool rowWritten = false;
             try
             {
                 if (err != null)
@@ -728,12 +954,29 @@ namespace EliteSoft.Erwin.AddIn
                     DdlQueueService.Instance.WriteResult(job.Id, string.Empty, Log);
                 else
                     DdlQueueService.Instance.WriteResult(job.Id, script, Log);
+                rowWritten = true;
             }
             catch (Exception ex)
             {
                 // Best-effort: leave the row RUNNING for admin requeue; never crash the worker.
                 Log($"[DDLWORKER] job {job.Id}: writing result to queue FAILED: {ex.Message}");
+                DdlJobEndStage("FAIL", $"row left RUNNING for an admin requeue: {ex.Message}");
             }
+
+            // The SUMMARY reports what the ROW says, not what the run produced: a DDL
+            // that never reached the queue is not a completed job, and reporting it as
+            // DONE would send the operator looking for a result that is not there.
+            if (!rowWritten)
+                DdlJobTraceOutcome("STUCK-RUNNING",
+                    "the run finished but its outcome could not be written - the row is still RUNNING and needs an admin requeue" +
+                    (err == null ? $" (produced {DescribeDdl(script)})" : $" (run error: {err})"));
+            else if (err != null)
+                DdlJobTraceOutcome("FAILED", err);
+            else if (string.IsNullOrEmpty(script))
+                DdlJobTraceOutcome("DONE", "no differences between the compared versions - empty RESULT_DDL");
+            else
+                DdlJobTraceOutcome("DONE", DescribeDdl(script));
+            DdlJobEndStage("OK");
 
             _currentDdlJob = null;
             _ddlWorkerState = DdlWorkerState.Cleanup; // next tick closes the model
@@ -756,17 +999,20 @@ namespace EliteSoft.Erwin.AddIn
                     // with the specific reason for the operator to correct the row.
                     Log($"[DDLWORKER] job {job.Id}: PERMANENT failure (no retry): {error}");
                     DdlQueueService.Instance.WriteFailure(job.Id, error, Log);
+                    DdlJobTraceOutcome("FAILED", "permanent open failure: " + error);
                 }
                 else if (job.RetryCount + 1 >= DdlWorkerMaxOpenRetries)
                 {
                     Log($"[DDLWORKER] job {job.Id}: open failed {job.RetryCount + 1}x - giving up (FAILED): {error}");
                     DdlQueueService.Instance.WriteFailure(job.Id, $"open failed after {job.RetryCount + 1} attempts: {error}", Log);
+                    DdlJobTraceOutcome("FAILED", $"open failed after {job.RetryCount + 1} attempts: {error}");
                 }
                 else
                 {
                     Log($"[DDLWORKER] job {job.Id}: transient open failure (attempt {job.RetryCount + 1}) - requeue + backoff {DdlWorkerRetryBackoffSec}s: {error}");
                     DdlQueueService.Instance.RequeueForRetry(job.Id, error, Log);
                     _ddlNextClaimAllowedUtc = DateTime.UtcNow.AddSeconds(DdlWorkerRetryBackoffSec);
+                    DdlJobTraceOutcome("REQUEUED", $"transient open failure (attempt {job.RetryCount + 1}, retry in {DdlWorkerRetryBackoffSec}s): {error}");
                 }
             }
             catch (Exception ex) { Log($"[DDLWORKER] job {job.Id}: requeue/fail write err: {ex.Message}"); }
@@ -782,6 +1028,7 @@ namespace EliteSoft.Erwin.AddIn
                 Log($"[DDLWORKER] job {job.Id} FAILED: {error}");
                 try { DdlQueueService.Instance.WriteFailure(job.Id, error, Log); }
                 catch (Exception ex) { Log($"[DDLWORKER] write failure err: {ex.Message}"); }
+                DdlJobTraceOutcome("FAILED", error);
                 _currentDdlJob = null;
             }
             _ddlWorkerState = DdlWorkerState.Cleanup;
@@ -797,6 +1044,8 @@ namespace EliteSoft.Erwin.AddIn
             // Runs on a BACKGROUND thread (like the open) so erwin's UI thread stays free
             // to raise + tear down the prompts (and the dismiss uses GetCursorPos).
             _ddlWorkerState = DdlWorkerState.Closing;
+            if (_ddlCleanupAttempts == 0)
+                DdlJobBeginStage("cleanup", "quiescing the add-in, then closing the job model without saving (see [WORKER-CLOSE])");
 
             // QUIESCE the add-in FIRST (job-5 finding 2026-07-11): the job model's
             // close silently aborted after every Save-Models discard (Mart Offline
@@ -853,6 +1102,9 @@ namespace EliteSoft.Erwin.AddIn
                 // exactly like a fresh attach.
                 Log($"[DDLWORKER] cleanup GAVE UP after {DdlWorkerMaxCleanupAttempts} attempts - the job model (and any leftover compare wizard) must be closed MANUALLY without saving. " +
                     "Worker is idle and will resume once erwin is model-less.");
+                DdlJobEndStage("FAIL", $"model still open after {DdlWorkerMaxCleanupAttempts} close attempts - MANUAL close needed (do NOT save); the worker stays idle until erwin is model-less");
+                if (_ddlTraceOutcome == null) DdlJobTraceOutcome("GAVE-UP", "job model could not be closed automatically");
+                DdlJobTraceEnd();
                 _ddlCleanupAttempts = 0;
                 DdlWorkerActiveUnattended = false; // a human is taking over - re-enable interactive modals
                 _ddlWorkerState = DdlWorkerState.Idle;
@@ -872,6 +1124,8 @@ namespace EliteSoft.Erwin.AddIn
             // session-lost callback that used to flip the flags is suspended by
             // the quiesce.
             Log("[DDLWORKER] cleanup done - model window closed; resetting to disconnected so the next job can be claimed.");
+            DdlJobEndStage("OK", "job model closed (changes discarded); erwin is model-less again");
+            DdlJobTraceEnd();
             _ddlCleanupAttempts = 0;
             DdlWorkerActiveUnattended = false; // re-enable interactive connect modals
             _ddlWorkerState = DdlWorkerState.Idle;
@@ -906,8 +1160,20 @@ namespace EliteSoft.Erwin.AddIn
                         return true;
                     }
                 }
-                error = $"requested right version v{v} not in combo - enable DDL_COMPARE_PREVIOUS_VERSIONS for this model " +
-                        $"(items: [{string.Join(", ", cmbRightModel.Items.Cast<object>().Select(x => x.ToString()))}])";
+                // The old text blamed DDL_COMPARE_PREVIOUS_VERSIONS unconditionally. In
+                // the field (2026-07-30) that gate was ON and the real cause was an
+                // inverted queue row, so the operator chased an admin toggle that was
+                // already correct. DdlJobVersionContract names the ACTUAL cause (and is
+                // unit-tested, unlike an inline string).
+                bool hasRealVersions = cmbRightModel.Items.Count > 0
+                    && (cmbRightModel.Items[0]?.ToString()?.StartsWith("v", StringComparison.Ordinal) ?? false);
+                error = DdlJobVersionContract.ExplainMissingTarget(
+                    requested: v,
+                    activeVersion: _martVersion,
+                    allowLastSaved: _ddlAllowLastSaved,
+                    allowPreviousVersions: _ddlAllowPreviousVersions,
+                    targetListCsv: RightComboItemsCsv(),
+                    listHasRealVersions: hasRealVersions);
                 return false;
             }
             catch (Exception ex) { error = "right-version select failed: " + ex.Message; return false; }
