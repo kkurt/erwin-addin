@@ -4238,11 +4238,19 @@ namespace EliteSoft.Erwin.AddIn
         // longer surfaced.
 
         /// <summary>
-        /// Warms the Domain Like Glossary cache at connect time, exactly like
+        /// (Re)reads the Domain Like Glossary at connect time, warming the cache the way
         /// <see cref="LoadGlossary"/> does for the standard one.
         /// <para>Without this the first new column pays for the whole read - repo queries plus a
         /// network round trip to the external glossary DB - while the user waits for the picker to
         /// appear. The load is a no-op when the mode is off (it early-returns on its flag).</para>
+        /// <para>The read is UNCONDITIONAL (<c>Reload</c>, not <c>if (!IsLoaded)</c>) because the
+        /// whole definition - the mapping columns AND the USE_DOMAIN_LIKE_GLOSSARY flag - lives in
+        /// the admin DB, and closing the model to reopen it is exactly the gesture a modeler makes
+        /// after editing it. Serving the cache captured before that edit made a freshly mapped UDP
+        /// look ignored until the refresh timer happened to fire (DOMAIN_GLOSSARY_LOAD_INTERVAL,
+        /// which drops to its 60-minute corporate default once the model is closed). The cost is one
+        /// repo round trip plus the external SELECT, per model open - the same cost the first connect
+        /// already pays.</para>
         /// </summary>
         private void LoadDomainGlossary()
         {
@@ -4251,13 +4259,20 @@ namespace EliteSoft.Erwin.AddIn
                 if (!DatabaseService.Instance.IsConfigured) return;
 
                 var dg = DomainGlossaryService.Instance;
-                if (!dg.IsLoaded) dg.LoadDomainGlossary();
+                dg.Reload();
 
                 if (dg.IsEnabled && !dg.IsLoaded)
                 {
                     // Armed but unusable: surface it at connect time instead of letting the first
                     // column discover it.
                     AddConnectWarning($"Domain like glossary: {dg.LastError}");
+                }
+                else if (dg.IsEnabled && !string.IsNullOrEmpty(dg.LastWarning))
+                {
+                    // Loaded, but with a duplicate definition or a dropped mapping row: the picker
+                    // will work and quietly write fewer fields than the admin configured, so this
+                    // has to reach the user, not just the log.
+                    AddConnectWarning($"Domain like glossary: {dg.LastWarning}");
                 }
             }
             catch (Exception ex)
@@ -4658,6 +4673,8 @@ namespace EliteSoft.Erwin.AddIn
                             $"req={rule.IsRequired} apply={rule.ApplyOn} {typeParam} cond={udpCond} msg='{msg}'");
                     }
 
+                    ReportTemplateApplierCoverage(service);
+
                     // Template rules navigate related objects via the global
                     // MC_OBJECT_RELATION alias catalog. Refresh it alongside the
                     // rules (only when a Template rule exists, to avoid a needless
@@ -4698,6 +4715,64 @@ namespace EliteSoft.Erwin.AddIn
             {
                 Log($"LoadNamingStandards error: {ex.Message}");
                 AddConnectWarning($"NamingStandards: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Reports, at connect, whether every active Template rule's OBJECT_TYPE
+        /// actually has an applier in this add-in.
+        ///
+        /// <para>Added 2026-07-31 after two live <c>OBJECT_TYPE=MODEL</c> Template
+        /// rules loaded, printed in the dump above, and then did nothing - because no
+        /// applier asked for MODEL. Nothing said so, so the symptom was identical to
+        /// a badly written rule. This check turns that class of failure into one line
+        /// plus a warning on the General tab.</para>
+        ///
+        /// <para>The POSITIVE line matters as much as the negative one: "no warning"
+        /// only means something if the check demonstrably ran.</para>
+        /// </summary>
+        private void ReportTemplateApplierCoverage(NamingStandardService service)
+        {
+            var declared = service.AllRules
+                .Where(r => r != null && r.IsActive && r.RuleType == NamingRuleKind.Template)
+                .ToList();
+            if (declared.Count == 0) return;
+
+            // REACHABILITY, not registry membership. Asking HasApplier alone would
+            // certify a rule the applier will never actually receive: GetTemplateRules
+            // matches the object type against the applier's literal (OrdinalIgnoreCase,
+            // NOT normalised, so "PRIMARY_KEY" misses "PRIMARY KEY") and additionally
+            // drops rows with no VALUE_TEMPLATE or no target. The only honest question
+            // is "will the applier be handed this rule id", so ask the selector itself.
+            var reachable = new HashSet<int>();
+            foreach (string objectType in new[]
+                     { TemplateApplierRegistry.Column, TemplateApplierRegistry.PrimaryKey, TemplateApplierRegistry.Model })
+            {
+                foreach (var rule in service.GetTemplateRules(objectType))
+                    reachable.Add(rule.Id);
+            }
+
+            // Grouped on the RAW admin OBJECT_TYPE, not the normalised form: the text
+            // has to show what the admin typed, or they cannot find the row to fix.
+            var unreachable = declared
+                .Where(r => !reachable.Contains(r.Id))
+                .GroupBy(r => r.ObjectType ?? "", StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (unreachable.Count == 0)
+            {
+                Log($"[TEMPLATE-SELFCHECK] {declared.Count} active Template rule(s), all reachable by an applier (Column, PRIMARY KEY, MODEL).");
+                return;
+            }
+
+            foreach (var group in unreachable)
+            {
+                string ids = string.Join(", ", group.Select(r => "#" + r.Id));
+                string reason = TemplateApplierRegistry.HasApplier(group.Key)
+                    ? $"object type '{group.Key}' has an applier, but these rules are not selectable by it (spelling that does not match 'Column' / 'PRIMARY KEY' / 'MODEL', an empty VALUE_TEMPLATE, or no target property/UDP)"
+                    : $"this add-in applies Template rules only for Column, PRIMARY KEY and MODEL, and '{group.Key}' is none of them";
+                Log($"[TEMPLATE-SELFCHECK] {group.Count()} Template rule(s) will NEVER run: {reason}. Affected rules: {ids}");
+                AddConnectWarning($"Template rules for '{group.Key}' will not be applied ({ids}).");
             }
         }
 
@@ -5891,10 +5966,33 @@ namespace EliteSoft.Erwin.AddIn
                     if (names.Count > 0) tableScope = names;
                 }
 
+                // Fallback: the generated script itself.
+                //
+                // The Object Filter page is unreadable on the OnFE fast path - that route opens
+                // the wizard HIDDEN and calls straight into it, so the page is never constructed
+                // and the probe finds no child windows at all (verified 2026-07-29: "no
+                // SysTreeView32 under wizard; child classes seen: <empty>"). The script is then
+                // the only surviving evidence of what the user picked, and on that route it lists
+                // exactly the selected tables.
+                //
+                // Checking the WHOLE model instead is not an acceptable fallback: the user asked
+                // for two tables and got 43 issues over 397 objects, which is both wrong and
+                // unusable. See ExtractTableNamesFromDdl for the alter-script caveat.
+                if (tableScope == null && !string.IsNullOrWhiteSpace(ddlForScope))
+                {
+                    var fromDdl = Services.ApprovalBlockingRuleGate.ExtractTableNamesFromDdl(ddlForScope);
+                    if (fromDdl.Count > 0)
+                    {
+                        tableScope = fromDdl;
+                        Log($"[APPROVAL-GATE] Object Filter page unreadable on this route - scoped to the " +
+                            $"{fromDdl.Count} table(s) named by the generated script instead.");
+                    }
+                }
+
                 if (tableScope == null)
-                    Log("[APPROVAL-GATE] 'Only Selected Objects' is on but no selection was harvested " +
-                        "from the wizard's Object Filter page - checking the WHOLE MODEL rather than " +
-                        "a partial set.");
+                    Log("[APPROVAL-GATE] 'Only Selected Objects' is on but the selection could not be " +
+                        "determined - neither the wizard's Object Filter page nor the generated script " +
+                        "yielded a table. Falling back to the WHOLE MODEL.");
             }
 
             try
@@ -6340,7 +6438,7 @@ namespace EliteSoft.Erwin.AddIn
                         {
                             log("[From-DB] 'Only Selected Objects' checked but no entity is selected on the active diagram - aborting render.");
                             dbScript = null;
-                            dbErr = "Lutfen diyagramda 1+ entity secip 'Generate DDL'i tekrar tiklayin (\"Only Selected Objects\" isaretli).";
+                            dbErr = "Select at least one entity on the diagram, then click 'Generate DDL' again (\"Only Selected Objects\" is ticked).";
                         }
                         else
                         {
@@ -7054,7 +7152,11 @@ namespace EliteSoft.Erwin.AddIn
             // suppressed while _ddlQueueActive is set.
             if (_ddlQueueActive)
             {
-                FinishCurrentDdlJob(script, err);
+                // sourceMode identifies WHICH of the three pipelines actually ran
+                // (FromMart-Same / FromMart-Cross / FromDB). The worker records it on
+                // the job's SUMMARY line: a job that produced no DDL is diagnosed very
+                // differently depending on the route it took.
+                FinishCurrentDdlJob(script, err, sourceMode);
             }
 
             btnAlterWizardProd.Enabled = DdlSourceEnabled;

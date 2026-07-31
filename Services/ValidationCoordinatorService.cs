@@ -724,6 +724,8 @@ namespace EliteSoft.Erwin.AddIn.Services
             _keyGroupSnapshots.Clear();
             _pkTemplateSeen.Clear();
             _pkTemplateWriteFailed.Clear();
+            _modelTemplateDriftWarned.Clear();
+            _modelTemplateSuppressed.Clear();
             _pkPropertySnapshots.Clear();
             _domainCache.Clear();
             _tablesBaselined.Clear();
@@ -791,6 +793,8 @@ namespace EliteSoft.Erwin.AddIn.Services
             _keyGroupSnapshots.Clear();
             _pkTemplateSeen.Clear();
             _pkTemplateWriteFailed.Clear();
+            _modelTemplateDriftWarned.Clear();
+            _modelTemplateSuppressed.Clear();
             _pkPropertySnapshots.Clear();
             _tablesBaselined.Clear();
             _pendingResults.Clear();
@@ -810,6 +814,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                 _keyGroupSnapshots.Clear();
                 _pkTemplateSeen.Clear();
                 _pkTemplateWriteFailed.Clear();
+                _modelTemplateDriftWarned.Clear();
+                _modelTemplateSuppressed.Clear();
                 _pkPropertySnapshots.Clear();
                 _domainCache.Clear();
 
@@ -1069,10 +1075,29 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <summary>
         /// Check if any model-level UDP values changed since last check.
         /// Called from MonitorTimer_Tick (same tick as model change detection).
+        /// <para>A change here is a USER GESTURE on the model, which is what makes
+        /// it the right trigger for MODEL Template rules: applying them at connect
+        /// instead would rewrite an already-open model, which the project's
+        /// "rules apply to new objects only" contract forbids.</para>
         /// </summary>
         private void CheckModelUdpChanges()
         {
             if (_modelUdpPaths == null || _modelUdpPaths.Count == 0) return;
+
+            // MonitorTimer_Tick calls this BEFORE it sets _isCheckingForChanges, so
+            // this scan held no reentrancy flag at all. That mattered once the loop
+            // could open a dialog and, through OnModelUdpChanged, run the
+            // DependencySet cascade's whole-metamodel Property_Type walk: both pump
+            // messages, and a re-entrant tick would iterate _modelUdpPaths again
+            // while the first pass is mid-flight. One flag, released in a finally.
+            if (_modelUdpScanInProgress) return;
+            _modelUdpScanInProgress = true;
+
+            // Collected across the scan and handed to the Template applier ONCE,
+            // after the loop: a template may read several UDPs, and running the
+            // applier inside the loop would open its modal while we are still
+            // iterating.
+            var changedUdps = new List<string>();
 
             try
             {
@@ -1111,11 +1136,28 @@ namespace EliteSoft.Erwin.AddIn.Services
                                         "Model");
                                     Log($"[ModelUDP] '{udpName}' is required - cleared value restored to '{prevVal}'");
 
-                                    Forms.AddinMessageDialog.Show(
-                                        $"UDP '{udpName}' is required. The value cannot be cleared; '{prevVal}' was restored.",
-                                        "UDP Required",
-                                        System.Windows.Forms.MessageBoxButtons.OK,
-                                        System.Windows.Forms.MessageBoxIcon.Warning);
+                                    // Through ShowValidationModal, not AddinMessageDialog.Show:
+                                    // this runs from MonitorTimer_Tick BEFORE _isCheckingForChanges
+                                    // is set, so without _validationModalShowing the tick re-enters
+                                    // this very scan while the dialog pumps (2026-07-31).
+                                    //
+                                    // Unattended guard, same contract as the model-required-UDP
+                                    // prompt in MonitorTimer_Tick and the template modals: the DDL
+                                    // worker opens models headlessly and a modal would hang it
+                                    // forever. The restore itself still happens; only the notice
+                                    // is withheld, and the log records that.
+                                    if (ModelConfigForm.DdlWorkerActiveUnattended)
+                                    {
+                                        Log($"[ModelUDP] '{udpName}' restore notice suppressed (DDL worker unattended).");
+                                    }
+                                    else
+                                    {
+                                        ShowValidationModal(
+                                            $"UDP '{udpName}' is required. The value cannot be cleared; '{prevVal}' was restored.",
+                                            "UDP Required",
+                                            System.Windows.Forms.MessageBoxButtons.OK,
+                                            System.Windows.Forms.MessageBoxIcon.Warning);
+                                    }
                                 }
                                 catch (Exception revertEx)
                                 {
@@ -1131,13 +1173,76 @@ namespace EliteSoft.Erwin.AddIn.Services
                         {
                             _lastModelUdpValues[udpName] = val;
                             Log($"[ModelUDP] '{udpName}' changed: '{prevVal}' -> '{val}'");
-                            OnModelUdpChanged?.Invoke(udpName, val);
+                            changedUdps.Add(udpName);
+
+                            // Own try: a subscriber fault is the subscriber's, and
+                            // reporting it as "check error for '<path>'" (the catch
+                            // below) would blame the property read for someone
+                            // else's exception.
+                            try { OnModelUdpChanged?.Invoke(udpName, val); }
+                            catch (Exception subEx) { Log($"[ModelUDP] '{udpName}' change subscriber failed: {subEx.GetType().Name}: {subEx.Message}"); }
                         }
                     }
                     catch (Exception ex) { Log($"[ModelUDP] check error for '{path}': {ex.Message}"); }
                 }
+
+                // MODEL Template rules run here, once per scan, AFTER every UDP has
+                // been read and every cascade subscriber has settled - so a template
+                // reading two UDPs the user changed together sees both.
+                if (changedUdps.Count > 0)
+                    ApplyModelTemplateRules(root, changedUdps);
+
+                // Clean pass: forget the throttle so a failure that returns after a
+                // recovery is reported in full rather than counted silently.
+                _lastModelUdpScanFailure = null;
+                _modelUdpScanFailureCount = 0;
             }
-            catch { }
+            catch (Exception scanEx)
+            {
+                // Was a bare catch until 2026-07-31. This method is the trigger site
+                // for both the DependencySet cascade and (now) the MODEL Template
+                // applier, so a failure here is indistinguishable from "my rule did
+                // not fire" - exactly the bug that made this fix necessary.
+                // Throttled because it runs off a ~1 s timer and the common cause is
+                // a session that died mid-tick, which would otherwise fill the log.
+                LogModelUdpScanFailure(scanEx);
+            }
+            finally
+            {
+                _modelUdpScanInProgress = false;
+            }
+        }
+
+        /// <summary>Held for the duration of one model-UDP scan; see the entry guard.</summary>
+        private bool _modelUdpScanInProgress;
+
+        // Signature of the last model-UDP scan failure plus how many times it has
+        // repeated. Reset on the next clean pass so a recover-then-fail-again is
+        // reported fresh instead of being swallowed by the throttle.
+        private string _lastModelUdpScanFailure;
+        private int _modelUdpScanFailureCount;
+        private const int ModelUdpScanFailureRestateEvery = 60; // ~1 min at the 1 s model-check cadence
+
+        /// <summary>
+        /// Reports a model-UDP scan failure without flooding: the first occurrence in
+        /// full, then every Nth identical repeat with the running count so a permanent
+        /// failure stays visible in a long log instead of scrolling away after one line.
+        /// Never a dialog - this fires from a timer.
+        /// </summary>
+        private void LogModelUdpScanFailure(Exception ex)
+        {
+            string signature = $"{ex.GetType().Name}: {ex.Message}";
+            if (!string.Equals(signature, _lastModelUdpScanFailure, StringComparison.Ordinal))
+            {
+                _lastModelUdpScanFailure = signature;
+                _modelUdpScanFailureCount = 1;
+                Log($"[ModelUDP] scan failed: {signature} (model UDP change detection, the DependencySet cascade and MODEL Template rules are all inactive while this persists)");
+                return;
+            }
+
+            _modelUdpScanFailureCount++;
+            if (_modelUdpScanFailureCount % ModelUdpScanFailureRestateEvery == 0)
+                Log($"[ModelUDP] scan still failing ({_modelUdpScanFailureCount} consecutive): {signature}");
         }
 
         #endregion
@@ -3690,7 +3795,21 @@ namespace EliteSoft.Erwin.AddIn.Services
                 try { return root.Properties(code)?.Value?.ToString() ?? ""; }
                 catch (Exception ex)
                 {
-                    Log($"Naming standard: SCAPI did not surface 'Model.{code}' (treating as empty): {ex.Message}");
+                    // Sparse storage, NOT a fault: erwin raises "does not use a
+                    // property of <X> type" for an optional property that has never
+                    // been set, and returns it normally once anything writes one.
+                    // Unset IS the empty state a Required rule exists to catch, so
+                    // this is reported as the ordinary condition it is. Any OTHER
+                    // exception keeps its full text - suppressing that would hide a
+                    // real read failure behind a routine one.
+                    //
+                    // 2026-08-01: the previous wording ("SCAPI did not surface ...")
+                    // plus the whole 200-character COM message, three times per pass,
+                    // made the normal case read as a defect and cost real triage time.
+                    if (IsPropertyNotSet(ex))
+                        Log($"Model.{code} is not set (optional property never written; treating as empty).");
+                    else
+                        Log($"Model.{code} could not be read (treating as empty): {AddinLogger.Describe(ex)}");
                     return "";
                 }
             }
@@ -3820,8 +3939,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                             try { _session.RollbackTransaction(transId); } catch (Exception rbEx) { Log($"RequiredModelField rollback err: {rbEx.Message}"); }
                             Log($"Model required field write failed for {fieldLabel}: {ex.Message}");
                             AddinMessageDialog.Show(
-                                $"'{typed}' degeri {fieldLabel} alanina yazilamadi.\n\nSCAPI hata:\n{ex.Message}",
-                                "Model alani yazilamadi",
+                                $"'{typed}' could not be written to {fieldLabel}.\n\nSCAPI error:\n{ex.Message}",
+                                "Model field not saved",
                                 MessageBoxButtons.OK,
                                 MessageBoxIcon.Error);
                             break;
@@ -4897,10 +5016,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                         // hid the same bug for several sessions.
                         Log($"EnforceLockedTableUdps: SCAPI rejected revert for '{kv.Key}' on '{tableName}' - lock NOT enforced");
                         Forms.AddinMessageDialog.Show(
-                            $"'{kv.Key}' UDP'si kilitli ancak SCAPI yazimi reddetti, eski deger geri yazilamadi.\n\n" +
-                            $"Yeni deger ('{newVal}') modelde kalacak.\n\n" +
-                            $"Eski degeri ('{baseVal}') geri yazmak icin erwin'in UDP grid'inden manuel olarak girin.",
-                            "UDP Kilitli - Revert Basarisiz",
+                            $"UDP '{kv.Key}' is locked, but SCAPI rejected the write, so the previous value could not be restored.\n\n" +
+                            $"The new value ('{newVal}') will stay in the model.\n\n" +
+                            $"To restore the previous value ('{baseVal}'), type it back manually in erwin's UDP grid.",
+                            "Locked UDP - revert failed",
                             System.Windows.Forms.MessageBoxButtons.OK,
                             System.Windows.Forms.MessageBoxIcon.Warning);
                         continue;
@@ -5523,7 +5642,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             IReadOnlyList<NamingStandardRule> rules;
             try
             {
-                rules = NamingStandardService.Instance.GetTemplateRules("Column");
+                rules = NamingStandardService.Instance.GetTemplateRules(TemplateApplierRegistry.Column);
             }
             catch (Exception ex)
             {
@@ -5582,16 +5701,28 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                     // Self-referential template guard (see ApplyPrimaryKeyRules): a
                     // template that reads its own target (property or UDP) would grow
-                    // without bound under FILL_MODE=Always. Refuse it - a related token
-                    // like {Table.Physical_Name} is the correct way to seed the value.
+                    // without bound under FILL_MODE=Always. Refuse it - {Current} is
+                    // the converging way to fold the target's own value back in.
                     bool selfReferential = udpTarget
                         ? NamingTemplateEngine.ReferencesOwnUdp(rule.ValueTemplate, rule.TargetUdpName)
                         : NamingTemplateEngine.ReferencesOwnProperty(rule.ValueTemplate, targetCode);
                     if (selfReferential)
                     {
-                        Log($"[TEMPLATE-SKIP] column='{columnName}' rule#{rule.Id}: template '{rule.ValueTemplate}' references its own target '{(udpTarget ? rule.TargetUdpName : targetCode)}' (self-referential - would loop); skipping. Use a related token like {{Table.Physical_Name}} instead.");
+                        Log($"[TEMPLATE-SKIP] column='{columnName}' rule#{rule.Id}: template '{rule.ValueTemplate}' references its own target '{(udpTarget ? rule.TargetUdpName : targetCode)}' (self-referential - would loop); skipping. Use {{Current}} for the target's own value (e.g. {{Table.Physical_Name}}_{{Current}}).");
                         continue;
                     }
+
+                    // {Current} + OnlyIfEmpty can never write: the mode only runs on
+                    // an empty target and an empty target has nothing to reshape.
+                    if (NamingTemplateEngine.CurrentTokenConflictsWithFillMode(rule.ValueTemplate, rule.TemplateFillMode))
+                    {
+                        Log($"[TEMPLATE-SKIP] column='{columnName}' rule#{rule.Id}: template '{rule.ValueTemplate}' uses {{Current}} with TEMPLATE_FILL_MODE=OnlyIfEmpty; that pair can never produce a value.");
+                        continue;
+                    }
+
+                    // Read the target BEFORE rendering: {Current} reshapes this very
+                    // value, and FILL_MODE / the idempotency check need it too.
+                    string currentVal = ReadScapiProperty(attr, targetCode);
 
                     string rendered;
                     try
@@ -5600,7 +5731,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                             rule.ValueTemplate,
                             ownCode => ReadScapiProperty(attr, ownCode),
                             (alias, code) => ResolveColumnRelatedProperty(entity, alias, code),
-                            udpName => NamingValidationEngine.ReadUdpValueForRule(attr, "Column", udpName));
+                            udpName => NamingValidationEngine.ReadUdpValueForRule(attr, "Column", udpName),
+                            currentVal);
                     }
                     catch (TemplateResolutionException tex)
                     {
@@ -5616,7 +5748,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                     }
 
                     // FILL_MODE: Always overwrites; OnlyIfEmpty keeps a human value.
-                    string currentVal = ReadScapiProperty(attr, targetCode);
                     bool shouldWrite = NamingTemplateEngine.ShouldWrite(rule.TemplateFillMode, currentVal, out bool unknownMode);
                     if (unknownMode)
                     {
@@ -5662,6 +5793,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                         }
                         _session.CommitTransaction(transId);
                         Log($"[TEMPLATE-APPLY] column='{columnName}' rule#{rule.Id} {targetCode}='{rendered}'");
+                        // The chain stops here: this write is OURS, not a user edit.
+                        NoteSelfWrittenColumnProperty(objectId, targetCode, rendered);
                     }
                     catch (Exception wex)
                     {
@@ -5677,6 +5810,113 @@ namespace EliteSoft.Erwin.AddIn.Services
                     Log($"[TEMPLATE-ERROR] column='{columnName}' rule#{rule.Id}: {ex.GetType().Name}: {ex.Message}");
                 }
             }
+        }
+
+        /// <summary>
+        /// The <see cref="AttributeValidationSnapshot"/> field that mirrors a given column
+        /// target code. Change detection compares each field separately, so a self-write has
+        /// to be recorded in the SAME slot the detector will read back.
+        /// </summary>
+        internal enum ColumnSnapshotSlot
+        {
+            /// <summary>First-class <c>PhysicalName</c> field.</summary>
+            PhysicalName,
+            /// <summary>First-class <c>PhysicalDataType</c> field.</summary>
+            PhysicalDataType,
+            /// <summary><c>UdpValues</c>, keyed by the BARE udp name.</summary>
+            Udp,
+            /// <summary><c>WatchedProperties</c>, keyed by the property code.</summary>
+            WatchedProperty
+        }
+
+        /// <summary>
+        /// Maps a Template rule's target code onto the snapshot slot that mirrors it. UDP
+        /// targets arrive as the SCAPI path <c>Attribute.Physical.&lt;Name&gt;</c> while
+        /// <c>UdpValues</c> is keyed by the bare name (see
+        /// <see cref="CheckAttributeUdpDependencies"/> and
+        /// <see cref="BaselineLockedAttributeUdps"/>), hence the out parameter.
+        /// </summary>
+        /// <param name="targetCode">Property code or <c>Attribute.Physical.*</c> UDP path.</param>
+        /// <param name="udpName">Bare UDP name when the result is <see cref="ColumnSnapshotSlot.Udp"/>; otherwise null.</param>
+        internal static ColumnSnapshotSlot ClassifyColumnTargetCode(string targetCode, out string udpName)
+        {
+            udpName = null;
+            if (string.IsNullOrEmpty(targetCode)) return ColumnSnapshotSlot.WatchedProperty;
+
+            const string udpPathPrefix = "Attribute.Physical.";
+            if (targetCode.Length > udpPathPrefix.Length
+                && targetCode.StartsWith(udpPathPrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                udpName = targetCode.Substring(udpPathPrefix.Length);
+                return ColumnSnapshotSlot.Udp;
+            }
+
+            if (string.Equals(targetCode, "Physical_Name", StringComparison.OrdinalIgnoreCase))
+                return ColumnSnapshotSlot.PhysicalName;
+            if (string.Equals(targetCode, "Physical_Data_Type", StringComparison.OrdinalIgnoreCase))
+                return ColumnSnapshotSlot.PhysicalDataType;
+
+            return ColumnSnapshotSlot.WatchedProperty;
+        }
+
+        /// <summary>
+        /// Re-baselines the column's change-detection snapshot after the ADD-IN ITSELF wrote
+        /// <paramref name="targetCode"/>, so the next detection pass does not read our own
+        /// write back as a fresh user edit.
+        /// <para>Without this, a Template rule that rewrites Physical_Name restarts the very
+        /// chain it was the tail of: <see cref="ProcessAttributeChanges"/> sees a rename and
+        /// re-runs <see cref="ValidateGlossary"/>, which re-opens the Domain Like Glossary
+        /// picker on the name the template just produced (reproduced 2026-07-30: 'TEST_ACKL'
+        /// -> 'Table2_TEST_ACKL_TEST' -> picker again). The chain-initiating gesture is the
+        /// user's; everything the add-in writes after it is a consequence, not a new event.</para>
+        /// <para>This is the same contract <see cref="CheckAttributeUdpDependencies"/> already
+        /// honours by absorbing its cascade writes into the snapshot inline (see the ordering
+        /// comment in <see cref="CheckEntityForChanges"/>).</para>
+        /// <para>Records the value we INTENDED to write, never a live re-read: erwin may
+        /// auto-uniquify our name ('X' -> 'X__1070') and that adjustment IS a real change the
+        /// scheduled recheck must still catch
+        /// (<see cref="NamingValidationEngine.IsAutoUniquifyRename"/>).</para>
+        /// </summary>
+        private void NoteSelfWrittenColumnProperty(string objectId, string targetCode, string value)
+        {
+            if (string.IsNullOrEmpty(objectId)) return;
+            // No snapshot yet = nothing is watching this column, so there is nothing our
+            // write could be mistaken for. The next CreateSnapshot baselines it as-is.
+            if (!_attributeSnapshots.TryGetValue(objectId, out var snapshot)) return;
+            if (!ApplySelfWriteToSnapshot(snapshot, targetCode, value)) return;
+
+            Log($"[SELF-WRITE] snapshot re-baselined: attr {objectId} {targetCode}='{value ?? ""}' - not a user edit, chain stops here");
+        }
+
+        /// <summary>
+        /// Writes <paramref name="value"/> into the snapshot slot that mirrors
+        /// <paramref name="targetCode"/>. Returns false when there is nothing to re-baseline
+        /// (no snapshot, or no target code), so the caller can stay silent.
+        /// </summary>
+        internal static bool ApplySelfWriteToSnapshot(
+            AttributeValidationSnapshot snapshot, string targetCode, string value)
+        {
+            if (snapshot == null || string.IsNullOrEmpty(targetCode)) return false;
+
+            // A cleared property is a value like any other: the detector compares it as "",
+            // so the snapshot has to hold "" too, not null.
+            string written = value ?? "";
+            switch (ClassifyColumnTargetCode(targetCode, out string udpName))
+            {
+                case ColumnSnapshotSlot.PhysicalName:
+                    snapshot.PhysicalName = written;
+                    break;
+                case ColumnSnapshotSlot.PhysicalDataType:
+                    snapshot.PhysicalDataType = written;
+                    break;
+                case ColumnSnapshotSlot.Udp:
+                    snapshot.UdpValues[udpName] = written;
+                    break;
+                default:
+                    snapshot.WatchedProperties[targetCode] = written;
+                    break;
+            }
+            return true;
         }
 
         /// <summary>
@@ -5815,7 +6055,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             IReadOnlyList<string> pkPropertyCodes;
             try
             {
-                templateRules = NamingStandardService.Instance.GetTemplateRules("PRIMARY KEY");
+                templateRules = NamingStandardService.Instance.GetTemplateRules(TemplateApplierRegistry.PrimaryKey);
                 pkPropertyCodes = NamingStandardService.Instance.GetPropertyCodes("PRIMARY KEY");
             }
             catch (Exception ex)
@@ -5912,9 +6152,22 @@ namespace EliteSoft.Erwin.AddIn.Services
                     if (selfReferential)
                     {
                         _pkTemplateWriteFailed.Add(failKey);
-                        Log($"[PK-TEMPLATE-SKIP] table='{tableName}' rule#{rule.Id}: template '{rule.ValueTemplate}' references its own target '{(udpTarget ? rule.TargetUdpName : targetCode)}' (self-referential - would loop); suppressing. Use a related token like {{Table.Physical_Name}} instead.");
+                        Log($"[PK-TEMPLATE-SKIP] table='{tableName}' rule#{rule.Id}: template '{rule.ValueTemplate}' references its own target '{(udpTarget ? rule.TargetUdpName : targetCode)}' (self-referential - would loop); suppressing. Use {{Current}} for the target's own value (e.g. PK_{{Current}}).");
                         continue;
                     }
+
+                    // {Current} + OnlyIfEmpty can never write: the mode only runs on
+                    // an empty target and an empty target has nothing to reshape.
+                    if (NamingTemplateEngine.CurrentTokenConflictsWithFillMode(rule.ValueTemplate, rule.TemplateFillMode))
+                    {
+                        _pkTemplateWriteFailed.Add(failKey);
+                        Log($"[PK-TEMPLATE-SKIP] table='{tableName}' rule#{rule.Id}: template '{rule.ValueTemplate}' uses {{Current}} with TEMPLATE_FILL_MODE=OnlyIfEmpty; that pair can never produce a value.");
+                        continue;
+                    }
+
+                    // Read the target BEFORE rendering: {Current} reshapes this very
+                    // value, and FILL_MODE / the idempotency check need it too.
+                    string currentVal = ReadScapiProperty(pkKg, targetCode);
 
                     string rendered;
                     try
@@ -5923,7 +6176,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                             rule.ValueTemplate,
                             ownCode => ReadScapiProperty(pkKg, ownCode),
                             (alias, code) => ResolvePrimaryKeyRelatedProperty(entity, alias, code),
-                            udpName => NamingValidationEngine.ReadUdpValueForRule(pkKg, "PRIMARY KEY", udpName));
+                            udpName => NamingValidationEngine.ReadUdpValueForRule(pkKg, "PRIMARY KEY", udpName),
+                            currentVal);
                     }
                     catch (TemplateResolutionException tex)
                     {
@@ -5934,7 +6188,6 @@ namespace EliteSoft.Erwin.AddIn.Services
                         continue;
                     }
 
-                    string currentVal = ReadScapiProperty(pkKg, targetCode);
                     bool shouldWrite = NamingTemplateEngine.ShouldWrite(rule.TemplateFillMode, currentVal, out bool unknownMode);
                     if (unknownMode)
                     {
@@ -6104,6 +6357,464 @@ namespace EliteSoft.Erwin.AddIn.Services
                 $"{alias}.{propertyCode}",
                 $"alias '{alias}' navigates PRIMARY KEY -> {toType}, which has no runtime navigation in this version");
         }
+
+        #region MODEL Template rules
+
+        /// <summary>
+        /// True when a SCAPI property read failed because the property has never been
+        /// SET on this object (erwin's sparse storage), as opposed to a genuine read
+        /// failure. erwin words it "... does not use a property of &lt;X&gt; type or the
+        /// property failed to satisfy a property collection filter conditions".
+        /// <para>Callers treat the unset case as an empty value, which is exactly what
+        /// a Required rule is there to catch, and report it as the ordinary condition
+        /// it is. Anything that does NOT match keeps its full diagnostic text.</para>
+        /// </summary>
+        internal static bool IsPropertyNotSet(Exception ex)
+            => ex?.Message != null
+               && ex.Message.IndexOf("does not use a property", StringComparison.OrdinalIgnoreCase) >= 0;
+
+        /// <summary>Owner-class prefix for a MODEL-scoped UDP path.</summary>
+        private const string ModelUdpPathPrefix = "Model.Physical.";
+
+        /// <summary>
+        /// Re-entry guard. Our own writes land on UDPs that
+        /// <see cref="CheckModelUdpChanges"/> polls, so without this a write could
+        /// drive a second pass through the same scan while the first is still open.
+        /// </summary>
+        private bool _modelTemplateApplyInProgress;
+
+        /// <summary>
+        /// Rules whose stored value came back different from what we rendered, warned
+        /// once per session so the log names the authoring fix without repeating it on
+        /// every gesture. Keyed on rule id.
+        /// </summary>
+        private readonly HashSet<int> _modelTemplateDriftWarned = new HashSet<int>();
+
+        /// <summary>
+        /// Rules refused for the rest of the session because they provably cannot
+        /// converge (the model stored something other than what the template rendered,
+        /// so the idempotency check can never match and the rule would re-write and
+        /// re-prompt on every model UDP edit). Cleared on rebaseline / reconnect, so a
+        /// corrected rule starts fresh.
+        /// </summary>
+        private readonly HashSet<int> _modelTemplateSuppressed = new HashSet<int>();
+
+        /// <summary>Latches the once-per-session "no MODEL Template rules loaded" line.</summary>
+        private bool _modelTemplateEmptyLogged;
+
+        /// <summary>
+        /// Applies active <see cref="NamingRuleKind.Template"/> rules whose
+        /// OBJECT_TYPE is MODEL: renders each rule's value and writes it to the
+        /// model-scoped UDP it targets.
+        ///
+        /// <para>Until 2026-07-31 nothing in the add-in did this. MODEL Template
+        /// rules loaded, appeared in the connect-time rule dump, and were then never
+        /// looked at again, because the only two appliers ask for "Column" and
+        /// "PRIMARY KEY" by literal. The failure was indistinguishable from a broken
+        /// rule, so the summary line at the end of this method is not decoration: it
+        /// is the evidence that the pass ran at all.</para>
+        ///
+        /// <para>TRIGGER: a model UDP the user changed. NOT connect time - applying
+        /// templates to an already-open model would be a retroactive rewrite, and
+        /// under TEMPLATE_FILL_MODE=Always it would silently overwrite a
+        /// human-authored value in every model that gets opened.</para>
+        ///
+        /// <para>LOOP SAFETY: every write is re-baselined into
+        /// <see cref="_lastModelUdpValues"/> from a LIVE READ-BACK (see
+        /// <see cref="NoteSelfWrittenModelUdp"/>), so the next scan does not see our
+        /// own write as a user edit. Baselining the rendered value instead would
+        /// deadlock the detector forever if erwin normalises what it stores.</para>
+        /// </summary>
+        /// <param name="root">The model root (SCAPI ModelObjects.Root).</param>
+        /// <param name="changedUdps">Model UDP names whose value the user just changed
+        /// (diagnostics only - every MODEL rule is evaluated, because a template may
+        /// read a model property rather than a UDP, and the idempotency check makes an
+        /// unaffected rule free).</param>
+        private void ApplyModelTemplateRules(dynamic root, IReadOnlyList<string> changedUdps)
+        {
+            if (root == null)
+            {
+                Log("[MODEL-TEMPLATE] skipped: no model root on this pass.");
+                return;
+            }
+            if (_modelTemplateApplyInProgress)
+            {
+                // Should be unreachable now that CheckModelUdpChanges holds its own
+                // scan flag; if it ever fires, the log has to say so rather than let
+                // a gesture vanish.
+                Log("[MODEL-TEMPLATE] skipped: a MODEL Template pass is already running (reentrancy guard).");
+                return;
+            }
+
+            IReadOnlyList<NamingStandardRule> rules;
+            try
+            {
+                rules = NamingStandardService.Instance.GetTemplateRules(TemplateApplierRegistry.Model);
+            }
+            catch (Exception ex)
+            {
+                Log($"[MODEL-TEMPLATE-ERROR] loading MODEL Template rules failed: {AddinLogger.Describe(ex)}");
+                return;
+            }
+            if (rules == null || rules.Count == 0)
+            {
+                // Said ONCE per session, not per gesture. Silence here is what made
+                // the original report undiagnosable, but a line on every model UDP
+                // edit would be noise on the many configs that define no MODEL
+                // Template rule at all. The connect-time self-check
+                // (ModelConfigForm.ReportTemplateApplierCoverage) is what catches the
+                // dangerous case: rules DECLARED for MODEL that the selector drops.
+                if (!_modelTemplateEmptyLogged)
+                {
+                    _modelTemplateEmptyLogged = true;
+                    Log("[MODEL-TEMPLATE] no MODEL Template rules are loaded for the active config; model UDP changes will not fill anything.");
+                }
+                return;
+            }
+
+            _modelTemplateApplyInProgress = true;
+            try
+            {
+                Log($"[MODEL-TEMPLATE] evaluating {rules.Count} MODEL Template rule(s) after model UDP change: {string.Join(", ", changedUdps)}");
+
+                int skipped = 0, unchanged = 0;
+                var pending = new List<(NamingStandardRule Rule, TemplateRuleDecision Decision)>();
+
+                foreach (var rule in rules)
+                {
+                    try
+                    {
+                        // Proven non-convergent earlier this session (see
+                        // NoteSelfWrittenModelUdp): retrying would re-write and
+                        // re-prompt on every gesture. Already reported once, loudly.
+                        if (_modelTemplateSuppressed.Contains(rule.Id))
+                        {
+                            skipped++;
+                            continue;
+                        }
+
+                        // A MODEL rule targeting a built-in model PROPERTY is refused in
+                        // v1: the model name properties feed CheckForModelChanges (the
+                        // window-title diff), so a template rename would re-enter the
+                        // model-change / reconnect path. Loud, never silent.
+                        if (!rule.TargetUdpId.HasValue)
+                        {
+                            Log($"[MODEL-TEMPLATE-SKIP] rule#{rule.Id}: targets the model property '{rule.PropertyCode}'. MODEL Template rules may only fill a MODEL UDP in this version; a model property target is not supported.");
+                            skipped++;
+                            continue;
+                        }
+
+                        // A model is OPENED, never created by the add-in, so isNew is
+                        // false at every MODEL evaluation moment. APPLY_ON=Create can
+                        // therefore never match - say so instead of dropping silently.
+                        if (!NamingValidationEngine.MatchesApplyOn(rule, isNew: false))
+                        {
+                            Log($"[MODEL-TEMPLATE-SKIP] rule#{rule.Id}: APPLY_ON={rule.ApplyOn} can never match a MODEL rule (a model is opened, never created). Use Update or Both.");
+                            skipped++;
+                            continue;
+                        }
+
+                        if (!NamingValidationEngine.IsRuleApplicable(rule, TemplateApplierRegistry.Model, root))
+                        {
+                            // Log(), not LogDebug(): LogDebug is compiled out of packaged
+                            // builds, so the one line that answers "why did my rule not
+                            // apply?" never reached a customer. This pass runs on a human
+                            // gesture over a handful of rules, so there is no volume case
+                            // for hiding it.
+                            Log($"[MODEL-TEMPLATE-COND] rule#{rule.Id} not applied: {NamingValidationEngine.DescribeApplicability(rule, TemplateApplierRegistry.Model, root)}");
+                            skipped++;
+                            continue;
+                        }
+
+                        var decision = TemplateRuleEvaluator.Evaluate(
+                            rule,
+                            ModelUdpPathPrefix,
+                            targetCode => ReadScapiProperty(root, targetCode),
+                            currentVal => NamingTemplateEngine.Render(
+                                rule.ValueTemplate,
+                                ownCode => ReadScapiProperty(root, ownCode),
+                                (alias, code) => ResolveModelRelatedProperty(alias, code),
+                                udpName => NamingValidationEngine.ReadUdpValueForRule(root, TemplateApplierRegistry.Model, udpName),
+                                currentVal),
+                            "{Current}_SUFFIX");
+
+                        switch (decision.Action)
+                        {
+                            case TemplateRuleAction.Skip:
+                                Log($"[MODEL-TEMPLATE-SKIP] rule#{rule.Id} target='{decision.TargetCode}': {decision.Reason}");
+                                skipped++;
+                                break;
+                            case TemplateRuleAction.NoChange:
+                                unchanged++;
+                                break;
+                            default:
+                                pending.Add((rule, decision));
+                                break;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"[MODEL-TEMPLATE-ERROR] rule#{rule.Id}: {AddinLogger.Describe(ex)}");
+                        skipped++;
+                    }
+                }
+
+                int applied = 0;
+                try
+                {
+                    if (pending.Count > 0) applied = CommitModelTemplateWrites(root, pending, changedUdps);
+                }
+                finally
+                {
+                    // In a finally so the summary survives a throw out of the write
+                    // phase: "the pass ran and here is how far it got" is the line
+                    // whose absence made the original report undiagnosable.
+                    Log($"[MODEL-TEMPLATE] pass complete: {rules.Count} rule(s), applied={applied} unchanged={unchanged} skipped={skipped}");
+                }
+            }
+            finally
+            {
+                _modelTemplateApplyInProgress = false;
+            }
+        }
+
+        /// <summary>
+        /// Confirms (when a rule is not AUTO_APPLY) and writes the decided MODEL
+        /// template values, then reports what was written.
+        /// <para>Both dialogs are batched to ONE per gesture and go through
+        /// <see cref="ShowValidationModal"/>: this path runs from the heartbeat with
+        /// no reentrancy flag of its own, and a modal pumps messages.</para>
+        /// </summary>
+        /// <returns>How many values were actually committed.</returns>
+        private int CommitModelTemplateWrites(
+            dynamic root,
+            List<(NamingStandardRule Rule, TemplateRuleDecision Decision)> pending,
+            IReadOnlyList<string> changedUdps)
+        {
+            int failed = 0;
+            // The DDL worker opens models headlessly. ANY modal from this path would
+            // block it forever, so an unattended run writes only what needs no human
+            // (AUTO_APPLY=true) and defers the rest to the next interactive open.
+            // Same contract as the model-required-UDP prompt in MonitorTimer_Tick.
+            bool unattended = ModelConfigForm.DdlWorkerActiveUnattended;
+
+            var toWrite = pending;
+            var needsConfirm = pending.Where(p => !p.Rule.AutoApply).ToList();
+            if (needsConfirm.Count > 0)
+            {
+                if (unattended)
+                {
+                    foreach (var p in needsConfirm)
+                        Log($"[MODEL-TEMPLATE-SKIP] rule#{p.Rule.Id} {p.Decision.TargetCode}='{p.Decision.RenderedValue}': AUTO_APPLY=false needs a confirmation and the DDL worker runs unattended; deferred.");
+                    toWrite = pending.Where(p => p.Rule.AutoApply).ToList();
+                }
+                else
+                {
+                    // Asked as ONE combined question: two consecutive modals per UDP
+                    // edit is bad UX and each one blocks erwin's input (WP 329).
+                    // Per-rule granularity stays expressible via AUTO_APPLY per rule.
+                    var answer = ShowValidationModal(
+                        BuildModelTemplatePrompt(needsConfirm, changedUdps),
+                        "Apply Naming Template",
+                        MessageBoxButtons.YesNo,
+                        MessageBoxIcon.Question);
+                    if (answer != DialogResult.Yes)
+                    {
+                        foreach (var p in needsConfirm)
+                            Log($"[MODEL-TEMPLATE-DECLINED] rule#{p.Rule.Id} {p.Decision.TargetCode}='{p.Decision.RenderedValue}': user declined");
+                        toWrite = pending.Where(p => p.Rule.AutoApply).ToList();
+                    }
+                }
+            }
+
+            int applied = 0;
+            var autoApplied = new List<string>();
+            foreach (var (rule, decision) in toWrite)
+            {
+                // Pre-write marker: [MODEL-TEMPLATE-APPLY] only lands AFTER commit, so
+                // a native failure inside the SCAPI write would otherwise leave no trace.
+                Log($"[MODEL-TEMPLATE-WRITE] rule#{rule.Id} -> {decision.TargetCode}='{decision.RenderedValue}'");
+                int transId = _session.BeginNamedTransaction("ApplyModelTemplate");
+                try
+                {
+                    if (!UdpRuntimeService.TrySetUdpProperty((object)root, decision.TargetCode, decision.RenderedValue, out Exception setEx, Log))
+                        throw setEx ?? new InvalidOperationException($"UDP set '{decision.TargetCode}' was rejected by SCAPI");
+                    _session.CommitTransaction(transId);
+                    applied++;
+                    // Old value included: an overwrite under FILL_MODE=Always is the
+                    // one thing a support engineer cannot reconstruct afterwards.
+                    Log($"[MODEL-TEMPLATE-APPLY] rule#{rule.Id} {decision.TargetCode}: '{decision.CurrentValue}' -> '{decision.RenderedValue}'");
+
+                    // The chain stops here: this write is OURS, not a user edit.
+                    NoteSelfWrittenModelUdp(root, rule, decision);
+
+                    if (rule.AutoApply)
+                        autoApplied.Add(DescribeModelTemplateChange(rule, decision));
+                }
+                catch (Exception wex)
+                {
+                    failed++;
+                    try { _session.RollbackTransaction(transId); }
+                    catch (Exception rex) { Log($"[MODEL-TEMPLATE-ERROR] rule#{rule.Id}: rollback failed: {AddinLogger.Describe(rex)}"); }
+                    Log($"[MODEL-TEMPLATE-ERROR] rule#{rule.Id}: writing '{decision.TargetCode}' failed: {AddinLogger.Describe(wex)}");
+                }
+            }
+
+            // Writing a model UDP changes nothing on screen but DOES dirty the model,
+            // and in this product the DDL dirty gate is the title-bar asterisk - so a
+            // silent write would change the user's DDL state with no cue at all. Rules
+            // the user just confirmed are not repeated back at them.
+            if (autoApplied.Count > 0)
+            {
+                Log($"[MODEL-TEMPLATE] {autoApplied.Count} model UDP value(s) written - the model is now marked dirty; save to persist.");
+                if (!unattended)
+                {
+                    string trigger = changedUdps.Count == 1
+                        ? $"Changing the model UDP '{changedUdps[0]}' filled the following value(s) from naming templates:"
+                        : $"Changing the model UDP(s) {string.Join(", ", changedUdps.Select(u => "'" + u + "'"))} filled the following value(s) from naming templates:";
+                    string failureNote = failed > 0
+                        ? $"\n\n{failed} further value(s) could not be written; see the add-in log."
+                        : "";
+                    ShowValidationModal(
+                        trigger + "\n\n  " + string.Join("\n  ", autoApplied)
+                            + failureNote
+                            + "\n\nThe model is now marked as changed; save it to persist.",
+                        "Naming standard applied",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
+                }
+            }
+            else if (failed > 0 && !unattended)
+            {
+                // Nothing landed. Saying nothing here would read as "the rule did not
+                // fire", which is the exact confusion this whole change exists to end.
+                ShowValidationModal(
+                    $"{failed} model UDP value(s) could not be written by the naming templates.\n\nSee the add-in log for the reason.",
+                    "Naming standard not applied",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+            }
+
+            return applied;
+        }
+
+        /// <summary>
+        /// One display line for a model template write. Values are QUOTED because the
+        /// difference this feature most often has to show is a leading or trailing
+        /// space, which an unquoted dialog line renders invisible.
+        /// </summary>
+        private static string DescribeModelTemplateChange(NamingStandardRule rule, TemplateRuleDecision decision)
+        {
+            string current = string.IsNullOrEmpty(decision.CurrentValue) ? "(empty)" : $"'{decision.CurrentValue}'";
+            return $"{rule.TargetUdpName}:  {current}  ->  '{decision.RenderedValue}'";
+        }
+
+        /// <summary>
+        /// English confirmation text for the AUTO_APPLY=false set. Shows current -&gt;
+        /// new per rule so a TEMPLATE_FILL_MODE=Always overwrite is visible BEFORE it
+        /// happens; "(empty)" is a literal so an empty current value is not an
+        /// invisible blank.
+        /// </summary>
+        private static string BuildModelTemplatePrompt(
+            List<(NamingStandardRule Rule, TemplateRuleDecision Decision)> items,
+            IReadOnlyList<string> changedUdps)
+        {
+            var sb = new System.Text.StringBuilder();
+            // Name the gesture first: nothing on screen changed, so without this the
+            // dialog arrives with no visible cause.
+            sb.AppendLine(changedUdps.Count == 1
+                ? $"You changed the model UDP '{changedUdps[0]}'."
+                : $"You changed the model UDP(s) {string.Join(", ", changedUdps.Select(u => "'" + u + "'"))}.");
+            sb.AppendLine();
+            sb.AppendLine(items.Count == 1
+                ? "A naming template can fill this model UDP value:"
+                : "Naming templates can fill these model UDP values:");
+            sb.AppendLine();
+            foreach (var (rule, decision) in items)
+                sb.AppendLine("  " + DescribeModelTemplateChange(rule, decision));
+            sb.AppendLine();
+            sb.AppendLine("Applying marks the model as changed.");
+            sb.Append(items.Count == 1 ? "Apply this value to the model?" : "Apply these values to the model?");
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// Re-baselines <see cref="_lastModelUdpValues"/> after our own write so
+        /// <see cref="CheckModelUdpChanges"/> does not report it as a user edit.
+        ///
+        /// <para>The baseline is the value AS STORED (read back live), never the value
+        /// we rendered. erwin may normalise on write, and baselining the intended value
+        /// on a path where the stored value differs would leave current != baseline
+        /// permanently: every scan would report a change, re-fire the cascade and
+        /// re-run this applier. That is the one way this feature could build a genuine
+        /// loop, so the read-back is mandatory rather than defensive.</para>
+        ///
+        /// <para>A stored-vs-rendered difference is reported once per rule: it means
+        /// the rule renders something the model will not keep verbatim (a template
+        /// ending in a stray space is the live example), and the fix is the template,
+        /// not a silent trim here.</para>
+        /// </summary>
+        private void NoteSelfWrittenModelUdp(dynamic root, NamingStandardRule rule, TemplateRuleDecision decision)
+        {
+            string udpName = rule.TargetUdpName;
+            if (string.IsNullOrEmpty(udpName)) return;
+
+            // NOT ReadScapiProperty: that helper maps every failure to "" by design
+            // (an unset property is normal there), which would silently baseline an
+            // EMPTY value after a failed read and make the next scan report our own
+            // write as a user edit. This read owns its error path.
+            string stored;
+            try
+            {
+                stored = root.Properties(decision.TargetCode)?.Value?.ToString() ?? "";
+            }
+            catch (Exception ex)
+            {
+                // Leaving the baseline STALE is strictly safer than baselining a value
+                // we could not confirm: the detector shares this exact read, so it
+                // fails the same way and simply does not fire.
+                Log($"[MODEL-TEMPLATE] rule#{rule.Id}: could not read '{decision.TargetCode}' back after the write ({AddinLogger.Describe(ex)}); baseline left unchanged.");
+                return;
+            }
+
+            _lastModelUdpValues[udpName] = stored;
+
+            if (string.Equals(stored, decision.RenderedValue, StringComparison.Ordinal)) return;
+
+            // The model did not keep what we rendered, so the idempotency check can
+            // never match and this rule would re-write (and re-prompt) on EVERY model
+            // UDP edit for the rest of the session. Stop it after the first proof and
+            // name the fix. Not a silent fallback: it is refused loudly, and refusing
+            // is the honest answer to a template the model will not store verbatim.
+            _modelTemplateSuppressed.Add(rule.Id);
+            if (_modelTemplateDriftWarned.Add(rule.Id))
+            {
+                Log($"[MODEL-TEMPLATE-SUPPRESSED] rule#{rule.Id}: the model stored '{stored}' but the template rendered '{decision.RenderedValue}'. The rule cannot converge, so it is suppressed for this session. A leading or trailing space is the usual cause: append |trim to the token, AFTER any split.");
+            }
+        }
+
+        /// <summary>
+        /// Resolves a <c>{Alias.PropertyCode}</c> token for a MODEL rule. The model
+        /// root is the top of the containment graph, so there is nothing to navigate
+        /// TO from it; both an unknown alias and a known-but-unnavigable one are hard
+        /// errors (no-fallback), never a silent empty value.
+        /// </summary>
+        private static string ResolveModelRelatedProperty(string alias, string propertyCode)
+        {
+            string toType = ObjectRelationCatalog.Instance.ResolveAlias(TemplateApplierRegistry.Model, alias);
+            if (string.IsNullOrEmpty(toType))
+            {
+                throw new TemplateResolutionException(
+                    $"{alias}.{propertyCode}",
+                    $"alias '{alias}' is not defined in MC_OBJECT_RELATION for object type 'MODEL'");
+            }
+
+            throw new TemplateResolutionException(
+                $"{alias}.{propertyCode}",
+                $"alias '{alias}' navigates MODEL -> {toType}, which has no runtime navigation in this version. A MODEL template can read the model's own properties ({{PropertyCode}}) and its UDPs ({{Udp:Name}}).");
+        }
+
+        #endregion
 
         /// <summary>
         /// Check column-level UDP changes for dependency cascade.
@@ -7102,8 +7813,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                     ValidateDomain(attr, currentState, previousState.DomainParentValue);
                 }
 
-                // Term-type policy: only fires when ONLY Physical_Data_Type changed (not on rename
-                // — the rename branch above re-applied glossary defaults authoritatively, so any
+                // Term-type policy: only fires when ONLY Physical_Data_Type changed (not on rename:
+                // the rename branch above re-applied glossary defaults authoritatively, so any
                 // diff there is intentional, not a user edit to constrain).
                 if (dataTypeChanged && !physicalNameChanged)
                 {
@@ -8640,7 +9351,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                         // Length > 0 / Required rule is meant to catch, so treat the
                         // unset property as an empty string and validate.
                         propValue = "";
-                        Log($"Naming standard: SCAPI did not surface 'Column.{propertyCode}' on this column (treating as empty): {ex.Message}");
+                        if (IsPropertyNotSet(ex))
+                            Log($"Column.{propertyCode} is not set on '{state.TableName}.{state.PhysicalName}' (optional property never written; treating as empty).");
+                        else
+                            Log($"Column.{propertyCode} could not be read on '{state.TableName}.{state.PhysicalName}' (treating as empty): {AddinLogger.Describe(ex)}");
                     }
 
                     Log($"NamingValidate: 'Column.{propertyCode}' on '{state.TableName}.{state.PhysicalName}' liveValue='{propValue}' isNew={revalidateAsNew}");
@@ -9809,6 +10523,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                     var glossary = GlossaryService.Instance;
                     var resolveTargetType = targetTypeOf ?? glossary.GetTargetType;
                     var resolveIsLocked = isLockedOf ?? glossary.GetIsLocked;
+                    int written = 0, skipped = 0, failed = 0;
                     foreach (var kvp in udpValues)
                     {
                         if (string.IsNullOrEmpty(kvp.Value))
@@ -9818,6 +10533,9 @@ namespace EliteSoft.Erwin.AddIn.Services
                             // (never swallow silently).
                             if (resolveIsLocked(kvp.Key))
                                 Log($"Glossary: locked field '{kvp.Key}' has no value for '{columnName}' - left unset (not fabricated).");
+                            else
+                                Log($"Glossary: mapping '{kvp.Key}' is empty for '{columnName}' - nothing to write.");
+                            skipped++;
                             continue;
                         }
 
@@ -9828,26 +10546,32 @@ namespace EliteSoft.Erwin.AddIn.Services
                         {
                             case "ERWIN_PROPERTY":
                                 string erwinPropName = MapPropertyCodeToErwin(targetField);
-                                TrySetProperty(attr, erwinPropName, kvp.Value);
+                                if (TrySetProperty(attr, erwinPropName, kvp.Value)) written++; else failed++;
                                 break;
 
                             case "UDP":
-                                TrySetUdp(attr, targetField, kvp.Value);
+                                if (TrySetUdp(attr, targetField, kvp.Value)) written++; else failed++;
                                 break;
 
                             case "DB_PROPERTY":
                                 Log($"Glossary: Skipping DB property '{targetField}' for '{columnName}'");
+                                skipped++;
                                 break;
 
                             default:
                                 // No type info (backward compat) — treat as UDP
-                                TrySetUdp(attr, targetField, kvp.Value);
+                                if (TrySetUdp(attr, targetField, kvp.Value)) written++; else failed++;
                                 break;
                         }
                     }
 
                     _session.CommitTransaction(transId);
-                    Log($"Glossary values applied for '{columnName}': {udpValues.Count} mapping(s)");
+                    // Count what actually reached erwin, not what was attempted: the old line
+                    // reported udpValues.Count and so said "2 mapping(s)" whether both writes
+                    // landed or both failed.
+                    Log($"Glossary values applied for '{columnName}': {written}/{udpValues.Count} written"
+                        + (skipped > 0 ? $", {skipped} skipped" : "")
+                        + (failed > 0 ? $", {failed} FAILED" : ""));
                 }
                 catch (Exception ex)
                 {
@@ -9880,22 +10604,33 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
         }
 
-        private void TrySetProperty(dynamic attr, string propertyName, string value)
+        /// <summary>Writes one erwin property. Returns whether the value actually landed.</summary>
+        private bool TrySetProperty(dynamic attr, string propertyName, string value)
         {
             try
             {
                 attr.Properties(propertyName).Value = value;
                 Log($"Set {propertyName} to '{value}' from glossary");
+                return true;
             }
             catch (Exception ex)
             {
                 Log($"Error setting {propertyName}: {ex.Message}");
+                return false;
             }
         }
 
-        private void TrySetUdp(dynamic attr, string udpName, string value)
+        /// <summary>
+        /// Writes one UDP, trying the property spellings erwin accepts for a Column UDP in order.
+        /// Returns whether the value actually landed.
+        /// <para>A miss here is the common shape of "I mapped a UDP and nothing happened": the UDP
+        /// does not exist on this model yet (UDP sync has not run / was declined), or the admin
+        /// TARGET_FIELD is spelled differently from the model's Property_Type. The first COM error is
+        /// kept and logged - it used to go to <c>Debug.WriteLine</c>, i.e. nowhere in production.</para>
+        /// </summary>
+        private bool TrySetUdp(dynamic attr, string udpName, string value)
         {
-            if (string.IsNullOrEmpty(value)) return;
+            if (string.IsNullOrEmpty(value)) return false;
 
             string[] formats = {
                 $"Attribute.Physical.{udpName}",
@@ -9904,21 +10639,25 @@ namespace EliteSoft.Erwin.AddIn.Services
                 $"UDP.{udpName}"
             };
 
+            string firstError = null;
             foreach (var format in formats)
             {
                 try
                 {
                     attr.Properties(format).Value = value;
                     Log($"Set {udpName} to '{value}' using '{format}'");
-                    return;
+                    return true;
                 }
                 catch (Exception ex)
                 {
-                    System.Diagnostics.Debug.WriteLine($"TrySetUdp: Format '{format}' failed: {ex.Message}");
+                    firstError ??= $"'{format}' -> {ex.GetType().Name}: {ex.Message}";
                 }
             }
 
-            Log($"Could not set {udpName} - no valid property format found");
+            Log($"Could not set UDP '{udpName}' to '{value}' - none of the {formats.Length} property "
+                + $"spellings exist on this object. First error: {firstError}. Check that the UDP is "
+                + "defined for COLUMN in Admin and that UDP sync has applied it to this model.");
+            return false;
         }
 
         private void ValidateDomain(dynamic attr, AttributeValidationSnapshot state, string oldDomainValue)
@@ -10650,7 +11389,9 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         #region Inner Classes
 
-        private class AttributeValidationSnapshot
+        // internal (not private) so the self-write re-baseline
+        // (ApplySelfWriteToSnapshot) is directly unit-testable.
+        internal class AttributeValidationSnapshot
         {
             public string ObjectId { get; set; }
             public string AttributeName { get; set; }

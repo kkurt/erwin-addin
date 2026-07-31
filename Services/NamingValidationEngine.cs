@@ -786,13 +786,22 @@ namespace EliteSoft.Erwin.AddIn.Services
 
         private static string ReadUdpValue(dynamic scapiObject, string objectType, string udpName)
         {
-            string ownerClass = objectType?.ToLower() switch
+            // ToLowerInvariant, NOT ToLower: on the customer's tr-TR machines
+            // "INDEX".ToLower() is "ındex" (dotless i), which matches no arm and
+            // silently routes an INDEX-scoped UDP read to the Entity default.
+            string ownerClass = objectType?.ToLowerInvariant() switch
             {
                 "table" => "Entity",
                 "column" => "Attribute",
                 "view" => "View",
                 "index" => "Key_Group",
                 "primary key" => "Key_Group",
+                // MODEL was missing until 2026-07-31. Without it a MODEL rule's
+                // {Udp:X} token built "Entity.Physical.X" on the model root, and
+                // only worked because SCAPI threw, IsNotOnThisClass matched the
+                // English error text, and TryReadModelUdp retried. That made
+                // every MODEL token resolution depend on a localisable message.
+                "model" => "Model",
                 _ => "Entity"
             };
             string path = $"{ownerClass}.Physical.{udpName}";

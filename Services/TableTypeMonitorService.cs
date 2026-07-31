@@ -2968,7 +2968,10 @@ namespace EliteSoft.Erwin.AddIn.Services
                         // entity, which is the loudest possible signal
                         // for admin to notice and fix the code.
                         propValue = "";
-                        Log($"Naming standard: SCAPI did not surface '{objectType}.{propertyCode}' on this entity (treating as empty): {ex.Message}");
+                        if (ValidationCoordinatorService.IsPropertyNotSet(ex))
+                            Log($"{objectType}.{propertyCode} is not set on this entity (optional property never written; treating as empty).");
+                        else
+                            Log($"{objectType}.{propertyCode} could not be read on this entity (treating as empty): {AddinLogger.Describe(ex)}");
                     }
 
                     // Diagnostic (2026-05-25): help triage "Required popup
