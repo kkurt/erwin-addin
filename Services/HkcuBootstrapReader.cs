@@ -125,8 +125,8 @@ namespace EliteSoft.Erwin.AddIn.Services
                     Host = host,
                     Port = port,
                     Database = database,
-                    Username = DpapiDecrypt(key.GetValue("DBUserName") as string),
-                    Password = DpapiDecrypt(key.GetValue("DBPassword") as string),
+                    Username = DpapiDecrypt(key.GetValue("DBUserName") as string, "DBUserName"),
+                    Password = DpapiDecrypt(key.GetValue("DBPassword") as string, "DBPassword"),
                 };
             }
         }
@@ -136,18 +136,68 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// encrypted under the current user's DPAPI master key by
         /// install-impl.ps1). An empty or null input returns empty. A decryption
         /// failure (corrupt blob, or a blob copied from another user/machine
-        /// whose master key is not present here) is rethrown so the caller
-        /// surfaces a real error instead of silently returning ciphertext -
-        /// matches the project rule against swallowing exceptions.
+        /// whose master key is not present here) still propagates - never
+        /// silently returns ciphertext, per the project rule against swallowing
+        /// exceptions - but is rewrapped with the registry path, the failing
+        /// value name, the account it failed on and the recovery step.
         /// </summary>
-        private static string DpapiDecrypt(string base64Cipher)
+        /// <remarks>
+        /// The raw framework text is "Key not valid for use in specified state."
+        /// with no context whatsoever. It reaches the user verbatim as
+        /// "Add-In Error: ..." from <c>ErwinAddIn.Execute</c>'s catch, because
+        /// this read happens inside the ModelConfigForm constructor. A prod
+        /// install hit exactly that on every model open (2026-07-30) and the
+        /// message gave the admin nothing to act on, so the cause and the fix
+        /// are spelled out here instead.
+        /// </remarks>
+        private static string DpapiDecrypt(string base64Cipher, string valueName)
         {
             if (string.IsNullOrEmpty(base64Cipher))
                 return "";
 
-            var cipherBytes = Convert.FromBase64String(base64Cipher);
-            var plainBytes = ProtectedData.Unprotect(cipherBytes, null, DataProtectionScope.CurrentUser);
-            return System.Text.Encoding.UTF8.GetString(plainBytes);
+            byte[] cipherBytes;
+            try
+            {
+                cipherBytes = Convert.FromBase64String(base64Cipher);
+            }
+            catch (FormatException ex)
+            {
+                throw new InvalidOperationException(
+                    BuildCredentialError(valueName,
+                        "the stored value is not valid Base64 (the registry value is corrupt or was hand-edited)"),
+                    ex);
+            }
+
+            try
+            {
+                var plainBytes = ProtectedData.Unprotect(cipherBytes, null, DataProtectionScope.CurrentUser);
+                return System.Text.Encoding.UTF8.GetString(plainBytes);
+            }
+            catch (CryptographicException ex)
+            {
+                throw new InvalidOperationException(
+                    BuildCredentialError(valueName,
+                        "it was encrypted under a different Windows account or machine (a registry key copied " +
+                        "between profiles is not portable), or this account's DPAPI master key changed - an " +
+                        "admin-forced password reset, or a temporary/roaming profile that did not load"),
+                    ex);
+            }
+        }
+
+        /// <summary>
+        /// Builds the operator-facing text for an undecryptable bootstrap
+        /// credential: what failed, on which account, why, and the one action
+        /// that fixes it.
+        /// </summary>
+        private static string BuildCredentialError(string valueName, string cause)
+        {
+            return
+                $"The MetaRepo DB credential '{valueName}' stored in HKCU\\{SubKeyPath} cannot be decrypted " +
+                $"on this Windows account ({Environment.UserDomainName}\\{Environment.UserName}) because " +
+                $"{cause}. " +
+                "Fix: run installer\\install.bat as THIS user on THIS machine, supplying the DB connection " +
+                "values (-DBHost/-DBName/-DBUserName/-DBPassword, or a bootstrap.seed.json placed next to " +
+                "install.bat), so the credentials are re-encrypted with this account's key.";
         }
     }
 }
