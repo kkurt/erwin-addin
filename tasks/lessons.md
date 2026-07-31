@@ -4,6 +4,108 @@ A running log of corrections and non-obvious findings that future sessions
 should not have to rediscover. Each entry is a short rule, the reason, and
 how to apply it.
 
+## 2026-07-30: In the template function grammar only the function NAME is trimmed - never "tidy up" the arguments
+
+**Rule:** `NamingTemplateEngine.ApplyFunction` splits a chain segment on `:` and trims ONLY
+`parts[0]`, the function name. Every argument is taken verbatim. That asymmetry is load-bearing, not
+an oversight: it is the only reason `{Name|split: :0}` ("first word") and `{Name|replace: :_}`
+("spaces to underscores") can be written at all. Adding a defensive `.Trim()` to the args - which
+looks like an obvious tidy-up next to the already-trimmed name - silently turns a single-space
+separator into an empty one, and the rule then dies with "needs a non-empty separator" for a reason
+the author cannot see in the template text.
+
+**Why:** A separator or search string is DATA, and whitespace is a legitimate value for it. A
+function name is GRAMMAR, where surrounding whitespace is noise (`{ Name | split: :1 }` must still
+parse). Numeric args are the deliberate middle case: `ParseCount` trims because a space can never be
+part of an integer.
+
+**How to apply:** When adding function #9, copy the shape of `split` / `replace`: `RequireArgCount`
+first, then validate string args for emptiness (a hard error, matching admin's save-time refusal),
+then `ParseCount` any numeric arg. Do not trim a string arg, and add a test that pins a
+space-as-data case. Where an operation naturally yields nothing (index past the last piece, `substr`
+past the end) return `string.Empty` and let the caller's existing "chain produced an empty value"
+check abort the render - do not invent a per-function fallback, and do not throw a second, competing
+error for the same condition. Related: [[reference_naming_confirmed_apply_fallthrough]] and the
+`{Current}` fixed-point entry below - a chain that does not settle is refused by the double-render
+guard for free, so no new function needs its own convergence logic.
+
+## 2026-07-30: `ex.Message` alone hid a dead feature for 11 days - log the whole chain, and say when a fallback is EXPECTED
+
+**Rule:** Two log lines that had been scrolling past every session turned out to be one silent
+outage and one false alarm, and both were failures of PHRASING, not of logic.
+
+1. `SessionTracking: startup: ApplySettings failed (best-effort): DbUpdateException: An error
+   occurred while saving the entity changes. See the inner exception for details.` The catch logged
+   `ex.Message`, and EF Core's `DbUpdateException` message contains literally nothing else - the
+   whole cause lives in the inner `SqlException`. Underneath was `Invalid column name
+   'IS_AUTO_DDL_GENERATOR'`: the 2026-07-19 migration had never been applied to ANY of the nine live
+   `MetaRepo*` DBs, so the add-in's session INSERT had been failing on every single startup for
+   eleven days. The feature was completely dead and the log was one string away from saying so.
+2. `PuLocatorReader: pu.Locator threw: RuntimeBinderException` looked like an error in every
+   session. It is the DESIGNED first stage of a four-stage fallback: Mart-bound PUs have no
+   `Locator` member at all. Wording a planned fallback as "threw" trains you to ignore the line -
+   and next to it in the same file sat a real one.
+
+**Why:** A "best-effort" catch is a promise that the failure is survivable, NOT that it is
+uninteresting. If the only channel that reports it is one truncated string, the promise silently
+becomes "nobody will ever know". Several framework exceptions are pure envelopes and say nothing
+in their own message: `DbUpdateException`, `TargetInvocationException`, `AggregateException`.
+
+**How to apply:**
+- Never log `ex.Message` or `ex.GetType().Name` on its own. Use
+  `AddinLogger.Describe(ex)` (`Services/AddinLogger.cs`), which flattens the chain to
+  `Type: message -> InnerType: message -> ...`, unwraps a single-child `AggregateException`, and
+  caps at depth 8 so one pathological exception cannot flood the file.
+- Reserve failure vocabulary ("threw", "failed", "error") for actual failures. When a stage of a
+  fallback chain is expected to miss, say what is missing and what is being tried next
+  (`PuLocatorReader.DescribeAttempt` / `IsMemberAbsent`). Late-bound COM reports "no such member"
+  two ways: `RuntimeBinderException` from the C# binder, and `DISP_E_MEMBERNOTFOUND` /
+  `DISP_E_UNKNOWNNAME` from IDispatch - match both or the distinction leaks.
+- An entity property with no column behind it fails only at runtime, only in the catch, and only on
+  the machines that were never migrated. After adding a column to a shared entity in `MetaShared`,
+  check the migration actually ran on the target DBs - EF here does not create or verify schema.
+- Do not silently apply such a migration to customer DBs to "fix" it. Fix the dev DB, verify, and
+  report the remaining ones as a deploy decision.
+
+## 2026-07-30: An error message that prescribes a fix is a hypothesis - check the state it blames
+
+**Rule:** Ten DDL-worker jobs died with `requested right version v8 not in combo - enable
+DDL_COMPARE_PREVIOUS_VERSIONS for this model`. That gate was ON, and the log said so two lines
+earlier (`[DDL-GATES] prev-versions=True`). The real cause was an inverted queue row (LEFT older
+than RIGHT), which the message could not name because the string was written for a single assumed
+cause. The wrong advice also cost the USER time: it pointed at an admin toggle, then at a mojibake
+creator name in erwin's Open dialog - both dead ends. Two combos were being conflated: erwin's Mart
+Open picker (lists every version, worked fine) and the add-in's own Target combo (built from the
+open version downwards, which is what "not in combo" referred to).
+
+**How to apply:** When a log line both diagnoses AND prescribes, verify the prescribed state in the
+same log before acting on it - the surrounding lines usually already contain the answer. When
+writing such a message, enumerate the distinguishable causes from state you already hold and name
+the actual one (see `Services/DdlJobVersionContract.ExplainMissingTarget`); when a message names a
+UI element ("combo", "list", "dialog"), qualify WHICH one, because the user is looking at erwin's.
+
+## 2026-07-29: A diagnostic probe that fails on a healthy machine is worse than no probe
+
+**Rule:** Chasing "Access is denied" from `Register-ScheduledTask` on a customer box, I handed the
+customer a check list containing `schtasks /Create /TN X /TR calc.exe /SC ONLOGON`. It returned
+`Access is denied` there, and also on my own perfectly healthy dev box, because `/SC ONLOGON`
+**without `/RU`** requests a logon trigger for ANY user, which Task Scheduler restricts to
+administrators by design. The probe could only ever fail, so its failure looked like confirmation of
+the hypothesis it was supposed to test. Two more self-inflicted errors in the same investigation:
+`[Security.Principal.WindowsIdentity]::GetCurrent().Groups` silently drops deny-only SIDs, so my
+elevation check reported a UAC-filtered administrator as "not in Administrators" and I repeated that
+false fact to the user; and I called an orphan-task theory "near-airtight" from a deduction whose
+premise (that an orphan would be invisible to `Get-ScheduledTask`) I had not measured. It was wrong:
+a task owned by another principal still grants the registering user an explicit Read ACE and IS
+enumerated, which the production log then refuted the theory with.
+
+**How to apply:** Before sending any diagnostic command to a customer, run it on a machine KNOWN to
+be healthy and confirm it passes there. A probe is only evidence if both outcomes are possible.
+Change one variable per probe (name, action, settings all at once tells you nothing), and write the
+expected-healthy result next to each command. When a deduction rests on an unmeasured premise, say
+"unmeasured" rather than "airtight", and prefer running the experiment: the two experiments that
+settled this one took under a minute each.
+
 ## 2026-07-19: A WP that names "the SEND/SAVE button" can point at either dialog in a two-step flow
 
 **Rule:** WP 319 said "the SEND or SAVE button in the modal after Generate DDL should become
@@ -1896,6 +1998,16 @@ the 2026-06-23 "positive confirmation before destructive action" lesson.
 
 **Why it matters / how to apply:** (1) A value-GENERATOR rule that reads its own output is inherently non-convergent - guard it statically (own-token == target), do not rely on the value-equality idempotency check. (2) Any per-heartbeat applier that WRITES is a cursor-flicker + model-churn risk; the dominant cost is the transaction, not the COM reads - a correct convergent template writes once then is idempotent (no per-tick write). (3) The live log is `%TEMP%\erwin-addin-debug.log` = `C:\Users\Kursat\AppData\Local\Temp\2\erwin-addin-debug.log`; the `c:\work` copy was stale for days - always confirm log mtime before trusting it. (4) A naming/template rule silently never loads if its CONFIG_ID != open config, IS_ACTIVE=0, or its property def has DBMS_VERSION_ID != NULL (loader filter).
 
+## 2026-07-30: `{Current}` - the converging way to fold a Template's own target back in (the shape recognizer)
+
+**Symptom (live):** rule#1175 `{Table.Physical_Name}_{Physical_Name}` targeting COLUMN Physical_Name never fired; the log showed `[TEMPLATE-SKIP] ... references its own target 'Physical_Name' (self-referential - would loop)`. The guard was RIGHT (same class as the 2026-06-29 PK runaway above), but the user's intent - "column name = TableName_ColumnName" - was legitimate and INEXPRESSIBLE: Template refused it and a Prefix rule only carries a static string, not a token.
+
+**Fix shipped:** a reserved SOURCE token `{Current}` = the TARGET property/UDP's own current value, with FIXED-POINT semantics instead of substitution. `Render` reads a template holding it as `L {Current} R`: render L and R normally (they may carry any other token), then take the SEED from the target's current value - the middle when the value already starts with L and ends with R and is long enough, otherwise the WHOLE value - and return `L + chain(seed) + R`. The proof that it converges: the result always starts with L, ends with R and is long enough, so the next render strips exactly what was written and rebuilds the identical string; the applier's `rendered == current` check then stops it. `abc` -> `Table2_abc` -> stable, ONE write. Constraints, all enforced at runtime: at most one `{Current}` (two makes the split ambiguous); an empty target is a hard error (it RESHAPES a value, it never invents one); `{Current}` + FILL_MODE=OnlyIfEmpty is refused as a pair that can never write; a pipe chain on `{Current}` is double-rendered and refused when non-idempotent (`replace:a:aa` would grow forever - the runaway sneaking back in through a pipe). The old self-referential guards STAY and now skip `{Current}` explicitly (reserved source wins even over a property literally named Current) and point at it in their skip message.
+
+**Shape, not a new mode:** implemented as an optional `currentValue` parameter on the EXISTING `Render` (default null), not a second public entry point - so a template without `{Current}` is byte-identical to before and neither applier grew a branch. Both appliers now read the target BEFORE rendering (it was read after) and pass it in; every rule lives in the pure engine, nothing is duplicated between ApplyColumnTemplateRules and ApplyPrimaryKeyRules.
+
+**Why / how to apply:** (1) When a static guard correctly refuses a LEGITIMATE intent, the answer is a new way to EXPRESS the intent, not a weaker guard - widening the guard would have re-opened the per-heartbeat write. (2) The distinction that made the design work: `{Physical_Name}` means "read a property" while `{Current}` means "the value I am about to overwrite"; the whole bug was those two being spelled the same. `{Self}` was rejected as a name for exactly that ambiguity, and a `FILL_MODE='EnsureShape'` was rejected because FILL_MODE answers "when to write", not "how to read the own token". (3) Before reserving a token name, survey the customer DBs - `Current` was checked against PROPERTY_CODE, MC_OBJECT_RELATION.ALIAS and existing VALUE_TEMPLATEs across all 9 online MetaRepo* DBs (zero hits), and VALUE_TEMPLATE is already nvarchar(2000) so there is NO schema or MetaShared change. (4) The 2026-06-29 `PK_{Physical_Name}` incident becomes correct under these semantics as `PK_{Current}`. (5) Admin owns save-time validation (reserved name, max one, the OnlyIfEmpty pair, Template-only, plus warning on a `|` OUTSIDE the braces - 3 customer rules have `{Physical_Name}|left:3` which silently writes the literal `abc|left:3`); the runtime re-checks anyway so a hand-inserted rule is skipped with a reason, never left failing every render.
+
 ## 2026-06-29: "column is PK" naming condition cannot be a property read - resolve via the Key_Group_Member walk
 
 **Rule:** erwin exposes NO readable Attribute property for primary-key membership. A DEPENDS_ON condition like `prop[IsPrimaryKey] in [True]` (or Is_PK / Primary_Key) reads EMPTY via `attr.Properties(code).Value` (proven live: `[TEMPLATE-COND] prop[IsPrimaryKey]=''`), so the rule silently never fires. PK membership is only knowable via the Key_Group graph (`IsAttributeInPrimaryKey`: entity's Key_Group with Key_Group_Type=="PK" -> Key_Group_Member rows -> Attribute_Ref match).
@@ -2334,3 +2446,232 @@ Kurallar:
    reddi onaya cevirememeli.
 4. Cokme avinda once Event Viewer: `Id=1026 .NET Runtime` managed stack'i
    verir ve dosya + satir numarasina kadar goturur. Tahmin etmeden once oku.
+
+---
+
+## 2026-07-30 - A "configured" test that never exercises the stored secret lets a broken install look healthy forever
+
+**Bug (user-reported from a fresh PROD install):** every model open popped
+`Add-In Error: Key not valid for use in specified state.` and nothing else. That is the raw
+framework text of a DPAPI `CryptographicException` from `HkcuBootstrapReader.DpapiDecrypt`
+(`ProtectedData.Unprotect`, CurrentUser scope) on `HKCU\Software\EliteSoft\MetaRepo\Bootstrap`'s
+`DBUserName`/`DBPassword`. It reaches the user verbatim because the HKCU read happens inside the
+`ModelConfigForm` constructor, i.e. inside `ErwinAddIn.Execute`'s catch. The message named no
+registry key, no account and no remedy. Worse: `install-impl.ps1`'s `Test-BootstrapConfigured`
+only checked that `DBHost`/`DBName` were non-empty, so it declared the machine "already
+configured", took the keep-existing branch, and skipped the write block entirely. Re-running
+install.bat could NOT fix it; the only recovery was deleting the registry key by hand.
+
+**Why (the trap):** a presence check is not a validity check. DBHost/DBName are plaintext and
+always readable, so the test passed on exactly the machines where the SECRET was unusable. DPAPI
+`CurrentUser` blobs are bound to the user AND the machine, and they also die when the account's
+master key changes (admin-forced password reset, temporary/roaming profile that did not load), so
+the failure is invisible to whoever built the package and reproducible only on the victim's
+profile. Two separate defects compounded: an unactionable error message, and a self-heal path
+that self-heals everything except the one state it was reached from. Diagnostic detail worth
+keeping: a well-formed blob under an unusable master key gives exactly "Key not valid for use in
+specified state.", while random/corrupt bytes give "The data is invalid." Those are different
+diagnoses and must not share one message.
+
+**How to apply:** any "is this already configured?" gate must exercise the thing that will
+actually be used at runtime, not the cheap plaintext neighbours of it. Here
+`Test-BootstrapConfigured` now calls `Test-DpapiDecryptable` on each non-empty credential and
+returns `$false` when Unprotect fails, so a plain re-run re-seeds under the correct account
+(empty credentials stay valid: trusted-connection installs legitimately seed ""). And when an
+exception is going to be shown to an operator verbatim, rewrap it with what failed, where it
+lives, which account it failed on, why, and the single command that fixes it - keep the original
+as `InnerException` so the log keeps the truth. Never downgrade the throw to a ciphertext
+fallback: that would send garbage as a password and re-report the problem as "login failed".
+Relates to feedback_no_silent_fallback + feedback_no_silent_errors + project_bootstrap_hkcu_only.
+
+---
+
+## 2026-07-30 - A probe that cannot fail is not evidence: `Test-Path` on an unreadable registry key returns `True`
+
+**Bug (caught by my own test before shipping):** to explain a prod `Access is denied` from
+`Register-ScheduledTask`, I added a check for a half-removed registration:
+`Test-Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\$TaskName"`.
+The test asserted that a task name which never existed reports nothing. It FAILED: the check
+reported "TaskCache registry entry EXISTS" for `EliteSoft No Such Task 8f3a1c`. Measured as a
+normal user on PS 7.6.3 / Windows Server 2022: `TaskCache` is readable by administrators only, and
+the PowerShell registry provider answers `Test-Path` with `True` for EVERY child of a key it
+cannot read, while `Test-Path HKLM:\SOFTWARE\<garbage>` one level up correctly returns `False`.
+`Get-Item` on the same path throws `SecurityException`; the native
+`Registry.LocalMachine.OpenSubKey` throws "Requested registry access is not allowed."
+
+**Why (the trap):** the installer runs non-elevated ON PURPOSE, so this check could never once
+have produced a correct answer - it would have printed fabricated evidence on every locked-down
+machine and pushed the operator to the wrong branch of the advice. Which is the exact failure I
+was fixing (the old code printed stale-task recovery when the cleanup had found no task at all).
+A boolean API that collapses "no" and "I am not allowed to look" into one value cannot be used for
+a diagnosis. The near-miss was only caught because the test asserted the NEGATIVE case; asserting
+only "an existing task is detected" would have passed happily.
+
+**How to apply:** when a check feeds a user-facing DIAGNOSIS, it needs three outcomes, not two:
+present, absent, and unknown. Prefer the API that distinguishes them (`Get-Item` +
+`ItemNotFoundException` vs `SecurityException`) over the convenient boolean one, and print "NOT
+CHECKABLE without administrator rights" rather than guessing. Test every probe against a subject
+that definitely does NOT exist, not just one that does - a probe that always says yes passes the
+positive test. Same shape as the presence-vs-validity lesson from earlier the same day
+(`Test-BootstrapConfigured` checking DBHost/DBName instead of decryptability): cheap check,
+plausible output, wrong answer. Relates to feedback_no_silent_fallback + feedback_memory_verify_live.
+
+---
+
+## 2026-07-30 (2) - A cache that survives the only gesture the user has to invalidate it
+
+**Bug:** "I defined a Domain Like Glossary mapping, attached a UDP, picked the glossary row in
+erwin, and the UDP stayed empty." The log showed the apply path working perfectly on exactly two
+mappings (`Set Definition`, `Set Physical_Data_Type`, `2 mapping(s)`) and never calling `TrySetUdp`
+at all. So the mapping row never reached the add-in. `ModelConfigForm.LoadDomainGlossary` warmed
+the cache with `if (!dg.IsLoaded) dg.LoadDomainGlossary();`, and `DomainGlossaryService.IsLoaded`
+was a bare `_isLoaded` flag. The user closed the model and reopened it (12:08:54 / 12:09:05) - the
+one action a modeler has for "pick up my admin change" - and the reconnect re-read NOTHING: the
+flag was still true from the load 2 minutes earlier. The refresh timer, the only other path, had
+just dropped from 5 to 60 minutes because the config context was torn down with the model.
+
+**Why (the trap):** the definition lives in the admin DB but the invalidation lived in add-in
+memory, so the two could not be connected by any user action. Worse, three DIFFERENT causes
+produced the identical log: a stale cache, a mapping row silently dropped by `ClassifyRow`
+returning `Ignored` (`default: break;`, no log - the exact "no swallowing" rule this repo has), and
+an unordered `SELECT TOP 1 ... WHERE MAPPING_CODE='DOMAIN_GLOSSARY'` binding to whichever of two
+definitions the query plan happened to return. The success path logged neither the mapping ID it
+bound to nor the value mappings it had read, and the apply line printed `udpValues.Count` - the
+ATTEMPTED count - so it read "2 mapping(s)" whether both writes landed or both failed. A log that
+cannot distinguish its own failure modes is not evidence, and `DomainGlossaryService` even carried
+an `IsLoadedForConfig(int)` that nothing ever called, i.e. the config-scoping guard the sibling
+`GlossaryService` uses was present as dead code.
+
+**How to apply:** when a cache mirrors admin-authored data, name the user gesture that must
+invalidate it and wire the invalidation to THAT, not to a timer whose interval the user cannot see
+(here: unconditional `Reload()` on model connect - one repo round trip plus one external SELECT per
+model open, the cost the first connect already pays). Report counts that were EARNED, never counts
+that were attempted. Every dropped-input branch must log the input and the reason in the admin's
+own vocabulary (`SOURCE_COLUMN is empty`), and every "pick one row" query must order by a stable
+key AND say out loud when there was more than one candidate. When a sibling service already owns
+the decision (`GlossaryService.IsLoadedForConfig`), call it rather than re-deriving it. Relates to
+feedback_no_silent_errors + reference_glossary_config_scoped_isloaded + feedback_verify_deployed_not_just_compiled.
+
+**Diagnosis note for next time:** the log for this class of bug arrives from the CUSTOMER machine.
+My local `MetaRepo*` databases are dev copies of a different corporate/config (1012 vs 2017), so
+querying them proves nothing about the reported environment. State that before reaching for a DB,
+and diagnose from the log plus the code path instead.
+
+---
+
+## 2026-07-30 (3) - A rule that restarts the chain it was the tail of
+
+**Bug:** with a Template naming rule AND a Domain Like Glossary both configured, the user added a
+column, picked its name from the glossary picker, watched the Template rule rewrite that name -
+and the picker re-opened on the name the rule had just produced. Live log, twice:
+`renamed Table2.<default> -> TEST_ACKL` (the user's gesture), then
+`[TEMPLATE-APPLY] Physical_Name='Table2_TEST_ACKL_TEST'` (ours), then
+`Physical name changed: Table2.TEST_ACKL -> Table2_TEST_ACKL_TEST` - the detector reading our own
+write back as a fresh user edit, re-entering `ValidateGlossary` -> `PromptDomainGlossary`. The
+first repro left the re-opened picker up for 68 seconds before the user cancelled it.
+
+**Why (the trap):** change detection is a differ against `_attributeSnapshots`, and the snapshot
+is only ever re-baselined by the DETECTION passes, never by the ENFORCEMENT passes. So every
+add-in write is indistinguishable from a user edit by construction, and any two subsystems that
+both write and both watch will feed each other. The house already knew this -
+`CheckAttributeUdpDependencies` absorbs its cascade writes into the snapshot inline and the
+ordering comment in `CheckEntityForChanges` spells out why - but the contract lived as a comment
+next to one call site instead of as a named operation, so the template path simply did not know it
+existed. An unnamed invariant is one nobody can honour.
+
+**How to apply:** the chain-initiating gesture is the user's; everything the add-in writes after it
+is a consequence, not a new event. Give that rule a NAME (`NoteSelfWrittenColumnProperty`) and call
+it at every enforcement write, so the next subsystem inherits it instead of rediscovering it as a
+bug report. Two details that are easy to get wrong: (1) re-baseline the slot the detector actually
+compares - the differ reads `PhysicalName`, `PhysicalDataType`, `UdpValues[bare name]` and
+`WatchedProperties[code]` separately, so a value routed to the wrong bag silently leaves the loop
+in place; (2) record the value you INTENDED to write, never a live re-read - erwin may
+auto-uniquify it (`X` -> `X__1070`) and that adjustment IS a real change the scheduled recheck
+must still catch. When one instance is found, grep for its siblings before declaring victory:
+`ApplyGlossaryUdpValues` and `ApplyPrimaryKeyRules` have the same shape, and the PK one can pop a
+MODAL on the add-in's own output. Report those rather than fixing them blind - suppressing a PK
+self-write also silences the warn-only validation of the template's output, which is a behaviour
+change the user has to approve. Relates to feedback_no_full_walks_in_change_detection +
+reference_naming_confirmed_apply_fallthrough + reference_erwin_uniquify_rename_isnew.
+
+## 2026-07-31: "Feature X does not work" may be the tool refusing to say the argument was junk
+
+**Rule:** The report was "`-Silent` works on install but not on uninstall, `Press any key` still
+comes". I had just shipped `-Silent`, so the natural suspects were the uninstall code path, the
+`.bat` forwarding, and a stale deployed copy. Four parallel investigators chased exactly those and
+two of them landed on "the package is stale, `-Silent` is uncommitted", with high confidence and a
+clean `git show HEAD` to back it. That answer was wrong: the screenshot contained a line
+(`Backed up DB connection to ...`) that only exists in the uncommitted working tree, which proves
+the machine was running the NEW script. One line of the user's own evidence outranked two
+confident agents.
+
+The real cause was one letter. The user's previous message to me had been "I mistyped it, it is
+`Silent` not `Slient`" - and `install-impl.ps1` has a SIMPLE `param()` block, so PowerShell puts an
+unknown `-Slient` into `$args` and runs the whole script anyway, exit code 0, not a word said. The
+slash habit is worse: `/Silent` is not a parameter name at all, so it binds POSITIONALLY to the
+first string parameter, `-DBHost`. Measured, all exit 0:
+
+    install.bat -Slient   -> $args=[-Slient], switch never set, full run, pause
+    install.bat /Silent   -> $DBHost='/Silent', switch never set, full run, pause
+
+**Why (the trap):** a feature can be perfect and still look broken, because the layer that decides
+whether the user reached the feature at all is silent about failure. `[CmdletBinding()]` fixes it
+in one line but was rejected after measuring it: it makes PowerShell intercept `-?` and print
+nothing, and `-?` is the documented help switch. The correct fix was an explicit gate. Note the
+asymmetry that made this so convincing a false lead: `-Silent` really did work on install, because
+the user typed it correctly there.
+
+**How to apply:** (1) When a switch "does not work", FIRST prove the switch reached the code, before
+auditing the code. A probe that prints the bound value and exits beats any amount of reading. (2)
+Treat a mistyped argument as an error with an exit code, never as an ignored one - "no silent
+fallback" covers the command line too, and the cheapest suggestion heuristics (exact match after
+stripping `-` or `/`, then compare sorted letters for transpositions) catch the realistic typos
+without fuzzy scoring. (3) Make a mode visible while it is active. `-Silent`'s only evidence was
+the ABSENCE of a pause thirty lines later, so "never bound" and "worked" were indistinguishable
+until the end of the run; one `Unattended run (-Silent)` line under the banner removes the whole
+class of report. (4) Agent consensus is not evidence. Two of four agreed on the stale-package
+theory; the user's screenshot refuted it in one line. Check findings against the artifact the user
+actually sent before accepting a confident answer. (5) A tool that customers run must state its own
+build identity in its normal output. The stale-package theory survived as long as it did only
+because nothing on screen could confirm or kill it; `install-impl.ps1` now prints
+`build: <time> <sha>[+local]` under the banner and under `-?`, stamped by `package.ps1` into the
+packaged copy only. The `+local` marker matters as much as the SHA: a package built from a dirty
+tree is not described by its commit.
+
+## 2026-07-31 - A rule can load, log, and still have no code that runs it
+
+**What happened:** two `OBJECT_TYPE=MODEL` Template rules were defined in MetaRepoZeynep. They
+loaded, appeared verbatim in the connect-time rule dump (`rule#1180 [Template] MODEL. ...`), the
+UDP edit that should have triggered them was detected and logged (`[ModelUDP] 'Application'
+changed`), and then nothing. No apply, no skip, no error. The rules were correct; the add-in had
+no applier for their object type. `GetTemplateRules` was called from exactly two places, both
+with a hardcoded string literal (`"Column"`, `"PRIMARY KEY"`).
+
+**Why (the trap):** every observable signal said the feature was engaged. The rule loaded, so the
+DB was fine. The trigger fired, so the detection was fine. The engine had tests, so the renderer
+was fine. Each layer proved itself and none of them owned the question "is anyone going to call
+this?". A hardcoded literal at a call site is invisible to every check that looks at data,
+because it is not data.
+
+**How to apply:**
+1. When a correctly-defined rule does nothing, look for the CALL SITE before auditing the rule,
+   the loader, or the engine. Grep the accessor and read every argument. If the argument is a
+   literal, the set of things that can ever run is a closed list that no admin can see.
+2. Configuration whose handler is chosen by a literal needs a coverage check that compares the
+   loaded configuration against the handlers that exist, and says so at load time. Emit the
+   POSITIVE line too (`all object types have an applier`) - "no warning" is only evidence if you
+   can prove the check ran.
+3. A diagnostic that is compiled out of the shipped build is not a diagnostic. `LogDebug` is
+   `[Conditional("DEV_DIAGNOSTICS")]` and the symbol is defined only in non-packaged builds, so
+   `[TEMPLATE-COND]` - the line whose own comment calls it "the #1 why-didn't-my-rule-apply
+   question" - is exactly the line the customer never receives. Check the build flavour before
+   trusting the absence of a log line.
+4. Any pass that can end with zero actions must still say it ran, with counts. The missing
+   `applied=N skipped=M` line is what made this undiagnosable from a 4650-line log.
+5. When an enforcement write targets something a change detector watches, re-baseline from a
+   LIVE READ-BACK, never from the value you rendered. If the model normalises what it stores
+   (a trailing space is enough), a rendered-value baseline never matches and the detector fires
+   forever. That is the difference between a bounded self-write and a real loop.
+6. `ToLower()` on an object-type string is a tr-TR bug waiting for the letter I. `"Index"
+   .ToLower()` is `"ındex"` on the customer's machines and silently matches no switch arm. Use
+   `ToLowerInvariant` for anything compared against ASCII literals.

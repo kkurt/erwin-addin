@@ -62,7 +62,6 @@
 - If it feels hacky, stop and find a better way
 - Don't settle for "it works" if it can be elegant
 
-- Act as a professional Windows Form UX designer when making UI changes
 - Consider user experience and ease of use in every change
 - For complex UI changes, sketch out the design first and get feedback before implementation
 

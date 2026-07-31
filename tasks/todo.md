@@ -1,3 +1,109 @@
+# Value template: ayiraci VERI olarak yazma (ters bolu ile kacis) - 2026-07-30
+
+Kullanici: "split fonksiyonunda split karakteri '|' ise bunu kullanamiyoruz. Nasil kullanabiliriz?"
+
+TESPIT (bos bir prob testiyle dogrulandi, sonra silindi): delik `split`e ozgu degil. `|` dis
+seviyede (token -> segment), `:` ic seviyede (segment -> parca), `}` ise regex seviyesinde
+boldugu icin ucu de HICBIR argumanda ve HICBIR kaynak adinda yazilamiyordu - `replace`in iki
+argumani ve `{Udp:...}` adlari da ayni sekilde kapaliydi.
+
+KARAR (kullanici onayladi): ters bolu ile kacis. `\|`, `\:`, `\\` - baska dizi YOK, tanimsiz
+`\x` SERT HATA. `}` kacirilamaz: tokeni bitirir. Gerekcesi olculdu:
+- `\|` ve `||` bugun de hata veriyor -> geriye donuk kirilma YOK (9 katalogda VALUE_TEMPLATE
+  icinde tek bir ters bolu yok).
+- `}`'yi kacirilabilir yapmak icin token regex'ini degistirmek gerekirdi; bu, BUGUN CALISAN bir
+  sablonu (`{Name|replace:a:\}` -> `\X\`) sessizce duz metne cevirirdi. Tek tehlikeli degisiklik
+  buydu, disarida birakildi.
+
+- [x] `NamingTemplateEngine`: `SplitUnescaped` + `Unescape`/`TryUnescape`; dort bolme noktasi
+      (token, `{Current}` sekilli token, fonksiyon argumanlari, `ExtractSource`) ondan geciyor.
+- [x] Yapi HEP KODLANMIS metinden okunur, sadece cikarilan YAPRAK cozulur: `{Udp\:Name}` =
+      "Udp:Name" property'si, `{Udp:A\|B}` = "A|B" UDP'si. Kacirilmis ayirac hicbir asamada
+      yapisal ayirac sanilamaz.
+- [x] `ReferencesOwnProperty` / `ReferencesOwnUdp` cozulmus adla karsilastiriyor; cozulemeyen ad
+      (bozuk kacis) atlanir - hatayi zaten render sirasinda `TemplateResolutionException` verir.
+- [x] `next == '}'` dali YAZILDI ve SILINDI: token regex'i `}`de kestigi icin oraya asla
+      ulasilamiyor (test kanitladi). Yonlendirme askida-kacis mesajina tasindi.
+- [x] Testler: `NamingTemplateEngineTests` +24 (escape bolumu) -> `Passed: 1215`, `0 Warning(s)`.
+- [x] erwin-admin ikizi: `TemplateGrammar` (ayni uc dizi, ayni mesajlar), argumanlar
+      arity/bosluk/sayi kontrollerinden ONCE cozuluyor; serbest metin argumanli fonksiyonlarin
+      hata mesajina kacis ipucu eklendi. Web: `templateSources` kacissiz `|` ile boluyor,
+      `classifySource` adi cozuyor, `needsSeparatorEscapeHint` ile baglama duyarli tek satir not.
+      `MetaWeb.Api.Tests` 558, web vitest 1191 (derive 49 -> 64).
+
+ACIK: iki repo da commit edilmedi; gramer iki repoda AYNI dizeyi ayristirdigi icin `split` ile
+birlikte ES ZAMANLI yayina alinmali.
+
+---
+
+# BUG: Template kuralinin KENDI yazdigi isim, sozluk penceresini tekrar aciyor (2026-07-30)
+
+Kullanici raporu: "Template kural + domain like glossary birlikte tanimli. Kolon ekledim,
+sozlukten adi sectim, isim set edildi ve template kural apply edildi. Normalde burada durmasi
+gerekirken son template degisikligini de update olarak algilayip sozluk penceresini tekrar acti.
+Zinciri ilk baslatan islemden sonraki eventler digerini tetiklememeli."
+
+## Kanit (canli log, `%TEMP%\2\erwin-addin-debug.log`) - iki kez uretildi
+
+```
+10:20:30.965  DomainGlossary: renamed Table2.<default> -> TEST_ACKL      <- zinciri baslatan kullanici hareketi
+10:20:31.024  Glossary values applied for 'TEST_ACKL': 2/2 written
+10:20:31.134  [TEMPLATE-WRITE] column='TEST_ACKL' rule#1176 -> Physical_Name='Table2_TEST_ACKL_TEST'
+10:20:31.199  [TEMPLATE-APPLY] ...                                        <- ADD-IN'IN KENDI YAZMASI
+10:20:31.500  [PENDING-NAME] ... renamed to 'Table2_TEST_ACKL_TEST' during inline-edit
+10:20:31.530  Physical name changed: Table2.TEST_ACKL -> Table2_TEST_ACKL_TEST   <- kendi yazmamiz "kullanici degisikligi" sayildi
+```
+Ilk tekrarda picker'in gercekten yeniden acildiginin kaniti (68 sn acik kalip iptal edildi):
+`10:11:08.433  DomainGlossary pick cancelled (OPTIONAL_SILENT): Table2.Table2_abc_ADRES_TEST`
+
+## Kok neden
+
+`ApplyColumnTemplateRules` (ValidationCoordinatorService.cs:5661-5677) SCAPI'ye yaziyor ama
+`_attributeSnapshots[objectId]`'i GUNCELLEMIYOR. Bir sonraki tespit gecisinde
+`ProcessAttributeChanges` bunu taze bir yeniden adlandirma olarak goruyor (satir 7099-7111),
+`ValidateGlossary` -> `PromptDomainGlossary` zincirini yeniden calistiriyor. Latch
+(`_domainGlossaryApplied`) hala picker'in yazdigi 'TEST_ACKL'i tuttugu icin
+`ShouldSkipDomainGlossaryPrompt` false donuyor ve pencere tekrar aciliyor.
+
+Evin kurali zaten bu: satir 5462-5470'teki yorum "dependency writes done by
+`CheckAttributeUdpDependencies` update the snapshot inline, so ... they bypass the lock."
+Template yolu bu sozlesmeyi uygulamiyordu.
+
+## Yapilacaklar
+
+- [x] `ClassifyColumnTargetCode` (internal static, saf): hedef property kodunu snapshot
+      alanina esler (PhysicalName / PhysicalDataType / Udp / WatchedProperty).
+- [x] `NoteSelfWrittenColumnProperty(objectId, targetCode, value)`: commit sonrasi snapshot'i
+      YENIDEN TEMELLER. YAZMAK ISTEDIGIMIZ degeri kaydeder, canliyi geri okumaz - erwin'in
+      auto-uniquify duzeltmesi ('X' -> 'X__1070') hala gercek bir degisiklik olarak yakalanmali.
+- [x] `ApplyColumnTemplateRules` commit'inden hemen sonra cagir (`[SELF-WRITE]` log satiri).
+- [x] Testler: `tests/ErwinAddIn.Tests/SelfWriteSnapshotTests.cs`, 4 slot + UDP yolu +
+      bos/null girdi + kucultulmus repro.
+- [x] Build 0 warning + tum test suite: `Build succeeded. 0 Warning(s) 0 Error(s)` /
+      `Passed! - Failed: 0, Passed: 1191` (temel 1170 idi).
+
+## Duzeltme sonrasi iz (kod uzerinden dogrulandi)
+
+Snapshot template yazmasindan hemen sonra 'Table2_TEST_ACKL_TEST' oldugu icin:
+`[PENDING-NAME]` drenaji artik yeniden adlandirma gormuyor -> `ValidateGlossary` cagrilmiyor ->
+picker acilmiyor. Ayni drenajin tekrar tetikledigi `ApplyColumnTemplateRules` bos gecis:
+`{Table.Physical_Name}_{Current}_TEST` bu isimde sabit nokta, idempotency kontrolu atliyor.
+`RecheckAttributeAgainstSnapshot` de sapma gormuyor. Auto-uniquify duzeltmesi hala yakalanir
+cunku snapshot'a canli deger degil, YAZMAK ISTEDIGIMIZ deger kaydediliyor.
+
+## Kapsam disi birakilanlar (ayni sinif, kullaniciya raporlandi, DEGISTIRILMEDI)
+
+1. `ApplyGlossaryUdpValues`'in kendi yazmalari da geri okunuyor:
+   `Physical_Data_Type changed: Table2.TEST_ACKL 'char(18)' -> 'VARCHAR2(100)'` (log 10:20:31.121).
+   Burada zararsiz kaldi cunku DATATYPE_LIBRARY_ENABLED kapali; acikken sozlugun kendi tipi
+   datatype whitelist'ine sokulur. Metot her iki sozluk modunda da paylasilan bir yol.
+2. `ApplyPrimaryKeyRules`: template yazmasi (satir 5997) `_pkPropertySnapshots`'i guncellemiyor,
+   ayni metodun 6031'deki non-template gecisi kendi yazmamizi kullanici duzenlemesi sanip
+   "Apply automatically?" MODAL'i acabiliyor. Duzeltmek template ciktisinin prefix/suffix
+   uyarilarini susturur - davranis degisikligi oldugu icin onay bekliyor.
+
+---
+
 # Integrate YUZEYI addin'den tamamen kaldirildi, 2026-07-25 (Developed)
 
 Kullanici sirasiyla: (1) "Integrate tabina gerek yok, karta tasi", (2) kart yanlis
@@ -2421,3 +2527,561 @@ Kullanici kararlari:
 
 Verified: build 0 warn / 0 err (TreatWarningsAsErrors acik), testler 1037/1037.
 Canli erwin testi HENUZ YAPILMADI. NOT committed.
+
+# Domain Like Glossary: maplenen UDP yazilmiyor (2026-07-30)
+
+Sikayet: paket cikilan makinada Domain Like Glossary tanimi yapildi ve bir UDP maplendi;
+erwinde glossary secimi yapilinca o UDP bos kaldi. Log: `c:\work\erwin-addin-debug.log`
+(PID 22380, config 2017 ORACLE_CONFIG, corporate Akbank).
+
+## Logun soyledigi
+
+```
+12:02:43.379 DomainGlossaryService: Loaded 209 row(s) in 20 domain(s)  (son mapping okumasi 12:07:14)
+12:09:50.022 Set Definition to '...' from glossary
+12:09:50.022 Set Physical_Data_Type to 'VARCHAR2(255)' from glossary
+12:09:50.055 Glossary values applied for 'EV_ADRES': 2 mapping(s)
+```
+
+Apply yolu SAGLAM calisti: `row.Values` yalnizca IKI eleman tasiyordu (ikisi de
+ERWIN_PROPERTY), `TrySetUdp` HIC cagrilmadi (ne "Set ... using ...", ne "Could not set"
+satiri var). Yani hata yazma tarafinda degil, mapping satirinin add-in'e HIC ULASMAMASINDA.
+`row.Values` birebir `_valueMappings`'ten uretildigi icin: yuklenen value mapping sayisi = 2.
+
+Ayni logdaki ikinci kanit: `UdpSyncEngine.FetchSnapshot` 12:02'de 0 tanim, 12:09'da 3 tanim
+gorüyor. Yani admin tarafindaki UDP calismasi 12:02 - 12:09 penceresinde yapilmis. Glossary
+mapping'i ise en son 12:07:14'te okunmus ve o okumada 2 value mapping vardi.
+
+## Neden add-in bunu gormedi (asil kok neden)
+
+Model 12:08:54'te kapandi, 12:09:05'te tekrar acildi. `ModelConfigForm.LoadDomainGlossary`
+`if (!dg.IsLoaded) dg.LoadDomainGlossary();` diyordu; cache dolu oldugu icin reconnect'te
+mapping YENIDEN OKUNMADI (logda 12:09'da tek bir DomainGlossaryService satiri yok). Ustune
+model kapandiginda refresh timer'i 5 dakikadan 60 dakikaya dustu ("every 60 minute(s)").
+Sonuc: modelin kapatilip acilmasi, yani kullanicinin admin degisikligini yansitmak icin
+yaptigi tek hareket, hicbir sey yenilemiyordu.
+
+Bu tek basina yeterli aciklama, ama logdan AYIRT EDILEMEYEN iki alternatif daha vardi ve
+ikisi de gercek acikti:
+
+- `ClassifyRow` bir satiri SOURCE_COLUMN veya TARGET_FIELD bos oldugu icin `Ignored`
+  dondugunde `default: break;` ile SESSIZCE dusuruyordu (proje kurali: hata yutma yok).
+- Mapping secimi `TOP 1 / FETCH FIRST 1` idi, ORDER BY yok. Config icin iki DOMAIN_GLOSSARY
+  satiri varsa hangisine baglandigi query plan'a kaliyordu ve digerine kaydedilen mapping
+  kolonlari hic uygulanmiyordu. Log basarili yolda mapping ID'sini hic yazmiyordu.
+
+## Yapilanlar
+
+- `ModelConfigForm.LoadDomainGlossary`: connect'te kosulsuz `dg.Reload()`. Tanim (mapping
+  kolonlari VE `USE_DOMAIN_LIKE_GLOSSARY` bayragi) admin DB'sinde yasiyor; modeli kapatip
+  acmak modelcinin bu degisiklikten sonra yaptigi harekettir. Maliyet: model acilisi basina
+  bir repo round trip + bir external SELECT, ilk connect'in zaten odedigi maliyet.
+- `DomainGlossaryService.IsLoaded` artik config-scoped: `GlossaryService.IsLoadedForConfig`
+  paylasilan kararini cagiriyor (kural iki kopyaya ayrilmasin). `IsLoadedForConfig(int)`
+  dead code degil, ayni karara delege ediyor.
+- Dusurulen mapping satiri artik logda ve `LastWarning`'de nedeniyle gorunuyor
+  (`IgnoredReason`: SOURCE_COLUMN bos / TARGET_FIELD bos / ikisi de bos).
+- Yukleme artik hangi tanima bagladigini ve yazacagi TAM envanteri logluyor:
+  `DG_TABLE_MAPPING ID=<n> value mapping(s)=<k>: SRC->TYPE:FIELD [locked], ...`.
+  "UDP set edilmedi" sikayeti bundan sonra tek log satiriyla ayirt edilebilir.
+- Coklu DOMAIN_GLOSSARY tanimi artik ORDER BY ID ile deterministik secilir, tum ID'ler
+  uyariya yazilir, uyari connect ekraninda kullaniciya cikar (`AddConnectWarning`).
+- `Glossary values applied for 'X': N mapping(s)` dogru sayiyor: `written/total`, skipped ve
+  FAILED ayri. Eski satir `udpValues.Count` yaziyordu, yani iki yazma da patlasa "2
+  mapping(s)" diyordu.
+- `TrySetUdp` basarisizligi artik ilk COM hatasini logluyor (eskiden `Debug.WriteLine`,
+  yani production'da hicbir yere) ve bool donuyor.
+
+## Kullanici tarafinda dogrulanacak (o makinada)
+
+1. Admin > Glossary > Domain Like Glossary: UDP satirinin SOURCE_COLUMN'u dolu mu?
+2. Yeni pakette modeli kapat/ac; logda `value mapping(s)=3` gorunuyor mu?
+3. Gorunuyor ama yazilmiyorsa log artik "Could not set UDP ..." + gercek COM hatasini verir.
+
+Verified: ErwinAddIn.csproj rebuild 0 warn / 0 err (TreatWarningsAsErrors acik),
+testler 1105/1105. Canli erwin testi kullanici tarafinda. NOT committed.
+
+# Template `{Current}` token: self-referential sablonu YAKINSAK hale getir (2026-07-30)
+
+## Problem (canli kanit)
+Kural 1175 (MetaRepoTmp, config 2015): COLUMN.Physical_Name hedefli
+`{Table.Physical_Name}_{Physical_Name}`, FILL_MODE=Always, APPLY_ON=Both.
+Log: `[TEMPLATE-SKIP] column='abc' rule#1175: ... references its own target
+'Physical_Name' (self-referential - would loop)`.
+Guard DOGRU calisiyor: yazma kendisi bir degisiklik oldugu icin snapshot diff
+tekrar tetikler, `Table2_abc` -> `Table2_Table2_abc` -> ... siniriz buyume
+(2026-06-29 PK_PK_PK olayinin ayni sinifi). `rendered == current` idempotency
+kontrolu bunu ASLA yakalamaz.
+Asil eksik: "kolon adi = TabloAdi_KolonAdi" niyeti sistemde HIC ifade edilemiyor
+(Prefix kural tipi sabit string tasiyor, token desteklemiyor).
+
+## Karar: Secenek B - niyeti ACIK token ile ifade et
+Yeni kaynak token `{Current}` = HEDEF property/UDP'nin mevcut degeri.
+`{Physical_Name}` (ayni objenin property'si) ile karistirilamaz; bug'in tamami
+bu iki kavramin karismasindan cikti.
+
+### Semantik (sabit nokta)
+Sablon `L {Current} R` (L ve R baska token icerebilen, once render edilen parcalar):
+- `current` L ile basliyor VE R ile bitiyorsa -> seed = ortadaki parca
+- degilse -> seed = `current`'in tamami
+- sonuc = `L + chain(seed) + R`
+Bir yazmadan sonra sonuc L ile baslar / R ile biter, yani seed sabitlenir ve
+mevcut `rendered == current` idempotency kontrolu devreye girip yazmayi durdurur.
+Tam olarak bir kez yazar. Heartbeat basina transaction YOK.
+
+### Kisitlar (hem admin save-time hem runtime)
+1. Sablonda EN FAZLA BIR `{Current}`.
+2. `{Current}` + FILL_MODE=OnlyIfEmpty CELISKILI (hedef bossa `{Current}` bos
+   cozulur, NO-FALLBACK geregi hata) -> reddet.
+3. `{Current}` fonksiyon zinciri tasiyabilir, ama runtime CIFT-RENDER yakinsaklik
+   kontrolu yapar: `chain(chain(seed)) != chain(seed)` ise yazma, logla, atla.
+   (`replace:a:aa` gibi idempotent olmayan zincirleri yakalar.)
+4. Bos `current` -> `{Current}` bos cozulur -> mevcut NO-FALLBACK hatasi. `{Current}`
+   var olan bir degeri DONUSTURMEK icindir, sifirdan uretmek icin degil.
+5. Self-referential own-token (`{Physical_Name}` hedef Physical_Name iken,
+   `{Udp:X}` hedef UDP X iken) REDDEDILMEYE DEVAM EDER; mesaj artik `{Current}`
+   kullanmayi soyler.
+
+### Neden `{Current}` (isim gerekcesi)
+9 MetaRepo* DB'sinde tarandi: `Current` adinda PROPERTY_CODE YOK, MC_OBJECT_RELATION
+ALIAS YOK, hicbir VALUE_TEMPLATE bu token'i kullanmiyor. Cakisma sifir.
+`{Self}` reddedildi: "objenin kendisi" mi "hedefin mevcut degeri" mi belirsiz.
+Yeni FILL_MODE (`EnsureShape`) reddedildi: FILL_MODE "ne zaman yazilir" sorusunu
+cevaplar, "own token nasil yorumlanir" sorusunu degil; iki dik kavram birlesirdi.
+
+### Sema degisikligi YOK
+VALUE_TEMPLATE zaten nvarchar(2000). MetaShared kontrat degisikligi de YOK -
+`{Current}` sadece sablon metni. Yani B'nin maliyeti sadece admin validasyon +
+Rule Management UI yardim metni + dokuman.
+
+## Add-in tarafi plan (bu repo)
+- [x] 1. `NamingTemplateEngine`: `CurrentSourceName = "Current"` sabiti +
+      `ContainsCurrentToken(template)` (public, saf). `CurrentTokenConflictsWithFillMode`
+      da eklendi ki iki applier OnlyIfEmpty celiskisini string parse etmesin.
+- [x] 2. Sablonu ikiye bolen `RenderShaped` eklendi. Ayri public metot YERINE
+      `Render`'a opsiyonel `currentValue` parametresi verildi: tek giris noktasi
+      kaldi, `{Current}` yoksa davranis bayt ayni (varsayilan null). Duz token
+      degistirme `RenderTokens`'a tasindi, `ApplyChain` iki yerden paylasiliyor.
+      Birden fazla `{Current}` -> `TemplateResolutionException`.
+- [x] 3. Iki guard'in mesaji `{Current}` oneriyor (guard mantigi degismedi).
+      Ek olarak iki guard `{Current}` token'ini artik ATLIYOR: rezerve kaynak,
+      hedefin adi `Current` olsa bile self-referential sayilmamali.
+- [x] 4. Iki applier de: self-ref guard -> `{Current}`+OnlyIfEmpty celiskisi ->
+      hedefi RENDER'DAN ONCE oku -> `Render(..., currentVal)`. Ortak mantigin
+      tamami motorda; applier'lar sadece cagiriyor, kopyalanan mantik yok.
+- [x] 5. Testler (`NamingTemplateEngineTests`): sabit nokta, 5 seed senaryosu
+      (her biri ikinci render'da sabitleniyor), L/R'de baska tokenlar, Ordinal
+      strip, idempotent zincir, idempotent OLMAYAN zincir -> hata, bos current ->
+      hata, coklu `{Current}` -> hata, buyuk/kucuk harf + bosluk toleransi,
+      `{Current}` yokken `currentValue` tamamen yok sayiliyor.
+- [x] 6. Build 0 warning / 0 error (hem ana proje hem test projesi), tum suit
+      1140/1140 gecti (bu sinif 116).
+- [x] 7. Canli dogrulama YAPILDI (kullanici, pid 14944, 2026-07-30 23:10). Log:
+      ```
+      [PENDING-NAME] attr ... renamed to 'abc' during inline-edit
+      Physical name changed: Table2.<default> -> abc
+      [TEMPLATE-WRITE] column='abc' rule#1175 -> Physical_Name='Table2_abc'
+      [TEMPLATE-APPLY] column='abc' rule#1175 Physical_Name='Table2_abc'
+      Physical name changed: Table2.abc -> Table2_abc
+      Column rename re-validation: 'Table2.abc' -> 'Table2_abc' - re-running apply=Create naming rules
+      ```
+      Ikinci `Physical name changed` satiri applier'in GERCEKTEN tekrar
+      kostugunu kanitliyor (snapshot yazmadan once `abc` olarak kaydediliyor,
+      heartbeat diff'i gorup `fireTemplate` set ediyor) - ve IKINCI YAZMA YOK.
+      Sabit nokta unit testte degil CANLIDA tutuyor. Yeni oturumda sifir
+      `[TEMPLATE-SKIP]` / `[TEMPLATE-ERROR]`; sonraki ~2 dakikalik heartbeat'ler
+      sessiz (2026-06-29 kacak yazmasi ~400ms'de bir yaziyordu). Geri alma:
+      `UPDATE MC_NAMING_STANDARD SET VALUE_TEMPLATE = '{Table.Physical_Name}_{Physical_Name}' WHERE ID = 1175;`
+      NOT: admin ekrani `{Current}`'i henuz kabul etmiyor, kural SQL ile kuruldu.
+      Config 2015'te baska aktif kural yok, yani Prefix/Suffix ile cakisma riski
+      olmayan temiz bir test yatagi.
+
+## Ikincil bulgu (admin'e bildirilecek, add-in bug'i degil)
+9 DB taramasinda 3 kural fonksiyon zincirini PARANTEZ DISINA yazmis:
+- MetaRepoTarik #1195 `{Physical_Name}|left:3`
+- MetaRepoTarik #1196 `{Physical_Name}|replace:TPL:TMP`
+- MetaRepoDamla  #1173 `{Definition}|lower`
+Gramer zinciri SUSLU PARANTEZ ICINDE bekliyor (`{Physical_Name|left:3}`).
+Disaridaki `|left:3` duz metin sayilir ve `abc|left:3` gibi COP bir deger yazilir,
+hata da vermez. Admin save-time'da token disinda kalan `|` icin uyarmali/reddetmeli.
+
+# Logdan cikan 2 ilgisiz bulgu duzeltildi (2026-07-30)
+
+`{Current}` canli dogrulamasinin logunda goze carpan, `{Current}` ile ILGISI OLMAYAN
+iki sorun. Kullanici "once 2 ilgisiz seyi de duzelt" dedi.
+
+## 1. Session tracking 11 gundur OLU, sebebi log'da gorunmuyordu
+Log: `SessionTracking: startup: ApplySettings failed (best-effort): DbUpdateException:
+An error occurred while saving the entity changes. See the inner exception for details.`
+
+- **Kok sebep:** `ADDIN_SESSION.IS_AUTO_DDL_GENERATOR` kolonu `AddinSession`
+  entity'sinde var ama **9 canli MetaRepo* DB'sinin HICBIRINDE yok** (hepsi 12 kolon).
+  `erwin-admin/migrations/20260719_addin_session_auto_ddl_generator.sql` 2026-07-19'da
+  yazilmis, hicbir yere uygulanmamis. MetaRepoTmp'de EF'in attigi INSERT birebir
+  tekrarlandi: `Msg 207 ... Invalid column name 'IS_AUTO_DDL_GENERATOR'.`
+  Yani her addin acilisinda INSERT patliyor, oturum takibi hic calismiyor.
+- **Neden 11 gun fark edilmedi:** catch sadece `ex.Message` logluyordu.
+  EF Core'un `DbUpdateException.Message`'i "See the inner exception for details"
+  disinda HICBIR sey icermiyor; asil `SqlException` inner'da ve atiliyordu.
+- [x] `AddinLogger.Describe(Exception)` eklendi: zinciri
+      `Tip: mesaj -> IcTip: mesaj -> ...` olarak duzlestirir. Tek cocuklu
+      `AggregateException` acilir; derinlik 8'de kesilir (logger tek bir bozuk
+      exception yuzunden sinirsiz satir yazamaz).
+- [x] `SessionTrackingService`'teki 10 catch (`ex.Message` / `ex.GetType().Name`)
+      `AddinLogger.Describe(ex)`'e gecti. Ayrica 2 SESSIZ catch (`CurrentProcessId`,
+      `GetAppVersion`) artik logluyor - "hata yutma yasagi".
+- [x] Migration **sadece dev DB'ye** (MetaRepoTmp) uygulandi ve dogrulandi:
+      kolon `bit NOT NULL DEFAULT ((0))`, ayni INSERT artik basarili.
+- [x] 6 unit test (`AddinLoggerDescribeTests`): tam zincir, ise yaramaz dis mesaj,
+      tek/cok cocuklu aggregate, derinlik siniri, null.
+- [ ] **KULLANICI KARARI:** kalan 8 DB (MetaRepo, MetaRepoAkbank, MetaRepoDamla,
+      MetaRepoEmre, MetaRepoFiba, MetaRepoInitTest, MetaRepoTarik, MetaRepoZeynep)
+      hala kolonsuz - musteri DB'leri de dahil. Migration idempotent ve additive
+      ama bunlara uygulamak bir DEPLOY karari, sessizce yapilmadi.
+
+## 2. `PuLocatorReader: pu.Locator threw: RuntimeBinderException` gurultusu
+Bu bir hata degil: Mart'a bagli PU'larda `Locator` uyesi COM tarafinda HIC YOK,
+yani 4 asamali fallback zincirinin TASARLANMIS 1. asama sonucu. "threw" kelimesi
+her modelde bir hata gibi okunuyordu.
+- [x] `IsMemberAbsent(ex)` ayrimi: `RuntimeBinderException` veya
+      `COMException` HRESULT `DISP_E_MEMBERNOTFOUND`/`DISP_E_UNKNOWNNAME` ->
+      "is not exposed by this PU (...) - trying <sonraki asama>."
+      Baska her exception GERCEK hata, "threw:" + mesaj olarak kaliyor (greplenebilir).
+- [x] Ayni ayrim `PropertyBag()` / `PropertyBag(null,true)` asamalari icin de.
+
+## 3. (ek) Eski em-dash temizligi
+- [x] `ValidationCoordinatorService.cs:7130` yorumundaki em-dash `:` ile degistirildi.
+- [ ] Repoda 17 dosyada daha 89 satirlik ESKI em-dash var (hepsi yorum/XML doc).
+      Ayri, tamamen mekanik bir commit olarak silinebilir - istenirse.
+
+Verified: ana proje 0 warning / 0 error (TreatWarningsAsErrors acik), tum suit
+1146/1146 (6 yeni test). NOT committed.
+
+# Template motoruna 8. fonksiyon: `split:<ayirac>:<index>` (2026-07-30)
+
+Isteri: [tasks/template-current-token.md](template-current-token.md) "Ek is: split fonksiyonu".
+Admin (erwin-admin) tarafi BITTI ve `split` iceren kurali KAYDEDIYOR; add-in'de case
+olmadigi icin `ApplyFunction`'in `default` dali `TemplateResolutionException`
+firlatiyordu. **Iki taraf es zamanli yayina alinmali.**
+
+## Gramer
+```
+split:<ayirac>:<index>
+```
+- `<ayirac>`: serbest metin, VERBATIM (trim EDILMEZ) - `replace`'in argumanlari gibi.
+  Tek bosluk mesru: `{Name|split: :0}` = ilk kelime. BOS olamaz -> HARD ERROR.
+- `<index>`: 0 tabanli (mevcut `substr:start:len` ile ayni konvansiyon), negatif olamaz.
+- Diger tum argumanlar gibi `:` ve `|` iceremez (gramer ayiraclari).
+
+## Yapilanlar
+- [x] `NamingTemplateEngine.ApplyFunction` icine `case "split"`. Tek dispatch
+      noktasi orasi; add-in'de baska bir fonksiyon-adi whitelist'i YOK (dogrulandi).
+- [x] Ayirac bos -> "split needs a non-empty separator". Kontrol index parse'indan
+      ONCE, boylece iki argumani da bozuk bir segmentte mesaj deterministik.
+- [x] Bolme ORDINAL (`value.Split(separator, StringSplitOptions.None)`). Fonksiyon
+      ADI case-insensitive, ayirac DEGIL: `split:x:1` "X"i ayirac saymaz.
+- [x] Aralik disi index -> `string.Empty`; mevcut "chain produced an empty value"
+      kontrolu render'i iptal eder (fallback degil, `substr`'in start>=length
+      davranisinin aynisi). Ayni sey bos parca ureten hallerde de gecerli
+      (`_LEADING|split:_:0`).
+- [x] Sadece `parts[0]` (fonksiyon adi) trim ediliyor - `{ Name | split: :1 }`
+      hala tek bosluk ayiracini goruyor. Bu asimetri yorumda yaziya dokuldu.
+- [x] `{Current|split:...}` ek kod olmadan dogru: cift-render yakinsaklik kontrolu
+      `split:_:0`'i (sabit nokta) geciriyor, `split:_:1`'i ("A_B"->"B"->"") reddediyor.
+- [x] 24 yeni test: 4 isteri ornegi birebir, cok karakterli ayirac, ayirac yok,
+      bas/son bos parca, bosluk ayiraci, fonksiyon adi etrafinda bosluk, ordinal
+      buyuk/kucuk harf, zincirleme, 6 malformed varyant, related/UDP kaynaklari,
+      `{Current}` sabit nokta + salinan zincir reddi.
+- [x] Dokuman: sinif XML doc'u, `ApplyFunction` doc'u, arguman-trim yorumu,
+      `tasks/prefix-suffix-template.md` gramer satiri, `tasks/template-current-token.md`
+      durum notu.
+
+## Degismeyenler
+Sema YOK, MetaShared sozlesmesi YOK, diger 7 fonksiyonun davranisi AYNI
+(1146 mevcut testin tamami degismeden gecti).
+
+Verified: ana proje 0 warning / 0 error, tum suit 1170/1170. NOT committed.
+
+# Installer: yanlis yazilan parametre + build damgasi (2026-07-31)
+
+Rapor: "`-Silent` install'da calisiyor, uninstall'da calismiyor, yine `Press any key` geliyor".
+
+## Teshis
+`-Silent` bozuk DEGILDI. `install-impl.ps1` BASIT bir `param()` blogu kullaniyor, bu yuzden
+tanimadigi bir isim sessizce `$args`'a dusuyor ve script bastan sona calisip 0 donuyor.
+Olculen davranis (hepsi exit 0):
+
+    uninstall.bat -Silent  -> baglandi, bekleme yok
+    uninstall.bat -Slient  -> BAGLANMADI, tam kosu, "Press any key"
+    uninstall.bat /Silent  -> BAGLANMADI, `/Silent` POZISYONEL olarak $DBHost'a gitti
+
+Kullanicinin bir onceki mesaji zaten "yanlis yazmisim, `Slient` degil `Silent`" idi. Yani
+komut satirinda bir harf hatasi vardi ve arac bunu hic soylemedi.
+
+## Yapilanlar
+- [x] `param()` blogunun hemen altinda komut satiri denetimi: tanimlanmayan argumanlar
+      exit 2 ile REDDEDILIYOR, hicbir sey kurulmuyor/kaldirilmiyor. Oneri iki ucuz
+      kontrol: bas taraftaki `-`/`/` atildiktan sonra tam eslesme (`/Silent`), sonra
+      harfleri siralayip karsilastirma (`Slient` -> `Silent`). Fuzzy skor yok.
+- [x] `[CmdletBinding()]` OLCULDU ve REDDEDILDI: bedava reddediyor ama `-?` switch'ini
+      PowerShell kendi yakalayip hicbir sey basmiyor, `-?` ise belgelenmis yardim
+      switch'i.
+- [x] `$DBPassword` bilerek denetim disi: parola `-` veya `/` ile baslayabilir.
+- [x] `Write-UnattendedNotice`: unattended mod ACIKKEN banner'in altinda kendini
+      soyluyor, hangi sinyalle actigini da yaziyor (`-Silent` vs stdin yonlendirmesi).
+      Oncesinde `-Silent`'in tek kaniti otuz satir sonraki beklemenin YOKLUGU idi.
+- [x] Build damgasi: `install-impl.ps1` icinde `@@BUILD_STAMP@@` yer tutucusu,
+      `package.ps1` sadece PAKETLENEN kopyada `2026-07-31 14:47 f2c0901[+local]`
+      olarak degistiriyor. Repo kopyasi degismiyor. Yer tutucu bulunamazsa paketleme
+      `throw` ile duruyor (sessiz "working tree" paketi cikmasin diye). Banner'da ve
+      `-?` ciktisinda basiliyor; `-?` hicbir sey calistirmadigi icin musteriye telefonda
+      guvenle sordurulabiliyor.
+- [x] Exit kodu sozlesmesi: 0 temiz, 1 en az bir adim hatali, 2 hatali komut satiri.
+      Yardim ciktisinda ve `docs/INSTALL.md`'de yazili.
+- [x] Dokuman: `docs/INSTALL.md` "Mistyped switches are rejected, not ignored",
+      "Which build is this machine running?", exit kodu tablosu, package.ps1 sozlesmesi.
+- [x] `tasks/lessons.md`: teshis tuzagi + ajan konsensusunun kanit olmadigi maddesi.
+
+## Dogrulama
+- Arguman kapisi + build damgasi: 22/22 (gercek `install-impl.ps1` uzerinde, `.bat`
+  sarmalayicilari dahil; `-Uninstall -Slient` uninstall govdesine GIRMEDEN reddediliyor).
+- `package.ps1` STEP 5b blogu dosyadan kesilip gercek haliyle kosuldu: 14/14
+  (damga formati, gercek git SHA, `+local`, BOM korunmasi, yer tutucu yoksa `throw`,
+  repo kopyasinin dokunulmadigi).
+- Mevcut installer regresyonu: 45/45.
+- em-dash yok, iki script de temiz parse ediyor. NOT committed.
+
+# MODEL Template kurallari hic calismiyordu (2026-07-31)
+
+Rapor: "1180 ve 1181 nolu template kurallar tanimlandi (MetaRepoZeynep), modelde
+`Application` UDP'sini set ettim ama split kurali calismadi."
+
+## Teshis
+
+Bug gercek ve kural dogru yazilmis. DB'den dogrulandi (MetaRepoZeynep, config 1012):
+her iki satir da `OBJECT_TYPE=MODEL`, `RULE_TYPE=Template`, `TARGET_UDP_ID` 2/22
+(`ApplicationCode` / `ApplicationName`, ikisi de MODEL kapsamli), `IS_ACTIVE=1`,
+`APPLY_ON=Both`, `AUTO_APPLY=1`.
+
+Kok neden: **add-in'de MODEL kapsamli Template kurallarini calistiran hicbir kod yolu
+yoktu.** `GetTemplateRules` repo genelinde iki yerden cagriliyordu, ikisi de sabit
+literal ile: `"Column"` (ValidationCoordinatorService.cs:5598) ve `"PRIMARY KEY"`
+(:6011). Kural yukleniyor, connect dokumune basiliyor, sonra bir daha bakilmiyordu.
+
+Log da bunu dogruluyor: `[ModelUDP] 'Application' changed: '' -> 'UYG051 | ...'`
+satirindan sonra tek bir template satiri yok. `OnModelUdpChanged`'in tek abonesi
+`ModelConfigForm.HandleModelUdpChanged` ve o sadece DependencySet liste kaskadi yapiyor.
+
+Uc bagimsiz ajan iddiayi curutmeye calisti, ucu de basarisiz oldu. Biri kurallari
+gercek singleton'a seed edip olctu: `GetTemplateRules("MODEL")` iki kurali da dondurdu.
+Yani selector, UDP hedef destegi, `split` fonksiyonu ve MODEL UDP yazma primitifi
+zaten vardi; eksik olan tek sey cagri yeriydi.
+
+## Yol boyunca bulunan ek kusurlar
+
+- `NamingValidationEngine.ReadUdpValue`'da `"model"` kolu yoktu; `_ => "Entity"`'ye
+  dusuyordu. MODEL kuralinin `{Udp:X}` token'i `Entity.Physical.X` kuruyor, SCAPI
+  firlatiyor, kod erwin'in **Ingilizce hata metnini** string-match edip
+  `Model.Physical.X` fallback'ine geciyordu. Yani calismasi lokalize edilebilir bir
+  mesaja bagliydi.
+- Ayni switch `ToLower()` kullaniyordu. tr-TR'de `"Index".ToLower()` = `"ındex"`,
+  hicbir kola uymuyor ve INDEX kapsamli UDP okumalari sessizce Entity'ye gidiyordu.
+- `split` trim yapmiyor, `Render` de sonucu trimlemiyor. 1180/1181 bu haliyle
+  `"UYG051 "` ve `" Kurumsal Internet-Mobil Bankaciligi"` yazar. **Kodda otomatik trim
+  YAPILMADI** (sessiz donusum, yazim hatasini gizler); duzeltme admin tarafinda
+  sablona `|trim` eklemek. Motor testleriyle sabitlendi.
+- `LogDebug` paketlenmis build'de `[Conditional("DEV_DIAGNOSTICS")]` ile derlenip
+  atiliyor. Yani `[TEMPLATE-COND]` (kodun kendi yorumunda "kuralim neden calismadi
+  sorusunun 1 numarali cevabi" dedigi satir) musteriye hic ulasmiyor.
+
+## Yapilanlar
+
+- [x] `Services/TemplateRuleEvaluator.cs` (YENI): Template kuralinin SCAPI'siz karar
+      cekirdegi. `Evaluate(...)` -> Write / Skip (Ingilizce gerekce ile) / NoChange.
+      Mevcut iki applier ayni yedi adimi COM yuruyusunun icine gomdugu icin hicbir
+      birim testi yok; karar mantigini ayirmak testlenebilir hale getiriyor.
+- [x] `Services/TemplateApplierRegistry.cs` (YENI): applier'i olan OBJECT_TYPE'lar.
+      Mevcut iki applier artik literal yerine bu sabitleri geciriyor, boylece sabit
+      ile literal birbirinden ayrisamaz.
+- [x] `ValidationCoordinatorService.ApplyModelTemplateRules`: tetikleyici
+      `CheckModelUdpChanges`, dongunun ARDINDAN tek pass. Kullanici gesture'i oldugu
+      icin "kurallar sadece yeni nesnelere" kuralini ihlal etmiyor.
+- [x] Dongu kirici `NoteSelfWrittenModelUdp`: `_lastModelUdpValues` commit sonrasi
+      CANLI GERI OKUMA ile yeniden temellendiriliyor, `rendered` ile degil. erwin
+      degeri normalize ederse `rendered` ile temellendirmek kalici uyusmazlik ve her
+      taramada yeniden yazma uretirdi.
+- [x] Stored != rendered farki kural basina bir kez loglaniyor ve duzeltmeyi
+      (`|trim`) isimlendiriyor.
+- [x] AUTO_APPLY=true yazimlari icin OK modal, AUTO_APPLY=false icin tek Yes/No modal
+      (gesture basina bir tane, `current -> new` gosteriyor). Ikisi de
+      `ShowValidationModal` uzerinden, cunku bu yol heartbeat'ten kosuyor ve kendi
+      reentrancy bayragi yok.
+- [x] DDL worker unattended korumasi: headless kosuda hicbir modal acilmiyor;
+      AUTO_APPLY=false kurallari loglanip erteleniyor.
+- [x] `CheckModelUdpChanges` icindeki cıplak `catch { }` imza-kisitlamali
+      `LogModelUdpScanFailure` oldu. `OnModelUdpChanged` cagrisi kendi catch'ine
+      alindi (abone hatasi artik property okumasina yazilmiyor).
+- [x] Required-UDP restore dialogu `AddinMessageDialog.Show` yerine
+      `ShowValidationModal` uzerinden (ayni reentrancy deligi).
+- [x] `ModelConfigForm.ReportTemplateApplierCoverage`: connect'te applier'i olmayan
+      bir OBJECT_TYPE icin Log + `AddConnectWarning`; kapsam tamsa pozitif
+      `[TEMPLATE-SELFCHECK]` satiri (uyari yoklugu ancak kontrolun kostugu
+      kanitlanabiliyorsa anlamli).
+- [x] `NamingValidationEngine`: `"model" => "Model"` kolu + `ToLowerInvariant()`.
+
+## Kapsam disi birakilanlar
+
+- Column / PRIMARY KEY applier'larini yeni cekirdege tasimak. Ikisi de calisiyor ve
+  hicbir test kapsami yok; bug fix ile ayni degisiklikte tasimak olasi bir regresyonu
+  yanlis yere yazardi. Ayri bir is olarak, once karakterizasyon testleriyle.
+- `[TEMPLATE-COND]` / `[PK-TEMPLATE-COND]` satirlarini `LogDebug`'dan `Log`'a almak.
+  Gercek bir kusur ama farkli bir yol (kolon sicak yolu) ve kural basina latch
+  gerektiriyor.
+- Connect aninda toplu uygulama ve backfill butonu. Kullanici karari: gerek yok.
+- MODEL kuralinin model PROPERTY'sini hedeflemesi. Model ad property'leri
+  `CheckForModelChanges`'i (pencere basligi diff'i) besliyor, sablonla yeniden
+  adlandirma reconnect yoluna geri girerdi. Yuksek sesle reddediliyor.
+
+## Dogrulama
+
+- `ErwinAddIn.csproj` derleniyor: 0 hata, 0 uyari.
+- Tam test paketi: 1259/1259 gecti (oncesi 1215, +44 yeni test).
+- Yeni testler: `TemplateRuleEvaluatorTests` (17), `ModelTemplateRuleTests` (18),
+  `NamingTemplateEngineTests` icine 1180/1181'in gercek render ciktilari (bosluklar
+  dahil), `|trim` varyantlari ve pipe'siz degerde 1181'in hard-fail'i.
+- em-dash yok. NOT committed.
+
+## Musteride yapilmasi gereken (admin DB, kod degil)
+
+MetaRepoZeynep config 1012:
+- 1180: `{Udp:Application|split:\|:0}` -> `{Udp:Application|split:\|:0|trim}`
+- 1181: `{Udp:Application|split:\|:1}` -> `{Udp:Application|split:\|:1|trim}`
+
+`|trim` mutlaka `split`'ten SONRA gelmeli; once trimlemek ikinci parcadaki bastaki
+boslugu birakir.
+
+## Review turu (4 lens + refutation) sonrasi duzeltmeler
+
+Kendi kodum 4 lensle (loop/reentrancy, correctness, project-rules, UX) denetlendi.
+Gercek cikan ve duzeltilenler:
+
+- [x] **`NoteSelfWrittenModelUdp`'in geri okumasi hicbir zaman firlatmiyordu.**
+      `ReadScapiProperty` her hatayi tasarim geregi `""`'ye esliyor, yani `catch` olu
+      koddu ve basarisiz okumada baseline BOS yaziliyordu. Artik `root.Properties(...)`
+      dogrudan okunuyor ve hata yolu bu metoda ait.
+- [x] **`CheckModelUdpChanges`'in kendi reentrancy bayragi yoktu.** DependencySet
+      kaskadi dongunun ICINDE tum metamodel Property_Type yuruyusunu yapiyor ve bu
+      WM_TIMER pompaliyor. `_modelUdpScanInProgress` eklendi, `finally`'de birakiliyor.
+- [x] **Yakinsamayan kural artik oturum boyu susturuluyor.** Model rendered'dan farkli
+      bir sey sakladiysa idempotency kontrolu asla tutmaz; onceki halde kural her model
+      UDP degisikliginde yeniden yazar ve yeniden modal acardi. Simdi ilk kanittan sonra
+      `[MODEL-TEMPLATE-SUPPRESSED]` ile reddediliyor ve duzeltme isimlendiriliyor.
+- [x] **Required-UDP restore modalinin unattended korumasi yoktu** (kendi kardesinde
+      vardi). Headless DDL worker'i sonsuza kadar bloklayabilirdi.
+- [x] **Self-check "beyan edilen vs erisilebilir" karsilastirmasina cevrildi.**
+      `HasApplier` normalize ederek karsilastiriyor, `GetTemplateRules` ise applier'in
+      literaline `OrdinalIgnoreCase` bakiyor; ustelik bos VALUE_TEMPLATE / hedefsiz
+      satirlari da atiyor. Yani eski hali, applier'in hicbir zaman almayacagi bir kurali
+      "kapsandi" diye onaylayabiliyordu. Artik dogrudan selector'a soruluyor.
+- [x] **Modal ve loglarda degerler tirnak icinde.** Bu ozelligin gostermesi gereken
+      fark cogu zaman bastaki/sondaki bosluk; tirnaksiz satirda gorunmez.
+- [x] **Modallar neden aciklandiklarini soyluyor** (hangi UDP degisikligi tetikledi) ve
+      onay diyalogu modelin dirty olacagini yaziyor.
+- [x] `[MODEL-TEMPLATE-APPLY]` artik eski degeri de yaziyor (`'X' -> 'Y'`); Always ile
+      yapilan bir uzerine yazma sonradan yeniden kurulamiyordu.
+- [x] Kismi basarisizlik kullaniciya soyleniyor; hicbiri yazilamadiysa ayri bir uyari.
+- [x] Sifir MODEL kurali durumu oturumda bir kez loglaniyor (her gesture'da degil).
+- [x] Reentrancy guard'indan sessiz cikis kalmadi; `pass complete` ozeti `finally`'de.
+- [x] COM hatalari `ex.Message` yerine `AddinLogger.Describe(ex)` ile.
+- [x] Evaluator: ozel ERROR_MESSAGE varken bile basarisiz TOKEN da rapor ediliyor.
+- [x] Evaluator: bilinmeyen TEMPLATE_FILL_MODE artik SCAPI okumasindan ve render'dan
+      ONCE yakalaniyor (yapisal kontrol, satirin ozelligi).
+- [x] Yanlislikla eklenmis UTF-8 BOM geri alindi.
+
+Reddedilenler: "iki modal per gesture" (baseline zaten olay oncesi yaziliyor, ikinci
+pass NoChange dondurur), "{Current} sinirsiz buyur" (RenderShaped'in L/R seed-strip'i
+yakinsatiyor). Kapsam disi birakilan pre-existing kusurlar: required-UDP restore
+yazimi basarisiz olursa 1 Hz modal dongusu (WriteUdpValues per-key hatalari yutuyor),
+bos MODEL UDP temizliginde baseline'in bayatlamasi, `InitializeModelUdpTracking`
+icindeki uc ciplak catch.
+
+Son durum: derleme 0 hata 0 uyari, test 1260/1260, em-dash 0, BOM temiz. NOT committed.
+
+### Refutation turunun okunmasi (dikkat)
+
+Verify fazi 32 bulgunun 32'sini "refuted" isaretledi, ama **bu temiz kagit degil**:
+duzeltmeleri agentlar kosarken yaptim, yani hareketli bir hedefi okudular. Ornekler:
+BOM reddi "dosyada hicbir yerde BOM yok" diyor (ben o agent kosmadan once kaldirmistim);
+self-check reddi ise dogrudan BENIM YENI YAZDIGIM kodu alintiliyor ("Grouped on RAW
+admin OBJECT_TYPE...", "reachability probe"). Yani red, duzeltmenin kanitiydi.
+
+Iki bulguyu kendim bagimsiz dogruladim ve dogru cikti:
+- `ReadScapiProperty` (:5936-5956) her hatayi `""`'ye esliyor -> catch olu koddu.
+- `HasApplier` normalize edip karsilastiriyor, `GetTemplateRules` ise applier'in
+  literaline `OrdinalIgnoreCase` bakiyor. `OBJECT_TYPE='PRIMARY_KEY'` icin HasApplier
+  true, GetTemplateRules("PRIMARY KEY") ise satiri DONDURMEZ. Eski self-check bu kurali
+  "kapsandi" diye onaylardi.
+
+Ayrica son turda KENDI soktugum bir hatayi yakaladim: `_modelTemplateSuppressed` hicbir
+yerde temizlenmiyordu, ama XML doc'u "reconnect'te temizlenir" diyordu. Sablonu duzelten
+admin, erwin'i yeniden baslatana kadar kuralin olu kalmasiyla karsilasirdi. Uc rebaseline
+noktasina da eklendi.
+
+Son durum: derleme 0 hata 0 uyari, test 1260/1260, em-dash 0, BOM temiz,
+`ValidationCoordinatorService.cs` diff'i 741/30 (hedefli hunk'lar, tam dosya yeniden
+yazimi degil). NOT committed.
+
+# Log gurultusu + Turkce hardcoded UI metinleri (2026-08-01)
+
+MODEL template dogrulamasi sirasinda logda takildigim iki sey.
+
+## 1. Model.Definition "did not surface" YANLIS ALARM DEGIL, ama oyle okunuyordu
+
+Once bug sandim: log "KKR (Comment)" diyor ama okuma `Model.Definition` yapiyor. YANLISTI.
+`(Comment)` sadece `FriendlyPropertyLabel`'in urettigi ekran etiketi; `WriteAccessorFor`
+"Definition"i aynen donduruyor. Okuyan da yazan da ayni property.
+
+Gercek mekanizma **sparse storage**: `Model.Definition` hic set edilmemisken okuma COM
+istisnasi firlatir, set edildikten sonra okunur. Kanit, yazim sonrasi yeniden okumanin
+(:3938) logda iz birakmamasi:
+
+    20:48:01.226  did not surface 'Model.Definition'     <- iptal sonrasi, hala bos
+    20:48:02.916  Model required field filled: KKR (Comment) = 'gggg...'
+    20:48:03.104  [ERWIN-BLOCK] ...                       <- "did not surface" YOK
+
+00:47'de yeniden sorulmasinin sebebi: doldurmadan oturum sonuna kadar logda model kaydi
+yok. SCAPI yazimlari Mart'a kaydedilene kadar bellekte. **Bug yok, davranis dogru.**
+
+Ama mesaj kotuydu: "SCAPI did not surface 'Model.Definition'" + 200 karakterlik COM metni,
+validation pass basina 3 kez. Normal durumu kusur gibi gosteriyor ve beni de yaniltti.
+
+- [x] `ValidationCoordinatorService.IsPropertyNotSet(ex)` eklendi: erwin'in
+      "does not use a property of <X> type" ifadesini tanir.
+- [x] Uc okuma noktasi (Model :3798, Column :9327, Entity TableTypeMonitorService :2971)
+      artik ayirt ediyor: set edilmemis ise tek kisa satir, BASKA bir istisna ise tam
+      metin `AddinLogger.Describe` ile. Gercek okuma hatasini rutin olanin arkasina
+      saklamiyor.
+- [x] `LogDebug` KULLANILMADI. Ilk denememde kullandim ve geri aldim: paketlenmis build'de
+      derlenip atiliyor, yani musteri gormuyor. Bu tam da lessons.md'ye yazdigim madde.
+- [x] `PropertyNotSetDetectionTests` (7 test): canli erwin mesaji birebir, buyuk/kucuk harf,
+      ve gercek hatalarin (RPC unavailable, AV, bos) yanlislikla eslesmemesi. Ayrica
+      `NamingValidationEngine.IsNotOnThisClass`'in "not valid class" sinyaliyle ayrisik
+      kaldigi sabitlendi - ikisi karisirsa yanlis yonlendirilmis UDP okumasi zararsiz
+      gorunurdu.
+
+## 2. Hardcoded Turkce UI metinleri (CLAUDE.md ihlali)
+
+Kural: "Hardcoded UI strings must be English, Turkish only from admin-DB message columns".
+
+- [x] `ValidationCoordinatorService.cs:3928` model alani yazilamadi dialogu -> Ingilizce
+- [x] `ValidationCoordinatorService.cs:5005` kilitli UDP revert hatasi dialogu -> Ingilizce
+- [x] `ModelConfigForm.cs:6441` From-DB "diyagramda entity secin" hatasi -> Ingilizce.
+      Bu `err` degiskenine gidiyor ve :7064'te `ShowTopMostMessage` ile kullaniciya
+      gosteriliyor; ayni degiskene yapilan diger butun atamalar zaten Ingilizceydi.
+
+BIRAKILANLAR: `ModelConfigForm.cs:5434` ve `:6528` Turkce, ama bunlar
+`NativeBridgeService.StepCheckpoint` cagrilari. `_stepCheckpoint` delegesi bagli
+degilse metot sessizce no-op (:261-263), yani siyah-dikdortgen arastirmasi icin
+kullanilan dev-only adim ayiklama araci; musteri surface'i degil. Dokunmadim.
+
+Dogrulama: derleme 0 hata 0 uyari, test 1270/1270 (+10). NOT committed.
