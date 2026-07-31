@@ -273,6 +273,44 @@ if (Test-Path $packagedComHost) {
 [System.IO.File]::Copy((Join-Path $scriptDir "installer\watcher-control.ps1"), (Join-Path $publishDir "watcher-control.ps1"), $true)
 [System.IO.File]::Copy((Join-Path $scriptDir "scripts\autostart-watcher.ps1"), (Join-Path $publishDir "autostart-watcher.ps1"), $true)
 
+# STEP 5b: Stamp the build identity into the PACKAGED install-impl.ps1 only.
+# The repo copy keeps its '@@BUILD_STAMP@@' placeholder and reports itself as a
+# working-tree run, so nobody has to remember to revert a generated value and
+# git never sees a spurious diff.
+#
+# The stamp is what a support screenshot shows under the install banner. Build
+# time answers "how old is this?"; the git short SHA answers "which code?"; the
+# "+local" marker warns that uncommitted changes went into it, which is exactly
+# the situation that made a field report ambiguous on 2026-07-31.
+$implDst = Join-Path $publishDir "install-impl.ps1"
+$gitDesc = "no-git"
+try {
+    $sha = (& git -C $scriptDir rev-parse --short HEAD 2>$null)
+    if ($LASTEXITCODE -eq 0 -and $sha) {
+        $dirty = (& git -C $scriptDir status --porcelain 2>$null)
+        $gitDesc = if ($dirty) { "$sha+local" } else { "$sha" }
+    }
+} catch {
+    # git missing or this is not a checkout: the timestamp alone still beats
+    # nothing, but say WHY the SHA is absent instead of printing a bare stamp.
+    $gitDesc = "no-git ($($_.Exception.Message))"
+}
+$buildStamp = "{0} {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm'), $gitDesc
+
+# Preserve the BOM state of the original file: rewriting a script's bytes is not
+# the place to silently change its encoding.
+$implBytes = [System.IO.File]::ReadAllBytes($implDst)
+$implHasBom = ($implBytes.Length -ge 3 -and $implBytes[0] -eq 0xEF -and $implBytes[1] -eq 0xBB -and $implBytes[2] -eq 0xBF)
+$implText = [System.IO.File]::ReadAllText($implDst)
+if ($implText -notmatch [regex]::Escape('@@BUILD_STAMP@@')) {
+    # Hard failure on purpose. A renamed variable or a reworded placeholder must
+    # not quietly produce packages that all claim to be "working tree" builds,
+    # because that is precisely the diagnostic this stamp exists to provide.
+    throw "Build stamp placeholder '@@BUILD_STAMP@@' not found in installer\install-impl.ps1. Restore it (see the 'Build identity' block near the top of that script) or fix this step."
+}
+[System.IO.File]::WriteAllText($implDst, $implText.Replace('@@BUILD_STAMP@@', $buildStamp), (New-Object System.Text.UTF8Encoding($implHasBom)))
+Write-Host "  Stamped build identity: $buildStamp" -ForegroundColor Cyan
+
 # DDL-generator flavor: ship the bootstrap model next to install-impl.ps1. Its
 # PRESENCE is what tells install-impl.ps1 to configure DDL-gen watcher mode
 # (install.bat cannot pass -DdlGenerator). A normal package never contains it,
