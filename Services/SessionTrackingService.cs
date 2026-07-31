@@ -149,7 +149,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
             catch (Exception ex)
             {
-                Log($"Start failed (best-effort, tracking off): {ex.GetType().Name}: {ex.Message}");
+                Log($"Start failed (best-effort, tracking off): {AddinLogger.Describe(ex)}");
             }
         }
 
@@ -165,11 +165,11 @@ namespace EliteSoft.Erwin.AddIn.Services
             if (Interlocked.CompareExchange(ref _started, 1, 0) == 0)
             {
                 try { AppDomain.CurrentDomain.ProcessExit += OnProcessExit; }
-                catch (Exception ex) { Log($"ReloadSettings ProcessExit hook error: {ex.Message}"); }
+                catch (Exception ex) { Log($"ReloadSettings ProcessExit hook error: {AddinLogger.Describe(ex)}"); }
             }
 
             try { Task.Run(() => ApplySettings("reload")); }
-            catch (Exception ex) { Log($"ReloadSettings dispatch failed (best-effort): {ex.Message}"); }
+            catch (Exception ex) { Log($"ReloadSettings dispatch failed (best-effort): {AddinLogger.Describe(ex)}"); }
         }
 
         /// <summary>
@@ -225,7 +225,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
                 catch (Exception ex)
                 {
-                    Log($"{reason}: ApplySettings failed (best-effort): {ex.GetType().Name}: {ex.Message}");
+                    Log($"{reason}: ApplySettings failed (best-effort): {AddinLogger.Describe(ex)}");
                 }
             }
         }
@@ -340,7 +340,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
             catch (Exception ex)
             {
-                Log($"heartbeat failed (best-effort): {ex.GetType().Name}: {ex.Message}");
+                Log($"heartbeat failed (best-effort): {AddinLogger.Describe(ex)}");
             }
             finally
             {
@@ -363,7 +363,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
             catch (Exception ex)
             {
-                Log($"graceful close failed (best-effort): {ex.GetType().Name}: {ex.Message}");
+                Log($"graceful close failed (best-effort): {AddinLogger.Describe(ex)}");
             }
         }
 
@@ -381,7 +381,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
             catch (Exception ex)
             {
-                Log($"force exit failed (best-effort): {ex.GetType().Name}: {ex.Message}");
+                Log($"force exit failed (best-effort): {AddinLogger.Describe(ex)}");
             }
         }
 
@@ -400,7 +400,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
             catch (Exception ex)
             {
-                Log($"NotifyHostClosing failed (best-effort): {ex.GetType().Name}: {ex.Message}");
+                Log($"NotifyHostClosing failed (best-effort): {AddinLogger.Describe(ex)}");
             }
         }
 
@@ -441,7 +441,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
             catch (Exception ex)
             {
-                Log($"WriteEndTime failed (best-effort): {ex.GetType().Name}: {ex.Message}");
+                Log($"WriteEndTime failed (best-effort): {AddinLogger.Describe(ex)}");
             }
         }
 
@@ -460,14 +460,18 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
             catch (Exception ex)
             {
-                Log($"StopTimer failed (best-effort): {ex.GetType().Name}: {ex.Message}");
+                Log($"StopTimer failed (best-effort): {AddinLogger.Describe(ex)}");
             }
         }
 
         private static int CurrentProcessId()
         {
             try { return System.Diagnostics.Process.GetCurrentProcess().Id; }
-            catch { return 0; }
+            catch (Exception ex)
+            {
+                Log($"could not read the process id: {AddinLogger.Describe(ex)}");
+                return 0;
+            }
         }
 
         private static string GetAppVersion()
@@ -479,10 +483,13 @@ namespace EliteSoft.Erwin.AddIn.Services
                 if (!string.IsNullOrWhiteSpace(info)) return info;
                 return asm.GetName().Version?.ToString() ?? "unknown";
             }
-            catch
+            catch (Exception ex)
             {
                 // Version is cosmetic metadata; an unreadable attribute must not
-                // abort tracking. Fall back to a marker rather than throw.
+                // abort tracking. Fall back to a marker rather than throw - but
+                // say so, otherwise "unknown" in APP_VERSION looks like a build
+                // that simply forgot to stamp itself.
+                Log($"could not read the assembly version: {AddinLogger.Describe(ex)}");
                 return "unknown";
             }
         }

@@ -1204,6 +1204,15 @@ namespace EliteSoft.Erwin.AddIn.Services
                 return null;
             }
             log?.Invoke($"NativeBridge: hidden wizard opened at hwnd=0x{_hiddenWizardHwnd.ToInt64():X}");
+
+            // Try the Object Filter harvest HERE, while the wizard has just been created and is
+            // still alive. The attempt after the direct invoke is too late: the invoke tears the
+            // wizard down before it returns (log 2026-07-29 - "alter wizard CLOSED" precedes
+            // "direct-invoke returned", and the probe then sees no child windows at all).
+            // Cheap and passive (a tree read, no clicks), and a no-op once harvested, so it costs
+            // nothing on the routes that already have the selection.
+            try { MartMartAutomation.TryHarvestObjectFilterSelectionFrom(_hiddenWizardHwnd, log); }
+            catch (Exception ex) { log?.Invoke($"NativeBridge: early Object Filter harvest threw: {ex.Message}"); }
             // The FEW-CTOR hook fires synchronously during wizard creation,
             // so g_capturedFEWPO is now set to the live wizard's options.
 

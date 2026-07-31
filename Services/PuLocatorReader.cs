@@ -7,7 +7,8 @@ namespace EliteSoft.Erwin.AddIn.Services
     /// Reads the <c>Locator</c> string of a SCAPI persistence unit through the
     /// fallback chain that has proven necessary on erwin DM r10.10:
     /// <list type="number">
-    ///   <item><c>pu.Locator</c> direct property (often "" for fresh Mart PUs).</item>
+    ///   <item><c>pu.Locator</c> direct property (often "" for fresh Mart PUs,
+    ///         and on Mart-bound PUs the member is absent altogether).</item>
     ///   <item><c>pu.PropertyBag().Value("Locator")</c>.</item>
     ///   <item><c>pu.PropertyBag(null, true).Value("Locator")</c> (bag with derived strings).</item>
     ///   <item>erwin main window title, e.g.
@@ -70,7 +71,7 @@ namespace EliteSoft.Erwin.AddIn.Services
             }
             catch (Exception ex)
             {
-                log?.Invoke($"PuLocatorReader: pu.Locator threw: {ex.GetType().Name}: {ex.Message}");
+                log?.Invoke(DescribeAttempt("pu.Locator", ex, "the property bag"));
                 return string.Empty;
             }
         }
@@ -86,9 +87,40 @@ namespace EliteSoft.Erwin.AddIn.Services
             catch (Exception ex)
             {
                 string variant = useDerivedValues ? "PropertyBag(null,true)" : "PropertyBag()";
-                log?.Invoke($"PuLocatorReader: pu.{variant}.Value(Locator) threw: {ex.GetType().Name}: {ex.Message}");
+                string next = useDerivedValues ? "the window title" : "the derived-value bag";
+                log?.Invoke(DescribeAttempt($"pu.{variant}.Value(Locator)", ex, next));
                 return string.Empty;
             }
+        }
+
+        /// <summary>
+        /// Phrases one failed stage of the chain. A member that this PU flavor
+        /// simply does not expose is the EXPECTED entry point into the next
+        /// stage - Mart-bound PUs on r10.10 have no <c>Locator</c> member at
+        /// all - so it must not read like a fault. Anything else IS a fault
+        /// (a live call that failed) and keeps the louder "threw" wording so
+        /// it stays greppable.
+        /// </summary>
+        private static string DescribeAttempt(string call, Exception ex, string nextStage) =>
+            IsMemberAbsent(ex)
+                ? $"PuLocatorReader: {call} is not exposed by this PU ({ex.GetType().Name}) - trying {nextStage}."
+                : $"PuLocatorReader: {call} threw: {ex.GetType().Name}: {ex.Message} - trying {nextStage}.";
+
+        /// <summary>
+        /// True when the exception means "this object has no such member",
+        /// rather than "the call was made and failed". Late-bound COM reports
+        /// that two ways: the C# binder raises
+        /// <c>RuntimeBinderException</c>, and IDispatch itself answers
+        /// DISP_E_UNKNOWNNAME / DISP_E_MEMBERNOTFOUND.
+        /// </summary>
+        private static bool IsMemberAbsent(Exception ex)
+        {
+            if (ex is Microsoft.CSharp.RuntimeBinder.RuntimeBinderException) return true;
+
+            const int DISP_E_MEMBERNOTFOUND = unchecked((int)0x80020003);
+            const int DISP_E_UNKNOWNNAME = unchecked((int)0x80020006);
+            return ex is System.Runtime.InteropServices.COMException com
+                && (com.HResult == DISP_E_MEMBERNOTFOUND || com.HResult == DISP_E_UNKNOWNNAME);
         }
 
         /// <summary>
