@@ -83,6 +83,7 @@ namespace EliteSoft.Erwin.AddIn.Services
         private bool _isEnabled;
         private bool _isLoaded;
         private string _lastError;
+        private string _lastWarning;
         private int _loadedConfigId = -1;
 
         // Cached effective flag + the config it was read for. ConfigContextService.GetEffective
@@ -114,9 +115,32 @@ namespace EliteSoft.Erwin.AddIn.Services
             return _flagValue;
         }
 
-        public bool IsLoaded => _isLoaded;
+        /// <summary>
+        /// True only when a successful load exists AND it was captured under the config that is
+        /// active NOW - the same contract as <see cref="GlossaryService.IsLoaded"/>, and the reason
+        /// the shared decision is reused rather than re-implemented. Without the config check the
+        /// uniform <c>if (!IsLoaded) LoadDomainGlossary()</c> callers would validate a newly opened
+        /// model against the PREVIOUS model's mapping (an MDI switch flips
+        /// <see cref="ConfigContextService.ActiveConfigId"/>).
+        /// </summary>
+        public bool IsLoaded =>
+            GlossaryService.IsLoadedForConfig(_isLoaded, _loadedConfigId, CurrentConfigId());
+
+        /// <summary>ActiveConfigId at "now", using the SAME formula the load path stamps
+        /// <see cref="_loadedConfigId"/> with; ConfigContext not initialized -&gt; -1.</summary>
+        private static int CurrentConfigId() =>
+            ConfigContextService.Instance.IsInitialized ? ConfigContextService.Instance.ActiveConfigId : -1;
 
         public string LastError => _lastError;
+
+        /// <summary>
+        /// Non-fatal problems found by the last load: a duplicate DOMAIN_GLOSSARY definition, or a
+        /// mapping row that had to be dropped. The load still succeeded, so <see cref="LastError"/>
+        /// stays null - but these are exactly the states in which an admin-side mapping looks
+        /// "configured but ignored", so the connect path surfaces them instead of burying them.
+        /// Null when the last load was clean.
+        /// </summary>
+        public string LastWarning => _lastWarning;
 
         /// <summary>Total number of cached (domain, column) rows.</summary>
         public int Count => _byDomain.Values.Sum(d => d.Count);
@@ -216,6 +240,24 @@ namespace EliteSoft.Erwin.AddIn.Services
         }
 
         /// <summary>
+        /// Why <see cref="ClassifyRow"/> called a row <see cref="MappingRole.Ignored"/>, in the
+        /// admin's own vocabulary. A dropped row is the one failure mode that looks IDENTICAL to a
+        /// working setup from erwin's side - the mapping exists in the admin screen, the glossary
+        /// loads, the picker opens, and the field is simply never written - so the reason has to
+        /// reach the log. Returns "" for a row that is NOT ignored.
+        /// </summary>
+        internal static string IgnoredReason(string sourceColumn, string targetField)
+        {
+            bool noSource = string.IsNullOrEmpty(sourceColumn);
+            bool noTarget = string.IsNullOrEmpty(targetField);
+
+            if (noSource && noTarget) return "SOURCE_COLUMN and TARGET_FIELD are both empty";
+            if (noSource) return "SOURCE_COLUMN is empty";
+            if (noTarget) return "TARGET_FIELD is empty";
+            return "";
+        }
+
+        /// <summary>
         /// TARGET_TYPE for a TARGET_FIELD (UDP / ERWIN_PROPERTY / DB_PROPERTY), or null when the
         /// field is not mapped. Same contract as <see cref="GlossaryService.GetTargetType"/> so it
         /// can be handed to the shared apply path as a delegate.
@@ -242,7 +284,8 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// Mirrors <c>GlossaryService.IsLoadedForConfig</c>: a stale cache from a previously
         /// opened model must not be consulted.
         /// </summary>
-        public bool IsLoadedForConfig(int configId) => _isLoaded && _loadedConfigId == configId;
+        public bool IsLoadedForConfig(int configId) =>
+            GlossaryService.IsLoadedForConfig(_isLoaded, _loadedConfigId, configId);
 
         /// <summary>
         /// Re-reads the definition. Also drops the cached mode flag so an admin-side toggle of
@@ -269,7 +312,9 @@ namespace EliteSoft.Erwin.AddIn.Services
             // last good data in place rather than blanking the popup. Every field is replaced only
             // once its new value is fully read.
             _lastError = null;
+            _lastWarning = null;
             var sw = System.Diagnostics.Stopwatch.StartNew();
+            var warnings = new List<string>();
 
             try
             {
@@ -319,6 +364,12 @@ namespace EliteSoft.Erwin.AddIn.Services
                     conn.Open();
                     tRepoOpen = sw.ElapsedMilliseconds;
 
+                    // Every DOMAIN_GLOSSARY row of this config is read, not just one: a second
+                    // definition is invisible from erwin (the markers resolve, the glossary loads,
+                    // the picker opens) yet the mapping columns saved on the OTHER row never apply.
+                    // Ordering by ID makes the choice deterministic - the previous unordered
+                    // "TOP 1 / FETCH FIRST 1" left it to the query plan.
+                    var mappingIds = new List<int>();
                     using (var cmd = DatabaseService.Instance.CreateCommand(GetMappingQuery(repoDbType), conn))
                     {
                         var pCfg = cmd.CreateParameter();
@@ -328,14 +379,28 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                         using (var reader = cmd.ExecuteReader())
                         {
-                            if (reader.Read())
+                            while (reader.Read())
                             {
-                                mappingId = Convert.ToInt32(reader["ID"]);
+                                mappingIds.Add(Convert.ToInt32(reader["ID"]));
+                                if (mappingId != null) continue;
+
+                                mappingId = mappingIds[0];
                                 dataSourceId = reader["DATA_SOURCE_ID"] == DBNull.Value
                                     ? (int?)null
                                     : Convert.ToInt32(reader["DATA_SOURCE_ID"]);
                             }
                         }
+                    }
+
+                    if (mappingIds.Count > 1)
+                    {
+                        string dup = $"CONFIG_ID={ctx.ActiveConfigId} has {mappingIds.Count} "
+                            + $"MAPPING_CODE='{MappingCode}' rows in DG_TABLE_MAPPING (ID="
+                            + $"{string.Join(", ", mappingIds)}); using ID={mappingId}. Mapping columns "
+                            + "saved on the other row(s) are NOT applied - delete the stale definition "
+                            + "on the Domain Like Glossary tab in Admin > Glossary.";
+                        warnings.Add(dup);
+                        Log($"DomainGlossaryService: WARNING {dup}");
                     }
 
                     tMapping = sw.ElapsedMilliseconds;
@@ -398,7 +463,7 @@ namespace EliteSoft.Erwin.AddIn.Services
 
                     tDataSource = sw.ElapsedMilliseconds;
 
-                    if (!ReadMappingColumns(conn, repoDbType, mappingId.Value)) return false;
+                    if (!ReadMappingColumns(conn, repoDbType, mappingId.Value, warnings)) return false;
                     tColumns = sw.ElapsedMilliseconds;
 
                     // Both markers drive the picker's two combos; without them there is nothing to
@@ -428,6 +493,7 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
 
                 _isLoaded = true;
+                _lastWarning = warnings.Count == 0 ? null : string.Join(" | ", warnings);
                 // Timing is logged because this read crosses the network to the external glossary
                 // DB: when the picker feels slow, this line says whether the load is the cause.
                 // Per-phase breakdown: "the load is slow" is useless without knowing WHICH step pays.
@@ -455,9 +521,10 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// to erwin, so they must stay out of <see cref="_valueMappings"/> - the same discipline
         /// the standard glossary applies to _TERM_TYPE_.
         /// </summary>
-        private bool ReadMappingColumns(DbConnection conn, string repoDbType, int mappingId)
+        private bool ReadMappingColumns(
+            DbConnection conn, string repoDbType, int mappingId, List<string> warnings)
         {
-            var valueMappings = new List<(string, string, string, bool)>();
+            var valueMappings = new List<(string sourceCol, string targetType, string targetField, bool isLocked)>();
             string domainCol = "", columnCol = "", namingCol = "";
             bool hasIsLocked = HasIsLockedColumn(conn, repoDbType);
 
@@ -501,7 +568,17 @@ namespace EliteSoft.Erwin.AddIn.Services
                             case MappingRole.ColumnMarker: columnCol = sourceCol; break;
                             case MappingRole.NamingStandardMarker: namingCol = sourceCol; break;
                             case MappingRole.Value: valueMappings.Add((sourceCol, targetType, targetField, isLocked)); break;
-                            default: break; // Ignored: no source column or no target field.
+
+                            default:
+                                // A dropped row is indistinguishable from a working one at the erwin
+                                // end - the field is simply never written - so it must never be
+                                // dropped silently.
+                                string dropped = $"mapping row ignored ({IgnoredReason(sourceCol, targetField)}): "
+                                    + $"SOURCE_COLUMN='{sourceCol}', TARGET_TYPE='{targetType}', TARGET_FIELD='{targetField}'";
+                                warnings.Add(dropped);
+                                Log($"DomainGlossaryService: {dropped} - fix it on the Domain Like Glossary "
+                                    + "tab in Admin > Glossary (both the source column and the target field are required).");
+                                break;
                         }
                     }
                 }
@@ -513,6 +590,16 @@ namespace EliteSoft.Erwin.AddIn.Services
             _domainSourceColumn = domainCol;
             _columnSourceColumn = columnCol;
             _namingStandardSourceColumn = namingCol;
+
+            // The exact inventory that the apply path will write, logged once per load. "The UDP
+            // was not set" is otherwise undiagnosable from the log: this line says whether the
+            // mapping ever reached the add-in, with which TARGET_TYPE, under which definition.
+            Log($"DomainGlossaryService: DG_TABLE_MAPPING ID={mappingId} value mapping(s)={valueMappings.Count}"
+                + (valueMappings.Count == 0
+                    ? " (none - only the marker rows are configured)"
+                    : ": " + string.Join(", ", valueMappings.Select(m =>
+                        $"{m.sourceCol}->{(string.IsNullOrEmpty(m.targetType) ? "UNTYPED(=UDP)" : m.targetType)}:"
+                        + $"{m.targetField}{(m.isLocked ? " [locked]" : "")}"))));
             return true;
         }
 
@@ -664,15 +751,16 @@ namespace EliteSoft.Erwin.AddIn.Services
                 case "POSTGRESQL":
                     return $@"SELECT ""ID"", ""DATA_SOURCE_ID"" FROM ""DG_TABLE_MAPPING""
                             WHERE ""MAPPING_CODE"" = '{MappingCode}' AND ""CONFIG_ID"" = @cfgId
-                            LIMIT 1";
+                            ORDER BY ""ID""";
                 case "ORACLE":
                     return $@"SELECT ID, DATA_SOURCE_ID FROM DG_TABLE_MAPPING
                             WHERE MAPPING_CODE = '{MappingCode}' AND CONFIG_ID = :cfgId
-                            FETCH FIRST 1 ROWS ONLY";
+                            ORDER BY ID";
                 case "MSSQL":
                 default:
-                    return $@"SELECT TOP 1 [ID], [DATA_SOURCE_ID] FROM [dbo].[DG_TABLE_MAPPING]
-                            WHERE [MAPPING_CODE] = '{MappingCode}' AND [CONFIG_ID] = @cfgId";
+                    return $@"SELECT [ID], [DATA_SOURCE_ID] FROM [dbo].[DG_TABLE_MAPPING]
+                            WHERE [MAPPING_CODE] = '{MappingCode}' AND [CONFIG_ID] = @cfgId
+                            ORDER BY [ID]";
             }
         }
 

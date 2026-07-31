@@ -86,6 +86,53 @@ public class DomainGlossaryTests
             .Should().Be(DomainGlossaryService.MappingRole.Ignored);
     }
 
+    // A dropped row is the one failure mode that looks IDENTICAL to a working setup from erwin's
+    // side: the mapping is visible in the admin screen, the glossary loads, the picker opens, and
+    // the mapped field is simply never written. So every Ignored row must be able to state which
+    // side of it is missing - that string is what the load logs and what the connect warning shows.
+    [Theory]
+    [InlineData("", "VERI_KATEGORISI", "SOURCE_COLUMN is empty")]
+    [InlineData(null, "VERI_KATEGORISI", "SOURCE_COLUMN is empty")]
+    [InlineData("VERI_KAT", "", "TARGET_FIELD is empty")]
+    [InlineData("VERI_KAT", null, "TARGET_FIELD is empty")]
+    [InlineData("", "", "SOURCE_COLUMN and TARGET_FIELD are both empty")]
+    [InlineData(null, null, "SOURCE_COLUMN and TARGET_FIELD are both empty")]
+    public void An_ignored_row_names_the_side_that_is_missing(
+        string sourceColumn, string targetField, string expected)
+    {
+        DomainGlossaryService.ClassifyRow(sourceColumn, targetField)
+            .Should().Be(DomainGlossaryService.MappingRole.Ignored);
+        DomainGlossaryService.IgnoredReason(sourceColumn, targetField).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("VERI_KAT", "VERI_KATEGORISI")]  // an ordinary value mapping
+    [InlineData("ANA_KATEGORI", "_DOMAIN_")]     // a marker
+    public void A_row_that_is_not_ignored_has_no_reason_to_report(string sourceColumn, string targetField)
+    {
+        // Guards the log line: a usable row must never be described as dropped.
+        DomainGlossaryService.ClassifyRow(sourceColumn, targetField)
+            .Should().NotBe(DomainGlossaryService.MappingRole.Ignored);
+        DomainGlossaryService.IgnoredReason(sourceColumn, targetField).Should().BeEmpty();
+    }
+
+    // The cache is config-scoped, exactly like the standard glossary's: an MDI model switch flips
+    // ConfigContextService.ActiveConfigId, and a mapping read under the previous config must not be
+    // reported as loaded (the picker would then write the other config's fields).
+    [Theory]
+    [InlineData(true, 2017, 2017, true)]
+    [InlineData(true, 2017, 1012, false)]   // loaded under another config -> reload required
+    [InlineData(true, 2017, -1, false)]     // ConfigContext not initialized
+    [InlineData(false, 2017, 2017, false)]  // never loaded
+    public void A_load_is_only_usable_under_the_config_it_was_captured_for(
+        bool loaded, int loadedUnderConfigId, int currentConfigId, bool expected)
+    {
+        // DomainGlossaryService.IsLoaded delegates to this same shared decision, so pinning it here
+        // pins both services against one rule instead of two copies drifting apart.
+        GlossaryService.IsLoadedForConfig(loaded, loadedUnderConfigId, currentConfigId)
+            .Should().Be(expected);
+    }
+
     // --- 2. The domain -> column index --------------------------------------------------
 
     [Fact]
