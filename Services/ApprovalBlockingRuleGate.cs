@@ -356,6 +356,52 @@ namespace EliteSoft.Erwin.AddIn.Services
         /// <summary>Debug-log prefix for every line this gate emits.</summary>
         public const string LogPrefix = "[APPROVAL-GATE]";
 
+        // Table names in a generated script: CREATE / ALTER / DROP TABLE, with the name either
+        // bracketed ([dbo].[X]), quoted ("dbo"."X"), backticked or bare, and optionally schema-
+        // qualified. Only the LAST identifier of the qualified name is captured as the leaf.
+        private static readonly System.Text.RegularExpressions.Regex DdlTableName =
+            new System.Text.RegularExpressions.Regex(
+                @"\b(?:CREATE|ALTER|DROP)\s+TABLE\s+(?:IF\s+(?:NOT\s+)?EXISTS\s+)?" +
+                @"(?<full>(?:[\[""`]?[\w$#]+[\]""`]?\s*\.\s*)*[\[""`]?(?<leaf>[\w$#]+)[\]""`]?)",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase
+                | System.Text.RegularExpressions.RegexOptions.Compiled);
+
+        /// <summary>
+        /// Table names mentioned by a generated script, as the blocking-rule walk matches them:
+        /// both the schema-qualified form and the bare leaf, so either spelling hits.
+        /// <para>This is the FALLBACK scope for "Only Selected Objects". The accurate source is
+        /// erwin's own Object Filter page, but the OnFE fast path never constructs that page (it
+        /// opens the wizard hidden and calls straight into it), so on that route there is nothing
+        /// to read and the script is the only remaining evidence of what the user picked.</para>
+        /// <para>KNOWN LIMIT: an ALTER script omits a table that was selected but UNCHANGED, so
+        /// scoping to it can check fewer tables than the user selected. That is why this is not
+        /// the primary source. It does not apply to the full-script routes, where every selected
+        /// table is emitted whether it changed or not. Under-scoping is still strictly better
+        /// than the previous behaviour of silently falling back to the WHOLE model.</para>
+        /// </summary>
+        public static IReadOnlyCollection<string> ExtractTableNamesFromDdl(string ddl)
+        {
+            var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (string.IsNullOrWhiteSpace(ddl)) return names;
+
+            foreach (System.Text.RegularExpressions.Match m in DdlTableName.Matches(ddl))
+            {
+                string leaf = (m.Groups["leaf"].Value ?? string.Empty).Trim();
+                if (leaf.Length > 0) names.Add(leaf);
+
+                // Qualified form, stripped of quoting and inner whitespace ("[dbo].[X]" -> "dbo.X")
+                // so it matches however the walk spells it.
+                string full = m.Groups["full"].Value;
+                if (!string.IsNullOrWhiteSpace(full))
+                {
+                    string cleaned = full.Replace("[", "").Replace("]", "")
+                        .Replace("\"", "").Replace("`", "").Replace(" ", "").Trim();
+                    if (cleaned.Length > 0) names.Add(cleaned);
+                }
+            }
+            return names;
+        }
+
         /// <summary>
         /// Upper bound on reported issues. A model that violates a rule on every column
         /// would otherwise produce thousands of rows - unusable in the dialog and a flood
