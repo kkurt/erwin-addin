@@ -1,6 +1,9 @@
+#nullable enable
+
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Text;
 
 namespace EliteSoft.Erwin.AddIn.Services
 {
@@ -93,6 +96,50 @@ namespace EliteSoft.Erwin.AddIn.Services
                 }
             }
             catch (Exception ex) { Debug.WriteLine($"AddinLogger.Log failed: {ex.Message}"); }
+        }
+
+        /// <summary>
+        /// Flattens an exception chain into a single log-safe line:
+        /// <c>OuterType: message -&gt; InnerType: message -&gt; ...</c>.
+        ///
+        /// <para>Use this instead of <c>ex.Message</c> in any catch that logs.
+        /// Several framework exceptions carry NO information in their own
+        /// message and delegate everything to the inner one: EF Core's
+        /// <c>DbUpdateException</c> says only "See the inner exception for
+        /// details", and a reflection/COM call reports
+        /// <c>TargetInvocationException</c>. On 2026-07-30 an
+        /// <c>ADDIN_SESSION</c> insert had been failing on every add-in start
+        /// for eleven days and nobody could tell why, because the catch logged
+        /// that placeholder and dropped the <c>SqlException</c> underneath it
+        /// that named the missing column.</para>
+        /// </summary>
+        public static string Describe(Exception? ex)
+        {
+            if (ex == null) return "(no exception)";
+
+            var sb = new StringBuilder();
+            Exception? current = ex;
+
+            // Capped: a chain long enough to hit this is pathological, and a
+            // logger must never turn one bad exception into an unbounded line.
+            for (int depth = 0; current != null && depth < 8; depth++)
+            {
+                if (depth > 0) sb.Append(" -> ");
+
+                // AggregateException's own message enumerates its children;
+                // unwrap a single-child one so the real cause reads first.
+                if (current is AggregateException agg && agg.InnerExceptions.Count == 1)
+                {
+                    current = agg.InnerExceptions[0];
+                }
+
+                sb.Append(current.GetType().Name).Append(": ").Append(current.Message);
+                current = current.InnerException;
+            }
+
+            if (current != null) sb.Append(" -> ...");
+
+            return sb.ToString();
         }
 
         /// <summary>
